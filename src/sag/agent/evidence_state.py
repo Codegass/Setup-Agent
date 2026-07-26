@@ -34,6 +34,18 @@ class FactStatus(str, Enum):
     CLAIMED = "claimed"
 
 
+class SupersededFact(BaseModel):
+    """The earlier-phase verified fact a cross-phase correction replaced."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: Any
+    canonical_value: str
+    provenance: str
+    source_phase: str | None = None
+    source_attempt_id: str | None = None
+
+
 class EvidenceFact(BaseModel):
     """One observed or claimed fact, kept even when it is a duplicate."""
 
@@ -48,6 +60,7 @@ class EvidenceFact(BaseModel):
     source_phase: str | None = None
     source_attempt_id: str | None = None
     evidence_refs: tuple[str, ...] = ()
+    superseded: tuple[SupersededFact, ...] = ()
 
 
 class BlockerRecord(BaseModel):
@@ -296,6 +309,48 @@ class RunEvidenceState(BaseModel):
         resolved = str(source_ref or provenance or (refs[0] if refs else "")).strip()
         return resolved, refs
 
+    def _superseded_by(
+        self,
+        scope: StateScope,
+        key: str,
+        canonical_value: str,
+        source_phase: str | None,
+    ) -> tuple[SupersededFact, ...]:
+        """Name the earlier-phase verified fact this registration invalidates.
+
+        §3.5 cross-phase corrections are written FORWARD: the stale record
+        stays in the append-only ledger untouched and the replacement carries
+        the trace of what it replaced. Only a different phase reporting a
+        different canonical value is a correction — same-phase progress and
+        later re-confirmations invalidate nothing. The trace deliberately does
+        not go through ``record_conflict``: an adjudicated repair is not
+        uncertainty about the evidence, and every conflict entry caps the run
+        verdict at partial (``sag.verdict.run_verdict``).
+        """
+        if not source_phase:
+            return ()
+        previous = next(
+            (
+                fact
+                for fact in reversed(self._facts)
+                if fact.status is FactStatus.VERIFIED and fact.scope is scope and fact.key == key
+            ),
+            None,
+        )
+        if previous is None or previous.canonical_value == canonical_value:
+            return ()
+        if not previous.source_phase or previous.source_phase == source_phase:
+            return ()
+        return (
+            SupersededFact(
+                value=copy.deepcopy(previous.value),
+                canonical_value=previous.canonical_value,
+                provenance=previous.provenance,
+                source_phase=previous.source_phase,
+                source_attempt_id=previous.source_attempt_id,
+            ),
+        )
+
     def register_fact(
         self,
         scope: StateScope,
@@ -319,6 +374,7 @@ class RunEvidenceState(BaseModel):
         if not resolved_ref:
             raise ValueError("verified facts require a nonblank evidence ref")
         canonical_value = _canonicalize(value)
+        normalized_phase = str(source_phase).strip() if source_phase else None
         fact = EvidenceFact(
             scope=scope,
             key=key,
@@ -326,9 +382,10 @@ class RunEvidenceState(BaseModel):
             canonical_value=canonical_value,
             status=FactStatus.VERIFIED,
             provenance=resolved_ref,
-            source_phase=str(source_phase).strip() if source_phase else None,
+            source_phase=normalized_phase,
             source_attempt_id=(str(source_attempt_id).strip() if source_attempt_id else None),
             evidence_refs=normalized_refs or (resolved_ref,),
+            superseded=self._superseded_by(scope, key, canonical_value, normalized_phase),
         )
         before = self._state_epochs[scope]
         identity = (scope, key, canonical_value)
