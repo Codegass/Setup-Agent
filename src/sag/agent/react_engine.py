@@ -3093,7 +3093,7 @@ class ReActEngine(UIEventEmitter):
 
     @property
     def advisor_mode(self) -> str:
-        """"off" | "same-model" | an explicit litellm model name."""
+        """Either "off", "same-model", or an explicit litellm model name."""
         return str(getattr(self.config, "advisor_mode", "same-model") or "off").strip() or "off"
 
     @property

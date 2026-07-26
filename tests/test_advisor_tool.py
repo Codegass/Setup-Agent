@@ -33,9 +33,7 @@ class _ScriptedAdvisorClient:
         return SimpleNamespace(model="scripted-action-model")
 
     def get_advisor_response(self, messages, *, model, max_tokens):
-        self.calls.append(
-            {"messages": list(messages), "model": model, "max_tokens": max_tokens}
-        )
+        self.calls.append({"messages": list(messages), "model": model, "max_tokens": max_tokens})
         if self.error is not None:
             raise self.error
         return self.advice
@@ -297,9 +295,10 @@ def test_consult_survives_a_broken_evidence_digest():
     result = engine.consult_advisor()
 
     assert result.metadata["advisor"] == "advice"
-    assert "TOOL: [build] BUILD FAILURE: missing dependency" in client.calls[0]["messages"][1][
-        "content"
-    ]
+    assert (
+        "TOOL: [build] BUILD FAILURE: missing dependency"
+        in client.calls[0]["messages"][1]["content"]
+    )
 
 
 # --- wiring: registration, consult binding, run pin ------------------------
@@ -383,9 +382,7 @@ def test_the_run_pin_carries_advisor_telemetry(tmp_path):
 
     agent._write_run_pin(target_repo_sha="a" * 40)
 
-    pin = RunPin.model_validate_json(
-        (tmp_path / "run-pin.json").read_text(encoding="utf-8")
-    )
+    pin = RunPin.model_validate_json((tmp_path / "run-pin.json").read_text(encoding="utf-8"))
     assert pin.advisor == {
         "mode": "same-model",
         "calls": [
