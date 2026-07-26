@@ -1979,38 +1979,16 @@ class MavenTool(BaseTool):
             )
 
         if analysis.get("failed_modules"):
-            suggested_action = self._suggested_build_action(command)
             for module_info in analysis["failed_modules"][:3]:
-                artifact_id = module_info.get("artifact_id")
-                pom_path = module_info.get("pom_path")
-                module_hint = pom_path or artifact_id
-                if artifact_id:
+                module_hint = module_info.get("pom_path") or module_info.get("artifact_id")
+                if module_hint:
                     error_suggestions.append(
-                        f"Temporarily exclude module '{artifact_id}' ({module_hint}) and rerun: "
-                        f"build(action='{suggested_action}', args='-pl !{artifact_id} -am')"
+                        f"Module failed: {module_hint} — read its build output above for the root cause"
                     )
-                elif pom_path:
-                    module_name = Path(pom_path).parent.name
-                    error_suggestions.append(
-                        f"Temporarily exclude module '{module_name}' ({module_hint}) and rerun: "
-                        f"build(action='{suggested_action}', args='-pl !{module_name} -am')"
-                    )
-            error_suggestions.append(
-                "Excluding the failing module lets the remaining reactor modules finish so you still capture their results."
-            )
 
         if analysis.get("failed_tests"):
-            suggested_action = self._suggested_build_action(command)
             for failed_test in analysis["failed_tests"][:5]:
-                display_name = failed_test.split("(")[0].strip() or failed_test
-                display_name = display_name.split(":")[0].strip()
-                error_suggestions.append(
-                    f"Skip failing test '{display_name}' on the next run: "
-                    f"build(action='{suggested_action}', args='-Dtest=!{display_name}')"
-                )
-            error_suggestions.append(
-                "Combine multiple exclusions with commas inside the test property, e.g. args='-Dtest=!TestOne,!TestTwo'."
-            )
+                error_suggestions.append(f"Failing test: {failed_test}")
 
         if analysis.get("surefire_reports"):
             for report_path in analysis["surefire_reports"][:3]:
@@ -2022,7 +2000,7 @@ class MavenTool(BaseTool):
             error_code = "TEST_FAILURE"
             error_suggestions.extend(
                 [
-                    "Fix failing tests or use -DskipTests=true to skip tests temporarily",
+                    "Fix the failing tests; the Surefire reports above carry the full failure context",
                     "Run 'maven test' with raw_output=true to see detailed test failure information",
                     "Check test logs for specific failure reasons",
                 ]
@@ -2066,7 +2044,7 @@ class MavenTool(BaseTool):
                     "Use bash to examine the problematic line in the POM file",
                     "Common issues: orphaned tags, missing closing tags, tags outside proper parent elements",
                     "Try: bash(command='xmllint --noout /path/to/pom.xml') to validate XML structure",
-                    "If unfixable, exclude the module: build(action='test', args='-pl !module-name')",
+                    "Repair the POM syntax at the reported line, then rerun the same build action",
                 ]
             )
             documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
