@@ -38,6 +38,7 @@ from .control_events import (
 from .current_plan import CurrentPlan, PlanFault, PlanFaultCode
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
+from .native_messages import render_messages
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_gates import (
     ClaimDisposition,
@@ -2132,6 +2133,13 @@ class ReActEngine(UIEventEmitter):
         completion_mode: str = "setup",
     ):
         """Run the main ReAct loop."""
+        if getattr(self.config, "native_executor_loop", False):
+            return self._run_native_loop(
+                initial_prompt,
+                max_iterations=max_iterations,
+                completion_mode=completion_mode,
+            )
+
         max_iter = max_iterations or self.max_iterations
         self._run_max_iterations = max_iter
 
@@ -2346,24 +2354,7 @@ class ReActEngine(UIEventEmitter):
                 # ATTEMPT-LEDGER COMPACTION (phase mode): old steps collapse to
                 # one line each behind the phase intro; exactly one ledger step
                 # exists at a time (position 1, right after the intro).
-                ledger = None
-                n_compacted = 0
-                if phase_mode and len(self.steps) > 1:
-                    tail = self.steps[1:]
-                    ledger, kept = compact_steps(tail, keep_recent=30)
-                    if ledger is not None:
-                        ledger_step = ReActStep(
-                            step_type=StepType.SYSTEM_GUIDANCE,
-                            content=ledger,
-                            timestamp=self._get_timestamp(),
-                        )
-                        kept_clean = [
-                            s
-                            for s in kept
-                            if "ATTEMPT LEDGER" not in (getattr(s, "content", "") or "")
-                        ]
-                        n_compacted = len(tail) - len(kept_clean)
-                        self.steps = [self.steps[0], ledger_step] + kept_clean
+                ledger, n_compacted = self._compact_window_if_needed(phase_mode)
 
                 # Build prompt for next iteration
                 current_prompt = self.prompt_builder.build_next_prompt(
@@ -2420,6 +2411,235 @@ class ReActEngine(UIEventEmitter):
             self._scheduler_active = False
             self._scheduled_turn = None
             self.state_evaluator.completion_mode = previous_completion_mode
+
+    @staticmethod
+    def _native_message_chars(messages: List[Dict[str, Any]]) -> int:
+        """Rough size of one rendered request, the native analogue of the flat
+        prompt length the context journal used to record."""
+        total = 0
+        for message in messages:
+            total += len(str(message.get("content") or ""))
+            for call in message.get("tool_calls") or ():
+                total += len(str(call.get("function", {}).get("arguments") or ""))
+        return total
+
+    def _run_native_loop(
+        self,
+        initial_prompt: str,
+        max_iterations: Optional[int] = None,
+        completion_mode: str = "setup",
+    ):
+        """Single-executor native tool-calling loop (spec §3.1).
+
+        One LLM call per iteration; the model sees `[system] + render_messages(
+        self.steps)`, answers with prose and/or tool calls, and every call is
+        dispatched with its id preserved. `self.steps` stays the single source
+        of truth, so phase signals, compaction, the archive, the journal, and
+        reporting all keep working unchanged. The skeleton (budget, wall clock,
+        floors, token export, exit paths) mirrors `_run_react_loop` minus the
+        scheduler and the dual-role mode selection."""
+        max_iter = max_iterations or self.max_iterations
+        self._run_max_iterations = max_iter
+
+        self.agent_logger.info(f"Starting native executor loop with max {max_iter} iterations")
+
+        phase_mode = completion_mode == "setup" and self.phase_machine is not None
+        # The native protocol has no scheduler; keep the predicate honest for
+        # every helper that still consults it until Task 8 deletes it.
+        self._scheduler_active = False
+        self._scheduled_turn = None
+
+        self.current_iteration = 0
+        self._phase_iterations = 0
+        if phase_mode:
+            self.steps = [self._phase_intro_step()]
+            self._journal_intro_dirty = True
+            self._journal_last_ledger = None
+            self._start_phase_branch()
+        else:
+            self.steps = []
+
+        self.prompt_builder.invalidate_trunk_cache()
+
+        # The system prompt is rebuilt once and re-sent on EVERY request — the
+        # audit finding in spec §3.1 was that the old loop rendered it once and
+        # then overwrote it with a flat text rebuild.
+        system_prompt = self.prompt_builder.build_initial_system_prompt(
+            repository_url=self.repository_url,
+            repository_ref=self.repository_ref,
+            tool_calling_enabled=self.llm_client.capabilities_for(
+                ReactModelMode.ACTION
+            ).supports_function_calling,
+            workflow_mode=completion_mode,
+        )
+        if initial_prompt:
+            system_prompt = system_prompt + "\n\n" + initial_prompt
+        if not phase_mode and initial_prompt:
+            # Non-phase runs open with no window at all; the kickoff prompt is
+            # the first user turn so the array is never system-only.
+            self.steps.append(
+                ReActStep(
+                    step_type=StepType.SYSTEM_GUIDANCE,
+                    content=initial_prompt,
+                    timestamp=self._get_timestamp(),
+                )
+            )
+
+        run_started_at = time.time()
+        wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
+
+        try:
+            while self.current_iteration < max_iter:
+                if wall_clock_exceeded(run_started_at, wall_clock_cap):
+                    elapsed = time.time() - run_started_at
+                    logger.warning(
+                        f"Native loop stopped: global wall-clock cap of {wall_clock_cap}s "
+                        f"reached after {elapsed:.0f}s / {self.current_iteration} iterations"
+                    )
+                    self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="wall clock cap exceeded")
+                    return False
+
+                if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
+                    self._export_token_usage_csv()
+                    return self._close_flow(RunTerminationStatus.COMPLETED)
+
+                self.current_iteration += 1
+                self._phase_iterations += 1
+                self.agent_logger.info(f"Native iteration {self.current_iteration}/{max_iter}")
+                self.token_tracker.set_iteration(self.current_iteration)
+
+                messages = render_messages(system_prompt, self.steps)
+                try:
+                    turn = self.llm_client.get_native_turn(messages)
+                except Exception as exc:
+                    # `get_native_turn` propagates provider errors instead of
+                    # swallowing them the way `get_response` did.
+                    logger.error(f"Native executor request failed: {exc}")
+                    self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason=f"LLM response unavailable: {exc}")
+                    return False
+
+                steps_before = len(self.steps)
+
+                if not turn.tool_calls:
+                    if turn.text.strip():
+                        self.steps.append(
+                            ReActStep(
+                                step_type=StepType.THOUGHT,
+                                content=turn.text,
+                                timestamp=self._get_timestamp(),
+                                model_used=turn.model_used,
+                            )
+                        )
+                    if completion_mode != "setup":
+                        # Run-task mode: a text answer ends the task.
+                        self._export_token_usage_csv()
+                        return True
+                    self.steps.append(
+                        ReActStep(
+                            step_type=StepType.SYSTEM_GUIDANCE,
+                            content=(
+                                "No tool was called. Continue with a tool call, "
+                                "or close the phase honestly via phase(...)."
+                            ),
+                            timestamp=self._get_timestamp(),
+                        )
+                    )
+                    if phase_mode:
+                        self._record_context_journal(
+                            None,
+                            0,
+                            len(self.steps) - steps_before,
+                            self._native_message_chars(messages),
+                        )
+                    continue
+
+                executed_steps = self._execute_native_calls(turn)
+                added = max(len(self.steps) - steps_before, 0)
+
+                if phase_mode:
+                    self._handle_phase_signals(executed_steps)
+                    if self.phase_machine.is_complete:
+                        termination = self.phase_machine.termination_state()
+                        self.agent_logger.info(
+                            f"All phases complete; flow termination: {termination}"
+                        )
+                        self._export_token_usage_csv()
+                        return self._close_flow(RunTerminationStatus.COMPLETED)
+                    self._maybe_nudge_phase_done()
+
+                # NO-PHYSICAL-PROGRESS GUARD: unchanged from the old loop.
+                completed_task_this_iteration = any(
+                    step.tool_name == "manage_context"
+                    and (step.tool_params or {}).get("action") == "complete_with_results"
+                    and step.tool_result is not None
+                    and step.tool_result.succeeded
+                    for step in executed_steps
+                )
+                if completed_task_this_iteration and self._check_progress_after_task():
+                    logger.warning(
+                        "Native loop stopped: no build progress after repeated completed tasks"
+                    )
+                    self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="no physical progress")
+                    return False
+
+                ledger, n_compacted = self._compact_window_if_needed(phase_mode)
+
+                if phase_mode:
+                    self._record_context_journal(
+                        ledger,
+                        n_compacted,
+                        added,
+                        self._native_message_chars(messages),
+                    )
+
+                if executed_steps:
+                    self.steps_since_context_switch += 1
+
+            logger.warning(f"Native loop completed without success after {max_iter} iterations")
+            self._export_token_usage_csv()
+            if phase_mode:
+                return self.abort(reason="iteration budget exhausted")
+            return False
+
+        except KeyboardInterrupt:
+            logger.warning("Native loop cancelled by keyboard interrupt")
+            self._export_token_usage_csv()
+            if phase_mode:
+                return self.cancel(reason="keyboard interrupt")
+            return False
+        except Exception as e:
+            logger.error(f"Native loop failed: {e}", exc_info=True)
+            self._export_token_usage_csv()
+            if phase_mode:
+                return self.abort(reason=f"engine exception: {type(e).__name__}")
+            return False
+
+    def _compact_window_if_needed(self, phase_mode: bool) -> tuple[Optional[str], int]:
+        """ATTEMPT-LEDGER COMPACTION (phase mode): old steps collapse to one
+        line each behind the phase intro; exactly one ledger step exists at a
+        time (position 1, right after the intro). Shared by both protocols —
+        the ledger step renders as a user message in the native loop."""
+        if not phase_mode or len(self.steps) <= 1:
+            return None, 0
+        tail = self.steps[1:]
+        ledger, kept = compact_steps(tail, keep_recent=30)
+        if ledger is None:
+            return None, 0
+        ledger_step = ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content=ledger,
+            timestamp=self._get_timestamp(),
+        )
+        kept_clean = [s for s in kept if "ATTEMPT LEDGER" not in (getattr(s, "content", "") or "")]
+        n_compacted = len(tail) - len(kept_clean)
+        self.steps = [self.steps[0], ledger_step] + kept_clean
+        return ledger, n_compacted
 
     def _record_setup_abort(self, phase_mode: bool, reason: str) -> None:
         if phase_mode and not self.phase_machine.is_complete:
@@ -3349,6 +3569,267 @@ class ReActEngine(UIEventEmitter):
         self._apply_phase_decision(record, route)
         return True
 
+    def _refusal_for_call(self, call: ToolCall) -> ToolExecution | None:
+        """The harness refusals that stand in for a real execution.
+
+        Shared by both protocols: sealed evidence closes every evidence tool,
+        and `report` stays closed until the verdict snapshot exists."""
+        if self._evidence_execution_closed(call):
+            return self._refused_closed_evidence_execution(call)
+        if call.name == "report" and not self._report_execution_allowed():
+            return self._refused_report_execution(call)
+        return None
+
+    def _execute_action_step(self, step: ReActStep) -> Optional[str]:
+        """Execute one ACTION step that is already appended to `self.steps`.
+
+        Protocol-neutral: the scheduler loop and the native executor loop share
+        it verbatim. Returns the reason the enclosing batch must stop (a phase
+        transition is pending, or the loop breaker closed the phase), else
+        None. When the step carries a native `tool_call_id`, its observation is
+        stamped with the same id so the two render as a tool_use/tool_result
+        pair."""
+        self.agent_logger.info(f"🔧 ACTION: {step.content}")
+        logger.info(f"🔧 ACTION: {step.content}")
+
+        # Emit UI event for action with parameters
+        self.emit(
+            EventType.AGENT_ACTION,
+            message=f"Using {step.tool_name or 'tool'}",
+            step_num=self.current_iteration,
+            tool_name=step.tool_name or "unknown",
+            tool_params=step.tool_params or {},
+        )
+
+        # Update token tracker with actual tool name for the last action token record
+        if step.tool_name:
+            self.token_tracker.update_last_tool_name(step.tool_name)
+
+        # Detailed logging in verbose mode
+        if self.config.verbose:
+            self._log_react_step_verbose(step)
+
+        branch_task_id = getattr(self.context_manager, "current_task_id", None)
+        call = self._build_tool_call_from_step(step)
+        # Legacy protocol steps carry no id; native ones do.
+        native_call_id = getattr(step, "tool_call_id", None)
+        previous_native_call_id = getattr(self, "_active_native_tool_call_id", None)
+        if native_call_id:
+            self._active_native_tool_call_id = native_call_id
+        try:
+            execution = self._refusal_for_call(call)
+            if execution is None:
+                execution = self._execute_tool_call(call)
+            result, control_execution_id, actual_executions = self._record_execution_bundle(
+                execution, call
+            )
+            step.tool_result = result
+            control_envelope_id = str(execution.metadata.get("control_envelope_id") or "") or None
+            if execution.validated_params is not None:
+                control_params = execution.validated_params
+            elif call.validated_params is not None:
+                control_params = call.validated_params
+            else:
+                control_params = call.raw_params
+            if control_envelope_id is None:
+                control_envelope_id = self._emit_control_action_envelope(
+                    call.name,
+                    control_params,
+                )
+            self._emit_control_tool_result(
+                envelope_id=control_envelope_id,
+                execution_id=control_execution_id or new_execution_id(),
+                tool=call.name,
+                params=control_params,
+                result=result,
+                actual_executions=actual_executions,
+            )
+        finally:
+            self._active_native_tool_call_id = previous_native_call_id
+        loop_decision = self._apply_tool_execution_loop_effects(execution)
+
+        # Log tool result in verbose mode
+        if self.config.verbose:
+            self._log_tool_result_verbose(step.tool_name, result)
+
+        # Add observation step with improved formatting
+        self._append_native_observation(native_call_id, execution.observation_text)
+
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is not None:
+            scheduler.observe_result(result)
+        else:
+            # Legacy run-task cadence: setup phase mode is owned by the
+            # executable-plan scheduler above.
+            evidence_assessment = result.evidence_assessment
+            should_force_thinking = (
+                result.invocation_status is InvocationStatus.PENDING
+                or result.succeeded
+                or evidence_assessment
+                in {
+                    EvidenceAssessment.PARTIAL,
+                    EvidenceAssessment.CONFLICT,
+                    EvidenceAssessment.UNKNOWN,
+                }
+            )
+            if should_force_thinking:
+                self._force_thinking_after_success = True
+                logger.debug(
+                    f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
+                )
+            if loop_decision is not None and loop_decision.request_thinking:
+                # LoopMemory owns this reasoning trigger.  Collapse the
+                # generic success trigger so one decision yields exactly
+                # one thinking step, never two consecutive forced turns.
+                self._force_thinking_after_success = False
+                self._force_thinking_next = True
+
+        if result.error_code == "TEST_ATTEMPT_REQUIRED":
+            required_attempt = self._missing_required_test_attempt()
+            if required_attempt is not None:
+                self._force_required_test_attempt(
+                    required_attempt,
+                    trigger="termination_refusal",
+                )
+
+        # Log to branch context if we're in one
+        if branch_task_id:
+            # Add action result to branch history using new context management system
+            try:
+                output_to_store = result.output if result.output else ""
+                from datetime import datetime
+
+                timestamp = datetime.now().isoformat()
+
+                # Store full output and get reference if output is large
+                stored_output_refs = []
+                if (
+                    len(output_to_store) > 800
+                    and self.output_storage is not None
+                    and not result.output_ref
+                ):
+                    # Store the full output
+                    ref_id = self.output_storage.store_output(
+                        task_id=self.context_manager.current_task_id,
+                        tool_name=step.tool_name,
+                        output=output_to_store,
+                        timestamp=timestamp,
+                        metadata={
+                            "invocation_status": result.invocation_status.value,
+                            "operation_outcome": result.operation_outcome.value,
+                            "evidence_status": result.evidence_status.value,
+                            "iteration": self.current_iteration,
+                        },
+                    )
+                    stored_output_refs.append(ref_id)
+
+                    # Get truncated version with reference
+                    output_to_store = self.output_storage.get_truncation_with_reference(
+                        output=output_to_store,
+                        ref_id=ref_id,
+                        max_length=800,
+                        tool_name=step.tool_name,
+                    )
+
+                history_entry = {
+                    "type": "action",
+                    "iteration": self.current_iteration,
+                    "tool_name": step.tool_name,
+                    "parameters": step.tool_params or {},
+                    "succeeded": result.succeeded,
+                    "invocation_status": result.invocation_status.value,
+                    "operation_outcome": result.operation_outcome.value,
+                    "evidence_status": result.evidence_status.value,
+                    "output": output_to_store,
+                    "observation": execution.observation_text,
+                    "output_refs": self._dedupe_strings(
+                        [
+                            *stored_output_refs,
+                            result.output_ref,
+                            *self._output_refs_from_text(output_to_store),
+                        ]
+                    ),
+                }
+                for field_name in ("failure_signature", "error_tail_preview"):
+                    value = getattr(result, field_name)
+                    if value:
+                        history_entry[field_name] = value
+                # A pending dispatch is not build-execution evidence;
+                # completion gates must be able to tell.
+                dispatch_status = (result.metadata or {}).get("dispatch_status")
+                if dispatch_status:
+                    history_entry["dispatch_status"] = dispatch_status
+                self.context_manager.add_to_branch_history(
+                    branch_task_id,
+                    history_entry,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log action to branch history: {e}")
+
+        if (
+            loop_decision is not None
+            and loop_decision.close_phase
+            and self._close_phase_for_loop(loop_decision, execution)
+        ):
+            logger.debug("Stopping the action batch after loop-driven phase closure")
+            return "the loop breaker closed this phase"
+
+        phase_signal = (result.metadata or {}).get("phase_signal")
+        if phase_signal in {"done", "blocked", "repair"}:
+            # The engine must apply the accepted proposal before any
+            # later action can run under a new or closed prerequisite.
+            logger.debug(f"Stopping the action batch at phase signal {phase_signal!r}")
+            return f"a {phase_signal} phase transition is being processed"
+
+        return None
+
+    def _append_native_observation(
+        self,
+        tool_call_id: Optional[str],
+        observation: str,
+    ) -> Optional[ReActStep]:
+        """Append an observation through the preserved enrichment path, stamped
+        with the tool_call it answers (None for the legacy protocol)."""
+        step = self._add_observation_step(observation)
+        if step is not None and tool_call_id:
+            step.tool_call_id = tool_call_id
+        return step
+
+    def _execute_native_calls(self, turn) -> List[ReActStep]:
+        """Execute every tool call of one assistant turn, in order.
+
+        EVERY call id gets exactly one observation — a real result, a harness
+        refusal, or a cancellation — because Anthropic rejects an assistant
+        tool_use that no tool_result answers (anatomy map risk 5). A phase
+        signal or a loop force-break stops execution but never stops the
+        answering."""
+        executed: List[ReActStep] = []
+        cancelled_reason: Optional[str] = None
+
+        for call in turn.tool_calls:
+            step = ReActStep(
+                step_type=StepType.ACTION,
+                content=call.name or "(tool call without a name)",
+                tool_name=call.name,
+                tool_params=dict(call.arguments),
+                timestamp=self._get_timestamp(),
+                model_used=turn.model_used,
+                tool_call_id=call.id,
+                native_text=turn.text,
+            )
+            self.steps.append(step)
+
+            if cancelled_reason is not None:
+                self._append_native_observation(call.id, f"[not executed: {cancelled_reason}]")
+                continue
+
+            batch_break_reason = self._execute_action_step(step)
+            executed.append(step)
+            if batch_break_reason is not None:
+                cancelled_reason = batch_break_reason
+
+        return executed
+
     def _execute_steps(self, steps: List[ReActStep]) -> bool:
         """Execute a list of ReAct steps."""
         for step in steps:
@@ -3386,193 +3867,7 @@ class ReActEngine(UIEventEmitter):
                         logger.warning(f"Failed to log thought to branch history: {e}")
 
             elif step.step_type == StepType.ACTION:
-                self.agent_logger.info(f"🔧 ACTION: {step.content}")
-                logger.info(f"🔧 ACTION: {step.content}")
-
-                # Emit UI event for action with parameters
-                self.emit(
-                    EventType.AGENT_ACTION,
-                    message=f"Using {step.tool_name or 'tool'}",
-                    step_num=self.current_iteration,
-                    tool_name=step.tool_name or "unknown",
-                    tool_params=step.tool_params or {},
-                )
-
-                # Update token tracker with actual tool name for the last action token record
-                if step.tool_name:
-                    self.token_tracker.update_last_tool_name(step.tool_name)
-
-                # Detailed logging in verbose mode
-                if self.config.verbose:
-                    self._log_react_step_verbose(step)
-
-                branch_task_id = getattr(self.context_manager, "current_task_id", None)
-                call = self._build_tool_call_from_step(step)
-                if self._evidence_execution_closed(call):
-                    execution = self._refused_closed_evidence_execution(call)
-                elif call.name == "report" and not self._report_execution_allowed():
-                    execution = self._refused_report_execution(call)
-                else:
-                    execution = self._execute_tool_call(call)
-                result, control_execution_id, actual_executions = self._record_execution_bundle(
-                    execution, call
-                )
-                step.tool_result = result
-                control_envelope_id = (
-                    str(execution.metadata.get("control_envelope_id") or "") or None
-                )
-                if execution.validated_params is not None:
-                    control_params = execution.validated_params
-                elif call.validated_params is not None:
-                    control_params = call.validated_params
-                else:
-                    control_params = call.raw_params
-                if control_envelope_id is None:
-                    control_envelope_id = self._emit_control_action_envelope(
-                        call.name,
-                        control_params,
-                    )
-                self._emit_control_tool_result(
-                    envelope_id=control_envelope_id,
-                    execution_id=control_execution_id or new_execution_id(),
-                    tool=call.name,
-                    params=control_params,
-                    result=result,
-                    actual_executions=actual_executions,
-                )
-                loop_decision = self._apply_tool_execution_loop_effects(execution)
-
-                # Log tool result in verbose mode
-                if self.config.verbose:
-                    self._log_tool_result_verbose(step.tool_name, result)
-
-                # Add observation step with improved formatting
-                self._add_observation_step(execution.observation_text)
-
-                scheduler = self._active_reasoning_scheduler()
-                if scheduler is not None:
-                    scheduler.observe_result(result)
-                else:
-                    # Legacy run-task cadence: setup phase mode is owned by the
-                    # executable-plan scheduler above.
-                    evidence_assessment = result.evidence_assessment
-                    should_force_thinking = (
-                        result.invocation_status is InvocationStatus.PENDING
-                        or result.succeeded
-                        or evidence_assessment
-                        in {
-                            EvidenceAssessment.PARTIAL,
-                            EvidenceAssessment.CONFLICT,
-                            EvidenceAssessment.UNKNOWN,
-                        }
-                    )
-                    if should_force_thinking:
-                        self._force_thinking_after_success = True
-                        logger.debug(
-                            f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
-                        )
-                    if loop_decision is not None and loop_decision.request_thinking:
-                        # LoopMemory owns this reasoning trigger.  Collapse the
-                        # generic success trigger so one decision yields exactly
-                        # one thinking step, never two consecutive forced turns.
-                        self._force_thinking_after_success = False
-                        self._force_thinking_next = True
-
-                if result.error_code == "TEST_ATTEMPT_REQUIRED":
-                    required_attempt = self._missing_required_test_attempt()
-                    if required_attempt is not None:
-                        self._force_required_test_attempt(
-                            required_attempt,
-                            trigger="termination_refusal",
-                        )
-
-                # Log to branch context if we're in one
-                if branch_task_id:
-                    # Add action result to branch history using new context management system
-                    try:
-                        output_to_store = result.output if result.output else ""
-                        from datetime import datetime
-
-                        timestamp = datetime.now().isoformat()
-
-                        # Store full output and get reference if output is large
-                        stored_output_refs = []
-                        if (
-                            len(output_to_store) > 800
-                            and self.output_storage is not None
-                            and not result.output_ref
-                        ):
-                            # Store the full output
-                            ref_id = self.output_storage.store_output(
-                                task_id=self.context_manager.current_task_id,
-                                tool_name=step.tool_name,
-                                output=output_to_store,
-                                timestamp=timestamp,
-                                metadata={
-                                    "invocation_status": result.invocation_status.value,
-                                    "operation_outcome": result.operation_outcome.value,
-                                    "evidence_status": result.evidence_status.value,
-                                    "iteration": self.current_iteration,
-                                },
-                            )
-                            stored_output_refs.append(ref_id)
-
-                            # Get truncated version with reference
-                            output_to_store = self.output_storage.get_truncation_with_reference(
-                                output=output_to_store,
-                                ref_id=ref_id,
-                                max_length=800,
-                                tool_name=step.tool_name,
-                            )
-
-                        history_entry = {
-                            "type": "action",
-                            "iteration": self.current_iteration,
-                            "tool_name": step.tool_name,
-                            "parameters": step.tool_params or {},
-                            "succeeded": result.succeeded,
-                            "invocation_status": result.invocation_status.value,
-                            "operation_outcome": result.operation_outcome.value,
-                            "evidence_status": result.evidence_status.value,
-                            "output": output_to_store,
-                            "observation": execution.observation_text,
-                            "output_refs": self._dedupe_strings(
-                                [
-                                    *stored_output_refs,
-                                    result.output_ref,
-                                    *self._output_refs_from_text(output_to_store),
-                                ]
-                            ),
-                        }
-                        for field_name in ("failure_signature", "error_tail_preview"):
-                            value = getattr(result, field_name)
-                            if value:
-                                history_entry[field_name] = value
-                        # A pending dispatch is not build-execution evidence;
-                        # completion gates must be able to tell.
-                        dispatch_status = (result.metadata or {}).get("dispatch_status")
-                        if dispatch_status:
-                            history_entry["dispatch_status"] = dispatch_status
-                        self.context_manager.add_to_branch_history(
-                            branch_task_id,
-                            history_entry,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to log action to branch history: {e}")
-
-                if (
-                    loop_decision is not None
-                    and loop_decision.close_phase
-                    and self._close_phase_for_loop(loop_decision, execution)
-                ):
-                    logger.debug("Stopping the action batch after loop-driven phase closure")
-                    break
-
-                phase_signal = (result.metadata or {}).get("phase_signal")
-                if phase_signal in {"done", "blocked", "repair"}:
-                    # The engine must apply the accepted proposal before any
-                    # later action can run under a new or closed prerequisite.
-                    logger.debug(f"Stopping the action batch at phase signal {phase_signal!r}")
+                if self._execute_action_step(step) is not None:
                     break
 
         return True
@@ -3842,8 +4137,11 @@ class ReActEngine(UIEventEmitter):
         if len(self.recent_tool_executions) > self.max_recent_executions:
             self.recent_tool_executions.pop(0)
 
-    def _add_observation_step(self, observation: str):
-        """Add an observation step, enriched with physical validation state."""
+    def _add_observation_step(self, observation: str) -> ReActStep:
+        """Add an observation step, enriched with physical validation state.
+
+        Returns the appended step so a native caller can stamp the
+        `tool_call_id` it answers."""
         # Get physical validation state if relevant
         physical_state = self._get_physical_validation_state(observation)
 
@@ -3870,6 +4168,8 @@ class ReActEngine(UIEventEmitter):
 
         # DEPRECATED: Task completion detection now handled by state_evaluator
         # self._check_task_completion_opportunity(observation)
+
+        return obs_step
 
     def _add_completion_guidance(self, reason: str):
         """Add guidance to help agent recognize task completion."""
