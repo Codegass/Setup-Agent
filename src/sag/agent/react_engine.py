@@ -2476,35 +2476,56 @@ class ReActEngine(UIEventEmitter):
         tool: str,
         params: Dict[str, Any],
     ) -> str | None:
+        """Key the envelope that every downstream `tool_result` hangs off.
+
+        Identity comes from whichever protocol is driving the call: the
+        scheduler's `plan_index`, or the native turn's `tool_call_id`
+        (`self._active_native_tool_call_id`, else the tool_call id of the
+        ACTION step currently being executed). There is deliberately no
+        scheduler-active gate — `_emit_control_tool_result` drops every event
+        whose envelope id is falsy, so a schedulerless run without this
+        fallback would silently emit no tool results at all.
+        """
         if getattr(self, "_suppress_control_action_envelope", False):
             return None
         sink = getattr(self, "control_event_sink", None)
-        if sink is None or self._active_reasoning_scheduler() is None:
+        if sink is None:
             return None
-        turn = getattr(self, "_scheduled_turn", None)
-        step = turn.step if turn is not None else None
-        scheduler = getattr(self, "reasoning_scheduler", None)
-        if step is None and scheduler is not None:
-            step = getattr(scheduler, "active_step", None)
-        if step is None:
-            logger.warning("Control envelope omitted because no scheduler action is active")
+        plan_index: int | None = None
+        if self._active_reasoning_scheduler() is not None:
+            turn = getattr(self, "_scheduled_turn", None)
+            step = turn.step if turn is not None else None
+            scheduler = getattr(self, "reasoning_scheduler", None)
+            if step is None and scheduler is not None:
+                step = getattr(scheduler, "active_step", None)
+            plan_index = getattr(step, "plan_index", None)
+        tool_call_id = getattr(self, "_active_native_tool_call_id", None)
+        if not tool_call_id:
+            for step in reversed(getattr(self, "steps", None) or ()):
+                if getattr(step, "step_type", None) is StepType.ACTION:
+                    tool_call_id = getattr(step, "tool_call_id", None)
+                    break
+        if plan_index is None and not tool_call_id:
+            logger.warning("Control envelope omitted because no action identity is active")
             return None
         safe_params = compact_control_value(params)
         envelope_id = f"envelope-{sink.sequence + 1:06d}"
-        emitted = self._emit_control_event(
-            "action_envelope",
-            {
-                "envelope_id": envelope_id,
-                "plan_index": step.plan_index,
-                "tool": tool,
-                "exact_params": safe_params,
-                "envelope_sha256": action_envelope_sha256(
-                    plan_index=step.plan_index,
-                    tool=tool,
-                    exact_params=safe_params,
-                ),
-            },
-        )
+        payload: Dict[str, Any] = {
+            "envelope_id": envelope_id,
+            "tool": tool,
+            "exact_params": safe_params,
+            "envelope_sha256": action_envelope_sha256(
+                plan_index=plan_index,
+                tool_call_id=tool_call_id,
+                tool=tool,
+                exact_params=safe_params,
+            ),
+        }
+        if plan_index is not None:
+            payload["plan_index"] = plan_index
+        if tool_call_id:
+            payload["tool_call_id"] = str(tool_call_id)
+        emitted = self._emit_control_event("action_envelope", payload)
         if emitted is None:
             return None
         self._active_control_envelope_id = envelope_id

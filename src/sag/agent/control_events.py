@@ -260,10 +260,24 @@ class SchedulerDecisionPayload(_StrictPayload):
 
 class ActionEnvelopePayload(_StrictPayload):
     envelope_id: str = Field(min_length=1)
-    plan_index: int = Field(ge=0)
+    plan_index: int | None = Field(default=None, ge=0)
+    tool_call_id: str | None = Field(default=None, min_length=1)
     tool: str = Field(min_length=1)
     exact_params: dict[str, Any]
     envelope_sha256: str
+
+    @model_validator(mode="after")
+    def _carries_an_action_identity(self) -> "ActionEnvelopePayload":
+        """One of the two protocol identities must key the envelope.
+
+        Recorded transcripts carry `plan_index` (scheduler protocol); native
+        tool-calling turns carry `tool_call_id`. An identityless envelope
+        cannot be correlated with its `tool_result`, so it is rejected here
+        rather than emitted and lost downstream.
+        """
+        if self.plan_index is None and not self.tool_call_id:
+            raise ValueError("action envelope requires plan_index or tool_call_id")
+        return self
 
 
 class TestCandidatePayload(_StrictPayload):
@@ -474,9 +488,28 @@ class ControlEvent(BaseModel):
         return cast(_StrictPayload, _PAYLOAD_MODELS[self.kind].model_validate(self.payload))
 
 
-def action_envelope_sha256(*, plan_index: int, tool: str, exact_params: Mapping[str, Any]) -> str:
+def action_envelope_sha256(
+    *,
+    plan_index: int | None = None,
+    tool: str,
+    exact_params: Mapping[str, Any],
+    tool_call_id: str | None = None,
+) -> str:
+    """Digest one action envelope under whichever protocol identity keys it.
+
+    `plan_index` wins whenever it is present, so every envelope recorded
+    under the scheduler protocol keeps hashing byte-identically. Native
+    turns have no plan index and substitute `tool_call:<id>` in the slot the
+    plan index occupied.
+    """
+    if plan_index is not None:
+        identity: Any = int(plan_index)
+    elif tool_call_id:
+        identity = f"tool_call:{tool_call_id}"
+    else:
+        raise ValueError("action envelope hash requires plan_index or tool_call_id")
     return canonical_sha256(
-        {"plan_index": int(plan_index), "tool": str(tool), "exact_params": dict(exact_params)}
+        {"plan_index": identity, "tool": str(tool), "exact_params": dict(exact_params)}
     )
 
 
