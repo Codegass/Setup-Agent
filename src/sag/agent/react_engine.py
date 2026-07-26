@@ -61,7 +61,7 @@ from .phase_transitions import (
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
-from .react_types import ReActStep, StepType
+from .react_types import ReActStep, ReactModelMode, StepType
 from .attempt_policy import (
     TestAttemptRequirement,
     TestCandidateResolution,
@@ -390,6 +390,9 @@ class ReActEngine(UIEventEmitter):
         # attempts); the model's own calls come with provider ids.
         self._forced_call_counter = 0
         self._active_native_tool_call_id = None
+
+        # Advisor consult accounting (spec §3.2).
+        self._reset_advisor_run_state()
 
         # State memory for successful operations
         self.successful_states = {
@@ -1562,6 +1565,7 @@ class ReActEngine(UIEventEmitter):
 
         self._phase_iterations = 0
         self.steps_since_context_switch = 0
+        self._reset_advisor_phase_state()
         if not machine.is_complete:
             self._archive_window_steps()
             self.steps = [self._phase_intro_step()]
@@ -2169,6 +2173,7 @@ class ReActEngine(UIEventEmitter):
 
         self.current_iteration = 0
         self._phase_iterations = 0
+        self._reset_advisor_run_state()
         if phase_mode:
             self.steps = [self._phase_intro_step()]
             self._journal_intro_dirty = True
@@ -3060,11 +3065,203 @@ class ReActEngine(UIEventEmitter):
         self._apply_phase_decision(record, route)
         return True
 
+    # ------------------------------------------------------------------
+    # Advisor consult (spec §3.2)
+    # ------------------------------------------------------------------
+
+    _ADVISOR_DISABLED_TEXT = "advisor is disabled for this run — proceed with your best judgment"
+    _ADVISOR_CAP_TEXT = "advisor cap reached for this phase — proceed with your best judgment"
+    _ADVISOR_UNAVAILABLE_TEXT = "advisor unavailable — proceed with your best judgment"
+    _ADVISOR_TRANSCRIPT_HEADER = "PHASE TRANSCRIPT"
+    _ADVISOR_DIGEST_HEADER = "EVIDENCE DIGEST"
+
+    def _reset_advisor_run_state(self) -> None:
+        """Run-scoped advisor state: the telemetry log plus the phase bits."""
+        self._advisor_calls: List[Dict[str, Any]] = []
+        self._reset_advisor_phase_state()
+
+    def _reset_advisor_phase_state(self) -> None:
+        """Per-phase advisor state, reset with the other per-phase counters.
+
+        The cap is per phase, and the two guarantee bits describe "what has
+        happened in THIS phase since the last consult" — carrying either across
+        a transition would redirect a phase for a failure it never saw."""
+        self._advisor_calls_in_phase = 0
+        self._had_failure_since_consult = False
+        self._advisor_redirect_armed = False
+        self._advisor_loop_guidance = ""
+
+    @property
+    def advisor_mode(self) -> str:
+        """"off" | "same-model" | an explicit litellm model name."""
+        return str(getattr(self.config, "advisor_mode", "same-model") or "off").strip() or "off"
+
+    @property
+    def advisor_telemetry(self) -> Dict[str, Any]:
+        """What the run pin records: the mode and one entry per consult."""
+        return {
+            "mode": self.advisor_mode,
+            "calls": [dict(call) for call in getattr(self, "_advisor_calls", ())],
+        }
+
+    def _advisor_enabled(self) -> bool:
+        return self.advisor_mode != "off"
+
+    def _advisor_cap_exhausted(self) -> bool:
+        cap = int(getattr(self.config, "advisor_phase_cap", 4) or 0)
+        return cap <= 0 or int(getattr(self, "_advisor_calls_in_phase", 0)) >= cap
+
+    def _advisor_model(self) -> str:
+        mode = self.advisor_mode
+        if mode != "same-model":
+            return mode
+        return str(self.llm_client.capabilities_for(ReactModelMode.ACTION).model)
+
+    @staticmethod
+    def _advisor_degraded_result(output: str, reason: str) -> ToolResult:
+        """A consult that never reached a provider still answers successfully.
+
+        Both degradations (ablation switch, phase cap) hand back guidance the
+        executor can act on. A failure-shaped result here would invite the model
+        to treat "no advice" as an impediment worth reporting."""
+        return ToolResult.completed_success(output=output, metadata={"advisor": reason})
+
+    def _record_advisor_call(self, *, phase: str, advice_chars: int, outcome: str) -> int:
+        """Count one consult and clear the guarantee bits it satisfies.
+
+        An errored consult counts exactly like an answered one: the executor
+        asked, and a provider outage must not pin it behind a redirect."""
+        self._advisor_calls_in_phase = int(getattr(self, "_advisor_calls_in_phase", 0)) + 1
+        self._had_failure_since_consult = False
+        self._advisor_redirect_armed = False
+        self._advisor_loop_guidance = ""
+        calls = getattr(self, "_advisor_calls", None)
+        if calls is None:
+            calls = self._advisor_calls = []
+        calls.append(
+            {
+                "iteration": int(getattr(self, "current_iteration", 0)),
+                "phase": phase,
+                "advice_chars": int(advice_chars),
+                "outcome": outcome,
+            }
+        )
+        return len(calls)
+
+    def consult_advisor(self) -> ToolResult:
+        """Consult a fresh-context reviewer about the current phase (spec §3.2).
+
+        Never raises and never returns a blocking result: mode "off", an
+        exhausted phase cap and a provider outage all degrade to a
+        success-shaped "proceed with your best judgment". A broken advisor is
+        Plan-2 behavior, not an aborted run."""
+        if not self._advisor_enabled():
+            return self._advisor_degraded_result(self._ADVISOR_DISABLED_TEXT, "off")
+        if self._advisor_cap_exhausted():
+            return self._advisor_degraded_result(self._ADVISOR_CAP_TEXT, "cap")
+
+        phase = str(getattr(getattr(self, "phase_machine", None), "current_phase", "") or "")
+        model = self._advisor_model()
+        try:
+            advice = self.llm_client.get_advisor_response(
+                self._advisor_messages(),
+                model=model,
+                max_tokens=int(getattr(self.config, "advisor_max_tokens", 2048)),
+            )
+        except Exception as exc:
+            self.agent_logger.warning(f"Advisor consult unavailable: {exc}")
+            advice = ""
+        advice_text = str(advice or "").strip()
+        outcome = "advice" if advice_text else "error"
+        index = self._record_advisor_call(
+            phase=phase,
+            advice_chars=len(advice_text),
+            outcome=outcome,
+        )
+        return ToolResult.completed_success(
+            output=advice_text or self._ADVISOR_UNAVAILABLE_TEXT,
+            metadata={
+                "advisor": outcome,
+                "advisor_call_index": index,
+                "advisor_model": model,
+            },
+        )
+
+    def _advisor_messages(self) -> List[Dict[str, str]]:
+        """System reviewer brief + the whole phase transcript and evidence.
+
+        The model chooses WHEN to consult, never WHAT the reviewer sees."""
+        # Prompt: src/sag/config/prompts/react_engine.yaml:274 advisor_system
+        system_brief = self.prompts.get("advisor_system")
+        return [
+            {"role": "system", "content": system_brief},
+            {"role": "user", "content": self._advisor_user_message()},
+        ]
+
+    def _advisor_user_message(self) -> str:
+        sections = [
+            f"{self._ADVISOR_TRANSCRIPT_HEADER}:",
+            self._advisor_transcript_text(),
+            self._advisor_evidence_digest(),
+        ]
+        return "\n".join(section for section in sections if section)
+
+    def _advisor_transcript_text(self) -> str:
+        """The rendered phase window flattened to `<ROLE>: <content>` lines.
+
+        Reusing `render_messages` is the point: the reviewer reads EXACTLY the
+        conversation the executor is working from (same pairing, same clamped
+        tool output), not a second, drifting projection of it."""
+        lines: List[str] = []
+        for message in render_messages("", getattr(self, "steps", None) or []):
+            role = str(message.get("role") or "")
+            if role == "system":
+                continue
+            content = str(message.get("content") or "")
+            calls = message.get("tool_calls") or ()
+            if calls:
+                rendered = "; ".join(
+                    f"{(call.get('function') or {}).get('name') or 'unnamed'}"
+                    f"({(call.get('function') or {}).get('arguments') or '{}'})"
+                    for call in calls
+                )
+                content = f"{content} [tool calls: {rendered}]".strip()
+            lines.append(f"{role.upper()}: {content}")
+        return "\n".join(lines)
+
+    def _advisor_evidence_digest(self) -> str:
+        """The deterministic evidence section: handoff projection, untried
+        islands, and the armed recurrence guidance."""
+        parts: List[str] = []
+        handoff = getattr(self, "phase_handoff", None)
+        if handoff is not None:
+            phase = str(getattr(getattr(self, "phase_machine", None), "current_phase", "") or "all")
+            try:
+                budget = int(getattr(self.config, "phase_handoff_char_budget", 6000))
+                parts.append(handoff.project_for(phase, char_budget=budget).to_prompt_text())
+            except Exception as exc:
+                # A digest gap must not cost the run its advice.
+                self.agent_logger.warning(f"Advisor evidence digest unavailable: {exc}")
+        untried = self._untried_island_targets().strip()
+        if untried:
+            parts.append(untried)
+        guidance = str(getattr(self, "_advisor_loop_guidance", "") or "").strip()
+        if guidance and getattr(self, "_advisor_redirect_armed", False):
+            parts.append(guidance)
+        if not parts:
+            return ""
+        return "\n".join([f"{self._ADVISOR_DIGEST_HEADER}:", *parts])
+
     def _refusal_for_call(self, call: ToolCall) -> ToolExecution | None:
         """The harness refusals that stand in for a real execution.
 
         Shared by both protocols: sealed evidence closes every evidence tool,
         and `report` stays closed until the verdict snapshot exists."""
+        if call.name == "advisor":
+            # The advisor is NEVER refused. `consult_advisor` already answers
+            # every mode, and a refused consult would strand the model behind
+            # the before-giving-up guarantee once evidence seals.
+            return None
         if self._evidence_execution_closed(call):
             return self._refused_closed_evidence_execution(call)
         if call.name == "report" and not self._report_execution_allowed():

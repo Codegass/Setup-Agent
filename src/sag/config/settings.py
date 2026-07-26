@@ -103,6 +103,17 @@ class Config(BaseModel):
     dispatch_soft_timeout_seconds: int = Field(default=900)
     dispatch_poll_interval_seconds: int = Field(default=15)
 
+    # Advisor (spec §3.2). "off" is the ablation switch §3.7.6 requires: it
+    # disables the consult AND every mechanical guarantee, degrading the run to
+    # Plan-2 behavior. "same-model" consults the action model with a fresh
+    # context; any other value is used verbatim as a litellm model name.
+    advisor_mode: str = Field(default="same-model")
+    # Hard output cap on one consult. Advice is strategy, not a transcript.
+    advisor_max_tokens: int = Field(default=2048)
+    # Consults allowed per phase; once exhausted the advisor answers "proceed
+    # with your best judgment" and the guarantees go inert (never a dead-lock).
+    advisor_phase_cap: int = Field(default=4)
+
     # Validation / verdict policy
     # Minimum test pass rate (fraction, 0-1) for a build-green run to be a SUCCESS.
     test_pass_threshold: float = Field(default=DEFAULT_TEST_PASS_THRESHOLD)
@@ -166,6 +177,9 @@ class Config(BaseModel):
             dispatch_poll_interval_seconds=int(
                 os.getenv("SAG_DISPATCH_POLL_INTERVAL_SECONDS", "15")
             ),
+            advisor_mode=os.getenv("SAG_ADVISOR_MODE", "same-model"),
+            advisor_max_tokens=int(os.getenv("SAG_ADVISOR_MAX_TOKENS", "2048")),
+            advisor_phase_cap=int(os.getenv("SAG_ADVISOR_PHASE_CAP", "4")),
             test_pass_threshold=float(
                 os.getenv("SAG_TEST_PASS_THRESHOLD", str(DEFAULT_TEST_PASS_THRESHOLD))
             ),

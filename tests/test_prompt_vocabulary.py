@@ -170,11 +170,17 @@ SETUP_FORBIDDEN_CEREMONY = (
 
 def _prompt_sections():
     data = yaml.safe_load(YAML_PATH.read_text())
-    return {
-        f"{group}.{name}": text
-        for group, sections in data.items()
-        for name, text in sections.items()
-    }
+    sections = {}
+    for group, value in data.items():
+        # Not every prompt belongs to a section group: `advisor_system` is a
+        # top-level brief for a different consumer (the advisor consult, not
+        # the executor's system prompt). It still faces the sweep below.
+        if isinstance(value, str):
+            sections[f"{group}.{group}"] = value
+            continue
+        for name, text in value.items():
+            sections[f"{group}.{name}"] = text
+    return sections
 
 
 def test_setup_yaml_sections_drop_task_ceremony():

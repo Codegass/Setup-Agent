@@ -185,6 +185,10 @@ class RunPin(BaseModel):
     random_seed_or_null: int | None
     dependency_cache_state: str = Field(min_length=1)
     host_arch: str = Field(min_length=1)
+    # Advisor telemetry for the run: {"mode", "calls": [...]} (spec §3.2).
+    # None on legacy/external pins built before the advisor existed, so the
+    # ablation comparison can tell "no advisor" from "advisor consulted 0×".
+    advisor: dict[str, Any] | None = None
 
     @field_validator("target_repo_sha", "sag_git_sha")
     @classmethod
