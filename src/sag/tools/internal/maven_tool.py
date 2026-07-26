@@ -969,24 +969,26 @@ class MavenTool(BaseTool):
         if pom_file:
             cmd_parts.extend(["-f", pom_file])
 
-        # Add command and goals
-        # Handle both string and list types for command
+        # Add command and goals as real argv tokens
         if isinstance(command, list):
-            command = " ".join(command)
-
-        if goals:
-            cmd_parts.append(f"{command} {goals}")
+            cmd_parts.extend(str(part) for part in command)
         else:
-            cmd_parts.append(command)
+            cmd_parts.extend(shlex.split(str(command or "")))
+        if goals:
+            cmd_parts.extend(shlex.split(str(goals)))
 
         # Extra args appended verbatim after main command
         if extra_args:
             if isinstance(extra_args, list):
-                cmd_parts.extend(extra_args)
+                cmd_parts.extend(str(arg) for arg in extra_args)
             else:
                 cmd_parts.extend(shlex.split(extra_args))
 
-        return " ".join(cmd_parts)
+        # Quote every token at the single shell boundary: the detached runner
+        # embeds this string in bash -c. Raw joins let internally generated
+        # arguments containing (), #, ! or commas reach bash unquoted — the
+        # 2026-07-24 bigtop launcher died on exactly that.
+        return " ".join(shlex.quote(part) for part in cmd_parts)
 
     def _resolve_maven_executable(
         self,
