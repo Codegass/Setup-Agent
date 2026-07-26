@@ -342,7 +342,6 @@ def _initial_prompt_with_project_tool():
     return builder.build_initial_system_prompt(
         repository_url="https://example.test/repo.git",
         repository_ref=None,
-        tool_calling_enabled=True,
         workflow_mode="setup",
     )
 

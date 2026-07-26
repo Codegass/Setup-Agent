@@ -274,7 +274,7 @@ class SetupAgent:
             "prompt_bundle_sha256": canonical_sha256(prompt_bundle),
             "feature_flags": {
                 "control_events": True,
-                "reasoning_scheduler": True,
+                "native_loop": True,
                 "phase_machine": self.phase_machine is not None,
             },
             "random_seed_or_null": random_seed,

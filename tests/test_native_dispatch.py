@@ -83,8 +83,6 @@ def native_engine():
         engine.emit = lambda *a, **k: None
         # No scheduler and no sealed evidence: the real refusal guards run and
         # decline to refuse, so calls reach the scripted executor.
-        engine._scheduler_active = False
-        engine.reasoning_scheduler = None
         engine.run_evidence_state = None
         engine.phase_machine = None
         engine.loop_memory = None

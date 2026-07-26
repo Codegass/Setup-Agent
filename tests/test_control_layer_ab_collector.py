@@ -431,7 +431,7 @@ def test_legacy_external_run_pin_is_complete_and_sanitized():
     assert pin.action_model == "action-model"
     assert pin.feature_flags == {
         "control_events": False,
-        "reasoning_scheduler": False,
+        "native_loop": True,
         "phase_machine": False,
     }
     assert pin.sanitized_config == {"max_iterations": 50}

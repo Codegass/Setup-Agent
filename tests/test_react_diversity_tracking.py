@@ -47,9 +47,6 @@ def _engine():
     engine.run_evidence_state = RunEvidenceState(run_id="loop-engine")
     engine.phase_machine = PhaseMachine(start_phase="build")
     engine.current_iteration = 1
-    engine._force_thinking_next = False
-    engine._force_thinking_after_success = False
-    engine.prompt_builder = SimpleNamespace(invalidate_trunk_cache=lambda: None)
     engine.context_manager = SimpleNamespace()
     engine.guidance = []
     engine._add_system_guidance = lambda message, priority=5: engine.guidance.append(
@@ -73,7 +70,10 @@ def test_fourth_unchanged_failure_records_blocker_and_requests_thinking():
         )
 
     assert decision.decision == "force_break"
-    assert engine._force_thinking_next is True
+    # Plan 2 Task 8: LoopMemory's `request_thinking` no longer flips a dual-role
+    # flag; the guidance step below is the whole visible effect until Plan 3
+    # routes it to the advisor.
+    assert decision.request_thinking is True
     assert engine.run_evidence_state.blockers[0].failure_signature.startswith(
         "loop_without_progress:"
     )

@@ -1,7 +1,6 @@
 """Agent package for Setup-Agent."""
 
 from .agent import SetupAgent
-from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
 from .context_manager import (  # BranchContext is DEPRECATED
     BranchContext,
     ContextManager,
@@ -16,7 +15,4 @@ __all__ = [
     "ContextManager",
     "TrunkContext",
     "BranchContext",
-    "AgentStateEvaluator",
-    "AgentStateAnalysis",
-    "AgentStatus",
 ]

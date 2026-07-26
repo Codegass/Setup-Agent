@@ -1230,7 +1230,7 @@ def build_legacy_run_pin(
         prompt_bundle_sha256=prompt_bundle_sha256,
         feature_flags={
             "control_events": False,
-            "reasoning_scheduler": False,
+            "native_loop": True,
             "phase_machine": False,
         },
         random_seed_or_null=random_seed,

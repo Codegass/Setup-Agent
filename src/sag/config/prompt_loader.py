@@ -15,18 +15,13 @@ REACT_ENGINE_REQUIRED_PROMPT_KEYS = (
     "initial_system.intelligent_setup_workflow",
     "initial_system.maven_pom_recovery",
     "initial_system.maven_multimodule_testing",
-    "initial_system.function_calling_response_format",
-    "initial_system.prompt_based_response_format",
+    "initial_system.response_format",
     "initial_system.repository_url_reminder",
     "initial_system.continuous_cycle_reminder",
-    "next_prompt.conversation_header",
-    "next_prompt.omitted_steps_notice",
-    "next_prompt.stuck_function_calling_guidance",
-    "next_prompt.stuck_repository_url_guidance",
-    "next_prompt.stuck_prompt_based_guidance",
-    "next_prompt.continuation",
-    "mode_prompts.thinking",
-    "mode_prompts.action",
+    "initial_system.run_task_context_management",
+    "initial_system.run_task_tool_clarification",
+    "initial_system.run_task_response_format",
+    "initial_system.run_task_completion_reminder",
 )
 
 

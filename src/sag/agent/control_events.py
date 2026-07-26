@@ -21,6 +21,10 @@ from typing import Any, Callable, Literal, Mapping, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CONTROL_EVENT_SCHEMA_VERSION = 2
+# `planner_response` and `scheduler_decision` are HISTORICAL kinds: the engine
+# stopped emitting them when Plan 2 Task 8 deleted the reasoning scheduler and
+# the plan lock. They stay in the schema so transcripts recorded before that
+# still parse and verify (replay reads and skips them).
 CONTROL_EVENT_KINDS = (
     "planner_response",
     "scheduler_decision",

@@ -7,6 +7,7 @@ import sag.tools.base as tool_base_module
 from sag.agent.evidence_state import EvidenceRole, RunEvidenceState
 from sag.agent.phase_machine import PhaseMachine, PhaseTermination
 from sag.agent.react_engine import ReActEngine
+from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
@@ -15,36 +16,29 @@ from sag.tools.base import BaseTool, ToolResult
 
 
 class _PromptBuilder:
-    def invalidate_trunk_cache(self):
-        pass
-
     def build_initial_system_prompt(self, **kwargs):
         return "system prompt"
 
-    def build_mode_prompt(self, prompt, mode, **kwargs):
-        return prompt
-
 
 class _LLMClient:
-    def __init__(self, response="unparseable response", error=None):
-        self.response = response
+    """Scripted native executor: one turn per iteration, or a raise."""
+
+    def __init__(self, turn=None, error=None):
+        self.turn = turn
         self.error = error
 
     def capabilities_for(self, mode):
-        return SimpleNamespace(supports_function_calling=False, model="test-model")
+        return SimpleNamespace(supports_function_calling=True, model="test-model")
 
-    def get_response(self, prompt, mode):
+    def get_native_turn(self, messages, **kwargs):
         if self.error is not None:
             raise self.error
-        return self.response
+        if self.turn is not None:
+            return self.turn
+        return NativeTurn(text="still thinking", tool_calls=(), model_used="test-model")
 
 
-class _ResponseParser:
-    def parse(self, response, **kwargs):
-        return []
-
-
-def _engine(*, response="unparseable response", error=None, wall_clock_cap=0):
+def _engine(*, turn=None, error=None, wall_clock_cap=0):
     engine = ReActEngine.__new__(ReActEngine)
     engine.max_iterations = 3
     engine.phase_machine = PhaseMachine()
@@ -58,14 +52,14 @@ def _engine(*, response="unparseable response", error=None, wall_clock_cap=0):
     engine.prompt_builder = _PromptBuilder()
     engine.repository_url = "https://example.test/repo.git"
     engine.repository_ref = None
-    engine.llm_client = _LLMClient(response=response, error=error)
-    engine.state_evaluator = SimpleNamespace(completion_mode="previous")
+    engine.llm_client = _LLMClient(turn=turn, error=error)
     engine.token_tracker = SimpleNamespace(set_iteration=lambda iteration: None)
-    engine.response_parser = _ResponseParser()
+    engine._get_timestamp = lambda: "2026-07-26 00:00:00"
+    engine.context_journal = None
+    engine.steps_since_context_switch = 0
     engine._phase_intro_step = lambda: SimpleNamespace(content="phase intro")
     engine._start_phase_branch = lambda: None
     engine._enforce_phase_floors = lambda: False
-    engine._should_use_thinking_model = lambda: True
     engine._export_token_usage_csv = lambda: None
     return engine
 
@@ -91,17 +85,19 @@ def test_setup_wall_clock_exhaustion_records_abort_without_advancing(monkeypatch
     _assert_setup_abort(engine, "wall clock cap exceeded")
 
 
-def test_setup_empty_llm_response_records_abort_without_advancing():
-    engine = _engine(response="")
+def test_setup_provider_failure_records_abort_naming_the_cause():
+    """`get_native_turn` raises instead of returning None, so the abort reason
+    carries the provider error rather than a bare 'unavailable'."""
+    engine = _engine(error=RuntimeError("LLM transport failed"))
 
     termination = engine.run_setup_loop("set up project", max_iterations=3)
 
     assert termination.termination is RunTerminationStatus.ABORTED
-    _assert_setup_abort(engine, "LLM response unavailable")
+    _assert_setup_abort(engine, "LLM response unavailable: LLM transport failed")
 
 
 def test_setup_iteration_exhaustion_records_abort_without_advancing():
-    engine = _engine(response="unparseable response")
+    engine = _engine()
 
     termination = engine.run_setup_loop("set up project", max_iterations=2)
 
@@ -111,7 +107,12 @@ def test_setup_iteration_exhaustion_records_abort_without_advancing():
 
 
 def test_setup_engine_exception_records_abort_without_advancing():
-    engine = _engine(error=RuntimeError("LLM transport failed"))
+    engine = _engine()
+
+    def explode():
+        raise RuntimeError("floor probe failed")
+
+    engine._enforce_phase_floors = explode
 
     termination = engine.run_setup_loop("set up project", max_iterations=3)
 
@@ -148,27 +149,29 @@ def test_construction_persistence_failure_is_audited_before_setup_abort():
             return None
 
     storage = TotalFailureStorage()
-    engine = _engine(response="build action")
+    engine = _engine(
+        turn=NativeTurn(
+            text="compiling",
+            tool_calls=(
+                NativeToolCall(
+                    id="call_build_1",
+                    name="build",
+                    arguments={"action": "compile"},
+                    raw_arguments='{"action": "compile"}',
+                ),
+            ),
+            model_used="test-model",
+        )
+    )
     engine.config = SimpleNamespace(max_wall_clock_seconds=0, verbose=False)
     engine.context_manager = SimpleNamespace(current_task_id=None)
+    engine.control_event_sink = None
     engine.emit = lambda *args, **kwargs: None
     engine.token_tracker = SimpleNamespace(
         set_iteration=lambda iteration: None,
         update_last_tool_name=lambda tool_name: None,
     )
-    engine._should_use_thinking_model = lambda: False
-    engine.response_parser = SimpleNamespace(
-        parse=lambda *args, **kwargs: [
-            ReActStep(
-                step_type=StepType.ACTION,
-                content="compile",
-                tool_name="build",
-                tool_params={"action": "compile"},
-                timestamp="ts",
-                model_used="test-model",
-            )
-        ]
-    )
+    engine._add_observation_step = lambda observation: None
     orchestrator = ToolOrchestrator(
         tools={"build": FailedConstructionTool()},
         context_manager=engine.context_manager,
@@ -207,18 +210,18 @@ def test_construction_persistence_failure_is_audited_before_setup_abort():
 
 
 def test_setup_duplicate_cleanup_keeps_first_abort_record():
-    engine = _engine(response="")
+    engine = _engine(error=RuntimeError("LLM transport failed"))
     engine.run_setup_loop("set up project", max_iterations=3)
     first_record = engine.phase_machine.records[0]
 
     engine._record_setup_abort(True, "duplicate cleanup")
 
     assert engine.phase_machine.records == (first_record,)
-    _assert_setup_abort(engine, "LLM response unavailable")
+    _assert_setup_abort(engine, "LLM response unavailable: LLM transport failed")
 
 
 def test_run_task_abnormal_exit_does_not_record_setup_abort():
-    engine = _engine(response="")
+    engine = _engine(error=RuntimeError("LLM transport failed"))
 
     succeeded = engine.run_react_loop(
         "perform one task",

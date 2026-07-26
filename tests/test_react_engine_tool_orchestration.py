@@ -1,3 +1,4 @@
+from engine_driver import execute_action_steps
 from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
@@ -378,7 +379,7 @@ def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypa
 
     monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
 
-    assert engine._execute_steps([step]) is True
+    assert execute_action_steps(engine, [step]) is None
     assert engine.seen_call.name == "example"
     assert engine.seen_call.raw_params == {"command": "pwd"}
     assert step.tool_result is result
@@ -386,7 +387,6 @@ def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypa
         s.step_type == StepType.OBSERVATION and s.content == "formatted observation"
         for s in engine.steps
     )
-    assert engine._force_thinking_after_success is True
 
 
 def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
@@ -420,7 +420,7 @@ def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
 
     monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
 
-    assert engine._execute_steps([step]) is True
+    assert execute_action_steps(engine, [step]) is None
 
     assert context.entries[0][0] == "phase_build"
     entry = context.entries[0][1]
@@ -468,7 +468,7 @@ def test_execute_steps_persists_short_failed_output_ref_in_branch_history(
         lambda: type("Orchestrator", (), {"execute": lambda self, call: execution})(),
     )
 
-    assert engine._execute_steps([step]) is True
+    assert execute_action_steps(engine, [step]) is None
 
     entry = context.load_branch_history("phase_build").history[0]
     assert result.output_ref in entry["output_refs"]
@@ -509,7 +509,7 @@ def test_execute_steps_records_action_even_if_tool_clears_current_task(monkeypat
 
     monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
 
-    assert engine._execute_steps([step]) is True
+    assert execute_action_steps(engine, [step]) is None
 
     assert context.entries[0][0] == "phase_build"
     entry = context.entries[0][1]
@@ -534,81 +534,11 @@ def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator(
         model_used="model",
     )
 
-    assert engine._execute_steps([step]) is True
+    assert execute_action_steps(engine, [step]) is None
 
     observation_events = [event for event in emitted if event[0][0] == EventType.AGENT_OBSERVATION]
     assert len(observation_events) == 1
     assert "echo executed successfully" in observation_events[0][1]["message"]
-
-
-def test_execute_steps_forces_thinking_after_partial_assessment_without_success(monkeypatch):
-    result = ToolResult.completed_failure(
-        evidence_assessment=EvidenceAssessment.PARTIAL, output="needs review"
-    )
-    step = ReActStep(
-        step_type=StepType.ACTION,
-        content="ACTION: example",
-        tool_name="example",
-        tool_params={"command": "pwd"},
-        timestamp="ts",
-        model_used="model",
-    )
-    execution = ToolExecution(
-        call=ToolCall(name="example", raw_params={"command": "pwd"}),
-        result=result,
-        status="recovery_attempted",
-        raw_params={"command": "pwd"},
-        validated_params={"command": "pwd"},
-        executed_params={"command": "pwd"},
-        observation_text="formatted observation",
-        attempted_execution=True,
-    )
-    engine = _engine_with_context()
-    engine.tools = {}
-
-    class FakeOrchestrator:
-        def execute(self, call):
-            engine.seen_call = call
-            return execution
-
-    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
-
-    assert engine._execute_steps([step]) is True
-    assert engine._force_thinking_after_success is True
-
-
-def test_execute_steps_forces_thinking_after_string_partial_assessment(monkeypatch):
-    result = ToolResult.completed_failure(evidence_assessment="partial", output="needs review")
-    step = ReActStep(
-        step_type=StepType.ACTION,
-        content="ACTION: example",
-        tool_name="example",
-        tool_params={"command": "pwd"},
-        timestamp="ts",
-        model_used="model",
-    )
-    execution = ToolExecution(
-        call=ToolCall(name="example", raw_params={"command": "pwd"}),
-        result=result,
-        status="recovery_attempted",
-        raw_params={"command": "pwd"},
-        validated_params={"command": "pwd"},
-        executed_params={"command": "pwd"},
-        observation_text="formatted observation",
-        attempted_execution=True,
-    )
-    engine = _engine_with_context()
-    engine.tools = {}
-
-    class FakeOrchestrator:
-        def execute(self, call):
-            engine.seen_call = call
-            return execution
-
-    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
-
-    assert engine._execute_steps([step]) is True
-    assert engine._force_thinking_after_success is True
 
 
 def test_apply_tool_execution_loop_effects_ignores_legacy_force_next_task():
@@ -628,9 +558,9 @@ def test_apply_tool_execution_loop_effects_ignores_legacy_force_next_task():
 
     engine._apply_tool_execution_loop_effects(execution)
 
-    assert engine._force_thinking_next is True
-    assert engine.prompt_builder._cached_trunk_context is None
-    assert engine.prompt_builder._trunk_context_cache_timestamp is None
+    # Plan 2 Task 8: `force_thinking_next` and the flat-prompt trunk cache both
+    # died with the dual-role protocol; the legacy force_next_task hook stays
+    # unreachable.
     assert context.force_next_task_calls == 0
 
 
@@ -647,3 +577,6 @@ def test_apply_tool_execution_loop_effects_skips_unavailable_force_next_task():
     engine._apply_tool_execution_loop_effects(execution)
 
     assert engine._force_thinking_next is False
+
+
+# Plan 2 Task 8: old protocol removed

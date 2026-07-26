@@ -1,3 +1,4 @@
+from engine_driver import execute_action_steps
 import ast
 import os
 import shutil
@@ -191,7 +192,7 @@ def test_build_facade_recovery_persistence_error_keeps_original_and_draft(tmp_pa
     _prepare_action_execution(engine)
 
     with pytest.raises(OutputPersistenceError) as raised:
-        engine._execute_steps(
+        execute_action_steps(engine, 
             [_action_step("build", {"action": "test", "working_directory": "/workspace/bad"})]
         )
 

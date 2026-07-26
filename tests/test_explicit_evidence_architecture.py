@@ -1,3 +1,4 @@
+from engine_driver import execute_action_steps
 from types import SimpleNamespace
 
 import pytest
@@ -192,7 +193,7 @@ def test_facade_jdk_retry_preserves_two_maven_actual_executions(tmp_path, monkey
 
     engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=lambda ignored: execution)
     _prepare_action_execution(engine)
-    engine._execute_steps(
+    execute_action_steps(engine, 
         [_action_step("build", {"action": "compile", "working_directory": "/workspace/proj"})]
     )
 
@@ -265,7 +266,7 @@ def test_java_repetition_is_observed_without_hidden_system_actions(tmp_path):
     engine._get_tool_orchestrator = lambda: orchestrator
     _prepare_action_execution(engine)
 
-    engine._execute_steps([_action_step("bash", {"command": command})])
+    execute_action_steps(engine, [_action_step("bash", {"command": command})])
 
     assert bash.calls == 1
     assert system.calls == []
@@ -355,7 +356,7 @@ def test_construction_persistence_failure_ingests_bounded_draft_once(
     _prepare_action_execution(engine)
 
     with pytest.raises(OutputPersistenceError) as raised:
-        engine._execute_steps([_action_step(tool_name, params)])
+        execute_action_steps(engine, [_action_step(tool_name, params)])
 
     draft = getattr(raised.value, "draft", None)
     assert draft is not None

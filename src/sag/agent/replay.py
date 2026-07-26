@@ -1,4 +1,10 @@
-"""Deterministic control-layer replay over production policy components."""
+"""Deterministic control-layer replay over production policy components.
+
+Plan 2 Task 8 deleted the reasoning scheduler, so replay no longer re-executes
+it. `scheduler_decision` and `planner_response` rows in transcripts recorded
+before Plan 2 are historical: they are read, counted, and skipped. Task 9
+replaces the scheduler-shaped verification with the native tool_call contract.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,6 @@ from typing import Any, Callable, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult, bind_tool_result_output_storage
 
 from .control_events import (
@@ -28,7 +33,6 @@ from .attempt_policy import (
     required_test_attempt,
     terminal_test_receipts,
 )
-from .current_plan import CurrentPlan
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
 from .phase_gates import ValidatorState, validate_phase_claim
@@ -37,12 +41,6 @@ from .phase_transitions import (
     PhaseTransitionPolicy,
     RepairBudgets,
     RepairRequest,
-)
-from .reasoning_scheduler import (
-    ReasoningScheduler,
-    ReasoningTrigger,
-    SchedulerMode,
-    SchedulerTurn,
 )
 from .verdict_finalizer import (
     EvidenceCloseReason,
@@ -233,7 +231,7 @@ class _ReplayVerdictOrchestrator:
 
 
 class ControlReplayRunner:
-    """Consume recorded inputs through the shipped scheduler/gates/policy/finalizer."""
+    """Consume recorded inputs through the shipped gates/policy/finalizer."""
 
     def __init__(
         self,
@@ -262,10 +260,6 @@ class ControlReplayRunner:
         transcript = ReplayTranscript.read(path)
         header = transcript.header
         initial = header.initial_state
-        scheduler = ReasoningScheduler(
-            available_tools=initial.available_tools,
-            heartbeat_actions=initial.heartbeat_actions,
-        )
         machine = PhaseMachine(start_phase=initial.start_phase)
         state = RunEvidenceState(run_id=header.run_id)
         for fact in initial.facts:
@@ -288,7 +282,6 @@ class ControlReplayRunner:
         finalizer = VerdictFinalizer(verdict_orchestrator)
 
         active_envelope: dict[str, Any] | None = None
-        pending_scheduler_turn: SchedulerTurn | None = None
         pending_record: PhaseAttemptRecord | None = None
         produced: list[dict[str, Any]] = []
         loop_decisions: list[LoopDecision] = []
@@ -302,73 +295,21 @@ class ControlReplayRunner:
             payload = event.payload
             try:
                 if event.kind == "scheduler_decision":
-                    if pending_scheduler_turn is not None:
-                        if pending_scheduler_turn.mode is not SchedulerMode.ACTION:
-                            raise ReplayValidationError(
-                                "scheduler decision replaced an unconsumed thinking turn"
-                            )
-                        # A live actor mismatch has no executable envelope. The
-                        # following scheduler decision is sufficient evidence
-                        # that production invalidated the outstanding action.
-                        scheduler.validate_actor_action(None, None)
-                        pending_scheduler_turn = None
-                    turn = scheduler.next_turn()
-                    expected_mode = SchedulerMode(payload["mode"])
-                    if turn.mode is not expected_mode:
-                        raise ReplayMismatchError(
-                            f"scheduler mode mismatch: {turn.mode.value} != {expected_mode.value}"
-                        )
-                    reasons = tuple(reason.value for reason in turn.reasons)
-                    if reasons != tuple(payload["reasons"]):
-                        raise ReplayMismatchError(
-                            f"scheduler reasons mismatch: {reasons!r} != {payload['reasons']!r}"
-                        )
-                    actual_plan_index = turn.step.plan_index if turn.step is not None else None
-                    if actual_plan_index != payload.get("plan_index"):
-                        raise ReplayMismatchError("scheduler plan index differs from transcript")
-                    pending_scheduler_turn = turn
+                    # Historical (pre-Plan-2) row: the scheduler it recorded no
+                    # longer exists, so there is nothing to re-execute.
+                    pass
                 elif event.kind == "planner_response":
-                    if not scheduler.awaiting_plan:
-                        raise ReplayValidationError("planner response arrived without a think turn")
-                    if (
-                        pending_scheduler_turn is not None
-                        and pending_scheduler_turn.mode is not SchedulerMode.THINK
-                    ):
-                        raise ReplayValidationError("planner response consumed an action turn")
-                    plan_payload = dict(payload["plan"])
-                    if plan_payload.get("rejected") is True:
-                        scheduler.reject_plan(str(plan_payload.get("code") or "malformed_plan"))
-                    else:
-                        plan = CurrentPlan.model_validate(plan_payload)
-                        if canonical_sha256(plan_payload) != payload["response_sha256"]:
-                            raise ReplayValidationError("planner response hash mismatch")
-                        scheduler.accept_plan(plan)
-                    pending_scheduler_turn = None
+                    # Historical (pre-Plan-2) row; counted for reporting only.
                     planner_response_count += 1
                 elif event.kind == "action_envelope":
-                    turn = pending_scheduler_turn or scheduler.next_turn()
-                    pending_scheduler_turn = None
-                    if turn.mode is not SchedulerMode.ACTION or turn.step is None:
-                        raise ReplayValidationError(
-                            "action envelope is impossible in scheduler state"
-                        )
                     calculated_hash = action_envelope_sha256(
-                        plan_index=payload["plan_index"],
+                        plan_index=payload.get("plan_index"),
+                        tool_call_id=payload.get("tool_call_id"),
                         tool=payload["tool"],
                         exact_params=payload["exact_params"],
                     )
                     if calculated_hash != payload["envelope_sha256"]:
                         raise ReplayValidationError("action envelope hash mismatch")
-                    if (
-                        turn.step.plan_index != payload["plan_index"]
-                        or turn.step.tool != payload["tool"]
-                    ):
-                        raise ReplayMismatchError("recorded envelope differs from scheduled action")
-                    if not scheduler.validate_actor_action(
-                        turn.step.tool,
-                        turn.step.exact_params,
-                    ):
-                        raise ReplayMismatchError("production scheduler rejected recorded envelope")
                     active_envelope = dict(payload)
                     active_envelope["_harness_forced"] = False
                     envelope_count += 1
@@ -482,8 +423,6 @@ class ControlReplayRunner:
                         )
                     with bind_tool_result_output_storage(output_storage):
                         result = ToolResult.model_validate(result_payload)
-                    if not forced_result:
-                        scheduler.observe_result(result)
                     actual_executions = tuple(payload.get("actual_executions") or ())
                     facade_only_forced_build = bool(
                         forced_result
@@ -547,12 +486,6 @@ class ControlReplayRunner:
                                 "facade-only forced build is allowed only for a "
                                 "complete terminal no-runner control receipt"
                             )
-                    if forced_result:
-                        # Live forced actions invalidate any remaining model plan
-                        # after their observation. Reproduce that scheduler
-                        # transition so the next recorded THINK reasons remain
-                        # deterministic.
-                        scheduler.request_reasoning(ReasoningTrigger.PLAN_EXHAUSTED)
                     active_envelope = None
                 elif event.kind == "validator_observation":
                     evidence_ref = next(iter(payload["evidence_refs"]), None)
@@ -659,7 +592,6 @@ class ControlReplayRunner:
                     if gate.validated_outcome.value != payload["expected_outcome"]:
                         raise ReplayMismatchError("gate outcome differs from transcript")
                     if not gate.accepted:
-                        scheduler.request_reasoning(ReasoningTrigger.GATE_REJECTION)
                         pending_record = None
                     else:
                         for key, value in gate.validated_facts.items():
@@ -723,7 +655,6 @@ class ControlReplayRunner:
                     appended = machine.apply(decision)
                     for record in appended:
                         state.record_phase_record(record)
-                    scheduler.request_reasoning(ReasoningTrigger.PHASE_CHANGE)
                     pending_record = None
                 elif event.kind == "loop_decision":
                     event_payload = dict(payload["event"])
@@ -743,15 +674,9 @@ class ControlReplayRunner:
                         raise ReplayMismatchError(
                             "loop decision differs from production LoopMemory"
                         )
-                    if decision.request_thinking:
-                        scheduler.request_reasoning(ReasoningTrigger.LOOP_BREAKER)
                     loop_decisions.append(decision)
                 elif event.kind == "evidence_close":
-                    if (
-                        active_envelope is not None
-                        or pending_scheduler_turn is not None
-                        or pending_record is not None
-                    ):
+                    if active_envelope is not None or pending_record is not None:
                         raise ReplayValidationError("evidence closed with unconsumed control state")
                     state.seal(
                         finalized_at=header.finalized_at,
@@ -779,7 +704,6 @@ class ControlReplayRunner:
             name
             for name, present in (
                 ("active_envelope", active_envelope is not None),
-                ("pending_scheduler_turn", pending_scheduler_turn is not None),
                 ("pending_phase_record", pending_record is not None),
             )
             if present

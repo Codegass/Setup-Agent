@@ -16,9 +16,7 @@ from sag.agent.control_events import (
     forced_action_sha256,
     sanitize_config,
 )
-from sag.agent.current_plan import CurrentPlan
 from sag.agent.react_engine import ReActEngine
-from sag.agent.reasoning_scheduler import ReasoningScheduler
 from sag.agent.replay import ControlReplayRunner, ReplayValidationError
 from sag.config.logger import SessionLogger
 from sag.config.prompt_loader import PromptConfig
@@ -827,37 +825,21 @@ def test_session_logger_control_sink_appends_host_and_mirror(tmp_path):
     assert mirrored == [(tmp_path / "control_events.jsonl").read_text(encoding="utf-8")]
 
 
-def test_live_engine_emits_scheduler_envelope_and_redacted_result(tmp_path):
+# Plan 2 Task 8: old protocol removed — the live envelope is keyed by the
+# native tool_call id, not by a scheduler plan index.
+def test_live_engine_emits_native_envelope_and_redacted_result(tmp_path):
     sink = ControlEventSink(
         tmp_path / "control_events.jsonl",
         clock=lambda: "2026-07-17T12:00:00Z",
         id_factory=lambda sequence: f"live-{sequence}",
     )
     params = {"action": "build", "working_directory": "/workspace/demo"}
-    plan = CurrentPlan.model_validate(
-        {
-            "steps": [
-                {
-                    "tool": "build",
-                    "exact_params": params,
-                    "preconditions": [],
-                    "expected_evidence": ["compiled artifacts"],
-                    "success_criteria": ["build succeeds"],
-                }
-            ]
-        }
-    )
     engine = object.__new__(ReActEngine)
     engine.control_event_sink = sink
-    engine.reasoning_scheduler = ReasoningScheduler(available_tools=["build"])
-    engine._scheduler_active = True
-    engine._scheduled_turn = None
     engine.phase_machine = None
+    engine.steps = []
+    engine._active_native_tool_call_id = "call_build_1"
 
-    assert engine._should_use_thinking_model() is True
-    engine.reasoning_scheduler.accept_plan(plan)
-    engine._emit_control_planner_response(plan)
-    assert engine._should_use_thinking_model() is False
     envelope_id = engine._emit_control_action_envelope("build", params)
     result = ToolResult(
         invocation_status=InvocationStatus.COMPLETED,
@@ -880,13 +862,10 @@ def test_live_engine_emits_scheduler_envelope_and_redacted_result(tmp_path):
 
     text = (tmp_path / "control_events.jsonl").read_text(encoding="utf-8")
     events = [ControlEvent.model_validate_json(line) for line in text.splitlines()]
-    assert [event.kind for event in events] == [
-        "scheduler_decision",
-        "planner_response",
-        "scheduler_decision",
-        "action_envelope",
-        "tool_result",
-    ]
+    assert [event.kind for event in events] == ["action_envelope", "tool_result"]
+    assert events[0].payload["tool_call_id"] == "call_build_1"
+    assert "plan_index" not in events[0].payload
+    assert events[-1].payload["envelope_id"] == envelope_id
     assert events[-1].payload["result"]["output"] == "stored as output_live_build"
     assert events[-1].payload["result"]["facts"] == {"compiled_classes": 41}
     assert "secret build output" not in text
