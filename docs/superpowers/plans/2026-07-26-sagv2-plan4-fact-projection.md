@@ -182,6 +182,21 @@ commit `git commit -m "feat: build closure names untried surveyed islands before
 
 ### Task 5: Consult-at-entry replaces the before-acting redirect
 
+> **BINDING NOTES FROM STAGE A (+ reviewer fix):**
+> 1. Every pytest attempt's metadata now carries `collection_scope`,
+>    `collected`, `collected_after_deselection`, `selection_mode`,
+>    `executed`, `collection_errors`, `native_bounded`,
+>    `smoke_receipt_present`, `native_ready_probe` — and the model-visible
+>    output line is exactly
+>    `Collection: {scope} — {collected} collected, {selected} selected, {executed} executed, {collection_errors} collection errors`
+>    (None renders as `unknown`). Use these exact keys for the digest line.
+> 2. Sealed verdict now carries `collection_errors`/`collection_errors_skipped`/
+>    `collection_error_summary` on `test_stats` (absent keys when
+>    unobserved — byte-compat).
+> 3. New rejection contract available to the digest: `ISLAND_ATTEMPT_REQUIRED`
+>    with metadata `untried_island_roots`/`untried_island_systems`.
+> 4. Post-Stage-A baseline: 2,588 passed / 1 skipped (env ±1 skip).
+
 **Files:**
 - Modify: `src/sag/agent/react_engine.py` (guarantee 1 mechanism; `_advisor_evidence_digest` :3232), `docs/superpowers/specs/2026-07-25-advisor-mode-harness-redesign.md` (§3.2 guarantee 3a amendment)
 - Test: `tests/test_consult_at_entry.py` (new); update `tests/test_advisor_guarantees.py` and `tests/test_advisor_engine_flow.py` expectations
