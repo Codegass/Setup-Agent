@@ -178,7 +178,7 @@ def test_receipt_for_another_project_root_does_not_unlock_this_one():
                 {
                     "project_root": "/workspace/other",
                     "candidate": TVM_SMOKE_PATH,
-                    "stats": {"executed": 3},
+                    "stats": {"executed": 3, "passed": 3},
                     "attempt": 1,
                 }
             ),
@@ -207,7 +207,7 @@ def test_bare_test_with_receipt_runs_the_full_suite():
                 {
                     "project_root": TVM_ROOT,
                     "candidate": TVM_SMOKE_PATH,
-                    "stats": {"executed": 3},
+                    "stats": {"executed": 3, "passed": 3},
                     "attempt": 1,
                 }
             ),
@@ -268,7 +268,7 @@ def test_explicit_args_with_receipt_use_the_plain_allowlist():
                 {
                     "project_root": TVM_ROOT,
                     "candidate": TVM_SMOKE_PATH,
-                    "stats": {"executed": 3},
+                    "stats": {"executed": 3, "passed": 3},
                     "attempt": 1,
                 }
             ),
@@ -322,7 +322,7 @@ def test_output_text_carries_the_collection_line_for_a_full_suite():
                 {
                     "project_root": TVM_ROOT,
                     "candidate": TVM_SMOKE_PATH,
-                    "stats": {"executed": 3},
+                    "stats": {"executed": 3, "passed": 3},
                     "attempt": 1,
                 }
             ),

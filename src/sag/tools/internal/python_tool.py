@@ -1376,7 +1376,10 @@ class PythonTool(BaseTool):
         }
         # Capability receipt: a bounded smoke that actually executed tests
         # cleanly is the ONLY thing that unlocks a later full collect.
-        if (
+        smoke_failed = int(junit_counts.get("failed_tests") or 0)
+        smoke_errors = int(junit_counts.get("error_tests") or 0)
+        smoke_skipped = int(junit_counts.get("skipped_tests") or 0)
+        smoke_clean = (
             native_bounded
             and collection_scope == "filtered"
             and native_smoke is not None
@@ -1384,22 +1387,35 @@ class PythonTool(BaseTool):
             and isinstance(executed, int)
             and executed >= 1
             and collection_errors == 0
-            and int(junit_counts.get("failed_tests") or 0) == 0
-            and int(junit_counts.get("error_tests") or 0) == 0
-        ):
+            and smoke_failed == 0
+            and smoke_errors == 0
+        )
+        # P0-E (ground-truth review 2026-07-26): a clean run is not evidence.
+        # The live TVM receipt was minted from 3 selected / 3 skipped, so a
+        # smoke that proved NOTHING unlocked the next full collect. Positive
+        # evidence — at least one non-skipped pass — is now required.
+        smoke_passed = (
+            (executed - smoke_failed - smoke_errors - smoke_skipped)
+            if isinstance(executed, int)
+            else 0
+        )
+        if smoke_clean and smoke_passed >= 1:
             self._write_native_smoke_receipt(
                 project_root=native_project_root,
                 candidate=native_smoke["path"],
                 stats={
                     "executed": executed,
                     "selected": collected_after_deselection,
-                    "failed": int(junit_counts.get("failed_tests") or 0),
-                    "errors": int(junit_counts.get("error_tests") or 0),
-                    "skipped": int(junit_counts.get("skipped_tests") or 0),
+                    "passed": smoke_passed,
+                    "failed": smoke_failed,
+                    "errors": smoke_errors,
+                    "skipped": smoke_skipped,
                 },
                 attempt=attempt_id,
             )
             metadata["smoke_receipt_written"] = True
+        elif smoke_clean:
+            metadata["smoke_capability_unproven"] = True
         if junit_error:
             metadata["junit_extraction"] = {
                 "status": "unavailable",
@@ -1436,6 +1452,12 @@ class PythonTool(BaseTool):
                 collection_errors=collection_errors,
             )
         )
+        if metadata.get("smoke_capability_unproven"):
+            preamble.append(
+                f"[test] bounded smoke: all {executed} selected tests were skipped — "
+                "capability NOT proven; no receipt written; the next bare test call "
+                "remains bounded"
+            )
         tail = self._tail(output)
         if success:
             return self._finish(
@@ -1726,11 +1748,26 @@ class PythonTool(BaseTool):
             f"{rendered(collection_errors)} collection errors"
         )
 
+    def _target_sha(self, project_root: Optional[str]) -> Optional[str]:
+        """The current checkout SHA of `project_root`, or None when unknown."""
+        if not project_root:
+            return None
+        result = self.orchestrator.execute_command(
+            f"git -C {shlex.quote(project_root)} rev-parse HEAD"
+        )
+        if not result.get("success"):
+            return None
+        return ((result.get("output") or "").strip()) or None
+
     def _native_smoke_receipt(self, project_root: Optional[str]) -> Optional[Dict[str, Any]]:
         """The capability receipt for THIS project root, or None.
 
         A receipt from another checkout never unlocks this one, and an
         unreadable/garbled receipt is no receipt — the bounded smoke runs again.
+        P0-E: a receipt without a recorded non-skipped pass proves no
+        capability (the live TVM one recorded 3 executed / 3 skipped), and a
+        receipt bound to a different target SHA was earned on different
+        sources; both are inert. An unverifiable binding is a failed binding.
         """
         if not project_root:
             return None
@@ -1745,6 +1782,12 @@ class PythonTool(BaseTool):
             return None
         if str(payload.get("project_root") or "").rstrip("/") != project_root.rstrip("/"):
             return None
+        stats = payload.get("stats")
+        passed = stats.get("passed") if isinstance(stats, dict) else None
+        if not isinstance(passed, int) or isinstance(passed, bool) or passed < 1:
+            return None
+        if "target_sha" in payload and payload["target_sha"] != self._target_sha(project_root):
+            return None
         return payload
 
     def _write_native_smoke_receipt(
@@ -1755,12 +1798,14 @@ class PythonTool(BaseTool):
         stats: Dict[str, Any],
         attempt: int,
     ) -> None:
+        target_sha = self._target_sha(project_root)
         body = json.dumps(
             {
                 "project_root": (project_root or "").rstrip("/"),
                 "candidate": candidate,
                 "stats": stats,
                 "attempt": attempt,
+                **({"target_sha": target_sha} if target_sha else {}),
             },
             sort_keys=True,
         )
