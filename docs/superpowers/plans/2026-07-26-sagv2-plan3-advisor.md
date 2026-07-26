@@ -143,6 +143,18 @@ evidence gap, not generic commands.
 
 ### Task 4: Advisor client, tool, config, telemetry
 
+> **BINDING NOTES FROM STAGE A:**
+> 1. `_add_observation_step(observation, source_tool=None)` now exists; the
+>    native path publishes a transient `self._observation_source_tool` via
+>    set/restore inside `_append_native_observation` (preserves the
+>    one-argument seam six test files patch). Task 5's pre-execution shim
+>    sits ABOVE this and must not interact with it.
+> 2. The build-family constant is the existing class attribute
+>    `ReActEngine._BUILD_EVIDENCE_TOOLS` (frozenset build/maven/gradle/python)
+>    — reuse it, don't mint a new set.
+> 3. Post-Stage-A full-suite baseline: 2,477 passed / 1 skipped (env ±1
+>    skip); measure your own clean baseline.
+
 **Files:**
 - Create: `src/sag/agent/advisor.py`
 - Modify: `src/sag/config/settings.py` (+ `from_env`), `src/sag/agent/react_llm.py` (one method), `src/sag/agent/agent.py` (tool registration ~:417–446 + run-pin ~:243/:292), `src/sag/agent/react_engine.py` (consult callback + telemetry + per-phase counter reset), `src/sag/config/prompts/react_engine.yaml` (advisor system prompt key)
