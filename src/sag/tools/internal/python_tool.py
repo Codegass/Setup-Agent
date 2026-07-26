@@ -46,6 +46,14 @@ from .python_env import (
 # the tests_not_fully_executed gate.
 PYTEST_REPORT_DIR = "/workspace/.setup_agent/pytest-reports"
 COLLECTED_JSON = "/workspace/.setup_agent/pytest_collected.json"
+# Plan 4 Task 1 (audit 2026-07-26): the CAPABILITY receipt. A native project
+# unlocks a full collect only after a bounded smoke actually executed tests on
+# this project root — readiness probes never unlock it.
+NATIVE_SMOKE_RECEIPT_JSON = "/workspace/.setup_agent/native_smoke_receipt.json"
+# Error codes whose attempt executed nothing at all.
+_PYTEST_NOTHING_RAN_CODES = frozenset(
+    {"PYTEST_COLLECTION_ERROR", "PYTEST_NO_TESTS", "PYTEST_USAGE_ERROR", "PYTEST_MISSING"}
+)
 
 # The pip rung a failed poetry/pipenv install falls back to (narrated).
 # Module form (bug #12): plain uv venvs ship no {venv}/bin/pip binary.
@@ -1039,59 +1047,103 @@ class PythonTool(BaseTool):
     ) -> ToolResult:
         python = f"{venv}/bin/python"
         preamble: List[str] = []
-        native_unready = bool(requirements.get("has_native_build")) and not (
-            self._native_project_ready(
-                python=python,
-                working_directory=working_directory,
-                requirements=requirements,
-            )
+        has_native_build = bool(requirements.get("has_native_build"))
+        native_project_root = (
+            str(
+                (requirements.get("survey") or {}).get("project_path")
+                or requirements.get("python_root")
+                or working_directory
+            ).rstrip("/")
+            if has_native_build
+            else None
         )
+        # Plan 4 Task 1 (audit 2026-07-26): the bounded smoke is CAPABILITY-
+        # gated, never readiness-gated. An LLVM-less TVM build satisfied this
+        # probe (surveyed distribution + PEP 610 origin + any native artifact),
+        # `native_unready` went False, and the bare test collected the full
+        # suite — precisely the failure the guard below was written to prevent.
+        # Readiness survives as an informational fact; the ONLY thing that
+        # unlocks a full collect is a capability receipt: a bounded smoke that
+        # actually executed tests on this project root.
+        native_ready_probe = has_native_build and self._native_project_ready(
+            python=python,
+            working_directory=working_directory,
+            requirements=requirements,
+        )
+        smoke_receipt_present = has_native_build and (
+            self._native_smoke_receipt(native_project_root) is not None
+        )
+        native_bounded = has_native_build and not smoke_receipt_present
         native_smoke = (
             self._verified_native_smoke_candidate(
                 working_directory=working_directory,
                 requirements=requirements,
             )
-            if native_unready
+            if native_bounded
             else None
         )
         native_selection_mode: Optional[str] = None
+        # `smoke_receipt_present` is the fact the gate DECIDED on (a receipt
+        # written by this very attempt is reported separately). `native_unready`
+        # keeps its literal meaning — the readiness probe failed — and is no
+        # longer a gate; no consumer may read it as one.
+        gate_metadata: Dict[str, Any] = {
+            "native_ready_probe": bool(native_ready_probe),
+            "smoke_receipt_present": bool(smoke_receipt_present),
+            **({"native_bounded": True} if native_bounded else {}),
+            **({"native_unready": True} if has_native_build and not native_ready_probe else {}),
+        }
 
         # Bug #13 defect 7: allowlist-sanitize the args BEFORE anything runs —
         # 'make test' was pasted verbatim into 'pytest make test' in the live run.
         hints = requirements.get("test_hints") or {}
         raw_args = (args or "").strip()
         if raw_args:
-            native_project_root = (
-                str(
-                    (requirements.get("survey") or {}).get("project_path")
-                    or requirements.get("python_root")
-                    or working_directory
-                ).rstrip("/")
-                if native_unready
-                else None
-            )
             pytest_args, rejection = self._sanitize_pytest_args(
                 raw_args,
                 working_directory,
-                required_project_root=native_project_root,
+                required_project_root=native_project_root if native_bounded else None,
                 required_smoke_boundary=(native_smoke["absolute_path"] if native_smoke else None),
             )
             if rejection:
                 replacement_args = native_smoke["args"] if native_smoke else None
+                # §3.3: name the concrete repair. Without a capability receipt
+                # the only accepted next command IS the surveyed bounded smoke,
+                # so the refusal spells it out instead of hinting at breadth.
+                smoke_first = (
+                    (
+                        "Run the verified bounded smoke first: "
+                        f"build(action='test', args={replacement_args!r}) — the "
+                        "full suite unlocks only after that smoke executes and "
+                        "writes its capability receipt"
+                    )
+                    if native_bounded and replacement_args
+                    else None
+                )
+                rejection_lines = [f"[test] rejected args {raw_args!r} — {rejection}"]
+                if smoke_first and native_smoke:
+                    rejection_lines.append(
+                        f"[test] no native smoke receipt for {native_project_root} — "
+                        f"the bounded smoke {native_smoke['path']} must execute first"
+                    )
                 return ToolResult.completed_failure(
-                    output=f"[test] rejected args {raw_args!r} — {rejection}",
+                    output="\n".join(rejection_lines),
                     error=rejection,
                     error_code="PYTEST_ARGS_REJECTED",
                     failure_signature="pytest_args_rejected:invalid_selector",
                     suggestions=[
                         _PYTEST_USAGE_HINT,
                         *(
-                            [
-                                "Use the verified native smoke instead: "
-                                f"build(action='test', args={replacement_args!r})"
-                            ]
-                            if replacement_args
-                            else []
+                            [smoke_first]
+                            if smoke_first
+                            else (
+                                [
+                                    "Use the verified native smoke instead: "
+                                    f"build(action='test', args={replacement_args!r})"
+                                ]
+                                if replacement_args
+                                else []
+                            )
                         ),
                         "For make targets or shell commands use the bash tool instead",
                     ],
@@ -1099,18 +1151,19 @@ class PythonTool(BaseTool):
                         "operation": "test",
                         "rejected_args": raw_args,
                         **({"replacement_args": replacement_args} if replacement_args else {}),
+                        **gate_metadata,
                     },
                 )
-            if native_unready:
+            if native_bounded:
                 pytest_args = self._bounded_native_pytest_args(pytest_args or "")
                 native_selection_mode = "explicit"
         else:
-            if native_unready:
+            if native_bounded:
                 if native_smoke is None:
                     return ToolResult.completed_failure(
                         output=(
-                            "[test] native core is not ready and the survey has no "
-                            "current, project-owned smoke target"
+                            "[test] this native project has no smoke receipt and the "
+                            "survey has no current, project-owned smoke target"
                         ),
                         error=(
                             "native smoke unavailable — refusing to guess a path or "
@@ -1123,17 +1176,22 @@ class PythonTool(BaseTool):
                         ],
                         metadata={
                             "operation": "test",
-                            "native_unready": True,
                             "selection_mode": "none",
+                            **gate_metadata,
                         },
                     )
                 pytest_args = native_smoke["args"]
                 native_selection_mode = "survey_candidate"
                 preamble.append(
-                    "[test] native core not ready — selected the surveyed, "
+                    "[test] no native smoke receipt yet — selected the surveyed, "
                     "project-owned bounded smoke target"
                 )
             else:
+                if smoke_receipt_present:
+                    preamble.append(
+                        "[test] native smoke receipt present — the bounded smoke "
+                        "already executed, so the full suite is unlocked"
+                    )
                 pytest_args = (hints.get("pytest_args") or "").strip()
 
         # Bug #13 defect 5: pytest bootstrap — ensure pytest is importable in
@@ -1173,7 +1231,7 @@ class PythonTool(BaseTool):
             selected=collected_after_deselection,
         )
 
-        if native_unready and (
+        if native_bounded and (
             collected_after_deselection is None or not 1 <= collected_after_deselection <= 50
         ):
             if collected_after_deselection is None:
@@ -1186,8 +1244,20 @@ class PythonTool(BaseTool):
                 code = "NATIVE_SMOKE_TOO_BROAD"
                 detail = (
                     f"the verified target selects {collected_after_deselection} tests; "
-                    "the native-unready safety limit is 50"
+                    "the bounded-smoke safety limit is 50"
                 )
+            # Nothing ran: executed is 0, and the collection-error count is
+            # unknown only when the collect command itself failed.
+            collection_errors = 0 if collect.get("success") else None
+            preamble.append(
+                self._collection_line(
+                    scope=collection_scope,
+                    collected=collected,
+                    selected=collected_after_deselection,
+                    executed=0,
+                    collection_errors=collection_errors,
+                )
+            )
             return self._finish(
                 ToolResult.completed_failure(
                     output=self._tail(collect.get("output") or ""),
@@ -1200,12 +1270,14 @@ class PythonTool(BaseTool):
                     ],
                     metadata={
                         "operation": "test",
-                        "native_unready": True,
                         "selection_mode": native_selection_mode,
                         "collection_scope": collection_scope,
                         "collection_command": collect_command,
                         "collected": collected,
                         "collected_after_deselection": collected_after_deselection,
+                        "executed": 0,
+                        "collection_errors": collection_errors,
+                        **gate_metadata,
                         **(
                             {
                                 "smoke_candidate": native_smoke["path"],
@@ -1268,6 +1340,12 @@ class PythonTool(BaseTool):
             except Exception as exc:  # tracking must never mask the honest result
                 logger.debug(f"python test tracking skipped: {exc}")
 
+        executed, collection_errors = self._executed_and_collection_errors(
+            junit_counts=junit_counts,
+            success=success,
+            error_code=error_code,
+            selected=collected_after_deselection,
+        )
         metadata = {
             "operation": "test",
             "command": command,
@@ -1279,14 +1357,8 @@ class PythonTool(BaseTool):
             "collected_after_deselection": collected_after_deselection,
             "collection_scope": collection_scope,
             "collected_json": COLLECTED_JSON,
-            **(
-                {
-                    "native_unready": True,
-                    "selection_mode": native_selection_mode,
-                }
-                if native_unready
-                else {}
-            ),
+            **({"selection_mode": native_selection_mode} if native_selection_mode else {}),
+            **gate_metadata,
             **(
                 {
                     "smoke_candidate": native_smoke["path"],
@@ -1296,7 +1368,38 @@ class PythonTool(BaseTool):
                 else {}
             ),
             **junit_counts,
+            # Derived AFTER junit_counts on purpose: `tests` counts JUnit
+            # testcase nodes, which a collection failure fills with collection
+            # nodes. `executed`/`collection_errors` are the honest projection.
+            "executed": executed,
+            "collection_errors": collection_errors,
         }
+        # Capability receipt: a bounded smoke that actually executed tests
+        # cleanly is the ONLY thing that unlocks a later full collect.
+        if (
+            native_bounded
+            and collection_scope == "filtered"
+            and native_smoke is not None
+            and success
+            and isinstance(executed, int)
+            and executed >= 1
+            and collection_errors == 0
+            and int(junit_counts.get("failed_tests") or 0) == 0
+            and int(junit_counts.get("error_tests") or 0) == 0
+        ):
+            self._write_native_smoke_receipt(
+                project_root=native_project_root,
+                candidate=native_smoke["path"],
+                stats={
+                    "executed": executed,
+                    "selected": collected_after_deselection,
+                    "failed": int(junit_counts.get("failed_tests") or 0),
+                    "errors": int(junit_counts.get("error_tests") or 0),
+                    "skipped": int(junit_counts.get("skipped_tests") or 0),
+                },
+                attempt=attempt_id,
+            )
+            metadata["smoke_receipt_written"] = True
         if junit_error:
             metadata["junit_extraction"] = {
                 "status": "unavailable",
@@ -1321,6 +1424,18 @@ class PythonTool(BaseTool):
         # separate conflict only when the XML was otherwise usable.
         if not attempt_tagged and not junit_error:
             result_conflicts.append(_PYTEST_ATTEMPT_ID_CONFLICT)
+        # Model-visible collection facts on EVERY pytest attempt: the scope the
+        # harness chose and what it actually produced. The audit found the model
+        # reading a full-suite collect as a passing test run.
+        preamble.append(
+            self._collection_line(
+                scope=collection_scope,
+                collected=collected,
+                selected=collected_after_deselection,
+                executed=executed,
+                collection_errors=collection_errors,
+            )
+        )
         tail = self._tail(output)
         if success:
             return self._finish(
@@ -1558,6 +1673,101 @@ class PythonTool(BaseTool):
             "absolute_path": verified["absolute_path"],
             "args": f"{shlex.quote(pytest_path)} --maxfail=1",
         }
+
+    @staticmethod
+    def _executed_and_collection_errors(
+        *,
+        junit_counts: Dict[str, int],
+        success: bool,
+        error_code: Optional[str],
+        selected: Optional[int],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Honest (executed, collection_errors) for one pytest attempt.
+
+        A collection failure executes NOTHING: pytest still writes a testcase
+        node per uncollectable file (the live TVM artifact: tests="56",
+        errors="28", skipped="28"), so the JUnit `tests` attribute must never
+        be laundered into an executed count. The structured per-node count
+        arrives with Plan 4 Task 2; until it does, a collection failure reports
+        an unknown (never a zero) collection-error count.
+        """
+        structured = junit_counts.get("collection_errors")
+        collection_errors = structured if isinstance(structured, int) else None
+        if error_code == "PYTEST_COLLECTION_ERROR":
+            return 0, collection_errors
+        if collection_errors is None:
+            collection_errors = 0
+        if error_code in _PYTEST_NOTHING_RAN_CODES:
+            return 0, collection_errors
+        junit_tests = junit_counts.get("tests")
+        if isinstance(junit_tests, int):
+            return junit_tests - collection_errors, collection_errors
+        # No usable JUnit report: a completed green run executed what it
+        # selected; anything else leaves the count unknown rather than invented.
+        return (selected if success else None), collection_errors
+
+    @staticmethod
+    def _collection_line(
+        *,
+        scope: str,
+        collected: Optional[int],
+        selected: Optional[int],
+        executed: Optional[int],
+        collection_errors: Optional[int],
+    ) -> str:
+        """The one model-visible collection fact line of a pytest attempt."""
+
+        def rendered(value: Optional[int]) -> str:
+            return "unknown" if value is None else str(value)
+
+        return (
+            f"Collection: {scope} — {rendered(collected)} collected, "
+            f"{rendered(selected)} selected, {rendered(executed)} executed, "
+            f"{rendered(collection_errors)} collection errors"
+        )
+
+    def _native_smoke_receipt(self, project_root: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The capability receipt for THIS project root, or None.
+
+        A receipt from another checkout never unlocks this one, and an
+        unreadable/garbled receipt is no receipt — the bounded smoke runs again.
+        """
+        if not project_root:
+            return None
+        result = self.orchestrator.execute_command(f"cat {shlex.quote(NATIVE_SMOKE_RECEIPT_JSON)}")
+        if not result.get("success"):
+            return None
+        try:
+            payload = json.loads((result.get("output") or "").strip())
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("project_root") or "").rstrip("/") != project_root.rstrip("/"):
+            return None
+        return payload
+
+    def _write_native_smoke_receipt(
+        self,
+        *,
+        project_root: Optional[str],
+        candidate: str,
+        stats: Dict[str, Any],
+        attempt: int,
+    ) -> None:
+        body = json.dumps(
+            {
+                "project_root": (project_root or "").rstrip("/"),
+                "candidate": candidate,
+                "stats": stats,
+                "attempt": attempt,
+            },
+            sort_keys=True,
+        )
+        self.orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
+        self.orchestrator.execute_command(
+            f"cat > {NATIVE_SMOKE_RECEIPT_JSON} <<'SAGEOF'\n{body}\nSAGEOF"
+        )
 
     @staticmethod
     def _bounded_native_pytest_args(pytest_args: str) -> str:
