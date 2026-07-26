@@ -44,6 +44,32 @@ MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
 MAX_SEALED_FAILURE_SIGNATURE_CHARS = 240
 MAX_SURVEYED_RECOMMENDATION_ITEMS = 5
 
+# Report-layer collection semantics (Plan 4 Task 3, 2026-07-26 audit): a pytest
+# collection failure is not an executed test. The sealed evidence carries the
+# counts and the dominant structured error; the report projects them under
+# these aliases, whichever seam the seal wrote them to.
+MAX_COLLECTION_ERROR_SUMMARY_CHARS = 240
+COLLECTION_FACT_ALIASES = {
+    "collection_errors": ("collection_errors", "tests_collection_errors"),
+    "collection_errors_skipped": (
+        "collection_errors_skipped",
+        "tests_collection_errors_skipped",
+    ),
+    "collection_error_summary": (
+        "collection_error_summary",
+        "tests_collection_error_summary",
+    ),
+}
+# The latest pytest/JUnit attempt's own coordinates. ``collection_scope`` and
+# the command are what the audit found missing from every model-, advisor- and
+# report-facing surface while the structured metadata carried them all along.
+LATEST_TEST_ATTEMPT_ALIASES = {
+    "command": ("test_command", "command"),
+    "collection_scope": ("collection_scope", "scope"),
+    "collected": ("collected",),
+    "selected": ("selected", "collected_after_deselection"),
+}
+
 
 # Local status vocabularies mapped onto the verdict kernel's closed vocabulary
 # (spec §6: failed < partial < success). Statuses outside the map (e.g.
@@ -101,6 +127,12 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
         "unique_skipped_tests": test_analysis.get("unique_skipped_tests"),
         "flaky_count": test_analysis.get("flaky_count", 0),
         "retried_count": test_analysis.get("retried_count", 0),
+        # Collection nodes are NOT executed tests (Plan 4 Task 2). Carried here
+        # so the legacy chain projects the same facts the sealed path does —
+        # without them the report can only guess at a collection failure.
+        "collection_errors": test_analysis.get("collection_errors"),
+        "collection_errors_skipped": test_analysis.get("collection_errors_skipped"),
+        "collection_error_summary": test_analysis.get("collection_error_summary"),
         "test_histories": test_analysis.get("test_histories", []),
         "metrics_conflicts": test_analysis.get("metrics_conflicts", []),
         # Legacy plural alias (markdown consumers) + the singular key the
@@ -1507,6 +1539,17 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "failed": False,
             }.get(tests.judgment),
         }
+        # Collection facts the seal carries (Plan 4 Task 2 writes them onto the
+        # sealed test stats). Read defensively so the projection is identical
+        # whether or not this seal was written by a build that records them.
+        collection_evidence = {
+            key: getattr(tests, key)
+            for key in COLLECTION_FACT_ALIASES
+            if getattr(tests, key, None) is not None
+        }
+        if collection_evidence.get("collection_errors"):
+            status["tests_collection_errors"] = collection_evidence["collection_errors"]
+
         evidence_refs = list(dict.fromkeys([*snapshot.input_refs, *snapshot.build_evidence.refs]))
         evidence_result = {
             "status": snapshot.verdict,
@@ -1518,6 +1561,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "errors": tests.errors,
                 "skipped": tests.skipped,
                 "flaky_count": tests.flaky_count,
+                **collection_evidence,
             },
             "conflicts": list(snapshot.conflicts),
             "evidence_refs": evidence_refs,
@@ -1556,6 +1600,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             "flags": {},
             "last_command": {},
             "failed_tests": [],
+            "collection_evidence": collection_evidence,
             "evidence_result": evidence_result,
             "attention": {
                 "items": [f"INFO {item['message']}" for item in attention_items],
@@ -1963,6 +2008,14 @@ class ReportTool(BaseTool, UIEventEmitter):
             "fingerprint_details": build_evidence.get("fingerprint_details") or {},
         }
 
+        # Same collection facts the sealed path projects, from the validator's
+        # stored parse result (build_stored_test_analysis carries them).
+        collection_evidence = {
+            key: test_analysis.get(key)
+            for key in COLLECTION_FACT_ALIASES
+            if test_analysis.get(key) is not None
+        }
+
         flags = {
             "fail_at_end": test_history.get("flags", {}).get("fail_at_end"),
             "excluded_tests": exclusions_tests,
@@ -1983,6 +2036,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             "flags": flags,
             "last_command": test_history.get("last_cmd", {}),
             "failed_tests": test_history.get("failed_tests", []),
+            "collection_evidence": collection_evidence,
             "evidence_result": evidence_result or {},
         }
 
@@ -4236,11 +4290,26 @@ class ReportTool(BaseTool, UIEventEmitter):
         """Render detailed test analysis with all metrics clearly displayed."""
         status = snapshot.get("status", {})
 
-        # Skip if no tests were run
-        if not status.get("tests_total"):
+        # A run whose pytest attempts produced only COLLECTION nodes executed
+        # nothing, so the old gate ("skip unless tests_total") deleted the one
+        # section that could have told the truth: the live TVM report showed
+        # "56 tests" from 28 collection errors + 28 paired skips and never
+        # named the RuntimeError behind them (2026-07-26 audit, findings 2/3).
+        # Collection facts and the attempt's own coordinates open the section
+        # on their own; the executed-test tables below still require executions.
+        collection = self._collection_failure_facts(snapshot)
+        attempt = self._latest_test_attempt_facts(snapshot)
+        if not status.get("tests_total") and not collection and not attempt:
             return []
 
         lines = ["## 🧪 Detailed Test Analysis", ""]
+        lines.extend(self._render_collection_failure(collection, status))
+        lines.extend(self._render_latest_test_attempt(attempt))
+
+        # Nothing executed: the metrics/breakdown tables would render collection
+        # artifacts under "Executed" headings. Facts only — stop here.
+        if not status.get("tests_total"):
+            return lines
 
         # Test Metrics Summary
         lines.extend(
@@ -4598,6 +4667,27 @@ class ReportTool(BaseTool, UIEventEmitter):
                 continue
             add(f"Unresolved evidence conflict: {name}.")
 
+        # A collection failure is a blocker in its own right, with the sealed
+        # structured error as its root cause (2026-07-26 audit, finding 3: the
+        # report guessed "missing native build" while the artifact carried the
+        # exact RuntimeError). Derived LAST so it can never suppress the build
+        # or conflict blockers above via the substring dedupe.
+        collection = self._collection_failure_facts(snapshot)
+        collection_errors = int(collection.get("collection_errors") or 0)
+        if collection_errors > 0:
+            try:
+                executed = int(status.get("tests_total") or 0)
+            except (TypeError, ValueError):
+                executed = 0
+            message = (
+                f"Test collection failed for {collection_errors} files — "
+                f"{executed} tests executed"
+            )
+            summary = collection.get("collection_error_summary")
+            if summary:
+                message += f"; root cause: {summary}"
+            add(f"{message}.")
+
         return derived
 
     def _sealed_failure_signature(self, snapshot: Dict[str, Any]) -> str:
@@ -4623,6 +4713,194 @@ class ReportTool(BaseTool, UIEventEmitter):
             signature = signature[: MAX_SEALED_FAILURE_SIGNATURE_CHARS - 1] + "…"
         detail = f": {signature}" if signature else " (no failure reason recorded)"
         return f"{phase} phase ended '{outcome}'{detail}"
+
+    # ------------------------------------------------------------------
+    # Collection semantics in the report (Plan 4 Task 3)
+    # ------------------------------------------------------------------
+
+    def _collection_fact_sources(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Every seam a sealed collection/attempt fact may legitimately live in.
+
+        Ordered by authority: the projection ``_build_report_snapshot`` writes,
+        then the sealed test stats (either the evidence_result view or the
+        canonical snapshot), then the render status, then the legacy physical/
+        history views. First non-null value per key wins, so a later seam can
+        only FILL a fact, never contradict an earlier one.
+        """
+        canonical = snapshot.get("canonical_snapshot") or {}
+        evidence = snapshot.get("evidence_result") or {}
+        history = snapshot.get("test_history") or {}
+        candidates = [
+            snapshot.get("collection_evidence"),
+            snapshot.get("latest_test_attempt"),
+            evidence.get("test_stats"),
+            evidence,
+            canonical.get("test_stats") if isinstance(canonical, dict) else None,
+            canonical,
+            snapshot.get("status"),
+            snapshot.get("physical_evidence"),
+            history.get("aggregate") if isinstance(history, dict) else None,
+            history.get("last_cmd") if isinstance(history, dict) else None,
+            snapshot.get("last_command"),
+        ]
+        return [source for source in candidates if isinstance(source, dict)]
+
+    @staticmethod
+    def _first_fact(sources: Iterable[Dict[str, Any]], aliases: Iterable[str]) -> Any:
+        for source in sources:
+            for alias in aliases:
+                value = source.get(alias)
+                if value is not None:
+                    return value
+        return None
+
+    def _collection_failure_facts(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """The sealed collection-failure facts, {} when the seal recorded none.
+
+        Facts only: counts as integers, the dominant structured error as the
+        seal recorded it. The report NEVER derives these from executed counts.
+        """
+        sources = self._collection_fact_sources(snapshot)
+        facts: Dict[str, Any] = {}
+
+        for key in ("collection_errors", "collection_errors_skipped"):
+            value = self._first_fact(sources, COLLECTION_FACT_ALIASES[key])
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count:
+                facts[key] = count
+
+        summary = self._first_fact(sources, COLLECTION_FACT_ALIASES["collection_error_summary"])
+        text = " ".join(str(summary or "").split())
+        if text:
+            if len(text) > MAX_COLLECTION_ERROR_SUMMARY_CHARS:
+                text = text[: MAX_COLLECTION_ERROR_SUMMARY_CHARS - 1] + "…"
+            facts["collection_error_summary"] = text
+
+        return facts
+
+    def _pytest_collected_facts(self) -> Dict[str, Any]:
+        """The last pytest collect pass as python_tool persisted it, {} if none.
+
+        ``pytest_collected.json`` is the runner's own structured record of the
+        latest attempt (scope/collected/selected). Memoized: one read per
+        report, and an unreachable or malformed file is simply no facts.
+        """
+        cached = getattr(self, "_pytest_collected_cache", None)
+        if cached is not None:
+            return cached
+
+        facts: Dict[str, Any] = {}
+        orchestrator = getattr(self, "docker_orchestrator", None)
+        if orchestrator is not None:
+            try:
+                from sag.tools.internal.python_tool import COLLECTED_JSON
+
+                result = orchestrator.execute_command(f"cat {COLLECTED_JSON}")
+                if result.get("success") or result.get("exit_code") == 0:
+                    payload = json.loads(str(result.get("output") or "").strip())
+                    if isinstance(payload, dict):
+                        facts = payload
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"pytest collect record unavailable for the report: {exc}")
+
+        self._pytest_collected_cache = facts
+        return facts
+
+    def _latest_test_attempt_facts(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Command/scope/collected/selected of the attempt the report describes."""
+        sources = self._collection_fact_sources(snapshot)
+        collected_record = self._pytest_collected_facts()
+        if collected_record:
+            sources = [*sources, collected_record]
+
+        facts: Dict[str, Any] = {}
+        for key, aliases in LATEST_TEST_ATTEMPT_ALIASES.items():
+            value = self._first_fact(sources, aliases)
+            if value is None:
+                continue
+            if key in ("collected", "selected"):
+                try:
+                    facts[key] = int(value)
+                except (TypeError, ValueError):
+                    continue
+            else:
+                text = " ".join(str(value).split())
+                if text:
+                    facts[key] = text
+        return facts
+
+    def _render_collection_failure(
+        self, facts: Dict[str, Any], status: Dict[str, Any]
+    ) -> List[str]:
+        """State the collection failure and quote its structured root cause."""
+        errors = int(facts.get("collection_errors") or 0)
+        if errors <= 0:
+            return []
+
+        try:
+            executed = int(status.get("tests_total") or 0)
+        except (TypeError, ValueError):
+            executed = 0
+        skipped_nodes = int(facts.get("collection_errors_skipped") or 0)
+
+        node_counts = f"{errors} collection errors"
+        if skipped_nodes:
+            node_counts += f", {skipped_nodes} collection-artifact skips"
+
+        lines = [
+            "### Test Collection Failure",
+            "",
+            f"- ❌ **Test collection failed for {errors} files — {executed} tests executed**",
+            f"- Collection nodes are excluded from every executed/passed/failed"
+            f" count ({node_counts}).",
+        ]
+
+        summary = facts.get("collection_error_summary")
+        if summary:
+            lines.extend(
+                [
+                    "- **Root cause (structured collection error):**",
+                    "",
+                    "  ```",
+                    f"  {summary}",
+                    "  ```",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "- No structured collection-error message was recorded in the"
+                    " sealed evidence.",
+                    "",
+                ]
+            )
+        return lines
+
+    def _render_latest_test_attempt(self, facts: Dict[str, Any]) -> List[str]:
+        """Name the scope and command of the latest recorded test attempt."""
+        details = []
+        for label, key in (
+            ("scope", "collection_scope"),
+            ("collected", "collected"),
+            ("selected", "selected"),
+        ):
+            if facts.get(key) is not None:
+                details.append(f"{label}={facts[key]}")
+
+        command = facts.get("command")
+        if not command and not details:
+            return []
+
+        line = "- **Latest test attempt:**"
+        if command:
+            line += f" `{command}`"
+        if details:
+            line += (" — " if command else " ") + ", ".join(details)
+        return [line, ""]
 
     def _survey_source_reachable(self) -> bool:
         """True when this tool can consult a survey store at all.
