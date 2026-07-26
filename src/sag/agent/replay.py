@@ -1,15 +1,43 @@
 """Deterministic control-layer replay over production policy components.
 
-Plan 2 Task 8 deleted the reasoning scheduler, so replay no longer re-executes
-it. `scheduler_decision` and `planner_response` rows in transcripts recorded
-before Plan 2 are historical: they are read, counted, and skipped. Task 9
-replaces the scheduler-shaped verification with the native tool_call contract.
+CONTRACT CHANGE (Plan 2). Replay used to prove determinism by re-executing the
+production `ReasoningScheduler`: it drove a live scheduler alongside the
+transcript and rejected any run whose recorded mode, reasoning triggers, or
+plan index differed. That verifier died with the protocol it verified — there
+is no scheduler, no plan, and no actor byte-match left to re-execute.
+
+What replay verifies now is the event stream itself:
+
+1. **Envelope resolution (dual key).** Every `tool_result` names an
+   `action_envelope` whose `envelope_sha256` recomputes byte-identically from
+   `{tool, exact_params, tool_call_id | plan_index}`. Native turns key on the
+   tool_call id; transcripts recorded before Plan 2 key on the plan index and
+   hash exactly as they did when they were written.
+2. **Pairing.** Exactly one `tool_result` answers each envelope — no envelope
+   left unanswered, no envelope answered twice. This is the same invariant the
+   live dispatcher owes Anthropic, checked offline.
+3. **Attempt ordering.** `tool_result` lineage is monotone per phase attempt:
+   once results for a later attempt appear, an earlier attempt cannot receive
+   another one.
+4. **Gate lineage.** Every `gate_decision` carries a claim for the phase
+   attempt that is actually open, and production `validate_phase_claim`
+   reproduces its recorded acceptance and outcome.
+
+Everything else the transcript proves is unchanged: phase transitions re-run
+through the real `PhaseTransitionPolicy`, loop decisions through the real
+`LoopMemory`, and the verdict through the real `VerdictFinalizer`.
+
+Rows of a kind this walk no longer models (`scheduler_decision`,
+`planner_response`) are **skipped and counted**, never fatal: an old transcript
+must still verify, and a silently ignored row would be indistinguishable from
+a row the walk forgot to check. The counts are reported as
+`ReplayResult.skipped_event_kinds`.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
@@ -55,6 +83,11 @@ class ReplayValidationError(ValueError):
 
 class ReplayMismatchError(ReplayValidationError):
     """A valid transcript no longer reproduces its frozen expectations."""
+
+
+#: Event kinds the engine stopped emitting when Plan 2 deleted the scheduler.
+#: The walk reads and counts them so pre-Plan-2 transcripts still verify.
+_HISTORICAL_EVENT_KINDS = frozenset({"scheduler_decision", "planner_response"})
 
 
 def _recorded_test_dispatch(tool: str, params: Mapping[str, Any]) -> bool:
@@ -171,6 +204,12 @@ class ReplayResult:
     repair_routes: tuple[RepairRouteResult, ...]
     planner_response_count: int
     executed_envelope_count: int
+    #: envelopes that received exactly one tool_result (== executed_envelope_count
+    #: for a well-formed transcript; the walk raises before it can differ)
+    paired_envelope_count: int = 0
+    gate_decision_count: int = 0
+    #: {kind: rows} for pre-Plan-2 event kinds this walk no longer models
+    skipped_event_kinds: Mapping[str, int] = field(default_factory=dict)
     compatibility_action_model_calls: int = 0
 
     def phase(self, phase: str) -> PhaseAttemptRecord:
@@ -288,19 +327,40 @@ class ControlReplayRunner:
         repairs: list[RepairRouteResult] = []
         planner_response_count = 0
         envelope_count = 0
+        paired_envelope_count = 0
+        gate_decision_count = 0
+        skipped_kinds: dict[str, int] = {}
+        answered_envelope_ids: set[str] = set()
+        # Ordered lineage of the phase attempts tool results have been seen for;
+        # a result for anything but the last entry is out of order.
+        attempt_order: list[str] = []
         forced_attempt_ids: set[str] = set()
         snapshot: RunVerdictSnapshot | None = None
+
+        def open_envelope(payload: dict[str, Any], *, forced: bool) -> dict[str, Any]:
+            """Claim the pairing slot; the previous envelope must be answered."""
+            nonlocal active_envelope, envelope_count
+            if active_envelope is not None:
+                raise ReplayValidationError(
+                    f"action envelope {active_envelope['envelope_id']!r} must be "
+                    "answered by exactly one tool_result before another action "
+                    "is recorded"
+                )
+            envelope = dict(payload)
+            envelope["_harness_forced"] = forced
+            active_envelope = envelope
+            envelope_count += 1
+            return envelope
 
         for event in transcript.events:
             payload = event.payload
             try:
-                if event.kind == "scheduler_decision":
-                    # Historical (pre-Plan-2) row: the scheduler it recorded no
-                    # longer exists, so there is nothing to re-execute.
-                    pass
-                elif event.kind == "planner_response":
-                    # Historical (pre-Plan-2) row; counted for reporting only.
-                    planner_response_count += 1
+                if event.kind in _HISTORICAL_EVENT_KINDS:
+                    # Recorded before Plan 2 by machinery this walk no longer
+                    # models. Skipped, but counted so the notice is visible.
+                    skipped_kinds[event.kind] = skipped_kinds.get(event.kind, 0) + 1
+                    if event.kind == "planner_response":
+                        planner_response_count += 1
                 elif event.kind == "action_envelope":
                     calculated_hash = action_envelope_sha256(
                         plan_index=payload.get("plan_index"),
@@ -310,14 +370,8 @@ class ControlReplayRunner:
                     )
                     if calculated_hash != payload["envelope_sha256"]:
                         raise ReplayValidationError("action envelope hash mismatch")
-                    active_envelope = dict(payload)
-                    active_envelope["_harness_forced"] = False
-                    envelope_count += 1
+                    open_envelope(payload, forced=False)
                 elif event.kind == "forced_action":
-                    if active_envelope is not None:
-                        raise ReplayValidationError(
-                            "forced action cannot replace an active action envelope"
-                        )
                     if machine.current_phase != payload["phase"]:
                         raise ReplayValidationError(
                             "forced action targets a phase that is not open"
@@ -364,13 +418,19 @@ class ControlReplayRunner:
                         raise ReplayValidationError(
                             "forced action differs from the production must-attempt policy"
                         )
-                    active_envelope = dict(payload)
-                    active_envelope["_harness_forced"] = True
+                    open_envelope(payload, forced=True)
                     forced_attempt_ids.add(payload["source_attempt_id"])
-                    envelope_count += 1
                 elif event.kind == "tool_result":
+                    if payload["envelope_id"] in answered_envelope_ids:
+                        raise ReplayValidationError(
+                            f"envelope {payload['envelope_id']!r} already has a "
+                            "tool_result; the pairing invariant allows exactly one"
+                        )
                     if active_envelope is None:
-                        raise ReplayValidationError("tool result has no active action envelope")
+                        raise ReplayValidationError(
+                            "tool result has no action envelope to answer "
+                            f"(envelope {payload['envelope_id']!r})"
+                        )
                     if payload["envelope_id"] != active_envelope["envelope_id"]:
                         raise ReplayValidationError("tool result references a different envelope")
                     if (
@@ -390,6 +450,16 @@ class ControlReplayRunner:
                         raise ReplayValidationError(
                             "forced result requires the exact forced phase attempt lineage"
                         )
+                    if source_attempt_id:
+                        if source_attempt_id in attempt_order:
+                            if attempt_order[-1] != source_attempt_id:
+                                raise ReplayValidationError(
+                                    "tool result ordering is not monotone per phase "
+                                    f"attempt: {source_attempt_id!r} was already closed "
+                                    f"by {attempt_order[-1]!r}"
+                                )
+                        else:
+                            attempt_order.append(source_attempt_id)
                     current_schema = header.schema_version >= 2
                     test_dispatch = _recorded_test_dispatch(
                         payload["tool"],
@@ -486,6 +556,8 @@ class ControlReplayRunner:
                                 "facade-only forced build is allowed only for a "
                                 "complete terminal no-runner control receipt"
                             )
+                    answered_envelope_ids.add(payload["envelope_id"])
+                    paired_envelope_count += 1
                     active_envelope = None
                 elif event.kind == "validator_observation":
                     evidence_ref = next(iter(payload["evidence_refs"]), None)
@@ -495,6 +567,7 @@ class ControlReplayRunner:
                     # decision is accepted. The observation event is audit data,
                     # not a second state mutation.
                 elif event.kind == "gate_decision":
+                    gate_decision_count += 1
                     if payload["phase"] != machine.current_phase:
                         raise ReplayValidationError("gate decision targets the wrong open phase")
                     source_attempt_id = payload.get("source_attempt_id")
@@ -700,6 +773,11 @@ class ControlReplayRunner:
 
         if snapshot is None:
             raise ReplayValidationError("transcript did not reach evidence_close")
+        if paired_envelope_count != envelope_count:
+            raise ReplayValidationError(
+                "the pairing invariant requires exactly one tool_result per "
+                f"envelope: {envelope_count} recorded, {paired_envelope_count} answered"
+            )
         unconsumed = tuple(
             name
             for name, present in (
@@ -729,6 +807,9 @@ class ControlReplayRunner:
             repair_routes=tuple(repairs),
             planner_response_count=planner_response_count,
             executed_envelope_count=envelope_count,
+            paired_envelope_count=paired_envelope_count,
+            gate_decision_count=gate_decision_count,
+            skipped_event_kinds=dict(skipped_kinds),
         )
 
 

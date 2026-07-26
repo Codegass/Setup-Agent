@@ -91,10 +91,6 @@ def _engine_with_context(context=None):
     engine.repository_ref = "rel/commons-cli-1.11.0"
     engine.output_storage = None
     engine.emit = lambda *args, **kwargs: None
-    engine._force_thinking_next = False
-    engine._force_thinking_after_success = False
-    engine.prompt_builder._cached_trunk_context = "cached"
-    engine.prompt_builder._trunk_context_cache_timestamp = 123
     return engine
 
 
@@ -574,9 +570,9 @@ def test_apply_tool_execution_loop_effects_skips_unavailable_force_next_task():
         metadata={"force_next_task": True},
     )
 
-    engine._apply_tool_execution_loop_effects(execution)
-
-    assert engine._force_thinking_next is False
+    # Plan 2 Task 8: no dual-role flag survives; the legacy force_next_task
+    # hook must stay unreachable and the call must not raise.
+    assert engine._apply_tool_execution_loop_effects(execution) is None
 
 
 # Plan 2 Task 8: old protocol removed

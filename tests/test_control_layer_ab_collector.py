@@ -363,6 +363,23 @@ def test_collector_relativizes_in_repo_session_to_repo_relative(tmp_path, monkey
         assert entry.startswith("logs/session_in_repo"), entry
 
 
+def test_collector_counts_the_native_executor_label(tmp_path):
+    """Plan 2 records every LLM call as `executor`; the collector must count
+    those as action calls or an A/B panel reads zero calls for a real run."""
+    session = _session(tmp_path)
+    (session / "token_usage.csv").write_text(
+        "iteration,type,tool_name,model,total_tokens\n"
+        "1,executor,project,action-model,100\n"
+        "2,executor,build,action-model,120\n",
+        encoding="utf-8",
+    )
+
+    record = ABCollector().collect(session)
+
+    assert record.metrics.thought_calls == 0
+    assert record.metrics.action_calls == 2
+
+
 def test_collector_counts_the_live_token_csv_type_column(tmp_path):
     session = _session(tmp_path)
     (session / "token_usage.csv").write_text(
