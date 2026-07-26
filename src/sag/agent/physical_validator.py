@@ -4195,14 +4195,14 @@ class PhysicalValidator:
             # None (not 0) when the count command fails: "couldn't measure" must
             # not masquerade as "zero classes" (which would also wrongly suppress
             # the artifact-based build inference downstream).
-            class_count = int((cc.get("output") or "0").strip() or 0) if cc.get("success") else None
+            class_count = self._count_from_output(cc, on_failure=None)
 
             jar_cmd = (
                 f"find '{module_dir}/{jars_glob}' -name '*.jar' -type f "
                 f"-not -path '*/gradle/wrapper/*' 2>/dev/null | wc -l"
             )
             jc = self._execute_command_with_logging(jar_cmd, f"counting jars in {rel}")
-            jar_count = int((jc.get("output") or "0").strip() or 0) if jc.get("success") else None
+            jar_count = self._count_from_output(jc, on_failure=None)
 
             report_dirs: List[str] = []
             for sub in report_subdirs:
@@ -4223,11 +4223,32 @@ class PhysicalValidator:
             )
             has_test_sources = "EXISTS" in (tst.get("output") or "")
 
+            # Source + report file counts for the flat CSV mirror. Two extra
+            # finds per module (~40% more execs on this scan); cheap relative to
+            # the build itself. ponytail: fold into the class/jar finds if scan
+            # latency ever matters.
+            jf = self._execute_command_with_logging(
+                f"find '{module_dir}/src' -name '*.java' -type f 2>/dev/null | wc -l",
+                f"counting java sources in {rel}",
+            )
+            java_file_count = self._count_from_output(jf, on_failure=None)
+
+            report_file_count = 0
+            if report_dirs:
+                joined = " ".join(f"'{d}'" for d in report_dirs)
+                rf = self._execute_command_with_logging(
+                    f"find {joined} -name '*.xml' -type f 2>/dev/null | wc -l",
+                    f"counting report files in {rel}",
+                )
+                report_file_count = self._count_from_output(rf, on_failure=0) or 0
+
             record = {
                 "path": rel,
                 "name": name,
                 "class_count": class_count,
                 "jar_count": jar_count,
+                "java_file_count": java_file_count,
+                "report_file_count": report_file_count,
                 "report_dirs": report_dirs,
                 "has_test_sources": has_test_sources,
             }
@@ -4261,6 +4282,27 @@ class PhysicalValidator:
 
             modules.append(record)
         return modules
+
+    @staticmethod
+    def _count_from_output(result: dict, *, on_failure: Optional[int]) -> Optional[int]:
+        """Parse a ``... | wc -l`` count, never raising on unexpected output.
+
+        scan_modules is best-effort evidence: an exception here propagates out
+        of the scan and _compute_module_metrics discards the ENTIRE per-module
+        breakdown. A find that prints a warning to stdout must cost one count,
+        not the whole submodule report. ``on_failure`` distinguishes "couldn't
+        measure" (None, so the artifact-based build inference stays suppressed)
+        from counts where zero is the honest answer.
+        """
+        if not result.get("success"):
+            return on_failure
+        tokens = str(result.get("output") or "").split()
+        if not tokens:
+            return 0
+        try:
+            return int(tokens[-1])
+        except ValueError:
+            return on_failure
 
     def _is_aggregator_shell_root(self, root_dir: str, build_system: str) -> bool:
         """Probe whether the root is a pure aggregator with no own sources.

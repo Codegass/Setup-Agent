@@ -16,8 +16,14 @@ class FakeOrch:
 def test_scan_modules_maven_counts_artifacts_and_report_dirs():
     responses = {
         "-name 'pom.xml'": {"output": "/w/p/connect/api/pom.xml\n/w/p/core/pom.xml"},
+        # The report-file count greps the SAME surefire path as the test -d probe,
+        # so these two more specific keys must precede it (FakeOrch matches in
+        # insertion order).
+        "/connect/api/target/surefire-reports' -name '*.xml": {"output": "12"},
+        "/core/target/surefire-reports' -name '*.xml": {"output": "4"},
         "/connect/api/target/classes": {"output": "180"},
         "/connect/api/target' -name '*.jar": {"output": "3"},
+        "/connect/api/src' -name '*.java": {"output": "95"},
         "/core/target/classes": {"output": "50"},
         "/core/target' -name '*.jar": {"output": "1"},
         "/connect/api/target/surefire-reports": {"output": "EXISTS"},
@@ -29,8 +35,25 @@ def test_scan_modules_maven_counts_artifacts_and_report_dirs():
     assert by_path["connect/api"]["name"] == "connect:api"
     assert by_path["connect/api"]["class_count"] == 180
     assert by_path["connect/api"]["jar_count"] == 3
+    assert by_path["connect/api"]["java_file_count"] == 95
+    assert by_path["connect/api"]["report_file_count"] == 12
     assert any("surefire" in d for d in by_path["connect/api"]["report_dirs"])
     assert by_path["core"]["class_count"] == 50
+
+
+def test_scan_modules_survives_non_numeric_count_output():
+    """A count command answering something other than a number must cost one
+    field, not the whole scan: scan_modules raising discards the entire
+    per-module breakdown in _compute_module_metrics."""
+    responses = {
+        "-name 'pom.xml'": {"output": "/w/p/core/pom.xml"},
+        # e.g. a find that wrote a warning to stdout
+        "/core/target/classes": {"output": "find: warning: bogus"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/p", "maven")
+    by_path = {m["path"]: m for m in modules}
+    assert by_path["core"]["class_count"] is None  # "couldn't measure", not zero
 
 
 def test_scan_modules_single_module_returns_root():

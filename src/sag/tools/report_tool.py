@@ -21,7 +21,13 @@ from sag.evidence import (
 )
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
-from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metrics
+from sag.tools.module_metrics import (
+    MODULE_METRICS_CSV_PATH,
+    MODULE_METRICS_PATH,
+    MODULE_METRICS_VERSION,
+    assemble_module_metrics,
+    module_metrics_to_csv,
+)
 
 # Sentinel for memoizing _build_module_metrics (the result can legitimately be
 # None, so None cannot double as "not computed yet").
@@ -1045,6 +1051,28 @@ class ReportTool(BaseTool, UIEventEmitter):
         except Exception as exc:  # pragma: no cover - defensive diagnostics
             logger.warning(f"Skipped report metrics artifact: {exc}")
 
+        # Module metrics belong on THIS path too. Only the legacy path persisted
+        # them, so every sealed run — i.e. every modern run — left no
+        # module_metrics.json/.csv while its own markdown pointed readers at the
+        # missing file. Rebuild from the sealed snapshot rather than rescanning:
+        # module_coverage already ran the rows through assemble_module_metrics at
+        # evidence-close, so they carry the persisted shape and this path keeps
+        # its no-rescan contract.
+        try:
+            sealed_summary = dict(snapshot.build_evidence.module_summary or {})
+            sealed_modules = [dict(module) for module in snapshot.build_evidence.modules or ()]
+            if sealed_summary or sealed_modules:
+                sealed_metrics = {
+                    "version": MODULE_METRICS_VERSION,
+                    "generated_at": timestamp,
+                    "module_summary": sealed_summary,
+                    "modules": sealed_modules,
+                }
+                self._persist_module_metrics(sealed_metrics)
+                self._persist_module_metrics_csv(sealed_metrics)
+        except Exception as exc:  # pragma: no cover - defensive diagnostics
+            logger.debug(f"sealed module metrics step skipped: {exc}")
+
         return (
             console_report,
             snapshot.verdict,
@@ -1177,6 +1205,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
             if module_metrics:
                 self._persist_module_metrics(module_metrics)
+                self._persist_module_metrics_csv(module_metrics)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"module metrics step skipped: {exc}")
 
@@ -1507,6 +1536,19 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "failed": False,
             }.get(tests.judgment),
         }
+        module_summary = snapshot.build_evidence.module_summary
+        if module_summary:
+            status.update(
+                {
+                    "modules_detected": module_summary.get("modules_total"),
+                    "modules_built": module_summary.get("modules_built"),
+                    "modules_failed_count": module_summary.get("modules_failed"),
+                    "modules_skipped_count": module_summary.get("modules_skipped"),
+                    "modules_tested": module_summary.get("modules_tested"),
+                    "modules_not_tested": module_summary.get("modules_not_tested"),
+                    "modules_test_bearing": module_summary.get("modules_test_bearing"),
+                }
+            )
         evidence_refs = list(dict.fromkeys([*snapshot.input_refs, *snapshot.build_evidence.refs]))
         evidence_result = {
             "status": snapshot.verdict,
@@ -1553,6 +1595,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             },
             "test_history": {},
             "per_module": {},
+            "module_summary": module_summary,
+            "modules": list(snapshot.build_evidence.modules),
             "flags": {},
             "last_command": {},
             "failed_tests": [],
@@ -3268,7 +3312,16 @@ class ReportTool(BaseTool, UIEventEmitter):
                 report_lines.extend(test_analysis_section)
 
             # Add per-submodule build/test breakdown (multi-module projects only)
-            if not setup_snapshot:
+            if setup_snapshot:
+                report_lines.extend(
+                    self._render_submodule_breakdown(
+                        {
+                            "module_summary": report_snapshot.get("module_summary") or {},
+                            "modules": report_snapshot.get("modules") or [],
+                        }
+                    )
+                )
+            else:
                 try:
                     mm = self._build_module_metrics(
                         self._load_test_history() or {},
@@ -3917,6 +3970,21 @@ class ReportTool(BaseTool, UIEventEmitter):
             self.docker_orchestrator.execute_command(cmd)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"Failed to persist module metrics: {exc}")
+
+    def _persist_module_metrics_csv(self, metrics: dict) -> None:
+        """Best-effort flat CSV mirror of module_metrics.json (never blocks)."""
+        if not metrics or not self.docker_orchestrator:
+            return
+        try:
+            payload = module_metrics_to_csv(metrics)
+            delimiter = "SAG_MODULE_METRICS_CSV_EOF"
+            cmd = (
+                f"mkdir -p /workspace/.setup_agent && "
+                f"cat > {MODULE_METRICS_CSV_PATH} <<'{delimiter}'\n{payload}{delimiter}"
+            )
+            self.docker_orchestrator.execute_command(cmd)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Failed to persist module metrics CSV: {exc}")
 
     def _render_submodule_breakdown(self, module_metrics: dict) -> List[str]:
         """Markdown 'Submodule Breakdown' section; [] for single-module projects."""

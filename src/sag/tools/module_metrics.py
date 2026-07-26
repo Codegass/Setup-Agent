@@ -8,9 +8,14 @@ Pure reconciliation of three inputs the report tool gathers:
 Mirrors report_metrics.py: a single pure function, missing values -> null/[].
 """
 
+import csv
+import io
 from typing import Any, Dict, List, Optional
 
 MODULE_METRICS_PATH = "/workspace/.setup_agent/module_metrics.json"
+# Flat CSV mirror of the JSON artifact — one row per module for eval/scoring
+# tools that want a spreadsheet, not a nested doc. Named to parallel the JSON.
+MODULE_METRICS_CSV_PATH = "/workspace/.setup_agent/module_metrics.csv"
 MODULE_METRICS_VERSION = 1
 _MAX_FAILING = 500
 _MAX_ERROR_SAMPLES = 20
@@ -202,6 +207,8 @@ def assemble_module_metrics(
             "build_source": build_source,
             "class_count": class_count,
             "jar_count": jar_count,
+            "java_file_count": _int_or_none(scan.get("java_file_count")),
+            "report_file_count": _int_or_none(scan.get("report_file_count")),
             "build_warnings": _int_or_none(scan.get("build_warnings")),
             "build_error_samples": _str_list(build_error_samples.get(path), _MAX_ERROR_SAMPLES),
             "tests_total": _int_or_none(t.get("tests_total")),
@@ -240,6 +247,8 @@ def assemble_module_metrics(
                 "build_source": "reactor",
                 "class_count": None,
                 "jar_count": None,
+                "java_file_count": None,
+                "report_file_count": None,
                 "build_warnings": None,
                 "build_error_samples": [],
                 "tests_total": None,
@@ -286,3 +295,46 @@ def assemble_module_metrics(
         "module_summary": summary,
         "modules": out_modules,
     }
+
+
+_CSV_COLUMNS = [
+    "module_path", "build_system", "report_file_count",
+    "total_tests", "passed_tests", "failed_tests", "error_tests", "skipped_tests",
+    "test_success", "parse_errors", "physical_validator_passed",
+    "class_file_count", "java_file_count",
+]
+
+
+def module_metrics_to_csv(metrics: Dict[str, Any]) -> str:
+    """Flatten the module_metrics dict into a one-row-per-module CSV string.
+
+    Columns mirror the external scoring CSV so eval tooling reads one format.
+    Two columns have no exact per-module source in SAG's model:
+    - parse_errors: SAG parses reports in aggregate, not per module -> always 0.
+    - physical_validator_passed: mapped to build_status == "success", the
+      per-module physical signal SAG does track.
+    """
+    summary = metrics.get("module_summary") or {}
+    systems = summary.get("build_systems") or []
+    default_system = systems[0] if systems else ""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_CSV_COLUMNS)
+    for m in metrics.get("modules") or []:
+        total = m.get("tests_total") or 0
+        writer.writerow([
+            m.get("path") or "",
+            default_system,
+            m.get("report_file_count") or 0,
+            total,
+            m.get("tests_passed") or 0,
+            m.get("tests_failed") or 0,
+            m.get("tests_errors") or 0,
+            m.get("tests_skipped") or 0,
+            total > 0 and (m.get("failing_count") or 0) == 0,
+            0,  # ponytail: no per-module parse-error count in SAG; 0 until it exists
+            m.get("build_status") == "success",
+            m.get("class_count") or 0,
+            m.get("java_file_count") or 0,
+        ])
+    return buf.getvalue()
