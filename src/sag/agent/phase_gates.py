@@ -394,6 +394,8 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
         conflicts.append("test_errors_detected")
     if status.get("parsing_errors"):
         conflicts.append("test_report_parse_error")
+    if status.get("stale_test_reports"):
+        conflicts.append("test_reports_stale")
     collection_summary = str(
         status.get("collection_error_summary") or test_stats.get("collection_error_summary") or ""
     ).strip()
@@ -420,9 +422,34 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
                     test_stats.get("collection_errors_skipped"),
                 ),
                 "collection_error_summary": collection_summary or None,
+                # Plan 5 Task B2: the receipt-scoped basis travels WITH the
+                # counts it produced. Auxiliary reports stay visible next to
+                # the primary numerator without ever entering it, and stale
+                # (superseded) reports are named rather than silently dropped.
+                # A receipt-free run emits none of these keys, so recorded
+                # replay fixtures serialize byte-identically.
+                "receipt_scoped": True if status.get("receipt_scoped") else None,
+                "auxiliary_test_stats": _auxiliary_counts(status.get("auxiliary_test_stats")),
+                "stale_test_reports": (
+                    [str(item) for item in status.get("stale_test_reports") or ()] or None
+                ),
             }.items()
             if value is not None
         },
+    }
+
+
+def _auxiliary_counts(value: Any) -> dict[str, int] | None:
+    """Auxiliary reports in the primary rollup's count shape, never merged.
+
+    Present only when the validator observed auxiliary reports at all; an
+    all-zero block still counts as observed ("reports existed, no tests ran").
+    """
+    if not isinstance(value, Mapping) or not value:
+        return None
+    return {
+        name: _first_nonnegative_int(value.get(name), 0) or 0
+        for name in ("executed", "passed", "failed", "errors", "skipped")
     }
 
 
@@ -547,6 +574,23 @@ def _inspect_test(validator, project_name) -> _ValidatorObservation:
     if validator is None:
         raise RuntimeError("no physical validator available")
     status = validator.validate_test_status(project_name)
+    receipt_error = str(status.get("receipt_error") or "").strip()
+    if receipt_error:
+        # Plan 5 Task B2 / matrix row "receipt persistence fails": receipts we
+        # cannot read leave every scanned report unattributed. RED, not
+        # UNAVAILABLE — an unverifiable rollup must block a partial claim too,
+        # while an honest failed/blocked claim can still close the phase.
+        return _ValidatorObservation(
+            ValidatorState.RED,
+            reason=f"invocation-receipt evidence is unreadable: {receipt_error}",
+            evidence_refs=tuple(str(ref) for ref in status.get("receipt_error_files") or ()),
+            suggestions=(
+                "Re-run the test invocation so it writes a readable receipt, then re-claim",
+                "Inspect the named receipt file; a truncated or partial write blocks closure",
+            ),
+            code="test_receipt_unreadable",
+            validated_facts={},
+        )
     test_stats = status.get("test_stats") or {}
     executed = int(test_stats.get("executed", status.get("total_tests", 0)) or 0)
     discovered = test_stats.get("discovered", status.get("static_test_count"))

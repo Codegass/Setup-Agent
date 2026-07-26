@@ -196,10 +196,19 @@ def _dist_record_matches(record_dir: str, project_name: str) -> bool:
     return normalized[len(wanted) + 1 : len(wanted) + 2].isdigit()
 
 
-# In-container test-report parser (executed via `python3 - <<'PY'`). The two
-# header assignments (project_dir, pytest_reports_dir) are prepended by
-# _parse_test_reports_compact_in_container. Kept as a plain module string so
-# the embedded script needs no f-string brace escaping.
+# Invocation receipts (Plan 5 Stage B, schema v1). One JSON file per runner
+# invocation; the directory name is the cross-lane storage contract and must
+# not move. Joined onto the workspace root so production reads
+# /workspace/.setup_agent/invocation_receipts while a test can stand a whole
+# workspace up in a temp dir.
+INVOCATION_RECEIPTS_DIRNAME = ".setup_agent/invocation_receipts"
+
+
+# In-container test-report parser (executed via `python3 - <<'PY'`). The four
+# header assignments (project_dir, pytest_reports_dir, receipts_dir,
+# primary_root) are prepended by _parse_test_reports_compact_in_container.
+# Kept as a plain module string so the embedded script needs no f-string brace
+# escaping.
 #
 # Aggregation model (WS7): every testcase is normalized to the canonical
 # (module_or_file, class, name, param_id) identity. Per-identity histories are
@@ -207,7 +216,15 @@ def _dist_record_matches(record_dir: str, project_name: str) -> bool:
 # and mtimes are transport details and never decide which observation is latest.
 # Raw executions remain diagnostics; primary/unique counts use each history's
 # latest status while first/worst/retry/flaky facts remain visible.
+#
+# Scoping model (Plan 5 Task B2): the scan discovers candidates, the receipts
+# decide provenance. Only reports CLAIMED by a receipt of the primary test
+# coordinate — and whose recorded sha256 still matches the file on disk — feed
+# the primary rollup. Everything else is auxiliary (visible, never counted) or
+# stale (claimed, superseded, quarantined). No receipts at all means the
+# legacy global scan, unchanged and unannotated.
 _COMPACT_REPORT_PARSER_BODY = '''
+import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -374,14 +391,133 @@ def int_attr(node, name):
         return 0
 
 
+def content_sha256(path):
+    """Current content hash, or None when the claimed report is gone."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 16), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def receipt_schema_error(payload):
+    """Schema-v1 conformance. A receipt we cannot read is never "no evidence"."""
+    if not isinstance(payload, dict):
+        return "receipt is not a JSON object"
+    if payload.get("schema_version") != 1:
+        return "unsupported schema_version " + repr(payload.get("schema_version"))
+    for key in ("receipt_id", "working_directory"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return "missing " + key
+    if not payload["working_directory"].startswith("/"):
+        return "working_directory is not an absolute path"
+    delta = payload.get("report_delta")
+    if delta is None:
+        return None
+    if not isinstance(delta, dict):
+        return "report_delta is not an object"
+    for bucket in ("new", "changed"):
+        entries = delta.get(bucket)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            return "report_delta." + bucket + " is not a list"
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return "report_delta." + bucket + " entry is not an object"
+            if not isinstance(entry.get("path"), str) or not entry["path"]:
+                return "report_delta." + bucket + " entry has no path"
+            if not isinstance(entry.get("sha256"), str) or not entry["sha256"]:
+                return "report_delta." + bucket + " entry has no sha256"
+    return None
+
+
+def read_invocation_receipts():
+    """Return (scoped, claims, corrupt) for the invocation-receipt directory.
+
+    ``claims`` maps a claimed report path to every sha256 the primary
+    coordinate's receipts recorded for it, so a retry that overwrites the same
+    path in place verifies through its newest receipt instead of colliding
+    with the superseded one.
+    """
+    receipts_root = Path(receipts_dir)
+    if not primary_root or not receipts_root.is_dir():
+        return False, {}, []
+    try:
+        receipt_files = sorted(
+            str(path) for path in receipts_root.iterdir() if path.name.endswith(".json")
+        )
+    except Exception as exc:
+        return True, {}, [receipts_dir + ": receipt directory unreadable (" + str(exc) + ")"]
+    if not receipt_files:
+        return False, {}, []
+    claims = {}
+    corrupt = []
+    primary_prefix = primary_root.rstrip("/")
+    for receipt_file in receipt_files:
+        try:
+            payload = json.loads(Path(receipt_file).read_text())
+        except Exception as exc:
+            corrupt.append(receipt_file + ": unreadable (" + str(exc) + ")")
+            continue
+        reason = receipt_schema_error(payload)
+        if reason:
+            corrupt.append(receipt_file + ": " + reason)
+            continue
+        working_directory = payload["working_directory"].rstrip("/") or "/"
+        if working_directory != primary_prefix and not working_directory.startswith(
+            primary_prefix + "/"
+        ):
+            continue
+        delta = payload.get("report_delta") or {}
+        for bucket in ("new", "changed"):
+            for entry in delta.get(bucket) or []:
+                claims.setdefault(entry["path"], set()).add(entry["sha256"].strip().lower())
+    return True, claims, corrupt
+
+
 root = Path(project_dir)
 # pytest --junitxml reports live OUTSIDE the project dir; scan that root too.
 pytest_reports = Path(pytest_reports_dir)
 scan_roots = [root] + ([pytest_reports] if pytest_reports.is_dir() else [])
-report_files = sorted(
+scanned_files = sorted(
     {str(path) for scan_root in scan_roots for path in scan_root.rglob("*.xml") if is_report_file(path)}
 )
-report_dirs = sorted({str(Path(path).parent) for path in report_files})
+# report_dirs stays a DISCOVERY fact over the whole scan: module coverage asks
+# "which modules produced any reports at all", not "which are primary".
+report_dirs = sorted({str(Path(path).parent) for path in scanned_files})
+
+receipt_scoped, receipt_claims, corrupt_receipts = read_invocation_receipts()
+auxiliary_files = []
+stale_files = []
+if corrupt_receipts:
+    # Fail closed: unreadable receipts mean the provenance of every scanned
+    # report is unknown, so nothing may be counted.
+    report_files = []
+elif receipt_scoped:
+    verified = set()
+    unverified = set()
+    for claimed_path, claimed_hashes in receipt_claims.items():
+        current = content_sha256(claimed_path)
+        if current is None:
+            # Claimed and since deleted: nothing on disk to attribute.
+            continue
+        if current in claimed_hashes:
+            verified.add(claimed_path)
+        else:
+            unverified.add(claimed_path)
+    unverified -= verified
+    report_files = [path for path in scanned_files if path in verified]
+    auxiliary_files = [
+        path for path in scanned_files if path not in verified and path not in unverified
+    ]
+    stale_files = sorted(unverified)
+else:
+    report_files = scanned_files
 
 groovy_classes = set()
 for groovy in root.rglob("src/test/groovy/**/*.groovy"):
@@ -598,8 +734,22 @@ for identity in sorted(attempts):
 for key in latest:
     latest[key] += suite_only[key]
 
+# Auxiliary reports are aggregated on their own basis: raw statuses, no
+# canonical identities, no histories. They are evidence ABOUT the run, never
+# evidence OF the primary coordinate.
+auxiliary_counts = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for report_file in auxiliary_files:
+    parsed = parse_report(report_file)
+    if parsed is None:
+        continue
+    if parsed["cases"] is None:
+        add_suite_counts(auxiliary_counts, parsed["suite_counts"])
+        continue
+    for identity, status in parsed["cases"]:
+        bump(auxiliary_counts, status)
+
 result = {
-    "valid": bool(report_files),
+    "valid": bool(scanned_files),
     "total_tests": latest["total"],
     "passed_tests": latest["passed"],
     "failed_tests": latest["failed"],
@@ -632,6 +782,28 @@ result = {
     "report_dirs": report_dirs,
     "parsing_errors": parsing_errors[:50],
 }
+
+# Absent facts stay absent keys: a legacy (receipt-free) run emits none of the
+# scoping keys, so recorded replay fixtures serialize byte-identically.
+if receipt_scoped:
+    result["receipt_scoped"] = True
+if auxiliary_files:
+    result["auxiliary_test_stats"] = {
+        "executed": auxiliary_counts["total"],
+        "passed": auxiliary_counts["passed"],
+        "failed": auxiliary_counts["failed"],
+        "errors": auxiliary_counts["error"],
+        "skipped": auxiliary_counts["skipped"],
+    }
+    result["auxiliary_report_files"] = auxiliary_files[:200]
+if stale_files:
+    result["stale_test_reports"] = stale_files[:200]
+if corrupt_receipts:
+    result = {
+        "valid": False,
+        "receipt_error": "; ".join(corrupt_receipts[:5]),
+        "receipt_error_files": corrupt_receipts[:20],
+    }
 print(json.dumps(result, separators=(",", ":")))
 '''
 
@@ -1510,9 +1682,38 @@ class PhysicalValidator:
             "parsing_errors": [],
         }
 
+        # Receipt scoping (Plan 5 Task B2). The primary coordinate is only
+        # resolved when receipts actually exist, so a receipt-free run keeps
+        # its command sequence — and its numbers — unchanged.
+        receipts_present = self._invocation_receipts_present()
+        primary_root = self._primary_test_coordinate_root() if receipts_present else None
+        coordinate_unresolved = receipts_present and not primary_root
+
         try:
-            compact_result = self._parse_test_reports_compact_in_container(project_dir)
-            if compact_result:
+            compact_result = self._parse_test_reports_compact_in_container(
+                project_dir, primary_root=primary_root
+            )
+            if compact_result and compact_result.get("receipt_error"):
+                return self._receipt_evidence_failure(
+                    test_result,
+                    cache_key,
+                    compact_result["receipt_error"],
+                    compact_result.get("receipt_error_files") or [],
+                )
+            if receipts_present and compact_result is None:
+                # Receipts exist but the receipt-aware parser never ran: an
+                # unscoped global rollup would silently re-inflate the primary
+                # numerator, so refuse it instead.
+                return self._receipt_evidence_failure(
+                    test_result,
+                    cache_key,
+                    (
+                        "invocation receipts exist but the receipt-scoped report "
+                        f"parser could not run in the container ({self._invocation_receipts_dir()})"
+                    ),
+                    [],
+                )
+            if compact_result and compact_result.get("valid"):
                 test_result.update(compact_result)
                 test_result.setdefault("report_files", [])
                 test_result.setdefault("report_dirs", [])
@@ -1522,6 +1723,13 @@ class PhysicalValidator:
                 test_result.setdefault("collection_errors", 0)
                 test_result.setdefault("collection_errors_skipped", 0)
                 test_result.setdefault("collection_error_summary", None)
+                if coordinate_unresolved:
+                    test_result["metrics_conflicts"] = sorted(
+                        {
+                            *(test_result.get("metrics_conflicts") or ()),
+                            "test_primary_coordinate_unresolved",
+                        }
+                    )
 
                 modules_without_tests = self._check_modules_without_tests(
                     project_dir, test_result.get("report_dirs") or []
@@ -1534,6 +1742,15 @@ class PhysicalValidator:
                         f"{'...' if len(modules_without_tests) > 5 else ''}"
                     )
 
+                self._cache_result(cache_key, test_result)
+                return test_result
+
+            if receipts_present:
+                # The receipt-scoped parser ran and found no report XML at all.
+                # The shell rescan below is deliberately skipped: its broader,
+                # provenance-free discovery is exactly what receipts exist to
+                # replace, so it must never become the receipt-scoped answer.
+                test_result["error"] = "No test report files found"
                 self._cache_result(cache_key, test_result)
                 return test_result
 
@@ -1844,8 +2061,69 @@ class PhysicalValidator:
         self._cache_result(cache_key, test_result)
         return test_result
 
+    # --- invocation receipts (Plan 5 Task B2) ------------------------------
+    def _invocation_receipts_dir(self) -> str:
+        """The schema-v1 receipt directory for this workspace."""
+        return f"{self.project_path.rstrip('/')}/{INVOCATION_RECEIPTS_DIRNAME}"
+
+    def _invocation_receipts_present(self) -> bool:
+        """One cheap probe; a receipt-free run must pay nothing beyond it."""
+        if not self.docker_orchestrator:
+            return False
+        try:
+            probe = self.docker_orchestrator.execute_command(
+                f"test -d {shlex.quote(self._invocation_receipts_dir())} && echo EXISTS"
+            )
+        except Exception as exc:
+            logger.debug(f"Invocation-receipt probe failed: {exc}")
+            return False
+        return "EXISTS" in ((probe or {}).get("output") or "")
+
+    def _primary_test_coordinate_root(self) -> Optional[str]:
+        """attempt_policy's primary test coordinate (Plan 4), or None.
+
+        Receipts alone cannot say which invocation is *primary*; that is the
+        survey coordinate's job. Without it we cannot honestly claim scoping,
+        so the caller falls back to the legacy scan and says so.
+        """
+        try:
+            from sag.agent import attempt_policy
+
+            resolution = attempt_policy.resolve_survey_test_candidates(self.docker_orchestrator)
+        except Exception as exc:
+            logger.debug(f"Primary test coordinate unresolved: {exc}")
+            return None
+        primary = getattr(resolution, "primary", None)
+        root = getattr(primary, "root", None)
+        return root or None
+
+    def _receipt_evidence_failure(
+        self,
+        test_result: Dict[str, any],
+        cache_key: str,
+        message: str,
+        error_files: List[str],
+    ) -> Dict[str, any]:
+        """Fail closed: unreadable receipts are an evidence-closure failure.
+
+        Persistence/readback failure is never "no evidence" — it means the
+        provenance of every scanned report is unknown, so no count may be
+        published and no phase may close on it.
+        """
+        logger.error(f"❌ Receipt-scoped test evidence unavailable: {message}")
+        test_result["valid"] = False
+        test_result["receipt_error"] = message
+        if error_files:
+            test_result["receipt_error_files"] = list(error_files)
+        test_result["metrics_conflicts"] = sorted(
+            {*(test_result.get("metrics_conflicts") or ()), "test_receipt_unreadable"}
+        )
+        test_result["parsing_errors"] = [*(test_result.get("parsing_errors") or []), message]
+        self._cache_result(cache_key, test_result)
+        return test_result
+
     def _parse_test_reports_compact_in_container(
-        self, project_dir: str
+        self, project_dir: str, primary_root: Optional[str] = None
     ) -> Optional[Dict[str, any]]:
         """Parse Maven/Gradle test XML inside the container and return compact JSON.
 
@@ -1853,6 +2131,14 @@ class PhysicalValidator:
         outputs. That is appropriate for logs, but corrupts XML facts when a
         validator does ``find`` followed by ``cat``. This parser keeps all XML
         reading local to the container and only returns aggregate metrics.
+
+        ``primary_root`` is attempt_policy's primary test coordinate; with it
+        the parser scopes the rollup to receipted reports. ``None`` (no
+        receipts, or no resolvable coordinate) keeps the legacy global scan.
+
+        Returns ``None`` only when the parser did not run or produced no
+        readable JSON — a run that found nothing still returns its dict, so
+        callers can tell "no reports" apart from "no parser".
         """
         from sag.tools.internal.python_tool import PYTEST_REPORT_DIR
 
@@ -1861,6 +2147,8 @@ class PhysicalValidator:
             "# SAG_COMPACT_TEST_REPORT_PARSER\n"
             f"project_dir = {json.dumps(project_dir)}\n"
             f"pytest_reports_dir = {json.dumps(PYTEST_REPORT_DIR)}\n"
+            f"receipts_dir = {json.dumps(self._invocation_receipts_dir())}\n"
+            f"primary_root = {json.dumps(primary_root) if primary_root else 'None'}\n"
             f"{_COMPACT_REPORT_PARSER_BODY}\n"
             "PY"
         )
@@ -1883,8 +2171,13 @@ class PhysicalValidator:
                 logger.debug("Compact test report parser JSON was not parseable")
                 return None
 
-        if not isinstance(parsed, dict) or not parsed.get("valid"):
+        if not isinstance(parsed, dict):
             return None
+        if parsed.get("receipt_error"):
+            logger.error(f"📊 Invocation-receipt evidence is unreadable: {parsed['receipt_error']}")
+            return parsed
+        if not parsed.get("valid"):
+            return parsed
 
         logger.info(
             "📊 Compact test report analysis: "
@@ -3799,6 +4092,18 @@ class PhysicalValidator:
             # Below the threshold -> the verdict fails on tests.
             evidence_status = "blocked"
 
+        # Receipt-scoped evidence (Plan 5 Task B2). Superseded reports are a
+        # visible conflict; an unreadable receipt is an evidence-closure
+        # failure that no pass rate may paper over.
+        if test_metrics.get("stale_test_reports"):
+            conflicts.append("test_reports_stale")
+        receipt_error = test_metrics.get("receipt_error")
+        if receipt_error:
+            conflicts.append("test_receipt_unreadable")
+            evidence_status = "conflict"
+            status = "FAILED"
+            reason = f"Invocation-receipt evidence is unreadable: {receipt_error}"
+
         result = {
             "has_test_reports": test_metrics.get("valid", False),
             "total_tests": test_metrics.get("total_tests", 0),
@@ -3841,6 +4146,19 @@ class PhysicalValidator:
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(report_files) or [project_dir],
         }
+        # Absent facts = absent keys: a receipt-free run carries none of these,
+        # so its status dict (and everything projected from it) is unchanged.
+        for key in (
+            "receipt_scoped",
+            "auxiliary_test_stats",
+            "auxiliary_report_files",
+            "stale_test_reports",
+            "receipt_error",
+            "receipt_error_files",
+        ):
+            value = test_metrics.get(key)
+            if value:
+                result[key] = value
 
         logger.info(f"Test validation complete: {status} - {reason}")
         if result["test_exclusions"]:

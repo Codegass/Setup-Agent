@@ -137,8 +137,18 @@ class _PytestReportOrchestrator:
 
 
 def _run_compact_parser(project_dir: str, pytest_reports_dir: str) -> dict:
-    """Execute the in-container parser body locally (same source string)."""
-    namespace = {"project_dir": project_dir, "pytest_reports_dir": pytest_reports_dir}
+    """Execute the in-container parser body locally (same source string).
+
+    Plan 5 Task B2 added two prepended coordinates (``receipts_dir``,
+    ``primary_root``). These sessions have no invocation receipts, so the
+    parser stays on its legacy global-scan basis.
+    """
+    namespace = {
+        "project_dir": project_dir,
+        "pytest_reports_dir": pytest_reports_dir,
+        "receipts_dir": "/workspace/.setup_agent/invocation_receipts",
+        "primary_root": None,
+    }
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
         exec(compile(_COMPACT_REPORT_PARSER_BODY, "<compact-parser>", "exec"), namespace)
