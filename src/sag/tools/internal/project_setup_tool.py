@@ -1169,15 +1169,15 @@ class ProjectSetupTool(BaseTool):
         venv = requirements.get("python_venv") or f"{directory}/.venv"
 
         # Venv next. A provisioning pre-flight already created it (uv/apt).
+        creation_failure: Optional[Dict[str, Any]] = None
         if not outcome.provisioned and not self._python_venv_exists(venv):
             made = self.orchestrator.execute_command(f"python3 -m venv {venv}", workdir=directory)
             if not made.get("success"):
-                return {
-                    "success": False,
-                    "error": f"could not create venv at {venv}: {made.get('output', '')}",
-                    "exit_code": made.get("exit_code"),
-                    "venv": venv,
-                }
+                # Do NOT return here. The exact live failure (Debian splits
+                # ensurepip out of the system python — 2026-07-24 TVM run) is
+                # what the ensure_venv_pip ladder below repairs; an early
+                # return made that ladder unreachable for creation failures.
+                creation_failure = made
 
         output_lines = [outcome.narration] if outcome.narration else []
 
@@ -1191,6 +1191,18 @@ class ProjectSetupTool(BaseTool):
         if repair_note:
             logger.info(repair_note)
             output_lines.append(repair_note)
+
+        if creation_failure is not None and not repair.get("ok"):
+            return {
+                "success": False,
+                "error": (
+                    f"could not create venv at {venv}: "
+                    f"{creation_failure.get('output', '')} "
+                    f"(repair ladder exhausted: {', '.join(repair.get('ladder') or [])})"
+                ),
+                "exit_code": creation_failure.get("exit_code"),
+                "venv": venv,
+            }
 
         # The project's OWN declared installer (shared faithfulness ladder).
         listing = self.orchestrator.execute_command(f"ls -A1 {directory}", workdir=directory)
