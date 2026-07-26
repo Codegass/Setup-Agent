@@ -1091,3 +1091,45 @@ def test_failed_refresh_caps_a_green_test_gate_without_requesting_another_refres
     assert capped.validated_outcome is PhaseOutcome.UNKNOWN
     assert capped.code == "test_candidate_resolution_unavailable"
     assert engine._missing_required_test_attempt() is None
+
+
+def _terminal_gradle_result():
+    return ToolResult.completed_success(
+        output="BUILD SUCCESSFUL\n2 actionable tasks: 2 executed",
+        metadata={"runner_dispatched": True, "command": "./gradlew test"},
+    )
+
+
+def test_auxiliary_island_receipt_does_not_discharge_the_primary():
+    orchestrator = ManifestOrchestrator()
+    orchestrator.manifest["test_islands"] = [
+        {"root": "/workspace/bigtop/bigtop-test-framework", "system": "gradle"},
+        {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle"},
+    ]
+    state = _ready_state()
+    _record_gradle_test(
+        state, _terminal_gradle_result(), root="/workspace/bigtop/bigtop-test-framework"
+    )
+    requirement = required_test_attempt(
+        state, orchestrator, phase="test", attempt_id="test-1"
+    )
+    assert requirement is not None
+    assert requirement.root == "/workspace/bigtop/bigtop-data-generators"
+
+
+def test_primary_receipt_discharges_the_requirement():
+    orchestrator = ManifestOrchestrator()
+    state = _ready_state()
+    _record_gradle_test(
+        state, _terminal_gradle_result(), root="/workspace/bigtop/bigtop-data-generators"
+    )
+    assert (
+        required_test_attempt(state, orchestrator, phase="test", attempt_id="test-1")
+        is None
+    )
+
+
+def test_resolution_exposes_the_primary_candidate():
+    resolution = resolve_survey_test_candidates(ManifestOrchestrator())
+    assert resolution.primary is not None
+    assert resolution.primary.root == "/workspace/bigtop/bigtop-data-generators"

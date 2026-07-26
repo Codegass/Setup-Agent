@@ -73,6 +73,7 @@ class TestCandidateResolution:
     candidates: tuple[TestAttemptRequirement, ...] = ()
     project_root: str | None = None
     workspace_root: str | None = None
+    primary: TestAttemptRequirement | None = None
 
     def to_snapshot(self) -> dict[str, Any]:
         return {
@@ -252,7 +253,7 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
             status="unsafe_coordinates",
             workspace_root=workspace_root,
         )
-    raw_candidates: list[tuple[Any, Any]] = []
+    raw_candidates: list[tuple[Any, Any, bool]] = []
     islands = manifest.get("test_islands") or ()
     if not isinstance(islands, (list, tuple)):
         return TestCandidateResolution(
@@ -260,16 +261,20 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
             project_root=project_root,
             workspace_root=workspace_root,
         )
+    # The manifest test_root/test_system pair is the PRIMARY coordinate and
+    # is processed first (spec §3.4-6): auxiliary islands may add evidence
+    # but can never substitute for it.
+    raw_candidates.append((manifest.get("test_root"), manifest.get("test_system"), True))
     for island in islands:
         if isinstance(island, Mapping):
             raw_candidates.append(
-                (island.get("root"), island.get("system") or manifest.get("test_system"))
+                (island.get("root"), island.get("system") or manifest.get("test_system"), False)
             )
-    raw_candidates.append((manifest.get("test_root"), manifest.get("test_system")))
 
     candidates: list[TestAttemptRequirement] = []
+    primary: TestAttemptRequirement | None = None
     seen: set[tuple[str, str]] = set()
-    for raw_root, raw_system in raw_candidates:
+    for raw_root, raw_system, is_primary in raw_candidates:
         system = _normalized_system(raw_system)
         if not raw_root or system is None:
             continue
@@ -315,10 +320,18 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
                 project_root=project_root,
                 workspace_root=workspace_root,
             )
+        requirement = _candidate_requirement(root, system)
         if (root, system) in seen:
+            if is_primary and primary is None:
+                primary = next(
+                    (c for c in candidates if c.root == root and c.system == system),
+                    None,
+                )
             continue
         seen.add((root, system))
-        candidates.append(_candidate_requirement(root, system))
+        candidates.append(requirement)
+        if is_primary and primary is None:
+            primary = requirement
     if not candidates:
         return TestCandidateResolution(
             status="coordinates_missing",
@@ -330,6 +343,7 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
         candidates=tuple(candidates),
         project_root=project_root,
         workspace_root=workspace_root,
+        primary=primary,
     )
 
 
@@ -646,18 +660,20 @@ def required_test_attempt(
             reason_code=resolved.status,
         )
     candidates = resolved.candidates
-    if terminal_test_receipts(state, attempt_id=attempt_id, candidates=candidates):
+    primary = resolved.primary
+    gate_candidates = (primary,) if primary is not None else candidates
+    if terminal_test_receipts(state, attempt_id=attempt_id, candidates=gate_candidates):
         return None
     if forced_test_refusal_receipts(
         state,
         attempt_id=attempt_id,
-        candidates=candidates,
+        candidates=gate_candidates,
     ):
         return None
     pending = _pending_test_dispatches(
         state,
         attempt_id=attempt_id,
-        candidates=candidates,
+        candidates=gate_candidates,
     )
     if pending:
         observation = pending[0]
@@ -675,13 +691,94 @@ def required_test_attempt(
             reason_code="pending_test_poll_required",
             parent_execution_id=observation.execution_id,
         )
-    return candidates[0]
+    return primary if primary is not None else candidates[0]
+
+
+_LOCAL_PREREQUISITE_SIGNATURES = (
+    "ensurepip is not available",
+    "command not found",
+    "no module named pip",
+    "no module named ensurepip",
+)
+
+_BUILD_RUNNER_TOOLS = frozenset({"build", "maven", "gradle", "python"})
+
+
+def local_prerequisite_signature(text: str) -> str | None:
+    """Match text against known local, mechanically repairable prerequisites."""
+    lowered = (text or "").lower()
+    for signature in _LOCAL_PREREQUISITE_SIGNATURES:
+        if signature in lowered:
+            return signature
+    return None
+
+
+def has_build_attempt_receipt(
+    state: RunEvidenceState | None, *, attempt_id: str | None
+) -> bool:
+    """One real build-runner dispatch in this build attempt (terminal or not)."""
+    if state is None or not attempt_id:
+        return False
+    for observation in state.tool_observations:
+        if observation.source_phase != "build":
+            continue
+        if observation.source_attempt_id != attempt_id:
+            continue
+        if observation.tool_name not in _BUILD_RUNNER_TOOLS:
+            continue
+        metadata = observation.result.metadata or {}
+        if metadata.get("runner_dispatched") is True and str(
+            metadata.get("command") or ""
+        ).strip():
+            return True
+    return False
+
+
+def build_attempt_requirement(
+    state: RunEvidenceState | None,
+    orchestrator: Any,
+    *,
+    phase: str | None,
+    attempt_id: str | None,
+) -> str | None:
+    """Reject build closure without one real build attempt (spec §3.4-7).
+
+    Fail-closed: an unreadable survey manifest never proves a no-target
+    project, so it still requires an attempt."""
+    if state is None or phase != "build":
+        return None
+    if has_build_attempt_receipt(state, attempt_id=attempt_id):
+        return None
+    manifest: Any = None
+    try:
+        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
+        if isinstance(result, Mapping) and result.get("success"):
+            manifest = json.loads(str(result.get("output") or ""))
+    except Exception:
+        manifest = None
+    if isinstance(manifest, Mapping) and manifest:
+        islands = manifest.get("build_islands") or ()
+        build_system = manifest.get("build_system") or (
+            (manifest.get("build_recommendation") or {}).get("build_system")
+        )
+        if not islands and not build_system:
+            return None  # survey-proven no-target project
+    return (
+        "Build phase cannot terminate before one real build attempt receipt. "
+        "NEXT REQUIRED ACTION: build(action='compile') at the surveyed build "
+        "root, or build(action='deps') when dependencies are the failure. "
+        "Missing OS packages or venv modules are local repairable "
+        "prerequisites, not external blockers."
+    )
 
 
 __all__ = [
     "CandidateResolutionStatus",
     "TestAttemptRequirement",
     "TestCandidateResolution",
+    "build_attempt_requirement",
+    "has_build_attempt_receipt",
+    "local_prerequisite_signature",
     "required_test_attempt",
     "has_test_candidate_refresh_receipt",
     "forced_test_refusal_receipts",
