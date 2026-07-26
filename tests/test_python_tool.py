@@ -26,6 +26,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 import sag.tools.internal.build_preflight as bp
+from sag.agent.invocation_receipts import RECEIPT_DIR
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.python_tool import (
     _NATIVE_PROJECT_READY_SCRIPT,
@@ -35,6 +36,23 @@ from sag.tools.internal.python_tool import (
     PythonTool,
     verify_project_owned_path,
 )
+
+
+def pytest_runs(orch):
+    """Physical pytest invocations recorded on the orchestrator.
+
+    The P0-A invocation receipt quotes the run's own argv inside its JSON
+    body, so a bare "-m pytest" substring scan of the command log would count
+    one run twice.
+    """
+    return [
+        command
+        for command in orch.commands
+        if "-m pytest" in command
+        and "--collect-only" not in command
+        and "--version" not in command
+        and RECEIPT_DIR not in command
+    ]
 
 
 def ok(output=""):
@@ -741,11 +759,7 @@ def test_test_writes_collected_denominator_and_junitxml_report():
     assert result.succeeded is True
     writes = [c for c in orch.commands if COLLECTED_JSON in c and "<<" in c]
     assert writes and '"collected": 42' in writes[0]
-    runs = [
-        c
-        for c in orch.commands
-        if "-m pytest" in c and "--collect-only" not in c and "--version" not in c
-    ]
+    runs = pytest_runs(orch)
     assert len(runs) == 1
     assert runs[0].startswith("/workspace/proj/.venv/bin/python -m pytest")
     assert f"--junitxml={PYTEST_REPORT_DIR}/pytest-" in runs[0]
@@ -984,11 +998,7 @@ def test_pytest_failures_are_honest_and_never_rerun():
         ],
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
-    runs = [
-        c
-        for c in orch.commands
-        if "-m pytest" in c and "--collect-only" not in c and "--version" not in c
-    ]
+    runs = pytest_runs(orch)
     assert len(runs) == 1  # exit 1 with failures is an HONEST result, not an error to retry
     # Bug #13 defect 6: tests that RAN with failures are an honest green —
     # the result (stats in output) is the deliverable, not an error state.
@@ -1697,9 +1707,7 @@ def test_native_unready_bare_test_uses_surveyed_bounded_smoke_without_full_colle
         f"/workspace/tvm/.venv/bin/python -m pytest --collect-only -q "
         f"{TVM_SMOKE_PATH} --maxfail=1"
     ]
-    runs = [
-        command for command in orch.commands if "--junitxml" in command and "-m pytest" in command
-    ]
+    runs = pytest_runs(orch)
     assert len(runs) == 1
     assert f"{TVM_SMOKE_PATH} --maxfail=1" in runs[0]
     writes = [command for command in orch.commands if COLLECTED_JSON in command and "<<" in command]

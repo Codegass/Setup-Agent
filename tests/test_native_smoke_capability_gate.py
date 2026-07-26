@@ -23,6 +23,7 @@ from test_python_tool import (
     Orch,
     fail,
     ok,
+    pytest_runs,
     tvm_native_smoke_rules,
 )
 
@@ -102,9 +103,7 @@ def test_ready_native_project_without_receipt_still_runs_bounded_smoke():
     collects = [command for command in orch.commands if "--collect-only" in command]
     assert len(collects) == 1
     assert TVM_SMOKE_PATH in collects[0]
-    runs = [
-        command for command in orch.commands if "--junitxml" in command and "-m pytest" in command
-    ]
+    runs = pytest_runs(orch)
     assert len(runs) == 1
     assert f"{TVM_SMOKE_PATH} --maxfail=1" in runs[0]
 
@@ -284,9 +283,7 @@ def test_explicit_args_with_receipt_use_the_plain_allowlist():
     assert result.succeeded is True
     assert result.metadata["collection_scope"] == "filtered"
     assert result.metadata["smoke_receipt_present"] is True
-    runs = [
-        command for command in orch.commands if "--junitxml" in command and "-m pytest" in command
-    ]
+    runs = pytest_runs(orch)
     assert len(runs) == 1
     assert "-m pytest tests --junitxml=" in runs[0]
 

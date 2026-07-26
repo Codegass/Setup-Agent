@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
 from sag.runtime.env_overlay import EnvOverlayStore
@@ -52,6 +53,9 @@ class MavenTool(BaseTool):
         self.command_tracker = command_tracker
         self.toolchain_manager = toolchain_manager or ToolchainManager(orchestrator)
         self.output_storage = None  # Will be initialized when needed
+        # Receipt facts for the LAST physical dispatch of the current execute()
+        # call (P0-A); merged into whichever ToolResult that call returns.
+        self._pending_invocation_receipt: Optional[Dict[str, Any]] = None
 
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use Maven-specific extraction."""
@@ -139,6 +143,8 @@ class MavenTool(BaseTool):
 
             timeout: Maximum seconds to wait for command completion (default: 300)
         """
+
+        self._pending_invocation_receipt = None
 
         # Whether the agent explicitly scoped this invocation. The
         # orchestration layer (PR #12) owns working-directory injection, so
@@ -368,6 +374,13 @@ class MavenTool(BaseTool):
             extra_args=extra_args,
             maven_executable=maven_executable,
         )
+        # The lifecycle actually handed to Maven (the caller's command plus any
+        # extra goals) versus what this tool was asked for. Both go into the
+        # invocation receipt so a later reader never has to re-derive them.
+        requested_action = self._action_text(command)
+        effective_action = " ".join(
+            part for part in (requested_action, self._action_text(goals)) if part
+        )
 
         # Check if this is a multi-module project running tests without fail handling
         is_multi_module = self._is_multi_module_project(working_directory)
@@ -436,8 +449,25 @@ class MavenTool(BaseTool):
                 # Use regular version for quick commands like help, version, etc.
                 return self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
 
+            def _run_build_with_receipt(attempt: int):
+                # P0-A: bracket the physical dispatch with report-XML content
+                # hashes so the reports THIS invocation wrote are attributable,
+                # instead of being inferred from a later global scan.
+                before = snapshot_reports(self.orchestrator.execute_command, [working_directory])
+                dispatched = _run_build()
+                self._record_invocation_receipt(
+                    requested_action=requested_action,
+                    effective_action=effective_action,
+                    argv=maven_cmd,
+                    working_directory=working_directory,
+                    attempt=attempt,
+                    result=dispatched,
+                    before=before,
+                )
+                return dispatched
+
             _build_t0 = time.monotonic()
-            result = _run_build()
+            result = _run_build_with_receipt(1)
             runner_dispatched_any = result.get("runner_dispatched") is True
             self._record_execution_receipt(
                 command,
@@ -472,7 +502,7 @@ class MavenTool(BaseTool):
                         )
                         jdk_retry_meta = {"from": active, "to": needed}
                         retry_t0 = time.monotonic()
-                        result = _run_build()
+                        result = _run_build_with_receipt(2)
                         self._record_execution_receipt(
                             command,
                             maven_cmd,
@@ -495,12 +525,14 @@ class MavenTool(BaseTool):
                 return handoff
 
             if result.get("termination_reason"):
-                return self._timeout_result_from_command(
-                    result,
-                    maven_cmd,
-                    command,
-                    maven_runtime=maven_runtime,
-                    maven_version_requirement=requested_requirement_metadata,
+                return self._apply_invocation_receipt(
+                    self._timeout_result_from_command(
+                        result,
+                        maven_cmd,
+                        command,
+                        maven_runtime=maven_runtime,
+                        maven_version_requirement=requested_requirement_metadata,
+                    )
                 )
 
             # Analyze the output
@@ -849,6 +881,55 @@ class MavenTool(BaseTool):
             tool_result.raw_output = preamble + (tool_result.raw_output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
+        return self._apply_invocation_receipt(tool_result)
+
+    @staticmethod
+    def _action_text(value: Any) -> str:
+        """Normalized goal text — accepts the list form _build_maven_command does."""
+        if isinstance(value, (list, tuple)):
+            return " ".join(str(part) for part in value)
+        return " ".join(shlex.split(str(value or "")))
+
+    def _record_invocation_receipt(
+        self,
+        *,
+        requested_action: str,
+        effective_action: str,
+        argv: str,
+        working_directory: str,
+        attempt: int,
+        result: Dict[str, Any],
+        before: Dict[str, str],
+    ) -> None:
+        """Persist the P0-A invocation receipt for one physical dispatch.
+
+        A build still in flight (detached hand-off) has no terminal outcome
+        and no meaningful report delta yet, so it mints nothing; the poll that
+        observes its completion is what carries evidence.
+        """
+        self._pending_invocation_receipt = None
+        if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
+            return
+        after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
+        self._pending_invocation_receipt = record_invocation(
+            self.orchestrator.execute_command,
+            tool="maven",
+            attempt=attempt,
+            requested_action=requested_action,
+            effective_action=effective_action,
+            argv=argv,
+            working_directory=working_directory,
+            exit_code=result.get("exit_code"),
+            before=before,
+            after=after,
+        )
+
+    def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:
+        """Byte-compat: `receipt_id` on success, `receipt_persisted` only on
+        failure — nothing at all on paths that dispatched no runner."""
+        receipt_metadata = getattr(self, "_pending_invocation_receipt", None)
+        if receipt_metadata:
+            tool_result.metadata.update(receipt_metadata)
         return tool_result
 
     def _record_execution_receipt(

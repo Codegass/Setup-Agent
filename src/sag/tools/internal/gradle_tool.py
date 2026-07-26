@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, TestStats
 
@@ -40,6 +41,9 @@ class GradleTool(BaseTool):
         self.orchestrator = orchestrator
         self.toolchain_manager = toolchain_manager or ToolchainManager(orchestrator)
         self.output_storage = None  # Will be initialized when needed
+        # Receipt facts for the LAST physical dispatch of the current execute()
+        # call (P0-A); merged into whichever ToolResult that call returns.
+        self._pending_invocation_receipt: Optional[Dict[str, Any]] = None
 
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use Gradle-specific extraction."""
@@ -85,6 +89,8 @@ class GradleTool(BaseTool):
                         For test tasks, automatically adds test.ignoreFailures=true.
                         Essential for running ALL tests in multi-module projects.
         """
+
+        self._pending_invocation_receipt = None
 
         # Handle command as alias for tasks
         if command and not tasks:
@@ -273,7 +279,23 @@ class GradleTool(BaseTool):
                     gradle_cmd, workdir=working_directory, timeout=timeout
                 )
 
-            result = _run_build()
+            def _run_build_with_receipt(attempt: int):
+                # P0-A: bracket the physical dispatch with report-XML content
+                # hashes so the reports THIS invocation wrote are attributable,
+                # instead of being inferred from a later global scan.
+                before = snapshot_reports(self.orchestrator.execute_command, [working_directory])
+                dispatched = _run_build()
+                self._record_invocation_receipt(
+                    requested_action=tasks,
+                    argv=gradle_cmd,
+                    working_directory=working_directory,
+                    attempt=attempt,
+                    result=dispatched,
+                    before=before,
+                )
+                return dispatched
+
+            result = _run_build_with_receipt(1)
 
             # Bounded retry: a version-shaped failure means the requirement in
             # the error text is authoritative; re-provision from it and rerun
@@ -299,13 +321,15 @@ class GradleTool(BaseTool):
                             f"re-provisioned, retry 1/1\n"
                         )
                         jdk_retry_meta = {"from": active, "to": needed}
-                        result = _run_build()
+                        result = _run_build_with_receipt(2)
 
             if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("gradle", gradle_cmd, result)
 
             if result.get("termination_reason"):
-                return self._timeout_result_from_command(result, gradle_cmd, tasks)
+                return self._apply_invocation_receipt(
+                    self._timeout_result_from_command(result, gradle_cmd, tasks)
+                )
 
             # Analyze the output
             analysis = self._analyze_gradle_output(result["output"], result["exit_code"])
@@ -443,6 +467,50 @@ class GradleTool(BaseTool):
             tool_result.raw_output = preamble + (tool_result.raw_output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
+        return self._apply_invocation_receipt(tool_result)
+
+    def _record_invocation_receipt(
+        self,
+        *,
+        requested_action: str,
+        argv: str,
+        working_directory: str,
+        attempt: int,
+        result: Dict[str, Any],
+        before: Dict[str, str],
+    ) -> None:
+        """Persist the P0-A invocation receipt for one physical dispatch.
+
+        Gradle runs the task list it was handed (the facade already mapped the
+        verb), so the two actions coincide — EXCEPT when no task was named at
+        all, where _build_gradle_command substitutes `build`. That
+        substitution is exactly the kind of divergence the receipt exists to
+        record, so it is written down rather than smoothed over.
+        """
+        self._pending_invocation_receipt = None
+        if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
+            return
+        after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
+        requested = " ".join(shlex.split(str(requested_action or "")))
+        self._pending_invocation_receipt = record_invocation(
+            self.orchestrator.execute_command,
+            tool="gradle",
+            attempt=attempt,
+            requested_action=requested,
+            effective_action=requested or "build",
+            argv=argv,
+            working_directory=working_directory,
+            exit_code=result.get("exit_code"),
+            before=before,
+            after=after,
+        )
+
+    def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:
+        """Byte-compat: `receipt_id` on success, `receipt_persisted` only on
+        failure — nothing at all on paths that dispatched no runner."""
+        receipt_metadata = getattr(self, "_pending_invocation_receipt", None)
+        if receipt_metadata:
+            tool_result.metadata.update(receipt_metadata)
         return tool_result
 
     def _resolve_gradle_executable(self, working_directory: str, prefer_wrapper: bool = True):
