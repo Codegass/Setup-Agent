@@ -1,5 +1,44 @@
 # SAG v2 Final Acceptance — Plans 1–3 Complete (spec §3.7)
 
+> ## ⚠️ CORRECTION (2026-07-26, post-publication review)
+>
+> A post-publication audit (hand-verified against the raw session evidence)
+> falsified this report's TVM section. Confirmed against
+> `control_events.jsonl` and the live containers:
+>
+> 1. **The TVM runs did NOT run the surveyed bounded smoke.** All three
+>    executed a bare `python -m pytest` with `collection_scope: full`,
+>    `collected: 11702`. The §3.7.5 clause "never performs a full-suite
+>    sweep" is **VIOLATED**, not passed.
+> 2. **The "56 tests executed" claim is wrong.** The 28 errors / 28 skipped
+>    are pytest *collection* nodes; `executed` is effectively 0. TVM has
+>    still never executed its bounded smoke in any recorded run, and its
+>    outcome under this environment is unknown.
+> 3. **The root cause is wrong.** `libtvm_ffi.so` exists (the native build
+>    RAN during the `--no-deps` editable install); the collection errors are
+>    `RuntimeError: LLVM version is not available` — TVM was built without
+>    LLVM support. The wall is toolchain capability, not a missing build.
+> 4. **Why the guard failed:** the native-readiness probe (import + PEP 610
+>    + any native lib under the artifact root) judged the LLVM-less build
+>    "ready", disabling the bounded-smoke defense. The truth
+>    (`collection_scope`/`collected`) was in structured metadata but never
+>    projected into model-, advisor-, or verdict-facing summaries — which
+>    is also how this report repeated the error.
+> 5. **Advisor claims softened:** bigtop r1's "build ×13" includes 8
+>    redirect-cancelled duplicates; real executed builds were 5. All four
+>    islands WERE re-attempted after consult (1 success, 3 failures) — the
+>    audit's "only one island resubmitted" is contradicted by builds
+>    #10–13 — but the friction is real, and phase re-entry resets
+>    `_advisor_calls_in_phase`, so before-acting cancelled a second
+>    correctly-planned 4-island batch. Advisor: mechanism PASS, efficacy
+>    UNPROVEN.
+>
+> **Re-graded verdict: commons-cli PASS · bigtop PASS · native protocol
+> PASS · TVM PENDING (guard defect + unverified smoke) · advisor mechanism
+> PASS / efficacy UNPROVEN.** The claim "every §3.7 clause passed" is
+> retracted. The body below is preserved unamended as the record of what
+> this report got wrong.
+
 **Date:** 2026-07-26
 **Code under test:** main @ `e349628` (Plan 1 + Plan 2 + Plan 3 all merged)
 **Pins:** model `gpt-5.4-mini` (thinking=action=advisor), image
