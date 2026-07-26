@@ -44,6 +44,32 @@ def _pytest_attempts(session: str):
             yield payload, meta
 
 
+def _junit_counts(meta: dict):
+    """(tests, failed, errors, skipped) — None when the attempt reported none."""
+    values = [meta.get(key) for key in ("tests", "failed_tests", "error_tests", "skipped_tests")]
+    if not all(isinstance(value, int) for value in values):
+        return None
+    return tuple(values)
+
+
+def _junit_passed(meta: dict):
+    """Non-skipped passes the attempt actually proved — None when unknowable."""
+    counts = _junit_counts(meta)
+    if counts is None:
+        return None
+    tests, failed, errors, skipped = counts
+    return tests - failed - errors - skipped
+
+
+def _all_skipped(meta: dict) -> bool:
+    """A clean run in which every selected test skipped — proves no capability."""
+    counts = _junit_counts(meta)
+    if counts is None:
+        return False
+    tests, failed, errors, skipped = counts
+    return tests >= 1 and skipped == tests and failed == 0 and errors == 0
+
+
 class Verifier:
     def __init__(self, session: str) -> None:
         self.session = session
@@ -92,6 +118,13 @@ class Verifier:
         with open(os.path.join(self.session, ".setup_agent", "verdict.json")) as handle:
             return json.load(handle)
 
+    def _receipt(self):
+        path = os.path.join(self.session, ".setup_agent", "native_smoke_receipt.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as handle:
+            return json.load(handle)
+
     def _report_text(self) -> str:
         reports = sorted(glob.glob(os.path.join(self.session, "setup-report-*.md")))
         if not reports:
@@ -135,8 +168,30 @@ class Verifier:
                     executed in (0, None),
                     f"executed={executed!r} with collection_errors={collection_errors}",
                 )
+            if _all_skipped(meta):
+                self.check(
+                    f"tvm.attempt{index}.no_receipt_on_all_skipped",
+                    not meta.get("smoke_receipt_written"),
+                    f"all {meta.get('tests')} selected tests skipped, "
+                    "yet smoke_receipt_written is set (capability NOT proven)",
+                )
+            # A mint only counts when this attempt's junit counts back it: an
+            # all-skipped receipt proves nothing, so it cannot unlock a later
+            # full collect.
             if meta.get("smoke_receipt_written"):
-                receipt_minted = True
+                passed = _junit_passed(meta)
+                if isinstance(passed, int) and passed >= 1:
+                    receipt_minted = True
+
+        receipt = self._receipt()
+        if receipt is not None:
+            passed = (receipt.get("stats") or {}).get("passed")
+            self.check(
+                "tvm.receipt.positive_evidence",
+                isinstance(passed, int) and passed >= 1,
+                f"native_smoke_receipt.json stats.passed={passed!r} "
+                f"(stats={receipt.get('stats')!r})",
+            )
 
         verdict = self._verdict()
         stats = verdict.get("test_stats") or {}
