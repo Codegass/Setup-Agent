@@ -1572,6 +1572,10 @@ class ReActEngine(UIEventEmitter):
             self._journal_intro_dirty = True
             self._journal_last_ledger = None
             self._start_phase_branch()
+            # Guarantee 1 (spec §3.2): the advice lands in the fresh window
+            # BEFORE the model plans this phase — including on a repair
+            # re-entry.
+            self._maybe_consult_advisor_at_phase_entry()
 
     def _project_name_for_gate(self) -> str | None:
         try:
@@ -2179,6 +2183,9 @@ class ReActEngine(UIEventEmitter):
             self._journal_intro_dirty = True
             self._journal_last_ledger = None
             self._start_phase_branch()
+            # Same seam as `_apply_phase_decision`: a run that STARTS in build
+            # or test (a resumed flow) gets its entry consult too.
+            self._maybe_consult_advisor_at_phase_entry()
         else:
             self.steps = []
 
@@ -3078,6 +3085,9 @@ class ReActEngine(UIEventEmitter):
     def _reset_advisor_run_state(self) -> None:
         """Run-scoped advisor state: the telemetry log plus the phase bits."""
         self._advisor_calls: List[Dict[str, Any]] = []
+        # Run-scoped so `advisor-entry-<n>` ids stay unique across every phase
+        # entry and re-entry of the run.
+        self._advisor_entry_counter = 0
         self._reset_advisor_phase_state()
 
     def _reset_advisor_phase_state(self) -> None:
@@ -3085,11 +3095,17 @@ class ReActEngine(UIEventEmitter):
 
         The cap is per phase, and the two guarantee bits describe "what has
         happened in THIS phase since the last consult" — carrying either across
-        a transition would redirect a phase for a failure it never saw."""
+        a transition would redirect a phase for a failure it never saw.
+
+        `_advisor_entry_consult_done` clears here on purpose: a phase RE-entry
+        (a repair loop) is a new entry and gets fresh advice, bounded by the
+        cap. Under the deleted before-acting redirect that same reset re-armed
+        a trap instead (2026-07-26 audit)."""
         self._advisor_calls_in_phase = 0
         self._had_failure_since_consult = False
         self._advisor_redirect_armed = False
         self._advisor_loop_guidance = ""
+        self._advisor_entry_consult_done = False
 
     @property
     def advisor_mode(self) -> str:
@@ -3187,6 +3203,109 @@ class ReActEngine(UIEventEmitter):
             },
         )
 
+    # Guarantee 1 (spec §3.2, amended 2026-07-26): the phases whose entry the
+    # harness consults on. provision/analyze actions are dictated by the phase
+    # objective, so they buy nothing from a reviewer.
+    _ADVISOR_ENTRY_PHASES = frozenset({"build", "test"})
+    _ADVISOR_ENTRY_NATIVE_TEXT = "[harness] consulting the advisor at phase entry"
+    _ADVISOR_ENTRY_ACTION_TEXT = "HARNESS CONSULT: advisor at phase entry"
+
+    def _maybe_consult_advisor_at_phase_entry(self) -> bool:
+        """Consult the advisor mechanically on entering build or test.
+
+        This REPLACES the before-acting redirect (which refused the phase's
+        first state-changing call and pointed at `advisor()`). The 2026-07-26
+        post-acceptance audit falsified that mechanism: in bigtop r1 it
+        cancelled two correctly-planned 4-island batches — 8 wasted calls — and
+        every phase re-entry reset the counter and re-armed the trap. A weak
+        model cannot be required to re-remember a batch the harness threw away.
+        Consulting at entry buys the SAME advice, in the window before the
+        model plans, at zero cancelled work.
+
+        The advisor still never blocks a run: mode "off" and an exhausted phase
+        cap skip silently, and any failure inside the consult degrades to no
+        consult rather than to an exception. Returns whether a consult pair was
+        appended (for tests and callers; the caller never acts on False)."""
+        machine = getattr(self, "phase_machine", None)
+        phase = str(getattr(machine, "current_phase", "") or "")
+        if phase not in self._ADVISOR_ENTRY_PHASES:
+            return False
+        if getattr(self, "_advisor_entry_consult_done", False):
+            return False
+        if not self._advisor_enabled() or self._advisor_cap_exhausted():
+            return False
+        # Latched BEFORE the consult: a consult that raises half-way must not
+        # be retried on the next call of this seam.
+        self._advisor_entry_consult_done = True
+        try:
+            self._append_entry_consult_pair()
+            return True
+        except Exception as exc:
+            # Module logger, not `agent_logger`: this handler is the last thing
+            # standing between an advisor defect and an aborted run, so it may
+            # not itself depend on engine state being complete.
+            logger.warning(f"Advisor phase-entry consult skipped: {exc}")
+            return False
+
+    def _append_entry_consult_pair(self) -> None:
+        """The harness authors one advisor call, forced-attempt style.
+
+        Same shape as `_force_required_test_attempt`: a synthetic ACTION step
+        whose id the harness mints, answered immediately by its observation, so
+        the pairing invariant and the evidence trail hold without a second code
+        path. The result is `consult_advisor()`'s — the identical contract the
+        model's own `advisor()` call gets, cap accounting included."""
+        result = self.consult_advisor()
+        call = ToolCall(
+            name="advisor",
+            raw_params={},
+            validated_params={},
+            raw_action_text=self._ADVISOR_ENTRY_ACTION_TEXT,
+            source_step_index=getattr(self, "current_iteration", 0),
+            model_used="harness",
+        )
+        execution = ToolExecution(
+            call=call,
+            result=result,
+            status="success",
+            raw_params={},
+            validated_params={},
+            observation_text=format_tool_result("advisor", result),
+            attempted_execution=True,
+            metadata={"advisor_entry_consult": True},
+        )
+        recorded, execution_id, actual_executions = self._record_execution_bundle(execution, call)
+        self._advisor_entry_counter = int(getattr(self, "_advisor_entry_counter", 0)) + 1
+        entry_call_id = f"advisor-entry-{self._advisor_entry_counter}"
+        self.steps.append(
+            ReActStep(
+                step_type=StepType.ACTION,
+                content=self._ADVISOR_ENTRY_ACTION_TEXT,
+                tool_name="advisor",
+                tool_params={},
+                tool_result=recorded,
+                timestamp=self._get_timestamp(),
+                model_used="harness",
+                tool_call_id=entry_call_id,
+                native_text=self._ADVISOR_ENTRY_NATIVE_TEXT,
+            )
+        )
+        # The ACTION step is appended first on purpose: the envelope keys off
+        # the newest ACTION identity, exactly as a model-issued call does.
+        self._emit_control_tool_result(
+            envelope_id=self._emit_control_action_envelope("advisor", {}),
+            execution_id=execution_id,
+            tool="advisor",
+            params={},
+            result=recorded,
+            actual_executions=actual_executions,
+        )
+        self._append_native_observation(
+            entry_call_id,
+            execution.observation_text,
+            source_tool="advisor",
+        )
+
     def _advisor_messages(self) -> List[Dict[str, str]]:
         """System reviewer brief + the whole phase transcript and evidence.
 
@@ -3229,9 +3348,42 @@ class ReActEngine(UIEventEmitter):
             lines.append(f"{role.upper()}: {content}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _advisor_count(value: Any) -> str:
+        """Counts render like the model-visible collection line: None is
+        `unknown`, never 0 — an unobserved count is not a zero count."""
+        return "unknown" if value is None else str(value)
+
+    def _last_test_attempt_line(self) -> str:
+        """The newest pytest attempt's collection facts, verbatim from its
+        metadata (Plan 4 Tasks 1-2 keys).
+
+        The reviewer's whole job in the test phase is judging whether a suite
+        actually RAN. Before this line, a run whose every attempt died in
+        collection looked to the advisor exactly like a run that executed
+        tests and failed them (live TVM: 28 collection errors, 0 executed)."""
+        state = getattr(self, "run_evidence_state", None)
+        for observation in reversed(tuple(getattr(state, "tool_observations", ()) or ())):
+            metadata = dict(getattr(getattr(observation, "result", None), "metadata", None) or {})
+            if "collection_scope" not in metadata:
+                continue
+            command = str(
+                metadata.get("command") or metadata.get("collection_command") or ""
+            ).strip()
+            return (
+                f"Last test attempt: {command or 'unknown'} — "
+                f"scope={metadata.get('collection_scope') or 'unknown'}, "
+                f"collected={self._advisor_count(metadata.get('collected'))}, "
+                f"selected={self._advisor_count(metadata.get('collected_after_deselection'))}, "
+                f"executed={self._advisor_count(metadata.get('executed'))}, "
+                f"collection_errors={self._advisor_count(metadata.get('collection_errors'))}"
+            )
+        return ""
+
     def _advisor_evidence_digest(self) -> str:
         """The deterministic evidence section: handoff projection, untried
-        islands, and the armed recurrence guidance."""
+        islands, the armed recurrence guidance, and the last test attempt's
+        collection facts."""
         parts: List[str] = []
         handoff = getattr(self, "phase_handoff", None)
         if handoff is not None:
@@ -3248,6 +3400,14 @@ class ReActEngine(UIEventEmitter):
         guidance = str(getattr(self, "_advisor_loop_guidance", "") or "").strip()
         if guidance and getattr(self, "_advisor_redirect_armed", False):
             parts.append(guidance)
+        try:
+            last_test = self._last_test_attempt_line()
+        except Exception as exc:
+            # A digest gap must not cost the run its advice.
+            logger.warning(f"Advisor test-attempt digest unavailable: {exc}")
+            last_test = ""
+        if last_test:
+            parts.append(last_test)
         if not parts:
             return ""
         return "\n".join([f"{self._ADVISOR_DIGEST_HEADER}:", *parts])
@@ -3306,10 +3466,17 @@ class ReActEngine(UIEventEmitter):
     def _advisor_redirect_for_call(self, call: ToolCall) -> ToolExecution | None:
         """Pre-execution advisor gate. None when the call may proceed.
 
-        All three rules are disabled when `advisor_mode == "off"` (the ablation
-        switch) or the phase cap is exhausted: a redirect the advisor can no
-        longer answer would dead-lock the run, and the advisor must NEVER block
-        a run."""
+        Two rules remain — before-giving-up and when-stuck. The third,
+        before-acting, was DELETED on 2026-07-26: cancelling the phase's first
+        state-changing call cancelled correctly-planned batches wholesale
+        (bigtop r1), so guarantee 1 is now the harness-authored consult at
+        phase entry (`_maybe_consult_advisor_at_phase_entry`), which costs no
+        planned work at all.
+
+        Both remaining rules are disabled when `advisor_mode == "off"` (the
+        ablation switch) or the phase cap is exhausted: a redirect the advisor
+        can no longer answer would dead-lock the run, and the advisor must
+        NEVER block a run."""
         if not self._advisor_enabled() or self._advisor_cap_exhausted():
             return None
         name = str(call.name or "").strip().lower()
@@ -3317,21 +3484,7 @@ class ReActEngine(UIEventEmitter):
             return None
 
         params = call.validated_params or call.raw_params or {}
-        phase = str(getattr(getattr(self, "phase_machine", None), "current_phase", "") or "")
         state_changing = self._is_state_changing(name, params)
-
-        if (
-            phase in {"build", "test"}
-            and int(getattr(self, "_advisor_calls_in_phase", 0)) == 0
-            and state_changing
-        ):
-            return self._advisor_redirect_execution(
-                call,
-                "before-acting",
-                "Consult advisor() before this phase's first state-changing action — "
-                "your full transcript is forwarded automatically. "
-                "This call was not executed.",
-            )
 
         if self._closes_phase_on_failure(name, params) and getattr(
             self, "_had_failure_since_consult", False

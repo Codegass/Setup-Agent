@@ -5,13 +5,21 @@ A real `ReActEngine` runs `run_setup_loop` against a scripted native LLM and a
 scripted advisor client: real phase machine, real transition policy, real
 dispatcher, real renderer, real redirects. The script is the failure shape the
 guarantees exist for — act before thinking, then give up after one failure —
-and the assertions are that the harness redirected exactly twice, that the run
-still reached COMPLETED, and that the pairing invariant never needed repair.
+and the assertions are that the harness consulted at build entry, redirected
+exactly once afterwards, that the run still reached COMPLETED, and that the
+pairing invariant never needed repair.
 
-The second test is the ablation demonstration: the identical script under
-`advisor_mode="off"` produces zero redirects and zero advisor provider calls,
-and still completes. That is what makes the advisor's effect measurable
-against the Plan-2 churn baseline instead of merely asserted.
+SUPERSEDED EXPECTATION (2026-07-26 post-acceptance audit): the script's third
+turn used to be cancelled by the before-acting redirect, and this file asserted
+two redirects. That redirect cancelled correctly-planned batches in bigtop r1
+and re-armed on phase re-entry, so guarantee 1 is now the harness-authored
+consult at phase entry: the same advice arrives BEFORE the model plans, and the
+third turn executes.
+
+The last test is the ablation demonstration: the identical script under
+`advisor_mode="off"` produces zero redirects, no entry consult and zero advisor
+provider calls, and still completes. That is what makes the advisor's effect
+measurable against the Plan-2 churn baseline instead of merely asserted.
 """
 
 from types import SimpleNamespace
@@ -171,7 +179,7 @@ def _script():
     return [
         _turn(1, "phase", {"action": "done", "outcome": "success"}),  # provision
         _turn(2, "phase", {"action": "done", "outcome": "success"}),  # analyze
-        _turn(3, "build", {"action": "compile"}),  # -> before-acting redirect
+        _turn(3, "build", {"action": "compile"}),  # executes: the entry consult already ran
         _turn(4, "advisor", {}),
         _turn(5, "build", {"action": "compile"}),  # executes, fails
         _turn(6, "phase", {"action": "blocked", "outcome": "failed", "reason": "provider"}),
@@ -326,23 +334,31 @@ def _redirect_spy(engine):
     return rules
 
 
-def test_the_guarantees_redirect_twice_and_the_run_still_completes(tmp_path, pairing_spy):
+def test_the_guarantees_consult_at_entry_redirect_once_and_still_complete(tmp_path, pairing_spy):
     engine = _engine(tmp_path)
     rules = _redirect_spy(engine)
 
     termination = engine.run_setup_loop("set up the project", max_iterations=20)
 
-    # Exactly the two guarantees the script trips, in order.
-    assert rules == ["before-acting", "before-giving-up"]
-    # The redirected build never ran; the post-consult retry did.
-    assert engine.tools["build"].calls == ["compile"]
+    # Exactly the one redirect guarantee the script still trips. (Audit
+    # 2026-07-26: before-acting used to precede it and cancel turn 3.)
+    assert rules == ["before-giving-up"]
+    # Nothing was cancelled: both scripted compiles reached the tool.
+    assert engine.tools["build"].calls == ["compile", "compile"]
 
     telemetry = engine.advisor_telemetry
     assert telemetry["mode"] == "same-model"
-    assert [call["phase"] for call in telemetry["calls"]] == ["build", "build"]
-    assert [call["outcome"] for call in telemetry["calls"]] == ["advice", "advice"]
+    # Three consults: the harness's at build entry, then the model's two.
+    assert [call["phase"] for call in telemetry["calls"]] == ["build", "build", "build"]
+    assert [call["outcome"] for call in telemetry["calls"]] == ["advice", "advice", "advice"]
     assert all(call["advice_chars"] == len(ADVICE) for call in telemetry["calls"])
-    assert [call["max_tokens"] for call in engine.llm_client.advisor_calls] == [2048, 2048]
+    assert [call["max_tokens"] for call in engine.llm_client.advisor_calls] == [2048, 2048, 2048]
+    # The entry consult is harness-authored: its id is minted by the harness,
+    # and it is already in the window the model plans turn 3 from.
+    build_entry_request = engine.llm_client.requests[2]
+    assert [
+        call["id"] for message in build_entry_request for call in message.get("tool_calls") or ()
+    ] == ["advisor-entry-1"]
 
     # The redirects flow through the ordinary evidence-recording path, so the
     # dispatcher paired everything and the renderer never had to repair.
@@ -355,7 +371,7 @@ def test_the_guarantees_redirect_twice_and_the_run_still_completes(tmp_path, pai
     assert engine.phase_machine.is_complete
 
 
-def test_the_redirects_reach_the_model_as_tool_results(tmp_path):
+def test_the_entry_consult_and_the_redirect_reach_the_model_as_tool_results(tmp_path):
     engine = _engine(tmp_path)
 
     engine.run_setup_loop("set up the project", max_iterations=20)
@@ -366,12 +382,18 @@ def test_the_redirects_reach_the_model_as_tool_results(tmp_path):
         for message in request
         if message["role"] == "tool"
     ]
-    assert any("Consult advisor() before this phase's first" in text for text in tool_messages)
     assert any(
         "A failure occurred since your last advisor consult" in text for text in tool_messages
     )
-    # ...and so does the advice itself.
+    # The entry consult's advice is a tool result like any other...
     assert any(ADVICE in text for text in tool_messages)
+    # ...opened by a harness-authored assistant turn that says so.
+    assert any(
+        message.get("content") == "[harness] consulting the advisor at phase entry"
+        for request in engine.llm_client.requests
+        for message in request
+        if message["role"] == "assistant"
+    )
 
 
 def test_advisor_mode_off_removes_every_redirect_and_the_run_still_completes(tmp_path):
@@ -384,8 +406,12 @@ def test_advisor_mode_off_removes_every_redirect_and_the_run_still_completes(tmp
     assert rules == []
     assert engine.llm_client.advisor_calls == [], "mode 'off' must consult no provider"
     assert engine.advisor_telemetry == {"mode": "off", "calls": []}
-    # The unredirected script reaches the tool one call earlier and burns the
-    # ceremony the guarantees would have converted into a consult.
+    assert not any(
+        call["id"].startswith("advisor-entry-")
+        for request in engine.llm_client.requests
+        for message in request
+        for call in message.get("tool_calls") or ()
+    ), "mode 'off' must author no entry consult"
     assert engine.tools["build"].calls == ["compile", "compile"]
     assert termination.termination is RunTerminationStatus.COMPLETED
     assert engine.phase_machine.is_complete

@@ -245,10 +245,11 @@ def _phase_step(engine, signal="done", **metadata):
 
 
 def _prepare_action_execution(engine):
-    # These suites are about the ingestion boundary, not the advisor: with the
-    # advisor armed, the before-acting guarantee would redirect the first
-    # state-changing build/test call and nothing would ever be ingested. The
-    # redirect itself is covered by tests/test_advisor_guarantees.py.
+    # These suites are about the ingestion boundary, not the advisor: an armed
+    # advisor adds consults and redirects to the very step sequence under test.
+    # The guarantees are covered by tests/test_advisor_guarantees.py and
+    # tests/test_consult_at_entry.py. (The original reason named the
+    # before-acting redirect, deleted by the 2026-07-26 audit.)
     engine.config = SimpleNamespace(verbose=False, advisor_mode="off")
     engine.current_iteration = 1
     engine.token_tracker = SimpleNamespace(update_last_tool_name=lambda tool_name: None)
