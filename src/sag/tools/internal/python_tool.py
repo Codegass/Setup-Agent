@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.evidence import TestStats
 from sag.testcases.compileall_metrics import (
     COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
@@ -1302,6 +1303,14 @@ class PythonTool(BaseTool):
 
         # ONE honest run per suite. pytest exit 1 (failures) is a RESULT to
         # report, never an error to retry — no rerun, ever.
+        # P0-A: bracket the run with report-XML content hashes so this
+        # attempt's JUnit output is attributable to this attempt alone —
+        # a rerun overwriting the same path is a content change, not a
+        # second report.
+        reports_before = snapshot_reports(
+            self.orchestrator.execute_command,
+            [working_directory, PYTEST_REPORT_DIR],
+        )
         result = self._run(command, working_directory, timeout)
         exit_code = result.get("exit_code")
         output = result.get("output") or ""
@@ -1313,6 +1322,25 @@ class PythonTool(BaseTool):
         attempt_tagged = attempt_tag_result.get("success")
         if attempt_tagged is None:
             attempt_tagged = attempt_tag_result.get("exit_code") == 0
+        # The after-snapshot follows the attempt tagger on purpose: tagging
+        # REWRITES the JUnit XML, so hashing before it would bind the receipt
+        # to bytes that no longer exist and every consumer would read the
+        # report as stale.
+        receipt_metadata = record_invocation(
+            self.orchestrator.execute_command,
+            tool="python",
+            attempt=attempt_id,
+            requested_action="test",
+            effective_action="test",
+            argv=command,
+            working_directory=working_directory,
+            exit_code=exit_code,
+            before=reports_before,
+            after=snapshot_reports(
+                self.orchestrator.execute_command,
+                [working_directory, PYTEST_REPORT_DIR],
+            ),
+        )
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
         success, error, error_code = _classify_pytest_result(exit_code, output)
@@ -1357,6 +1385,9 @@ class PythonTool(BaseTool):
             "collected_after_deselection": collected_after_deselection,
             "collection_scope": collection_scope,
             "collected_json": COLLECTED_JSON,
+            # Byte-compat: `receipt_id` when the receipt landed,
+            # `receipt_persisted: false` when it did not — never both.
+            **receipt_metadata,
             **({"selection_mode": native_selection_mode} if native_selection_mode else {}),
             **gate_metadata,
             **(
