@@ -95,16 +95,68 @@ Commit: `feat: verifier rejects vacuous capability receipts (P0-E negative asser
 ## Stage B — P0-A: minimal invocation receipts, scoped evidence
 
 Runner calls (maven/gradle/python test paths) persist a minimal
-`InvocationReceipt` (receipt_id, attempt_id, domain root, requested/effective
-action, actual argv, exit status, test_report_delta with before/after content
-hashes, structured stats). `physical_validator`'s primary test rollup consumes
-current primary receipts instead of `rglob("*.xml")`; auxiliary reports stay
-visible but never enter the primary numerator/denominator. Persistence is
-atomic; persistence failure blocks phase closure. Matrix rows: primary/auxiliary
-coexistence (Bigtop stays exactly 50/50), retry-overwrite content hashes, JDK
-retry no-double-count, receipt-persistence failure blocks closure.
-Field set deliberately minimal; extend only when a matrix row requires it.
-Concrete task specs are bound at stage launch on top of Stage A's merged HEAD.
+`InvocationReceipt`; the validator's primary test rollup consumes receipts
+instead of an unscoped `rglob("*.xml")`. Matrix rows: primary/auxiliary
+coexistence (Bigtop stays exactly 50/50), retry-overwrite content hashes,
+JDK retry no-double-count, receipt-persistence failure blocks closure.
+
+### Binding notes (Stage B, bound on `85fa4c7`)
+
+**Receipt schema v1 (the cross-lane contract — EXACT):** one JSON file per
+runner invocation at
+`/workspace/.setup_agent/invocation_receipts/<receipt_id>.json`, written
+atomically (temp file + `mv`):
+
+```json
+{
+  "schema_version": 1,
+  "receipt_id": "inv-<phase>-<attempt>-<seq>",
+  "tool": "maven" | "gradle" | "python",
+  "requested_action": "<the model's verb>",
+  "effective_action": "<the verb actually executed>",
+  "argv": "<full command line>",
+  "working_directory": "/workspace/<...>",
+  "exit_code": 0,
+  "outcome": "completed" | "failed",
+  "report_delta": {
+    "new": [{"path": "...", "sha256": "..."}],
+    "changed": [{"path": "...", "sha256": "..."}]
+  }
+}
+```
+
+`report_delta` is computed from before/after snapshots of report-XML content
+hashes over the same scan roots the validator uses (project root +
+pytest-reports dir). Unchanged files never appear. Absent facts = absent keys.
+
+**Task B1 (lane b1): receipt module + runner integration.**
+Files: NEW `src/sag/agent/invocation_receipts.py` (+ NEW test file);
+integrate in `src/sag/tools/internal/maven_tool.py`,
+`src/sag/tools/internal/gradle_tool.py`,
+`src/sag/tools/internal/python_tool.py` (test path). Module interface:
+`snapshot_reports(execute, scan_roots) -> dict[path, sha256]`,
+`report_delta(before, after) -> dict`,
+`write_receipt(execute, receipt: dict) -> bool` (False on persistence
+failure; callers surface `receipt_persisted: false` in ToolResult metadata —
+never raise). Each build/test invocation records requested vs effective
+action (the facade's verb mapping is already computed at the call sites) and
+the exact argv. Snapshot cost is one `find`+`sha256sum` shell round-trip per
+side of the invocation.
+
+**Task B2 (lane b2): validator + gate consumption.**
+Files: `src/sag/agent/physical_validator.py`, `src/sag/agent/phase_gates.py`
+(+ NEW test file with hand-written schema-v1 receipt fixtures).
+`parse_test_reports` partitions the scanned XMLs: **primary** = files claimed
+by `report_delta` of receipts whose `working_directory` is at/under the
+primary test coordinate root and whose current content hash still matches the
+receipt (hash mismatch ⇒ stale, excluded and flagged); **auxiliary** =
+everything else, carried as a separate visible block
+(`auxiliary_test_stats`), never entering the primary numerator/denominator.
+No receipts present ⇒ legacy fallback to the current global scan with
+`receipt_scoped: false`. Corrupt/unreadable receipts dir when receipts are
+expected ⇒ validation error; the phase gate refuses closure (matrix row
+"receipt persistence fails"). Sealed snapshot carries the new keys only when
+present (byte-compat with replay fixtures, same pattern as Plan 4).
 
 ## Stage C — P0-B(+F): typed build domains and sealed domain outcomes
 
