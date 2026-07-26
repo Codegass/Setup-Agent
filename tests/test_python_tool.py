@@ -1791,7 +1791,13 @@ def test_native_unready_stale_survey_candidate_refuses_to_guess_or_collect():
     assert not any("--junitxml" in command for command in orch.commands)
 
 
-def test_native_ready_bare_test_keeps_full_suite_behavior():
+def test_native_ready_probe_is_informational_and_never_unlocks_the_full_suite():
+    """Superseded expectation (audit 2026-07-26, Plan 4 Task 1): readiness used
+    to disarm the bounded smoke, and an LLVM-less TVM build passed the probe —
+    the bare test then collected the FULL suite, the exact failure the guard was
+    written to prevent. Readiness is now recorded as a fact; only a capability
+    receipt unlocks a full collect (tests/test_native_smoke_capability_gate.py).
+    The probe's SHAPE assertions below are unchanged."""
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
@@ -1806,12 +1812,15 @@ def test_native_ready_bare_test_keeps_full_suite_behavior():
     result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
 
     assert result.succeeded is True
-    assert "native_unready" not in result.metadata
-    assert result.metadata["collection_scope"] == "full"
-    assert result.metadata["collected"] == 357
+    assert "native_unready" not in result.metadata  # the probe DID pass
+    assert result.metadata["native_ready_probe"] is True
+    assert result.metadata["smoke_receipt_present"] is False
+    assert result.metadata["collection_scope"] == "filtered"
+    assert result.metadata["collected"] is None
+    assert result.metadata["collected_after_deselection"] == 3
     collects = [command for command in orch.commands if "--collect-only" in command]
     assert len(collects) == 1
-    assert TVM_SMOKE_PATH not in collects[0]
+    assert TVM_SMOKE_PATH in collects[0]
     ready_probe = next(
         command for command in orch.commands if "SAG_NATIVE_PROJECT_READY" in command
     )
