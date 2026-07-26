@@ -191,7 +191,6 @@ def test_project_setup_clone_checks_out_ref_and_records_resolved_commit():
         action="clone",
         repository_url="https://github.com/apache/commons-cli.git",
         ref="rel/commons-cli-1.11.0",
-        auto_install_deps=False,
     )
 
     assert result.succeeded is True
@@ -219,7 +218,6 @@ def test_project_setup_clone_bad_ref_fails_without_project_detection():
         action="clone",
         repository_url="https://github.com/apache/commons-cli.git",
         ref="missing-ref",
-        auto_install_deps=False,
     )
 
     assert result.succeeded is False
@@ -241,7 +239,6 @@ def test_clone_initializes_submodules_when_gitmodules_present():
     result = tool.execute(
         action="clone",
         repository_url="https://github.com/apache/commons-cli.git",
-        auto_install_deps=False,
     )
 
     assert result.succeeded is True
@@ -260,7 +257,6 @@ def test_clone_skips_submodules_when_gitmodules_absent():
     result = tool.execute(
         action="clone",
         repository_url="https://github.com/apache/commons-cli.git",
-        auto_install_deps=False,
     )
 
     assert result.succeeded is True
@@ -275,7 +271,6 @@ def test_clone_submodule_failure_is_best_effort_and_does_not_fail_clone():
     result = tool.execute(
         action="clone",
         repository_url="https://github.com/apache/commons-cli.git",
-        auto_install_deps=False,
     )
 
     # A submodule fetch failure (network, private repo) must not fail the clone —
@@ -293,7 +288,6 @@ def test_project_setup_legacy_branch_maps_to_ref_when_ref_absent():
         action="clone",
         repository_url="https://github.com/apache/commons-cli.git",
         branch="rel/commons-cli-1.11.0",
-        auto_install_deps=False,
     )
 
     assert result.succeeded is True
