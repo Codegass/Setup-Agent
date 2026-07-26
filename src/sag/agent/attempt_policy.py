@@ -694,10 +694,91 @@ def required_test_attempt(
     return primary if primary is not None else candidates[0]
 
 
+_LOCAL_PREREQUISITE_SIGNATURES = (
+    "ensurepip is not available",
+    "command not found",
+    "no module named pip",
+    "no module named ensurepip",
+)
+
+_BUILD_RUNNER_TOOLS = frozenset({"build", "maven", "gradle", "python"})
+
+
+def local_prerequisite_signature(text: str) -> str | None:
+    """Match text against known local, mechanically repairable prerequisites."""
+    lowered = (text or "").lower()
+    for signature in _LOCAL_PREREQUISITE_SIGNATURES:
+        if signature in lowered:
+            return signature
+    return None
+
+
+def has_build_attempt_receipt(
+    state: RunEvidenceState | None, *, attempt_id: str | None
+) -> bool:
+    """One real build-runner dispatch in this build attempt (terminal or not)."""
+    if state is None or not attempt_id:
+        return False
+    for observation in state.tool_observations:
+        if observation.source_phase != "build":
+            continue
+        if observation.source_attempt_id != attempt_id:
+            continue
+        if observation.tool_name not in _BUILD_RUNNER_TOOLS:
+            continue
+        metadata = observation.result.metadata or {}
+        if metadata.get("runner_dispatched") is True and str(
+            metadata.get("command") or ""
+        ).strip():
+            return True
+    return False
+
+
+def build_attempt_requirement(
+    state: RunEvidenceState | None,
+    orchestrator: Any,
+    *,
+    phase: str | None,
+    attempt_id: str | None,
+) -> str | None:
+    """Reject build closure without one real build attempt (spec §3.4-7).
+
+    Fail-closed: an unreadable survey manifest never proves a no-target
+    project, so it still requires an attempt."""
+    if state is None or phase != "build":
+        return None
+    if has_build_attempt_receipt(state, attempt_id=attempt_id):
+        return None
+    manifest: Any = None
+    try:
+        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
+        if isinstance(result, Mapping) and result.get("success"):
+            manifest = json.loads(str(result.get("output") or ""))
+    except Exception:
+        manifest = None
+    if isinstance(manifest, Mapping) and manifest:
+        islands = manifest.get("build_islands") or ()
+        build_system = manifest.get("build_system") or (
+            (manifest.get("build_recommendation") or {}).get("build_system")
+        )
+        if not islands and not build_system:
+            return None  # survey-proven no-target project
+    return (
+        "Build phase cannot terminate before one real build attempt receipt. "
+        "NEXT REQUIRED ACTION: build(action='compile') at the surveyed build "
+        "root, or build(action='deps') when dependencies are the failure. "
+        "Missing OS packages or venv modules are local repairable "
+        "prerequisites, not external blockers."
+    )
+
+
 __all__ = [
     "CandidateResolutionStatus",
     "TestAttemptRequirement",
     "TestCandidateResolution",
+    "build_attempt_requirement",
+    "has_build_attempt_receipt",
+    "local_prerequisite_signature",
     "required_test_attempt",
     "has_test_candidate_refresh_receipt",
     "forced_test_refusal_receipts",

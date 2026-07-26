@@ -9,7 +9,11 @@ from typing import Any, Dict, List, Optional
 
 from sag.agent.phase_gates import ClaimDisposition, check_phase_claim
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
-from sag.agent.attempt_policy import required_test_attempt
+from sag.agent.attempt_policy import (
+    build_attempt_requirement,
+    local_prerequisite_signature,
+    required_test_attempt,
+)
 from sag.agent.phase_transitions import RepairRequest
 
 from .base import BaseTool, ToolResult
@@ -205,6 +209,47 @@ class PhaseTool(BaseTool):
                     **required_attempt.to_metadata(),
                 },
             )
+
+        if verb == "blocked" or claimed_outcome is PhaseOutcome.FAILED:
+            build_requirement = build_attempt_requirement(
+                self.run_evidence_state,
+                self.orchestrator,
+                phase=phase,
+                attempt_id=getattr(self.machine, "current_attempt_id", None),
+            )
+            if build_requirement is not None:
+                return ToolResult.completed_failure(
+                    output=build_requirement,
+                    error="build phase has no build attempt receipt",
+                    error_code="BUILD_ATTEMPT_REQUIRED",
+                    suggestions=[
+                        "Run build(action='compile') at the surveyed build root",
+                        "If dependencies fail, run build(action='deps') first",
+                    ],
+                    metadata={"phase": phase},
+                )
+
+        if verb == "blocked":
+            prerequisite = local_prerequisite_signature(
+                " ".join((reason or "", *tuple(evidence or ())))
+            )
+            if prerequisite is not None:
+                return ToolResult.completed_failure(
+                    output=(
+                        f"blocked-claim rejected: '{prerequisite}' is a local, "
+                        "repairable prerequisite, not an external impediment. "
+                        "Install the missing piece (OS packages via bash "
+                        "apt-get install, python venv/pip via "
+                        "build(action='deps')) and retry before claiming blocked."
+                    ),
+                    error="local prerequisite misclassified as external blocker",
+                    error_code="LOCAL_PREREQUISITE_NOT_BLOCKER",
+                    suggestions=[
+                        "Install the missing prerequisite, then retry the failed action",
+                        "Claim blocked only after the tool-owned repair ladder is exhausted",
+                    ],
+                    metadata={"phase": phase, "prerequisite": prerequisite},
+                )
 
         claim = PhaseClaim(
             phase=phase,
