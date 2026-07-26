@@ -27,7 +27,7 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metric
 # None, so None cannot double as "not computed yet").
 _MODULE_METRICS_UNSET = object()
 from sag.ui.events import EventType, UIEventEmitter
-from sag.verdict import rescue_blocked_build, run_verdict
+from sag.verdict import ADJUDICATED_CONFLICTS, rescue_blocked_build, run_verdict
 
 from .base import BaseTool, ToolResult
 
@@ -36,6 +36,13 @@ if TYPE_CHECKING:
 
 MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS = 5
 MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
+
+# Report-layer honesty (Plan 3 Task 3) bounds: a blocker line quotes the phase
+# record's recorded failure signature, and the recommendations quote surveyed
+# coordinates — both bounded so a pathological reason string cannot flood the
+# section.
+MAX_SEALED_FAILURE_SIGNATURE_CHARS = 240
+MAX_SURVEYED_RECOMMENDATION_ITEMS = 5
 
 
 # Local status vocabularies mapped onto the verdict kernel's closed vocabulary
@@ -4418,7 +4425,14 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         lines.append("")
 
-        # Issues by severity
+        # Issues by severity. The attention rules alone cannot be trusted here:
+        # the setup-mode adapter maps EVERY sealed conflict onto an INFO item,
+        # so a failed run used to reach this section with an empty blocker list
+        # and print "Blockers (0) / ✅ No blocking issues". Derive the missing
+        # blockers from the seal itself.
+        blockers = blockers + self._sealed_failure_blockers(
+            snapshot, [item["message"] for item in blockers]
+        )
         if blockers:
             lines.extend([f"### Blockers ({len(blockers)})", ""])
             for item in blockers:
@@ -4437,6 +4451,29 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Actionable Recommendations
         lines.extend(["### Actionable Recommendations"])
+
+        # Surveyed coordinates outrank generic ecosystem prose (§3.5-adjacent
+        # P2): the TVM report recommended "pip install -e . && pytest" while
+        # the survey manifest carried the real install ladder and a verified
+        # smoke coordinate. Quote what was surveyed; when a survey source is
+        # reachable but recorded nothing, name that gap instead of inventing
+        # commands the run never verified.
+        surveyed = self._surveyed_setup_facts()
+        if surveyed:
+            lines.extend(self._render_surveyed_recommendations(surveyed))
+            lines.append("")
+            return lines
+        if self._survey_source_reachable():
+            lines.extend(
+                [
+                    "- ⚠️ No surveyed setup coordinates were recorded for this run, so this"
+                    " report has no verified install or test commands to quote.",
+                    "- Run project(action='analyze') to record them before trusting any"
+                    " reproduction steps.",
+                ]
+            )
+            lines.append("")
+            return lines
 
         # Language-aware advice: a python snapshot must NOT be handed maven
         # commands. TVM (python-primary, jvm/ Maven binding) got a report
@@ -4505,6 +4542,207 @@ class ReportTool(BaseTool, UIEventEmitter):
             if label in ("maven", "gradle"):
                 return label
         return ""
+
+    # ------------------------------------------------------------------
+    # Report-layer honesty (Plan 3 Task 3)
+    # ------------------------------------------------------------------
+
+    def _sealed_failure_blockers(
+        self, snapshot: Dict[str, Any], existing_messages: Iterable[str]
+    ) -> List[Dict[str, str]]:
+        """Blocker entries derived from the SEALED evidence, not from attention.
+
+        The attention rules are the only blocker source today, and setup-mode
+        snapshots build ``attention.raw`` by mapping every sealed conflict onto
+        an INFO item (``_build_report_snapshot``). A run sealed ``failed`` thus
+        printed "Blockers (0) / ✅ No blocking issues". Three sealed signals
+        each produce a blocker line: the failed verdict (with the failing phase
+        and its recorded failure signature), failed build evidence, and every
+        unresolved (non-adjudicated) conflict. Entries already present in
+        ``existing_messages`` are never duplicated.
+        """
+        seen = {str(message) for message in existing_messages}
+        derived: List[Dict[str, str]] = []
+
+        def add(message: str) -> None:
+            if message in seen:
+                return
+            seen.add(message)
+            derived.append({"severity": "BLOCKER", "icon": "🔴", "message": message})
+
+        status = snapshot.get("status") or {}
+        canonical = snapshot.get("canonical_snapshot") or {}
+        verdict = str(status.get("verdict") or status.get("overall") or "").strip().lower()
+
+        if verdict == "failed":
+            add(f"Run verdict FAILED — {self._sealed_failure_signature(snapshot)}")
+
+        build_evidence = canonical.get("build_evidence") or {}
+        build_failed = "failed" in (
+            str(build_evidence.get("judgment") or "").lower(),
+            str(build_evidence.get("outcome") or "").lower(),
+        )
+        # A build blocker the attention rules (or the verdict line above)
+        # already named is not restated.
+        if build_failed and not any("build" in message.lower() for message in seen):
+            refs = ", ".join(str(ref) for ref in list(build_evidence.get("refs") or [])[:3])
+            suffix = f" (evidence: {refs})" if refs else ""
+            add(f"Build evidence sealed as failed — no green build recorded{suffix}.")
+
+        conflicts = (snapshot.get("evidence_result") or {}).get("conflicts")
+        if not conflicts:
+            conflicts = canonical.get("conflicts") or []
+        for conflict in conflicts:
+            name = str(conflict).strip()
+            if not name or name in ADJUDICATED_CONFLICTS:
+                continue
+            add(f"Unresolved evidence conflict: {name}.")
+
+        return derived
+
+    def _sealed_failure_signature(self, snapshot: Dict[str, Any]) -> str:
+        """The failing phase plus the failure signature the seal recorded."""
+        canonical = snapshot.get("canonical_snapshot") or {}
+        record: Optional[Dict[str, Any]] = None
+        for candidate in canonical.get("phase_records") or []:
+            if not isinstance(candidate, dict):
+                continue
+            outcome = str(
+                candidate.get("validated_outcome") or candidate.get("outcome") or ""
+            ).lower()
+            if outcome and outcome != "success":
+                record = candidate
+
+        if record is None:
+            return "the sealed evidence records no successful closure."
+
+        phase = str(record.get("phase") or "unknown")
+        outcome = str(record.get("validated_outcome") or record.get("outcome") or "unknown")
+        signature = " ".join(str(record.get("reason") or record.get("key_results") or "").split())
+        if len(signature) > MAX_SEALED_FAILURE_SIGNATURE_CHARS:
+            signature = signature[: MAX_SEALED_FAILURE_SIGNATURE_CHARS - 1] + "…"
+        detail = f": {signature}" if signature else " (no failure reason recorded)"
+        return f"{phase} phase ended '{outcome}'{detail}"
+
+    def _survey_source_reachable(self) -> bool:
+        """True when this tool can consult a survey store at all.
+
+        Without an orchestrator or a context manager the report cannot know
+        what was surveyed, so silence about the survey is honest and the
+        legacy ecosystem template stays.
+        """
+        return (
+            getattr(self, "docker_orchestrator", None) is not None
+            or getattr(self, "context_manager", None) is not None
+        )
+
+    def _read_survey_manifest(self) -> Dict[str, Any]:
+        """The analyzer's build-requirements manifest; {} when unreachable."""
+        orchestrator = getattr(self, "docker_orchestrator", None)
+        if orchestrator is None:
+            return {}
+        try:
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            manifest = read_build_requirements(orchestrator)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"survey manifest unreadable for recommendations: {exc}")
+            return {}
+        return manifest if isinstance(manifest, dict) else {}
+
+    def _trunk_build_recommendation(self) -> Dict[str, Any]:
+        """The trunk's surveyed build coordinates; {} when unreachable."""
+        context_manager = getattr(self, "context_manager", None)
+        if context_manager is None:
+            return {}
+        try:
+            trunk_context = context_manager.load_trunk_context()
+            summary = getattr(trunk_context, "environment_summary", None) or {}
+            recommendation = summary.get("build_recommendation") or {}
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"trunk build coordinates unavailable for recommendations: {exc}")
+            return {}
+        return recommendation if isinstance(recommendation, dict) else {}
+
+    def _surveyed_setup_facts(self) -> Dict[str, Any]:
+        """Surveyed coordinates the recommendations may quote; {} when none.
+
+        Facts only — the install commands, verified smoke coordinates and
+        build/test coordinates the survey actually recorded. Memoized: one
+        manifest read per report.
+        """
+        cached = getattr(self, "_surveyed_facts_cache", None)
+        if cached is not None:
+            return cached
+
+        manifest = self._read_survey_manifest()
+        facts: Dict[str, Any] = {}
+
+        install_commands: List[str] = []
+        for command in manifest.get("python_install_commands") or []:
+            text = " ".join(str(command).split())
+            if text and text not in install_commands:
+                install_commands.append(text)
+        if install_commands:
+            facts["install_commands"] = install_commands[:MAX_SURVEYED_RECOMMENDATION_ITEMS]
+
+        smoke: List[str] = []
+        for candidate in manifest.get("python_smoke_candidates") or []:
+            raw_path = candidate.get("path") if isinstance(candidate, dict) else candidate
+            path = str(raw_path or "").strip()
+            if path and path not in smoke:
+                smoke.append(path)
+        if smoke:
+            facts["smoke_coordinates"] = smoke[:MAX_SURVEYED_RECOMMENDATION_ITEMS]
+
+        recommendation = self._trunk_build_recommendation()
+        coordinates = {}
+        for key in ("build_system", "build_root", "test_system", "test_root"):
+            value = recommendation.get(key) or manifest.get(key)
+            text = str(value or "").strip()
+            if text:
+                coordinates[key] = text
+        if coordinates:
+            facts["coordinates"] = coordinates
+
+        self._surveyed_facts_cache = facts
+        return facts
+
+    def _render_surveyed_recommendations(self, facts: Dict[str, Any]) -> List[str]:
+        """Render the surveyed facts as the actionable recommendations."""
+        lines: List[str] = []
+        index = 0
+
+        install_commands = facts.get("install_commands") or []
+        if install_commands:
+            index += 1
+            lines.append(f"{index}. **Install with the surveyed commands**:")
+            lines.append("   ```bash")
+            for command in install_commands:
+                lines.append(f"   {command}")
+            lines.append("   ```")
+
+        smoke = facts.get("smoke_coordinates") or []
+        if smoke:
+            index += 1
+            lines.append(f"{index}. **Verified smoke coordinates** (survey-recorded tests):")
+            for coordinate in smoke:
+                lines.append(f"   - `{coordinate}`")
+
+        coordinates = facts.get("coordinates") or {}
+        if coordinates:
+            index += 1
+            lines.append(f"{index}. **Surveyed build coordinates**:")
+            for label, key in (
+                ("Build system", "build_system"),
+                ("Build root", "build_root"),
+                ("Test system", "test_system"),
+                ("Test root", "test_root"),
+            ):
+                if coordinates.get(key):
+                    lines.append(f"   - {label}: `{coordinates[key]}`")
+
+        return lines
 
     def _render_task_progress(self, actual_accomplishments: dict = None) -> List[str]:
         """Render task progress in improved table format."""
