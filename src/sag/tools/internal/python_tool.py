@@ -50,6 +50,12 @@ COLLECTED_JSON = "/workspace/.setup_agent/pytest_collected.json"
 # The pip rung a failed poetry/pipenv install falls back to (narrated).
 # Module form (bug #12): plain uv venvs ship no {venv}/bin/pip binary.
 _PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
+# The rung after a successful local-provider install whose root retry re-fails
+# on the provider's OWN distribution: the in-repo build resolves BELOW the
+# declared floor (PEP 440 orders 0.1.13.dev47 < 0.1.13), so resolution can
+# never succeed. Install the root project without resolving, then the declared
+# dependencies the provider does not supply.
+_PIP_NO_DEPS = "{venv}/bin/python -m pip install -e . --no-deps"
 
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 # The SELECTED count of a filtered collection: the X of pytest's
@@ -671,6 +677,7 @@ class PythonTool(BaseTool):
         retry_meta: Optional[Dict[str, str]] = None
         provider_recovery_meta: Optional[Dict[str, Any]] = None
         provider_recovery_attempted = False
+        provider_no_deps_rung: Optional[bool] = None
         retried = False
         overall_ok = True
         failure_detail: Optional[str] = None
@@ -732,6 +739,36 @@ class PythonTool(BaseTool):
                         result_already_recorded = True
                     install_failed = self._effective_install_failure(result)
 
+                    # The provider installed, yet the retried root install
+                    # re-fails naming the provider's OWN distribution: the
+                    # in-repo build sits below the declared floor, so no
+                    # amount of retrying resolves it. One more narrated rung.
+                    # One-shot: guarded by provider_recovery_attempted above.
+                    if (
+                        install_failed
+                        and not provider_failed
+                        and self._missing_distribution_name(result.get("output") or "")
+                        == provider_recovery_meta["distribution_name"]
+                    ):
+                        transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
+                        preamble.append(
+                            f"[recovery] the local {provider_recovery_meta['distribution_name']} "
+                            "build resolves below the declared floor; installed the root "
+                            "project with --no-deps, then its remaining declared dependencies"
+                        )
+                        rung = self._run_no_deps_rung(
+                            distribution_name=provider_recovery_meta["distribution_name"],
+                            working_directory=working_directory,
+                            timeout=install_timeout,
+                            requirements=requirements,
+                            venv=venv,
+                        )
+                        transcript.extend(rung["transcript"])
+                        result = rung["result"]
+                        result_already_recorded = True
+                        install_failed = self._effective_install_failure(result)
+                        provider_no_deps_rung = not install_failed
+
             # Faithfulness deviation (spec Component 3): the project's own
             # tool failed; the pip rung keeps setup moving, NARRATED so the
             # generated setup docs reflect what actually ran.
@@ -780,6 +817,11 @@ class PythonTool(BaseTool):
                         if provider_recovery_meta
                         else {}
                     ),
+                    **(
+                        {"provider_no_deps_rung": provider_no_deps_rung}
+                        if provider_no_deps_rung is not None
+                        else {}
+                    ),
                 },
             ),
             preamble,
@@ -790,13 +832,61 @@ class PythonTool(BaseTool):
         return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
 
     @classmethod
+    def _requirement_distribution_name(cls, requirement: Any) -> Optional[str]:
+        """The normalized distribution name a requirement string names, before
+        any version specifier (`apache-tvm-ffi>=0.1.13` -> `apache-tvm-ffi`)."""
+        match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(requirement or "").strip())
+        return cls._normalized_distribution_name(match.group(0)) if match else None
+
+    @classmethod
     def _missing_distribution_name(cls, output: str) -> Optional[str]:
         match = _MISSING_DISTRIBUTION_RE.search(output or "")
         if not match:
             return None
-        requirement = match.group("requirement")
-        name = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement)
-        return cls._normalized_distribution_name(name.group(0)) if name else None
+        return cls._requirement_distribution_name(match.group("requirement"))
+
+    @classmethod
+    def _remaining_declared_dependencies(
+        cls, requirements: Dict[str, Any], installed: set[str]
+    ) -> List[str]:
+        """The manifest's declared dependencies minus the ones already supplied
+        by an installed local provider (installing those from the index is the
+        very resolution that cannot succeed)."""
+        remaining: List[str] = []
+        for requirement in requirements.get("python_declared_dependencies") or ():
+            text = str(requirement or "").strip()
+            if not text or cls._requirement_distribution_name(text) in installed:
+                continue
+            remaining.append(text)
+        return remaining
+
+    def _run_no_deps_rung(
+        self,
+        *,
+        distribution_name: str,
+        working_directory: str,
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
+    ) -> Dict[str, Any]:
+        """Install the root project without resolving, then the declared
+        dependencies the local provider does not supply. Stops at the first
+        failure — the caller renders it as an honest failure, rung narrated."""
+        transcript: List[str] = []
+        no_deps_command = _PIP_NO_DEPS.replace("{venv}", venv)
+        result = self._run(no_deps_command, working_directory, timeout)
+        transcript.append(f"$ {no_deps_command}\n{self._tail(result.get('output') or '')}")
+        if not self._effective_install_failure(result):
+            remaining = self._remaining_declared_dependencies(
+                requirements, {self._normalized_distribution_name(distribution_name)}
+            )
+            if remaining:
+                deps_command = f"{venv}/bin/python -m pip install " + " ".join(
+                    shlex.quote(item) for item in remaining
+                )
+                result = self._run(deps_command, working_directory, timeout)
+                transcript.append(f"$ {deps_command}\n{self._tail(result.get('output') or '')}")
+        return {"result": result, "transcript": transcript}
 
     def _recover_local_provider(
         self,
@@ -813,14 +903,9 @@ class PythonTool(BaseTool):
         if missing is None or " install " not in f" {command} ":
             return None
         declared = {
-            self._normalized_distribution_name(match.group(0))
+            name
             for requirement in requirements.get("python_declared_dependencies") or ()
-            if (
-                match := re.match(
-                    r"[A-Za-z0-9][A-Za-z0-9._-]*",
-                    str(requirement or "").strip(),
-                )
-            )
+            if (name := self._requirement_distribution_name(requirement))
         }
         if missing not in declared:
             return None
