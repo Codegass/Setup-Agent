@@ -311,6 +311,57 @@ def testcase_status(testcase):
     return "passed"
 
 
+# Mirrors _collection_node_kind / _structured_error_line /
+# _dominant_collection_error in the host module (Plan 4 Task 2): pytest
+# collection nodes (empty classname + a "collection failure"/"collection
+# skipped" child) never executed, so they are counted apart and never become
+# canonical identities. Both parsers must agree or the compact path would keep
+# reporting the audit's phantom "56 tests executed".
+COLLECTION_EXCEPTION_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\\s*:\\s+\\S")
+
+
+def collection_node_kind(testcase):
+    if (testcase.get("classname") or "").strip():
+        return None
+    for child in testcase:
+        tag = local_name(child)
+        if tag not in ("error", "skipped"):
+            continue
+        if "collection" in (child.get("message") or "").lower():
+            return tag
+    return None
+
+
+def structured_error_line(testcase):
+    error = None
+    for child in testcase:
+        if local_name(child) == "error":
+            error = child
+            break
+    if error is None:
+        return ""
+    candidates = []
+    for line in (error.text or "").splitlines():
+        stripped = line.strip()
+        if stripped != "E" and not stripped.startswith("E "):
+            continue
+        stripped = stripped[1:].strip().lstrip("|").strip()
+        if COLLECTION_EXCEPTION_LINE.match(stripped):
+            candidates.append(stripped)
+    if candidates:
+        return candidates[-1]
+    return (error.get("message") or "").strip()
+
+
+def dominant_collection_error(counts):
+    dominant = None
+    dominant_count = 0
+    for message, count in counts.items():
+        if message and count > dominant_count:
+            dominant, dominant_count = message, count
+    return dominant
+
+
 def merge_status(current, new):
     severity = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
     return new if severity.get(new, 0) > severity.get(current, 0) else current
@@ -380,8 +431,21 @@ def parse_report(report_file):
     ]
     if testcases:
         cases = []
+        collection_errors = 0
+        collection_errors_skipped = 0
+        collection_messages = {}
         for testcase in testcases:
             classname = (testcase.get("classname") or "").strip()
+            collection_kind = collection_node_kind(testcase)
+            if collection_kind == "error":
+                collection_errors += 1
+                message = structured_error_line(testcase)
+                if message:
+                    collection_messages[message] = collection_messages.get(message, 0) + 1
+                continue
+            if collection_kind == "skipped":
+                collection_errors_skipped += 1
+                continue
             simple_classname = classname.split(".")[-1] if classname else ""
             if simple_classname in groovy_classes:
                 continue
@@ -397,6 +461,9 @@ def parse_report(report_file):
             "suite_counts": None,
             "attempt_id": attempt_id,
             "attempt_error": attempt_error,
+            "collection_errors": collection_errors,
+            "collection_errors_skipped": collection_errors_skipped,
+            "collection_messages": collection_messages,
         }
     counts = {"total": 0, "failed": 0, "error": 0, "skipped": 0}
     suites = (
@@ -416,6 +483,9 @@ def parse_report(report_file):
         "suite_counts": counts,
         "attempt_id": attempt_id,
         "attempt_error": attempt_error,
+        "collection_errors": 0,
+        "collection_errors_skipped": 0,
+        "collection_messages": {},
     }
 
 
@@ -452,10 +522,17 @@ raw = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
 suite_only = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
 attempts = {}
 sources = {}
+collection_errors_total = 0
+collection_errors_skipped_total = 0
+collection_messages_total = {}
 for report_file in report_files:
     parsed = parse_report(report_file)
     if parsed is None:
         continue
+    collection_errors_total += parsed["collection_errors"]
+    collection_errors_skipped_total += parsed["collection_errors_skipped"]
+    for message, count in parsed["collection_messages"].items():
+        collection_messages_total[message] = collection_messages_total.get(message, 0) + count
     cases = parsed["cases"]
     suite_counts = parsed["suite_counts"]
     attempt_id = parsed["attempt_id"]
@@ -541,6 +618,9 @@ result = {
     "unique_methods": len({identity[:3] for identity in attempts}),
     "flaky_count": flaky_count,
     "retried_count": retried_count,
+    "collection_errors": collection_errors_total,
+    "collection_errors_skipped": collection_errors_skipped_total,
+    "collection_error_summary": dominant_collection_error(collection_messages_total),
     "test_histories": histories,
     "metrics_conflicts": sorted(metrics_conflicts),
     "test_success": (
@@ -554,6 +634,96 @@ result = {
 }
 print(json.dumps(result, separators=(",", ":")))
 '''
+
+
+# --- pytest collection-node semantics (Plan 4 Task 2) -----------------------
+# pytest's JUnit writer emits one testcase node per FILE it could not import,
+# with an EMPTY classname and an `<error message="collection failure">` child
+# (module-level skips come out as `<skipped message="collection skipped">`).
+# Nothing executed in either case. The 2026-07-26 post-acceptance audit caught
+# the harness reporting TVM's 28 + 28 collection nodes as "56 tests executed —
+# 28 errors, 28 skipped"; the run had in fact never executed a single test.
+# Collection nodes are therefore counted in their own stats and are excluded
+# from total/passed/failed/errors/skipped and from canonical test identities.
+#
+# Detection signature (verified against all 58 recorded pytest artifacts under
+# logs/: EVERY empty-classname node is one of these two shapes, and no other
+# empty-classname node shape exists in any recorded run):
+#   classname == "" AND child <error|skipped message contains "collection">
+_COLLECTION_EXCEPTION_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\s*:\s+\S")
+
+
+def _collection_node_kind(testcase: ET.Element) -> Optional[str]:
+    """Return "error"/"skipped" for a pytest collection node, else None."""
+    if (testcase.get("classname") or "").strip():
+        return None
+    for tag in ("error", "skipped"):
+        child = testcase.find(tag)
+        if child is None:
+            continue
+        if "collection" in (child.get("message") or "").lower():
+            return tag
+    return None
+
+
+def _structured_error_line(text: str, fallback: str = "") -> str:
+    """The LAST `E   <Exception>: <msg>` line of a pytest error body.
+
+    pytest prints the traceback plus one `E   ` line per raised exception; the
+    last one is the cause that actually stopped collection (TVM's bodies show
+    a swallowed `AttributeError` first and the real
+    `RuntimeError: LLVM version is not available` last). Caret/underline `E `
+    continuation lines are rejected by the identifier-colon shape.
+    """
+    candidates = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped != "E" and not stripped.startswith("E "):
+            continue
+        stripped = stripped[1:].strip().lstrip("|").strip()
+        if _COLLECTION_EXCEPTION_LINE.match(stripped):
+            candidates.append(stripped)
+    if candidates:
+        return candidates[-1]
+    return (fallback or "").strip()
+
+
+def _dominant_collection_error(counts: Dict[str, int]) -> Optional[str]:
+    """Most frequent collection-error message; ties keep the first seen."""
+    dominant = None
+    dominant_count = 0
+    for message, count in (counts or {}).items():
+        if message and count > dominant_count:
+            dominant, dominant_count = message, count
+    return dominant
+
+
+def _partition_collection_nodes(
+    entries: List[Dict[str, any]],
+) -> Tuple[List[Dict[str, any]], Dict[str, any]]:
+    """Split runtime testcases from pytest collection nodes."""
+    runtime_cases: List[Dict[str, any]] = []
+    collection_errors = 0
+    collection_errors_skipped = 0
+    messages: Dict[str, int] = {}
+    for entry in entries:
+        kind = entry.get("collection_node")
+        if kind == "error":
+            collection_errors += 1
+            message = entry.get("collection_message") or ""
+            if message:
+                messages[message] = messages.get(message, 0) + 1
+            continue
+        if kind == "skipped":
+            collection_errors_skipped += 1
+            continue
+        runtime_cases.append(entry)
+    return runtime_cases, {
+        "collection_errors": collection_errors,
+        "collection_errors_skipped": collection_errors_skipped,
+        "collection_error_counts": messages,
+        "collection_error_summary": _dominant_collection_error(messages),
+    }
 
 
 def _is_pytest_report_path(path: str, pytest_reports_dir: str) -> bool:
@@ -1326,6 +1496,10 @@ class PhysicalValidator:
             "unique_methods": 0,
             "flaky_count": 0,
             "retried_count": 0,
+            # pytest collection nodes: counted, never executed (Plan 4 Task 2).
+            "collection_errors": 0,
+            "collection_errors_skipped": 0,
+            "collection_error_summary": None,
             "test_histories": [],
             "metrics_conflicts": [],
             "test_success": False,
@@ -1345,6 +1519,9 @@ class PhysicalValidator:
                 test_result.setdefault(
                     "report_file_count", len(test_result.get("report_files") or [])
                 )
+                test_result.setdefault("collection_errors", 0)
+                test_result.setdefault("collection_errors_skipped", 0)
+                test_result.setdefault("collection_error_summary", None)
 
                 modules_without_tests = self._check_modules_without_tests(
                     project_dir, test_result.get("report_dirs") or []
@@ -1442,6 +1619,9 @@ class PhysicalValidator:
                 "errors": 0,
                 "skipped": 0,
             }
+            collection_errors = 0
+            collection_errors_skipped = 0
+            collection_error_counts: Dict[str, int] = {}
 
             for report_file in report_files:
                 try:
@@ -1459,6 +1639,13 @@ class PhysicalValidator:
                             f"Failed to parse XML structure in {report_file}"
                         )
                         continue
+
+                    collection_errors += stats.get("collection_errors", 0) or 0
+                    collection_errors_skipped += stats.get("collection_errors_skipped", 0) or 0
+                    for message, count in (stats.get("collection_error_counts") or {}).items():
+                        collection_error_counts[message] = (
+                            collection_error_counts.get(message, 0) + count
+                        )
 
                     attempt_id, attempt_error = _test_report_attempt_id(xml_content)
                     is_pytest = _is_pytest_report_path(report_file, PYTEST_REPORT_DIR)
@@ -1569,6 +1756,9 @@ class PhysicalValidator:
                     ),
                     "flaky_count": aggregated.flaky_count,
                     "retried_count": aggregated.retried_count,
+                    "collection_errors": collection_errors,
+                    "collection_errors_skipped": collection_errors_skipped,
+                    "collection_error_summary": _dominant_collection_error(collection_error_counts),
                     "test_histories": aggregated.to_dict()["histories"],
                     "metrics_conflicts": sorted(metrics_conflicts),
                     "failing_test_names": sorted(
@@ -1723,7 +1913,9 @@ class PhysicalValidator:
                 # Collect all testcases first
                 all_testcases = self._collect_testcases_from_suite(root, file_path)
 
-                testcase_entries = all_testcases
+                # Collection nodes never executed -> they leave the runtime set
+                # entirely (Plan 4 Task 2).
+                testcase_entries, collection = _partition_collection_nodes(all_testcases)
 
                 # Recalculate statistics over every runtime testcase (spec §3.4-4)
                 total = len(testcase_entries)
@@ -1739,6 +1931,7 @@ class PhysicalValidator:
                     "errors": errors,
                     "skipped": skipped,
                     "testcases": testcase_entries,
+                    **collection,
                 }
 
             # Gradle format: <testsuites> containing multiple <testsuite>
@@ -1748,7 +1941,7 @@ class PhysicalValidator:
                 for testsuite in root.findall("testsuite"):
                     all_testcases.extend(self._collect_testcases_from_suite(testsuite, file_path))
 
-                testcase_entries = all_testcases
+                testcase_entries, collection = _partition_collection_nodes(all_testcases)
 
                 # Calculate statistics over every runtime testcase (spec §3.4-4)
                 total = len(testcase_entries)
@@ -1764,6 +1957,7 @@ class PhysicalValidator:
                     "errors": errors,
                     "skipped": skipped,
                     "testcases": testcase_entries,
+                    **collection,
                 }
 
             # Try to find testsuite elements even if root is different
@@ -1774,9 +1968,14 @@ class PhysicalValidator:
                 for testsuite in testsuites:
                     all_testcases.extend(self._collect_testcases_from_suite(testsuite, file_path))
 
-                testcase_entries = all_testcases
+                testcase_entries, collection = _partition_collection_nodes(all_testcases)
 
-                if testcase_entries:
+                # An all-collection-nodes file still parsed successfully: it
+                # reports zero executed tests, not a parse failure.
+                saw_collection_nodes = (
+                    collection["collection_errors"] or collection["collection_errors_skipped"]
+                )
+                if testcase_entries or saw_collection_nodes:
                     # Calculate statistics over every runtime testcase (spec §3.4-4)
                     total = len(testcase_entries)
                     failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
@@ -1791,6 +1990,7 @@ class PhysicalValidator:
                         "errors": errors,
                         "skipped": skipped,
                         "testcases": testcase_entries,
+                        **collection,
                     }
                 return None
 
@@ -1892,16 +2092,23 @@ class PhysicalValidator:
             file_attr = identity_file or file_path
             time_attr = testcase.get("time")
             status = self._determine_testcase_status(testcase)
-            cases.append(
-                {
-                    "name": name,
-                    "classname": classname,
-                    "file": file_attr,
-                    "identity_file": identity_file,
-                    "status": status,
-                    "time": float(time_attr) if time_attr else 0.0,
-                }
-            )
+            collection_kind = _collection_node_kind(testcase)
+            entry = {
+                "name": name,
+                "classname": classname,
+                "file": file_attr,
+                "identity_file": identity_file,
+                "status": status,
+                "time": float(time_attr) if time_attr else 0.0,
+                "collection_node": collection_kind,
+            }
+            if collection_kind == "error":
+                error = testcase.find("error")
+                entry["collection_message"] = _structured_error_line(
+                    error.text if error is not None else "",
+                    (error.get("message") if error is not None else "") or "",
+                )
+            cases.append(entry)
         # Debug logging
         if len(cases) > 0:
             logger.debug(f"Collected {len(cases)} testcases from {file_path}")
@@ -3493,6 +3700,13 @@ class PhysicalValidator:
             == "success"
         )
 
+        # pytest collection nodes are NOT executed tests (Plan 4 Task 2). They
+        # travel with the verdict so the report can quote the real root cause
+        # instead of inventing "N tests errored".
+        collection_errors = test_metrics.get("collection_errors", 0) or 0
+        collection_errors_skipped = test_metrics.get("collection_errors_skipped", 0) or 0
+        collection_error_summary = test_metrics.get("collection_error_summary")
+
         # Determine test status based on metrics
         if not test_metrics.get("valid", False):
             status = "WARNING"
@@ -3512,6 +3726,14 @@ class PhysicalValidator:
                 f"Tests below the {threshold_pct:.0f}% pass threshold: "
                 f"{test_metrics['passed_tests']}/{test_metrics['total_tests']} ({pass_rate:.1f}%)"
             )
+
+        # "0/0 (0.0%)" describes a run that executed nothing as if it had run
+        # and failed. When collection died, say exactly that and name the cause.
+        if collection_errors and not test_metrics.get("total_tests", 0):
+            status = "FAILED"
+            reason = f"Test collection failed for {collection_errors} files — 0 tests executed"
+            if collection_error_summary:
+                reason = f"{reason}: {collection_error_summary}"
 
         failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
         # Python projects: python_tool's pytest --collect-only denominator is
@@ -3549,6 +3771,7 @@ class PhysicalValidator:
                 "skipped": test_metrics.get("skipped_tests", 0),
                 "flaky_count": test_metrics.get("flaky_count", 0),
                 "pass_rate": round(pass_rate, 1),
+                "collection_errors": collection_errors,
             }
         report_files = test_metrics.get("report_files", [])
         conflicts = []
@@ -3556,6 +3779,10 @@ class PhysicalValidator:
             conflicts.append("test_failures_detected")
         if test_metrics.get("error_tests", 0):
             conflicts.append("test_errors_detected")
+        # Collection nodes no longer inflate error_tests, so the verdict cap
+        # they used to (accidentally) carry needs its own honest signal.
+        if collection_errors:
+            conflicts.append("test_collection_failed")
         if test_metrics.get("parsing_errors", []):
             conflicts.append("test_report_parse_error")
         if test_metrics.get("metrics_conflicts", []):
@@ -3599,6 +3826,9 @@ class PhysicalValidator:
             "unique_skipped_tests": test_metrics.get("unique_skipped_tests"),
             "flaky_count": test_metrics.get("flaky_count", 0),
             "retried_count": test_metrics.get("retried_count", 0),
+            "collection_errors": collection_errors,
+            "collection_errors_skipped": collection_errors_skipped,
+            "collection_error_summary": collection_error_summary,
             "test_histories": test_metrics.get("test_histories", []),
             "metrics_conflicts": test_metrics.get("metrics_conflicts", []),
             "parsing_errors": test_metrics.get("parsing_errors", []),
