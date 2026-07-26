@@ -1471,13 +1471,18 @@ class ReActEngine(UIEventEmitter):
     def _coordinates_line(rec, phase: str) -> Optional[str]:
         """The intro call-out without action wording (dim b deleted) —
         coordinate FACTS only (system + where), for build and test alike."""
+        # P0-B: "independent" is a graph conclusion, not a directory fact —
+        # claim it only when the surveyed coordinate graph has no edges.
+        island_label = (
+            "coordinate-linked domains" if rec.get("domain_edges") else "independent islands"
+        )
         if phase == "test":
             islands = rec.get("test_islands")
             if islands and len(islands) > 1:
                 coords = "; ".join(
                     f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
                 )
-                return f"Test coordinates (independent islands): {coords}."
+                return f"Test coordinates ({island_label}): {coords}."
             test_root = rec.get("test_root")
             if not test_root or test_root == rec.get("build_root"):
                 return None
@@ -1487,7 +1492,7 @@ class ReActEngine(UIEventEmitter):
             coords = "; ".join(
                 f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
             )
-            return f"Build coordinates (independent islands): {coords}."
+            return f"Build coordinates ({island_label}): {coords}."
         if rec.get("is_aggregator_only"):
             return "Build coordinates: the survey found no standard compile target at the root."
         return f"Build coordinates: {rec.get('build_system')} at {rec.get('build_root')}."
