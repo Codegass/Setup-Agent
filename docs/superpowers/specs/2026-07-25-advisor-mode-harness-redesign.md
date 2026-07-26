@@ -136,8 +136,12 @@ A client-side tool named `advisor`, contract mirroring the official one:
   transcript (system prompt, conversation, tool results) **plus a
   deterministic evidence digest** — survey facts, what the current phase
   gate still lacks, untried independent islands, available repair ladders
-  and their state. The executor cannot choose or mis-cite what the advisor
-  sees.
+  and their state, and (amended 2026-07-26) the latest test attempt's
+  collection facts verbatim: command, scope, collected, selected,
+  executed, collection errors. Without that last line a run whose every
+  pytest attempt died in collection is indistinguishable, to the reviewer,
+  from one that executed tests and failed them. The executor cannot choose
+  or mis-cite what the advisor sees.
 - **Default advisor: the same weak model, fresh context**, with an
   advisor-only system prompt ("you are a reviewer; strategic guidance only;
   you have no tools; keep it under ~80 words"). **Configurable** to a
@@ -160,12 +164,27 @@ A client-side tool named `advisor`, contract mirroring the official one:
   2. *Persistent system-prompt timing block* — survives every iteration
      under the new protocol (the old one rendered once and vanished).
   3. *Three mechanical guarantees* (evidence-triggered, not model-judged):
-     - **Before acting:** from the build phase onward, the first
-       *state-changing* tool call of each phase without a prior advisor
-       receipt is not executed; its tool result redirects to `advisor()`.
-       Read-only orientation calls (search, read-only bash, analyze) are
-       exempt; provision/analyze phases are exempt entirely — their
-       actions are dictated by the phase objective.
+     - **Consult at phase entry** (amended 2026-07-26; supersedes
+       *before acting*): on entering the build or test phase — including
+       every re-entry after a repair loop — the HARNESS consults the
+       advisor itself, before the executor's first turn of that phase. The
+       consult is appended to the fresh phase window as a synthetic
+       assistant tool_call (`advisor-entry-<n>`, native text
+       `[harness] consulting the advisor at phase entry`) plus its tool
+       result, following the forced-attempt precedent, so the pairing
+       invariant and the evidence trail hold without a second code path.
+       It counts against the per-phase cap; `advisor_mode="off"` and an
+       exhausted cap skip it entirely, and any failure inside it degrades
+       to no consult — the advisor never blocks a run.
+       *Rationale (2026-07-26 post-acceptance audit):* the original
+       mechanism refused the phase's first *state-changing* tool call and
+       redirected it to `advisor()`. That cancelled correctly-planned
+       work: in bigtop r1 it discarded two 4-island build batches (8
+       wasted calls), and because phase re-entry resets the per-phase
+       consult counter it re-armed the trap each time. A weak model cannot
+       be required to re-remember a batch the harness threw away.
+       Consulting at entry delivers the same advice, in the window before
+       the model plans, at zero cancelled work.
      - **Before giving up:** a `phase(action='blocked')` or
        failure-outcome closure with no advisor consult since the most
        recent failure is rejected by the gate, redirecting to `advisor()`.

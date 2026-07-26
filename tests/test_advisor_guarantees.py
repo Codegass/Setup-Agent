@@ -1,15 +1,23 @@
 # tests/test_advisor_guarantees.py
-"""The three mechanical guarantees (spec §3.2): before-acting,
+"""The three mechanical guarantees (spec §3.2): consult-at-entry,
 before-giving-up, when-stuck.
 
-Each is an engine-level PRE-EXECUTION redirect: the call never reaches the
-tool, and the model gets a tool result naming the one concrete next action
-(`advisor()`). Redirects travel the same evidence-recording path as the Plan-2
-refusals, so the pairing invariant and the audit trail hold.
+Guarantees 2 and 3 are engine-level PRE-EXECUTION redirects: the call never
+reaches the tool, and the model gets a tool result naming the one concrete next
+action (`advisor()`). Redirects travel the same evidence-recording path as the
+Plan-2 refusals, so the pairing invariant and the audit trail hold.
+
+SUPERSEDED (2026-07-26 post-acceptance audit): guarantee 1 used to be a THIRD
+redirect, "before-acting" — the phase's first state-changing call was refused
+and pointed at `advisor()`. It cancelled two correctly-planned 4-island batches
+in bigtop r1 (8 wasted calls) and re-armed on every phase re-entry, so it was
+replaced by the harness-authored consult at phase entry. Its expectations below
+are inverted accordingly; the mechanism itself is covered by
+`tests/test_consult_at_entry.py`.
 
 Two inertness properties are as load-bearing as the redirects themselves: with
 `advisor_mode == "off"` (the §3.7.6 ablation) and with the phase cap
-exhausted, all three rules stand down. A guarantee that outlives the advisor's
+exhausted, every rule stands down. A guarantee that outlives the advisor's
 ability to answer it is a dead-lock, not a guarantee.
 """
 
@@ -169,47 +177,51 @@ def _observations(engine):
     return [step for step in engine.steps if step.step_type == StepType.OBSERVATION]
 
 
-# --- (a) before-acting -----------------------------------------------------
+# --- (a) guarantee 1 is no longer a redirect -------------------------------
+#
+# SUPERSEDED EXPECTATION (audit 2026-07-26): these three used to assert that
+# the phase's first state-changing call was refused and redirected. That is
+# exactly the behavior the audit falsified — the redirect cancelled planned
+# work — so the expectation is inverted: the first call EXECUTES, and the
+# advice reaches the model through the entry consult instead
+# (tests/test_consult_at_entry.py).
 
 
-def test_first_state_changing_build_action_is_redirected_to_the_advisor():
+def test_the_first_state_changing_build_action_is_no_longer_redirected():
     engine = _engine(phase="build")
 
     engine._execute_action_step(_step("build", {"action": "compile"}))
 
-    assert engine.executed_calls == [], "the redirected call must not run"
-    observation = _observations(engine)[0].content
-    assert "Consult advisor() before this phase's first state-changing action" in observation
-    assert "This call was not executed." in observation
-    # Same evidence-recording path as a refusal: the result is emitted, and the
-    # observation answers the call id that opened the pair.
-    assert engine.emitted_tool_results[0]["result"].metadata["advisor_redirect"] == "before-acting"
+    assert [call.name for call in engine.executed_calls] == ["build"]
+    assert _observations(engine)[0].content == "[build] executed"
     assert _observations(engine)[0].tool_call_id == "call_1"
 
 
-def test_the_same_call_executes_after_one_consult():
+def test_a_whole_planned_batch_survives_the_phase_without_a_consult():
+    """The bigtop r1 shape at unit scale: four islands planned in one turn, all
+    four executed. Under before-acting the first was cancelled and the model
+    had to re-remember the other three."""
     engine = _engine(phase="build")
 
-    engine._execute_action_step(_step("build", {"action": "compile"}))
-    engine.consult_advisor()
-    engine._execute_action_step(_step("build", {"action": "compile"}, call_id="call_2"))
+    for index, root in enumerate(("/a", "/b", "/c", "/d"), start=1):
+        engine._execute_action_step(
+            _step(
+                "build", {"action": "compile", "working_directory": root}, call_id=f"call_{index}"
+            )
+        )
 
-    assert [call.name for call in engine.executed_calls] == ["build"]
-    assert _observations(engine)[1].content == "[build] executed"
+    assert [call.raw_params["working_directory"] for call in engine.executed_calls] == [
+        "/a",
+        "/b",
+        "/c",
+        "/d",
+    ]
 
 
-def test_before_acting_does_not_fire_outside_build_and_test():
-    engine = _engine(phase="provision")
-
-    engine._execute_action_step(_step("project", {"action": "clone"}))
-
-    assert [call.name for call in engine.executed_calls] == ["project"]
-
-
-def test_before_acting_covers_the_test_phase_too():
+def test_no_redirect_fires_in_the_test_phase_before_the_first_consult_either():
     engine = _engine(phase="test")
 
-    assert engine._advisor_redirect_for_call(_call("build", {"action": "test"})) is not None
+    assert engine._advisor_redirect_for_call(_call("build", {"action": "test"})) is None
 
 
 # --- (b) before-giving-up --------------------------------------------------
@@ -308,12 +320,11 @@ def test_consulting_the_advisor_disarms_the_recurrence_rule():
 # --- (d)/(e) inertness: the advisor never dead-locks a run -----------------
 
 
-def test_advisor_mode_off_makes_all_three_rules_inert():
+def test_advisor_mode_off_makes_every_rule_inert():
     engine = _engine(phase="build", advisor_mode="off", outcome="failed")
     engine._had_failure_since_consult = True
     engine._advisor_redirect_armed = True
 
-    assert engine._advisor_redirect_for_call(_call("build", {"action": "compile"})) is None
     assert (
         engine._advisor_redirect_for_call(
             _call("phase", {"action": "blocked", "outcome": "failed"})
@@ -321,9 +332,12 @@ def test_advisor_mode_off_makes_all_three_rules_inert():
         is None
     )
     assert engine._advisor_redirect_for_call(_call("bash", {"command": "make install"})) is None
+    # Guarantee 1 under the ablation: no entry consult, no provider call.
+    assert engine._maybe_consult_advisor_at_phase_entry() is False
+    assert engine.llm_client.calls == []
 
 
-def test_an_exhausted_phase_cap_makes_all_three_rules_inert():
+def test_an_exhausted_phase_cap_makes_every_rule_inert():
     engine = _engine(phase="build", advisor_phase_cap=1)
     engine.consult_advisor()
     assert engine.consult_advisor().metadata["advisor"] == "cap"
@@ -337,20 +351,27 @@ def test_an_exhausted_phase_cap_makes_all_three_rules_inert():
         is None
     )
     assert engine._advisor_redirect_for_call(_call("bash", {"command": "make install"})) is None
+    assert engine._maybe_consult_advisor_at_phase_entry() is False
 
 
 def test_a_redirect_preempts_the_closed_evidence_refusal():
     """Rule ordering: a redirected call must not be described to the model in
     closed-evidence refusal wording — it was stopped for a different reason and
-    has a different next action."""
-    engine = _engine(phase="build")
+    has a different next action.
+
+    (Audit 2026-07-26: this used to be demonstrated with the deleted
+    before-acting rule; when-stuck is the surviving state-changing redirect.)"""
+    engine = _engine(phase="build", loop_decision=_loop_decision("guide", recurrence_count=2))
+    engine.consult_advisor()
+    engine._execute_action_step(_step("build", {"action": "compile"}))
+    assert engine._advisor_redirect_armed is True
     engine.run_evidence_state = SimpleNamespace(sealed=True)
 
     redirect = engine._advisor_redirect_for_call(_call("build", {"action": "compile"}))
-    assert redirect.metadata["advisor_redirect"] == "before-acting"
+    assert redirect.metadata["advisor_redirect"] == "when-stuck"
 
-    engine._execute_action_step(_step("build", {"action": "compile"}))
-    observation = _observations(engine)[0].content
+    engine._execute_action_step(_step("build", {"action": "compile"}, call_id="call_2"))
+    observation = _observations(engine)[1].content
     assert "Consult advisor()" in observation
     assert "sealed" not in observation
 
@@ -401,8 +422,12 @@ def test_state_changing_classification(name, params, state_changing):
     assert engine._is_state_changing(name, params) is state_changing
 
 
-def test_read_only_reconnaissance_is_never_redirected_before_the_first_consult():
+def test_read_only_reconnaissance_is_never_redirected_by_the_recurrence_rule():
+    """(Audit 2026-07-26: the classification used to be exercised through
+    before-acting; when-stuck is the surviving rule that reads it.)"""
     engine = _engine(phase="build")
+    engine.consult_advisor()
+    engine._advisor_redirect_armed = True
 
     assert engine._advisor_redirect_for_call(_call("bash", {"command": "ls -la"})) is None
     assert engine._advisor_redirect_for_call(_call("project", {"action": "analyze"})) is None
