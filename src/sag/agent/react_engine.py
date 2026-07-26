@@ -403,6 +403,11 @@ class ReActEngine(UIEventEmitter):
         self.max_recent_executions = 10
         self._force_thinking_next = False
 
+        # Native tool-call identity for harness-authored calls (forced test
+        # attempts); the model's own calls come with provider ids.
+        self._forced_call_counter = 0
+        self._active_native_tool_call_id = None
+
         # CRITICAL: Flag to force thinking after successful tool execution
         self._force_thinking_after_success = False
 
@@ -1239,6 +1244,8 @@ class ReActEngine(UIEventEmitter):
             add_conflict=True,
         )
 
+    _FORCED_ATTEMPT_NATIVE_TEXT = "[harness] executing the mandatory test attempt"
+
     def _force_required_test_attempt(
         self,
         requirement: TestAttemptRequirement,
@@ -1333,6 +1340,11 @@ class ReActEngine(UIEventEmitter):
                 execution,
                 call,
             )
+            # The harness authors this call, so the harness mints its id: the
+            # synthetic ACTION step and the observation below must render as a
+            # matched tool_use/tool_result pair like any model-issued call.
+            self._forced_call_counter = getattr(self, "_forced_call_counter", 0) + 1
+            forced_call_id = f"forced-{self._forced_call_counter}"
             action_step = ReActStep(
                 step_type=StepType.ACTION,
                 content=f"HARNESS FORCED: {requirement.action_text()}",
@@ -1341,6 +1353,8 @@ class ReActEngine(UIEventEmitter):
                 tool_result=result,
                 timestamp=self._get_timestamp(),
                 model_used="harness",
+                tool_call_id=forced_call_id,
+                native_text=self._FORCED_ATTEMPT_NATIVE_TEXT,
             )
             self.steps.append(action_step)
             self._emit_control_tool_result(
@@ -1354,9 +1368,11 @@ class ReActEngine(UIEventEmitter):
             # Invalidate the model-owned plan before LoopMemory contributes any
             # additional reason. Replay observes the same deterministic order
             # from the forced tool_result followed by loop_decision events.
+            # No-op without a scheduler (the native protocol has none); the
+            # call itself is deleted with the old protocol in Task 8.
             self._request_scheduler_reasoning(ReasoningTrigger.PLAN_EXHAUSTED)
             self._apply_tool_execution_loop_effects(execution)
-            self._add_observation_step(execution.observation_text)
+            self._append_native_observation(forced_call_id, execution.observation_text)
             return True
         finally:
             self._suppress_control_action_envelope = False
