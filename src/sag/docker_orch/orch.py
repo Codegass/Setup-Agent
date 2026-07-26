@@ -1,6 +1,7 @@
 """Docker Orchestrator for managing containers and volumes."""
 
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -1237,7 +1238,15 @@ class DockerOrchestrator:
         if exit_code is None and state == "vanished":
             # A vanished process with no exit file is explicit crash evidence.
             exit_code = 1
-            full_output += "\n[detached command ended without recording an exit code]"
+            if re.search(r"bash: -c: line \d+: .*syntax error", full_output):
+                # The launcher itself failed bash parsing — no inner process
+                # ever ran. Keep this distinct from an inner-command crash.
+                full_output += (
+                    "\n[launcher error: the dispatched command failed bash "
+                    "parsing before execution — no inner process ran]"
+                )
+            else:
+                full_output += "\n[detached command ended without recording an exit code]"
 
         inline_output = full_output
         if len(inline_output) > 10000:

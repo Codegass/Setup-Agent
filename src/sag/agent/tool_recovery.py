@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional
 
 from loguru import logger as default_logger
 
@@ -332,11 +331,6 @@ class ToolRecoveryHandler:
                 recovery_params=recovery_params,
             )
 
-        if analysis:
-            decision = self._recover_maven_exclusions(params, analysis)
-            if decision.should_recover:
-                return decision
-
         return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
     def _maven_version_contract_guidance(
@@ -481,69 +475,6 @@ class ToolRecoveryHandler:
 
         return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
-    def _recover_maven_exclusions(
-        self, params: Dict[str, Any], analysis: Dict[str, Any]
-    ) -> RecoveryDecision:
-        failed_modules: List[str] = []
-        for module in analysis.get("failed_modules", []):
-            artifact = module.get("artifact_id")
-            if artifact:
-                failed_modules.append(artifact)
-            else:
-                pom_path = module.get("pom_path")
-                if pom_path:
-                    failed_modules.append(Path(pom_path).parent.name)
-
-        failed_tests = [
-            self._format_test_exclusion(test) for test in analysis.get("failed_tests", [])
-        ]
-
-        recovery_params = dict(params)
-        recovery_params["fail_at_end"] = True
-        new_exclusions = False
-
-        if failed_modules:
-            excluded_modules: Set[str] = self.successful_states.setdefault(
-                "excluded_modules", set()
-            )
-            for module_name in failed_modules:
-                if module_name and module_name not in excluded_modules:
-                    excluded_modules.add(module_name)
-                    new_exclusions = True
-            if excluded_modules and new_exclusions:
-                props = self._normalize_properties(recovery_params.get("properties"))
-                props = [prop for prop in props if not prop.startswith("-pl")]
-                module_clause = ",".join(f"!{name}" for name in sorted(excluded_modules))
-                props.append(f"-pl {module_clause}")
-                props = self._ensure_flag(props, "-am")
-                recovery_params["properties"] = props
-
-        if failed_tests:
-            excluded_tests: Set[str] = self.successful_states.setdefault("excluded_tests", set())
-            added_test = False
-            for test_name in failed_tests:
-                if test_name and test_name not in excluded_tests:
-                    excluded_tests.add(test_name)
-                    added_test = True
-            if excluded_tests and added_test:
-                props = self._normalize_properties(recovery_params.get("properties"))
-                test_clause = "!" + ",!".join(sorted(excluded_tests))
-                props = self._set_property(props, "test=", test_clause)
-                recovery_params["properties"] = props
-                new_exclusions = True
-
-        maven_tool = self._delegate_tool("maven")
-        if new_exclusions and maven_tool is not None:
-            result = maven_tool.safe_execute(**recovery_params)
-            return self._attempted(
-                strategy="maven_exclude_modules_or_tests",
-                message=("Recovered by excluding failing modules/tests and rerunning Maven"),
-                result=result,
-                recovery_params=recovery_params,
-            )
-
-        return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
-
     def _maven_timeout_guidance(
         self, params: Dict[str, Any], failed_result: ToolResult
     ) -> RecoveryDecision:
@@ -635,6 +566,30 @@ class ToolRecoveryHandler:
                 result=result,
                 recovery_params=recovery_params,
             )
+
+        combined = f"{error_msg}\n{failed_result.output or ''}"
+        if "unzip: command not found" in combined and not self.successful_states.get(
+            "gradle_unzip_installed"
+        ):
+            # Gradle wrapper prerequisite (spec §3.4-5): the wrapper needs
+            # unzip to unpack its distribution. Install the one allowlisted
+            # package and retry the identical invocation once.
+            install = self._execute_workspace_recovery_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y unzip"
+            )
+            if install.get("success"):
+                self.successful_states["gradle_unzip_installed"] = True
+                result = gradle_tool.safe_execute(**params)
+                return self._attempted(
+                    strategy="gradle_install_unzip",
+                    message=(
+                        "Recovered by installing unzip (Gradle wrapper "
+                        "prerequisite) and retrying once"
+                    ),
+                    result=result,
+                    recovery_params=dict(params),
+                )
 
         return self._no_strategy("gradle_no_strategy", "No Gradle recovery strategy applicable")
 
@@ -990,30 +945,3 @@ class ToolRecoveryHandler:
             metadata=metadata,
         )
 
-    def _normalize_properties(self, raw_props: Any) -> List[str]:
-        if not raw_props:
-            return []
-        if isinstance(raw_props, list):
-            return [prop for prop in raw_props if prop]
-        if isinstance(raw_props, str):
-            return [prop.strip() for prop in raw_props.split(",") if prop.strip()]
-        return [str(raw_props)]
-
-    def _ensure_flag(self, props: List[str], flag: str) -> List[str]:
-        if flag not in props:
-            props.append(flag)
-        return props
-
-    def _set_property(self, props: List[str], prefix: str, value: str) -> List[str]:
-        updated = [prop for prop in props if not prop.startswith(prefix)]
-        updated.append(f"{prefix}{value}")
-        return updated
-
-    def _format_test_exclusion(self, name: str) -> str:
-        cleaned = (name or "").strip()
-        if not cleaned:
-            return cleaned
-        if "." in cleaned and "#" not in cleaned:
-            cls, method = cleaned.rsplit(".", 1)
-            return f"{cls}#{method}"
-        return cleaned
