@@ -1395,19 +1395,20 @@ def island_applies_maven_publish(orch, root: str) -> bool:
     return bool((found.get("output") or "").strip())
 
 
-def enumerate_build_islands(
+def _group_modules_by_island(
     orch, project_path: str, source_modules: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Group every source-bearing module into its independent build island
-    (pathological-aggregator path only) — DESCRIPTIVELY.
+) -> tuple:
+    """One ancestor walk over the source modules -> (islands, members).
 
-    Each island is ``{root, system, applies_maven_publish}``, deduped by root:
-    what exists on disk, nothing about what to do with it. The recommended
-    action (goal) is a prescription and stays with the analyzer tool layer —
-    the surveyor describes, it never prescribes.
+    ``islands`` is what ``enumerate_build_islands`` returns; ``members`` maps
+    each island root to the module dirs that grouped into it (a gradle
+    multi-project's subprojects) with their languages. The domain layer needs
+    the membership, and sharing this single pass keeps the domain scan from
+    re-probing every ancestor of every module a second time.
     """
     islands: List[Dict[str, Any]] = []
     by_root: Dict[str, Dict[str, Any]] = {}
+    members: Dict[str, List[Dict[str, Any]]] = {}
 
     for mod in source_modules:
         info = island_root_for(orch, project_path, mod["dir"])
@@ -1417,6 +1418,7 @@ def enumerate_build_islands(
             # (vendored/example copy); exclude it rather than manufacture a
             # bogus system=null island.
             continue
+        members.setdefault(root, []).append({"dir": mod["dir"], "lang": mod.get("lang")})
         existing = by_root.get(root)
         if existing is None:
             island = {
@@ -1435,7 +1437,367 @@ def enumerate_build_islands(
                 "system"
             ] == "gradle" and island_applies_maven_publish(orch, root)
 
-    return islands
+    return islands, members
+
+
+def enumerate_build_islands(
+    orch, project_path: str, source_modules: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Group every source-bearing module into its independent build island
+    (pathological-aggregator path only) — DESCRIPTIVELY.
+
+    Each island is ``{root, system, applies_maven_publish}``, deduped by root:
+    what exists on disk, nothing about what to do with it. The recommended
+    action (goal) is a prescription and stays with the analyzer tool layer —
+    the surveyor describes, it never prescribes.
+
+    An island is a DIRECTORY fact only. Whether two islands are independent is
+    a question about COORDINATES, which ``enumerate_build_domains`` answers.
+    """
+    return _group_modules_by_island(orch, project_path, source_modules)[0]
+
+
+# --------------------------------------------------------------------------- #
+# Build-domain coordinates (domain schema v1, P0-B).
+#
+# LIVE EVIDENCE (bigtop): the island machinery grouped four roots by their
+# nearest build marker and the guidance called them independent. It never read
+# an artifact coordinate: bigtop-data-generators publishes
+# org.apache.bigtop:bigpetstore-data-generator:3.7.0-SNAPSHOT while
+# bigpetstore-transaction-queue requires 3.5.0-SNAPSHOT and bigpetstore-spark
+# requires 3.6.0-SNAPSHOT — 13 attempts died on a dependency that cannot
+# resolve. A domain therefore carries the coordinates it PRODUCES and REQUIRES,
+# and independence becomes a conclusion of the graph.
+#
+# Extraction is regex-level and strictly literal: a ${property}/$var value is an
+# absent fact and is omitted, never guessed (guessing bigtop-samplers' version
+# would have minted an edge nobody declared).
+# --------------------------------------------------------------------------- #
+
+
+def literal_coordinate_value(raw) -> Optional[str]:
+    """One coordinate value as a FACT, or None.
+
+    Rejects property indirection (``${revision}``, ``$version``) — an
+    unresolved value is not a coordinate and must not be guessed.
+    """
+    text = str(raw or "").strip()
+    if not text or "$" in text:
+        return None
+    return text
+
+
+def _read_config_text(orch, path: str) -> str:
+    """Raw text of one build config file, "" when absent/unreadable.
+
+    Reads through the orchestrator execute pattern the rest of the survey uses
+    (``cat``, untruncated — this text is parsed here by regex and never
+    reaches the model).
+    """
+    if not orch:
+        return ""
+    result = orch.execute_command(f"cat {shlex.quote(path)} 2>/dev/null", truncate_output=False)
+    if not result.get("success"):
+        return ""
+    return result.get("output") or ""
+
+
+# Everything from the first of these ends the pom's own coordinate header: a
+# <groupId> further down belongs to a dependency/plugin, never to the project.
+_POM_HEADER_TERMINATORS = (
+    "<properties>",
+    "<modules>",
+    "<dependencyManagement>",
+    "<dependencies>",
+    "<build>",
+    "<profiles>",
+    "<reporting>",
+    "<distributionManagement>",
+)
+
+
+def _first_element(tag: str, blob: str) -> Optional[str]:
+    match = re.search(rf"<{tag}>([^<]*)</{tag}>", blob)
+    return literal_coordinate_value(match.group(1)) if match else None
+
+
+def parse_maven_coordinates(pom_text: str) -> Dict[str, Any]:
+    """Coordinates a pom.xml PRODUCES and REQUIRES, from its raw text.
+
+    ``produces``: the project's own groupId/artifactId/version, with the
+    ``<parent>`` block supplying group/version when the project omits them
+    (the ordinary Maven module shape — bigtop's modules inherit both).
+    ``requires``: every ``<dependency>`` whose groupId/artifactId/version are
+    all literal.
+
+    Keys are absent when nothing parsed, and a coordinate carries only the
+    parts that were actually declared (absent fact = absent key).
+    """
+    text = pom_text or ""
+    parent = re.search(r"<parent>(.*?)</parent>", text, re.DOTALL)
+    parent_block = parent.group(1) if parent else ""
+    header = text[: parent.start()] + text[parent.end() :] if parent else text
+    for terminator in _POM_HEADER_TERMINATORS:
+        index = header.find(terminator)
+        if index != -1:
+            header = header[:index]
+
+    coordinates: Dict[str, Any] = {}
+    name = _first_element("artifactId", header)
+    if name:
+        produced = {}
+        group = _first_element("groupId", header) or _first_element("groupId", parent_block)
+        if group:
+            produced["group"] = group
+        produced["name"] = name
+        version = _first_element("version", header) or _first_element("version", parent_block)
+        if version:
+            produced["version"] = version
+        coordinates["produces"] = [produced]
+
+    requires: List[Dict[str, str]] = []
+    for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.DOTALL):
+        group = _first_element("groupId", block)
+        artifact = _first_element("artifactId", block)
+        version = _first_element("version", block)
+        if not (group and artifact and version):
+            # A managed/interpolated version is no GAV at all — omit it.
+            continue
+        coordinate = {"group": group, "name": artifact, "version": version}
+        if coordinate not in requires:
+            requires.append(coordinate)
+    if requires:
+        coordinates["requires"] = requires
+    return coordinates
+
+
+# `group 'x'` / `group = "x"` (build.gradle(.kts)) and `group=x`
+# (gradle.properties). $-bearing values never match the literal class.
+def _gradle_assignment(key: str, text: str) -> Optional[str]:
+    match = re.search(rf"^\s*{key}\b\s*(?:=\s*)?[\"']([^\"']+)[\"']", text or "", re.MULTILINE)
+    return literal_coordinate_value(match.group(1)) if match else None
+
+
+def _properties_assignment(key: str, text: str) -> Optional[str]:
+    match = re.search(rf"^\s*{key}\b\s*=\s*(\S+)\s*$", text or "", re.MULTILINE)
+    return literal_coordinate_value(match.group(1)) if match else None
+
+
+def parse_gradle_group_version(build_text: str, properties_text: str = "") -> Dict[str, str]:
+    """The ``group``/``version`` a Gradle build DECLARES.
+
+    build.gradle(.kts) wins over gradle.properties (bigtop's data-generators
+    declares both in gradle.properties); keys are absent when the value is
+    missing or interpolated.
+    """
+    values: Dict[str, str] = {}
+    for key in ("group", "version"):
+        value = _gradle_assignment(key, build_text) or _properties_assignment(key, properties_text)
+        if value:
+            values[key] = value
+    return values
+
+
+_GRADLE_GAV_RE = re.compile(r"[\"']([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+)[\"']")
+
+
+def parse_gradle_requires(build_text: str) -> List[Dict[str, str]]:
+    """Literal ``"group:name:version"`` dependency strings, deduped in order.
+
+    Interpolated notation (``"g:n:$v"``, ``"$g:n:v"``) never matches the
+    literal pattern, so it is omitted rather than guessed.
+    """
+    requires: List[Dict[str, str]] = []
+    for group, name, version in _GRADLE_GAV_RE.findall(build_text or ""):
+        coordinate = {"group": group, "name": name, "version": version}
+        if coordinate not in requires:
+            requires.append(coordinate)
+    return requires
+
+
+def _gradle_build_files(orch, root: str) -> List[str]:
+    """Every build.gradle(.kts) at or under a gradle domain root (build output
+    excluded) — the multi-project's own build files, which is where the
+    subprojects and their literal GAVs live."""
+    if not orch:
+        return []
+    command = (
+        f"find {shlex.quote(root)} -maxdepth 3 -type f "
+        f"\\( -name 'build.gradle' -o -name 'build.gradle.kts' \\) "
+        f"-not -path '*/build/*' 2>/dev/null"
+    )
+    found = orch.execute_command(command)
+    return [line.strip() for line in (found.get("output") or "").splitlines() if line.strip()]
+
+
+def _gradle_domain_coordinates(orch, root: str) -> Dict[str, Any]:
+    """produces/requires for one gradle domain.
+
+    produces: the domain's declared group/version paired with the name of each
+    (sub)project that APPLIES the maven-publish plugin — the observable signal
+    that it puts an artifact in the local maven repo (a project that publishes
+    nothing produces nothing, so spark/transaction-queue stay empty). The
+    plugin counts when it is applied in the project's own build file or in the
+    multi-project root's (the convention block that covers subprojects).
+    requires: literal GAVs across all of those build files.
+    """
+    build_text = _read_config_text(orch, f"{root}/build.gradle") or _read_config_text(
+        orch, f"{root}/build.gradle.kts"
+    )
+    declared = parse_gradle_group_version(
+        build_text, _read_config_text(orch, f"{root}/gradle.properties")
+    )
+    root_publishes = island_applies_maven_publish(orch, root)
+
+    build_files = _gradle_build_files(orch, root)
+    project_dirs = []
+    for path in build_files:
+        directory = path.rsplit("/", 1)[0]
+        if directory not in project_dirs:
+            project_dirs.append(directory)
+    if not project_dirs:
+        project_dirs = [root]
+
+    produces: List[Dict[str, str]] = []
+    requires: List[Dict[str, str]] = []
+    for directory in project_dirs:
+        text = (
+            build_text
+            if directory == root
+            else (
+                _read_config_text(orch, f"{directory}/build.gradle")
+                or _read_config_text(orch, f"{directory}/build.gradle.kts")
+            )
+        )
+        for coordinate in parse_gradle_requires(text):
+            if coordinate not in requires:
+                requires.append(coordinate)
+        publishes = root_publishes or (
+            directory != root and island_applies_maven_publish(orch, directory)
+        )
+        if not publishes:
+            continue
+        coordinate = {}
+        if declared.get("group"):
+            coordinate["group"] = declared["group"]
+        # Gradle's default project name is its directory name.
+        coordinate["name"] = directory.rstrip("/").rsplit("/", 1)[-1]
+        if declared.get("version"):
+            coordinate["version"] = declared["version"]
+        if coordinate not in produces:
+            produces.append(coordinate)
+
+    coordinates: Dict[str, Any] = {}
+    if produces:
+        coordinates["produces"] = produces
+    if requires:
+        coordinates["requires"] = requires
+    return coordinates
+
+
+def enumerate_build_domains(
+    orch, project_path: str, source_modules: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """The build islands TYPED with their coordinates — domain schema v1.
+
+    Each domain is ``{root, system, languages, produces, requires}`` in island
+    order and island grouping (a gradle multi-project is one domain), with
+    every key beyond root/system present only when the fact exists.
+    Descriptive: it records what each root builds and consumes, never what to
+    do about it.
+    """
+    islands, members = _group_modules_by_island(orch, project_path, source_modules)
+    domains: List[Dict[str, Any]] = []
+    for island in islands:
+        root = island["root"]
+        domain: Dict[str, Any] = {"root": root, "system": island["system"]}
+        languages = sorted({m["lang"] for m in members.get(root, []) if m.get("lang")})
+        if languages:
+            domain["languages"] = languages
+        if island["system"] == "maven":
+            coordinates = parse_maven_coordinates(_read_config_text(orch, f"{root}/pom.xml"))
+        elif island["system"] == "gradle":
+            coordinates = _gradle_domain_coordinates(orch, root)
+        else:
+            coordinates = {}
+        for key in ("produces", "requires"):
+            if coordinates.get(key):
+                domain[key] = coordinates[key]
+        domains.append(domain)
+    return domains
+
+
+def _edge_detail(coordinate: Dict[str, str], producer_version: Optional[str]) -> str:
+    required = f"requires {coordinate['group']}:{coordinate['name']} {coordinate['version']}"
+    if producer_version:
+        return f"{required}; producer builds {producer_version}"
+    # The producer declares no version anywhere we can read: that is an absent
+    # fact, not an observed mismatch.
+    return f"{required}; producer version not declared"
+
+
+def derive_domain_edges(domains: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Coordinate edges between build domains — the ONLY evidence that can say
+    whether domains are independent.
+
+    An edge exists when one domain's ``requires`` names another domain's
+    ``produces`` (group+name match); its status is ``version_incompatible``
+    iff the two version strings differ, else ``compatible``. No match, no
+    edge: an unmatched dependency is somebody else's artifact.
+    """
+    produced: Dict[tuple, tuple] = {}
+    for domain in domains or ():
+        for coordinate in domain.get("produces") or ():
+            key = (coordinate.get("group"), coordinate.get("name"))
+            if not all(key):
+                continue
+            produced.setdefault(key, (domain.get("root"), coordinate.get("version")))
+
+    edges: List[Dict[str, str]] = []
+    for domain in domains or ():
+        consumer = domain.get("root")
+        for coordinate in domain.get("requires") or ():
+            match = produced.get((coordinate.get("group"), coordinate.get("name")))
+            if not match:
+                continue
+            producer, producer_version = match
+            if producer == consumer:
+                continue  # a domain consuming its own artifact is not an edge
+            version = coordinate.get("version")
+            status = (
+                "version_incompatible"
+                if producer_version and version and version != producer_version
+                else "compatible"
+            )
+            edge = {
+                "consumer": consumer,
+                "producer": producer,
+                "status": status,
+                "detail": _edge_detail(coordinate, producer_version),
+            }
+            if edge not in edges:
+                edges.append(edge)
+    return edges
+
+
+def domain_mismatch_clause(edge: Dict[str, str]) -> str:
+    """One version-incompatible edge as a fact sentence:
+    ``<producer> builds 3.7.0-SNAPSHOT; <consumer> requires g:n 3.5.0-SNAPSHOT``.
+
+    Reads the edge's own ``detail`` (built by ``_edge_detail``, same module) so
+    the two phrasings cannot drift apart. Returns "" for anything that is not
+    a version mismatch — what to DO about it stays with the tool layer.
+    """
+    if (edge or {}).get("status") != "version_incompatible":
+        return ""
+    match = re.match(r"^requires (\S+) (\S+); producer builds (\S+)$", edge.get("detail") or "")
+    if not match:
+        return ""
+    coordinate, required_version, producer_version = match.groups()
+    return (
+        f"{edge.get('producer')} builds {producer_version}; "
+        f"{edge.get('consumer')} requires {coordinate} {required_version}"
+    )
 
 
 def scan_root_build_markers(orch, project_path: str) -> Dict[str, Any]:
@@ -1665,6 +2027,9 @@ SURVEY_FINGERPRINT_SOURCES = (
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
+    # A gradle domain's produced group/version is read from gradle.properties
+    # when the build file omits it (P0-B), so its content is a fact source.
+    "gradle.properties",
     "gradlew",
     "package.json",
     "pyproject.toml",
