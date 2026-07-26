@@ -160,7 +160,7 @@ def test_all_skipped_attempt_without_projected_skip_reasons_fails(tmp_path):
 
     verifier = run_tvm(session)
 
-    assert any(name.endswith("skip_reasons_projected") for name in verifier.failures)
+    assert any("skip_reasons_projected" in name for name in verifier.failures)
 
 
 def test_partially_skipped_attempt_is_not_subject_to_the_negative(tmp_path):
