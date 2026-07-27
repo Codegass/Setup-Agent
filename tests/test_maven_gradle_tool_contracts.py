@@ -588,12 +588,15 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
     assert result.succeeded is False
     assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
     assert orchestrator.monitored_commands == []
-    # The JDK pre-flight's probes (manifest read, java -version) are the only
-    # container commands allowed before the version-resolution early-return.
+    # The JDK pre-flight's READS are the only container commands allowed before
+    # the version-resolution early-return: the manifest, the `java` probe, and
+    # the env overlay that states which java runtime was registered. The
+    # pre-flight compares those last two and writes nothing.
+    preflight_reads = ("build_requirements.json", "java -version", "env_overlay.json")
     assert [
         (command, workdir, timeout)
         for (command, workdir, timeout) in orchestrator.commands
-        if "build_requirements.json" not in command and "java -version" not in command
+        if not any(marker in command for marker in preflight_reads)
     ] == []
     assert toolchain_manager.seen_spec.version_requirement.raw == "3.9.6"
     assert result.metadata["maven_version_requirement"] == {
@@ -749,9 +752,17 @@ def test_java_enforcer_failure_does_not_persist_or_block_maven_runtime():
     assert result.error_code == "JAVA_VERSION_ERROR"
     assert "maven_version_requirement" not in result.metadata
     assert "runtime_contract_persisted" not in result.metadata
-    assert not any(
-        "env_overlay" in command for command, _workdir, _timeout in orchestrator.commands
-    )
+    # Persistence, not traffic. The pre-flight now READS the overlay to compare
+    # the java runtime this dispatch runs with the one that was registered; what
+    # a JAVA version failure must never do is WRITE Maven evidence into it, so
+    # every overlay command this run issues has to be a read.
+    overlay_commands = [
+        command for command, _workdir, _timeout in orchestrator.commands if "env_overlay" in command
+    ]
+    assert overlay_commands
+    assert all(
+        command.startswith(("if test -f ", "cat -- ")) for command in overlay_commands
+    ), overlay_commands
 
 
 def test_maven_tool_failed_result_metadata_includes_detected_maven_requirement():

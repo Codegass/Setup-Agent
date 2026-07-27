@@ -15,7 +15,7 @@ docs/superpowers/specs/2026-07-07-python-project-support-design.md Component 2.
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from loguru import logger
 
@@ -72,26 +72,128 @@ _TEMURIN_SETUP = (
 )
 
 
+# One probe answers both questions the activation check asks: which `java` a
+# dispatch will actually run, and which major that is. Keeping them in one
+# command means the check costs no round trip a build did not already pay.
+_JAVA_RUNTIME_PROBE = "command -v java 2>/dev/null; java -version 2>&1"
+
+# The named conflict for "the build is not running the runtime we registered".
+JAVA_RUNTIME_CONFLICT = "java_runtime_not_activated"
+
+# A registered runtime states its version however the registrar spelled it:
+# "21", "21.0.9" and the legacy "1.8" are all the same JDK to a build. The
+# comparison is between MAJORS, so a spelling difference is never a conflict.
+_JAVA_MAJOR_RE = re.compile(r"^(?:1\.)?(\d+)")
+
+
+def _java_major(version: Any) -> Optional[str]:
+    """The JDK major a version string names, or None."""
+    if version is None:
+        return None
+    match = _JAVA_MAJOR_RE.match(str(version).strip())
+    return match.group(1) if match else None
+
+
+def active_java_runtime(orchestrator) -> Dict[str, str]:
+    """The `java` this container resolves right now.
+
+    Absent facts are absent keys: a container that names no executable and
+    prints no version banner returns `{}` rather than a dict of Nones.
+    """
+    result = orchestrator.execute_command(_JAVA_RUNTIME_PROBE)
+    output = result.get("output") or ""
+    runtime: Dict[str, str] = {}
+    for line in output.splitlines():
+        candidate = line.strip()
+        if candidate.startswith("/"):
+            runtime["executable"] = candidate
+            break
+    match = _JAVA_VERSION_RE.search(output)
+    if match:
+        runtime["major"] = match.group(1)
+    return runtime
+
+
 def active_java_major(orchestrator) -> Optional[str]:
     """Major version of the currently active `java`, or None."""
-    result = orchestrator.execute_command("java -version 2>&1")
-    match = _JAVA_VERSION_RE.search(result.get("output") or "")
-    return match.group(1) if match else None
+    return active_java_runtime(orchestrator).get("major")
+
+
+def registered_java_runtime(orchestrator) -> Dict[str, str]:
+    """The java runtime the env overlay states is active, or `{}`."""
+    try:
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        candidate = EnvOverlayStore(orchestrator).active_candidate("java") or {}
+    except Exception as exc:
+        logger.debug(f"registered java runtime unreadable: {exc}")
+        return {}
+    runtime: Dict[str, str] = {}
+    executable = str(candidate.get("executable") or "").strip()
+    if executable:
+        runtime["executable"] = executable
+    major = _java_major(candidate.get("version"))
+    if major:
+        runtime["major"] = major
+    return runtime
+
+
+def java_activation_conflict(
+    registered: Dict[str, str],
+    active: Dict[str, str],
+) -> Optional[str]:
+    """The mismatch between the registered java and the one a dispatch runs.
+
+    Live polaris (`logs/session_20260727_065557_97847`): Java 21 was registered
+    and the compile still resolved Java 17, and the run's only record of that
+    was the model's own guess. A disagreement between the two is a fact about
+    the environment; it is stated, never silently accepted.
+    """
+    if not registered or not active:
+        return None
+    registered_executable = registered.get("executable")
+    active_executable = active.get("executable")
+    if registered_executable and active_executable:
+        if registered_executable != active_executable:
+            return (
+                f"[conflict] {JAVA_RUNTIME_CONFLICT}: the registered runtime is "
+                f"{registered_executable} but this dispatch runs {active_executable}"
+            )
+    registered_major = registered.get("major")
+    active_major = active.get("major")
+    if registered_major and active_major and registered_major != active_major:
+        return (
+            f"[conflict] {JAVA_RUNTIME_CONFLICT}: the registered runtime is "
+            f"Java {registered_major} but this dispatch runs Java {active_major}"
+        )
+    return None
 
 
 def _register_overlay(orchestrator, java_home: str, version: str) -> bool:
     """Register the provisioned JDK in the shared env overlay (report-visible)."""
     try:
         from sag.runtime.env_overlay import EnvOverlayStore
+        from sag.tools.internal.toolchain_manager import record_registered_runtime
 
+        executable = f"{java_home}/bin/java"
         EnvOverlayStore(orchestrator).register(
             "java",
-            f"{java_home}/bin/java",
+            executable,
             version=version,
             source="build_preflight",
             env={"JAVA_HOME": java_home},
             path_prepend=[f"{java_home}/bin"],
             activate=True,
+        )
+        # The overlay is what the dispatch shell sources; the registry is what
+        # the dispatch's identity is taken over. A registration that reaches
+        # only one of them cannot reach the build.
+        record_registered_runtime(
+            orchestrator,
+            "java",
+            executable,
+            version=version,
+            source="registered",
         )
         return True
     except Exception as exc:
@@ -107,6 +209,7 @@ class PreflightOutcome:
     provisioned: bool = False
     mismatch: bool = False
     narration: str = ""
+    conflicts: Tuple[str, ...] = ()
 
 
 class JdkPreflight:
@@ -123,12 +226,39 @@ class JdkPreflight:
             return PreflightOutcome(True, None, required_version)
 
     def _run(self, required: Optional[str], source: str) -> PreflightOutcome:
+        # The activation check needs something to compare AGAINST, so it reads
+        # the overlay first and probes only when a runtime was registered. A
+        # container with no registered java behaves exactly as before: no
+        # probe, no narration, no conflict.
+        registered = registered_java_runtime(self.orchestrator)
         if not required:
-            return PreflightOutcome(True, None, None)
-        active = active_java_major(self.orchestrator)
+            if not registered:
+                return PreflightOutcome(True, None, None)
+            active_runtime = active_java_runtime(self.orchestrator)
+            conflict = java_activation_conflict(registered, active_runtime)
+            return PreflightOutcome(
+                matched=True,
+                active_version=active_runtime.get("major"),
+                required_version=None,
+                narration=conflict or "",
+                conflicts=(JAVA_RUNTIME_CONFLICT,) if conflict else (),
+            )
+
+        active_runtime = active_java_runtime(self.orchestrator)
+        active = active_runtime.get("major")
         if active == required:
             logger.debug(f"JDK pre-flight: active Java {active} matches requirement")
-            return PreflightOutcome(True, active, required)
+            # The version the manifest asked for is satisfied, which does not
+            # by itself prove the build inherited the runtime that was
+            # registered for it — the executables can still differ.
+            conflict = java_activation_conflict(registered, active_runtime)
+            return PreflightOutcome(
+                matched=True,
+                active_version=active,
+                required_version=required,
+                narration=conflict or "",
+                conflicts=(JAVA_RUNTIME_CONFLICT,) if conflict else (),
+            )
 
         header = (
             f"[pre-flight] Required: Java {required} (source: {source}). "
