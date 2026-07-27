@@ -366,9 +366,17 @@ class GradleTool(BaseTool):
                     self._timeout_result_from_command(result, gradle_cmd, tasks)
                 )
 
+            # The complete log. Detached builds hand back a complete
+            # `full_output` (untruncated) next to the bounded inline `output`;
+            # the analysis is parsed by regex and never reaches the model's
+            # context, so it reads THIS text and no truncation applies to it
+            # (same defect Maven carried: a summary line in the omitted middle
+            # was a summary line thrown away).
+            full_output = result.get("full_output") or result["output"]
+
             # Analyze the output
             analysis = self._analyze_gradle_output(
-                result["output"],
+                full_output,
                 result["exit_code"],
                 compile_source_languages=_compile_source_languages,
             )
@@ -391,10 +399,7 @@ class GradleTool(BaseTool):
                     if compile_mismatch:
                         analysis["compile_source_mismatch"] = compile_mismatch
 
-            # Store full output if large. Detached builds hand back a complete
-            # `full_output` (untruncated log) next to the bounded inline `output`;
-            # persist the complete log so output_search surfaces the real failure.
-            full_output = result.get("full_output") or result["output"]
+            # Persist the complete log so output_search surfaces the real failure.
             ref_id = None
             if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:

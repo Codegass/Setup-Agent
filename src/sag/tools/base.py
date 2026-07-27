@@ -1018,13 +1018,53 @@ class BaseTool(ABC):
 
         self._parameter_schema = schema
 
-    def _truncate_output(self, output: str, tool_name: str = None) -> str:
+    @staticmethod
+    def _stored_output_reference(result: "ToolResult") -> Optional[str]:
+        """The OutputStorage reference a result carries, when it carries one.
+
+        Tools set it either on the canonical `output_ref` field or as
+        `output_ref_id` in the metadata; both name the same stored text.
+        """
+        for candidate in (
+            getattr(result, "output_ref", None),
+            (getattr(result, "metadata", None) or {}).get("output_ref_id"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
+    @staticmethod
+    def _truncation_guidance(output_ref: Optional[str]) -> str:
+        """How to read the part of the output the window omitted.
+
+        The complete text is persisted as an OutputStorage `output_<id>`
+        reference, which lives outside the container filesystem: `grep` and
+        `bash` cannot reach it, and `output_search` is the only tool that can.
+        Naming a tool with nothing to read is what cost the 2026-07-27
+        commons-cli run seven actions of hand-reconstruction.
+        """
+        if output_ref:
+            return (
+                f"💡 The complete output is stored as '{output_ref}'. Read the omitted "
+                f"middle with output_search(action='grep', ref_id='{output_ref}', "
+                "grep_pattern='Tests run') — substitute the pattern you need.\n\n"
+            )
+        return (
+            "💡 This result carries no stored output reference, so the omitted middle "
+            "cannot be retrieved — rerun the command with a narrower scope if you need it.\n\n"
+        )
+
+    def _truncate_output(
+        self, output: str, tool_name: str = None, output_ref: Optional[str] = None
+    ) -> str:
         """
         Intelligently truncate long output to preserve context window.
 
         Args:
             output: The raw output to truncate
             tool_name: Name of the tool (used for custom extraction)
+            output_ref: OutputStorage reference holding the complete output, when
+                        the tool persisted one
 
         Returns:
             Truncated output with head, tail, and guidance
@@ -1050,9 +1090,7 @@ class BaseTool(ABC):
         truncation_info = (
             f"\n\n... [OUTPUT TRUNCATED: {len(output)} chars total, showing first {self.head_length} "
             f"and last {self.tail_length} chars] ...\n"
-            f"💡 TIP: If you need specific information from the full output, use 'bash' tool with 'grep' "
-            f"to search for keywords, or 'file_io' to save and search through the complete output.\n\n"
-        )
+        ) + self._truncation_guidance(output_ref)
 
         return head + truncation_info + tail
 
@@ -1290,7 +1328,11 @@ class BaseTool(ABC):
             # Apply output truncation if needed
             if result.succeeded and result.output:
                 original_length = len(result.output)
-                result.output = self._truncate_output(result.output, self.name)
+                result.output = self._truncate_output(
+                    result.output,
+                    self.name,
+                    output_ref=self._stored_output_reference(result),
+                )
 
                 # Update metadata with truncation info
                 if len(result.output) < original_length:

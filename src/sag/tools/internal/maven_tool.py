@@ -61,6 +61,9 @@ class MavenTool(BaseTool):
         # Receipt facts for the LAST physical dispatch of the current execute()
         # call (P0-A); merged into whichever ToolResult that call returns.
         self._pending_invocation_receipt: Optional[Dict[str, Any]] = None
+        # Which Maven the current execute() call chose, and why (Plan 7 §A1);
+        # merged into the returned ToolResult the same way.
+        self._pending_runner_choice: Optional[Dict[str, Any]] = None
 
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use Maven-specific extraction."""
@@ -98,7 +101,7 @@ class MavenTool(BaseTool):
         pom_file: str = None,
         fail_at_end: bool = False,
         ignore_test_failures: bool = False,
-        use_wrapper: bool = False,
+        use_wrapper: Optional[bool] = None,
         extra_args: str = None,
         maven_version_requirement: str = None,
         *,
@@ -146,10 +149,16 @@ class MavenTool(BaseTool):
             ignore_test_failures: Continue build even if tests fail (alternative to fail_at_end)
                                  Sets maven.test.failure.ignore=true property
 
+            use_wrapper: Leave unset (None) to run the project's own ./mvnw when the
+                        checkout ships an executable one — the rule GradleTool
+                        already honours for gradlew. True forces the wrapper, False
+                        forces the registered Maven.
+
             timeout: Maximum seconds to wait for command completion (default: 300)
         """
 
         self._pending_invocation_receipt = None
+        self._pending_runner_choice = None
 
         # Whether the agent explicitly scoped this invocation. The
         # orchestration layer (PR #12) owns working-directory injection, so
@@ -247,6 +256,17 @@ class MavenTool(BaseTool):
                     f"({recommended_root or 'root'}) — sibling deps may be unresolved; "
                     "tests outside this module will not run"
                 )
+        # Which Maven runs: the project's own wrapper when the checkout ships a
+        # usable one, the registered Maven otherwise — and the reason, on the
+        # record either way (spec Plan 7 §A1).
+        prefer_wrapper, runner_choice, runner_narration = self._choose_maven_runner(
+            working_directory,
+            use_wrapper,
+            requirements,
+        )
+        self._pending_runner_choice = runner_choice
+        if runner_narration:
+            preamble_lines.append(runner_narration)
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         requested_version = ToolVersionRequirement.from_raw(
@@ -272,7 +292,7 @@ class MavenTool(BaseTool):
         resolved_maven = self._resolve_maven_executable(
             working_directory=working_directory,
             version_requirement=resolution_requirement,
-            prefer_wrapper=use_wrapper,
+            prefer_wrapper=prefer_wrapper,
         )
 
         if contract_requirement and not resolved_maven:
@@ -290,7 +310,7 @@ class MavenTool(BaseTool):
                 resolved_maven = self._resolve_maven_executable(
                     working_directory=working_directory,
                     version_requirement=resolution_requirement,
-                    prefer_wrapper=use_wrapper,
+                    prefer_wrapper=prefer_wrapper,
                 )
                 if not resolved_maven:
                     return self._maven_executable_not_resolved_result(working_directory)
@@ -302,9 +322,22 @@ class MavenTool(BaseTool):
         maven_executable = (
             resolved_maven.candidate.path
             if resolved_maven
-            else ("./mvnw" if use_wrapper else "mvn")
+            else ("./mvnw" if prefer_wrapper else "mvn")
         )
         maven_runtime = self._maven_runtime_metadata(resolved_maven, maven_executable)
+        # The resolver has the last word — a version requirement can exclude the
+        # wrapper the checkout ships, and the record states what actually runs.
+        wrapper_is_runner = maven_runtime.get("source") == "wrapper"
+        if wrapper_is_runner != (runner_choice["runner"] == "wrapper"):
+            runner_choice = {
+                **runner_choice,
+                "runner": "wrapper" if wrapper_is_runner else "registered",
+                "reason": (
+                    f"{runner_choice['reason']}; the toolchain resolved "
+                    f"{maven_runtime.get('executable')} ({maven_runtime.get('source')})"
+                ),
+            }
+            self._pending_runner_choice = runner_choice
         requested_requirement_metadata = self._maven_version_requirement_metadata(
             contract_requirement
         )
@@ -318,7 +351,7 @@ class MavenTool(BaseTool):
                 properties,
                 pom_file,
                 fail_at_end,
-                use_wrapper=use_wrapper,
+                use_wrapper=prefer_wrapper,
                 extra_args=extra_args,
                 maven_executable=maven_executable,
             )
@@ -380,7 +413,7 @@ class MavenTool(BaseTool):
             properties,
             pom_file,
             fail_at_end,
-            use_wrapper=use_wrapper,
+            use_wrapper=prefer_wrapper,
             extra_args=extra_args,
             maven_executable=maven_executable,
         )
@@ -491,7 +524,8 @@ class MavenTool(BaseTool):
                 return dispatched
 
             _build_t0 = time.monotonic()
-            result = _run_build_with_receipt(1)
+            attempt = 1
+            result = _run_build_with_receipt(attempt)
             runner_dispatched_any = result.get("runner_dispatched") is True
             self._record_execution_receipt(
                 command,
@@ -500,6 +534,65 @@ class MavenTool(BaseTool):
                 result,
                 duration=time.monotonic() - _build_t0,
             )
+
+            # A wrapper that never became a Maven process must not cost the
+            # build: re-resolve without it and rerun ONCE, with the reason on
+            # the record (spec Plan 7 §A1). A wrapper that ran and reported a
+            # build failure is Maven speaking and is left alone.
+            if (
+                wrapper_is_runner
+                and not result.get("dispatch_status")
+                and not result.get("termination_reason")
+            ):
+                start_failure = self._maven_wrapper_start_failure(result)
+                fallback = (
+                    self._resolve_maven_executable(
+                        working_directory=working_directory,
+                        version_requirement=resolution_requirement,
+                        prefer_wrapper=False,
+                    )
+                    if start_failure
+                    else None
+                )
+                if fallback and fallback.candidate.path != maven_executable:
+                    wrapper_path = runner_choice.get("wrapper_path") or maven_executable
+                    wrapper_is_runner = False
+                    runner_choice = {
+                        **runner_choice,
+                        "runner": "registered",
+                        "reason": f"{wrapper_path} failed to start ({start_failure})",
+                    }
+                    self._pending_runner_choice = runner_choice
+                    preamble += (
+                        f"[toolchain] ./mvnw failed to start ({start_failure}) — "
+                        f"falling back to {fallback.candidate.path}\n"
+                    )
+                    maven_executable = fallback.candidate.path
+                    maven_runtime = self._maven_runtime_metadata(fallback, maven_executable)
+                    maven_cmd = self._build_maven_command(
+                        command,
+                        goals,
+                        profiles,
+                        properties,
+                        pom_file,
+                        fail_at_end,
+                        use_wrapper=False,
+                        extra_args=extra_args,
+                        maven_executable=maven_executable,
+                    )
+                    attempt += 1
+                    fallback_t0 = time.monotonic()
+                    result = _run_build_with_receipt(attempt)
+                    self._record_execution_receipt(
+                        command,
+                        maven_cmd,
+                        working_directory,
+                        result,
+                        duration=time.monotonic() - fallback_t0,
+                    )
+                    runner_dispatched_any = (
+                        runner_dispatched_any or result.get("runner_dispatched") is True
+                    )
 
             # Bounded retry: a version-shaped failure means the requirement in
             # the error text is authoritative; re-provision from it and rerun
@@ -526,7 +619,8 @@ class MavenTool(BaseTool):
                         )
                         jdk_retry_meta = {"from": active, "to": needed}
                         retry_t0 = time.monotonic()
-                        result = _run_build_with_receipt(2)
+                        attempt += 1
+                        result = _run_build_with_receipt(attempt)
                         self._record_execution_receipt(
                             command,
                             maven_cmd,
@@ -559,8 +653,17 @@ class MavenTool(BaseTool):
                     )
                 )
 
+            # The complete log. For detached builds the orchestrator hands back
+            # a complete `full_output` (untruncated) alongside the bounded
+            # inline `output`; everything derived internally — the analysis, the
+            # command tracker, the persisted output — reads THIS text, never the
+            # model-facing window (live commons-cli 2026-07-27: the aggregate
+            # `Tests run:` line sat in the omitted middle, so counts the runner
+            # had already computed were discarded and re-derived by hand).
+            full_output = result.get("full_output") or result["output"]
+
             # Analyze the output
-            analysis = self._analyze_maven_output(result["output"], result["exit_code"])
+            analysis = self._analyze_maven_output(full_output, result["exit_code"])
             if auto_ignore_test_failures and analysis.get("test_failure_count", 0) > 0:
                 analysis["build_success"] = False
                 analysis["error_type"] = analysis.get("error_type") or "TEST_FAILURE"
@@ -568,11 +671,8 @@ class MavenTool(BaseTool):
             if requested_requirement_metadata and not analysis.get("maven_version_requirement"):
                 analysis["maven_version_requirement"] = requested_requirement_metadata
 
-            # Store full output if large. For detached builds the orchestrator
-            # hands back a complete `full_output` (untruncated log) alongside the
-            # bounded inline `output`; persist the complete log so output_search
-            # can surface the real failure, not just a 50-line tail.
-            full_output = result.get("full_output") or result["output"]
+            # Persist the complete log so output_search can surface the real
+            # failure, not just a 50-line tail.
             ref_id = None
             if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
@@ -702,7 +802,7 @@ class MavenTool(BaseTool):
                         tool="maven",
                         working_dir=working_directory,
                         exit_code=result["exit_code"],
-                        output=result["output"],
+                        output=full_output,
                     )
                 elif is_build_command:
                     self.command_tracker.track_build_command(
@@ -710,7 +810,7 @@ class MavenTool(BaseTool):
                         tool="maven",
                         working_dir=working_directory,
                         exit_code=result["exit_code"],
-                        output=result["output"],
+                        output=full_output,
                         duration=_build_elapsed,
                     )
                 logger.debug(f"Tracked Maven command: {maven_cmd[:100]}...")
@@ -957,10 +1057,17 @@ class MavenTool(BaseTool):
 
     def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:
         """Byte-compat: `receipt_id` on success, `receipt_persisted` only on
-        failure — nothing at all on paths that dispatched no runner."""
+        failure — nothing at all on paths that dispatched no runner.
+
+        The runner choice (spec Plan 7 §A1) rides the same merge: whichever
+        Maven ran, and why, is a fact of every result a dispatch produced.
+        """
         receipt_metadata = getattr(self, "_pending_invocation_receipt", None)
         if receipt_metadata:
             tool_result.metadata.update(receipt_metadata)
+        runner_choice = getattr(self, "_pending_runner_choice", None)
+        if runner_choice:
+            tool_result.metadata["maven_runner_choice"] = runner_choice
         return tool_result
 
     def _record_execution_receipt(
@@ -1101,6 +1208,188 @@ class MavenTool(BaseTool):
         # arguments containing (), #, ! or commas reach bash unquoted — the
         # 2026-07-24 bigtop launcher died on exactly that.
         return " ".join(shlex.quote(part) for part in cmd_parts)
+
+    # ------------------------------------------------------------------
+    # which Maven runs (Plan 7 §A1)
+    # ------------------------------------------------------------------
+
+    WRAPPER_PROPERTIES = ".mvn/wrapper/maven-wrapper.properties"
+
+    # A wrapper that never became a Maven process. Every marker below is the
+    # launcher failing, not Maven reporting a build result: a wrapper that
+    # downloads its distribution needs network, and losing the network must not
+    # lose the build. Maven's own failures ([ERROR] ... BUILD FAILURE) are
+    # deliberately absent — those are answers, not a missing runner.
+    WRAPPER_START_FAILURE_MARKERS = (
+        "could not find or load main class org.apache.maven.wrapper",
+        "error: could not find or load main class",
+        "cannot download",
+        "could not download",
+        "failed to download",
+        "error downloading",
+        "unable to download",
+        "no such file or directory",
+        "permission denied",
+    )
+    WRAPPER_START_FAILURE_EXIT_CODES = (126, 127)
+
+    @staticmethod
+    def _maven_wrapper_pinned_version(properties_text: str) -> Optional[str]:
+        """The Maven version a wrapper's distributionUrl states, when it states one.
+
+        Live camel: `distributionUrl=https://.../apache-maven/3.9.11/
+        apache-maven-3.9.11-bin.zip` pins 3.9.11. A URL naming no version
+        (a `latest` alias, a private mirror) pins nothing, and an absent fact
+        stays an absent key.
+        """
+        for line in (properties_text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith("!"):
+                continue
+            key, separator, value = stripped.partition("=")
+            if not separator or key.strip() != "distributionUrl":
+                continue
+            # .properties escapes `:` as `\:`; the URL is the same URL.
+            url = value.strip().replace("\\", "")
+            match = re.search(r"apache-maven-(\d[\w.\-]*?)-(?:bin|src)\.", url)
+            if match:
+                return match.group(1)
+            match = re.search(r"/(\d+(?:\.\d+)+(?:-[\w.]+)?)/", url)
+            if match:
+                return match.group(1)
+        return None
+
+    def _maven_wrapper_facts(self, directory: str) -> Dict[str, Any]:
+        """What the checkout at `directory` says about its own ./mvnw.
+
+        Returns `{}` when the directory states nothing — no wrapper, or no
+        orchestrator to ask. Absent facts are absent keys.
+        """
+        if not self.orchestrator or not directory:
+            return {}
+        root = directory.rstrip("/") or "/"
+        wrapper = f"{root}/mvnw"
+        quoted = shlex.quote(wrapper)
+        probe = self.orchestrator.execute_command(
+            f"if [ -x {quoted} ]; then echo EXECUTABLE; "
+            f"elif [ -f {quoted} ]; then echo PRESENT; else echo MISSING; fi"
+        )
+        marker = (probe.get("output") or "").strip()
+        if "EXECUTABLE" not in marker and "PRESENT" not in marker:
+            return {}
+
+        facts: Dict[str, Any] = {
+            "wrapper_path": wrapper,
+            "executable": "EXECUTABLE" in marker,
+        }
+        properties = self.orchestrator.execute_command(
+            f"cat {shlex.quote(f'{root}/{self.WRAPPER_PROPERTIES}')} 2>/dev/null"
+        )
+        pinned = self._maven_wrapper_pinned_version(properties.get("output") or "")
+        if pinned:
+            facts["pinned_version"] = pinned
+        return facts
+
+    def _choose_maven_runner(
+        self,
+        working_directory: str,
+        use_wrapper: Optional[bool],
+        requirements: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, Dict[str, Any], Optional[str]]:
+        """Whether to prefer the wrapper, which Maven that makes the runner, why.
+
+        The project's own wrapper wins when the checkout ships an executable
+        one: it is what the project asks to be built with, down to the resolver
+        its `.mvn/extensions.xml` was compiled against (live camel: a registered
+        Maven died in `org.eclipse.aether.SessionData.computeIfAbsent` before
+        compiling a line). An explicit `use_wrapper=False` from a caller still
+        wins over the checkout.
+
+        The preference and the recorded runner are separate answers: a caller
+        may force the preference on a checkout that ships no usable wrapper,
+        and the record then states what is actually there, not what was asked.
+        """
+        if use_wrapper is False:
+            return (
+                False,
+                {"runner": "registered", "reason": "the caller passed use_wrapper=False"},
+                None,
+            )
+        forced = use_wrapper is True
+
+        # The invocation's own working directory, then the surveyed project
+        # root it targets when the pre-flight already read one (the facade
+        # reads the manifest a layer up and passes none — the choice then rests
+        # on the directory the command actually runs in).
+        searched = [working_directory]
+        build_root = ((requirements or {}).get("build_root") or "").rstrip("/")
+        if build_root and build_root != (working_directory or "").rstrip("/"):
+            searched.append(build_root)
+
+        facts: Dict[str, Any] = {}
+        for directory in searched:
+            facts = self._maven_wrapper_facts(directory)
+            if facts:
+                break
+
+        if not facts:
+            return (
+                forced,
+                {
+                    "runner": "registered",
+                    "reason": f"no ./mvnw in {' or '.join(searched)}",
+                },
+                None,
+            )
+
+        wrapper_path = facts["wrapper_path"]
+        pinned = facts.get("pinned_version")
+        pin_fact = {"pinned_version": pinned} if pinned else {}
+        if not facts["executable"]:
+            return (
+                forced,
+                {
+                    "runner": "registered",
+                    "reason": f"{wrapper_path} is not executable",
+                    "wrapper_path": wrapper_path,
+                    **pin_fact,
+                },
+                "[toolchain] ./mvnw is present but not executable — using the registered Maven",
+            )
+
+        return (
+            True,
+            {
+                "runner": "wrapper",
+                "reason": f"the checkout ships an executable {wrapper_path}",
+                "wrapper_path": wrapper_path,
+                **pin_fact,
+            },
+            "[toolchain] using the project's own ./mvnw"
+            + (f" (pins Maven {pinned})" if pinned else ""),
+        )
+
+    def _maven_wrapper_start_failure(self, result: Dict[str, Any]) -> Optional[str]:
+        """Why ./mvnw never became a Maven process, when it never did.
+
+        A Maven that ran at all announces itself — `[INFO]` lines, the
+        `Apache Maven <version>` banner. Output carrying either is Maven
+        reporting a build result, however it failed, and is never second-guessed:
+        the launcher markers below would otherwise fire on a genuine build error
+        whose text happens to mention a missing file.
+        """
+        exit_code = result.get("exit_code")
+        if exit_code in (0, None):
+            return None
+        text = str(result.get("full_output") or result.get("output") or "").lower()
+        if "[info]" in text or "apache maven" in text:
+            return None
+        if exit_code in self.WRAPPER_START_FAILURE_EXIT_CODES:
+            return f"exit code {exit_code}"
+        for marker in self.WRAPPER_START_FAILURE_MARKERS:
+            if marker in text:
+                return marker
+        return None
 
     def _resolve_maven_executable(
         self,
@@ -2936,8 +3225,11 @@ Maven Tool Usage Examples:
                 },
                 "use_wrapper": {
                     "type": "boolean",
-                    "description": "Use ./mvnw wrapper if available (falls back to mvn)",
-                    "default": False,
+                    "description": (
+                        "Leave unset to run the project's own ./mvnw when the checkout "
+                        "ships an executable one; false forces the registered Maven"
+                    ),
+                    "default": None,
                 },
                 "extra_args": {
                     "type": ["string", "array"],
