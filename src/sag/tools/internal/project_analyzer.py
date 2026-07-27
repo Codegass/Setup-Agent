@@ -74,7 +74,12 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # and the edges carry their stable edge_id/support_claim_ids (Plan 6 Stage A).
 # A v9 manifest has neither, so reusing it would serve a later stage facts
 # whose identities do not exist.
-SURVEY_FACTS_VERSION = 10
+# v11: the survey also discovers the bounded document map and the typed claims
+# its indexed entries state (Plan 6 Stage F1), and the stamp carries the
+# document-map fingerprint the contract freeze pins against. A v10 manifest was
+# written by a survey that produced neither, so reusing it would leave a run
+# with no claims to cite and no map to retrieve from.
+SURVEY_FACTS_VERSION = 11
 
 
 def _project_recommendation_coordinates(rec):
@@ -408,10 +413,16 @@ class ProjectAnalyzerTool(BaseTool):
             # Tests can live in different modules / a different build system than
             # the main build (Bigtop: Maven build module, Gradle test modules).
             self._recommend_test_approach(project_path, analysis["build_recommendation"])
+            # Step 4.7 (Plan 6 Stage F1): the bounded document map and the typed
+            # claims its indexed entries state. It runs AFTER the domains are
+            # typed, because a claim is scoped to the domain whose tree it was
+            # read under, and BEFORE the manifest, because the DomainFacts
+            # projection persisted below reads the claims this writes.
+            document_map = self._survey_documents_and_claims(project_path, analysis)
             # Persist the phase-1 -> build-tool handoff into the container so
             # MavenTool/GradleTool (which only hold an orchestrator) can run
             # the JDK pre-flight against the analyzed requirements.
-            self._persist_build_requirements(project_path, analysis)
+            self._persist_build_requirements(project_path, analysis, document_map=document_map)
         except Exception as exc:
             logger.warning(f"Build-approach recommendation failed: {exc}")
 
@@ -811,6 +822,108 @@ class ProjectAnalyzerTool(BaseTool):
         if edges:
             rec["domain_edges"] = edges
 
+    # --- the document survey (Plan 6 Stage F1, spec §C1) --------------------
+
+    def _survey_documents_and_claims(
+        self,
+        project_path: str,
+        analysis: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Discover the bounded document map and mint the claims it states.
+
+        Two independent halves, each with its own recorded conflict. The map
+        answers "what does this checkout SAY about building itself, and where",
+        as handles that never carry text; the claims answer "what do those
+        bytes state", as typed literals with their own provenance. Nothing here
+        reaches a prompt: the model never sees a document, an excerpt or a
+        command — the DomainFacts projection downstream carries claim IDs only.
+
+        Failure is a FACT, never an analyze failure (plan §F1 item 1): a map
+        that could not be discovered or persisted leaves `document_map_failed`,
+        extraction that could not run or persist leaves
+        `claim_extraction_failed`, and the survey continues with fewer facts.
+        Returns the map so the caller can hand it to the projection instead of
+        reading it back out of the container.
+        """
+        execute = getattr(self.docker_orchestrator, "execute_command", None)
+        if not callable(execute):
+            return None
+
+        from sag.agent.claim_records import write_claims
+        from sag.agent.document_map import discover_document_map, write_document_map
+
+        try:
+            document_map = discover_document_map(execute, project_path)
+            if not write_document_map(execute, document_map):
+                raise RuntimeError("the discovered map did not reach the container")
+        except Exception as exc:
+            self._record_survey_conflict(analysis, "document_map_failed", exc)
+            return None
+        fingerprint = str(document_map.get("document_map_fingerprint") or "")
+        if fingerprint:
+            analysis["document_map_fingerprint"] = fingerprint
+
+        try:
+            claims = self._extract_document_claims(execute, project_path, document_map, analysis)
+            if claims and not write_claims(execute, claims):
+                raise RuntimeError("not every extracted claim reached the container")
+        except Exception as exc:
+            self._record_survey_conflict(analysis, "claim_extraction_failed", exc)
+        return document_map
+
+    def _extract_document_claims(
+        self,
+        execute,
+        project_path: str,
+        document_map: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> List[Any]:
+        """Run the typed extractors over the entries that HAVE extractors.
+
+        One bounded fetch per such entry, under the map's own byte budget. An
+        entry whose kind no extractor reads is never fetched again — it was
+        already hashed and indexed, and a second read of it could produce
+        nothing.
+        """
+        from sag.agent.claim_records import entry_has_extractors, extract_policy_claims
+        from sag.agent.document_map import read_entry_text
+
+        domain_roots = [
+            str(domain.get("root") or "")
+            for domain in (analysis.get("build_recommendation") or {}).get("build_domains") or ()
+            if domain.get("root")
+        ]
+        claims: List[Any] = []
+        for entry in document_map.get("entries") or ():
+            body = entry.payload() if hasattr(entry, "payload") else dict(entry)
+            if not entry_has_extractors(body):
+                continue
+            text = read_entry_text(execute, body)
+            if not text:
+                continue
+            claims.extend(
+                extract_policy_claims(
+                    body,
+                    text,
+                    checkout_root=project_path,
+                    domain_roots=domain_roots,
+                )
+            )
+        return claims
+
+    @staticmethod
+    def _record_survey_conflict(analysis: Dict[str, Any], kind: str, exc: Exception) -> None:
+        """Record one named survey conflict on the analysis; never raise.
+
+        The conflict is a survey fact like any other, so it lives beside them
+        and stays out of the bounded public fact sheet, which admits only the
+        keys it names.
+        """
+        logger.warning(f"{kind}: {exc}")
+        analysis.setdefault("survey_conflicts", []).append(
+            {"kind": kind, "detail": f"{type(exc).__name__}: {exc}"[:200]}
+        )
+
     def _recommend_test_approach(self, project_path: str, build_rec: Dict[str, Any]) -> None:
         """Recommend WHERE to run tests — they often live in different modules (and
         a different build system) than the main build.
@@ -923,8 +1036,18 @@ class ProjectAnalyzerTool(BaseTool):
             "root": python_config.get("python_root") or project_path,
         }
 
-    def _persist_build_requirements(self, project_path: str, analysis: Dict[str, Any]) -> None:
+    def _persist_build_requirements(
+        self,
+        project_path: str,
+        analysis: Dict[str, Any],
+        *,
+        document_map: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Persist the analyzer's build/test requirements manifest (spec §2).
+
+        `document_map` is the map this survey just discovered, passed in rather
+        than read back: the projection below needs it and the caller is already
+        holding it.
 
         The root shape is DERIVED from the recommendation the analyzer already
         computed — it is a classification of the chosen targeting, not a second
@@ -990,6 +1113,16 @@ class ProjectAnalyzerTool(BaseTool):
             "test_islands": rec.get("test_islands") or [],
         }
 
+        # Plan 6 Stage F1: the same staleness contract, one document further —
+        # the pre-dispatch freeze pins this fingerprint, so a contract frozen
+        # against a map that has since changed is refused as historical rather
+        # than applied to current truth (spec §6 "Staleness"). Absent when this
+        # survey discovered no map, so a manifest never states a pin it has not
+        # observed.
+        document_map_fingerprint = str(analysis.get("document_map_fingerprint") or "")
+        if document_map_fingerprint:
+            data["survey"]["document_map_fingerprint"] = document_map_fingerprint
+
         # P0-B: the typed domains and their coordinate edges ride the SAME
         # handoff manifest, so every reader downstream judges independence from
         # the graph instead of the directory layout. Absent — not empty — when
@@ -1013,6 +1146,9 @@ class ProjectAnalyzerTool(BaseTool):
                 self.docker_orchestrator,
                 rec["build_domains"],
                 rec.get("domain_edges"),
+                # The map this survey just discovered, handed over rather than
+                # read back out of the container.
+                document_map=document_map,
                 native_artifact_fact=self._survey_native_artifact_fact(project_path, analysis),
             )
             if domain_facts:

@@ -37,6 +37,7 @@ from .attempt_policy import (
     test_execution_binding,
     test_execution_matches_candidate,
 )
+from .claim_graph import commit_assessment_transitions
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
     ControlEventSink,
@@ -45,6 +46,7 @@ from .control_events import (
     compact_control_value,
     forced_action_sha256,
 )
+from .evidence_assessments import ASSESSMENT_DIR
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .invocation_contracts import action_context, clear_action_context, set_action_context
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
@@ -76,11 +78,17 @@ from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_types import ReactModelMode, ReActStep, StepType
 from .repair_contracts import (
+    REPAIR_DIR,
     REPAIR_TOOL,
     accepted_repair_for,
+    build_repair,
     clear_accepted_repair,
+    is_failure_class,
+    read_records,
+    retrieve_for,
     set_accepted_repair,
     surfacing_block,
+    write_repair,
 )
 from .retry_authority import (
     RETRY_TOOL,
@@ -4034,9 +4042,11 @@ class ReActEngine(UIEventEmitter):
 
         Reactive, never anticipatory (Plan 6 Stage C3, spec §C6): a proposal is
         surfaced only after a receipt this dispatch minted was assessed as a
-        typed failure, and only when a repair for THAT assessment is already on
-        disk. No receipt in the metadata means no assessment to react to, so the
-        evidence directories are not even read."""
+        typed failure. Plan 6 Stage F1 makes the proposal EXIST at the same
+        seam — retrieval is legal from the moment the typed code is on disk and
+        not one moment earlier — so creation runs first and surfacing then
+        finds what it needs. No receipt in the metadata means no assessment to
+        react to, so the evidence directories are not even read."""
         if source_tool != REPAIR_TOOL:
             return None
         orchestrator = getattr(self, "orchestrator", None)
@@ -4046,7 +4056,203 @@ class ReActEngine(UIEventEmitter):
         receipt_id = str((getattr(result, "metadata", None) or {}).get("receipt_id") or "").strip()
         if not receipt_id:
             return None
+        contract_id = str(
+            (getattr(result, "metadata", None) or {}).get("contract_id") or ""
+        ).strip()
+        self._create_missing_repairs(orchestrator, receipt_id, contract_id)
         return surfacing_block(orchestrator, receipt_id)
+
+    def _create_missing_repairs(
+        self,
+        orchestrator: Any,
+        receipt_id: str,
+        contract_id: str,
+    ) -> None:
+        """Mint the proposal a fresh failure assessment has not got yet.
+
+        Plan 6 Stage F1 (spec §C6): the loop's retrieval step had no production
+        caller, so a live failure was assessed and then answered with nothing.
+        This is where it belongs — the dispatch ran, its receipt was assessed,
+        and the typed code that routes the read is persisted.
+
+        Bounded three ways: only assessments of THIS receipt that carry a
+        failure-class code, only those with no proposal on disk, and one
+        attempt per assessment for the whole run — `unknown` is a real answer
+        (spec §C6 step 5) and re-asking would re-read the repository for it.
+
+        Never raises: a proposal that could not be created is a missing repair,
+        not a broken observation."""
+        execute = getattr(orchestrator, "execute_command", None)
+        if not callable(execute):
+            return
+        attempted = self._assessment_guard("_repair_creation_attempts")
+        try:
+            triggers = [
+                record
+                for record in read_records(orchestrator, ASSESSMENT_DIR)
+                if str(record.get("receipt_id") or "").strip() == receipt_id
+                and is_failure_class(record.get("typed_code"))
+                and str(record.get("assessment_id") or "").strip() not in attempted
+            ]
+            if not triggers:
+                return
+            answered = {
+                str(record.get("trigger_assessment_id") or "").strip()
+                for record in read_records(orchestrator, REPAIR_DIR)
+            }
+            pending = [
+                record
+                for record in triggers
+                if str(record.get("assessment_id") or "").strip() not in answered
+            ]
+            if not pending:
+                return
+
+            from sag.agent.document_map import read_entry_text
+            from sag.agent.physical_survey import read_document_map
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            document_map = read_document_map(orchestrator)
+            if not (document_map or {}).get("entries"):
+                # No map, no bounded selection: retrieval would have to read the
+                # repository, which is exactly what §C6 exists to prevent.
+                return
+            requirements = read_build_requirements(orchestrator) or {}
+            contract = read_frozen_contract(execute, contract_id) or {}
+            for trigger in pending:
+                attempted.add(str(trigger.get("assessment_id") or "").strip())
+                self._create_repair_for(
+                    execute,
+                    trigger,
+                    document_map=document_map,
+                    requirements=requirements,
+                    contract=contract,
+                    fetch_text=lambda entry: read_entry_text(execute, entry),
+                )
+        except Exception as exc:  # retrieval never breaks an observation
+            logger.debug(f"no repair was created for receipt {receipt_id}: {exc}")
+
+    @staticmethod
+    def _create_repair_for(
+        execute,
+        trigger: Dict[str, Any],
+        *,
+        document_map: Dict[str, Any],
+        requirements: Dict[str, Any],
+        contract: Dict[str, Any],
+        fetch_text,
+    ) -> None:
+        """Retrieve, propose and persist ONE repair for one assessment.
+
+        The scope comes from the survey manifest and the frozen contract, never
+        from the assessment — which states a typed code and nothing about where
+        it happened. The domain is resolved by the contract's own `domain_id`
+        rather than by re-deriving containment: the freeze already decided
+        which domain this dispatch belonged to, and a second rule for the same
+        question is a second answer waiting to happen.
+
+        The domain roots handed to the extractors are the survey's own, so a
+        claim re-read here carries the applicability it was minted with; roots
+        that disagreed would make an applicable claim look like somebody
+        else's."""
+        survey = requirements.get("survey") if isinstance(requirements, Mapping) else None
+        checkout_root = str((survey or {}).get("project_path") or "").strip()
+        domains = requirements.get("build_domains") or requirements.get("domain_facts") or ()
+        roots = [
+            str(domain.get("root") or "")
+            for domain in domains
+            if isinstance(domain, Mapping) and domain.get("root")
+        ]
+        by_domain_id = {
+            str(fact.get("domain_id") or ""): str(fact.get("root") or "")
+            for fact in requirements.get("domain_facts") or ()
+            if isinstance(fact, Mapping)
+        }
+        domain_id = str(contract.get("domain_id") or "").strip()
+        domain_root = by_domain_id.get(domain_id, "")
+        retrieved = retrieve_for(
+            str(trigger.get("typed_code") or ""),
+            document_map=document_map,
+            fetch_text=fetch_text,
+            checkout_root=checkout_root or str(requirements.get("build_root") or ""),
+            domain_id=domain_id or None,
+            applicability={"domain": domain_root} if domain_root else None,
+            domain_roots=roots,
+            execute=execute,
+        )
+        repair = build_repair(
+            trigger,
+            retrieved["claims"],
+            domain_id=domain_id or None,
+            domain_root=domain_root
+            or str(contract.get("expected_cwd") or requirements.get("build_root") or "")
+            or checkout_root,
+            fact_epoch=contract.get("fact_epoch"),
+            open_conflicts=retrieved["conflicts"],
+        )
+        if repair is not None:
+            write_repair(execute, repair)
+
+    def _commit_claim_transitions(self, source_tool: Optional[str]) -> None:
+        """Move the claims this dispatch's own assessments settled.
+
+        Plan 6 Stage F1 (spec §C5): a contract cites the stored claims that
+        authorized it, so a verdict on its receipt is also a verdict on those
+        claims. `expectation_met` confirms them; a typed `falsifier_*`
+        contradicts them and retracts whatever rested on them. Everything else
+        moves nothing.
+
+        Same seam as the retry authority and the repair block, for the same
+        reason: this is the one place where receipt, contract and assessment
+        are all on disk together. One commit attempt per assessment, and never
+        raises — an uncommitted group is absent to replay, not half-applied."""
+        if source_tool != REPAIR_TOOL:
+            return
+        orchestrator = getattr(self, "orchestrator", None)
+        execute = getattr(orchestrator, "execute_command", None)
+        if not callable(execute):
+            return
+        committed = self._assessment_guard("_claim_commit_attempts")
+        try:
+            metadata = getattr(self._answered_action_result(), "metadata", None) or {}
+            receipt_id = str(metadata.get("receipt_id") or "").strip()
+            contract_id = str(metadata.get("contract_id") or "").strip()
+            if not receipt_id or not contract_id:
+                return
+            contract = read_frozen_contract(execute, contract_id) or {}
+            claim_ids = [str(value).strip() for value in contract.get("supporting_claim_ids") or ()]
+            claim_ids = [value for value in claim_ids if value]
+            if not claim_ids:
+                return
+            for record in read_records(orchestrator, ASSESSMENT_DIR):
+                if str(record.get("receipt_id") or "").strip() != receipt_id:
+                    continue
+                assessment_id = str(record.get("assessment_id") or "").strip()
+                if not assessment_id or assessment_id in committed:
+                    continue
+                committed.add(assessment_id)
+                commit_assessment_transitions(
+                    execute,
+                    assessment_id=assessment_id,
+                    typed_code=record.get("typed_code"),
+                    claim_ids=claim_ids,
+                    emit=self._emit_control_event,
+                    fact_epoch=contract.get("fact_epoch"),
+                )
+        except Exception as exc:  # the claim graph never breaks an observation
+            logger.debug(f"claim transitions were not committed for this observation: {exc}")
+
+    def _assessment_guard(self, name: str) -> set:
+        """The in-memory set of assessment ids one reaction has already run for.
+
+        Published lazily on the engine, like `_observation_source_tool`: the
+        bound is per RUN, and the seam it guards is reached from constructors
+        the tests substitute."""
+        guard = getattr(self, name, None)
+        if guard is None:
+            guard = set()
+            setattr(self, name, guard)
+        return guard
 
     def _record_retry_authority(self, source_tool: Optional[str]) -> None:
         """Sign the retry key of a dispatch a failure-class assessment closed.
@@ -4103,6 +4309,7 @@ class ReActEngine(UIEventEmitter):
         than passed down, because `_add_observation_step` is a one-argument
         seam that callers (and tests) substitute."""
         self._record_retry_authority(source_tool)
+        self._commit_claim_transitions(source_tool)
         block = self._repair_surfacing_block(source_tool)
         if block:
             # One block per observation: this is the only place an observation

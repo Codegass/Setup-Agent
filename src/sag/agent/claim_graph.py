@@ -37,13 +37,14 @@ reads it back — a fresh `load()` takes the events and the claim files only.
 """
 
 import hashlib
+import json
 import posixpath
 import shlex
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
-from sag.agent.claim_records import EVIDENCE_STATUSES
+from sag.agent.claim_records import CLAIM_DIR, EVIDENCE_STATUSES
 from sag.agent.control_events import canonical_json
 
 CLAIM_GRAPH_SCHEMA_VERSION = 1
@@ -60,6 +61,14 @@ INVALIDATED_STATUS = "unknown"
 # When a claim stops supporting the conclusions that rest on it.
 LOST_EVIDENCE_STATUSES = ("contradicted", "unknown")
 LOST_SOURCE_STATUSES = ("stale", "superseded")
+
+# What a typed verdict does to the claims its contract cited (spec §C5). Data,
+# so the bridge below states no policy of its own: a code outside this table
+# moves nothing, which is what "an honest failure falsifies no claim" means.
+CONFIRMING_CODE = "expectation_met"
+CONTRADICTING_PREFIX = "falsifier_"
+CONFIRMED_STATUS = "confirmed"
+CONTRADICTED_STATUS = "contradicted"
 
 
 class ClaimGraphError(Exception):
@@ -449,6 +458,118 @@ def load(
 
 
 # ---------------------------------------------------------------------------
+# the live bridge: one assessment -> one committed group (Plan 6 Stage F1)
+# ---------------------------------------------------------------------------
+
+
+def read_claim_files(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Every persisted claim body, ordered by id so two reads agree.
+
+    One bounded glob `cat` — the same read `repair_contracts.read_records`
+    performs over the same directory. It is restated here rather than imported
+    for the reason `materialize` takes the same argument: this module's
+    transport is an `execute` CALLABLE, and reaching for the Stage C3 reader
+    would make the C1 graph depend on the C3 repair layer to read its own
+    subjects. The equivalence is asserted by test rather than assumed.
+
+    A line that does not parse is skipped rather than failing the read: a
+    corrupt neighbour must not hide the claims we do understand.
+    """
+    try:
+        probe = execute(f"cat {shlex.quote(CLAIM_DIR)}/*.json 2>/dev/null") or {}
+    except Exception as exc:  # an unreadable directory is an absent fact
+        logger.debug(f"claim files unavailable for the graph: {exc}")
+        return []
+    claims: Dict[str, Dict[str, Any]] = {}
+    for line in str(probe.get("output") or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except (TypeError, ValueError):
+            continue
+        identifier = _text(payload.get("claim_id")) if isinstance(payload, Mapping) else ""
+        if identifier:
+            claims[identifier] = dict(payload)
+    return [claims[identifier] for identifier in sorted(claims)]
+
+
+def commit_assessment_transitions(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    *,
+    assessment_id: Any,
+    typed_code: Any,
+    claim_ids: Sequence[str],
+    emit: Callable[[str, Mapping[str, Any]], Any],
+    fact_epoch: Optional[int] = None,
+) -> Tuple[str, ...]:
+    """Move the claims one assessment settled, as ONE event group (note (a)).
+
+    A contract cites the stored claims that authorized it, so a verdict on its
+    receipt is also a verdict on those claims: `expectation_met` CONFIRMS them,
+    and a typed `falsifier_*` CONTRADICTS them and retracts whatever rested on
+    them. Every other typed code moves nothing — a compiler error is a real
+    fact about the run and falsifies nothing a document states (spec §C5).
+
+    The subjects are the claim FILES, so a claim that never reached disk is
+    skipped by name: a contract citing an unpersisted claim is a conflict to
+    record, not a crash. Events are handed to `emit` in order and the terminal
+    record closes the group, so a run that dies mid-commit leaves a group
+    replay reads as absent rather than half-applied.
+
+    Returns the ids that moved. Never raises.
+    """
+    trigger = _text(assessment_id)
+    code = _text(typed_code)
+    subjects = [value for value in (_text(item) for item in claim_ids or ()) if value]
+    if not trigger or not subjects:
+        return ()
+    if code == CONFIRMING_CODE:
+        status = CONFIRMED_STATUS
+    elif code.startswith(CONTRADICTING_PREFIX):
+        status = CONTRADICTED_STATUS
+    else:
+        return ()
+
+    try:
+        graph = load((), read_claim_files(execute), fact_epoch=fact_epoch)
+        group = group_identity(trigger)
+        moved: List[str] = []
+        for claim_id in subjects:
+            try:
+                graph.transition(claim_id, status, trigger, group, fact_epoch=fact_epoch)
+            except UnknownClaimError:
+                logger.warning(
+                    f"contract claim {claim_id!r} has no claim file; {trigger} moved "
+                    "nothing for it and the citation stays an open conflict"
+                )
+                continue
+            except ClaimGraphError as exc:
+                logger.debug(f"{trigger} could not move {claim_id!r}: {exc}")
+                continue
+            moved.append(claim_id)
+            if status == CONTRADICTED_STATUS:
+                moved.extend(
+                    graph.invalidate_dependents(
+                        claim_id, group_id=group, cause_assessment_id=trigger
+                    )
+                )
+        if not moved:
+            return ()
+        graph.commit_group(group)
+        for payload in graph.pending_events():
+            emit("claim_transition", payload)
+        graph.materialize(execute)
+        return tuple(moved)
+    except Exception as exc:  # the graph never breaks the run that fed it
+        logger.debug(f"claim transitions for {trigger} were not committed: {exc}")
+        return ()
+
+
+# ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------
 
@@ -520,6 +641,10 @@ __all__ = [
     "CLAIM_GRAPH_HEREDOC",
     "CLAIM_GRAPH_PATH",
     "CLAIM_GRAPH_SCHEMA_VERSION",
+    "CONFIRMED_STATUS",
+    "CONFIRMING_CODE",
+    "CONTRADICTED_STATUS",
+    "CONTRADICTING_PREFIX",
     "INVALIDATED_STATUS",
     "LOST_EVIDENCE_STATUSES",
     "LOST_SOURCE_STATUSES",
@@ -529,6 +654,8 @@ __all__ = [
     "StaleFactEpochError",
     "SupportCycleError",
     "UnknownClaimError",
+    "commit_assessment_transitions",
     "group_identity",
     "load",
+    "read_claim_files",
 ]
