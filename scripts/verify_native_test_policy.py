@@ -31,6 +31,39 @@ RECEIPT_SCHEMA_VERSIONS = (1, 2)
 # sessions record none, so the immutability assertion falls back to integrity.
 RECEIPT_HASH_KEYS = ("receipt_sha256", "receipt_content_hash", "receipt_hash")
 
+# Pre-dispatch invocation contracts (Plan 6 Stage B, spec §C3). Plan 5 sessions
+# persist none; `contracts.chain` is silent for them by construction.
+CONTRACT_DIRNAME = os.path.join(".setup_agent", "invocation_contracts")
+# Names the contract module may export its own hash formula under. The module
+# is authoritative when present — the verifier must never carry a SECOND copy
+# of the formula it is checking.
+CONTRACT_HASH_EXPORTS = ("contract_hash_for", "contract_sha256", "compute_contract_hash")
+# Event kinds that carry an action identity a contract may bind to.
+ENVELOPE_KINDS = ("action_envelope", "forced_action")
+
+
+def contract_hash_of(payload: dict) -> str:
+    """The contract's own content hash, recomputed — never reimplemented here.
+
+    `sag.agent.invocation_contracts` owns the formula; when it exports one, that
+    export is what runs. Otherwise the formula is the control plane's shared
+    canonical-JSON digest taken over the payload minus its own `contract_hash`,
+    which is what the contract writer is built from. Either way the digest comes
+    from imported code, so a verifier PASS cannot mean the two drifted together.
+    """
+    body = {key: value for key, value in (payload or {}).items() if key != "contract_hash"}
+    try:
+        from sag.agent import invocation_contracts
+    except ImportError:
+        invocation_contracts = None
+    for name in CONTRACT_HASH_EXPORTS:
+        formula = getattr(invocation_contracts, name, None)
+        if callable(formula):
+            return str(formula(body))
+    from sag.agent.control_events import canonical_sha256
+
+    return canonical_sha256(body)
+
 
 def _events(session: str):
     path = os.path.join(session, ".setup_agent", "control_events.jsonl")
@@ -208,6 +241,90 @@ class Verifier:
                     f"{path}: unsupported schema_version {payload.get('schema_version')!r}"
                 )
         self.check("receipts.immutable", not problems, "; ".join(problems[:5]))
+
+    def assert_contract_chain(self) -> None:
+        """`contracts.chain` — receipt -> contract -> envelope (spec §C3).
+
+        A `contract_id` on a receipt is a claim that this physical run was
+        frozen before it happened. The claim is only worth the walk that backs
+        it, so for every receipt carrying one:
+
+        * the contract file exists on disk;
+        * its `contract_hash` recomputes over its own canonical payload, so a
+          field edited after the freeze breaks the seal;
+        * the receipt's own `contract_hash`, when it records one, is that same
+          digest — the two ends must agree, not merely both exist;
+        * its `envelope_id` names an action the session actually emitted, so a
+          contract cannot be minted for a dispatch the control plane never saw.
+
+        Version gating is by evidence, not by a version field: a session whose
+        receipts carry no `contract_id` is pre-Stage-B and this assertion states
+        NOTHING — it neither passes nor fails, so every Plan 5 recording keeps
+        its exact assertion set.
+        """
+        bound: list[tuple[str, str, dict]] = []
+        for path in _receipt_files(self.session):
+            try:
+                with open(path) as handle:
+                    receipt = json.load(handle)
+            except (OSError, TypeError, ValueError):
+                continue  # malformed receipt bytes belong to receipts.immutable
+            if not isinstance(receipt, dict):
+                continue
+            contract_id = str(receipt.get("contract_id") or "").strip()
+            if contract_id:
+                bound.append((path, contract_id, receipt))
+        if not bound:
+            return
+
+        envelope_ids = {
+            str(event.get("payload", {}).get("envelope_id") or "")
+            for event in _events(self.session)
+            if event.get("kind") in ENVELOPE_KINDS
+        }
+        problems: list[str] = []
+        for path, contract_id, receipt in bound:
+            name = os.path.basename(path)
+            contract_path = os.path.join(self.session, CONTRACT_DIRNAME, f"{contract_id}.json")
+            if not os.path.exists(contract_path):
+                problems.append(f"{name}: contract {contract_id} was never persisted")
+                continue
+            try:
+                with open(contract_path) as handle:
+                    contract = json.load(handle)
+            except (OSError, TypeError, ValueError) as exc:
+                problems.append(f"{contract_id}: unreadable or unparseable ({exc})")
+                continue
+            if not isinstance(contract, dict):
+                problems.append(f"{contract_id}: contract is not a JSON object")
+                continue
+            if str(contract.get("contract_id") or "").strip() != contract_id:
+                problems.append(
+                    f"{contract_id}: file records contract_id {contract.get('contract_id')!r}"
+                )
+                continue
+            persisted = str(contract.get("contract_hash") or "").strip().lower()
+            recomputed = contract_hash_of(contract).lower()
+            if persisted != recomputed:
+                problems.append(
+                    f"{contract_id}: contract_hash {persisted or '<absent>'} does not "
+                    f"recompute ({recomputed}) — the contract was edited after the freeze"
+                )
+                continue
+            claimed = str(receipt.get("contract_hash") or "").strip().lower()
+            if claimed and claimed != persisted:
+                problems.append(
+                    f"{name}: receipt records contract_hash {claimed}, "
+                    f"the contract records {persisted}"
+                )
+                continue
+            envelope_id = str(contract.get("envelope_id") or "").strip()
+            if envelope_id not in envelope_ids:
+                problems.append(
+                    f"{contract_id}: envelope_id {envelope_id or '<absent>'} is not among "
+                    "the session's action_envelope/forced_action events"
+                )
+        self.check("contracts.chain", not problems, "; ".join(problems[:5]))
 
     def _verdict(self) -> dict:
         with open(os.path.join(self.session, ".setup_agent", "verdict.json")) as handle:
@@ -392,6 +509,7 @@ def main() -> int:
     verifier = Verifier(options.session)
     verifier.assert_pairing_and_hashes()
     verifier.assert_receipts_immutable()
+    verifier.assert_contract_chain()
     getattr(verifier, f"assert_{options.profile}")()
 
     print(f"== {options.profile} :: {options.session}")
