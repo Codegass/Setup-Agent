@@ -1,11 +1,32 @@
-"""Project analyzer tool for intelligent project setup planning."""
+"""Project analyzer tool for physical project surveying."""
 
-import json
 import re
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+# The filesystem READERS live in the physical observation substrate beside the
+# validator (analyzer diet, Category 2); the old names are re-exported here so
+# every call site — including project_setup_tool and the tests — is unchanged.
+from sag.agent.physical_survey import (
+    ENFORCER_JAVA_PATTERN,
+    FALLBACK_BUILD_MARKERS,
+)
+from sag.agent.physical_survey import (  # noqa: E402
+    PYTHON_SUBDIR_CANDIDATES as _PYTHON_SUBDIR_CANDIDATES,
+)
+from sag.agent.physical_survey import (
+    detect_python_package_root,
+)
+from sag.agent.physical_survey import normalize_java_version as _normalize_java_version
+from sag.agent.physical_survey import path_exists as _path_exists
+from sag.agent.physical_survey import root_has_installable_package as _root_has_installable_package
+from sag.project_fact_sheet import (
+    project_analysis_error_metadata,
+    project_fact_sheet_metadata,
+    serialize_project_analysis_error,
+    serialize_project_fact_sheet,
+)
 from sag.testcases.catalog import (
     STATIC_SCAN_EXCLUSION_HELPER,
     TestCaseCatalog,
@@ -13,19 +34,6 @@ from sag.testcases.catalog import (
 )
 
 from ..base import BaseTool, ToolResult
-
-# The filesystem READERS live in the physical observation substrate beside the
-# validator (analyzer diet, Category 2); the old names are re-exported here so
-# every call site — including project_setup_tool and the tests — is unchanged.
-from sag.agent.physical_survey import (  # noqa: E402
-    ENFORCER_JAVA_PATTERN,
-    FALLBACK_BUILD_MARKERS,
-    PYTHON_SUBDIR_CANDIDATES as _PYTHON_SUBDIR_CANDIDATES,
-    detect_python_package_root,
-    normalize_java_version as _normalize_java_version,
-    path_exists as _path_exists,
-    root_has_installable_package as _root_has_installable_package,
-)
 
 PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 
@@ -65,11 +73,12 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 SURVEY_FACTS_VERSION = 9
 
 
-def _strip_recommendation_prescriptions(rec):
-    """Treatment mask dim (b): drop the ACTION fields (goal/rationale) from a
-    build recommendation, keeping the coordinate FACTS (system, roots,
-    islands as {root, system}) that the shared machinery — workdir default,
-    island checklist — consumes in both arms."""
+def _project_recommendation_coordinates(rec):
+    """Project internal island redirect state onto shared coordinate facts.
+
+    Per-island ``goal`` remains an internal mechanical input; trunk/model
+    consumers receive only system/root coordinates and the typed domain graph.
+    """
     if not rec:
         return rec
     projected = {k: v for k, v in rec.items() if k not in ("goal", "rationale")}
@@ -82,8 +91,19 @@ def _strip_recommendation_prescriptions(rec):
     return projected
 
 
+def _analysis_failure(code: str, **facts: Any) -> ToolResult:
+    """Return a typed analyzer failure; the engine owns its prose projection."""
+    metadata = project_analysis_error_metadata(code, **facts)
+    return ToolResult.completed_failure(
+        output=serialize_project_analysis_error(metadata),
+        error=code,
+        error_code=code,
+        metadata=metadata,
+    )
+
+
 class ProjectAnalyzerTool(BaseTool):
-    """Tool for analyzing project structure and generating intelligent execution plans."""
+    """Tool for observing and persisting project facts."""
 
     def __init__(self, docker_orchestrator=None, context_manager=None):
         description = (
@@ -237,7 +257,7 @@ class ProjectAnalyzerTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         """
-        Analyze project and generate execution plan.
+        Survey project structure and persist observed facts.
 
         Args:
             action: Action to perform ('analyze' for full analysis)
@@ -248,17 +268,9 @@ class ProjectAnalyzerTool(BaseTool):
         # Check for unexpected parameters
         if kwargs:
             invalid_params = list(kwargs.keys())
-            return ToolResult.completed_failure(
-                output=(
-                    f"❌ Invalid parameters for project analysis: {invalid_params}\n\n"
-                    f"✅ Valid parameters:\n"
-                    f"  - action (optional): 'analyze' (default: 'analyze')\n"
-                    f"  - project_path (optional): Path to project directory (default: '/workspace')\n"
-                    f"  - update_context (optional): Update trunk context (default: True)\n\n"
-                    f"Example: project(action='analyze', project_path='/workspace/myproject')\n"
-                    f"Example: project(action='analyze')"  # Uses all defaults
-                ),
-                error=f"Invalid parameters: {invalid_params}",
+            return _analysis_failure(
+                "ANALYSIS_INVALID_PARAMETERS",
+                invalid_parameters=invalid_params,
             )
 
         logger.info(f"Starting project analysis at: {project_path}")
@@ -268,16 +280,9 @@ class ProjectAnalyzerTool(BaseTool):
                 # Step 1: Validate and discover project path
                 validated_path = self._validate_and_discover_project_path(project_path)
                 if not validated_path:
-                    return ToolResult.completed_failure(
-                        output="",
-                        error=f"No valid project found at {project_path} or in common subdirectories",
-                        suggestions=[
-                            "Ensure the project has been cloned successfully",
-                            "Check if the project contains build files (pom.xml, build.gradle, package.json, etc.)",
-                            "Try specifying the exact project directory path",
-                            "Use bash tool to list directory contents: bash(command='ls -la /workspace')",
-                        ],
-                        error_code="PROJECT_NOT_FOUND",
+                    return _analysis_failure(
+                        "PROJECT_NOT_FOUND",
+                        requested_path=project_path,
                     )
 
                 logger.info(f"✅ Using validated project path: {validated_path}")
@@ -287,16 +292,9 @@ class ProjectAnalyzerTool(BaseTool):
 
                 # Step 3: Validate analysis results
                 if not self._is_analysis_valid(analysis_result):
-                    return ToolResult.completed_failure(
-                        output="",
-                        error="Project analysis failed to detect valid project structure",
-                        suggestions=[
-                            "Verify the project is properly structured",
-                            "Check if build files are accessible",
-                            "Ensure the project directory is correct",
-                            "Try manual analysis with bash tool",
-                        ],
-                        error_code="ANALYSIS_FAILED",
+                    return _analysis_failure(
+                        "ANALYSIS_FAILED",
+                        validated_path=validated_path,
                     )
 
                 # Step 4: Update context if requested
@@ -306,53 +304,33 @@ class ProjectAnalyzerTool(BaseTool):
                         analysis_result["context_updated"] = True
                     else:
                         analysis_result["context_updated"] = False
-                        analysis_result["context_error"] = "Failed to update trunk context"
+                        analysis_result["context_error"] = "TRUNK_CONTEXT_UPDATE_FAILED"
 
+                fact_sheet = self._facts_projected_metadata(analysis_result)
                 return ToolResult.completed_success(
-                    output=self._format_analysis_output(analysis_result),
-                    metadata=self._facts_projected_metadata(analysis_result),
+                    output=serialize_project_fact_sheet(fact_sheet),
+                    metadata=fact_sheet,
                 )
             else:
-                return ToolResult.completed_failure(
-                    output=(
-                        f"❌ Invalid action for project analysis: '{action}'\n\n"
-                        f"✅ Valid actions:\n"
-                        f"  - analyze: Perform comprehensive project analysis and generate setup plan\n\n"
-                        f"Examples:\n"
-                        f"  project(action='analyze')\n"
-                        f"  project(action='analyze', project_path='/workspace/myproject')"
-                    ),
-                    error=f"Invalid action: {action}",
-                    suggestions=[
-                        "Use action='analyze' to perform comprehensive project analysis",
-                        "Check the tool documentation for valid actions",
-                    ],
+                return _analysis_failure(
+                    "ANALYSIS_INVALID_ACTION",
+                    action=action,
                 )
 
         except Exception as e:
             logger.error(f"Failed to analyze project: {e}")
-            return ToolResult.completed_failure(
-                output="",
-                error=f"Project analysis failed: {str(e)}",
-                suggestions=[
-                    "Check if project is properly cloned and accessible",
-                    "Verify Docker container has access to the project directory",
-                    "Try using bash tool to manually inspect the project structure",
-                ],
-                error_code="ANALYSIS_EXCEPTION",
+            return _analysis_failure(
+                "ANALYSIS_EXCEPTION",
+                exception_type=type(e).__name__,
             )
 
     def _facts_projected_metadata(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """The analysis as recorded in ToolResult.metadata / the control
-        record: facts only. The plan is absent (dim a deleted) and the build
-        recommendation carries coordinate FACTS only — no goal/rationale
-        strings (dim b deleted)."""
-        projected = dict(analysis)
-        projected.pop("execution_plan", None)
-        projected["build_recommendation"] = _strip_recommendation_prescriptions(
-            projected.get("build_recommendation")
-        )
-        return projected
+        """Project internal survey state onto the bounded public fact schema.
+
+        Tool-layer installer choices and other policy fields stay in the
+        manifest/internal handoff; they never inherit the fact-sheet identity.
+        """
+        return project_fact_sheet_metadata(analysis)
 
     def _perform_comprehensive_analysis(self, project_path: str) -> Dict[str, Any]:
         """Perform comprehensive project analysis."""
@@ -383,7 +361,9 @@ class ProjectAnalyzerTool(BaseTool):
 
         # Step 4: 检测测试配置
         test_config = self._analyze_test_configuration(project_path, analysis["project_type"])
-        analysis.update(test_config)
+        # A test scanner that has no ecosystem-specific build label must not
+        # erase the structure/config scanner's observed build system.
+        analysis.update({key: value for key, value in test_config.items() if value is not None})
 
         # Step 4.5: Build test catalog for Java projects
         # This provides structured test discovery with full metadata
@@ -453,21 +433,10 @@ class ProjectAnalyzerTool(BaseTool):
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
         from sag.agent.physical_survey import analyze_documentation
 
-        documentation = analyze_documentation(self.docker_orchestrator, project_path)
-        # The surveyor extracts commands AS DOCUMENTED; repairing broken ones
-        # is a prescription and happens here (final Category-2 review). Skip
-        # commands with -Dtest without a value (invalid Maven syntax).
-        fixed = []
-        for clean_cmd in documentation.get("test_commands", []):
-            if "-Dtest" in clean_cmd and not re.search(r"-Dtest=\S+", clean_cmd):
-                # Fix the command by removing invalid -Dtest
-                clean_cmd = clean_cmd.replace("-Dtest", "").strip()
-                # If it becomes just 'mvn clean install', change to 'mvn clean test'
-                if clean_cmd == "mvn clean install -Dossindex.skip":
-                    clean_cmd = "mvn clean test -Dossindex.skip"
-            fixed.append(clean_cmd)
-        documentation["test_commands"] = fixed
-        return documentation
+        # Category 4: documentation facts are returned AS DOCUMENTED. Validity
+        # and any later correction belong to the contract/assessment loop, not
+        # to the survey result.
+        return analyze_documentation(self.docker_orchestrator, project_path)
 
     def _clean_markdown_command(self, command: str) -> str:
         from sag.agent.physical_survey import clean_markdown_command
@@ -610,26 +579,23 @@ class ProjectAnalyzerTool(BaseTool):
     def _recommend_build_approach(
         self, project_path: str, analysis: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Recommend WHERE and HOW to build so the build phase does not compile an
-        empty aggregator root.
+        """Survey build coordinates so the build phase does not target an empty
+        aggregator root.
 
         Bigtop's root pom is ``packaging=pom`` aggregating Groovy/Gradle modules,
         so ``mvn compile`` at the root returns BUILD SUCCESS with zero
         ``target/classes/*.class``. This inspects the real layout — root packaging,
-        root/module main-source dirs (Java AND Groovy), and any Gradle build — and
-        returns a concrete recommendation the build phase can target:
+        root/module main-source dirs (Java AND Groovy), and any Gradle build.
 
-            {build_system, build_root, goal, is_aggregator_only, has_gradle,
-             source_modules, rationale}
+            {build_system, build_root, is_aggregator_only, has_gradle,
+             source_modules}
         """
         rec: Dict[str, Any] = {
             "build_system": analysis.get("build_system"),
             "build_root": project_path,
-            "goal": "compile",
             "is_aggregator_only": False,
             "has_gradle": False,
             "source_modules": [],
-            "rationale": "",
         }
         # Python project: a missing Java compile target is EXPECTED, never a
         # block signal. Make the recommendation REAL — live probes (paramiko,
@@ -644,7 +610,6 @@ class ProjectAnalyzerTool(BaseTool):
         # (react_engine._detected_build_system).
         python_config = analysis.get("python_config") or {}
         if python_config or str(analysis.get("project_type", "")).strip().lower() == "python":
-            installer = python_config.get("python_installer") or "pip"
             # The real install target: a python/ subdir for a native-core repo
             # (TVM), the repo root for a plain project. python_root is set by
             # _analyze_python_project; fall back to the repo root when the
@@ -653,7 +618,6 @@ class ProjectAnalyzerTool(BaseTool):
             rec.update(
                 build_system="python",
                 build_root=python_root,
-                goal="deps",
                 test_root=python_root,
                 test_system="pytest",
             )
@@ -662,11 +626,6 @@ class ProjectAnalyzerTool(BaseTool):
             # the python package can import). False/absent for plain projects.
             if python_config.get("has_native_build"):
                 rec["has_native_build"] = True
-            rec["rationale"] = (
-                f"Python project ({installer}): create the venv and install "
-                "with build(action='deps'), verify with build(action='compile'), "
-                "test with build(action='test')."
-            )
             return rec
 
         orch = self.docker_orchestrator
@@ -690,33 +649,21 @@ class ProjectAnalyzerTool(BaseTool):
 
         # 1) Plain Maven module with its own sources: compile at the root.
         if has_pom and (root_main_java or root_main_groovy or root_main_scala or root_main_kotlin):
-            rec.update(build_system="maven", build_root=project_path, goal="compile")
-            rec["rationale"] = "Root Maven module has main sources; compile at the root."
+            rec.update(build_system="maven", build_root=project_path)
             return rec
 
         # 2) Aggregator root (packaging=pom): compiling the root produces nothing.
         if has_pom and packaging == "pom":
             groovy_modules = [m for m in source_modules if m["lang"] == "groovy"]
             if source_modules:
-                # Groovy is compiled by a plugin bound to a later phase, so a bare
-                # `compile` frequently yields no target/classes; `install` runs it.
-                goal = "install" if groovy_modules else "compile"
                 # If the root pom declares modules, the reactor builds them — build
                 # at root. If it does NOT (Bigtop: profile-gated modules), building
                 # the root compiles nothing, so target the source module directly.
                 if analysis.get("maven_modules"):
                     build_root = project_path
-                    scope = "the reactor at the root"
-                    # Reactor modules can depend on siblings' produced artifacts
-                    # (shaded jars, code-gen), not just their .class files — those
-                    # exist only after a module is built and installed, which
-                    # `compile` never does. Install so the test phase resolves them
-                    # (cassandra-java-driver: core needs the shaded-guava jar).
-                    goal = "install"
                 else:
                     preferred = (groovy_modules or source_modules)[0]
                     build_root = preferred["dir"]
-                    scope = f"module {preferred['module']} directly"
                     # PATHOLOGICAL-AGGREGATOR PATH ONLY: this repo is an
                     # archipelago (Bigtop: a maven island + several INDEPENDENT
                     # gradle islands, each with real sources). Picking ONE
@@ -739,31 +686,18 @@ class ProjectAnalyzerTool(BaseTool):
                     # BESIDE build_islands (untouched) and stay ABSENT on a
                     # single-domain project — there is no graph to speak of.
                     self._attach_build_domains(rec, project_path, source_modules, preferred["dir"])
-                rec.update(build_system="maven", build_root=build_root, goal=goal)
-                rec["rationale"] = (
-                    f"Aggregator root over {len(source_modules)} source module(s) "
-                    f"({len(groovy_modules)} Groovy); build {scope} with '{goal}'."
-                )
+                rec.update(build_system="maven", build_root=build_root)
                 return rec
             if rec["has_gradle"]:
-                rec.update(build_system="gradle", build_root=project_path, goal="build")
-                rec["rationale"] = (
-                    "Maven root is an aggregator with no compilable modules, but a "
-                    "Gradle build is present and is likely the primary build."
-                )
+                rec.update(build_system="gradle", build_root=project_path)
                 return rec
             # Nothing to compile anywhere and no Gradle: packaging/meta-project.
             rec["is_aggregator_only"] = True
-            rec["rationale"] = (
-                "Root is a Maven aggregator with no module main sources and no Gradle "
-                "build — there is no standard Java compile target (packaging/meta-project)."
-            )
             return rec
 
         # 3) Gradle-only project.
         if not has_pom and rec["has_gradle"]:
-            rec.update(build_system="gradle", build_root=project_path, goal="build")
-            rec["rationale"] = "Gradle build detected (no root pom)."
+            rec.update(build_system="gradle", build_root=project_path)
             return rec
 
         return rec
@@ -805,14 +739,14 @@ class ProjectAnalyzerTool(BaseTool):
         """Group every source-bearing module into its independent build island
         (pathological-aggregator path only).
 
-        Each island is ``{root, system, goal, rationale}``, deduped by root, with
+        Each island is ``{root, system, goal}``, deduped by root, with
         the preferred module's island FIRST (so build_islands[0]["root"] ==
         build_root for backward compatibility). The surveyor substrate supplies
         the DESCRIPTIVE island facts ({root, system, applies_maven_publish});
-        the goal composed here from those facts is a prescription (maven ->
-        'install', gradle-with-maven-publish -> 'publishToMavenLocal', else
-        'build' — so a cross-island SNAPSHOT dependency resolves from the local
-        maven repo) and stays at the tool layer until Category 3's A/B gate.
+        the goal is the one Category-3 survivor consumed mechanically by the
+        island redirect/build tool (maven -> 'install',
+        gradle-with-maven-publish -> 'publishToMavenLocal', else 'build').
+        Category 4 removed the unread rationale fields.
         """
         from sag.agent.physical_survey import enumerate_build_islands
 
@@ -830,10 +764,6 @@ class ProjectAnalyzerTool(BaseTool):
                     "root": fact["root"],
                     "system": fact["system"],
                     "goal": goal,
-                    "rationale": (
-                        f"Independent {fact['system'] or 'unknown'} build island "
-                        f"under the aggregator; build it on its own with '{goal}'."
-                    ),
                 }
             )
 
@@ -956,10 +886,6 @@ class ProjectAnalyzerTool(BaseTool):
                 island = {
                     "root": root,
                     "system": info["system"],
-                    "rationale": (
-                        f"Independent {info['system'] or 'unknown'} test island; "
-                        "run its tests on its own."
-                    ),
                 }
                 by_root[root] = island
                 test_islands.append(island)
@@ -1021,7 +947,6 @@ class ProjectAnalyzerTool(BaseTool):
             "java_version_enforced": bool(analysis.get("java_version_enforced")),
             "root_shape": root_shape,
             "build_root": build_root,
-            "build_goal": rec.get("goal"),
             "fail_at_end": fail_at_end,
             "test_root": rec.get("test_root"),
             "test_system": rec.get("test_system"),
@@ -1147,10 +1072,9 @@ class ProjectAnalyzerTool(BaseTool):
 
         build_recommendation = analysis.get("build_recommendation")
         if build_recommendation:
-            # dim (b) deleted: the trunk carries coordinate FACTS only (system,
-            # roots, islands as {root, system}) — no goal/rationale. The intro
-            # line and gates read from here.
-            build_recommendation = _strip_recommendation_prescriptions(build_recommendation)
+            # The trunk carries coordinate FACTS only (system, roots, islands
+            # as {root, system}); the intro line and gates read from here.
+            build_recommendation = _project_recommendation_coordinates(build_recommendation)
             trunk_context.environment_summary["build_recommendation"] = build_recommendation
             logger.info(
                 "📊 Stored build coordinates: "
@@ -1185,257 +1109,6 @@ class ProjectAnalyzerTool(BaseTool):
                     "by_module": test_catalog.get("by_module", {}),
                 }
 
-    def _render_recommended_build_output(self, analysis: Dict[str, Any]) -> str:
-        # dim (b) deleted: build coordinates only — the survey facts (system,
-        # roots, islands as {root, system}), no goal/rationale action wording.
-        rec = analysis.get("build_recommendation") or {}
-        if not rec:
-            return ""
-        islands = rec.get("build_islands") or []
-        if len(islands) > 1:
-            coords = "; ".join(
-                f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
-            )
-            # P0-B: "independent" is a claim about COORDINATES. It survives only
-            # while the graph has no edges between these roots; once one root
-            # consumes another's artifact they are linked, and a version
-            # mismatch is a blocker the model must see BEFORE its first attempt
-            # (bigtop: 13 attempts against a dependency that cannot resolve).
-            edges = rec.get("domain_edges") or []
-            label = "independent islands" if not edges else "coordinate-linked domains"
-            return (
-                self._render_domain_mismatches(edges)
-                + f"\n🏝️ Build coordinates ({label}): {coords}\n"
-            )
-        return f"\n📍 Build coordinates: {rec.get('build_system')} at " f"{rec.get('build_root')}\n"
-
-    @staticmethod
-    def _render_domain_mismatches(edges: List[Dict[str, str]]) -> str:
-        """Name every version-incompatible coordinate edge, before the
-        coordinates the model would act on.
-
-        The fact phrasing comes from the survey substrate; the instruction is
-        the tool layer's prescription. It says "do not silently alias" because
-        the ground-truth review's diagnostic 3.7-as-3.6 alias proved only that
-        staleness blocks the path — the aliased Spark build still failed on a
-        missing API — so the mismatch must be REPORTED, never papered over.
-        """
-        from sag.agent.physical_survey import domain_mismatch_clause
-
-        clauses = [clause for clause in map(domain_mismatch_clause, edges or []) if clause]
-        if not clauses:
-            return ""
-        lines = "\n".join(
-            f"   • {clause} — record the mismatch, do not silently alias" for clause in clauses
-        )
-        return (
-            "\n⚠️ Coordinate mismatch between build domains "
-            f"({len(clauses)} observed, before any attempt):\n{lines}\n"
-        )
-
-    @staticmethod
-    def _fact_atom(value: Any, *, limit: int = 160) -> str:
-        """Render one project-controlled fact as a bounded single line."""
-        text = " ".join(str(value or "").split())
-        if len(text) <= limit:
-            return text
-        return text[: limit - 1] + "…"
-
-    def _render_python_facts(self, analysis: Dict[str, Any]) -> str:
-        """Project a bounded, descriptive subset of Python survey facts."""
-        config = analysis.get("python_config") or {}
-        if not config:
-            return ""
-
-        from .build_preflight import REQUIREMENTS_PATH
-
-        lines: List[str] = []
-
-        def scalar(label: str, key: str) -> None:
-            value = self._fact_atom(config.get(key))
-            if value:
-                lines.append(f"   • {label}: {value}")
-
-        def bounded(label: str, values: List[str], *, limit: int = 3) -> None:
-            clean = [value for value in values if value]
-            if not clean:
-                return
-            rendered = ", ".join(clean[:limit])
-            if len(clean) > limit:
-                rendered += (
-                    f" (+{len(clean) - limit} more in {REQUIREMENTS_PATH})"
-                )
-            lines.append(f"   • {label}: {rendered}")
-
-        scalar("Distribution", "python_distribution_name")
-        scalar("Build backend", "python_build_backend")
-        scalar("Install root", "python_root")
-
-        providers: List[str] = []
-        for provider in config.get("python_local_providers") or []:
-            if not isinstance(provider, dict):
-                continue
-            name = self._fact_atom(provider.get("distribution_name"))
-            root = self._fact_atom(provider.get("root"))
-            if name and root:
-                providers.append(f"{name} at {root}")
-        bounded("Local providers", providers)
-
-        artifact_roots = [
-            self._fact_atom(root) for root in config.get("native_artifact_roots") or []
-        ]
-        bounded("Native artifact roots", artifact_roots)
-
-        smoke_coordinates: List[str] = []
-        for candidate in config.get("python_smoke_candidates") or []:
-            if not isinstance(candidate, dict):
-                continue
-            path = self._fact_atom(candidate.get("path"))
-            source = self._fact_atom(candidate.get("source"))
-            if path:
-                smoke_coordinates.append(
-                    f"{path} ({source})" if source else path
-                )
-        bounded("Verified smoke coordinates", smoke_coordinates)
-
-        if not lines:
-            return ""
-        return "\n🐍 Python facts (observed):\n" + "\n".join(lines) + "\n"
-
-    def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
-        """格式化分析输出"""
-        output = "🔍 PROJECT ANALYSIS COMPLETED\n\n"
-
-        # 分析路径信息
-        project_path = analysis.get("project_path", "Unknown")
-        output += f"📁 Analyzed Path: {project_path}\n"
-
-        # 基本信息
-        project_type = analysis.get("project_type", "Unknown")
-        build_system = analysis.get("build_system", "Unknown")
-        output += f"📂 Project Type: {project_type}\n"
-        output += f"🔧 Build System: {build_system}\n"
-
-        # Build coordinates — the survey facts that steer the build phase away
-        # from an empty aggregator root (e.g. Bigtop's packaging=pom over
-        # Groovy/Gradle). dim (b) deleted: coordinates only, no action wording.
-        rec = analysis.get("build_recommendation") or {}
-        if rec:
-            output += self._render_recommended_build_output(analysis)
-            # Tests may live in a different module / build system than the build.
-            # (Python recs are pytest-at-the-build-root by construction — their
-            # differing labels must not render the call-out; mirrors
-            # react_engine._recommended_build_line.)
-            test_root = rec.get("test_root")
-            if test_root and (
-                test_root != rec.get("build_root")
-                or (
-                    rec.get("test_system") != rec.get("build_system")
-                    and str(rec.get("build_system", "")).strip().lower() != "python"
-                )
-            ):
-                output += f"🧪 Test coordinates: {rec.get('test_system')} at {test_root}\n"
-
-        output += self._render_python_facts(analysis)
-
-        # 显示发现的文件
-        existing_files = analysis.get("existing_files", [])
-        if existing_files:
-            output += f"📄 Project Files Found: {', '.join(existing_files[:5])}\n"
-            if len(existing_files) > 5:
-                output += f"    ... and {len(existing_files) - 5} more files\n"
-        else:
-            output += f"⚠️ No project files detected\n"
-
-        # An unknown verdict shows its evidence so the model can judge it
-        # (and override with its own observations) instead of trusting a
-        # bare "unknown" as authoritative.
-        if str(project_type).lower() == "unknown":
-            checked = analysis.get("detection_checked") or []
-            if checked:
-                output += (
-                    f"🔎 Detection evidence: checked for {', '.join(checked)} — none present\n"
-                )
-            root_listing = analysis.get("root_listing")
-            if root_listing:
-                output += f"📁 Project root contains:\n{root_listing}\n"
-            output += (
-                "⚠️ This 'unknown' verdict is a detection result, not ground truth — "
-                "if build evidence exists (wrapper scripts, compiled artifacts), trust that instead.\n"
-            )
-
-        if analysis.get("java_version"):
-            output += f"☕ Java Version: {analysis['java_version']}\n"
-
-        # 依赖信息
-        dependencies = analysis.get("dependencies", [])
-        if dependencies:
-            output += (
-                f"📦 Dependencies: {len(dependencies)} found ({', '.join(dependencies[:3])}...)\n"
-            )
-
-        # 文档分析
-        doc = analysis.get("documentation", {})
-        if doc.get("java_version_requirement"):
-            output += f"📋 Required Java Version: {doc['java_version_requirement']}\n"
-
-        if doc.get("build_commands"):
-            output += f"🔨 Build Commands Found: {', '.join(doc['build_commands'][:3])}\n"
-
-        if doc.get("test_commands"):
-            output += f"🧪 Test Commands Found: {', '.join(doc['test_commands'][:3])}\n"
-
-        # 测试框架
-        test_framework = analysis.get("test_framework", "unknown")
-        if test_framework != "unknown":
-            output += f"🧪 Test Framework: {test_framework}\n"
-
-        # Test count analysis - now with accurate parameterized expansion
-        static_test_count = analysis.get("static_test_count")
-        method_count = analysis.get("method_count")
-        test_count_method = analysis.get("test_count_method", "unknown")
-
-        if static_test_count is not None:
-            if test_count_method == "accurate_expansion_counting":
-                output += f"📊 Test Count Analysis (Accurate with Expansions):\n"
-                output += f"   • Total Test Cases: {static_test_count} (includes parameterized expansions)\n"
-                if method_count and method_count != static_test_count:
-                    output += f"   • Method Annotations: {method_count} (@Test, @ParameterizedTest, etc.)\n"
-                    expansion = static_test_count / method_count if method_count > 0 else 1
-                    output += (
-                        f"   • Expansion Factor: {expansion:.1f}x (from parameterized tests)\n"
-                    )
-
-                # Show breakdown if available
-                param_info = analysis.get("parameterized_info", {})
-                if param_info:
-                    regular = param_info.get("regular_tests", 0)
-                    param_expansions = param_info.get("parameterized_expansions", 0)
-                    if regular or param_expansions:
-                        output += f"   • Breakdown: {regular} regular tests + {param_expansions} parameterized expansions\n"
-            elif test_count_method == "actual_executions":
-                output += f"📊 Test Count: {static_test_count} actual test executions (from test reports)\n"
-                output += f"   ℹ️ This includes all parameterized test expansions\n"
-            else:
-                output += f"📊 Test Count: {static_test_count} test method annotations found\n"
-                output += f"   ℹ️ Note: Parameterized tests will execute multiple times\n"
-
-        # dim (a) deleted: no execution plan is generated — the analyze output
-        # reports the survey facts and whether they persisted, no plan section.
-        if analysis.get("context_updated"):
-            output += "\n✅ Survey facts recorded on the trunk\n"
-        elif analysis.get("context_updated") is False:
-            output += (
-                f"\n⚠️ Context update failed: "
-                f"{analysis.get('context_error', 'Unknown error')}\n"
-            )
-        if project_type != "Unknown" and build_system != "Unknown":
-            output += "\n🎯 Survey complete — facts persisted for the build/test phases."
-        else:
-            output += "\n⚠️ Project analysis incomplete - manual investigation may be needed"
-
-        return output
-
     def _get_parameters_schema(self) -> Dict[str, Any]:
         """Get the parameters schema for this tool."""
         return {
@@ -1467,77 +1140,17 @@ class ProjectAnalyzerTool(BaseTool):
         }
 
     def get_usage_example(self) -> str:
-        """Get usage examples for the project analyzer tool."""
+        """Describe the public facts-only survey surface."""
         return """
-Project Analyzer Tool Usage Examples:
+Project survey examples:
+  project(action="analyze")
+  project(action="analyze", project_path="/workspace/my-project")
 
-1. Analyze project in workspace (most common):
-   project_analyzer(action="analyze")
-
-2. Analyze project in specific directory:
-   project_analyzer(action="analyze", project_path="/workspace/my-project")
-
-3. Analyze without updating context:
-   project_analyzer(action="analyze", update_context=False)
-
-4. Legacy parameter support (automatically mapped):
-   project_analyzer(action="analyze", directory="/workspace/project")
-
-🎯 THREE-STEP EXECUTION STRATEGY:
-✅ STEP 1: Clone repository (handled by project_setup tool)
-✅ STEP 2: Build project (compile/package - CRITICAL)
-✅ STEP 3: Test project (run tests - CRITICAL) 
-✅ STEP 4: Generate report
-
-SUCCESS CRITERIA:
-- SUCCESS: All three core steps (clone + build + test) succeed
-- FAILED: Clone or build fails
-- PARTIAL: Clone + build succeed, but tests fail
-
-ENHANCED FEATURES:
-✅ Smart path discovery - automatically finds project in subdirectories
-✅ Three-step plan generation - creates clear clone → build → test → report workflow
-✅ Multi-platform support - Maven, Gradle, npm, Python, Rust, Go
-✅ Parameter compatibility - supports both 'project_path' and 'directory'
-✅ Intelligent fallback plans - generates meaningful tasks even for unknown projects
-✅ Context safety - preserves existing tasks if analysis fails
-✅ Plan validation - ensures generated plans follow three-step pattern
-
-WORKFLOW:
-1. First clone the repository using project_setup tool
-2. Then use project_analyzer to understand the project and generate three-step plan
-3. Execute the generated tasks: build → test → report
-4. Report tool will evaluate success based on all three core steps
-
-WHAT IT ANALYZES:
-- Project type (Java, Node.js, Python, Rust, Go, etc.)
-- Build system (Maven, Gradle, npm, pip, Cargo, etc.)
-- Java version requirements from README and config files
-- Maven/Gradle dependencies and build configuration
-- Test frameworks (JUnit, TestNG, Spock, Jest, pytest)
-- Documentation and build/test commands
-- Source code structure and organization
-
-GENERATED PLAN FORMAT:
-Each task includes a 'core_step' field indicating its role:
-- core_step: "preparation" - Environment setup
-- core_step: "build" - Project compilation/packaging  
-- core_step: "test" - Test execution
-- core_step: "report" - Final status report
-
-ROBUST ERROR HANDLING:
-- Validates project path and discovers actual project location
-- Handles parameter name variations (project_path vs directory)
-- Generates three-step fallback plans for unknown project types
-- Preserves existing context if analysis fails
-- Provides detailed diagnostic information
-
-OUTPUT:
-- Comprehensive project analysis with path validation
-- Three-step execution plan: build → test → report
-- Plan quality assessment and validation
-- Safe context updates with rollback protection
-- Clear core step identification for each task
+The survey records observed project type, build/test coordinates, package and
+module layout, tool constraints, test structure, and documentation facts. It
+returns a schema-versioned fact sheet and does not generate an execution plan,
+choose a build action, repair documented commands, or judge whether a later
+build/test succeeded.
 """
 
     def _validate_and_discover_project_path(self, initial_path: str) -> Optional[str]:

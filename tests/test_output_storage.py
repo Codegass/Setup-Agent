@@ -6,6 +6,7 @@ import pytest
 
 from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
 from sag.evidence import OperationOutcome
+from sag.project_fact_sheet import with_project_fact_sheet_identity
 from sag.tools.base import ToolResult
 from sag.utils.container_io import DEFAULT_MAX_CMD_CHARS
 
@@ -222,6 +223,40 @@ def test_emergency_output_file_is_deterministic_and_survives_new_manager(tmp_pat
     assert reader.has_output_ref(first_ref) is True
 
 
+def test_emergency_project_fact_sheet_is_searchable_after_restart(tmp_path):
+    metadata = {
+        "action": "analyze",
+        "invocation_status": "completed",
+        "operation_outcome": "success",
+        "fact_sheet_schema": "sag.project-facts",
+        "fact_sheet_version": 1,
+    }
+    writer = OutputStorageManager(tmp_path)
+    ref = writer.store_emergency_output(
+        task_id="phase_analyze",
+        tool_name="project",
+        output='{"schema":"sag.project-facts","version":1}',
+        metadata=metadata,
+    )
+    for index in range(257):
+        writer.store_emergency_output(
+            task_id=f"unrelated-{index}",
+            tool_name="build",
+            output=f"unrelated emergency output {index}",
+            metadata={"action": "compile"},
+        )
+
+    reader = OutputStorageManager(tmp_path)
+    [found] = reader.search_outputs(
+        task_id="phase_analyze",
+        tool_name="project",
+        limit=1,
+        metadata_match=metadata,
+    )
+    assert found["ref_id"] == ref
+    assert found["metadata"]["action"] == "analyze"
+
+
 def test_primary_jsonl_failure_gives_partial_result_retrievable_emergency_ref():
     orchestrator = FakeOutputStorageOrchestrator()
     orchestrator.failed_write_paths.add(STORAGE_PATH)
@@ -241,6 +276,85 @@ def test_primary_jsonl_failure_gives_partial_result_retrievable_emergency_ref():
     assert attached.output_ref.startswith("output_emergency_")
     reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
     assert reader.retrieve_output(attached.output_ref) == partial.output
+
+
+def test_durable_project_fact_sheet_index_keeps_action_and_schema(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    result = ToolResult.completed_success(
+        output='{"schema":"sag.project-facts","version":1}',
+        metadata=with_project_fact_sheet_identity({"project_type": "Java"}),
+    )
+
+    attached = attach_durable_output_ref(
+        result,
+        storage,
+        task_id="phase_analyze",
+        tool_name="project",
+        action="analyze",
+    )
+
+    [indexed] = storage.search_outputs(
+        task_id="phase_analyze",
+        tool_name="project",
+        limit=1,
+    )
+    assert indexed["ref_id"] == attached.output_ref
+    assert indexed["metadata"]["action"] == "analyze"
+    assert indexed["metadata"]["fact_sheet_schema"] == "sag.project-facts"
+    assert indexed["metadata"]["fact_sheet_version"] == 1
+
+
+def test_metadata_filter_applies_before_result_limit(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    target_metadata = {
+        "action": "analyze",
+        "invocation_status": "completed",
+        "operation_outcome": "success",
+        "fact_sheet_schema": "sag.project-facts",
+        "fact_sheet_version": 1,
+    }
+    target_ref = storage.store_output(
+        task_id="phase_analyze",
+        tool_name="project",
+        output="target fact sheet",
+        metadata=target_metadata,
+    )
+    for index in range(105):
+        storage.store_output(
+            task_id="phase_analyze",
+            tool_name="project",
+            output=f"later unrelated project call {index}",
+            metadata={"action": "clone", "iteration": index},
+        )
+
+    [found] = storage.search_outputs(
+        task_id="phase_analyze",
+        tool_name="project",
+        limit=1,
+        metadata_match=target_metadata,
+    )
+    assert found["ref_id"] == target_ref
+
+
+def test_search_metadata_is_whitelisted_and_value_bounded(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    storage.store_output(
+        task_id="phase_analyze",
+        tool_name="project",
+        output="facts",
+        metadata={
+            "action": "x" * 1_000,
+            "private_policy_blob": "must not escape",
+        },
+    )
+
+    [found] = storage.search_outputs(
+        task_id="phase_analyze",
+        tool_name="project",
+        limit=1,
+    )
+    assert len(found["metadata"]["action"]) == 256
+    assert "private_policy_blob" not in found["metadata"]
 
 
 def test_attach_rejects_syntactic_ref_that_cannot_be_retrieved():

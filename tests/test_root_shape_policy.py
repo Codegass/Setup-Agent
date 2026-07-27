@@ -6,7 +6,7 @@ computed (it does not re-classify) and persists the phase-1 -> build-tool
 handoff manifest:
 
 healthy_reactor          -> build_root == project root AND reactor modules
-                            declared; install/test fail-at-end at root
+                            declared; test fail-at-end at root
 pathological_aggregator  -> build_root is a subdirectory (leaf targeting)
 single_module            -> everything else (root build, no reactor modules)
 """
@@ -37,8 +37,11 @@ class FakeOrch:
             return {"success": True, "exit_code": 0, "output": ""}
         if cmd.startswith("test -e"):
             path = cmd.split("test -e ", 1)[1].split(" ", 1)[0]
-            return {"success": True, "exit_code": 0,
-                    "output": "yes" if path in self.existing else "no"}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "yes" if path in self.existing else "no",
+            }
         if cmd.startswith("find"):
             output = self.test_find_output if "src/test" in cmd else self.find_output
             return {"success": True, "exit_code": 0, "output": output}
@@ -57,13 +60,15 @@ def _manifest(analysis, orch, project_path="/workspace/proj"):
     return json.loads(orch.files[REQUIREMENTS_PATH])
 
 
-def test_healthy_reactor_manifest_targets_root_install_fail_at_end():
+def test_healthy_reactor_manifest_targets_root_without_a_prescribed_goal():
     orch = FakeOrch(
         existing_paths={"/workspace/proj/pom.xml"},
         # one source-bearing module reachable from root
         find_output="/workspace/proj/core/src/main/java\n",
     )
-    orch.pom = "<project><packaging>pom</packaging><modules><module>core</module></modules></project>"
+    orch.pom = (
+        "<project><packaging>pom</packaging><modules><module>core</module></modules></project>"
+    )
     analysis = {
         "maven_modules": ["core"],
         "build_config": {"packaging": "pom"},
@@ -74,7 +79,7 @@ def test_healthy_reactor_manifest_targets_root_install_fail_at_end():
     manifest = _manifest(analysis, orch)
     assert manifest["root_shape"] == "healthy_reactor"
     assert manifest["build_root"] == "/workspace/proj"
-    assert manifest["build_goal"] == "install"
+    assert "build_goal" not in manifest
     assert manifest["fail_at_end"] is True
     # java requirements ride along on the same handoff
     assert manifest["java_version"] == "11"
@@ -116,7 +121,9 @@ def test_healthy_reactor_test_targeting_is_root_fail_at_end():
         find_output="/workspace/proj/core/src/main/java\n",
         test_find_output="/workspace/proj/core/src/test/java\n",
     )
-    orch.pom = "<project><packaging>pom</packaging><modules><module>core</module></modules></project>"
+    orch.pom = (
+        "<project><packaging>pom</packaging><modules><module>core</module></modules></project>"
+    )
     analysis = {"maven_modules": ["core"], "build_config": {"packaging": "pom"}}
     manifest = _manifest(analysis, orch)
     assert manifest["test_root"] == "/workspace/proj"

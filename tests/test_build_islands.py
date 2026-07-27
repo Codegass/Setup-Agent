@@ -18,6 +18,7 @@ and intros (snapshot tests below).
 import re
 from types import SimpleNamespace
 
+from sag.agent.project_fact_projection import render_recommended_build_facts
 from sag.agent.react_engine import ReActEngine
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
@@ -233,10 +234,11 @@ def test_bigtop_preferred_build_module_is_first_island():
     assert rec["build_islands"][0]["root"] == rec["build_root"]
 
 
-def test_bigtop_each_island_carries_a_rationale():
+def test_bigtop_each_build_island_keeps_only_redirect_fields():
     _orch, analysis = _analyze_bigtop()
     for island in analysis["build_recommendation"]["build_islands"]:
-        assert island.get("rationale")
+        assert set(island) == {"root", "system", "goal"}
+        assert island["goal"]
 
 
 # --------------------------------------------------------------------------- #
@@ -572,7 +574,9 @@ def _analyze_root_lang(lang):
     p = "/workspace/rootlang"
     orch = FakeOrchestrator(
         {f"{p}/pom.xml", f"{p}/src/main/{lang}"},
-        packaging="jar",
+        # If the language probe regresses, this would fall through to the
+        # aggregator-only branch instead of returning the root coordinate.
+        packaging="pom",
         source_dirs=[],
         test_dirs=[],
     )
@@ -582,24 +586,23 @@ def _analyze_root_lang(lang):
     return p, analysis["build_recommendation"]
 
 
-def test_root_scala_sources_compile_at_root_like_java():
+def test_root_scala_sources_are_detected_at_root_like_java():
     p, rec = _analyze_root_lang("scala")
     assert rec.get("build_system") == "maven"
     assert rec.get("build_root") == p
-    assert rec.get("goal") == "compile"
+    assert rec.get("is_aggregator_only") is False
     assert not rec.get("build_islands")
-    # Must take the "root has main sources" branch (#1), not fall through to the
-    # default rec — assert the branch's own rationale so a root_main_* probe gap
-    # (scala not recognised) cannot pass on the accidental default.
-    assert rec.get("rationale") == "Root Maven module has main sources; compile at the root."
+    assert "goal" not in rec
+    assert "rationale" not in rec
 
 
-def test_root_kotlin_sources_compile_at_root_like_java():
+def test_root_kotlin_sources_are_detected_at_root_like_java():
     p, rec = _analyze_root_lang("kotlin")
     assert rec.get("build_system") == "maven"
     assert rec.get("build_root") == p
-    assert rec.get("goal") == "compile"
-    assert rec.get("rationale") == "Root Maven module has main sources; compile at the root."
+    assert rec.get("is_aggregator_only") is False
+    assert "goal" not in rec
+    assert "rationale" not in rec
 
 
 # --------------------------------------------------------------------------- #
@@ -616,7 +619,8 @@ def test_root_kotlin_sources_compile_at_root_like_java():
 #
 # FIX: each island records a build GOAL — maven -> 'install',
 # gradle-with-maven-publish -> 'publishToMavenLocal', else gradle -> 'build';
-# the intro renders the goal per island AND appends cross-island guidance.
+# mechanical island redirect/build consumers use it, while the intro projects
+# only root/system coordinates.
 # --------------------------------------------------------------------------- #
 def _bigtop_islands_by_root():
     _orch, analysis = _analyze_bigtop()
@@ -632,19 +636,14 @@ def test_bigtop_gradle_island_with_maven_publish_goal_is_publish_to_maven_local(
     # data-generators applies the maven-publish plugin -> it must PUBLISH so the
     # transaction-queue island can resolve its artifact from file:/root/.m2/...
     by_root = _bigtop_islands_by_root()
-    assert (
-        by_root[f"{BIGTOP}/bigtop-data-generators"]["goal"] == "publishToMavenLocal"
-    )
+    assert by_root[f"{BIGTOP}/bigtop-data-generators"]["goal"] == "publishToMavenLocal"
 
 
 def test_bigtop_gradle_islands_without_maven_publish_goal_is_build():
     # spark + transaction-queue do NOT apply maven-publish -> plain 'build'.
     by_root = _bigtop_islands_by_root()
     assert by_root[f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-spark"]["goal"] == "build"
-    assert (
-        by_root[f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-transaction-queue"]["goal"]
-        == "build"
-    )
+    assert by_root[f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-transaction-queue"]["goal"] == "build"
 
 
 def test_bigtop_every_island_carries_a_goal():
@@ -733,14 +732,11 @@ def test_single_module_build_intro_stays_coordinates_only():
     assert "local maven repo" not in line
 
 
-def test_analyzer_output_renders_island_coordinates_no_goal_or_single_target():
-    """dim (b) deleted: with multiple islands the analyzer output renders the
-    island COORDINATES only — no per-island goal, no competing single-target
+def test_engine_projection_renders_island_coordinates_no_goal_or_single_target():
+    """dim (b) deleted: with multiple islands the engine projection renders
+    the island COORDINATES only — no per-island goal, no competing single-target
     'Recommended Build' sentence (the bigtop5 competing-authority failure cannot
     recur because neither authority carries an action)."""
-    from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
-
-    tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
     rec = {
         "build_system": "maven",
         "goal": "install",
@@ -750,15 +746,24 @@ def test_analyzer_output_renders_island_coordinates_no_goal_or_single_target():
             "build module bigtop-test-framework directly with 'install'."
         ),
         "build_islands": [
-            {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven",
-             "goal": "install"},
-            {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle",
-             "goal": "publishToMavenLocal"},
-            {"root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
-             "system": "gradle", "goal": "build"},
+            {
+                "root": "/workspace/bigtop/bigtop-test-framework",
+                "system": "maven",
+                "goal": "install",
+            },
+            {
+                "root": "/workspace/bigtop/bigtop-data-generators",
+                "system": "gradle",
+                "goal": "publishToMavenLocal",
+            },
+            {
+                "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+                "system": "gradle",
+                "goal": "build",
+            },
         ],
     }
-    output = tool._render_recommended_build_output({"build_recommendation": rec})
+    output = render_recommended_build_facts({"build_recommendation": rec})
     assert "Build coordinates (independent islands):" in output
     assert "maven in /workspace/bigtop/bigtop-test-framework" in output
     # no action wording of any kind
@@ -767,10 +772,7 @@ def test_analyzer_output_renders_island_coordinates_no_goal_or_single_target():
     assert "'publishToMavenLocal'" not in output
 
 
-def test_analyzer_output_renders_single_coordinate_without_islands():
-    from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
-
-    tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
+def test_engine_projection_renders_single_coordinate_without_islands():
     rec = {
         "build_system": "maven",
         "goal": "install",
@@ -778,7 +780,7 @@ def test_analyzer_output_renders_single_coordinate_without_islands():
         "rationale": "Reactor root declares 3 module(s); install -fae at root.",
         "build_islands": [],
     }
-    output = tool._render_recommended_build_output({"build_recommendation": rec})
+    output = render_recommended_build_facts({"build_recommendation": rec})
     assert "📍 Build coordinates: maven at /workspace/proj" in output
     assert "Recommended Build" not in output
     assert "independent build islands" not in output

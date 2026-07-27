@@ -14,6 +14,7 @@ from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
 from sag.evidence import OperationOutcome
+from sag.project_fact_sheet import project_fact_sheet_identity
 from sag.tools.base import (
     BaseTool,
     OutputPersistenceError,
@@ -25,6 +26,16 @@ from sag.tools.base import (
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .attempt_ledger import compact_steps
+from .attempt_policy import (
+    TestAttemptRequirement,
+    TestCandidateResolution,
+    forced_test_refusal_receipts,
+    has_test_candidate_refresh_receipt,
+    required_test_attempt,
+    resolve_survey_test_candidates,
+    test_execution_binding,
+    test_execution_matches_candidate,
+)
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
     ControlEventSink,
@@ -61,17 +72,7 @@ from .phase_transitions import (
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
-from .react_types import ReActStep, ReactModelMode, StepType
-from .attempt_policy import (
-    TestAttemptRequirement,
-    TestCandidateResolution,
-    forced_test_refusal_receipts,
-    has_test_candidate_refresh_receipt,
-    required_test_attempt,
-    resolve_survey_test_candidates,
-    test_execution_binding,
-    test_execution_matches_candidate,
-)
+from .react_types import ReactModelMode, ReActStep, StepType
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ActualToolExecution,
@@ -813,6 +814,7 @@ class ReActEngine(UIEventEmitter):
                 self.output_storage,
                 task_id=task_id,
                 tool_name=tool_name,
+                action=action,
             )
         except OutputPersistenceError as exc:
             logger.error(f"Failed to persist full output for {tool_name}: {exc}")
@@ -3853,6 +3855,7 @@ class ReActEngine(UIEventEmitter):
                 from datetime import datetime
 
                 timestamp = datetime.now().isoformat()
+                fact_sheet_identity = project_fact_sheet_identity(result.metadata)
 
                 # Store full output and get reference if output is large
                 stored_output_refs = []
@@ -3872,6 +3875,8 @@ class ReActEngine(UIEventEmitter):
                             "operation_outcome": result.operation_outcome.value,
                             "evidence_status": result.evidence_status.value,
                             "iteration": self.current_iteration,
+                            "action": (step.tool_params or {}).get("action"),
+                            **fact_sheet_identity,
                         },
                     )
                     stored_output_refs.append(ref_id)
@@ -3883,6 +3888,25 @@ class ReActEngine(UIEventEmitter):
                         max_length=800,
                         tool_name=step.tool_name,
                     )
+                elif fact_sheet_identity and result.output_ref and len(output_to_store) > 800:
+                    # The durable evidence path may already have persisted this
+                    # fact sheet. Branch history still gets a bounded preview,
+                    # never a second multi-kilobyte JSON copy.
+                    output_to_store = self.output_storage.get_truncation_with_reference(
+                        output=output_to_store,
+                        ref_id=result.output_ref,
+                        max_length=800,
+                        tool_name=step.tool_name,
+                    )
+
+                observation_to_store = execution.observation_text
+                if fact_sheet_identity and len(observation_to_store) > 6_000:
+                    ref = result.output_ref or "structured fact-sheet metadata"
+                    suffix = (
+                        "\n… [engine project-fact projection truncated in branch history; "
+                        f"source: {ref}]"
+                    )
+                    observation_to_store = observation_to_store[: 6_000 - len(suffix)] + suffix
 
                 history_entry = {
                     "type": "action",
@@ -3894,7 +3918,7 @@ class ReActEngine(UIEventEmitter):
                     "operation_outcome": result.operation_outcome.value,
                     "evidence_status": result.evidence_status.value,
                     "output": output_to_store,
-                    "observation": execution.observation_text,
+                    "observation": observation_to_store,
                     "output_refs": self._dedupe_strings(
                         [
                             *stored_output_refs,
@@ -3903,6 +3927,8 @@ class ReActEngine(UIEventEmitter):
                         ]
                     ),
                 }
+                if fact_sheet_identity:
+                    history_entry["metadata"] = fact_sheet_identity
                 for field_name in ("failure_signature", "error_tail_preview"):
                     value = getattr(result, field_name)
                     if value:
@@ -4107,9 +4133,7 @@ class ReActEngine(UIEventEmitter):
                         "maven"
                         if tool_name == "maven"
                         else str(
-                            result_facts.get("system")
-                            or result_metadata.get("system")
-                            or "maven"
+                            result_facts.get("system") or result_metadata.get("system") or "maven"
                         )
                         .strip()
                         .lower()

@@ -18,8 +18,8 @@ recommendations) stays at the tool layer until Category 3's A/B gate.
 
 from __future__ import annotations
 
-import re
 import posixpath
+import re
 import shlex
 import zlib
 from typing import Any, Dict, List, Optional
@@ -384,8 +384,8 @@ def analyze_documentation(orch, project_path: str) -> Dict[str, Any]:
             for match in matches:
                 clean_cmd = clean_markdown_command(match)
                 # AS DOCUMENTED (markdown formatting stripped, deduped): the
-                # prescriptive repair of broken documented commands happens at
-                # the tool layer, not in the surveyor.
+                # survey and public fact sheet do not repair it. Validity and
+                # correction belong to the later assessment/contract loop.
                 if clean_cmd and clean_cmd not in documentation["test_commands"]:
                     documentation["test_commands"].append(clean_cmd)
 

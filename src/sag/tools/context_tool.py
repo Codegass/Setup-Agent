@@ -1,13 +1,18 @@
 """Context management tool for the agent."""
 
 import re
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from sag.agent.history_state import HistoryActionState, decode_history_action_state
-
 from sag.agent.context_manager import BranchContextHistory, ContextManager, TaskStatus
+from sag.agent.history_state import HistoryActionState, decode_history_action_state
+from sag.project_fact_sheet import (
+    PROJECT_FACT_SHEET_SCHEMA,
+    PROJECT_FACT_SHEET_VERSION,
+    is_project_fact_sheet_metadata,
+)
 
 from .base import BaseTool, ToolError, ToolResult
 
@@ -1714,16 +1719,7 @@ IMPORTANT:
                 # completions; it is superseded. The analyzer records the
                 # survey stamp / build facts on the trunk env-summary — that
                 # is what completing an analyze task must show.
-                trunk_context = self.context_manager.load_trunk_context()
-                env = (
-                    (getattr(trunk_context, "environment_summary", None) or {})
-                    if trunk_context
-                    else {}
-                )
-                has_survey_facts = bool(
-                    env.get("survey") or env.get("build_recommendation") or env.get("build_system")
-                )
-                if trunk_context and not has_survey_facts:
+                if not self._check_trunk_context_for_survey_facts():
                     validation_result.update(
                         {
                             "valid": False,
@@ -1916,130 +1912,163 @@ IMPORTANT:
                 ],
             }
 
-    # Marker emitted at the top of ProjectAnalyzerTool's success output; the
-    # consolidated `project` facade records its history entries under the
-    # facade name, so analyze evidence is recognised by this output marker
-    # (a `project` clone/provision entry must NOT satisfy the analyzer gate).
+    # Pre-Category-4 histories identified analyze calls through rendered prose.
+    # Keep the marker only for reading those histories; new entries are
+    # recognised from their action parameters and structured fact-sheet
+    # metadata.
     _ANALYSIS_OUTPUT_MARKER = "PROJECT ANALYSIS COMPLETED"
+
+    @staticmethod
+    def _structured_action_succeeded(entry: Mapping[str, Any]) -> bool:
+        """Require the canonical terminal-success fields on modern receipts."""
+        if entry.get("invocation_status") != "completed":
+            return False
+        if entry.get("operation_outcome") != "success":
+            return False
+        return entry.get("succeeded", True) is True
+
+    @staticmethod
+    def _legacy_action_succeeded(entry: Mapping[str, Any]) -> bool:
+        """Reject explicit legacy failures without requiring modern fields."""
+        if entry.get("invocation_status") not in (None, "completed"):
+            return False
+        if entry.get("operation_outcome") not in (None, "success"):
+            return False
+        for key in ("succeeded", "success"):
+            if key in entry and entry.get(key) is not True:
+                return False
+        return True
+
+    @staticmethod
+    def _fact_sheet_metadata(metadata: Any) -> Optional[Mapping[str, Any]]:
+        """Return a recognised fact sheet from history or storage metadata."""
+        if not isinstance(metadata, Mapping):
+            return None
+        if is_project_fact_sheet_metadata(metadata):
+            return metadata
+        return None
+
+    @classmethod
+    def _is_structured_project_analysis_entry(cls, entry: Mapping[str, Any]) -> bool:
+        """Recognise a successful modern project(action='analyze') receipt."""
+        parameters = entry.get("parameters")
+        return (
+            entry.get("type") == "action"
+            and entry.get("tool_name") == "project"
+            and isinstance(parameters, Mapping)
+            and parameters.get("action") == "analyze"
+            and cls._structured_action_succeeded(entry)
+            and cls._fact_sheet_metadata(entry.get("metadata")) is not None
+        )
+
+    @classmethod
+    def _legacy_project_action_matches(cls, entry: Mapping[str, Any]) -> bool:
+        """Accept only genuine pre-schema analyzer actions.
+
+        A current fact-sheet record that failed the modern lifecycle checks may
+        not fall through and become valid merely because its output contains
+        the old marker.
+        """
+        metadata = entry.get("metadata")
+        if isinstance(metadata, Mapping) and (
+            "fact_sheet_schema" in metadata or "fact_sheet_version" in metadata
+        ):
+            return False
+        if not cls._legacy_action_succeeded(entry):
+            return False
+        parameters = entry.get("parameters")
+        if isinstance(parameters, Mapping) and parameters.get("action") not in (None, "analyze"):
+            return False
+        return True
 
     def _check_project_analyzer_execution(self) -> bool:
         """
         Check if the project analysis was actually executed by examining multiple sources.
         Enhanced to check trunk context updates and output storage in addition to branch history.
         """
-        try:
-            if not self.context_manager.current_task_id:
-                return False
-
-            # Method 1: Check branch history (original check)
-            branch_history = self.context_manager.load_branch_history(
-                self.context_manager.current_task_id
-            )
-            if branch_history:
-                # Check if any history entry indicates an analyzer execution
-                for entry in branch_history.history:
-                    if isinstance(entry, dict):
-                        # Action entries: legacy analyzer name, or the project
-                        # facade whose output carries the analysis marker.
-                        if entry.get("type") == "action":
-                            tool_name = entry.get("tool_name")
-                            if tool_name == "project_analyzer":
-                                logger.info(
-                                    "✅ Found evidence of analyzer execution in branch history"
-                                )
-                                return True
-                            if tool_name == "project" and (
-                                self._ANALYSIS_OUTPUT_MARKER
-                                in str(entry.get("output", "") or "").upper()
-                            ):
-                                logger.info(
-                                    "✅ Found project(action='analyze') evidence in branch history"
-                                )
-                                return True
-
-                        # Check for content that mentions the analysis
-                        content = str(entry.get("content", "")).lower()
-                        if (
-                            "project_analyzer" in content
-                            or self._ANALYSIS_OUTPUT_MARKER.lower() in content
-                        ):
-                            logger.info("✅ Found reference to project analysis in branch history")
-                            return True
-
-            # Method 2: Check if trunk context was updated with new tasks (evidence of analyzer execution)
-            trunk_evidence = self._check_trunk_context_for_analyzer_updates()
-            if trunk_evidence:
-                logger.warning(
-                    "⚠️ Project analyzer execution not in branch history but trunk context shows updates"
-                )
-                logger.info(
-                    "✅ Accepting based on trunk context evidence (new tasks or project metadata)"
-                )
-                return True
-
-            # Method 3: Check output storage for analyzer outputs
-            if self._check_output_storage_for_analyzer():
-                logger.warning(
-                    "⚠️ Project analysis execution not in branch history but found in output storage"
-                )
-                logger.info("✅ Accepting based on output storage evidence")
-                return True
-
-            logger.warning("❌ No evidence of project analysis execution found in any source")
-            logger.info("💡 Hint: Use project(action='analyze') before completing this task")
+        task_id = getattr(self.context_manager, "current_task_id", None)
+        if not task_id:
             return False
 
+        try:
+            # Method 1: Check branch history (original check)
+            branch_history = self.context_manager.load_branch_history(task_id)
+            if branch_history:
+                # Prefer the Category-4 structured action receipt. The analyzer
+                # output is no longer required to contain rendered prose.
+                for entry in branch_history.history:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    if self._is_structured_project_analysis_entry(entry):
+                        logger.info(
+                            "✅ Found structured project(action='analyze') fact-sheet evidence "
+                            "in branch history"
+                        )
+                        return True
+
+                # Compatibility only: old histories used a dedicated tool name
+                # or embedded the marker in an action's rendered output. Do not
+                # treat model-authored mentions of "project_analyzer" as proof.
+                for entry in branch_history.history:
+                    if (
+                        not isinstance(entry, Mapping)
+                        or entry.get("type") != "action"
+                        or not self._legacy_project_action_matches(entry)
+                    ):
+                        continue
+                    tool_name = entry.get("tool_name")
+                    if tool_name == "project_analyzer":
+                        logger.info("✅ Found legacy analyzer action in branch history")
+                        return True
+                    rendered = str(entry.get("output", "") or "")
+                    if tool_name == "project" and self._ANALYSIS_OUTPUT_MARKER in rendered.upper():
+                        logger.info("✅ Found legacy project analysis marker in branch history")
+                        return True
         except Exception as e:
-            logger.error(f"Failed to check project analysis execution: {e}")
-            # Be lenient on errors - don't block completion due to validation errors
+            # One unavailable evidence source is unknown, not authority to
+            # reject evidence from the other independently persisted sources.
+            logger.error(f"Failed to check branch history for project analysis: {e}")
+
+        # Method 2: framework-owned survey facts can satisfy the facts-only
+        # analyze task even when no model-issued tool receipt survived.
+        if self._check_trunk_context_for_survey_facts():
+            logger.warning(
+                "⚠️ Project analyzer execution not in branch history but trunk context shows updates"
+            )
+            logger.info("✅ Accepting based on persisted trunk survey facts")
             return True
 
-    def _check_trunk_context_for_analyzer_updates(self) -> bool:
-        """
-        Check if trunk context shows evidence of project_analyzer execution.
-        Looks for new tasks added or project metadata updates.
-        """
+        # Method 3: Check output storage for analyzer outputs. This source is
+        # still consulted when branch history is corrupt or unavailable.
+        if self._check_output_storage_for_analyzer():
+            logger.warning(
+                "⚠️ Project analysis execution not in branch history but found in output storage"
+            )
+            logger.info("✅ Accepting based on output storage evidence")
+            return True
+
+        logger.warning("❌ No evidence of project analysis execution found in any source")
+        logger.info("💡 Hint: Use project(action='analyze') before completing this task")
+        return False
+
+    def _check_trunk_context_for_survey_facts(self) -> bool:
+        """Check the trunk for persisted survey facts, never todo expansion."""
         try:
             trunk_context = self.context_manager.load_trunk_context()
             if not trunk_context:
                 return False
 
-            # Check if we have tasks beyond the initial task_2 (analyzer task)
-            # Initial setup usually has task_1 (clone) and task_2 (analyze)
-            # If we have task_3+ it means analyzer added new tasks
-            task_count = len(trunk_context.todo_list)
-            if task_count > 2:
-                # Check if any task after task_2 was created recently
-                for task in trunk_context.todo_list:
-                    task_id = task.id
-                    # Tasks created by analyzer typically start from task_3
-                    if task_id not in ["task_1", "task_2"]:
-                        logger.debug(f"Found task {task_id} which suggests analyzer was executed")
-                        return True
-
-            # Also check if any task has java_version or build_system in key_results
-            # These are typically set by project_analyzer
-            for task in trunk_context.todo_list:
-                if task.key_results:
-                    key_results_lower = task.key_results.lower()
-                    if any(
-                        indicator in key_results_lower
-                        for indicator in [
-                            "java_version",
-                            "build_system",
-                            "maven",
-                            "gradle",
-                            "project_path",
-                            "dependencies",
-                        ]
-                    ):
-                        logger.debug(f"Found project metadata in task {task.id} key_results")
-                        return True
-
-            return False
+            environment = getattr(trunk_context, "environment_summary", None) or {}
+            if not isinstance(environment, Mapping):
+                return False
+            survey = environment.get("survey")
+            if isinstance(survey, Mapping) and survey.get("analyzer_version") is not None:
+                return True
+            # Compatibility with pre-stamp facts-only trunks.
+            return bool(environment.get("build_recommendation") or environment.get("build_system"))
 
         except Exception as e:
-            logger.error(f"Failed to check trunk context: {e}")
+            logger.error(f"Failed to check trunk survey facts: {e}")
             return False
 
     def _check_output_storage_for_analyzer(self) -> bool:
@@ -2054,25 +2083,50 @@ IMPORTANT:
             ):
                 return False
 
-            # Search for analyzer outputs: the legacy tool name, then the
-            # project facade filtered to outputs carrying the analysis marker.
-            results = self.context_manager.output_storage.search_outputs(
-                tool_name="project_analyzer", task_id=self.context_manager.current_task_id, limit=1
+            storage = self.context_manager.output_storage
+
+            # Modern records are recognised from index metadata rather than
+            # searching the analyzer's rendered prose. search_outputs refreshes
+            # the durable index before returning reference rows.
+            project_results = storage.search_outputs(
+                tool_name="project",
+                task_id=self.context_manager.current_task_id,
+                limit=1,
+                metadata_match={
+                    "action": "analyze",
+                    "invocation_status": "completed",
+                    "operation_outcome": "success",
+                    "fact_sheet_schema": PROJECT_FACT_SHEET_SCHEMA,
+                    "fact_sheet_version": PROJECT_FACT_SHEET_VERSION,
+                },
             )
-            if not results:
-                results = self.context_manager.output_storage.search_outputs(
-                    pattern=self._ANALYSIS_OUTPUT_MARKER,
-                    tool_name="project",
-                    task_id=self.context_manager.current_task_id,
-                    limit=1,
+            for result in project_results:
+                if not isinstance(result, Mapping):
+                    continue
+                metadata = result.get("metadata")
+                if not isinstance(metadata, Mapping):
+                    continue
+                parameters = metadata.get("parameters")
+                action = (
+                    parameters.get("action")
+                    if isinstance(parameters, Mapping)
+                    else metadata.get("action")
                 )
+                if (
+                    action == "analyze"
+                    and self._structured_action_succeeded(metadata)
+                    and self._fact_sheet_metadata(metadata) is not None
+                ):
+                    logger.debug(
+                        "Found structured project analysis output in storage: "
+                        f"{result.get('ref_id')}"
+                    )
+                    return True
 
-            if results:
-                logger.debug(
-                    f"Found project analysis output in storage: {results[0].get('ref_id')}"
-                )
-                return True
-
+            # Legacy tool-name/marker compatibility is intentionally confined
+            # to branch histories. Durable search accepts only the current
+            # structured receipt so a failed or unrelated old record cannot
+            # become completion evidence after its lifecycle fields are lost.
             return False
 
         except Exception as e:

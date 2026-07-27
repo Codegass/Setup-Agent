@@ -9,8 +9,8 @@ These tests cover:
 and assert the commons-cli happy path is NOT over-blocked.
 
 Fakes mirror production shapes: ContextManager has NO project_name attribute
-(only the trunk context does), and engine-written action history entries only
-carry type/tool_name/success/output.
+(only the trunk context does), and modern analyzer action history carries the
+structured project fact-sheet identity copied from ToolResult metadata.
 """
 
 from types import SimpleNamespace
@@ -19,6 +19,10 @@ import pytest
 
 from sag.agent.context_manager import TaskStatus
 from sag.agent.react_types import StepType
+from sag.project_fact_sheet import (
+    PROJECT_FACT_SHEET_SCHEMA,
+    PROJECT_FACT_SHEET_VERSION,
+)
 from sag.tools.base import ToolError
 from sag.tools.context_tool import ContextTool
 
@@ -529,8 +533,15 @@ def test_final_report_matcher_finds_report_phase_task():
 ANALYZE_ACTION = {
     "type": "action",
     "tool_name": "project",
-    "success": True,
-    "output": "=== PROJECT ANALYSIS COMPLETED ===\nbuild system: maven",
+    "parameters": {"action": "analyze", "path": "/workspace/demo"},
+    "succeeded": True,
+    "invocation_status": "completed",
+    "operation_outcome": "success",
+    "metadata": {
+        "fact_sheet_schema": PROJECT_FACT_SHEET_SCHEMA,
+        "fact_sheet_version": PROJECT_FACT_SHEET_VERSION,
+    },
+    "output": '{"fact_sheet_schema":"sag.project-facts","fact_sheet_version":1}',
 }
 
 
@@ -568,6 +579,23 @@ def test_analyze_task_rejected_without_persisted_survey_facts():
         _task("Use project_analyzer to analyze project structure"),
         summary="Analyzed the project.",
         key_results="looks like maven",
+    )
+    assert result["valid"] is False
+    assert "survey facts" in result["reason"]
+
+
+def test_analyze_task_rejected_when_trunk_context_is_missing():
+    """A successful action receipt does not replace the required trunk write."""
+    context = SimpleNamespace(
+        current_task_id="task_2",
+        load_branch_history=lambda _task_id: SimpleNamespace(history=[ANALYZE_ACTION]),
+        load_trunk_context=lambda: None,
+        output_storage=None,
+    )
+    result = ContextTool(context)._validate_task_completion(
+        _task("Use project_analyzer to analyze project structure"),
+        summary="Analyzed the project.",
+        key_results="receipt exists but no trunk exists",
     )
     assert result["valid"] is False
     assert "survey facts" in result["reason"]

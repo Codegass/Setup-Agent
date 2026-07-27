@@ -1,4 +1,3 @@
-from engine_driver import execute_action_steps, execute_native_like
 import shlex
 import subprocess
 import sys
@@ -6,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from engine_driver import execute_action_steps, execute_native_like
 from test_python_tool import MANIFEST as PYTHON_MANIFEST
 from test_python_tool import Orch as PythonOrchestrator
 from test_python_tool import fail as command_fail
@@ -36,8 +36,13 @@ from sag.agent.verdict_finalizer import (
     read_verdict_snapshot,
 )
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
+from sag.project_fact_sheet import (
+    serialize_project_fact_sheet,
+    with_project_fact_sheet_identity,
+)
 from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_output_storage
 from sag.tools.build.build_tool import BuildTool
+from sag.tools.context_tool import ContextTool
 from sag.tools.internal.python_tool import PYTEST_REPORT_DIR, PythonTool
 
 
@@ -178,6 +183,45 @@ def _green_tests(engine):
             ),
         ),
     )
+
+
+def test_recorded_project_fact_sheet_is_structurally_recoverable_from_storage(tmp_path):
+    engine, _ = _engine(tmp_path, phase="analyze")
+    engine.context_manager.current_task_id = "phase_analyze"
+    metadata = with_project_fact_sheet_identity(
+        {
+            "project_path": "/workspace/demo",
+            "project_type": "Java",
+            "build_system": "Maven",
+        }
+    )
+    result = ToolResult.completed_success(
+        output=serialize_project_fact_sheet(metadata),
+        metadata=metadata,
+    )
+
+    recorded = engine._record_tool_execution(
+        "project",
+        {"action": "analyze", "project_path": "/workspace/demo"},
+        result,
+    )
+
+    [indexed] = engine.output_storage.search_outputs(
+        task_id="phase_analyze",
+        tool_name="project",
+        limit=1,
+    )
+    assert indexed["ref_id"] == recorded.output_ref
+    assert indexed["metadata"]["action"] == "analyze"
+    assert indexed["metadata"]["fact_sheet_schema"] == "sag.project-facts"
+
+    context = SimpleNamespace(
+        current_task_id="phase_analyze",
+        output_storage=engine.output_storage,
+        load_branch_history=lambda _task_id: SimpleNamespace(history=[]),
+        load_trunk_context=lambda: None,
+    )
+    assert ContextTool(context)._check_project_analyzer_execution() is True
 
 
 def _phase_metadata(

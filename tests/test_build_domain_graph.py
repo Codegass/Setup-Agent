@@ -29,6 +29,11 @@ from sag.agent.physical_survey import (
     parse_gradle_requires,
     parse_maven_coordinates,
 )
+from sag.agent.project_fact_projection import render_recommended_build_facts
+from sag.project_fact_sheet import (
+    project_fact_sheet_metadata,
+    serialize_project_fact_sheet,
+)
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
@@ -255,10 +260,8 @@ def test_bigtop_emits_four_build_domains_beside_the_islands():
     assert len(rec["build_domains"]) == 4
 
 
-def test_build_islands_stay_byte_identical_beside_the_domains():
-    """The domain keys ride ALONGSIDE build_islands — the directory facts (and
-    their prescriptions) are untouched, so every existing island consumer keeps
-    reading exactly what it read before."""
+def test_build_island_redirect_fields_stay_beside_the_domains():
+    """Domain facts do not disturb the root/system/goal redirect contract."""
     _orch, analysis = _analyze_bigtop()
     islands = {i["root"]: i for i in analysis["build_recommendation"]["build_islands"]}
     assert set(islands) == {TF, DG, SPARK, TQ}
@@ -266,13 +269,9 @@ def test_build_islands_stay_byte_identical_beside_the_domains():
         "root": TF,
         "system": "maven",
         "goal": "install",
-        "rationale": (
-            "Independent maven build island under the aggregator; "
-            "build it on its own with 'install'."
-        ),
     }
     assert islands[DG]["goal"] == "build"  # publish is applied per subproject
-    assert set(islands[SPARK]) == {"root", "system", "goal", "rationale"}
+    assert set(islands[SPARK]) == {"root", "system", "goal"}
 
 
 def test_domain_carries_its_languages_sorted():
@@ -570,8 +569,125 @@ def test_single_domain_manifest_has_no_domain_keys():
 #    independence claim stops when the graph has edges.
 # --------------------------------------------------------------------------- #
 def _render(analysis):
-    tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
-    return tool._render_recommended_build_output(analysis)
+    return render_recommended_build_facts(project_fact_sheet_metadata(analysis))
+
+
+def test_public_fact_projection_preserves_typed_bigtop_domain_graph():
+    _orch, analysis = _analyze_bigtop()
+    public = project_fact_sheet_metadata(analysis)
+    recommendation = public["build_recommendation"]
+
+    assert [edge["status"] for edge in recommendation["domain_edges"]] == [
+        "version_incompatible",
+        "version_incompatible",
+    ]
+    assert recommendation["domain_edges_total"] == 2
+    assert recommendation["domain_mismatches_total"] == 2
+    assert "<depth-limited>" not in json.dumps(recommendation)
+    assert "<depth-limited>" not in serialize_project_fact_sheet(public)
+
+    public_domains = {domain["root"]: domain for domain in recommendation["build_domains"]}
+    internal_domains = {
+        domain["root"]: domain for domain in analysis["build_recommendation"]["build_domains"]
+    }
+    for root, domain in public_domains.items():
+        for key in ("languages", "produces", "requires"):
+            if key in internal_domains[root]:
+                assert domain[f"{key}_total"] == len(internal_domains[root][key])
+
+
+def test_public_domain_nested_lists_are_bounded_with_original_totals():
+    coordinates = [
+        {"group": "org.example", "name": f"artifact-{index}", "version": "1.0"}
+        for index in range(10)
+    ]
+    public = project_fact_sheet_metadata(
+        {
+            "build_recommendation": {
+                "build_system": "maven",
+                "build_root": "/workspace/project",
+                "build_domains": [
+                    {
+                        "root": "/workspace/project",
+                        "system": "maven",
+                        "languages": [f"lang-{index}" for index in range(10)],
+                        "produces": coordinates,
+                        "requires": coordinates,
+                    }
+                ],
+            }
+        }
+    )
+    domain = public["build_recommendation"]["build_domains"][0]
+    assert len(domain["languages"]) == 8
+    assert domain["languages_total"] == 10
+    assert len(domain["produces"]) == 8
+    assert domain["produces_total"] == 10
+    assert len(domain["requires"]) == 8
+    assert domain["requires_total"] == 10
+    assert domain["produces"][0] == {
+        "group": "org.example",
+        "name": "artifact-0",
+        "version": "1.0",
+    }
+
+
+def _linked_analysis(edges):
+    return {
+        "build_recommendation": {
+            "build_system": "maven",
+            "build_root": "/workspace/project",
+            "build_islands": [
+                {"root": "/workspace/producer", "system": "maven"},
+                {"root": "/workspace/consumer", "system": "maven"},
+            ],
+            "domain_edges": edges,
+        }
+    }
+
+
+def _edge(index, status):
+    return {
+        "consumer": f"/workspace/consumer-{index}",
+        "producer": f"/workspace/producer-{index}",
+        "status": status,
+        "detail": (
+            f"requires org.example:artifact-{index} 1.0; producer builds 2.0"
+            if status == "version_incompatible"
+            else f"requires org.example:artifact-{index} 1.0; producer builds 1.0"
+        ),
+    }
+
+
+def test_public_mismatch_count_excludes_compatible_domain_edges():
+    output = _render(
+        _linked_analysis(
+            [
+                _edge(0, "compatible"),
+                _edge(1, "version_incompatible"),
+            ]
+        )
+    )
+
+    assert "Coordinate mismatch between build domains (1 observed" in output
+    assert "Coordinate mismatch between build domains (2 observed" not in output
+
+
+def test_public_edge_cap_keeps_a_ninth_mismatch_and_reports_omitted_links():
+    analysis = _linked_analysis(
+        [_edge(index, "compatible") for index in range(8)] + [_edge(8, "version_incompatible")]
+    )
+    public = project_fact_sheet_metadata(analysis)
+    recommendation = public["build_recommendation"]
+    output = render_recommended_build_facts(public)
+
+    assert recommendation["domain_edges"][0]["status"] == "version_incompatible"
+    assert recommendation["domain_edges_total"] == 9
+    assert recommendation["domain_mismatches_total"] == 1
+    assert "artifact-8" in output
+    assert "Coordinate mismatch between build domains (1 observed" in output
+    assert "8 of 9 observed links shown" in output
+    assert "1 more in /workspace/.setup_agent/build_requirements.json" in output
 
 
 def test_guidance_names_every_incompatible_edge_before_the_coordinates():
@@ -795,9 +911,7 @@ def test_literal_group_match_still_wins_over_name_only():
         {
             "root": "/p/producer",
             "system": "gradle",
-            "produces": [
-                {"group": "org.example", "name": "lib", "version": "2.0"}
-            ],
+            "produces": [{"group": "org.example", "name": "lib", "version": "2.0"}],
         },
         {
             "root": "/p/consumer",

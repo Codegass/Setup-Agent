@@ -19,6 +19,10 @@ import yaml
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.react_types import StepType
 from sag.config.prompt_loader import load_react_engine_prompts
+from sag.project_fact_sheet import (
+    PROJECT_FACT_SHEET_SCHEMA,
+    PROJECT_FACT_SHEET_VERSION,
+)
 from sag.tools.context_tool import ContextTool
 
 REPO_SRC = Path(__file__).resolve().parents[1] / "src" / "sag"
@@ -102,7 +106,151 @@ class _AnalyzerEvidenceCM:
         return None
 
 
-def test_analyzer_evidence_accepts_project_facade_analyze_output():
+class _IndexedOutputStorage:
+    def __init__(
+        self,
+        metadata,
+        output='{"schema":"sag.project-facts"}',
+        *,
+        tool_name="project",
+    ):
+        self.current_index = {
+            "output_project_facts": {
+                "task_id": "task_2",
+                "tool_name": tool_name,
+                "metadata": metadata,
+            }
+        }
+        self._output = output
+
+    def search_outputs(
+        self,
+        pattern=None,
+        task_id=None,
+        tool_name=None,
+        limit=10,
+        metadata_match=None,
+    ):
+        entry = self.current_index["output_project_facts"]
+        if task_id and entry["task_id"] != task_id:
+            return []
+        if tool_name and entry["tool_name"] != tool_name:
+            return []
+        if metadata_match and any(
+            entry["metadata"].get(key) != value for key, value in metadata_match.items()
+        ):
+            return []
+        if pattern and re.search(pattern, self._output, re.IGNORECASE) is None:
+            return []
+        return [
+            {
+                "ref_id": "output_project_facts",
+                "metadata": entry["metadata"],
+            }
+        ][:limit]
+
+
+def _fact_sheet_metadata(**overrides):
+    metadata = {
+        "fact_sheet_schema": PROJECT_FACT_SHEET_SCHEMA,
+        "fact_sheet_version": PROJECT_FACT_SHEET_VERSION,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def _structured_analyze_entry(**overrides):
+    entry = {
+        "type": "action",
+        "tool_name": "project",
+        "parameters": {"action": "analyze", "path": "/workspace/x"},
+        "succeeded": True,
+        "invocation_status": "completed",
+        "operation_outcome": "success",
+        "metadata": _fact_sheet_metadata(),
+        "output": '{"fact_sheet_schema":"sag.project-facts","fact_sheet_version":1}',
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_analyzer_evidence_accepts_structured_project_facade_receipt():
+    tool = ContextTool(_AnalyzerEvidenceCM([_structured_analyze_entry()]))
+    assert tool._check_project_analyzer_execution() is True
+
+
+def test_analyzer_evidence_rejects_action_without_fact_sheet_identity():
+    tool = ContextTool(
+        _AnalyzerEvidenceCM([_structured_analyze_entry(metadata={"build_system": "maven"})])
+    )
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_unsupported_fact_sheet_version():
+    tool = ContextTool(
+        _AnalyzerEvidenceCM(
+            [
+                _structured_analyze_entry(
+                    metadata=_fact_sheet_metadata(fact_sheet_version=PROJECT_FACT_SHEET_VERSION + 1)
+                )
+            ]
+        )
+    )
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_unsupported_fact_sheet_version_cannot_fall_through_legacy_alias():
+    entry = _structured_analyze_entry(
+        tool_name="project_analyzer",
+        metadata=_fact_sheet_metadata(fact_sheet_version=PROJECT_FACT_SHEET_VERSION + 1),
+        output="PROJECT ANALYSIS COMPLETED",
+    )
+    tool = ContextTool(_AnalyzerEvidenceCM([entry]))
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_missing_fact_sheet_version_cannot_fall_through_legacy_alias():
+    entry = _structured_analyze_entry(
+        tool_name="project_analyzer",
+        metadata={"fact_sheet_schema": PROJECT_FACT_SHEET_SCHEMA},
+        output="PROJECT ANALYSIS COMPLETED",
+    )
+    tool = ContextTool(_AnalyzerEvidenceCM([entry]))
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_wrong_action_with_fact_sheet_identity():
+    tool = ContextTool(
+        _AnalyzerEvidenceCM(
+            [_structured_analyze_entry(parameters={"action": "clone", "path": "/workspace/x"})]
+        )
+    )
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_failed_analyze_with_fact_sheet_identity():
+    tool = ContextTool(
+        _AnalyzerEvidenceCM(
+            [
+                _structured_analyze_entry(
+                    succeeded=False,
+                    operation_outcome="failed",
+                )
+            ]
+        )
+    )
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_structured_receipt_without_terminal_state():
+    entry = _structured_analyze_entry()
+    entry.pop("invocation_status")
+    entry.pop("operation_outcome")
+    tool = ContextTool(_AnalyzerEvidenceCM([entry]))
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_accepts_legacy_rendered_marker():
     tool = ContextTool(
         _AnalyzerEvidenceCM(
             [
@@ -116,6 +264,43 @@ def test_analyzer_evidence_accepts_project_facade_analyze_output():
         )
     )
     assert tool._check_project_analyzer_execution() is True
+
+
+def test_analyzer_evidence_accepts_structured_output_storage_record():
+    cm = _AnalyzerEvidenceCM([])
+    cm.output_storage = _IndexedOutputStorage(
+        {
+            "action": "analyze",
+            "invocation_status": "completed",
+            "operation_outcome": "success",
+            **_fact_sheet_metadata(),
+        }
+    )
+    assert ContextTool(cm)._check_project_analyzer_execution() is True
+
+
+def test_analyzer_evidence_rejects_clone_output_storage_record():
+    cm = _AnalyzerEvidenceCM([])
+    cm.output_storage = _IndexedOutputStorage(
+        {
+            "action": "clone",
+            "invocation_status": "completed",
+            "operation_outcome": "success",
+            **_fact_sheet_metadata(),
+        }
+    )
+    assert ContextTool(cm)._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_storage_record_without_terminal_state():
+    cm = _AnalyzerEvidenceCM([])
+    cm.output_storage = _IndexedOutputStorage(
+        {
+            "action": "analyze",
+            **_fact_sheet_metadata(),
+        }
+    )
+    assert ContextTool(cm)._check_project_analyzer_execution() is False
 
 
 def test_analyzer_evidence_rejects_project_clone_only_history():
@@ -132,6 +317,76 @@ def test_analyzer_evidence_rejects_project_clone_only_history():
         )
     )
     assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_legacy_marker_on_explicit_clone_action():
+    tool = ContextTool(
+        _AnalyzerEvidenceCM(
+            [
+                {
+                    "type": "action",
+                    "tool_name": "project",
+                    "parameters": {"action": "clone"},
+                    "success": True,
+                    "output": "PROJECT ANALYSIS COMPLETED",
+                }
+            ]
+        )
+    )
+    assert tool._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_legacy_output_storage_records():
+    """Legacy tool-name/marker fallback is confined to branch histories."""
+    cm = _AnalyzerEvidenceCM([])
+    cm.output_storage = _IndexedOutputStorage(
+        {
+            "operation_outcome": "failed",
+            "invocation_status": "completed",
+        },
+        output="PROJECT ANALYSIS COMPLETED",
+        tool_name="project_analyzer",
+    )
+    assert ContextTool(cm)._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_rejects_legacy_todo_expansion_without_survey_facts():
+    cm = _AnalyzerEvidenceCM([])
+    cm.load_trunk_context = lambda: SimpleNamespace(
+        environment_summary={},
+        todo_list=[
+            SimpleNamespace(id=f"task_{index}", key_results="maven") for index in range(1, 6)
+        ],
+    )
+    assert ContextTool(cm)._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_check_fails_closed_when_history_is_unreadable():
+    cm = _AnalyzerEvidenceCM([])
+
+    def unreadable_history(_task_id):
+        raise RuntimeError("history unavailable")
+
+    cm.load_branch_history = unreadable_history
+    assert ContextTool(cm)._check_project_analyzer_execution() is False
+
+
+def test_analyzer_evidence_uses_structured_storage_when_history_is_unreadable():
+    cm = _AnalyzerEvidenceCM([])
+
+    def unreadable_history(_task_id):
+        raise RuntimeError("history unavailable")
+
+    cm.load_branch_history = unreadable_history
+    cm.output_storage = _IndexedOutputStorage(
+        {
+            "action": "analyze",
+            "invocation_status": "completed",
+            "operation_outcome": "success",
+            **_fact_sheet_metadata(),
+        }
+    )
+    assert ContextTool(cm)._check_project_analyzer_execution() is True
 
 
 def test_analyzer_completion_suggestions_use_project_vocabulary():

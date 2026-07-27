@@ -60,6 +60,24 @@ _CLAIM_VALIDATOR_STATE = {
 # these states has NOT closed, so no gate may refine a claim upward past it.
 _UNCLOSED_DOMAIN_STATES = frozenset({"failed", "blocked", "untried"})
 
+_ANALYSIS_STATUS_PROJECTIONS = {
+    "analysis_trunk_missing": (
+        "Project survey facts are not persisted on the trunk.",
+        ("Run project(action='analyze') before closing the analyze phase.",),
+    ),
+    "analysis_static_count_missing": (
+        "Project survey facts exist, but no static test-count fact was observed.",
+        (
+            "Continue as partial when the project has no observable static denominator, "
+            "or rerun project(action='analyze') after the checkout changes.",
+        ),
+    ),
+    "analysis_facts_missing": (
+        "No persisted project survey facts were observed.",
+        ("Run project(action='analyze') before closing the analyze phase.",),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -710,6 +728,7 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
             code="analysis_unavailable",
         )
     status = method(project_name)
+    analysis_code = str(status.get("analysis_status_code") or "")
     state = _state_from_evidence_status(status.get("evidence_status") or status.get("status"))
     if state is ValidatorState.UNAVAILABLE:
         if status.get("analyzed") and status.get("has_static_test_count"):
@@ -718,19 +737,27 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
             state = ValidatorState.PARTIAL
         elif status.get("success") is True:
             state = ValidatorState.GREEN
-        elif status.get("success") is False or status.get("missing_analysis_prompt"):
+        elif status.get("success") is False or analysis_code:
             state = ValidatorState.RED
+    projected_reason, projected_suggestions = _ANALYSIS_STATUS_PROJECTIONS.get(
+        analysis_code,
+        ("", ()),
+    )
+    analysis_status_facts = status.get("analysis_status_facts")
+    if not isinstance(analysis_status_facts, Mapping):
+        analysis_status_facts = {}
     return _ValidatorObservation(
         state,
-        reason=(
-            status.get("reason")
-            or status.get("missing_analysis_prompt")
-            or "project analysis validator returned no conclusion"
-        ),
+        reason=projected_reason
+        or status.get("reason")
+        or "project analysis validator returned no conclusion",
         evidence_refs=_status_refs(status),
-        code=f"analysis_{state.value}",
+        suggestions=projected_suggestions,
+        code=analysis_code or f"analysis_{state.value}",
         validated_facts={
-            "analysis.build_entry_ready": state in {ValidatorState.GREEN, ValidatorState.PARTIAL}
+            "analysis.build_entry_ready": state in {ValidatorState.GREEN, ValidatorState.PARTIAL},
+            "analysis.status_code": analysis_code or None,
+            "analysis.status_facts": dict(analysis_status_facts),
         },
     )
 
@@ -775,9 +802,7 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         except Exception:
             requirements = None
             islands = None
-    checklist = coverage_checklist_line(
-        module_coverage(validator, project_name), islands=islands
-    )
+    checklist = coverage_checklist_line(module_coverage(validator, project_name), islands=islands)
     if checklist:
         reason = f"{reason} · {checklist}"
         if "no output yet" in checklist or "remaining:" in checklist:

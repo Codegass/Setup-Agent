@@ -1,10 +1,24 @@
+from types import SimpleNamespace
+
 from engine_driver import execute_action_steps
+from test_framework_survey import SurveyOrch
+
+from sag.agent.output_storage import OutputStorageManager
 from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.react_prompt_builder import ReActPromptBuilder
-from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
+from sag.agent.tool_orchestration import (
+    ToolCall,
+    ToolExecution,
+    ToolLifecycleEvent,
+    ToolOrchestrator,
+)
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.evidence import EvidenceAssessment, EvidenceStatus, InvocationStatus, OperationOutcome
+from sag.project_fact_sheet import with_project_fact_sheet_identity
 from sag.tools.base import BaseTool, ToolResult
+from sag.tools.context_tool import ContextTool
+from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+from sag.tools.project_tool import ProjectTool
 from sag.ui.events import EventType
 
 
@@ -34,7 +48,11 @@ class RecordingBranchContext:
         return type(
             "BranchHistory",
             (),
-            {"history": [entry for entry_task_id, entry in self.entries if entry_task_id == task_id]},
+            {
+                "history": [
+                    entry for entry_task_id, entry in self.entries if entry_task_id == task_id
+                ]
+            },
         )()
 
 
@@ -426,6 +444,124 @@ def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
     assert entry["parameters"] == {"action": "compile"}
     assert entry["observation"] == "build succeeded"
     assert entry["output_refs"] == ["output_build"]
+
+
+def test_project_fact_sheet_branch_history_is_bounded(monkeypatch, tmp_path):
+    context = RecordingBranchContext()
+    result = ToolResult.completed_success(
+        output="{" + '"facts":"' + "x" * 2_000 + '"}',
+        metadata=with_project_fact_sheet_identity(
+            {
+                "project_path": "/workspace/demo",
+                "project_type": "Java",
+                "build_system": "Maven",
+            }
+        ),
+    )
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: project analyze",
+        tool_name="project",
+        tool_params={"action": "analyze"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="project", raw_params={"action": "analyze"}),
+        result=result,
+        status="success",
+        raw_params={"action": "analyze"},
+        validated_params={"action": "analyze"},
+        executed_params={"action": "analyze"},
+        observation_text="PROJECT ANALYSIS COMPLETED\n" + "y" * 20_000,
+        attempted_execution=True,
+    )
+    engine = _engine_with_context(context=context)
+    engine.tools = {}
+    engine.output_storage = OutputStorageManager(tmp_path)
+
+    monkeypatch.setattr(
+        engine,
+        "_get_tool_orchestrator",
+        lambda: type("Orchestrator", (), {"execute": lambda self, call: execution})(),
+    )
+
+    assert execute_action_steps(engine, [step]) is None
+
+    entry = context.entries[0][1]
+    assert entry["metadata"]["fact_sheet_schema"] == "sag.project-facts"
+    assert len(entry["output"]) <= 850
+    assert len(entry["observation"]) <= 6_000
+    assert "projection truncated in branch history" in entry["observation"]
+    assert entry["output_refs"]
+
+
+def test_real_project_facade_fact_receipt_reaches_context_completion(monkeypatch, tmp_path):
+    """Analyzer -> public facade -> orchestration -> engine history/storage ->
+    ContextTool uses production objects at every handoff."""
+
+    class AnalysisContext(RecordingBranchContext):
+        current_task_id = "phase_analyze"
+
+        def __init__(self):
+            super().__init__()
+            self.trunk = SimpleNamespace(environment_summary={})
+            self.saved = False
+            self.output_storage = None
+
+        def load_trunk_context(self):
+            return self.trunk
+
+        def _save_trunk_context(self, trunk):
+            self.trunk = trunk
+            self.saved = True
+
+    context = AnalysisContext()
+    storage = OutputStorageManager(tmp_path)
+    context.output_storage = storage
+    analyzer = ProjectAnalyzerTool(SurveyOrch(), context)
+    project = ProjectTool(analyzer_tool=analyzer)
+    engine = _engine_with_context(context=context)
+    engine.tools = {"project": project}
+    engine.output_storage = storage
+    orchestration = ToolOrchestrator(
+        tools=engine.tools,
+        context_manager=context,
+        recent_tool_executions=engine.recent_tool_executions,
+        successful_states=engine.successful_states,
+        repository_url=engine.repository_url,
+        repository_ref=engine.repository_ref,
+        track_tool_execution=lambda *_args, **_kwargs: None,
+        update_successful_states=lambda *_args, **_kwargs: None,
+        add_system_guidance=lambda *_args, **_kwargs: None,
+        get_timestamp=lambda: "2026-07-26T22:00:00Z",
+        output_storage=storage,
+    )
+    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: orchestration)
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: project analyze",
+        tool_name="project",
+        tool_params={"action": "analyze", "project_path": "/workspace/proj"},
+        timestamp="ts",
+        model_used="weak-model",
+    )
+
+    assert execute_action_steps(engine, [step]) is None
+
+    assert context.saved is True
+    assert step.tool_result.metadata["fact_sheet_schema"] == "sag.project-facts"
+    [entry] = [value for task_id, value in context.entries if task_id == "phase_analyze"]
+    assert entry["parameters"]["action"] == "analyze"
+    assert entry["metadata"]["fact_sheet_schema"] == "sag.project-facts"
+    assert "PROJECT ANALYSIS COMPLETED" in entry["observation"]
+    assert ContextTool(context)._check_project_analyzer_execution() is True
+    completion = ContextTool(context)._validate_task_completion(
+        SimpleNamespace(id="phase_analyze", description="Analyze project structure"),
+        "Survey facts recorded.",
+        "Structured fact receipt and trunk survey are present.",
+    )
+    assert completion["valid"] is True
 
 
 def test_execute_steps_persists_short_failed_output_ref_in_branch_history(

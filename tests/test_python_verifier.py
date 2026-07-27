@@ -512,6 +512,10 @@ def test_collected_json_fallback_feeds_static_test_count():
     result = validator.validate_project_analysis_status("proj")
     assert result["has_static_test_count"] is True
     assert result["static_test_count"] == 42
+    assert result["analysis_status_code"] == "analysis_trunk_missing"
+    assert "missing_analysis_prompt" not in result
+    assert "project_analyzer" not in str(result)
+    assert "execution plan" not in str(result).lower()
 
 
 def test_survey_facts_mark_analysis_ready_before_python_test_collection():

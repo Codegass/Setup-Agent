@@ -8,12 +8,14 @@ in the main context files. It provides indexing and search capabilities.
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.project_fact_sheet import project_fact_sheet_identity
 from sag.tools.base import (
     OutputPersistenceError,
     ToolResult,
@@ -26,6 +28,46 @@ from sag.utils.container_io import write_container_text
 
 class OutputDurabilityError(OutputPersistenceError):
     """Raised when no validated durable home can be established for output."""
+
+
+_SEARCH_METADATA_KEYS = (
+    "invocation_status",
+    "operation_outcome",
+    "evidence_status",
+    "error_code",
+    "failure_signature",
+    "iteration",
+    "action",
+    "fact_sheet_schema",
+    "fact_sheet_version",
+)
+_EMERGENCY_SEARCH_LIMIT = 256
+
+
+def _storage_metadata(metadata: Any) -> Dict[str, Any]:
+    """Copy durable metadata while bounding the newly indexed action scalar."""
+    if not isinstance(metadata, Mapping):
+        return {}
+    normalized = dict(metadata)
+    if normalized.get("action") not in (None, ""):
+        normalized["action"] = str(normalized["action"])[:256]
+    return normalized
+
+
+def _search_metadata_projection(metadata: Any) -> Dict[str, Any]:
+    """Expose only bounded index identity/status fields to search callers."""
+    if not isinstance(metadata, Mapping):
+        return {}
+    projected: Dict[str, Any] = {}
+    for key in _SEARCH_METADATA_KEYS:
+        value = metadata.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (bool, int, float)):
+            projected[key] = value
+        else:
+            projected[key] = str(value)[:256]
+    return projected
 
 
 def _output_round_trips(storage: Any, ref: str, output: str) -> bool:
@@ -62,6 +104,7 @@ def attach_durable_output_ref(
     *,
     task_id: str,
     tool_name: str,
+    action: Optional[str] = None,
 ) -> ToolResult:
     """Return a detached result whose full output has durable provenance."""
     output = canonical_full_output_source(
@@ -81,6 +124,8 @@ def attach_durable_output_ref(
         "evidence_status": result.evidence_status.value,
         "error_code": result.error_code,
         "failure_signature": result.failure_signature,
+        "action": action,
+        **project_fact_sheet_identity(result.metadata),
     }
     failures: list[str] = []
     persistence_methods = (
@@ -339,6 +384,7 @@ class OutputStorageManager:
         """
         # Generate a unique ID for this output
         timestamp = timestamp or datetime.now().isoformat()
+        metadata = _storage_metadata(metadata)
         content_hash = hashlib.md5(
             f"{task_id}_{tool_name}_{timestamp}_{output[:100]}".encode()
         ).hexdigest()[:12]
@@ -352,7 +398,7 @@ class OutputStorageManager:
             "timestamp": timestamp,
             "output_length": len(output),
             "output": output,
-            "metadata": metadata or {},
+            "metadata": metadata,
         }
 
         # Append to storage file (JSONL format for efficient appending)
@@ -401,7 +447,7 @@ class OutputStorageManager:
             "line_number": self._count_lines_in_file(),  # Line number in JSONL file
             "first_100_chars": output[:100],
             "last_100_chars": output[-100:] if len(output) > 100 else output,
-            "metadata": metadata or {},
+            "metadata": metadata,
         }
 
         try:
@@ -445,6 +491,46 @@ class OutputStorageManager:
             return None
         return record
 
+    def _searchable_emergency_records(self) -> List[Dict[str, Any]]:
+        """Load a bounded newest-first set of independently durable records."""
+        refs: List[str] = []
+        if self.orchestrator:
+            command = (
+                f"ls -1t {self.container_storage_dir}/"
+                "emergency-output_emergency_*.json 2>/dev/null "
+                f"| head -{_EMERGENCY_SEARCH_LIMIT}"
+            )
+            listed = self.orchestrator.execute_command(command)
+            paths = (
+                (listed.get("output") or "").splitlines() if listed.get("exit_code") == 0 else []
+            )
+            for path in paths:
+                filename = path.rsplit("/", 1)[-1]
+                if filename.startswith("emergency-") and filename.endswith(".json"):
+                    refs.append(filename[len("emergency-") : -len(".json")])
+        else:
+            try:
+                paths = sorted(
+                    self.storage_dir.glob("emergency-output_emergency_*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                    reverse=True,
+                )[:_EMERGENCY_SEARCH_LIMIT]
+                refs = [
+                    path.name[len("emergency-") : -len(".json")]
+                    for path in paths
+                    if path.name.startswith("emergency-") and path.name.endswith(".json")
+                ]
+            except OSError as exc:
+                logger.warning(f"Failed to enumerate emergency output records: {exc}")
+                return []
+
+        records = []
+        for ref_id in refs:
+            record = self._read_emergency_record(ref_id)
+            if record is not None:
+                records.append(record)
+        return records
+
     def store_emergency_output(
         self,
         task_id: str,
@@ -454,13 +540,14 @@ class OutputStorageManager:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Store one content-addressed record outside the primary JSONL/index pair."""
+        metadata = _storage_metadata(metadata)
         identity = {
             "task_id": task_id,
             "tool_name": tool_name,
             "timestamp": timestamp,
             "output_length": len(output),
             "output": output,
-            "metadata": metadata or {},
+            "metadata": metadata,
             "storage_mode": "emergency",
         }
         canonical_identity = json.dumps(
@@ -494,6 +581,30 @@ class OutputStorageManager:
                 temp_path.replace(path)
         except Exception as exc:
             raise OSError(f"failed to store emergency output {ref_id}: {exc}") from exc
+
+        # Keep emergency identity searchable through the same lightweight
+        # durable index. The individual record remains the source of truth and
+        # retrieval path; this index row only avoids a pre-filter filesystem
+        # scan after restart.
+        try:
+            self.current_index = self._load_index()
+            self.current_index[ref_id] = {
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "timestamp": timestamp,
+                "output_length": len(output),
+                "line_number": 0,
+                "first_100_chars": output[:100],
+                "last_100_chars": output[-100:] if len(output) > 100 else output,
+                "metadata": metadata,
+                "storage_mode": "emergency",
+            }
+            self._save_index()
+        except Exception as exc:
+            # The content-addressed emergency record still round-trips by ref.
+            # Search has a bounded legacy-record scan as a secondary recovery
+            # path when this lightweight index write is unavailable.
+            logger.warning(f"Failed to index emergency output {ref_id}: {exc}")
 
         logger.warning(f"Stored output in emergency record: {ref_id}")
         return ref_id
@@ -588,6 +699,7 @@ class OutputStorageManager:
         task_id: Optional[str] = None,
         tool_name: Optional[str] = None,
         limit: int = 10,
+        metadata_match: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search for outputs matching criteria.
@@ -597,6 +709,7 @@ class OutputStorageManager:
             task_id: Filter by task ID
             tool_name: Filter by tool name
             limit: Maximum number of results
+            metadata_match: Exact index-metadata fields that must all match
 
         Returns:
             List of matching output references with snippets
@@ -613,12 +726,55 @@ class OutputStorageManager:
 
         # First, filter by index criteria
         candidates = []
-        for ref_id, info in self.current_index.items():
+        # Newest first: callers looking for the current action receipt should
+        # not be shadowed by an older record for the same task/tool.
+        for ref_id, info in reversed(self.current_index.items()):
             if task_id and info.get("task_id") != task_id:
                 continue
             if tool_name and info.get("tool_name") != tool_name:
                 continue
+            if metadata_match:
+                metadata = info.get("metadata")
+                if not isinstance(metadata, Mapping) or any(
+                    metadata.get(key) != value for key, value in metadata_match.items()
+                ):
+                    continue
             candidates.append((ref_id, info))
+
+        # Compatibility recovery for emergency records created before they
+        # gained index rows, or while the emergency index write itself was
+        # unavailable. Current records are filtered in the index *before* the
+        # result limit; this bounded scan cannot shadow them.
+        indexed_refs = {ref_id for ref_id, _info in candidates}
+        for record in self._searchable_emergency_records():
+            ref_id = str(record["ref_id"])
+            if ref_id in indexed_refs:
+                continue
+            if task_id and record.get("task_id") != task_id:
+                continue
+            if tool_name and record.get("tool_name") != tool_name:
+                continue
+            metadata = record.get("metadata")
+            if metadata_match and (
+                not isinstance(metadata, Mapping)
+                or any(metadata.get(key) != value for key, value in metadata_match.items())
+            ):
+                continue
+            output = str(record.get("output") or "")
+            candidates.append(
+                (
+                    ref_id,
+                    {
+                        "task_id": record.get("task_id"),
+                        "tool_name": record.get("tool_name"),
+                        "timestamp": record.get("timestamp"),
+                        "output_length": len(output),
+                        "first_100_chars": output[:100],
+                        "last_100_chars": output[-100:] if len(output) > 100 else output,
+                        "metadata": metadata or {},
+                    },
+                )
+            )
 
         # If pattern provided, search in full outputs
         if pattern:
@@ -655,6 +811,7 @@ class OutputStorageManager:
                                 "match_count": len(matches),
                                 "snippet": snippet,
                                 "output_length": info["output_length"],
+                                "metadata": _search_metadata_projection(info.get("metadata")),
                             }
                         )
         else:
@@ -669,6 +826,7 @@ class OutputStorageManager:
                         "first_100": info["first_100_chars"],
                         "last_100": info["last_100_chars"],
                         "output_length": info["output_length"],
+                        "metadata": _search_metadata_projection(info.get("metadata")),
                     }
                 )
 

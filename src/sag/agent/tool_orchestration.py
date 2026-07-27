@@ -10,7 +10,15 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
+from sag.agent.project_fact_projection import (
+    render_project_analysis_error,
+    render_project_fact_sheet,
+)
 from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
+from sag.project_fact_sheet import (
+    is_project_analysis_error_metadata,
+    is_project_fact_sheet_metadata,
+)
 from sag.tools.base import (
     ActualToolExecution,
     BaseTool,
@@ -169,8 +177,25 @@ def _format_evidence_observation(result: ToolResult) -> list[str]:
 
 
 def format_tool_result(tool_name: str, result: ToolResult) -> str:
-    """Format tool result for observation. Output truncation is now handled in BaseTool."""
+    """Format a tool result at the engine/model boundary."""
     evidence_lines = _format_evidence_observation(result)
+    visible_output = result.output
+    project_error_projection: dict[str, Any] = {}
+    if (
+        tool_name in {"project", "project_analyzer"}
+        and result.succeeded
+        and is_project_fact_sheet_metadata(result.metadata)
+    ):
+        # Category 4: the analyzer emits only the structured fact sheet.  The
+        # orchestration layer owns every model-visible prose projection.
+        visible_output = render_project_fact_sheet(result.metadata)
+    elif (
+        tool_name in {"project", "project_analyzer"}
+        and result.operation_outcome is OperationOutcome.FAILED
+        and is_project_analysis_error_metadata(result.metadata)
+    ):
+        project_error_projection = render_project_analysis_error(result.metadata)
+        visible_output = str(project_error_projection.get("details") or "")
 
     if result.operation_outcome is not OperationOutcome.FAILED:
         if result.invocation_status is InvocationStatus.PENDING:
@@ -195,9 +220,8 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         if tool_name == "bash" and result.metadata and "command" in result.metadata:
             formatted += f"\nCommand: {result.metadata['command']}"
 
-        # Add output (already processed by BaseTool truncation)
-        if result.output:
-            formatted += f"\n\nOutput: {result.output}"
+        if visible_output:
+            formatted += f"\n\nOutput: {visible_output}"
 
         # Envelope extras (spec §5): machine-readable facts and retrieval refs.
         facts = getattr(result, "facts", None)
@@ -222,7 +246,9 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
     else:
         # For failed results, show error and suggestions
-        error_msg = result.error if result.error else "Unknown error occurred"
+        error_msg = (
+            project_error_projection.get("message") or result.error or "Unknown error occurred"
+        )
         formatted = f"❌ {tool_name} failed: {error_msg}"
 
         if evidence_lines:
@@ -233,20 +259,23 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
             formatted += f"\nCommand: {result.metadata['command']}"
 
         # Show extracted error details from output (especially important for maven tool)
-        if result.output and result.output.strip():
-            formatted += f"\n\n{result.output}"
+        if visible_output and visible_output.strip():
+            formatted += f"\n\n{visible_output}"
 
         if tool_name in ("maven", "build"):
             formatted += _format_maven_version_contract(result)
 
-        if result.suggestions:
-            formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])
+        suggestions = project_error_projection.get("suggestions") or result.suggestions
+        if suggestions:
+            formatted += f"\n\nSuggestions:\n" + "\n".join(
+                f"• {suggestion}" for suggestion in suggestions[:3]
+            )
 
         if result.error_code:
             formatted += f"\nError code: {result.error_code}"
         if result.failure_signature:
             formatted += f"\nFailure signature: {result.failure_signature}"
-        if result.error_tail_preview:
+        if result.error_tail_preview and not project_error_projection:
             formatted += f"\nError tail: {result.error_tail_preview}"
         if result.output_ref:
             formatted += f"\nFull output ref: {result.output_ref}"
@@ -255,7 +284,7 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         if (
             result.raw_output
             and (not result.error or len(result.error.strip()) < 10)
-            and (not result.output or len(result.output.strip()) < 20)
+            and (not visible_output or len(visible_output.strip()) < 20)
         ):
             formatted += f"\n\nRaw output: {result.raw_output}"
 

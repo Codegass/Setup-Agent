@@ -37,13 +37,12 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
-from sag.runtime.container_io import ContainerFileReadError, read_container_text
-
 from sag.config.settings import (
     DEFAULT_BUILD_COVERAGE_THRESHOLD,
     DEFAULT_TEST_EXECUTION_THRESHOLD,
     DEFAULT_TEST_PASS_THRESHOLD,
 )
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
     TestCaseCatalog,
@@ -2190,9 +2189,7 @@ class PhysicalValidator:
         )
         return parsed
 
-    def _parse_single_test_xml(
-        self, xml_content: str, file_path: str
-    ) -> Optional[Dict[str, int]]:
+    def _parse_single_test_xml(self, xml_content: str, file_path: str) -> Optional[Dict[str, int]]:
         """
         Parse a single test XML file and extract statistics.
         Handles both Maven Surefire and Gradle formats.
@@ -4195,13 +4192,15 @@ class PhysicalValidator:
                 - analyzed: Boolean indicating if analysis was performed
                 - has_static_test_count: Boolean for test count presence
                 - static_test_count: The actual count if available
-                - missing_analysis_prompt: Suggested prompt to inject if not analyzed
+                - analysis_status_code: Typed absence/incompleteness code
+                - analysis_status_facts: Bounded physical status facts
         """
         result = {
             "analyzed": False,
             "has_static_test_count": False,
             "static_test_count": None,
-            "missing_analysis_prompt": None,
+            "analysis_status_code": None,
+            "analysis_status_facts": {},
             "trunk_context_found": False,
         }
 
@@ -4218,11 +4217,8 @@ class PhysicalValidator:
                 logger.warning(
                     "No trunk context file found - project analysis likely not performed"
                 )
-                result["missing_analysis_prompt"] = (
-                    "🚨 CRITICAL: Project analysis has NOT been performed yet! "
-                    "You MUST run project_analyzer(action='analyze') immediately to count static tests "
-                    "and generate an intelligent execution plan. This is REQUIRED for accurate reporting."
-                )
+                result["analysis_status_code"] = "analysis_trunk_missing"
+                result["analysis_status_facts"] = {"trunk_context_found": False}
                 return self._apply_python_collected_denominator(result, project_name)
 
             trunk_file = trunk_file_result["output"].strip()
@@ -4250,12 +4246,11 @@ class PhysicalValidator:
                         )
                     else:
                         logger.warning("⚠️ Trunk context exists but no static_test_count found")
-                        result["missing_analysis_prompt"] = (
-                            "⚠️ WARNING: Project analysis appears incomplete. Static test count is missing! "
-                            "Please run project(action='analyze', project_path='/workspace/{project}') "
-                            "to properly analyze the project and count all test methods. "
-                            "This is essential for accurate test coverage reporting."
-                        )
+                        result["analysis_status_code"] = "analysis_static_count_missing"
+                        result["analysis_status_facts"] = {
+                            "trunk_context_found": True,
+                            "static_test_count_present": False,
+                        }
 
                     # Check for other analysis markers. dim (c) deleted
                     # (Category-3 analyzer diet): the analyzer no longer writes
@@ -4277,11 +4272,11 @@ class PhysicalValidator:
         except Exception as e:
             logger.error(f"Error validating project analysis status: {e}")
 
-        if not result["analyzed"] and not result["missing_analysis_prompt"]:
-            result["missing_analysis_prompt"] = (
-                "📊 REMINDER: Run project(action='analyze') to get accurate static test counts "
-                "for better reporting. This helps track test coverage and execution rates."
-            )
+        if not result["analyzed"] and not result["analysis_status_code"]:
+            result["analysis_status_code"] = "analysis_facts_missing"
+            result["analysis_status_facts"] = {
+                "trunk_context_found": result["trunk_context_found"],
+            }
 
         return self._apply_python_collected_denominator(result, project_name)
 
@@ -4320,6 +4315,11 @@ class PhysicalValidator:
         result["has_static_test_count"] = True
         result["static_test_count"] = collected
         result["static_test_count_source"] = "pytest_collect_only"
+        if result.get("analyzed") and result.get("analysis_status_code") == (
+            "analysis_static_count_missing"
+        ):
+            result["analysis_status_code"] = None
+            result["analysis_status_facts"] = {}
         return result
 
     def _python_collected_count(self, project_name: Optional[str]) -> Optional[int]:

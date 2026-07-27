@@ -1,9 +1,9 @@
-"""ProjectAnalyzer._recommend_build_approach — pick the real build target.
+"""ProjectAnalyzer._recommend_build_approach — survey the real build target.
 
 Bigtop's root pom is packaging=pom aggregating Groovy/Gradle modules, and its
 modules are declared inside a profile (so the parsed <modules> list is empty).
-The analyzer must still find the Groovy source module and recommend building it,
-not fall back to compiling the empty root.
+The analyzer must still find the Groovy source module instead of reporting the
+empty root as the build coordinate.
 """
 
 import re
@@ -48,16 +48,17 @@ def _rec(paths, analysis, packaging="jar", source_dirs=(), path="/workspace/p"):
     return analyzer._recommend_build_approach(path, analysis)
 
 
-def test_plain_maven_module_compiles_at_root():
+def test_plain_maven_module_has_root_build_coordinates():
     rec = _rec(
         {"/workspace/p/pom.xml", "/workspace/p/src/main/java"},
         {"build_system": "maven"},
         packaging="jar",
     )
     assert rec["build_system"] == "maven"
-    assert rec["goal"] == "compile"
     assert rec["build_root"] == "/workspace/p"
     assert rec["is_aggregator_only"] is False
+    assert "goal" not in rec
+    assert "rationale" not in rec
 
 
 def test_aggregator_with_declared_modules_builds_reactor_at_root():
@@ -69,9 +70,9 @@ def test_aggregator_with_declared_modules_builds_reactor_at_root():
         path="/workspace/bigtop",
     )
     assert rec["build_system"] == "maven"
-    assert rec["goal"] == "install"  # Groovy -> install, not bare compile
     assert rec["build_root"] == "/workspace/bigtop"  # reactor declares the modules
     assert any(m["lang"] == "groovy" for m in rec["source_modules"])
+    assert "goal" not in rec
 
 
 def test_aggregator_with_profile_gated_modules_targets_source_module_directly():
@@ -85,12 +86,13 @@ def test_aggregator_with_profile_gated_modules_targets_source_module_directly():
         path="/workspace/bigtop",
     )
     assert rec["build_system"] == "maven"
-    assert rec["goal"] == "install"
     assert rec["build_root"] == "/workspace/bigtop/bigtop-test-framework"
     assert rec["is_aggregator_only"] is False
+    assert "goal" not in rec
+    assert "rationale" not in rec
 
 
-def test_aggregator_with_no_source_modules_but_gradle_recommends_gradle():
+def test_aggregator_with_no_source_modules_but_gradle_detects_gradle():
     rec = _rec(
         {"/workspace/p/pom.xml", "/workspace/p/gradlew", "/workspace/p/build.gradle"},
         {"build_system": "maven", "maven_modules": ["docs"]},
@@ -98,9 +100,9 @@ def test_aggregator_with_no_source_modules_but_gradle_recommends_gradle():
         source_dirs=[],
     )
     assert rec["build_system"] == "gradle"
-    assert rec["goal"] == "build"
     assert rec["has_gradle"] is True
     assert rec["is_aggregator_only"] is False
+    assert "goal" not in rec
 
 
 def test_pure_aggregator_meta_project_is_flagged_blocked():
@@ -111,16 +113,17 @@ def test_pure_aggregator_meta_project_is_flagged_blocked():
         source_dirs=[],
     )
     assert rec["is_aggregator_only"] is True
-    assert "meta-project" in rec["rationale"]
+    assert "rationale" not in rec
 
 
-def test_gradle_only_project_recommends_gradle_build():
+def test_gradle_only_project_has_gradle_build_coordinates():
     rec = _rec(
         {"/workspace/p/gradlew", "/workspace/p/build.gradle"},
         {"build_system": "gradle"},
     )
     assert rec["build_system"] == "gradle"
-    assert rec["goal"] == "build"
+    assert rec["build_root"] == "/workspace/p"
+    assert "goal" not in rec
 
 
 def _test_rec(build_rec, test_dirs, paths, path="/workspace/bigtop"):

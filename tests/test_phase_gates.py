@@ -269,6 +269,34 @@ def test_analyze_validator_maps_complete_and_partial_evidence():
     assert partial.validator_state is ValidatorState.PARTIAL
 
 
+def test_analyze_missing_facts_reason_is_engine_projected_from_typed_code():
+    class Analyzer(FakeValidator):
+        def validate_project_analysis_status(self, project_name=None):
+            return {
+                "analyzed": False,
+                "has_static_test_count": False,
+                "analysis_status_code": "analysis_trunk_missing",
+                "analysis_status_facts": {"trunk_context_found": False},
+            }
+
+    result = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=Analyzer(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is False
+    assert result.code == "analysis_trunk_missing"
+    assert result.reason == "Project survey facts are not persisted on the trunk."
+    assert result.suggestions == (
+        "Run project(action='analyze') before closing the analyze phase.",
+    )
+    assert "execution plan" not in result.reason.lower()
+    assert "project_analyzer" not in result.reason
+
+
 def test_all_collection_errors_are_red_even_when_report_exists():
     class CollectionFailure(FakeValidator):
         def validate_test_status(self, project_name=None):

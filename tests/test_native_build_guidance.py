@@ -37,9 +37,10 @@ import re
 import shlex
 from types import SimpleNamespace
 
+from sag.agent.phase_machine import PhaseMachine
 from sag.agent.physical_survey import _smoke_candidates_from_pyproject
 from sag.agent.physical_validator import PhysicalValidator
-from sag.agent.phase_machine import PhaseMachine
+from sag.agent.project_fact_projection import render_project_fact_sheet
 from sag.agent.react_engine import ReActEngine
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
@@ -346,10 +347,7 @@ def test_current_tvm_pep517_facts_are_grounded_in_the_root_pyproject():
 def test_current_tvm_analyze_output_projects_compact_observed_python_facts():
     analysis, _ = _analyzed(_TVM_ROOT, _CURRENT_TVM_FILES)
 
-    output = ProjectAnalyzerTool(
-        docker_orchestrator=None,
-        context_manager=None,
-    )._format_analysis_output(analysis)
+    output = render_project_fact_sheet(analysis)
 
     assert "🐍 Python facts (observed):" in output
     assert "Distribution: apache-tvm" in output

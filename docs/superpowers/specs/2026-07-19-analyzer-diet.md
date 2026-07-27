@@ -1,7 +1,9 @@
 # Project Analyzer Diet — Four-Layer Split
 
 **Date:** 2026-07-19
-**Status:** Design agreed with Chenhao (conversation 2026-07-18/19); Category 1 implementing now, 2–4 staged behind panel A/B.
+**Status:** Categories 1–4 executed. Category 3 deletion landed
+2026-07-20 after the evidence panel; Category 4 projection cleanup landed
+2026-07-26.
 **The tool's charter (Chenhao's formulation, the test for every future change):**
 
 > The analyzer exists to LOWER THE AGENT'S COST OF DISCOVERY — so it does not
@@ -25,7 +27,7 @@ components read is written ONLY inside the agent-invoked tool).
 | **1. Framework mechanics** | manifest (`build_requirements.json`), env-summary RAW facts | engine-guaranteed survey (this spec, Category 1) | preflight, gates, finalizer, build tools — machines |
 | **2. Physical observation** | filesystem READING: structure scan, config parsing, island enumeration, module scan | shared substrate beside the validator; two roles on top — **surveyor** (what EXISTS, pre-hoc) and **judge** (what HAPPENED, post-hoc) | both layers 1 and 3 |
 | **3. Agent tool surface** | `project(action='analyze')` returns the FACT SHEET only — cheap discovery | thin wrapper over the surveyor | the agent |
-| **4. Rendering projections** | fact sheet → intro/observation text, **brief projection** (review 2026-07-19: projections are renderings, not layer-1 facts) | engine intro builder | the agent's window |
+| **4. Rendering projections** | typed fact sheet / typed survey error → bounded model-facing observation text | engine orchestration and projection modules | the agent's window |
 
 Hard rules carried over from the control-layer work:
 - The surveyor DESCRIBES, never prescribes; the judge VERDICTS, never recommends.
@@ -150,13 +152,14 @@ setup tool). Live pyyaml: agent skipped analyze → deps no-oped → run wasted.
   older-version manifest re-surveys instead of serving stale facts (full
   source-fingerprint invalidation lands with Category 2).
 
-**Declared temporary compatibility (review P2, option b).** The guarantee
-reuses the SAME full pipeline as agent-invoked analyze — including brief
-composition, whose projection the intro then renders. Splitting a facts-only
-pipeline now would create two divergent survey paths (a worse seam than the
-prescriptions themselves). The prescriptive output is therefore acknowledged
-as temporary: it is removed by Category 3's A/B gate, and its removal
-criterion is explicit — panel parity of facts-plus-feedback vs. prescriptions.
+**Temporary compatibility at Category-1 landing (resolved by Categories 3
+and 4).** The guarantee initially reused the SAME full pipeline as
+agent-invoked analyze — including brief composition — to avoid creating two
+divergent survey paths before the panel. Category 3 removed brief production;
+Category 4 then deleted the dead module and separated the shared structured
+fact contract from the engine-owned model projection. `ensure_facts` and
+agent-invoked analyze still share one survey pipeline, but neither now creates
+or renders a brief.
 
 **Done-bar (`tests/test_framework_survey.py`, 14 tests: 13 unit + 1
 UNMOCKED integration).** Unit: production constructor path; `created`
@@ -232,9 +235,12 @@ is unchanged.
   substrate; the recommendation methods consume facts only.
 - P2 surveyor no longer prescribes: `read_python_metadata` returns
   descriptive metadata; the installer ladder (`detect_installer`) composes
-  at the analyzer beside setup/python tools' own calls; README command
-  repair (the `-Dtest` fix) moved to the tool layer — the surveyor extracts
-  commands AS DOCUMENTED.
+  at the analyzer beside setup/python tools' own calls. At the Category-2
+  boundary the README `-Dtest` repair moved above the physical reader, which
+  itself extracted commands AS DOCUMENTED. Category 4 completed that
+  separation: the public fact sheet now also preserves commands AS
+  DOCUMENTED; command validity and repair belong to the later
+  assessment/contract loop, not to survey or projection.
 - P2 judge logic evicted: `count_actual_test_executions` (surefire-report
   reading — post-hoc evidence) deleted with zero callers (grep proof in the
   commit).
@@ -551,9 +557,11 @@ There is no unconditional "generator must go": if a stage-2 keep-set
 retains the plan pipeline, it stays and the spec records which probe kept
 it and why.
 
-**Category 4 done-bar.** All rendering lives in the engine projection with
-marker-based snapshot tests; the analyzer tool result contains the fact sheet
-only.
+**Category 4 done-bar (met 2026-07-26).** All model-facing survey rendering
+lives in the engine projection and is locked by structured boundary/snapshot
+tests; the analyzer tool result contains a bounded, schema-versioned fact
+sheet only. Typed survey failures follow the same boundary: the analyzer emits
+an error code and facts, and the engine owns the explanatory copy.
 
 **Decision instrument, not taste:** the panel is empirical because the
 answer is model-strength dependent. The authoritative decision rule is the
@@ -612,9 +620,10 @@ dimension:
   loop-redirect reader.
 - **(c) project_brief** — `_compose_project_brief` + its projection + the trunk
   brief keys + the analyze file ref; the validator's readiness marker no longer
-  reads `project_brief_ref`/`_fingerprint`. (The self-contained
-  `sag/agent/project_brief.py` module and its direct unit tests are left in
-  place — dead in production, removable as a separate Category-4 cleanup.)
+  reads `project_brief_ref`/`_fingerprint`. At this Category-3 landing the
+  self-contained `sag/agent/project_brief.py` module and its direct unit tests
+  were deliberately left as dead production code; Category 4 subsequently
+  deleted them.
 - **(d) objectives_wording** — the "Recommended Build/Tests" objective variants
   and the `.replace()`-derived FACTS_* selection chain collapsed: the facts
   wording IS `PHASE_OBJECTIVES`/`PYTHON_PHASE_OBJECTIVES`/`KICKOFF_PHASE_OBJECTIVES`,
@@ -646,6 +655,111 @@ adjusted to the facts-only rendering. Full suite: 2158 passed, 1 skipped, 6
 failed — exactly the registered baseline reds (test_evidence_ingestion×1,
 test_stage1_review_fixes×2, test_lineage_idempotence_followup×2,
 test_packaging_smoke×1); no new failures.
+
+## Category 4 — executed (2026-07-26)
+
+Category 3 proved that the old prescription dimensions could disappear; this
+cleanup makes the remaining facts-only boundary structural rather than
+conventional.
+
+**Deleted dead production surface.**
+
+- Deleted `src/sag/agent/project_brief.py`. It had zero production readers
+  after Category 3.
+- Deleted its four direct-only suites:
+  `test_project_brief_adapters.py`, `test_project_brief_fingerprint.py`,
+  `test_project_brief_projection.py`, and `test_project_brief_roles.py`.
+- Deleted the remaining zero-reader prescription residue: top-level
+  recommendation `goal`/`rationale` composition, persisted `build_goal`,
+  per-island `rationale`, and the obsolete `test_reactor_build_goal.py`.
+  Per-build-island `goal` is the sole survivor because mechanical island
+  redirect/build consumers still read it; trunk and public fact projection
+  strip it before model visibility.
+- Historical panel helpers and `sag/config/prescriptions.py` remain solely to
+  reproduce sealed Category-3 evidence; they are not runtime prescription
+  channels.
+
+**One machine contract, one prose owner.**
+
+- `sag/project_fact_sheet.py` owns the shared prose-free wire contract:
+  `sag.project-facts` version 1 for success and
+  `sag.project-analysis-error` version 1 for failure. The public success
+  payload is an observed-fact whitelist. It retains project/build/test
+  coordinates, islands, build domains/edges, documentation as observed, and
+  Python layout/provider/native facts; it excludes resolved runtime choices,
+  installer ladders, install commands, notes, test hints, and other policy.
+- Values, collections, nesting, public metadata, and raw output are bounded.
+  Every shortened collection carries its original total, so the projection
+  never turns “100 observed, 8 retained” into “8 observed.” Oversized metadata
+  falls back to schema identity plus coordinates/counts and explicitly names
+  the full manifest as the authoritative source;
+  analyzer raw output remains valid JSON under its 8 KiB budget rather than
+  being truncated into invalid JSON by the generic tool limit.
+- Nested documentation, parameterized-test, Python provider/package/smoke, and
+  test-catalog structures have typed field whitelists; a schema/version label
+  cannot make malformed nested values executable or crash the renderer.
+- Build domains and edges use their physical-survey schemas directly:
+  `{root, system, languages, produces, requires}` and
+  `{consumer, producer, status, detail}`. Nested domain collections preserve
+  original totals, valid coordinates survive raw/public envelope depth, and
+  version mismatches are retained ahead of compatible links when the public
+  edge list is bounded. Total links and total mismatches are counted
+  separately, so a ninth mismatch cannot disappear and compatible links cannot
+  inflate the blocker count; any omitted links point to the full manifest.
+- `sag/agent/project_fact_projection.py` is the sole model-facing renderer for
+  project-survey success and typed failure. Field/list caps plus a total
+  projection cap prevent repository-controlled README paths, dependencies, or
+  domain lists from growing the model observation without bound.
+- `tool_orchestration` recognizes the schema identity and replaces raw JSON
+  with that engine projection. The analyzer no longer contains
+  `_format_analysis_output`, recommendation/domain/Python renderers, or fact
+  stringification helpers.
+
+**Failure, persistence, and completion evidence.**
+
+- Every public analyzer failure is a typed JSON result. The analyzer supplies
+  only a code and bounded error facts; engine projection supplies explanatory
+  text and any retry suggestion. Thus failure paths cannot bypass the same
+  ownership boundary that governs success.
+- Durable output records carry the invoked action and fact-sheet
+  schema/version. Search exposes only a field- and value-bounded
+  lifecycle/schema whitelist, never the analyzer's arbitrary metadata body.
+  Exact metadata filtering occurs before the result limit, and independently
+  durable emergency records remain searchable after manager restart.
+- A modern branch/storage action record counts only when it is an exact
+  successful `project(action='analyze')` receipt: project facade,
+  `parameters.action == "analyze"` (or the canonical indexed action),
+  completed/success lifecycle, and current fact-sheet schema/version. A
+  mention of analyzer text is not evidence. Pre-Category-4 tool-name/marker
+  recognition remains explicitly confined to legacy branch histories.
+- Analyze-task completion separately requires persisted trunk survey facts.
+  A successful receipt with no trunk, a failed legacy record, or todo
+  expansion is insufficient. Framework-owned survey facts may satisfy the
+  facts-only task when an action receipt did not survive. An unreadable
+  history does not suppress valid trunk/storage evidence; each source fails
+  closed independently, and all-unknown remains a refusal.
+- Branch history stores the fact identity plus a bounded preview/reference,
+  not an unbounded duplicate of the fact sheet. Exceptions while reading
+  history or storage fail closed.
+
+**Behavior fixed while proving the boundary.** Test-framework scanning no
+longer overwrites an already detected build system with `None`; documentation
+commands remain AS DOCUMENTED through the public fact sheet; policy-bearing
+internal manifest data remains available to its mechanical consumers without
+leaking into the public analyzer result. The physical validator now emits only
+typed analysis status codes/facts; `phase_gates` owns their model-facing
+projection. The stale public analyzer usage text that promised an intelligent
+three-step execution plan was replaced with a survey-only contract.
+
+**Verification.** The final Category-4 boundary set passed 388 tests, covering raw
+JSON versus engine observation, success/error schema identity, policy-field
+exclusion, truthful collection totals, compact-fallback visibility, malformed
+nested inputs, output/projection/history bounds, structured action receipts,
+primary/emergency durable-search handoff, strict negative
+lifecycle/version/action cases, legacy compatibility, and a real
+analyzer→project-facade→orchestration→engine→ContextTool chain. The final
+repository suite passed **2,809 tests** with dependency access enabled for the
+isolated wheel-build smoke test (25 warnings, zero failures).
 
 ## Post-panel operational reliability for weaker models
 

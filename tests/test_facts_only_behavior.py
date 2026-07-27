@@ -18,18 +18,28 @@ steer) and the shared mechanical machinery (workdir default, manifest reads)
 are retained — this file asserts they still behave.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
+from test_framework_survey import SurveyOrch
 
+from sag.agent.project_fact_projection import render_project_fact_sheet
+from sag.agent.tool_orchestration import format_tool_result
 from sag.config.prescriptions import (
     PRESCRIPTION_FLAG_NAMES,
     parse_treatment_mask,
     treatment_mask_environment,
 )
+from sag.project_fact_sheet import (
+    project_analysis_error_metadata,
+    project_fact_sheet_metadata,
+    serialize_project_analysis_error,
+    serialize_project_fact_sheet,
+    with_project_fact_sheet_identity,
+)
+from sag.tools.base import ToolResult
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
-
-from test_framework_survey import SurveyOrch
 
 
 def _analysis(tool, path="/workspace/proj"):
@@ -61,22 +71,290 @@ def test_metadata_and_output_have_no_plan():
     assert "EXECUTION PLAN" not in result.output
 
 
-def test_output_renders_facts_success_not_plan_failure():
-    """A successful facts-only survey renders as success — the deleted plan
-    path never injects a 'No execution plan generated' / 'Analysis failed'
-    negative signal."""
+def test_public_fact_sheet_metadata_excludes_tool_policy_fields():
     tool = ProjectAnalyzerTool(SurveyOrch())
     result = tool.execute(action="analyze", project_path="/workspace/proj")
-    assert "No execution plan generated" not in result.output
-    assert "Analysis failed" not in result.output
-    assert "Context update failed" not in result.output
-    assert "Survey complete" in result.output
+
+    python = result.metadata.get("python_config") or {}
+    for policy_field in (
+        "python_version",
+        "python_installer",
+        "python_install_commands",
+        "python_install_source",
+        "python_install_note",
+        "python_venv",
+        "test_hints",
+    ):
+        assert policy_field not in python
+    assert python.get("python_root") is not None
+    assert python.get("python_packages")
+
+
+def test_documented_commands_are_not_rewritten_by_the_analyzer(monkeypatch):
+    from sag.agent import physical_survey
+
+    documented = {
+        "build_commands": [],
+        "test_commands": ["mvn clean install -Dtest -Dossindex.skip"],
+    }
+    monkeypatch.setattr(
+        physical_survey,
+        "analyze_documentation",
+        lambda _orchestrator, _path: documented.copy(),
+    )
+
+    observed = ProjectAnalyzerTool(SurveyOrch())._analyze_documentation("/workspace/proj")
+
+    assert observed["test_commands"] == documented["test_commands"]
+
+
+def test_analyzer_emits_fact_sheet_and_engine_projects_the_model_observation():
+    """The analyzer result is structured facts; only the engine boundary adds
+    the marker and model-facing survey prose."""
+    tool = ProjectAnalyzerTool(SurveyOrch())
+    result = tool.execute(action="analyze", project_path="/workspace/proj")
+
+    raw_fact_sheet = json.loads(result.output)
+    assert raw_fact_sheet["schema"] == "sag.project-facts"
+    assert raw_fact_sheet["version"] == 1
+    assert "PROJECT ANALYSIS COMPLETED" not in result.output
+    assert "Survey complete" not in result.output
+
+    observation = format_tool_result("project", result)
+    assert observation.startswith(
+        "✅ project executed successfully\n\n" "Output: 🔍 PROJECT ANALYSIS COMPLETED\n"
+    )
+    assert "No execution plan generated" not in observation
+    assert "Analysis failed" not in observation
+    assert "Context update failed" not in observation
+    assert "Survey complete" in observation
+
+
+def test_analyzer_failure_is_typed_and_only_engine_projects_explanatory_prose():
+    result = ProjectAnalyzerTool(SurveyOrch()).execute(action="unsupported")
+
+    raw_error = json.loads(result.output)
+    assert raw_error == {
+        "code": "ANALYSIS_INVALID_ACTION",
+        "facts": {"action": "unsupported"},
+        "schema": "sag.project-analysis-error",
+        "version": 1,
+    }
+    assert result.error == "ANALYSIS_INVALID_ACTION"
+    assert result.suggestions == []
+
+    observation = format_tool_result("project", result)
+    assert "The project survey action is invalid." in observation
+    assert "Use project(action='analyze')." in observation
+    assert '"schema":"sag.project-analysis-error"' not in observation
+
+
+def test_typed_analysis_error_json_remains_valid_and_bounded():
+    metadata = project_analysis_error_metadata(
+        "ANALYSIS_EXCEPTION",
+        nested={
+            f"key-{outer}": {f"child-{inner}": "x" * 2_000 for inner in range(32)}
+            for outer in range(32)
+        },
+    )
+
+    encoded = serialize_project_analysis_error(metadata)
+    decoded = json.loads(encoded)
+
+    assert len(encoded) < 8_000
+    assert decoded["schema"] == "sag.project-analysis-error"
+    assert decoded["facts"]["truncated"] is True
+
+
+def test_raw_fact_sheet_stays_valid_and_bounded_for_large_project_facts():
+    fact_sheet = with_project_fact_sheet_identity(
+        {
+            "project_path": "/workspace/" + "p" * 10_000,
+            "project_type": "Python",
+            "build_system": "python",
+            "existing_files": [f"file-{index}-" + "x" * 2_000 for index in range(100)],
+            "documentation": {
+                "build_commands": ["python -m build " + "a" * 10_000],
+            },
+        }
+    )
+
+    encoded = serialize_project_fact_sheet(fact_sheet)
+    decoded = json.loads(encoded)
+
+    assert len(encoded) < 8_000
+    assert decoded["project"]["project_path"].endswith("…")
+    assert len(decoded["files"]) == 8
+    assert decoded["documentation"]["build_commands"][0].endswith("…")
+
+
+def test_bounded_fact_lists_preserve_true_totals_through_engine_projection():
+    analysis = {
+        "project_path": "/workspace/demo",
+        "project_type": "Java",
+        "build_system": "Maven",
+        "existing_files": [f"file-{index}" for index in range(100)],
+        "dependencies": [f"dependency-{index}" for index in range(100)],
+        "build_recommendation": {
+            "build_system": "maven",
+            "build_root": "/workspace/demo",
+            "build_islands": [
+                {"system": "maven", "root": f"/workspace/demo/module-{index}"}
+                for index in range(100)
+            ],
+        },
+        "python_config": {
+            "python_local_providers": [
+                {
+                    "distribution_name": f"provider-{index}",
+                    "root": f"vendor/provider-{index}",
+                }
+                for index in range(100)
+            ],
+        },
+    }
+
+    metadata = project_fact_sheet_metadata(analysis)
+    raw = json.loads(serialize_project_fact_sheet(metadata))
+    projected = render_project_fact_sheet(metadata)
+
+    assert len(metadata["existing_files"]) == 8
+    assert metadata["existing_files_total"] == 100
+    assert raw["fact_totals"]["existing_files"] == 100
+    assert raw["fact_totals"]["build_coordinates.build_islands"] == 100
+    assert "... and 95 more files" in projected
+    assert "Dependencies: 100 found" in projected
+    assert "+92 more in /workspace/.setup_agent/build_requirements.json" in projected
+    assert "+97 more in /workspace/.setup_agent/build_requirements.json" in projected
+
+
+def test_compact_metadata_fallback_is_explicit_in_raw_and_engine_views():
+    huge_atom = "x" * 1_000
+    analysis = {
+        "project_path": "/workspace/demo",
+        "project_type": "Native",
+        "build_system": "cmake",
+        "existing_files": [f"file-{index}" for index in range(100)],
+        "dependencies": [f"dep-{index}" for index in range(100)],
+        "build_recommendation": {
+            "build_system": "cmake",
+            "build_root": "/workspace/demo",
+            "build_domains": [
+                {
+                    "root": f"/workspace/demo/domain-{index}",
+                    "system": "cmake",
+                    "languages": [huge_atom for _ in range(8)],
+                    "produces": [
+                        {
+                            "group": huge_atom,
+                            "name": f"producer-{coordinate}",
+                            "version": huge_atom,
+                        }
+                        for coordinate in range(8)
+                    ],
+                    "requires": [
+                        {
+                            "group": huge_atom,
+                            "name": f"requirement-{coordinate}",
+                            "version": huge_atom,
+                        }
+                        for coordinate in range(8)
+                    ],
+                }
+                for index in range(8)
+            ],
+        },
+    }
+
+    metadata = project_fact_sheet_metadata(analysis)
+    raw = json.loads(serialize_project_fact_sheet(metadata))
+    projected = render_project_fact_sheet(metadata)
+
+    assert metadata["fact_sheet_truncated"] is True
+    assert raw["truncated"] is True
+    assert raw["fact_counts"]["existing_files"] == 100
+    assert raw["authoritative_source"] == "/workspace/.setup_agent/build_requirements.json"
+    assert "Public fact sheet compacted" in projected
+    assert "existing_files=100" in projected
+    assert "/workspace/.setup_agent/build_requirements.json" in projected
+
+
+def test_engine_fact_projection_has_a_hard_total_budget():
+    huge = {
+        "project_path": "/workspace/" + "p" * 50_000,
+        "project_type": "unknown",
+        "build_system": "unknown",
+        "root_listing": "entry\n" * 100_000,
+        "existing_files": ["f" * 10_000 for _ in range(100)],
+        "dependencies": ["d" * 10_000 for _ in range(100)],
+        "documentation": {
+            "build_commands": ["cmd " + "x" * 100_000 for _ in range(100)],
+        },
+        "build_recommendation": {
+            "build_system": "maven",
+            "build_root": "/workspace/" + "r" * 50_000,
+            "build_islands": [
+                {"system": "maven", "root": f"/workspace/island-{index}-" + "i" * 10_000}
+                for index in range(100)
+            ],
+        },
+    }
+
+    projected = render_project_fact_sheet(huge)
+
+    assert len(projected) <= 12_000
+    assert "+92 more" in projected
+
+
+def test_engine_projection_fails_closed_on_malformed_nested_fact_types():
+    malformed = with_project_fact_sheet_identity(
+        {
+            "project_path": "/workspace/demo",
+            "project_type": "Java",
+            "build_system": "Maven",
+            "build_recommendation": {
+                "build_islands": [
+                    {"root": "/workspace/producer", "system": "maven"},
+                    {"root": "/workspace/consumer", "system": "gradle"},
+                ],
+                "domain_edges": [
+                    {
+                        "consumer": "/workspace/consumer",
+                        "producer": "/workspace/producer",
+                        "status": "version_incompatible",
+                        "detail": {"not": "text"},
+                    }
+                ],
+            },
+            "documentation": {"build_commands": 9},
+            "static_test_count": 10,
+            "method_count": "not-a-number",
+            "parameterized_info": "not-a-map",
+        }
+    )
+
+    observation = format_tool_result(
+        "project",
+        ToolResult.completed_success(output="{}", metadata=malformed),
+    )
+    projected = render_project_fact_sheet(malformed)
+
+    assert "PROJECT ANALYSIS COMPLETED" in observation
+    assert "PROJECT ANALYSIS COMPLETED" in projected
+    assert "Coordinate mismatch" not in projected
+
+
+def test_analyzer_usage_is_survey_only():
+    usage = ProjectAnalyzerTool(SurveyOrch()).get_usage_example()
+    assert 'project(action="analyze")' in usage
+    assert "does not generate an execution plan" in usage
+    assert "THREE-STEP" not in usage
+    assert "project_analyzer(action" not in usage
 
 
 def test_split_root_test_hint_is_coordinates_only():
     """A bigtop-shape recommendation renders 'Test coordinates', never
     'Recommended Tests' (dim b)."""
-    tool = ProjectAnalyzerTool(SurveyOrch())
     analysis = {
         "project_type": "Java",
         "build_system": "Maven",
@@ -90,14 +368,13 @@ def test_split_root_test_hint_is_coordinates_only():
             "test_system": "gradle",
         },
     }
-    out = tool._format_analysis_output(analysis)
+    out = render_project_fact_sheet(analysis)
     assert "Recommended Tests" not in out
     assert "Test coordinates: gradle at /workspace/p/tests-live-here" in out
     assert "Recommended Build" not in out
 
 
 def test_python_fact_projection_is_bounded_and_ignores_prescriptive_fields():
-    tool = ProjectAnalyzerTool(SurveyOrch())
     analysis = {
         "project_path": "/workspace/native",
         "project_type": "Python",
@@ -127,7 +404,7 @@ def test_python_fact_projection_is_bounded_and_ignores_prescriptive_fields():
         },
     }
 
-    output = tool._format_analysis_output(analysis)
+    output = render_project_fact_sheet(analysis)
 
     assert "provider-0 at vendor/provider-0" in output
     assert "provider-2 at vendor/provider-2" in output
@@ -149,7 +426,7 @@ def test_recommendation_keeps_coordinates_drops_actions():
     rec = result.metadata.get("build_recommendation") or {}
     assert rec.get("build_root")  # coordinate facts retained (shared machinery)
     assert "goal" not in rec and "rationale" not in rec
-    assert "Recommended Build" not in result.output
+    assert "Recommended Build" not in format_tool_result("project", result)
 
 
 def test_trunk_recommendation_is_stripped():
@@ -278,8 +555,9 @@ def test_loop_redirect_reads_island_goals_from_the_shared_manifest():
     island."""
     import json
 
-    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
     from test_python_phase_guidance import _engine_at, _python_env
+
+    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
     manifest = {
         "build_islands": [
@@ -397,8 +675,8 @@ def test_stage_mask_binding():
 
 
 def test_pin_verification_uses_the_shared_naming_and_catches_drift():
-    from scripts.collect_control_layer_ab import CollectionError, _verify_prescription_pin
     from sag.config.prescriptions import feature_flags_for_mask
+    from scripts.collect_control_layer_ab import CollectionError, _verify_prescription_pin
 
     f_mask = parse_treatment_mask("off")
     good_pin = SimpleNamespace(feature_flags=feature_flags_for_mask(f_mask))

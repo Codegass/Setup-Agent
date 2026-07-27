@@ -20,13 +20,16 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from sag.runtime.container_io import read_container_text
+from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
 from sag.tools.internal.python_env import (
     _REPAIR_ACTION_PHRASE,
     ensure_venv_pip,
     resolve_python_version,
 )
 
-REQUIREMENTS_PATH = "/workspace/.setup_agent/build_requirements.json"
+# Backward-compatible export for existing tool consumers. New engine/shared
+# layers import the dependency-neutral runtime constant instead.
+REQUIREMENTS_PATH = BUILD_REQUIREMENTS_PATH
 
 
 def write_build_requirements(orchestrator, data: Dict[str, Any]) -> bool:
@@ -63,7 +66,7 @@ _TEMURIN_SETUP = (
     "wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public "
     "| gpg --dearmor -o /usr/share/keyrings/adoptium.gpg 2>/dev/null; "
     'echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] '
-    'https://packages.adoptium.net/artifactory/deb '
+    "https://packages.adoptium.net/artifactory/deb "
     '$(. /etc/os-release && echo $VERSION_CODENAME) main" '
     "> /etc/apt/sources.list.d/adoptium.list && apt-get update"
 )
@@ -148,7 +151,9 @@ class JdkPreflight:
                     ),
                 )
             return PreflightOutcome(
-                matched=False, active_version=active, required_version=required,
+                matched=False,
+                active_version=active,
+                required_version=required,
                 provisioned=True,
                 narration=(
                     f"{header}\n→ installed JDK {required}, "
@@ -156,8 +161,11 @@ class JdkPreflight:
                 ),
             )
         return PreflightOutcome(
-            matched=False, active_version=active, required_version=required,
-            provisioned=False, mismatch=True,
+            matched=False,
+            active_version=active,
+            required_version=required,
+            provisioned=False,
+            mismatch=True,
             narration=(
                 f"{header}\n→ could not provision JDK {required} "
                 f"(apt + Temurin exhausted); continuing on Java {active or 'unknown'} — "
@@ -201,7 +209,9 @@ class JdkPreflight:
 # static pom analysis cannot always see — spec §1c).
 _VERSION_ERROR_PATTERNS = [
     # enforcer: "... allowed range [17,)" / "allowed version range [11,17)"
-    re.compile(r"RequireJavaVersion.*?allowed(?:\s+version)?\s+range\s*\[?(\d+)", re.DOTALL | re.IGNORECASE),
+    re.compile(
+        r"RequireJavaVersion.*?allowed(?:\s+version)?\s+range\s*\[?(\d+)", re.DOTALL | re.IGNORECASE
+    ),
     # javac: "invalid target release: 21" / "release version 17 not supported"
     re.compile(r"invalid (?:target|source) release:?\s*(?:1\.)?(\d+)", re.IGNORECASE),
     re.compile(r"release version (\d+) not supported", re.IGNORECASE),
@@ -304,7 +314,9 @@ class PythonPreflight:
             logger.warning(f"Python pre-flight error (continuing): {exc}")
             return PreflightOutcome(True, None, required_version)
 
-    def _run(self, required: Optional[str], constraint: Optional[str], source: str) -> PreflightOutcome:
+    def _run(
+        self, required: Optional[str], constraint: Optional[str], source: str
+    ) -> PreflightOutcome:
         if not required:
             return PreflightOutcome(True, None, None)
         active = active_python_version(self.orchestrator)
@@ -350,12 +362,18 @@ class PythonPreflight:
             if pip_note:
                 narration += f"\n{pip_note}"
             return PreflightOutcome(
-                matched=False, active_version=active, required_version=required,
-                provisioned=True, narration=narration,
+                matched=False,
+                active_version=active,
+                required_version=required,
+                provisioned=True,
+                narration=narration,
             )
         return PreflightOutcome(
-            matched=False, active_version=active, required_version=required,
-            provisioned=False, mismatch=True,
+            matched=False,
+            active_version=active,
+            required_version=required,
+            provisioned=False,
+            mismatch=True,
             narration=(
                 f"{header}\n→ could not provision Python {required} "
                 f"(uv + apt exhausted); continuing on Python {active or 'unknown'} — "
@@ -388,7 +406,7 @@ class PythonPreflight:
             return cached
         probe = self.orchestrator.execute_command(
             "python3 -m ensurepip --version 2>/dev/null "
-            "|| python3 -c \"import importlib.util,sys; "
+            '|| python3 -c "import importlib.util,sys; '
             "sys.exit(0 if importlib.util.find_spec('ensurepip') else 1)\""
         )
         ok = bool(probe.get("success"))
@@ -427,8 +445,7 @@ class PythonPreflight:
             narration += f"\n{pip_note}"
         if not registered:
             narration += (
-                "\n→ overlay registration failed; the repaired interpreter is "
-                "not durably active"
+                "\n→ overlay registration failed; the repaired interpreter is " "not durably active"
             )
             return PreflightOutcome(
                 matched=False,
@@ -439,8 +456,12 @@ class PythonPreflight:
                 narration=narration,
             )
         return PreflightOutcome(
-            matched=True, active_version=active, required_version=required,
-            provisioned=True, mismatch=False, narration=narration,
+            matched=True,
+            active_version=active,
+            required_version=required,
+            provisioned=True,
+            mismatch=False,
+            narration=narration,
         )
 
     def _venv_path(self) -> str:
@@ -466,9 +487,7 @@ class PythonPreflight:
         return bool(probe.get("success"))
 
     def _uv_provision(self, version: str, venv: str) -> bool:
-        install = self.orchestrator.execute_command(
-            f"{_UV_PATH}; uv python install {version}"
-        )
+        install = self.orchestrator.execute_command(f"{_UV_PATH}; uv python install {version}")
         if not install.get("success"):
             return False
         # --seed: a plain `uv venv` ships NO pip inside the venv (bug #12),
