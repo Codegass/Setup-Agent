@@ -316,17 +316,26 @@ _DOMAIN_STATES = frozenset({"success", "failed", "blocked", "untried"})
 
 
 def _sealed_domain_states(state: RunEvidenceState) -> dict[str, dict[str, str]] | None:
-    """Per-domain build states exactly as the gate validated them (Task C2).
+    """Per-domain build states, newest gate evaluation first (Task C2).
 
-    The BUILD fact is authoritative; a run that only reached the test gate
-    still seals what its rollup carried. Unrecognized state values are dropped
-    rather than sealed — the rollup contract is schema v1's four states, and an
+    Live p5v-bigtop-r2: the model ran the gradle domains only in the TEST
+    phase, so the build gate's snapshot froze them 'untried' while completed
+    receipts sat on disk. The test gate re-reads receipts LATER, so its copy
+    supersedes the build fact per root; roots only the build gate saw keep
+    their build state. Unrecognized state values are dropped rather than
+    sealed — the rollup contract is schema v1's four states, and an
     unparseable domain fact is an absent fact, never an invented one.
     """
-    value = state.fact_value("build.domain_states")
-    if not isinstance(value, Mapping):
-        rollup = state.fact_value("test.stats")
-        value = rollup.get("domain_states") if isinstance(rollup, Mapping) else None
+    build_value = state.fact_value("build.domain_states")
+    rollup = state.fact_value("test.stats")
+    test_value = rollup.get("domain_states") if isinstance(rollup, Mapping) else None
+    value: Mapping[str, Any] | None
+    if isinstance(build_value, Mapping) and isinstance(test_value, Mapping):
+        value = {**build_value, **test_value}
+    elif isinstance(build_value, Mapping):
+        value = build_value
+    else:
+        value = test_value if isinstance(test_value, Mapping) else None
     if not isinstance(value, Mapping):
         return None
     sealed: dict[str, dict[str, str]] = {}

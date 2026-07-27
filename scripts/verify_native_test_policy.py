@@ -247,11 +247,24 @@ class Verifier:
         # name-only "unverified" edges rather than inventing blockers.
         domain_states = (verdict.get("build_evidence") or {}).get("domain_states") or {}
         states = {r: (s or {}).get("state") for r, s in domain_states.items()}
-        not_success = [r for r, s in states.items() if s in ("failed", "blocked")]
+        # untried is an honest terminal state here: with unverified edges
+        # named pre-attempt, not attempting a doomed consumer is legitimate —
+        # the truth table already forbids global success while it lasts.
+        stale_consumers = [
+            r
+            for r in states
+            if r.endswith("bigpetstore-spark") or r.endswith("bigpetstore-transaction-queue")
+        ]
         self.check(
             "bigtop.domains.stale_consumers_not_green",
-            len(not_success) >= 2,
+            len(stale_consumers) == 2
+            and all(states[r] in ("failed", "blocked", "untried") for r in stale_consumers),
             f"domain_states={states}",
+        )
+        self.check(
+            "bigtop.verdict.partial",
+            verdict.get("verdict") == "partial",
+            f"verdict={verdict.get('verdict')!r}",
         )
         requirements_path = os.path.join(self.session, ".setup_agent", "build_requirements.json")
         edges = []

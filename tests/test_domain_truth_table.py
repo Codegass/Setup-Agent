@@ -456,3 +456,39 @@ def test_sealed_domain_states_round_trip_through_the_snapshot_json():
     )
     restored = RunVerdictSnapshot.model_validate_json(snapshot.model_dump_json())
     assert restored.build_evidence.domain_states == BIGTOP_DOMAIN_STATES
+
+
+def test_test_gate_domain_states_supersede_the_build_snapshot_per_root():
+    """Live p5v-bigtop-r2: the gradle domains ran only in the TEST phase, so
+    the build gate froze them 'untried' while completed receipts sat on disk;
+    the test gate re-read receipts later and knew better. Newest wins per
+    root; roots only the build gate saw keep their build state."""
+    from sag.agent.evidence_state import RunEvidenceState, StateScope
+    from sag.agent.verdict_finalizer import _sealed_domain_states
+
+    state = RunEvidenceState(run_id="sealed-domain-order")
+    state.register_fact(
+        StateScope.ARTIFACTS,
+        "build.domain_states",
+        {
+            "/w/data-generators": {"state": "untried"},
+            "/w/test-framework": {"state": "success"},
+        },
+        "gate://build",
+    )
+    state.register_fact(
+        StateScope.TEST_RUNTIME,
+        "test.stats",
+        {
+            "executed": 50,
+            "domain_states": {"/w/data-generators": {"state": "success"}},
+        },
+        "gate://test",
+    )
+
+    sealed = _sealed_domain_states(state)
+
+    assert sealed == {
+        "/w/data-generators": {"state": "success"},
+        "/w/test-framework": {"state": "success"},
+    }
