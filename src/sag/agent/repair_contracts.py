@@ -123,7 +123,10 @@ FAILURE_CLASS_PREFIXES = (
 # CMake, and the install/build sections of documentation.
 CAPABILITY_ENTRY_KINDS = ("yaml", "cmake")
 # Where a dependency is pinned: python metadata, requirements files, Docker.
-DEPENDENCY_ENTRY_KINDS = ("toml", "python", "requirements", "dockerfile")
+# Live p6v-tvm-r4: the project's own NumPy pin lives in a docker INSTALL
+# SCRIPT (`docker/install/*.sh`) — shell entries are where Docker-era pins
+# live, exactly the "Docker/installation scripts" family §C1 discovers.
+DEPENDENCY_ENTRY_KINDS = ("toml", "python", "requirements", "dockerfile", "shell")
 # Everything else is a question about THIS domain, answered by its own docs.
 DOC_ENTRY_KINDS = ("markdown",)
 # Section titles that mark documentation as being about building/installing.

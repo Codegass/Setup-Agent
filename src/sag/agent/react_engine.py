@@ -37,6 +37,7 @@ from .attempt_policy import (
     test_execution_binding,
     test_execution_matches_candidate,
 )
+from .claim_records import CLAIM_DIR
 from .claim_graph import commit_assessment_transitions
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
@@ -4129,6 +4130,11 @@ class ReActEngine(UIEventEmitter):
                     requirements=requirements,
                     contract=contract,
                     fetch_text=lambda entry: read_entry_text(execute, entry),
+                    # Live p6v-tvm-r4: the survey had ALREADY minted the numpy
+                    # pin claim at analyze time; re-reading only the retrieval's
+                    # own extraction left the builder blind to it. The builder
+                    # sees the persisted claims too — same store, one truth.
+                    persisted_claims=read_records(orchestrator, CLAIM_DIR),
                 )
         except Exception as exc:  # retrieval never breaks an observation
             logger.debug(f"no repair was created for receipt {receipt_id}: {exc}")
@@ -4142,6 +4148,7 @@ class ReActEngine(UIEventEmitter):
         requirements: Dict[str, Any],
         contract: Dict[str, Any],
         fetch_text,
+        persisted_claims: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Retrieve, propose and persist ONE repair for one assessment.
 
@@ -4181,9 +4188,20 @@ class ReActEngine(UIEventEmitter):
             domain_roots=roots,
             execute=execute,
         )
+        merged_claims: List[Dict[str, Any]] = []
+        seen_claim_ids: set = set()
+        for claim in list(retrieved["claims"]) + list(persisted_claims or []):
+            record = claim if isinstance(claim, dict) else getattr(claim, "__dict__", {})
+            identifier = str(
+                (record.get("claim_id") if isinstance(record, dict) else "") or id(claim)
+            )
+            if identifier in seen_claim_ids:
+                continue
+            seen_claim_ids.add(identifier)
+            merged_claims.append(claim)
         repair = build_repair(
             trigger,
-            retrieved["claims"],
+            merged_claims,
             domain_id=domain_id or None,
             domain_root=domain_root
             or str(contract.get("expected_cwd") or requirements.get("build_root") or "")

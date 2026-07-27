@@ -839,3 +839,60 @@ def test_a_non_build_observation_reads_no_evidence_at_all(forced_engine):  # noq
     engine._append_native_observation("call-1", "analyzed", source_tool="project")
 
     assert container.commands == []
+
+
+def test_a_persisted_analyze_time_pin_reaches_the_repair_builder():
+    """Live p6v-tvm-r4: the survey minted the numpy pin claim at analyze
+    time, the dependency failure was typed, and no repair appeared — the
+    builder only saw the retrieval's own extraction. Persisted claims and
+    retrieved claims are one store."""
+    import json as _json
+
+    from sag.agent.react_engine import ReActEngine
+
+    pin_claim = {
+        "claim_id": "dependency-bf50d1004469",
+        "kind": "dependency",
+        "source_class": "config",
+        "typed_value": {
+            "ecosystem": "pip",
+            "package": "numpy",
+            "specifier": "==",
+            "version": "1.26.*",
+        },
+        "applicability": {},
+        "source_ref": {"entry_id": "doc-x", "source_hash": "ab" * 32, "source_range": "L29"},
+    }
+    trigger = {
+        "assessment_id": "asm-x-dependency_incompatible_numpy-0daebc4b",
+        "receipt_id": "inv-python-2-0003",
+        "typed_code": "dependency_incompatible_numpy",
+        "detail": "ValueError: Could not convert T.float32 to a NumPy dtype",
+    }
+    contract = {"contract_id": "ic-x", "expected_cwd": "/workspace/tvm", "domain_id": ""}
+    written = {}
+
+    def execute(command, **_kwargs):
+        if "repair_contracts" in command and "mv -f" in command:
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            written[_json.loads(body)["repair_id"]] = _json.loads(body)
+            return {"success": True, "exit_code": 0, "output": ""}
+        return {"success": True, "exit_code": 0, "output": ""}
+
+    ReActEngine._create_repair_for(
+        execute,
+        trigger,
+        document_map={"entries": []},
+        requirements={"build_root": "/workspace/tvm"},
+        contract=contract,
+        fetch_text=lambda entry: "",
+        persisted_claims=[pin_claim],
+    )
+
+    assert len(written) == 1
+    repair = next(iter(written.values()))
+    call = repair["proposed_public_call"]
+    assert call["tool"] == "build"
+    assert call["params"]["action"] == "deps"
+    assert "numpy==1.26.*" in _json.dumps(call["params"])
+    assert "dependency-bf50d1004469" in repair["supporting_claim_ids"]
