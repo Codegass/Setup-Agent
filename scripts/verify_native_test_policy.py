@@ -14,11 +14,22 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
 
 SMOKE_PATH = "tests/python/all-platform-minimal-test"
+
+# Invocation receipts (Plan 5 Stage B, schema v1/v2). Both versions are read:
+# v2 only ADDS keys and keeps every v1 key byte-stable, so no assertion here
+# may reject a receipt for carrying the newer version.
+RECEIPT_DIRNAME = os.path.join(".setup_agent", "invocation_receipts")
+RECEIPT_SCHEMA_VERSIONS = (1, 2)
+
+# Where a session's own events may record a receipt's content hash. Plan 5
+# sessions record none, so the immutability assertion falls back to integrity.
+RECEIPT_HASH_KEYS = ("receipt_sha256", "receipt_content_hash", "receipt_hash")
 
 
 def _events(session: str):
@@ -59,6 +70,32 @@ def _junit_passed(meta: dict):
         return None
     tests, failed, errors, skipped = counts
     return tests - failed - errors - skipped
+
+
+def _receipt_files(session: str):
+    """Every archived invocation-receipt file, sorted. Empty when none exist."""
+    return sorted(glob.glob(os.path.join(session, RECEIPT_DIRNAME, "*.json")))
+
+
+def _recorded_receipt_hashes(session: str) -> dict:
+    """receipt_id -> the LAST content hash the session's own events recorded.
+
+    Plan 5 receipts carry no hash in their ToolResult metadata, so this is
+    normally empty; when a later stage records one, the last value wins because
+    that is the state the run itself last vouched for.
+    """
+    hashes: dict[str, str] = {}
+    for payload in _tool_results(session):
+        meta = (payload.get("result") or {}).get("metadata") or {}
+        receipt_id = str(meta.get("receipt_id") or "").strip()
+        if not receipt_id:
+            continue
+        for key in RECEIPT_HASH_KEYS:
+            digest = str(meta.get(key) or "").strip().lower()
+            if digest:
+                hashes[receipt_id] = digest
+                break
+    return hashes
 
 
 def _all_skipped(meta: dict) -> bool:
@@ -117,6 +154,60 @@ class Verifier:
         self.check("no.scheduler.events",
                    all(e.get("kind") not in ("scheduler_decision", "planner_response")
                        for e in _events(self.session)))
+
+    def assert_receipts_immutable(self) -> None:
+        """A finalized receipt is never rewritten (Plan 6 Stage 0, spec §C4).
+
+        Two branches, one assertion:
+
+        * the session's events recorded a content hash for a receipt — the file
+          on disk must still hash to it, so the ``mark_semantic_failure``-style
+          rewrite this stage deletes grades as a FAILURE;
+        * no hash was recorded (every Plan 5 session) — the file must still be
+          non-empty, parseable JSON of a schema version we read, which is the
+          integrity half of immutability: a truncated or half-written receipt is
+          exactly the state an interrupted rewrite leaves behind.
+
+        A session with no receipt files asserts nothing (absent facts stay
+        absent), so receipt-free recorded sessions keep their assertion set.
+        """
+        files = _receipt_files(self.session)
+        if not files:
+            return
+        recorded = _recorded_receipt_hashes(self.session)
+        problems: list[str] = []
+        for path in files:
+            receipt_id = os.path.basename(path)[: -len(".json")]
+            try:
+                with open(path, "rb") as handle:
+                    body = handle.read()
+            except OSError as exc:
+                problems.append(f"{path}: unreadable ({exc})")
+                continue
+            expected = recorded.get(receipt_id)
+            if expected:
+                digest = hashlib.sha256(body).hexdigest()
+                if digest != expected:
+                    problems.append(
+                        f"{path}: content sha256 {digest} does not match the last hash "
+                        f"the session recorded for it ({expected}) — the receipt was rewritten"
+                    )
+                continue
+            if not body.strip():
+                problems.append(f"{path}: receipt file is empty")
+                continue
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError) as exc:
+                problems.append(f"{path}: truncated or unparseable JSON ({exc})")
+                continue
+            if not isinstance(payload, dict):
+                problems.append(f"{path}: receipt is not a JSON object")
+            elif payload.get("schema_version", 1) not in RECEIPT_SCHEMA_VERSIONS:
+                problems.append(
+                    f"{path}: unsupported schema_version {payload.get('schema_version')!r}"
+                )
+        self.check("receipts.immutable", not problems, "; ".join(problems[:5]))
 
     def _verdict(self) -> dict:
         with open(os.path.join(self.session, ".setup_agent", "verdict.json")) as handle:
@@ -300,6 +391,7 @@ def main() -> int:
 
     verifier = Verifier(options.session)
     verifier.assert_pairing_and_hashes()
+    verifier.assert_receipts_immutable()
     getattr(verifier, f"assert_{options.profile}")()
 
     print(f"== {options.profile} :: {options.session}")

@@ -195,11 +195,13 @@ def _dist_record_matches(record_dir: str, project_name: str) -> bool:
     return normalized[len(wanted) + 1 : len(wanted) + 2].isdigit()
 
 
-# Invocation receipts (Plan 5 Stage B, schema v1). One JSON file per runner
+# Invocation receipts (Plan 5 Stage B, schema v1/v2). One JSON file per runner
 # invocation; the directory name is the cross-lane storage contract and must
 # not move. Joined onto the workspace root so production reads
 # /workspace/.setup_agent/invocation_receipts while a test can stand a whole
-# workspace up in a temp dir.
+# workspace up in a temp dir. Plan 6 Stage 0's append-only evidence assessments
+# live in the documented SIBLING directory (.setup_agent/evidence_assessments),
+# which the in-container parser derives from this one.
 INVOCATION_RECEIPTS_DIRNAME = ".setup_agent/invocation_receipts"
 
 
@@ -403,10 +405,18 @@ def content_sha256(path):
 
 
 def receipt_schema_error(payload):
-    """Schema-v1 conformance. A receipt we cannot read is never "no evidence"."""
+    """Receipt conformance. A receipt we cannot read is never "no evidence".
+
+    Version-gated (Plan 6 Stage 0, spec §C4): v1 and v2 are both read, because
+    v2 only ADDS keys and keeps every v1 key's name and shape. An absent
+    ``schema_version`` is v1. An unknown FUTURE version is CORRUPT here rather
+    than merely skipped: this reader decides the provenance of the primary test
+    count, where Plan 5's law is that unattributable evidence closes nothing.
+    """
     if not isinstance(payload, dict):
         return "receipt is not a JSON object"
-    if payload.get("schema_version") != 1:
+    version = payload.get("schema_version", 1)
+    if isinstance(version, bool) or version not in (1, 2):
         return "unsupported schema_version " + repr(payload.get("schema_version"))
     for key in ("receipt_id", "working_directory"):
         value = payload.get(key)
@@ -435,6 +445,56 @@ def receipt_schema_error(payload):
     return None
 
 
+def assessment_schema_error(payload):
+    """ReceiptAssessment conformance (Plan 6 Stage 0, spec §C4).
+
+    The append-only typed interpretation of one receipt:
+    ``{assessment_id, receipt_id, typed_code, detail}``. A record we cannot
+    read is a hole in the evidence chain exactly like an unreadable receipt —
+    it may be the very verdict that condemns an exit-0 invocation.
+    """
+    if not isinstance(payload, dict):
+        return "assessment is not a JSON object"
+    version = payload.get("schema_version", 1)
+    if isinstance(version, bool) or version not in (1, 2):
+        return "unsupported schema_version " + repr(payload.get("schema_version"))
+    for key in ("assessment_id", "receipt_id", "typed_code"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return "missing " + key
+    return None
+
+
+def read_evidence_assessments():
+    """Corrupt-assessment messages for the evidence-assessment directory.
+
+    The directory is the documented sibling of the receipt directory, so no new
+    prepended coordinate is needed. Only ``*.json`` is read: an atomic writer's
+    ``<id>.json.tmp`` temp file is a partially written record, which is ABSENT
+    rather than corrupt.
+    """
+    assessments_root = Path(receipts_dir).parent / "evidence_assessments"
+    if not assessments_root.is_dir():
+        return []
+    try:
+        assessment_files = sorted(
+            str(path) for path in assessments_root.iterdir() if path.name.endswith(".json")
+        )
+    except Exception as exc:
+        return [str(assessments_root) + ": assessment directory unreadable (" + str(exc) + ")"]
+    corrupt = []
+    for assessment_file in assessment_files:
+        try:
+            payload = json.loads(Path(assessment_file).read_text())
+        except Exception as exc:
+            corrupt.append(assessment_file + ": assessment unreadable (" + str(exc) + ")")
+            continue
+        reason = assessment_schema_error(payload)
+        if reason:
+            corrupt.append(assessment_file + ": " + reason)
+    return corrupt
+
+
 def read_invocation_receipts():
     """Return (scoped, claims, corrupt) for the invocation-receipt directory.
 
@@ -442,6 +502,10 @@ def read_invocation_receipts():
     coordinate's receipts recorded for it, so a retry that overwrites the same
     path in place verifies through its newest receipt instead of colliding
     with the superseded one.
+
+    ``corrupt`` also carries unreadable evidence assessments (Plan 6 Stage 0):
+    persistence failure of a receipt OR an assessment is one evidence-closure
+    failure with one mechanism and one message naming the file.
     """
     receipts_root = Path(receipts_dir)
     if not primary_root or not receipts_root.is_dir():
@@ -455,7 +519,7 @@ def read_invocation_receipts():
     if not receipt_files:
         return False, {}, []
     claims = {}
-    corrupt = []
+    corrupt = read_evidence_assessments()
     primary_prefix = primary_root.rstrip("/")
     for receipt_file in receipt_files:
         try:
