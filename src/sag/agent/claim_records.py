@@ -123,6 +123,24 @@ LIFECYCLE_RUNNERS = {
 }
 
 MARKDOWN_KINDS = ("markdown", "md", "rst", "text")
+# Every document-map kind some extractor below can read. It is stated here, in
+# the module that owns the extractors, because the survey has to decide whether
+# fetching an entry's text can produce anything at all — a `pyproject.toml` is
+# worth INDEXING and is worth no second read, and a caller that re-derived this
+# list would eventually disagree with the extractors it is describing.
+EXTRACTOR_ENTRY_KINDS = MARKDOWN_KINDS + (
+    "yaml",
+    "yml",
+    "dockerfile",
+    "docker",
+    "shell",
+    "sh",
+    "bash",
+    "cmake",
+    "xml",
+    "pom",
+    "requirements",
+)
 SHELL_FENCE_LANGUAGES = (
     "",
     "sh",
@@ -1190,6 +1208,22 @@ def extract_env_definitions(
                     )
                 )
     return _mint(entry, drafts)
+
+
+def entry_has_extractors(entry: Mapping[str, Any]) -> bool:
+    """Whether any extractor here can read this document map entry.
+
+    The kind decides, with the three name-carried exceptions the extractors
+    themselves already honour (a requirements file, a Dockerfile and a
+    CMakeLists are recognised by what they ARE, not by how they are stored).
+    A False answer means fetching this entry's text would buy nothing.
+    """
+    return (
+        _entry_kind(entry) in EXTRACTOR_ENTRY_KINDS
+        or _is_requirements(entry)
+        or _is_dockerfile(entry)
+        or _is_cmake(entry)
+    )
 
 
 def extract_policy_claims(

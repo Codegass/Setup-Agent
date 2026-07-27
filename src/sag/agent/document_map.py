@@ -417,6 +417,28 @@ def _read_head(
     return str(result.get("output") or "")
 
 
+def read_entry_text(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    entry: Any,
+) -> Optional[str]:
+    """The indexed text of one map entry, under the SAME budget discovery used.
+
+    The map deliberately carries handles rather than text, so every consumer
+    that needs the bytes back — claim extraction, targeted retrieval — fetches
+    them again. This is the one fetch they share, so the `MAX_FILE_BYTES` bound
+    is stated once: a consumer with its own `cat` would read past the bytes the
+    entry was hashed and indexed over, and then be talking about a different
+    document than the one the handle names.
+
+    None when the entry names no path or the read failed; an unreadable
+    document states nothing, and nothing is guessed on its behalf.
+    """
+    path = _field(entry, "path")
+    if not path:
+        return None
+    return _read_head(execute, path)
+
+
 def _probe_target_sha(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     root: str,

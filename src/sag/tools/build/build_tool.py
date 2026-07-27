@@ -398,6 +398,16 @@ class BuildTool(BaseTool):
             expected_argv=expected_argv,
             intent_source=scope.intent_source,
             requirements=requirements,
+            # Plan 6 Stage F1: the document-map pin the assessor compares
+            # against (`_current_fingerprints` already reads the same stamp).
+            # It comes from the survey manifest this call ALREADY holds, so the
+            # pin costs no probe; absent from the stamp means absent from the
+            # contract, which is what a session with no map states.
+            document_map_fingerprint=(
+                (requirements.get("survey") or {}).get("document_map_fingerprint")
+                if isinstance(requirements, Mapping)
+                else None
+            ),
             # Spec §C8: "the contract stores claim IDs". The ids come from the
             # gate's lookup of stored evidence, never from a call parameter,
             # so a frozen native contract carries the provenance that
