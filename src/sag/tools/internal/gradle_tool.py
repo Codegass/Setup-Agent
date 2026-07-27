@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.agent.evidence_assessments import ReceiptAssessment, write_assessment
 from sag.agent.invocation_receipts import (
-    mark_semantic_failure,
     record_invocation,
     snapshot_reports,
 )
@@ -140,6 +140,11 @@ class GradleTool(BaseTool):
         # layer probes the container — and reruns — per build.
         preamble_lines: List[str] = []
         outcome = None
+        # The manifest the pre-flight already read, kept for the invocation
+        # receipt's survey pins and domain. Empty on the facade path, which
+        # deliberately reads the manifest ONE layer up: the receipt records the
+        # pins it can see and omits the ones it cannot.
+        requirements: Dict[str, Any] = {}
         if _env_preflight:
             requirements = read_build_requirements(self.orchestrator)
             outcome = JdkPreflight(self.orchestrator).run(
@@ -303,6 +308,7 @@ class GradleTool(BaseTool):
                     attempt=attempt,
                     result=dispatched,
                     before=before,
+                    requirements=requirements,
                 )
                 return dispatched
 
@@ -443,13 +449,14 @@ class GradleTool(BaseTool):
             evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
             if result["exit_code"] == 0 and compile_mismatch:
                 # Gradle's own exit code says SUCCESS; the task outcomes say the
-                # compile never touched the sources. The narrower fact wins —
-                # and the invocation receipt must carry the same verdict, or
-                # the domain gate would score this domain green from exit 0.
-                mark_semantic_failure(
-                    self.orchestrator.execute_command,
-                    self._pending_invocation_receipt,
-                    compile_mismatch,
+                # compile never touched the sources. The narrower fact wins, and
+                # the evidence must say so or the domain gate would score this
+                # domain green from exit 0. Plan 6 Stage 0: that verdict is an
+                # append-only assessment NEXT TO the receipt — the receipt is
+                # finalized once and states only what gradle physically did.
+                self._record_receipt_assessment(
+                    typed_code="compile_no_source_mismatch",
+                    detail=compile_mismatch,
                 )
                 return self._finalize_main_result(
                     ToolResult.completed_failure(
@@ -552,6 +559,7 @@ class GradleTool(BaseTool):
         attempt: int,
         result: Dict[str, Any],
         before: Dict[str, str],
+        requirements: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist the P0-A invocation receipt for one physical dispatch.
 
@@ -577,6 +585,24 @@ class GradleTool(BaseTool):
             exit_code=result.get("exit_code"),
             before=before,
             after=after,
+            output=result.get("full_output") or result.get("output"),
+            requirements=requirements,
+        )
+
+    def _record_receipt_assessment(self, *, typed_code: str, detail: str) -> bool:
+        """Append this classifier's verdict next to THIS invocation's receipt.
+
+        Spec §C4: the receipt is finalized once. A run whose receipt never
+        landed has nothing to assess — the missing receipt is already reported
+        as `receipt_persisted: false`.
+        """
+        pending = getattr(self, "_pending_invocation_receipt", None) or {}
+        receipt_id = str(pending.get("receipt_id") or "").strip()
+        if not receipt_id:
+            return False
+        return write_assessment(
+            self.orchestrator.execute_command,
+            ReceiptAssessment(receipt_id=receipt_id, typed_code=typed_code, detail=detail),
         )
 
     def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:
