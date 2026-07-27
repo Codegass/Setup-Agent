@@ -759,6 +759,11 @@ class ControlReplayRunner:
                         state,
                         EvidenceCloseReason(payload["reason"]),
                     )
+                elif event.kind == "claim_transition":
+                    # Plan 6 Stage C: claim-graph transitions are replayed by
+                    # claim_graph.load(), not by this walker — pass through so
+                    # a transcript that carries them still verifies end-to-end.
+                    pass
                 else:  # pragma: no cover - ControlEvent validation owns this
                     raise ReplayValidationError(f"unsupported event kind: {event.kind}")
             except ReplayValidationError:

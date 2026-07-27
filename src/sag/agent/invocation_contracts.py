@@ -63,7 +63,7 @@ CONTRACT_HEREDOC = "SAGCONTRACT"
 # The typed refusal a facade returns when the contract did not reach disk.
 CONTRACT_PERSIST_FAILED = "CONTRACT_PERSIST_FAILED"
 # Who authored the intent. `accepted_repair` arrives with Stage C.
-INTENT_SOURCES = ("model", "controller")
+INTENT_SOURCES = ("model", "controller", "accepted_repair")
 DEFAULT_INTENT_SOURCE = "model"
 # What a dispatch records when no engine envelope was emitted for it (no
 # control-event sink configured). A stated absence, never a borrowed identity,
@@ -320,6 +320,11 @@ def freeze_contract(
         # and an uncommittable call is not dispatched (fail closed).
         logger.warning(f"invocation contract for {envelope_id} could not be frozen: {exc}")
         return None
+    # Stage C3: an intent that matches a live repair proposal is stamped
+    # accepted_repair (repair_id + source, hash recomputed) BEFORE persistence.
+    from sag.agent.repair_contracts import stamp_repair
+
+    contract = stamp_repair(contract)
     if not write_contract(execute, contract):
         logger.warning(
             f"invocation contract {contract['contract_id']} did not reach disk; "
