@@ -211,11 +211,86 @@ dispatch; hash mismatch detected by verifier).
 
 ## Stage C — Causal loop (ClaimGraph + assessments + retrieval + repair)
 
-Spec §C5/C6. Claim transitions with AND/OR support sets, cycle rejection,
-event groups per note (a); mismatch taxonomy (unknown/blocked/stale vs
-contradicted via direct falsifiers only); typed targeted retrieval over the
-Stage A map; `RepairContract` → accepted/modified `ActionIntent` →
-Stage B freeze path.
+Spec §C5/C6 + binding note (a). Bound on `8eaa414`. Three lanes.
+
+**Shared contracts (EXACT).**
+- Claim transitions are control events, kind `claim_transition`, grouped:
+  every event in a group carries `group_id`
+  (`"grp-"+sha256(trigger id)[:12]`); the group ends with kind
+  `claim_transition` payload `{group_id, terminal: true}` (the
+  group-commit record). Replay treats an uncommitted group as absent.
+- Current graph state materializes at
+  `/workspace/.setup_agent/claim_graph.json` (atomic rewrite, rebuildable
+  from events; the events are the truth).
+- `ReceiptAssessment.typed_code` vocabulary for the assessor (extensible
+  set, these are the Stage C base): `expectation_met`,
+  `no_dispatch`, `transient_network`, `timeout`, `permission_denied`,
+  `precondition_unmet`, `stale_fingerprint`, `deviated_receipt`,
+  `falsifier_<predicate_id>` (contradiction), `capability_absent_<name>`.
+- `RepairContract` persisted at
+  `/workspace/.setup_agent/repair_contracts/<repair_id>.json`
+  (`repair_id = "rep-"+sha256(trigger_assessment_id)[:12]`), fields per
+  spec §C6 verbatim; `proposed_public_call = {tool, params}` only.
+
+**Task C1 (lane c1): ClaimGraph.** NEW `src/sag/agent/claim_graph.py`
+(+ tests); register `claim_transition` in `control_events.py` (kinds +
+payload model `{claim_id, from_status, to_status, cause_assessment_id?,
+group_id, terminal?}`; hash-stable absent-key pattern as before).
+Graph API: `load(events, claim_files)`, `transition(claim_id, to,
+cause)`, support edges with `{"all_of": [...]}` / `{"any_of": [...]}`,
+cycle rejection at edge insert, `invalidate_dependents(claim_id)` —
+downstream flips to `unknown` ONLY when its complete support is lost
+(alternate any_of path keeps it alive), epoch checks (a transition citing
+a stale fact_epoch is refused). Deterministic replay test: same events ⇒
+same graph; uncommitted group ⇒ ignored.
+
+**Task C2 (lane c2): assessor.** Files:
+`src/sag/agent/evidence_assessments.py` (assessor function),
+`src/sag/agent/invocation_contracts.py` + `src/sag/tools/build/build_tool.py`
+(freeze gains `expected_observations` + `direct_falsifiers`), tests.
+- Freeze additions (minimal typed set): for build/compile/package/install
+  contracts `expected_observations=["artifact_or_report_delta"]`; for
+  test contracts `expected_observations=["report_delta"]`;
+  `direct_falsifiers=[{"predicate_id": "empty_delta_despite_success",
+  "kind": "delta_empty_on_exit0"}]`.
+- `assess_receipt(contract, receipt, *, current_fingerprints) ->
+  ReceiptAssessment`: taxonomy per spec §C5 — no dispatch/timeout/
+  permission ⇒ blocked-class codes; fingerprint mismatch ⇒
+  `stale_fingerprint`; `compliance=="deviated"` ⇒ `deviated_receipt`
+  (never a contradiction); exact/equivalent + fresh + falsifier predicate
+  true ⇒ `falsifier_<id>`; success path ⇒ `expectation_met`. Capability:
+  a per-testcase skip whose reason matches a named capability pattern
+  already carried by the smoke claim ⇒ `capability_absent_<name>`
+  (llvm/cuda from the existing skip-reason facts — pattern data, not
+  project names).
+- Wire: after each receipt lands in build_tool's dispatch path, run the
+  assessor and persist the assessment (idempotent).
+
+**Task C3 (lane c3): retrieval + RepairContract.** NEW
+`src/sag/agent/repair_contracts.py`, `src/sag/agent/react_engine.py`
+(surfacing + acceptance detection), tests.
+- Retriever: `retrieve_for(typed_code, *, document_map, domain_id,
+  applicability) -> list[entry sections]` — bounded (≤5 entries), selects
+  by kind/ecosystem tags (e.g. `capability_absent_*` ⇒ CI workflows +
+  CMake + install docs; dependency codes ⇒ metadata/Docker), runs the
+  Stage A extractors on the indexed sections only, records new claims +
+  conflicts, returns `unknown` (empty) when nothing applicable.
+- RepairContract builder: from a failure/capability assessment + newly
+  retrieved claims, propose ONE public call (e.g. the documented
+  lifecycle argv for the domain, or `build(action='deps'/'test')
+  variants); `supporting_claim_ids` mandatory — no claims, no proposal
+  (emit `unknown` instead, spec hard rule).
+- Engine surfacing: when a repair proposal exists for the latest
+  assessment, append a bounded evidence-triggered block to the next
+  observation: `[repair] <typed code>: proposed <tool>(<params>) —
+  provenance <claim ids>; accept by calling it, or state why not.` (This
+  is reactive, Category-3 compatible.)
+- Acceptance detection: next model call with tool+params equal to a live
+  proposal ⇒ action context `intent_source="accepted_repair"` +
+  `repair_id` recorded on the contract (extend the b1 thread-through).
+Stage exit: full suite; Plan 5 profiles unchanged; negative controls
+(no claims ⇒ no proposal; deviated receipt cannot contradict; uncommitted
+group invisible; cycle rejected).
 
 ## Stage D — Retry authority
 
