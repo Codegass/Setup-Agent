@@ -194,6 +194,9 @@ def test_receipt_v2_carries_every_new_key_when_the_fact_is_known():
         toolchain_fingerprint={"executable": "/usr/bin/mvn", "version": "Apache Maven 3.9.6"},
         output_content_hash=HASH_B,
         testcase_outcomes={"nodes": [{"node_id": "A#b", "status": "passed"}]},
+        contract_id="ic-000000000abc",
+        contract_hash="e" * 64,
+        compliance="exact",
     )
 
     assert receipt["target_sha"] == SHA
@@ -201,6 +204,8 @@ def test_receipt_v2_carries_every_new_key_when_the_fact_is_known():
     assert receipt["config_fingerprint"] == "config-1"
     assert receipt["domain_id"] == "/workspace/proj/core"
     assert receipt["actual_cwd"] == "/workspace/proj/core"
+    assert receipt["contract_id"] == "ic-000000000abc"
+    assert receipt["contract_hash"] == "e" * 64
     assert receipt["compliance"] == "exact"
     assert receipt["toolchain_fingerprint"] == {
         "executable": "/usr/bin/mvn",
@@ -217,15 +222,18 @@ def test_receipt_v2_omits_every_fact_it_does_not_know():
     assert set(receipt) == {
         "schema_version",
         *V1_KEYS,
-        # The two facts a dispatch always knows: where it ran and (until
-        # Stage B freezes contracts) that it ran exactly what was materialized.
+        # The one fact a dispatch always knows: where it ran.
         "actual_cwd",
-        "compliance",
     }
 
 
-def test_receipt_v2_compliance_is_the_frozen_stage_0_constant():
-    assert build_receipt(**V1_ARGS)["compliance"] == "exact"
+def test_receipt_v2_states_compliance_only_against_a_frozen_contract():
+    """Plan 6 Stage B: `compliance` was the constant "exact" while no contract
+    existed to compare a dispatch against. Now one does, so the claim is made
+    only when the facade actually froze it — a receipt with no contract states
+    no compliance rather than asserting a match with nothing."""
+    assert "compliance" not in build_receipt(**V1_ARGS)
+    assert "contract_id" not in build_receipt(**V1_ARGS)
 
 
 def test_receipt_v2_actual_cwd_defaults_to_the_directory_the_dispatch_used():
@@ -522,6 +530,9 @@ def test_record_invocation_persists_every_v2_fact_it_could_observe():
         after={SUREFIRE: HASH_A},
         output="[INFO] BUILD SUCCESS\n",
         requirements=V2_MANIFEST,
+        contract_id="ic-000000000abc",
+        contract_hash="e" * 64,
+        compliance="exact",
     )
 
     (receipt,) = receipts_written(execute.commands)
@@ -532,6 +543,8 @@ def test_record_invocation_persists_every_v2_fact_it_could_observe():
     assert "survey_fingerprint" not in receipt
     assert receipt["domain_id"] == "/workspace/proj/core"
     assert receipt["actual_cwd"] == "/workspace/proj/core"
+    assert receipt["contract_id"] == "ic-000000000abc"
+    assert receipt["contract_hash"] == "e" * 64
     assert receipt["compliance"] == "exact"
     assert receipt["toolchain_fingerprint"] == {
         "executable": "/usr/bin/mvn",
@@ -633,7 +646,6 @@ def test_record_invocation_still_writes_a_receipt_when_every_probe_is_silent():
         "schema_version",
         *V1_KEYS,
         "actual_cwd",
-        "compliance",
     }
 
 

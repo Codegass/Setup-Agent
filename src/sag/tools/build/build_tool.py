@@ -5,6 +5,15 @@ import re
 import shlex
 from typing import Any, Dict, List, Optional
 
+from sag.agent.evidence_assessments import ControlAssessment, write_assessment
+from sag.agent.invocation_contracts import (
+    CONTRACT_DIR,
+    CONTRACT_PERSIST_FAILED,
+    current_action_context,
+    dispatch_contract,
+    freeze_contract,
+    unrecorded_envelope_id,
+)
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.internal.build_preflight import (
@@ -74,6 +83,16 @@ class BuildTool(BaseTool):
         # orchestration layer owns working-directory injection, so the facade
         # never re-targets; explicitness only gates the [scope] warning below.
         explicitly_scoped = working_directory not in (None, "", "/workspace")
+        # The call AS SUBMITTED. The facade may re-target the working directory
+        # below; the contract records both, because a normalization the caller
+        # never asked for is exactly the kind of fact §C3 keeps separate.
+        requested_call_params = {
+            "action": verb,
+            "args": args,
+            "working_directory": working_directory,
+            "timeout": timeout,
+            "maven_version_requirement": maven_version_requirement,
+        }
 
         system, checked = self._detect_system(working_directory)
         if system is None and working_directory in (None, "", "/workspace"):
@@ -164,6 +183,71 @@ class BuildTool(BaseTool):
                     "unresolved; tests outside this module will not run"
                 )
 
+        # --- Pre-dispatch contract freeze (Plan 6 Stage B, spec §C3) ---
+        # Materialize the effective action and its argv WITHOUT dispatching,
+        # freeze that materialization, and dispatch only once the contract is
+        # on disk. A contract that did not land has no dispatch authority, so
+        # the refusal below is the whole point: the physical command never runs.
+        if system == "maven":
+            materialized = backend.materialize(
+                effective_verb,
+                args,
+                working_directory,
+                timeout,
+                maven_version_requirement=maven_version_requirement,
+            )
+        else:
+            materialized = backend.materialize(effective_verb, args, working_directory, timeout)
+
+        scope = current_action_context()
+        envelope_id = scope.envelope_id or unrecorded_envelope_id()
+        contract = freeze_contract(
+            self.docker_orchestrator.execute_command,
+            envelope_id=envelope_id,
+            tool=self.name,
+            params=requested_call_params,
+            effective_action=backend.effective_action(materialized),
+            expected_cwd=working_directory,
+            expected_argv=backend.expected_argv(materialized),
+            intent_source=scope.intent_source,
+            requirements=requirements,
+        )
+        if contract is None:
+            write_assessment(
+                self.docker_orchestrator.execute_command,
+                ControlAssessment(
+                    event_or_intent_id=envelope_id,
+                    stage="materialization",
+                    typed_code=CONTRACT_PERSIST_FAILED,
+                    detail=(
+                        f"{system} {effective_verb} at {working_directory} was not "
+                        "dispatched: its invocation contract did not reach disk"
+                    ),
+                ),
+            )
+            return ToolResult.completed_failure(
+                output="\n".join(
+                    preamble_lines
+                    + [
+                        "[contract] the invocation contract for this dispatch could not be "
+                        f"persisted under {CONTRACT_DIR}, so {system} {effective_verb} was "
+                        "NOT run. Nothing was built and no evidence was produced."
+                    ]
+                ),
+                error="invocation contract not persisted",
+                error_code=CONTRACT_PERSIST_FAILED,
+                facts={
+                    "system": system,
+                    "requested_action": verb,
+                    "effective_action": effective_verb,
+                    "working_directory": working_directory,
+                },
+                suggestions=[
+                    "Check that /workspace/.setup_agent is writable in the container",
+                    "Retry the same build call once the workspace accepts writes",
+                ],
+            )
+
         def _execute_backend():
             if system == "maven":
                 return backend.execute(
@@ -172,31 +256,43 @@ class BuildTool(BaseTool):
                     working_directory,
                     timeout,
                     maven_version_requirement=maven_version_requirement,
+                    params=materialized,
                 )
-            return backend.execute(effective_verb, args, working_directory, timeout)
+            return backend.execute(
+                effective_verb,
+                args,
+                working_directory,
+                timeout,
+                params=materialized,
+            )
 
-        actual_executions = [_execute_backend()]
-        inner = actual_executions[-1].result
+        # The contract is bound for the dispatch only: the runner reads it to
+        # bind its receipt back, and nothing outside this block inherits it.
+        with dispatch_contract(contract):
+            actual_executions = [_execute_backend()]
+            inner = actual_executions[-1].result
 
-        # Bounded retry (spec §1c): a version-shaped failure means the JDK in
-        # the error text is authoritative (static analysis cannot always see
-        # it); re-provision from it and rerun EXACTLY once, never more.
-        if outcome is not None and not inner.succeeded:
-            failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
-            needed = classify_version_error(failure_text)
-            active = outcome.active_version or active_java_major(self.docker_orchestrator)
-            if needed and needed != active:
-                retry_outcome = JdkPreflight(self.docker_orchestrator).run(
-                    needed, source="build-error"
-                )
-                if retry_outcome.provisioned:
-                    preamble_lines.append(
-                        f"[pre-flight] build error requires Java {needed}, "
-                        "re-provisioned, retry 1/1"
+            # Bounded retry (spec §1c): a version-shaped failure means the JDK in
+            # the error text is authoritative (static analysis cannot always see
+            # it); re-provision from it and rerun EXACTLY once, never more. The
+            # rerun is the SAME materialized argv, so it runs under the same
+            # frozen contract.
+            if outcome is not None and not inner.succeeded:
+                failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
+                needed = classify_version_error(failure_text)
+                active = outcome.active_version or active_java_major(self.docker_orchestrator)
+                if needed and needed != active:
+                    retry_outcome = JdkPreflight(self.docker_orchestrator).run(
+                        needed, source="build-error"
                     )
-                    jdk_retry_meta = {"from": active, "to": needed}
-                    actual_executions.append(_execute_backend())
-                    inner = actual_executions[-1].result
+                    if retry_outcome.provisioned:
+                        preamble_lines.append(
+                            f"[pre-flight] build error requires Java {needed}, "
+                            "re-provisioned, retry 1/1"
+                        )
+                        jdk_retry_meta = {"from": active, "to": needed}
+                        actual_executions.append(_execute_backend())
+                        inner = actual_executions[-1].result
 
         # Computed last so it lands FIRST: the model must read what actually ran
         # before it reasons about the result (spec §Stage D contract 4).
@@ -220,6 +316,7 @@ class BuildTool(BaseTool):
             island_context,
             preamble_lines,
             jdk_retry_meta,
+            contract,
         ).with_execution_trace(actual_executions)
 
     def _detect_system(self, working_directory: str):
@@ -326,6 +423,7 @@ class BuildTool(BaseTool):
         island_context: Optional[Dict[str, str]] = None,
         preamble_lines: Optional[List[str]] = None,
         jdk_retry: Optional[Dict[str, Optional[str]]] = None,
+        contract: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         facts: Dict[str, Any] = {
             "system": system,
@@ -376,6 +474,13 @@ class BuildTool(BaseTool):
             metadata.update(island_context)
         if jdk_retry:
             metadata["jdk_retry"] = jdk_retry
+        # The contract this dispatch was frozen against travels with the result
+        # (plan §Stage B): envelope -> contract -> receipt is the chain the
+        # verifier walks, and the control event only ever sees the metadata.
+        for key in ("contract_id", "contract_hash"):
+            value = str((contract or {}).get(key) or "").strip()
+            if value:
+                metadata[key] = value
         payload = {
             "output": output,
             "facts": facts,

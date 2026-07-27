@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.agent.invocation_contracts import contract_receipt_fields
 from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
@@ -931,6 +932,10 @@ class MavenTool(BaseTool):
             after=after,
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,
+            # Plan 6 Stage B: bind this dispatch back to the contract the build
+            # facade froze for it. Absent when the runner was called outside
+            # the facade, and `compliance` is the argv comparison's verdict.
+            **contract_receipt_fields(argv),
         )
 
     def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:

@@ -337,6 +337,9 @@ def build_receipt(
     toolchain_fingerprint: Optional[Mapping[str, str]] = None,
     output_content_hash: Optional[str] = None,
     testcase_outcomes: Optional[Mapping[str, Any]] = None,
+    contract_id: Optional[str] = None,
+    contract_hash: Optional[str] = None,
+    compliance: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble a schema-v2 receipt. Absent facts serialize as absent keys.
 
@@ -356,13 +359,17 @@ def build_receipt(
         receipt["exit_code"] = exit_code
     receipt["outcome"] = "completed" if exit_code == 0 else "failed"
     receipt["report_delta"] = report_delta(before, after)
-    # v2 (spec §C4). `compliance` is the frozen constant until Stage B can
-    # compare a dispatch against a frozen contract; `actual_cwd` is the
-    # directory the dispatch physically used, which is the fact Stage B then
-    # compares against the contract's requested cwd.
-    receipt["compliance"] = "exact"
+    # v2 (spec §C4). `actual_cwd` is the directory the dispatch physically
+    # used; `contract_id`/`contract_hash` bind this receipt to the contract the
+    # facade froze BEFORE the dispatch, and `compliance` is that comparison's
+    # verdict (invocation_contracts.compliance_class). A dispatch with no
+    # frozen contract states none of the three — a receipt never claims
+    # compliance with a contract that does not exist.
     for key, value in (
         ("actual_cwd", actual_cwd or working_directory),
+        ("contract_id", contract_id),
+        ("contract_hash", contract_hash),
+        ("compliance", compliance),
         ("target_sha", target_sha),
         ("survey_fingerprint", survey_fingerprint),
         ("config_fingerprint", config_fingerprint),
@@ -425,6 +432,9 @@ def record_invocation(
     after: Mapping[str, str],
     output: Optional[str] = None,
     requirements: Optional[Mapping[str, Any]] = None,
+    contract_id: Optional[str] = None,
+    contract_hash: Optional[str] = None,
+    compliance: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Persist the receipt for one runner call; return its ToolResult metadata.
 
@@ -432,8 +442,11 @@ def record_invocation(
     completed: the tree's sha, the runner's toolchain and the per-testcase
     outcomes of the reports this invocation wrote are probed; the survey pins
     and the domain are read from the manifest the CALLER already holds, never
-    from a second manifest probe. Every fact degrades to an absent key — none
-    of them can fail the build the model is waiting for.
+    from a second manifest probe. The contract binding
+    (`contract_id`/`contract_hash`/`compliance`) is passed in by the caller,
+    which is the only layer that knows both the frozen contract and the argv it
+    physically ran. Every fact degrades to an absent key — none of them can
+    fail the build the model is waiting for.
 
     Byte-compat (Plans 2-4 pattern): a persisted receipt adds ONLY
     `receipt_id`; a failed write adds ONLY `receipt_persisted: false`.
@@ -459,6 +472,9 @@ def record_invocation(
         ),
         output_content_hash=output_content_hash(output),
         testcase_outcomes=read_testcase_outcomes(execute, report_delta(before, after)),
+        contract_id=contract_id,
+        contract_hash=contract_hash,
+        compliance=compliance,
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):
