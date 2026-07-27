@@ -70,7 +70,11 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # gradle.properties joins the fingerprint domain (a gradle domain's produced
 # version is read there). A v8 manifest carries no domains at all, so reusing
 # it would hide the very graph the gate now judges independence by.
-SURVEY_FACTS_VERSION = 9
+# v10: the manifest carries the neutral per-domain projection (domain_facts)
+# and the edges carry their stable edge_id/support_claim_ids (Plan 6 Stage A).
+# A v9 manifest has neither, so reusing it would serve a later stage facts
+# whose identities do not exist.
+SURVEY_FACTS_VERSION = 10
 
 
 def _project_recommendation_coordinates(rec):
@@ -786,7 +790,11 @@ class ProjectAnalyzerTool(BaseTool):
         ABSENT (not empty) so single-module/healthy-reactor recommendations,
         manifests and intros are byte-identical to before.
         """
-        from sag.agent.physical_survey import derive_domain_edges, enumerate_build_domains
+        from sag.agent.physical_survey import (
+            derive_domain_edges,
+            enumerate_build_domains,
+            read_policy_claims,
+        )
 
         domains = enumerate_build_domains(self.docker_orchestrator, project_path, source_modules)
         if len(domains) < 2:
@@ -796,7 +804,10 @@ class ProjectAnalyzerTool(BaseTool):
         # stay index-aligned for their readers.
         domains.sort(key=lambda d: 0 if d["root"] == preferred_root else 1)
         rec["build_domains"] = domains
-        edges = derive_domain_edges(domains)
+        # Plan 6 Stage A: the persisted policy claims are what can SUPPORT an
+        # edge. Absent claims mean absent support keys — the edges themselves
+        # are still derived from the coordinates alone.
+        edges = derive_domain_edges(domains, claims=read_policy_claims(self.docker_orchestrator))
         if edges:
             rec["domain_edges"] = edges
 
@@ -892,6 +903,26 @@ class ProjectAnalyzerTool(BaseTool):
             test_islands.sort(key=lambda i: 0 if i["root"] == dominant_root else 1)
             build_rec["test_islands"] = test_islands
 
+    @staticmethod
+    def _survey_native_artifact_fact(
+        project_path: str, analysis: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The survey-time native-artifact fact, in the engine probe's vocabulary.
+
+        The survey knows WHERE a native core would land (``python_root``); it
+        cannot know whether the library is BUILT — that is a post-hoc reading,
+        so the pre-build status is honestly ``unknown``. Returns None when the
+        project declares no native build at all, and the domain then carries no
+        ``capability_state`` key (absent fact, absent key).
+        """
+        python_config = analysis.get("python_config") or {}
+        if not python_config.get("has_native_build"):
+            return None
+        return {
+            "status": "unknown",
+            "root": python_config.get("python_root") or project_path,
+        }
+
     def _persist_build_requirements(self, project_path: str, analysis: Dict[str, Any]) -> None:
         """Persist the analyzer's build/test requirements manifest (spec §2).
 
@@ -967,6 +998,25 @@ class ProjectAnalyzerTool(BaseTool):
         for key in ("build_domains", "domain_edges"):
             if rec.get(key):
                 data[key] = rec[key]
+
+        # Plan 6 Stage A (spec §C2): the neutral per-domain projection rides the
+        # SAME manifest as the domains it is derived from, so a later stage
+        # judges a domain from typed facts instead of re-reading the repository.
+        # Facts only: role/environment stay "unknown" until a deterministic rule
+        # exists, and documented_actions are claim IDs — never commands. Absent
+        # (not empty) without a multi-domain decomposition, which keeps
+        # single-module and healthy-reactor manifests byte-identical.
+        if rec.get("build_domains"):
+            from sag.agent.physical_survey import build_domain_facts
+
+            domain_facts = build_domain_facts(
+                self.docker_orchestrator,
+                rec["build_domains"],
+                rec.get("domain_edges"),
+                native_artifact_fact=self._survey_native_artifact_fact(project_path, analysis),
+            )
+            if domain_facts:
+                data["domain_facts"] = domain_facts
 
         # Python requirements ride along on the SAME handoff manifest (spec
         # Component 1): java keys stay, python keys are added when the
