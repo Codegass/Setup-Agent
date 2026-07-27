@@ -158,13 +158,56 @@ Plan 5 profiles unchanged on recorded sessions.
 
 ## Stage B — Execution binding (ActionIntent → InvocationContract)
 
-Spec §C3 + edge execution law. The native tool-call from the model IS the
-ActionIntent (no protocol change); the facade freezes fingerprints,
-validates against edges/gates/containment, materializes effective action +
-argv WITHOUT dispatch, persists + hashes the contract, binds envelope, then
-dispatches. Documented-command normalization keeps original + normalized +
-equivalence proof. Consumer dispatch locked on unverified edges per note
-(c). Receipt v2 gains real `contract_id`/`contract_hash`/`compliance`.
+Spec §C3 + edge execution law. Bound on `9966311`. Two lanes.
+
+**Binding decision (envelope ordering).** The engine emits the
+action_envelope BEFORE tool execution; materialized argv exists only inside
+the build facade. Therefore: the contract is frozen inside `build_tool`
+AFTER envelope emission but strictly BEFORE physical dispatch, records the
+`envelope_id`, and the ToolResult metadata + invocation receipt carry
+`contract_id`/`contract_hash`. The verifier walks
+envelope → contract (by envelope_id) → receipt (by contract_id); the
+envelope hash formula is unchanged (byte-compat).
+
+**Contract v1 fields (subset of spec §C3, absent-when-unknown):**
+`schema_version=1, contract_id ("ic-"+sha256(envelope_id+argv)[:12]),
+contract_hash (sha256 of the canonical payload sans hash), envelope_id,
+target_sha, config_fingerprint, document_map_fingerprint, fact_epoch,
+domain_id, intent_source ("model"|"controller"), requested_call
+{tool, params}, effective_action, expected_cwd, expected_argv,
+blocking_conflict_ids, predecessor_contract_id?` — persisted atomically at
+`/workspace/.setup_agent/invocation_contracts/<contract_id>.json`.
+`expected_observations`/`direct_falsifiers`/`supersedes` arrive with
+Stage C.
+
+**Task B1 (lane b1): contract module + facade freeze.**
+NEW `src/sag/agent/invocation_contracts.py` (+ tests); integrate in
+`src/sag/tools/build/build_tool.py`: after the backend materializes the
+effective action/argv (dry — the backends already compute both before
+running), freeze + persist the contract, then dispatch; persistence
+failure ⇒ refuse dispatch (fail closed, named error). The maven/gradle/
+python receipt writers receive `contract_id`/`contract_hash` and compute
+`compliance`: "exact" (actual argv == expected), "equivalent" (recorded
+normalization only), "deviated" otherwise.
+
+**Task B2 (lane b2): edge execution law + chain verification.**
+Files: `src/sag/tools/build/build_tool.py` refusal path (coordinate with
+b1 via disjoint hunks: b2 owns the PRE-materialization edge check),
+`scripts/verify_native_test_policy.py`, tests.
+- Before materialization: read `domain_edges`; a build/test dispatch whose
+  working_directory falls under a consumer root of a
+  `version_incompatible` edge is REFUSED (completed_failure,
+  error_code=DOMAIN_EDGE_BLOCKED, the edge detail verbatim, no runner
+  invocation, ControlAssessment written); an `unverified` edge consumer is
+  refused with error_code=DOMAIN_EDGE_UNVERIFIED naming the producer that
+  must build first (resolution machinery lands in Stage C).
+- Verifier: new assertion family `contracts.chain` — every runner receipt
+  with a `contract_id` has a persisted contract whose `envelope_id` exists
+  in the events and whose `contract_hash` recomputes; receipts without
+  contracts allowed only for pre-Stage-B sessions (version-gated).
+Stage exit: full suite; Plan 5 profiles unchanged; negative controls
+(blocked consumer never dispatches; contract persistence failure blocks
+dispatch; hash mismatch detected by verifier).
 
 ## Stage C — Causal loop (ClaimGraph + assessments + retrieval + repair)
 
