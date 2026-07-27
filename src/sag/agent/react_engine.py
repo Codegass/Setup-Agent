@@ -46,7 +46,7 @@ from .control_events import (
     compact_control_value,
     forced_action_sha256,
 )
-from .evidence_assessments import ASSESSMENT_DIR
+from .evidence_assessments import ASSESSMENT_DIR, ensure_receipt_assessed
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .invocation_contracts import action_context, clear_action_context, set_action_context
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
@@ -4255,6 +4255,25 @@ class ReActEngine(UIEventEmitter):
             setattr(self, name, guard)
         return guard
 
+    def _ensure_observed_receipt_assessed(self, source_tool: Optional[str]) -> None:
+        """Backstop assessor for dispatches no facade path assessed.
+
+        The tool-recovery delegate freezes its own fallback contract but runs
+        outside the build facade, so its receipt reaches this seam without a
+        verdict (live p6v-bigtop-r3). Idempotent; never raises."""
+        if source_tool != RETRY_TOOL:
+            return
+        execute = getattr(getattr(self, "orchestrator", None), "execute_command", None)
+        if not callable(execute):
+            return
+        try:
+            metadata = getattr(self._answered_action_result(), "metadata", None) or {}
+            receipt_id = str(metadata.get("receipt_id") or "").strip()
+            if receipt_id:
+                ensure_receipt_assessed(execute, receipt_id)
+        except Exception as exc:
+            logger.debug(f"observed-receipt assessment backstop skipped: {exc}")
+
     def _record_retry_authority(self, source_tool: Optional[str]) -> None:
         """Sign the retry key of a dispatch a failure-class assessment closed.
 
@@ -4310,6 +4329,7 @@ class ReActEngine(UIEventEmitter):
         the physical-evidence trigger. It is published on the engine rather
         than passed down, because `_add_observation_step` is a one-argument
         seam that callers (and tests) substitute."""
+        self._ensure_observed_receipt_assessed(source_tool)
         self._record_retry_authority(source_tool)
         self._commit_claim_transitions(source_tool)
         block = self._repair_surfacing_block(source_tool)

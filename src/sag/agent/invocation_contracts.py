@@ -471,6 +471,19 @@ def ensure_dispatch_contract(
     if existing:
         return dict(existing), False
     context = current_action_context()
+    # Facade convention (Stage B): expected_argv EXCLUDES the runner
+    # executable — the binary is the toolchain's resolution, not part of the
+    # commitment — and python pins no argv at all (the venv interpreter and
+    # report path are resolved inside the tool). The fallback freeze must
+    # state the same shape, or every compliant dispatch grades `deviated`
+    # against its own contract (live p6v-bigtop-r3, inv-gradle-1-0004).
+    frozen_argv: Optional[str] = None
+    if tool != "python":
+        try:
+            tokens = shlex.split(str(expected_argv or ""))
+        except ValueError:
+            tokens = str(expected_argv or "").split()
+        frozen_argv = " ".join(tokens[1:]) if len(tokens) > 1 else None
     contract = freeze_contract(
         execute,
         envelope_id=context.envelope_id or unrecorded_envelope_id(),
@@ -478,7 +491,7 @@ def ensure_dispatch_contract(
         params={"action": _text(effective_action)},
         effective_action=effective_action,
         expected_cwd=expected_cwd,
-        expected_argv=expected_argv,
+        expected_argv=frozen_argv,
         intent_source=context.intent_source,
         requirements=requirements or {},
     )

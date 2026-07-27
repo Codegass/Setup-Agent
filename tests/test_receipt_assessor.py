@@ -790,3 +790,72 @@ def test_the_assessment_is_never_a_receipt_rewrite():
         assess_receipt(contract_for(), receipt_for(), current_fingerprints=CURRENT),
         ReceiptAssessment,
     )
+
+
+def test_backstop_assesses_a_facade_external_receipt_once():
+    """Live p6v-bigtop-r3: the recovery delegate's dispatch had a fallback
+    contract and no verdict — the backstop owes it exactly one."""
+    import json as _json
+
+    from sag.agent.evidence_assessments import ensure_receipt_assessed
+
+    store = {
+        "/workspace/.setup_agent/invocation_receipts/inv-gradle-1-0004.json": _json.dumps(
+            {
+                "schema_version": 2,
+                "receipt_id": "inv-gradle-1-0004",
+                "contract_id": "ic-b5204a1e70cd",
+                "tool": "gradle",
+                "requested_action": "compileJava",
+                "effective_action": "compileJava",
+                "argv": "/workspace/bigtop/gradlew --build-cache compileJava",
+                "working_directory": "/workspace/bigtop/bigtop-data-generators",
+                "exit_code": 0,
+                "outcome": "completed",
+                "compliance": "exact",
+                "report_delta": {"new": [{"path": "/r.xml", "sha256": "ab" * 32}], "changed": []},
+            }
+        ),
+        "/workspace/.setup_agent/invocation_contracts/ic-b5204a1e70cd.json": _json.dumps(
+            {
+                "schema_version": 1,
+                "contract_id": "ic-b5204a1e70cd",
+                "contract_hash": "x",
+                "envelope_id": "envelope-000009",
+                "requested_call": {"tool": "build", "params": {"action": "compileJava"}},
+                "effective_action": "compileJava",
+                "expected_cwd": "/workspace/bigtop/bigtop-data-generators",
+                "expected_argv": "--build-cache compileJava",
+                "intent_source": "controller",
+                "expected_observations": ["artifact_or_report_delta"],
+                "direct_falsifiers": [
+                    {"predicate_id": "empty_delta_despite_success", "kind": "delta_empty_on_exit0"}
+                ],
+            }
+        ),
+    }
+    written = {}
+
+    def execute(command, **_kwargs):
+        if command.startswith("ls "):
+            return {"success": True, "exit_code": 0, "output": "\n".join(written)}
+        if command.startswith("cat "):
+            for path, body in store.items():
+                if path in command:
+                    return {"success": True, "exit_code": 0, "output": body}
+            return {"success": False, "exit_code": 1, "output": ""}
+        if "evidence_assessments" in command and "mv -f" in command:
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            payload = _json.loads(body)
+            written[payload["assessment_id"] + ".json"] = body
+            return {"success": True, "exit_code": 0, "output": ""}
+        return {"success": True, "exit_code": 0, "output": ""}
+
+    assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is True
+    assert len(written) == 1
+    body = _json.loads(next(iter(written.values())))
+    assert body["typed_code"] == "expectation_met"
+
+    # second pass: already assessed => no-op
+    assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is False
+    assert len(written) == 1

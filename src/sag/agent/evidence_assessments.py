@@ -283,6 +283,54 @@ def write_assessment(execute, assessment) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def ensure_receipt_assessed(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    receipt_id: Any,
+) -> bool:
+    """Backstop: assess a dispatched receipt no facade path assessed.
+
+    Live p6v-bigtop-r3: the tool-recovery delegate freezes its own fallback
+    contract, but only the build facade ran the assessor — the recovery
+    dispatch's receipt had a contract and no verdict. This runs at the engine
+    observation seam for exactly that gap; the write is idempotent, so a
+    facade-assessed receipt is a no-op. Never raises.
+    """
+    identifier = str(receipt_id or "").strip()
+    if not identifier:
+        return False
+    try:
+        slug = _slug(identifier)
+        for name in _list_assessment_files(execute):
+            if slug and slug in name:
+                return False  # already assessed by the dispatching layer
+        receipt = read_receipt(execute, identifier)
+        if not isinstance(receipt, Mapping):
+            return False
+        contract_id = str(receipt.get("contract_id") or "").strip()
+        if not contract_id:
+            return False
+        from sag.agent.retry_authority import read_frozen_contract
+
+        contract = read_frozen_contract(execute, contract_id)
+        if not isinstance(contract, Mapping):
+            return False
+        assessment = assess_receipt(contract, receipt)
+        return write_assessment(execute, assessment)
+    except Exception as exc:  # a backstop must never break an observation
+        logger.debug(f"receipt {identifier} backstop assessment skipped: {exc}")
+        return False
+
+
+def _list_assessment_files(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+) -> List[str]:
+    try:
+        result = execute(f"ls {ASSESSMENT_DIR} 2>/dev/null") or {}
+    except Exception:
+        return []
+    return [line.strip() for line in (result.get("output") or "").splitlines() if line.strip()]
+
+
 def assess_receipt(
     contract: Optional[Mapping[str, Any]],
     receipt: Optional[Mapping[str, Any]],

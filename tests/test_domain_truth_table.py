@@ -492,3 +492,49 @@ def test_test_gate_domain_states_supersede_the_build_snapshot_per_root():
         "/w/data-generators": {"state": "success"},
         "/w/test-framework": {"state": "success"},
     }
+
+
+def test_a_dependency_probe_receipt_never_settles_a_domain_state():
+    """Live p6v-bigtop-r3: a completed `gradle dependencies` probe at the
+    spark root scored the blocked consumer green. Inspection is not
+    production; the domain stays untried."""
+    from sag.agent.phase_gates import _domain_states
+
+    requirements = {
+        "build_domains": [
+            {"root": "/w/spark", "system": "gradle"},
+        ],
+        "domain_edges": [],
+    }
+    probe_receipt = {
+        "receipt_id": "inv-gradle-1-0005",
+        "tool": "gradle",
+        "effective_action": "dependencies",
+        "outcome": "completed",
+        "working_directory": "/w/spark",
+    }
+
+    derivation = _domain_states(requirements, [probe_receipt], [])
+
+    assert derivation.states == {"/w/spark": {"state": "untried"}}
+
+
+def test_a_legacy_receipt_without_effective_action_still_counts():
+    """Pre-Stage-B receipts state no effective action; their attempt facts
+    (the recorded Plan 5 sessions) must keep their domain states."""
+    from sag.agent.phase_gates import _domain_states
+
+    requirements = {
+        "build_domains": [{"root": "/w/lib", "system": "maven"}],
+        "domain_edges": [],
+    }
+    legacy = {
+        "receipt_id": "inv-maven-1-0001",
+        "tool": "maven",
+        "outcome": "completed",
+        "working_directory": "/w/lib",
+    }
+
+    derivation = _domain_states(requirements, [legacy], [])
+
+    assert derivation.states == {"/w/lib": {"state": "success"}}

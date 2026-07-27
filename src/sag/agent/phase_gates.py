@@ -786,6 +786,33 @@ def _condemned_receipt_ids(
     return frozenset(condemned), tuple(dict.fromkeys(conflicts))
 
 
+# Effective actions that PRODUCE something a domain state may rest on.
+# Inspection verbs (dependencies/deps, help, tasks, probes) are visible
+# evidence but never an attempt (spec §C2 execution law).
+_PRODUCTION_ACTION_PREFIXES = (
+    "compile",
+    "test",
+    "package",
+    "install",
+    "publish",
+    "assemble",
+    "build",
+    "verify",
+    "native",
+)
+
+
+def _is_production_action(value: Any) -> bool:
+    action = str(value or "").strip().lower()
+    if not action:
+        # A receipt that states no effective action states an attempt of the
+        # requested verb — the pre-Stage-B shape. Counting it preserves the
+        # recorded Plan 5 sessions' domain states unchanged.
+        return True
+    first = action.split()[0].rsplit(":", 1)[-1]
+    return any(first.startswith(prefix) for prefix in _PRODUCTION_ACTION_PREFIXES)
+
+
 def _domain_states(
     requirements: Mapping[str, Any] | None,
     receipts: Iterable[Mapping[str, Any]],
@@ -823,6 +850,13 @@ def _domain_states(
     for receipt in sorted(receipts, key=_receipt_order):
         outcome = str(receipt.get("outcome") or "").strip().lower()
         if outcome not in {"completed", "failed"}:
+            continue
+        # Live p6v-bigtop-r3: a completed `gradle dependencies` PROBE at the
+        # spark root scored the domain green. The edge law deliberately lets
+        # dependency probes through so a mismatch can show itself — an
+        # inspection is never a production attempt, and only production
+        # verbs may settle a domain's state.
+        if not _is_production_action(receipt.get("effective_action")):
             continue
         if str(receipt.get("receipt_id") or "").strip() in condemned:
             outcome = "failed"
