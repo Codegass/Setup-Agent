@@ -209,6 +209,11 @@ class MavenTool(BaseTool):
         # layer probes the container — and reruns — per build.
         preamble_lines: List[str] = []
         outcome = None
+        # The manifest the pre-flight already read, kept for the invocation
+        # receipt's survey pins and domain. Empty on the facade path, which
+        # deliberately reads the manifest ONE layer up: the receipt records the
+        # pins it can see and omits the ones it cannot.
+        requirements: Dict[str, Any] = {}
         if _env_preflight:
             requirements = read_build_requirements(self.orchestrator)
             outcome = JdkPreflight(self.orchestrator).run(
@@ -463,6 +468,7 @@ class MavenTool(BaseTool):
                     attempt=attempt,
                     result=dispatched,
                     before=before,
+                    requirements=requirements,
                 )
                 return dispatched
 
@@ -900,6 +906,7 @@ class MavenTool(BaseTool):
         attempt: int,
         result: Dict[str, Any],
         before: Dict[str, str],
+        requirements: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist the P0-A invocation receipt for one physical dispatch.
 
@@ -922,6 +929,8 @@ class MavenTool(BaseTool):
             exit_code=result.get("exit_code"),
             before=before,
             after=after,
+            output=result.get("full_output") or result.get("output"),
+            requirements=requirements,
         )
 
     def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:

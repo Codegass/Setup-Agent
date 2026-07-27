@@ -69,6 +69,20 @@ def written_receipt(orch):
     return json.loads(writes[0].split("<<'SAGEOF'\n", 1)[1].rsplit("\nSAGEOF", 1)[0])
 
 
+def gate_commands(orch):
+    """Everything the capability gate ran — i.e. before any pytest call.
+
+    The gate decides BEFORE pytest is invoked, so this window is exactly its
+    own container traffic. Scoping matters since Plan 6 Stage 0: the invocation
+    receipt records the run's target sha AFTER the dispatch, so a bare
+    "did any git command run" scan no longer isolates the gate's behaviour.
+    """
+    for index, command in enumerate(orch.commands):
+        if "-m pytest" in command:
+            return orch.commands[:index]
+    return list(orch.commands)
+
+
 # ---------------------------------------------------------------------------
 # (a) all-skipped proves nothing
 # ---------------------------------------------------------------------------
@@ -280,7 +294,7 @@ def test_positive_receipt_without_target_sha_still_unlocks_and_skips_rev_parse()
 
     assert result.metadata["smoke_receipt_present"] is True
     assert result.metadata["collection_scope"] == "full"
-    assert not any("rev-parse HEAD" in command for command in orch.commands)
+    assert not any("rev-parse HEAD" in command for command in gate_commands(orch))
 
 
 # ---------------------------------------------------------------------------
@@ -303,4 +317,4 @@ def test_non_native_run_gains_no_capability_keys():
 
     assert "smoke_capability_unproven" not in result.metadata
     assert "smoke_receipt_written" not in result.metadata
-    assert not any("rev-parse HEAD" in command for command in orch.commands)
+    assert not any("rev-parse HEAD" in command for command in gate_commands(orch))

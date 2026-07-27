@@ -525,30 +525,50 @@ def test_skip_flags_on_test_commands_still_flagged():
 
 
 class SelfProbingGradleOrchestrator(GradleLogOrchestrator):
-    """Answers the NO-SOURCE self-probe and receipt reads like a container."""
+    """Answers the NO-SOURCE self-probe and the evidence writes like a container.
+
+    The two evidence stores are modelled separately on purpose: the receipt
+    files must be observably write-once, while the assessment files are the
+    append-only side (Plan 6 Stage 0).
+    """
 
     def __init__(self, output, exit_code=0, probe_languages="scala\n"):
         super().__init__(output, exit_code=exit_code)
         self.probe_languages = probe_languages
         self.receipts = {}
+        self.assessments = {}
+
+    def _write(self, command, store, pattern):
+        import re as _re
+
+        match = _re.search(pattern, command)
+        body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+        if match:
+            store[match.group(1)] = body
+        return {"success": True, "output": "", "exit_code": 0}
+
+    def _read(self, command, store):
+        for identifier, body in store.items():
+            if identifier in command:
+                return {"success": True, "output": body, "exit_code": 0}
+        return {"success": False, "output": "", "exit_code": 1}
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append(command)
         if "for lang in scala kotlin groovy" in command:
             return {"success": True, "output": self.probe_languages, "exit_code": 0}
         if command.startswith("cat ") and "invocation_receipts" in command:
-            for receipt_id, body in self.receipts.items():
-                if receipt_id in command:
-                    return {"success": True, "output": body, "exit_code": 0}
-            return {"success": False, "output": "", "exit_code": 1}
+            return self._read(command, self.receipts)
         if "invocation_receipts" in command and "mv -f" in command:
-            import re as _re
-
-            match = _re.search(r"invocation_receipts/(inv-[^./]+)\.json\.tmp", command)
-            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
-            if match:
-                self.receipts[match.group(1)] = body
-            return {"success": True, "output": "", "exit_code": 0}
+            return self._write(
+                command, self.receipts, r"invocation_receipts/(inv-[^./]+)\.json\.tmp"
+            )
+        if command.startswith("cat ") and "evidence_assessments" in command:
+            return self._read(command, self.assessments)
+        if "evidence_assessments" in command and "mv -f" in command:
+            return self._write(
+                command, self.assessments, r"evidence_assessments/(asm-[^./]+)\.json\.tmp"
+            )
         return super().execute_command(command, workdir=workdir, timeout=timeout)
 
 
@@ -568,9 +588,14 @@ def test_no_source_guard_holds_without_a_caller_probe():
     assert result.error == NO_SOURCE_MISMATCH
 
 
-def test_semantic_failure_downgrades_the_invocation_receipt():
-    """The receipt must carry the classifier's verdict, not the raw exit 0 —
-    otherwise the domain gate scores a NO-SOURCE domain green."""
+def test_semantic_failure_is_appended_as_an_assessment_not_a_receipt_rewrite():
+    """Superseded expectation (Plan 6 Stage 0, spec §C4): the NO-SOURCE verdict
+    used to be written INTO this invocation's receipt (`outcome: failed` plus a
+    `semantic_failure` string), which meant a finalized receipt's bytes changed
+    after the fact and no reader could treat one as a stable anchor. The verdict
+    is now an append-only `ReceiptAssessment` keyed to that receipt; the receipt
+    keeps stating only what gradle physically did. The GATE-facing contract is
+    unchanged and is lane z2's: a failure-class assessment outranks exit 0."""
     orchestrator = SelfProbingGradleOrchestrator(
         "> Task :compileJava NO-SOURCE\nBUILD SUCCESSFUL in 3s\n"
     )
@@ -580,9 +605,39 @@ def test_semantic_failure_downgrades_the_invocation_receipt():
         use_wrapper=False,
     )
     assert result.succeeded is False
-    import json as _json
 
-    receipts = [_json.loads(body) for body in orchestrator.receipts.values()]
-    assert len(receipts) == 1
-    assert receipts[0]["outcome"] == "failed"
-    assert "NO-SOURCE" in receipts[0]["semantic_failure"]
+    (receipt,) = [json.loads(body) for body in orchestrator.receipts.values()]
+    (assessment,) = [json.loads(body) for body in orchestrator.assessments.values()]
+    # The receipt states the command fact and nothing more.
+    assert receipt["outcome"] == "completed"
+    assert "semantic_failure" not in receipt
+    # The verdict lives beside it, bound to that receipt id.
+    assert assessment["receipt_id"] == receipt["receipt_id"]
+    assert assessment["typed_code"] == "compile_no_source_mismatch"
+    assert "NO-SOURCE" in assessment["detail"]
+
+
+def test_the_finalized_receipt_is_written_once_and_never_re_read():
+    """Receipt immutability (spec §C4): the classifier never re-reads or
+    rewrites the receipt file it just wrote."""
+    orchestrator = SelfProbingGradleOrchestrator(
+        "> Task :compileJava NO-SOURCE\nBUILD SUCCESSFUL in 3s\n"
+    )
+    GradleTool(orchestrator).execute(
+        tasks="compileJava",
+        working_directory="/workspace/p",
+        use_wrapper=False,
+    )
+
+    writes = [
+        command
+        for command in orchestrator.commands
+        if "invocation_receipts" in command and "mv -f" in command
+    ]
+    reads = [
+        command
+        for command in orchestrator.commands
+        if command.startswith("cat ") and "invocation_receipts" in command
+    ]
+    assert len(writes) == 1
+    assert reads == []

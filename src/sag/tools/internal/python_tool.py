@@ -19,6 +19,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from sag.agent.evidence_assessments import (
+    ControlAssessment,
+    next_control_event_id,
+    write_assessment,
+)
 from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.evidence import TestStats
 from sag.testcases.compileall_metrics import (
@@ -1151,6 +1156,7 @@ class PythonTool(BaseTool):
                         f"[test] no native smoke receipt for {native_project_root} — "
                         f"the bounded smoke {native_smoke['path']} must execute first"
                     )
+                self._record_control_assessment("PYTEST_ARGS_REJECTED", rejection)
                 return ToolResult.completed_failure(
                     output="\n".join(rejection_lines),
                     error=rejection,
@@ -1185,15 +1191,17 @@ class PythonTool(BaseTool):
         else:
             if native_bounded:
                 if native_smoke is None:
+                    unavailable = (
+                        "native smoke unavailable — refusing to guess a path or "
+                        "collect the full suite"
+                    )
+                    self._record_control_assessment("NATIVE_SMOKE_UNAVAILABLE", unavailable)
                     return ToolResult.completed_failure(
                         output=(
                             "[test] this native project has no smoke receipt and the "
                             "survey has no current, project-owned smoke target"
                         ),
-                        error=(
-                            "native smoke unavailable — refusing to guess a path or "
-                            "collect the full suite"
-                        ),
+                        error=unavailable,
                         error_code="NATIVE_SMOKE_UNAVAILABLE",
                         suggestions=[
                             "Rerun project(action='analyze') to refresh verified smoke targets",
@@ -1364,6 +1372,8 @@ class PythonTool(BaseTool):
                 self.orchestrator.execute_command,
                 [working_directory, PYTEST_REPORT_DIR],
             ),
+            output=result.get("full_output") or output,
+            requirements=requirements,
         )
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
@@ -1848,6 +1858,24 @@ class PythonTool(BaseTool):
             if len(reasons) >= self._SKIP_REASON_LIMIT:
                 break
         return reasons
+
+    def _record_control_assessment(self, typed_code: str, detail: str) -> bool:
+        """Record a pre-dispatch refusal as a typed control fact (spec §C4).
+
+        A refusal ran no runner, so it mints no invocation receipt — but the
+        ToolResult alone leaves no evidence a later reader can consult. The
+        assessment says which stage refused and under which typed code, and it
+        can never contradict a project-owned claim. Never blocks the refusal.
+        """
+        return write_assessment(
+            self.orchestrator.execute_command,
+            ControlAssessment(
+                event_or_intent_id=next_control_event_id("python-test"),
+                stage="precondition",
+                typed_code=typed_code,
+                detail=detail,
+            ),
+        )
 
     def _target_sha(self, project_root: Optional[str]) -> Optional[str]:
         """The current checkout SHA of `project_root`, or None when unknown."""
