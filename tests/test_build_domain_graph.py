@@ -23,6 +23,7 @@ import re
 
 from sag.agent.physical_survey import (
     derive_domain_edges,
+    edge_id_for,
     enumerate_build_domains,
     enumerate_build_islands,
     parse_gradle_group_version,
@@ -356,12 +357,14 @@ def test_bigtop_yields_exactly_two_version_incompatible_edges():
         "producer": DG,
         "status": "version_incompatible",
         "detail": (f"requires {DG_ARTIFACT} 3.6.0-SNAPSHOT; producer builds 3.7.0-SNAPSHOT"),
+        "edge_id": edge_id_for(SPARK, DG, f"{DG_ARTIFACT}:3.6.0-SNAPSHOT"),
     } in incompatible
     assert {
         "consumer": TQ,
         "producer": DG,
         "status": "version_incompatible",
         "detail": (f"requires {DG_ARTIFACT} 3.5.0-SNAPSHOT; producer builds 3.7.0-SNAPSHOT"),
+        "edge_id": edge_id_for(TQ, DG, f"{DG_ARTIFACT}:3.5.0-SNAPSHOT"),
     } in incompatible
 
 
@@ -431,6 +434,7 @@ def test_maven_consumer_with_matching_version_is_a_compatible_edge():
             "producer": f"{ACME}/lib",
             "status": "compatible",
             "detail": "requires com.acme:lib 1.0.0; producer builds 1.0.0",
+            "edge_id": edge_id_for(f"{ACME}/app", f"{ACME}/lib", "com.acme:lib:1.0.0"),
         }
     ]
 
@@ -443,6 +447,7 @@ def test_maven_consumer_with_stale_version_is_incompatible():
             "producer": f"{ACME}/lib",
             "status": "version_incompatible",
             "detail": "requires com.acme:lib 2.0.0; producer builds 1.0.0",
+            "edge_id": edge_id_for(f"{ACME}/app", f"{ACME}/lib", "com.acme:lib:2.0.0"),
         }
     ]
 
@@ -850,6 +855,7 @@ def test_derive_domain_edges_without_a_producer_version_is_not_a_mismatch():
             "producer": "/w/p",
             "status": "compatible",
             "detail": "requires g:lib 1.0; producer version not declared",
+            "edge_id": edge_id_for("/w/c", "/w/p", "g:lib:1.0"),
         }
     ]
 

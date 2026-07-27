@@ -18,6 +18,8 @@ recommendations) stays at the tool layer until Category 3's A/B gate.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import posixpath
 import re
 import shlex
@@ -1736,7 +1738,216 @@ def _edge_detail(coordinate: Dict[str, str], producer_version: Optional[str]) ->
     return f"{required}; producer version not declared"
 
 
-def derive_domain_edges(domains: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+# --------------------------------------------------------------------------- #
+# Stage A identity + the survey's read side of the other stages' persistence
+# (Plan 6, spec §C1/§C2).
+#
+# The document map and the typed policy claims are written elsewhere; the
+# projection below CONSUMES them through their documented shapes only. Every
+# read is defensive: those files are produced by a different stage, may be
+# absent or half-written, and hold untrusted repository-derived material. An
+# unreadable claim is an absent fact, never an error and never a guess.
+# --------------------------------------------------------------------------- #
+
+SETUP_AGENT_DIR = "/workspace/.setup_agent"
+DOCUMENT_MAP_PATH = f"{SETUP_AGENT_DIR}/document_map.json"
+POLICY_CLAIMS_DIR = f"{SETUP_AGENT_DIR}/claims"
+
+# The first fact epoch. It is monotonic per survey generation: a later stage
+# compares it to decide whether a contract was frozen against current facts.
+DOMAIN_FACT_EPOCH = 1
+# role/environment have no deterministic rule yet, so they carry the only
+# honest value. Guessing "required" here would be a recommendation wearing a
+# fact's key.
+UNKNOWN_DOMAIN_ROLE = "unknown"
+UNKNOWN_DOMAIN_ENVIRONMENT = "unknown"
+# The capability vocabulary of the engine's native-artifact probe.
+CAPABILITY_STATES = ("present", "absent", "unknown")
+
+# A claim ID is a MACHINE identifier that rides persisted, model-reachable
+# facts. It is minted as ``"<kind>-" + sha256(...)[:12]``, so a value carrying
+# whitespace, prose punctuation or unbounded length is not an identifier — it
+# is untrusted repository text wearing an ID's key, and it never becomes a
+# documented action or an edge support claim.
+_CLAIM_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _valid_claim_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_CLAIM_ID_PATTERN.match(value))
+
+
+def stable_fact_id(prefix: str, material: str) -> str:
+    """``<prefix><sha256(material)[:12]>`` — the Stage A identity formula."""
+    return f"{prefix}{hashlib.sha256(str(material).encode('utf-8')).hexdigest()[:12]}"
+
+
+def domain_id_for(root: str) -> str:
+    """Stable ID of one build domain, derived from its root only."""
+    return stable_fact_id("dom-", str(root or ""))
+
+
+def edge_id_for(consumer: str, producer: str, coordinate: str) -> str:
+    """Stable ID of one dependency edge (consumer + producer + coordinate)."""
+    return stable_fact_id("edge-", f"{consumer}{producer}{coordinate}")
+
+
+def coordinate_key(coordinate: Dict[str, Any]) -> str:
+    """``group:name:version`` of one coordinate, with absent parts empty."""
+    return ":".join(
+        str((coordinate or {}).get(part) or "") for part in ("group", "name", "version")
+    )
+
+
+def _under_root(path: Any, root: str) -> bool:
+    """Whether ``path`` IS ``root`` or lies beneath it.
+
+    Posix-segment containment, never a bare string prefix: ``/workspace/app``
+    must not swallow ``/workspace/app-ui``'s documents.
+    """
+    if not isinstance(path, str) or not path or not root:
+        return False
+    candidate = posixpath.normpath(path)
+    base = posixpath.normpath(root)
+    return candidate == base or candidate.startswith(f"{base}/")
+
+
+def read_policy_claims(orch) -> List[Dict[str, Any]]:
+    """Every persisted claim record under ``<workspace>/.setup_agent/claims/``.
+
+    Ordered by ``claim_id`` so two surveys of the same container read
+    identically. Anything that is not a JSON object carrying a well-formed
+    ``claim_id`` is skipped — an absent directory yields ``[]``, which is what
+    an absent fact looks like everywhere else in the survey.
+    """
+    if not orch:
+        return []
+    try:
+        result = orch.execute_command(
+            f"find {shlex.quote(POLICY_CLAIMS_DIR)} -maxdepth 1 -type f -name '*.json' "
+            "2>/dev/null",
+            truncate_output=False,
+        )
+    except Exception as exc:  # a probe failure is an absent fact, not a crash
+        logger.debug(f"policy claim listing unavailable: {exc}")
+        return []
+    if not (result or {}).get("success"):
+        return []
+    claims: Dict[str, Dict[str, Any]] = {}
+    for line in str((result or {}).get("output") or "").splitlines():
+        path = line.strip()
+        if not path.endswith(".json"):
+            continue
+        try:
+            record = json.loads(_read_config_text(orch, path) or "")
+        except Exception:  # unreadable or malformed: an absent fact
+            continue
+        if not isinstance(record, dict):
+            continue
+        claim_id = record.get("claim_id")
+        if _valid_claim_id(claim_id):
+            claims.setdefault(claim_id, record)
+    return [claims[claim_id] for claim_id in sorted(claims)]
+
+
+def read_document_map(orch) -> Dict[str, Any]:
+    """The persisted document map, ``{}`` when absent or unparseable."""
+    if not orch:
+        return {}
+    try:
+        payload = json.loads(_read_config_text(orch, DOCUMENT_MAP_PATH) or "")
+    except Exception:  # unreadable or malformed: an absent map, not an error
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _claim_domain(claim: Dict[str, Any]) -> Optional[str]:
+    applicability = claim.get("applicability")
+    if not isinstance(applicability, dict):
+        return None
+    domain = applicability.get("domain")
+    return domain if isinstance(domain, str) and domain else None
+
+
+def _claim_argv_paths(claim: Dict[str, Any]) -> List[str]:
+    """The path-shaped tokens of a lifecycle claim: its cwd and its argv.
+
+    Argv is read verbatim (the claim preserves what the document said); only
+    the tokens are inspected, and nothing here ever renders them.
+    """
+    typed_value = claim.get("typed_value")
+    if not isinstance(typed_value, dict):
+        return []
+    tokens: List[str] = []
+    cwd = typed_value.get("cwd")
+    if isinstance(cwd, str):
+        tokens.append(cwd)
+    argv = typed_value.get("argv")
+    if isinstance(argv, (list, tuple)):
+        tokens.extend(token for token in argv if isinstance(token, str))
+    return tokens
+
+
+def _documented_action_ids(claims: List[Dict[str, Any]], root: str) -> List[str]:
+    """Claim IDs documenting this domain — IDs ONLY, never the commands.
+
+    Two deterministic matches: the claim's ``applicability.domain`` names this
+    exact root, or its lifecycle argv/cwd references a path under it. A claim
+    scoped to a nested directory belongs to that directory, not to the parent
+    domain, so applicability matching is exact.
+    """
+    matched: List[str] = []
+    for claim in claims or ():
+        claim_id = claim.get("claim_id")
+        if not _valid_claim_id(claim_id):
+            continue
+        domain = _claim_domain(claim)
+        if domain is not None and posixpath.normpath(domain) == posixpath.normpath(root):
+            matched.append(claim_id)
+            continue
+        if any(_under_root(token, root) for token in _claim_argv_paths(claim)):
+            matched.append(claim_id)
+    return sorted(dict.fromkeys(matched))
+
+
+def _edge_support_claim_ids(
+    coordinate: Dict[str, Any],
+    consumer: str,
+    producer: str,
+    claims: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    """Claim IDs that literally declare this edge's coordinate at an endpoint.
+
+    The Stage A rule is exact and typed: the claim is scoped to the consumer or
+    the producer domain AND its ``typed_value`` declares the same group+name
+    the edge was derived from. A claim that merely mentions a version somewhere
+    else is not evidence for this edge.
+    """
+    name = coordinate.get("name")
+    if not name:
+        return []
+    group = coordinate.get("group")
+    endpoints = {posixpath.normpath(consumer or ""), posixpath.normpath(producer or "")}
+    matched: List[str] = []
+    for claim in claims or ():
+        claim_id = claim.get("claim_id")
+        domain = _claim_domain(claim)
+        if not _valid_claim_id(claim_id) or domain is None:
+            continue
+        if posixpath.normpath(domain) not in endpoints:
+            continue
+        typed_value = claim.get("typed_value")
+        if not isinstance(typed_value, dict):
+            continue
+        if typed_value.get("group") == group and typed_value.get("name") == name:
+            matched.append(claim_id)
+    return sorted(dict.fromkeys(matched))
+
+
+def derive_domain_edges(
+    domains: List[Dict[str, Any]],
+    *,
+    claims: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, str]]:
     """Coordinate edges between build domains — the ONLY evidence that can say
     whether domains are independent.
 
@@ -1744,6 +1955,11 @@ def derive_domain_edges(domains: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     ``produces`` (group+name match); its status is ``version_incompatible``
     iff the two version strings differ, else ``compatible``. No match, no
     edge: an unmatched dependency is somebody else's artifact.
+
+    Plan 6 Stage A adds identity BESIDE the existing keys: a stable ``edge_id``
+    (so a later stage can invalidate the contracts that depend on an edge
+    revision) and ``support_claim_ids`` — absent when no persisted claim
+    declares this coordinate for either endpoint.
     """
     produced: Dict[tuple, tuple] = {}
     produced_by_name: Dict[str, tuple] = {}
@@ -1795,7 +2011,11 @@ def derive_domain_edges(domains: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                     if unverified
                     else _edge_detail(coordinate, producer_version)
                 ),
+                "edge_id": edge_id_for(consumer, producer, coordinate_key(coordinate)),
             }
+            support = _edge_support_claim_ids(coordinate, consumer, producer, claims)
+            if support:
+                edge["support_claim_ids"] = support
             if edge not in edges:
                 edges.append(edge)
     return edges
@@ -1819,6 +2039,144 @@ def domain_mismatch_clause(edge: Dict[str, str]) -> str:
         f"{edge.get('producer')} builds {producer_version}; "
         f"{edge.get('consumer')} requires {coordinate} {required_version}"
     )
+
+
+def _capability_state_for(root: str, native_artifact_fact: Any) -> Optional[str]:
+    """The domain's native capability state, or None when it has no native root.
+
+    Reads the engine's native-artifact probe shape
+    (``{"status": present|absent|unknown, "root": ...}``) unchanged: capability
+    is PROBED, never inferred from a phase outcome (Plan 5 P0-D). A status
+    outside that vocabulary is not a fact and yields no key.
+    """
+    if not isinstance(native_artifact_fact, dict):
+        return None
+    if not _under_root(native_artifact_fact.get("root"), root):
+        return None
+    status = native_artifact_fact.get("status")
+    return status if status in CAPABILITY_STATES else None
+
+
+def _partial_map_conflicts(partial_map: Any, root: str) -> List[Dict[str, str]]:
+    """The document map's partial entries that fall inside this domain.
+
+    A partial map is the map's own conflict list: a bounded survey that
+    excluded a symlink escape, a binary, a vendored tree or over-budget content
+    says so rather than passing itself off as complete.
+    """
+    conflicts: List[Dict[str, str]] = []
+    if not isinstance(partial_map, (list, tuple)):
+        return conflicts
+    for entry in partial_map:
+        if not isinstance(entry, dict):
+            continue
+        path = next(
+            (
+                entry[key]
+                for key in ("path", "realpath")
+                if isinstance(entry.get(key), str) and entry.get(key)
+            ),
+            None,
+        )
+        if not _under_root(path, root):
+            continue
+        conflict = {"kind": "partial_map", "path": path}
+        reason = entry.get("reason")
+        if isinstance(reason, str) and reason:
+            conflict["reason"] = reason
+        if conflict not in conflicts:
+            conflicts.append(conflict)
+    return conflicts
+
+
+def _domain_open_conflicts(
+    root: str,
+    edges: Any,
+    partial_map: Any,
+) -> List[Dict[str, str]]:
+    """Everything the survey can already call a conflict for this domain.
+
+    Both endpoints of a version-incompatible edge own it: the consumer cannot
+    resolve the artifact and the producer builds the other version. Compatible
+    and unverified edges are NOT conflicts — an unverified link is an unknown,
+    and calling it a conflict would seal a domain the survey never disproved.
+    """
+    conflicts: List[Dict[str, str]] = []
+    for edge in edges or ():
+        if not isinstance(edge, dict) or edge.get("status") != "version_incompatible":
+            continue
+        if root not in (edge.get("consumer"), edge.get("producer")):
+            continue
+        conflict = {
+            "kind": "version_incompatible",
+            "edge_id": edge.get("edge_id"),
+            "detail": domain_mismatch_clause(edge) or edge.get("detail") or "",
+        }
+        if conflict not in conflicts:
+            conflicts.append(conflict)
+    conflicts.extend(_partial_map_conflicts(partial_map, root))
+    return conflicts
+
+
+def build_domain_facts(
+    orch,
+    domains: Optional[List[Dict[str, Any]]],
+    edges: Optional[List[Dict[str, Any]]] = None,
+    *,
+    claims: Optional[List[Dict[str, Any]]] = None,
+    document_map: Optional[Dict[str, Any]] = None,
+    native_artifact_fact: Optional[Dict[str, Any]] = None,
+    fact_epoch: int = DOMAIN_FACT_EPOCH,
+) -> List[Dict[str, Any]]:
+    """Project the typed build domains onto neutral ``DomainFacts`` (spec §C2).
+
+    One record per domain, in survey order:
+    ``{domain_id, root, system, languages?, role, environment, produces?,
+    requires?, documented_actions?, capability_state?, open_conflicts?,
+    fact_epoch}``. Absent facts stay absent keys, exactly as the domains
+    themselves do.
+
+    What this is NOT: ``DomainFacts`` contains no goal, no chosen order, no
+    recommended action, no probe sequence and no prose plan. ``role`` and
+    ``environment`` are the constant ``unknown`` until a deterministic rule
+    exists, and ``documented_actions`` are claim IDENTIFIERS — the commands a
+    document quotes never travel with them.
+
+    ``claims`` / ``document_map`` default to reading the persisted Stage A
+    files through ``orch``; callers that already hold them (the analyzer reads
+    the claims once for the edges) pass them in to avoid a second read.
+    """
+    if not domains:
+        return []
+    records = read_policy_claims(orch) if claims is None else list(claims)
+    mapping = read_document_map(orch) if document_map is None else (document_map or {})
+    partial_map = mapping.get("partial_map") if isinstance(mapping, dict) else None
+
+    facts: List[Dict[str, Any]] = []
+    for domain in domains:
+        root = str(domain.get("root") or "")
+        fact: Dict[str, Any] = {"domain_id": domain_id_for(root), "root": root}
+        if domain.get("system"):
+            fact["system"] = domain["system"]
+        if domain.get("languages"):
+            fact["languages"] = list(domain["languages"])
+        fact["role"] = UNKNOWN_DOMAIN_ROLE
+        fact["environment"] = UNKNOWN_DOMAIN_ENVIRONMENT
+        for key in ("produces", "requires"):
+            if domain.get(key):
+                fact[key] = list(domain[key])
+        documented_actions = _documented_action_ids(records, root)
+        if documented_actions:
+            fact["documented_actions"] = documented_actions
+        capability_state = _capability_state_for(root, native_artifact_fact)
+        if capability_state:
+            fact["capability_state"] = capability_state
+        open_conflicts = _domain_open_conflicts(root, edges, partial_map)
+        if open_conflicts:
+            fact["open_conflicts"] = open_conflicts
+        fact["fact_epoch"] = int(fact_epoch)
+        facts.append(fact)
+    return facts
 
 
 def scan_root_build_markers(orch, project_path: str) -> Dict[str, Any]:
