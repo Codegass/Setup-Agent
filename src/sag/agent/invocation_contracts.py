@@ -73,6 +73,27 @@ UNRECORDED_ENVELOPE_PREFIX = "envelope-unrecorded"
 # unknown, not a block, so it is not a blocking conflict id (spec §C2).
 BLOCKING_CONFLICT_KINDS = ("version_incompatible",)
 
+# What a dispatch of each PUBLIC verb promises to leave behind (Plan 6 Stage C,
+# spec §C5). The typed expectation is what the assessor compares the receipt
+# against, so it is decided here — before the run — and never after it.
+#
+# `deps` is deliberately absent: dependency resolution writes no report and no
+# artifact, so exit 0 with an empty delta is its NORMAL outcome and a contract
+# that expected otherwise would falsify every successful resolution.
+EXPECTED_OBSERVATIONS = {
+    "build": ("artifact_or_report_delta",),
+    "compile": ("artifact_or_report_delta",),
+    "install": ("artifact_or_report_delta",),
+    "package": ("artifact_or_report_delta",),
+    "test": ("report_delta",),
+}
+# The v1 typed predicate a receipt may be measured against: an exit 0 that left
+# nothing observable behind (the gradle NO-SOURCE shape). This is the ONLY
+# licence the assessor has to contradict a claim, so the set stays minimal.
+DIRECT_FALSIFIERS = (
+    {"predicate_id": "empty_delta_despite_success", "kind": "delta_empty_on_exit0"},
+)
+
 _SEQUENCE = itertools.count(1)
 _SEQUENCE_LOCK = threading.Lock()
 _SCOPE = threading.local()
@@ -114,6 +135,26 @@ def unrecorded_envelope_id() -> str:
     return f"{UNRECORDED_ENVELOPE_PREFIX}-{sequence:06d}"
 
 
+def expected_observations(action: Any) -> List[str]:
+    """What a dispatch of this public verb promises to leave behind.
+
+    A verb the table does not name promises NOTHING — an empty list, written as
+    an absent key. Guessing an expectation is how a harness invents a mismatch.
+    """
+    return list(EXPECTED_OBSERVATIONS.get(_text(action).lower(), ()))
+
+
+def direct_falsifiers(action: Any) -> List[Dict[str, str]]:
+    """The typed predicates that may contradict a claim for this verb.
+
+    Bound to `expected_observations`: with nothing expected there is nothing to
+    falsify, so a verb that promises no observation names no falsifier either.
+    """
+    if not expected_observations(action):
+        return []
+    return [dict(falsifier) for falsifier in DIRECT_FALSIFIERS]
+
+
 def build_contract(
     *,
     envelope_id: str,
@@ -130,12 +171,14 @@ def build_contract(
     domain_id: Optional[str] = None,
     blocking_conflict_ids: Optional[Sequence[str]] = None,
     predecessor_contract_id: Optional[str] = None,
+    expected_observations: Optional[Sequence[str]] = None,
+    direct_falsifiers: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble one schema-v1 contract. Pure — no probes, no I/O.
 
-    Field names and shapes are the plan's Stage B v1 list verbatim; the fields
-    `expected_observations`/`direct_falsifiers`/`supersedes_contract_id` arrive
-    with Stage C and are not invented here.
+    Field names and shapes are the plan's Stage B v1 list verbatim, plus the
+    Stage C typed expectations (`expected_observations`/`direct_falsifiers`)
+    the assessor reads back; `supersedes_contract_id` is not invented here.
     """
     argv = _text(expected_argv)
     identifier = contract_identity(envelope_id, argv)
@@ -168,6 +211,17 @@ def build_contract(
     contract["expected_cwd"] = _text(expected_cwd)
     if argv:
         contract["expected_argv"] = argv
+    observations = [_text(value) for value in expected_observations or ()]
+    observations = [value for value in observations if value]
+    if observations:
+        contract["expected_observations"] = observations
+        predicates = [
+            {str(key): _text(value) for key, value in dict(falsifier).items()}
+            for falsifier in direct_falsifiers or ()
+            if isinstance(falsifier, Mapping)
+        ]
+        if predicates:
+            contract["direct_falsifiers"] = predicates
     conflicts = [_text(value) for value in blocking_conflict_ids or ()]
     conflicts = [value for value in conflicts if value]
     if conflicts:
@@ -234,8 +288,14 @@ def freeze_contract(
     the contract is a commitment against.
 
     A None return is not a warning — the caller has no authority to dispatch.
+
+    The typed expectations are derived from the PUBLIC verb the model
+    submitted, not from the materialized action: `verify`, `assemble` and a
+    gradle task list are three spellings of the same public promise, and the
+    assessor compares against the promise.
     """
     fact = _domain_fact(requirements, expected_cwd)
+    action = (params or {}).get("action")
     try:
         contract = build_contract(
             envelope_id=envelope_id,
@@ -252,6 +312,8 @@ def freeze_contract(
             domain_id=fact.get("domain_id") if fact else None,
             blocking_conflict_ids=_blocking_conflict_ids(fact),
             predecessor_contract_id=predecessor_contract_id,
+            expected_observations=expected_observations(action),
+            direct_falsifiers=direct_falsifiers(action),
         )
     except (TypeError, ValueError) as exc:
         # A call the canonical form cannot represent cannot be committed to,
@@ -490,6 +552,8 @@ __all__ = [
     "CONTRACT_PERSIST_FAILED",
     "CONTRACT_SCHEMA_VERSION",
     "DEFAULT_INTENT_SOURCE",
+    "DIRECT_FALSIFIERS",
+    "EXPECTED_OBSERVATIONS",
     "INTENT_SOURCES",
     "UNRECORDED_ENVELOPE_PREFIX",
     "action_context",
@@ -501,7 +565,9 @@ __all__ = [
     "contract_receipt_fields",
     "current_action_context",
     "current_contract",
+    "direct_falsifiers",
     "dispatch_contract",
+    "expected_observations",
     "freeze_contract",
     "set_action_context",
     "unrecorded_envelope_id",

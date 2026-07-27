@@ -17,6 +17,13 @@ stable evidence anchor. This module replaces that path:
   refused"). A refusal dispatched no runner, so it mints no receipt, but it is
   not silence either.
 
+Plan 6 Stage C (spec §C5) adds the thing that WRITES those receipt verdicts:
+`assess_receipt` compares a frozen contract with the receipt of the dispatch it
+authorized and answers with ONE typed code. The point of the taxonomy is that a
+mismatch is not automatically a contradiction — a proxy timeout, a fingerprint
+the harness has moved past and a genuinely empty compile are three different
+facts, and Plan 5 recorded all three as "the build failed".
+
 Two properties make replay safe: `assessment_id` is derived from the subject
 and the typed code, so writing the same verdict twice is idempotent; and a
 DIFFERENT body under an existing id is refused, never merged and never
@@ -31,12 +38,15 @@ is the phase gate's business, not the runner's.
 import hashlib
 import itertools
 import json
+import re
 import shlex
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
+
+from sag.agent.invocation_receipts import RECEIPT_DIR
 
 ASSESSMENT_SCHEMA_VERSION = 1
 ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
@@ -51,6 +61,70 @@ CODE_SLUG_MAX_CHARS = 40
 # this set is a programming error, not a fact about the run, so it is refused
 # rather than persisted.
 CONTROL_STAGES = ("precondition", "materialization", "envelope", "dispatch")
+
+# --- the §C5 receipt taxonomy ----------------------------------------------
+# Codes whose CAUSE lies outside the project: nothing was learned about the
+# code, so they leave the expected claim unknown/blocked and can never
+# contradict it, however suggestive the rest of the receipt looks.
+BLOCKED_CLASS_CODES = (
+    "no_dispatch",
+    "transient_network",
+    "timeout",
+    "permission_denied",
+    "precondition_unmet",
+)
+# The contract was frozen against pins the harness has since moved past. The
+# receipt stays historical evidence; it just no longer speaks for NOW.
+STALE_FINGERPRINT = "stale_fingerprint"
+# The dispatch did not run the frozen vector. That is an observation about the
+# dispatch, never evidence against a contract it declined to honour.
+DEVIATED_RECEIPT = "deviated_receipt"
+# The dispatch honoured the contract and produced what it promised.
+EXPECTATION_MET = "expectation_met"
+# It honoured the contract and did not. An honest failure — a compiler error is
+# a real fact about the run, but it falsifies no claim on its own.
+EXPECTATION_UNMET = "expectation_unmet"
+# `falsifier_<predicate_id>` is the ONLY contradicting shape (spec §C5).
+FALSIFIER_PREFIX = "falsifier_"
+# `capability_absent_<name>` rides alongside the primary verdict.
+CAPABILITY_PREFIX = "capability_absent_"
+
+# The compliance classes that let a receipt speak for the contract at all.
+# `None` is UNKNOWABLE, not compliant, so it is deliberately not here.
+COMPLIANT_CLASSES = ("exact", "equivalent")
+
+# What a dispatch STATE means, typed. The routing authority is the typed fact
+# the facade already holds — never a raw failure string (spec §C6).
+DISPATCH_STATUS_CODES = {
+    "cancelled": "no_dispatch",
+    "pending": "no_dispatch",
+    "timeout": "timeout",
+}
+# Which typed tool error codes name a cause outside the project. Data, so a new
+# runner adds a row instead of a branch.
+BLOCKED_CLASS_ERROR_CODES = {
+    "CONNECTION_ERROR": "transient_network",
+    "ENV_ACTIVATION_NOT_CONFIRMED": "precondition_unmet",
+    "NETWORK_ERROR": "transient_network",
+    "PERMISSION_ERROR": "permission_denied",
+    "PREREQUISITE_INCOMPLETE": "precondition_unmet",
+    "VERSION_MISMATCH": "precondition_unmet",
+}
+# The pins a contract and the harness's current state can disagree about. A pin
+# only one side states is UNKNOWN, never a mismatch.
+FINGERPRINT_KEYS = (
+    "target_sha",
+    "config_fingerprint",
+    "document_map_fingerprint",
+    "survey_fingerprint",
+)
+# The named capabilities a skip reason can reveal as absent. PATTERNS, not
+# project names: the table is data, an ecosystem adds a row, and the assessor
+# never learns what a project is called.
+CAPABILITY_PATTERNS = (
+    {"name": "llvm", "pattern": "need llvm|LLVM"},
+    {"name": "cuda", "pattern": "CUDA"},
+)
 
 _SEQUENCE = itertools.count(1)
 _SEQUENCE_LOCK = threading.Lock()
@@ -204,6 +278,311 @@ def write_assessment(execute, assessment) -> bool:
     return _succeeded(result)
 
 
+# ---------------------------------------------------------------------------
+# the assessor: one contract, one receipt, one typed verdict (spec §C5)
+# ---------------------------------------------------------------------------
+
+
+def assess_receipt(
+    contract: Optional[Mapping[str, Any]],
+    receipt: Optional[Mapping[str, Any]],
+    *,
+    current_fingerprints: Optional[Mapping[str, str]] = None,
+    dispatch_status: Optional[str] = None,
+    error_code: Optional[str] = None,
+) -> ReceiptAssessment:
+    """What ONE finalized receipt means against the contract that authorized it.
+
+    The order below IS the taxonomy (spec §C5), because each rule disqualifies
+    the ones under it:
+
+    1. a cause outside the project — no dispatch, network, timeout, permission,
+       an unmet environment precondition — means nothing was learned about the
+       code, so it is a blocked-class code and can never contradict;
+    2. a pin the harness has moved past makes the receipt historical, not
+       current, so it is `stale_fingerprint`;
+    3. a dispatch that left the frozen vector is a `deviated_receipt`: an extra
+       observation about the dispatch, never evidence against a contract it
+       declined to honour;
+    4. only then, and only for an exact/equivalent fresh receipt, may a typed
+       direct falsifier fire — `falsifier_<predicate_id>`, the one contradicting
+       shape in the vocabulary;
+    5. otherwise the exit code decides between `expectation_met` and
+       `expectation_unmet`.
+
+    `dispatch_status` and `error_code` are the TYPED facts the facade already
+    holds (the invocation status and the tool's own error code). Raw failure
+    text is diagnostics, never the routing authority (spec §C6).
+
+    Pure: no I/O, no clock, no probes — the same evidence always yields the same
+    verdict, which is what makes the persisted assessment replayable.
+    """
+    pins = _pinned_fingerprints(contract, receipt)
+    identifier = _text((receipt or {}).get("receipt_id"))
+
+    def verdict(typed_code: str, detail: str) -> ReceiptAssessment:
+        return ReceiptAssessment(
+            receipt_id=identifier,
+            typed_code=typed_code,
+            detail=detail,
+            fingerprints=pins or None,
+        )
+
+    blocked = _blocked_class(receipt, dispatch_status, error_code)
+    if blocked is not None:
+        return verdict(*blocked)
+
+    stale = _stale_pin(pins, current_fingerprints)
+    if stale is not None:
+        key, pinned, current = stale
+        return verdict(
+            STALE_FINGERPRINT,
+            f"the contract pinned {key}={pinned}; the current {key} is {current}",
+        )
+
+    compliance = _text((receipt or {}).get("compliance"))
+    if compliance == "deviated":
+        return verdict(
+            DEVIATED_RECEIPT,
+            f"the dispatch ran {_text((receipt or {}).get('argv'))!r} instead of the "
+            f"frozen {_text((contract or {}).get('expected_argv'))!r}",
+        )
+
+    promised = _expected_observations(contract)
+    stated = ", ".join(promised) if promised else "no stated observation"
+    if compliance in COMPLIANT_CLASSES:
+        predicate = _falsified_predicate(contract, receipt)
+        if predicate:
+            return verdict(
+                f"{FALSIFIER_PREFIX}{predicate}",
+                f"exit 0 produced none of the expected {stated}",
+            )
+
+    exit_code = _exit_code(receipt)
+    if exit_code == 0:
+        return verdict(EXPECTATION_MET, f"exit 0; nothing contradicts the expected {stated}")
+    return verdict(EXPECTATION_UNMET, f"exit {exit_code} against the expected {stated}")
+
+
+def capability_absences(receipt: Optional[Mapping[str, Any]]) -> List[ReceiptAssessment]:
+    """`capability_absent_<name>` for every capability a skip reason revealed.
+
+    These ride ALONGSIDE the primary verdict rather than replacing it: a test
+    suite that skipped its LLVM cases still passed the cases it ran, and the
+    skip reason is the only place the environment says the capability is
+    missing at all. One assessment per NAME, in the table's own order, so the
+    same receipt always yields the same list.
+    """
+    identifier = _text((receipt or {}).get("receipt_id"))
+    reasons = _skip_reasons(receipt)
+    if not identifier or not reasons:
+        return []
+    absences: List[ReceiptAssessment] = []
+    for entry in CAPABILITY_PATTERNS:
+        name = _text(entry.get("name"))
+        pattern = str(entry.get("pattern") or "")
+        if not name or not pattern:
+            continue
+        try:
+            matcher = re.compile(pattern)
+        except re.error:
+            logger.debug(f"capability pattern for {name} is not a valid expression")
+            continue
+        hit = next(((node, reason) for node, reason in reasons if matcher.search(reason)), None)
+        if hit is None:
+            continue
+        node, reason = hit
+        absences.append(
+            ReceiptAssessment(
+                receipt_id=identifier,
+                typed_code=f"{CAPABILITY_PREFIX}{name}",
+                detail=f"{node} was skipped: {reason}",
+            )
+        )
+    return absences
+
+
+def read_receipt(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    receipt_id: Any,
+) -> Optional[Dict[str, Any]]:
+    """The finalized receipt `receipt_id`, or None when it cannot be read.
+
+    The assessor works from the persisted bytes, not from whatever the runner
+    happened to keep in memory: an assessment of a receipt nobody can read
+    would be a verdict about nothing.
+    """
+    identifier = _text(receipt_id)
+    if not identifier:
+        return None
+    payload = _read_existing(execute, f"{RECEIPT_DIR}/{identifier}.json")
+    if not isinstance(payload, dict) or "unparseable" in payload:
+        return None
+    return payload
+
+
+def assess_dispatch(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    *,
+    contract: Optional[Mapping[str, Any]],
+    receipt: Optional[Mapping[str, Any]],
+    current_fingerprints: Optional[Mapping[str, str]] = None,
+    dispatch_status: Optional[str] = None,
+    error_code: Optional[str] = None,
+) -> List[ReceiptAssessment]:
+    """Assess ONE dispatch and persist every verdict; return the ones that landed.
+
+    The primary verdict first, then any capability absence. Persistence is
+    idempotent (`write_assessment`), so re-assessing the same receipt — a
+    replay, a second pass over the same execution trace — writes nothing new.
+    """
+    if not _text((receipt or {}).get("receipt_id")):
+        return []
+    assessments = [
+        assess_receipt(
+            contract,
+            receipt,
+            current_fingerprints=current_fingerprints,
+            dispatch_status=dispatch_status,
+            error_code=error_code,
+        )
+    ]
+    assessments.extend(capability_absences(receipt))
+    return [assessment for assessment in assessments if write_assessment(execute, assessment)]
+
+
+def _blocked_class(
+    receipt: Optional[Mapping[str, Any]],
+    dispatch_status: Optional[str],
+    error_code: Optional[str],
+) -> Optional[Tuple[str, str]]:
+    """The blocked-class code this dispatch earned, or None when none applies."""
+    status = _text(dispatch_status).lower()
+    if status in DISPATCH_STATUS_CODES:
+        return DISPATCH_STATUS_CODES[status], f"the dispatch ended as {status}"
+    if _exit_code(receipt) is None:
+        return "no_dispatch", "the receipt records no exit state for this dispatch"
+    code = _text(error_code).upper()
+    typed = BLOCKED_CLASS_ERROR_CODES.get(code)
+    if typed:
+        return typed, f"the runner reported {code}"
+    return None
+
+
+def _stale_pin(
+    pinned: Mapping[str, str],
+    current: Optional[Mapping[str, str]],
+) -> Optional[Tuple[str, str, str]]:
+    """The first pin the contract and the present disagree about.
+
+    A pin only one side states is UNKNOWN, never a mismatch — calling it stale
+    would invent a disagreement neither side ever expressed.
+    """
+    for key in FINGERPRINT_KEYS:
+        was = _text(pinned.get(key))
+        now = _text((current or {}).get(key))
+        if was and now and was != now:
+            return key, was, now
+    return None
+
+
+def _falsified_predicate(
+    contract: Optional[Mapping[str, Any]],
+    receipt: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    """The `predicate_id` this receipt establishes, or None (v1: one predicate).
+
+    `delta_empty_on_exit0`: the runner said success and left nothing behind.
+    For a verb that promises an artifact OR a report delta, the artifact side
+    must be an EXPLICIT absence — a receipt that says nothing about artifacts
+    states an unknown, and an unknown never contradicts (spec §C5). So a green
+    compile whose receipt carries no artifact facts is not falsified; when the
+    receipt gains an artifact delta, the predicate covers it with no change
+    here.
+    """
+    observations = _expected_observations(contract)
+    if not observations:
+        return None
+    if _exit_code(receipt) != 0:
+        return None
+    if _delta_is_empty((receipt or {}).get("report_delta")) is not True:
+        return None
+    if "artifact_or_report_delta" in observations:
+        if _delta_is_empty((receipt or {}).get("artifact_delta")) is not True:
+            return None
+    for falsifier in (contract or {}).get("direct_falsifiers") or ():
+        if not isinstance(falsifier, Mapping):
+            continue
+        if _text(falsifier.get("kind")) != "delta_empty_on_exit0":
+            continue
+        predicate = _text(falsifier.get("predicate_id"))
+        if predicate:
+            return predicate
+    return None
+
+
+def _expected_observations(contract: Optional[Mapping[str, Any]]) -> List[str]:
+    raw = (contract or {}).get("expected_observations")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [text for text in (_text(value) for value in raw) if text]
+
+
+def _pinned_fingerprints(
+    contract: Optional[Mapping[str, Any]],
+    receipt: Optional[Mapping[str, Any]],
+) -> Dict[str, str]:
+    """The pins this dispatch was decided on; the CONTRACT's pin wins.
+
+    The contract is the commitment, so where both state a pin the contract's is
+    the one the harness promised against.
+    """
+    pins: Dict[str, str] = {}
+    for source in (receipt, contract):
+        for key in FINGERPRINT_KEYS:
+            value = _text((source or {}).get(key))
+            if value:
+                pins[key] = value
+    return pins
+
+
+def _skip_reasons(receipt: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
+    """`(node_id, reason)` for every SKIPPED testcase the receipt recorded."""
+    outcomes = (receipt or {}).get("testcase_outcomes")
+    nodes = outcomes.get("nodes") if isinstance(outcomes, Mapping) else None
+    if not isinstance(nodes, (list, tuple)):
+        return []
+    reasons: List[Tuple[str, str]] = []
+    for node in nodes:
+        if not isinstance(node, Mapping) or _text(node.get("status")) != "skipped":
+            continue
+        reason = _text(node.get("reason"))
+        if reason:
+            reasons.append((_text(node.get("node_id")), reason))
+    return reasons
+
+
+def _delta_is_empty(delta: Any) -> Optional[bool]:
+    """True/False when the delta states its lists; None when it states nothing."""
+    if not isinstance(delta, Mapping):
+        return None
+    buckets: List[Sequence[Any]] = []
+    for key in ("new", "changed"):
+        value = delta.get(key)
+        if not isinstance(value, (list, tuple)):
+            return None
+        buckets.append(value)
+    return not any(buckets)
+
+
+def _exit_code(receipt: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The exit state the receipt recorded; None when it recorded none."""
+    value = (receipt or {}).get("exit_code")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _read_existing(execute, path: str) -> Optional[Dict[str, Any]]:
     """The assessment already at `path`, or None when there is none to honour.
 
@@ -235,6 +614,10 @@ def _succeeded(result: Mapping[str, Any]) -> bool:
 
 def _bounded(detail: Any) -> str:
     return " ".join(str(detail or "").split())[:DETAIL_MAX_CHARS]
+
+
+def _text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
 
 
 def _slug(value: Any) -> str:

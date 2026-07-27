@@ -5,9 +5,13 @@ import re
 import shlex
 from typing import Any, Dict, List, Mapping, Optional
 
+from loguru import logger
+
 from sag.agent.evidence_assessments import (
     ControlAssessment,
+    assess_dispatch,
     next_control_event_id,
+    read_receipt,
     write_assessment,
 )
 from sag.agent.invocation_contracts import (
@@ -351,6 +355,11 @@ class BuildTool(BaseTool):
                         actual_executions.append(_execute_backend())
                         inner = actual_executions[-1].result
 
+        # --- contract-vs-receipt assessment (Plan 6 Stage C, spec §C5) ------
+        # What the dispatch MEANT is decided here, against the contract that
+        # authorized it — never inside the runner, which only knows what it did.
+        self._assess_receipts(contract, requirements, actual_executions)
+
         # Computed last so it lands FIRST: the model must read what actually ran
         # before it reasons about the result (spec §Stage D contract 4).
         delta_line = self._semantic_delta_line(
@@ -375,6 +384,75 @@ class BuildTool(BaseTool):
             jdk_retry_meta,
             contract,
         ).with_execution_trace(actual_executions)
+
+    # --- contract-vs-receipt assessment (spec §C5) --------------------------
+
+    def _assess_receipts(
+        self,
+        contract: Optional[Mapping[str, Any]],
+        requirements: Mapping[str, Any],
+        executions: List[Any],
+    ) -> None:
+        """Assess every receipt this facade call minted, and persist the verdicts.
+
+        Each physical dispatch is assessed on its own — the JDK-driven rerun is
+        a second dispatch under the same contract, and reading only the last
+        receipt would erase the first one's meaning.
+
+        This never changes the result and never raises: the model is waiting on
+        a build, and a verdict that could not be written is a missing evidence
+        record, not a failed build. A DISPATCHED receipt with no assessment is
+        an evidence-closure hole the phase gate should refuse to close over;
+        that gate reads the assessment directory and lands in Stage D.
+        """
+        assessed = set()
+        for execution in executions:
+            result = getattr(execution, "result", None)
+            metadata = getattr(result, "metadata", None) or {}
+            receipt_id = str(metadata.get("receipt_id") or "").strip()
+            if not receipt_id or receipt_id in assessed:
+                continue
+            assessed.add(receipt_id)
+            try:
+                receipt = read_receipt(self.docker_orchestrator.execute_command, receipt_id)
+                if not receipt:
+                    logger.debug(f"receipt {receipt_id} could not be read back; not assessed")
+                    continue
+                assess_dispatch(
+                    self.docker_orchestrator.execute_command,
+                    contract=contract,
+                    receipt=receipt,
+                    current_fingerprints=self._current_fingerprints(requirements, receipt),
+                    dispatch_status=getattr(result.invocation_status, "value", None),
+                    error_code=result.error_code,
+                )
+            except Exception as exc:  # evidence never breaks the build result
+                logger.debug(f"receipt {receipt_id} was not assessed: {exc}")
+
+    @staticmethod
+    def _current_fingerprints(
+        requirements: Mapping[str, Any],
+        receipt: Mapping[str, Any],
+    ) -> Dict[str, str]:
+        """The pins the harness can state NOW, without a second probe.
+
+        The survey stamp is the current config/document-map pin, and the
+        receipt's own target sha is the most recent observation of the tree —
+        it was probed AFTER the dispatch, where the contract's was probed
+        before. A pin nobody currently states stays absent, so it can never be
+        read as a mismatch.
+        """
+        current: Dict[str, str] = {}
+        survey = requirements.get("survey") if isinstance(requirements, Mapping) else None
+        if isinstance(survey, Mapping):
+            for key in ("config_fingerprint", "document_map_fingerprint", "survey_fingerprint"):
+                value = str(survey.get(key) or "").strip()
+                if value:
+                    current[key] = value
+        target_sha = str((receipt or {}).get("target_sha") or "").strip()
+        if target_sha:
+            current["target_sha"] = target_sha
+        return current
 
     # --- domain-edge execution law (spec §C2) -------------------------------
 

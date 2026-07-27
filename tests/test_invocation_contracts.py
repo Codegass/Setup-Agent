@@ -245,6 +245,10 @@ def test_freeze_contract_omits_every_pin_it_does_not_know():
         "requested_call",
         "effective_action",
         "expected_cwd",
+        # Not pins: the Stage C typed expectations are derived from the public
+        # verb the caller submitted, so `compile` always states them.
+        "expected_observations",
+        "direct_falsifiers",
     }
 
 
