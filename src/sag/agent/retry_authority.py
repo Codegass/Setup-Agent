@@ -135,7 +135,37 @@ def environment_fingerprint(contract: Optional[Mapping[str, Any]]) -> Optional[s
     return _text((contract or {}).get("config_fingerprint")) or None
 
 
-def compute_retry_key(contract: Optional[Mapping[str, Any]], typed_code: Any) -> str:
+TOOLCHAIN_REGISTRY_PATH = "/workspace/.setup_agent/toolchains.json"
+
+
+def toolchain_state_fingerprint(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+) -> Optional[str]:
+    """A content hash of the container's toolchain registry, or None.
+
+    Live p6v-cli-r1: registering Maven 3.9.9 after a version-gate failure IS
+    the material toolchain change spec §C7 names — but the config pin never
+    moves, so the retry of the same compile was refused. The registry file is
+    where that state lives; hashing its bytes makes any registration part of
+    the retry identity without resolving a single executable.
+    """
+    try:
+        result = execute(f"cat {TOOLCHAIN_REGISTRY_PATH} 2>/dev/null") or {}
+    except Exception as exc:  # the ledger must never break a dispatch
+        logger.debug(f"toolchain registry unreadable: {exc}")
+        return None
+    body = (result.get("output") or "").strip()
+    if not result.get("success") or not body:
+        return None
+    return canonical_sha256({"toolchains": body})[:16]
+
+
+def compute_retry_key(
+    contract: Optional[Mapping[str, Any]],
+    typed_code: Any,
+    *,
+    toolchain_state: Optional[str] = None,
+) -> str:
     """The plan's `retry_key` for one (dispatch, typed failure) pair.
 
     Canonical hashing is `control_events.canonical_sha256`, so the ledger's
@@ -155,6 +185,7 @@ def compute_retry_key(contract: Optional[Mapping[str, Any]], typed_code: Any) ->
         ("target_sha", _text((contract or {}).get("target_sha"))),
         ("domain_id", _text((contract or {}).get("domain_id"))),
         ("environment_fingerprint", environment_fingerprint(contract)),
+        ("toolchain_state", _text(toolchain_state)),
     ):
         if value:
             material[key] = value
@@ -407,8 +438,12 @@ def blocking_entry(
     if not ledger:
         return None
     reader = read_contract or (lambda identifier: read_frozen_contract(execute, identifier))
+    # The candidate's identity includes the toolchain registry AS OF NOW: a
+    # registration between the recorded failure and this dispatch changes the
+    # key, so the version-recovery retry is a new dispatch, not a repeat.
+    toolchain_state = toolchain_state_fingerprint(execute)
     for code in sorted({_text(entry.get("typed_code")) for entry in ledger.values()} - {""}):
-        key = compute_retry_key(candidate, code)
+        key = compute_retry_key(candidate, code, toolchain_state=toolchain_state)
         entry = ledger.get(key)
         if not entry or _text(entry.get("typed_code")) != code:
             continue

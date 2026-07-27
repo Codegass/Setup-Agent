@@ -884,3 +884,32 @@ def test_recorded_plan5_sessions_grade_without_failures(profile, name):
     # The archived receipts are v1 and parse, so the new assertion registers
     # and passes rather than staying silent on the only live evidence we have.
     assert "receipts.immutable" in verifier.passes
+
+
+def test_control_assessments_share_the_directory_without_corrupting_it():
+    """Live p6v-cli-r1: a ControlAssessment (event_or_intent_id, no
+    receipt_id) in evidence_assessments/ was judged a corrupt
+    ReceiptAssessment and the fail-closed path blocked test closure over a
+    green suite. The two record shapes share one directory by design."""
+    from sag.agent.phase_gates import _condemned_receipt_ids
+
+    control = {
+        "schema_version": 1,
+        "assessment_id": "asm-ctl_build_retry_0001-retry_without_delta-bffda016",
+        "event_or_intent_id": "ctl-build_retry-0001",
+        "stage": "precondition",
+        "typed_code": "retry_without_delta",
+        "detail": "already failed as expectation_unmet x1",
+    }
+    receipts = [{"receipt_id": "inv-maven-1-0001", "outcome": "completed"}]
+    condemning = {
+        "schema_version": 1,
+        "assessment_id": "asm-x",
+        "receipt_id": "inv-maven-1-0001",
+        "typed_code": "compile_no_source_mismatch",
+    }
+
+    condemned, conflicts = _condemned_receipt_ids(receipts, [control, condemning])
+
+    assert condemned == frozenset({"inv-maven-1-0001"})
+    assert conflicts == ()  # the control record raises no missing-receipt noise

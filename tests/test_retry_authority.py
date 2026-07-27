@@ -833,3 +833,62 @@ def test_the_controller_and_the_facade_agree_on_one_key(forced_engine):  # noqa:
     refused = build_tool(orchestrator).execute(action="test", working_directory=DOMAIN)
 
     assert refused.error_code == RETRY_WITHOUT_DELTA
+
+
+class _RegistryOrch:
+    """Answers the toolchain-registry cat with configurable content."""
+
+    def __init__(self, registry_body=""):
+        self.registry_body = registry_body
+
+    def __call__(self, command, **_kwargs):
+        if "toolchains.json" in command:
+            if self.registry_body is None:
+                return {"success": False, "exit_code": 1, "output": ""}
+            return {"success": True, "exit_code": 0, "output": self.registry_body}
+        return {"success": True, "exit_code": 0, "output": ""}
+
+
+def test_a_toolchain_registration_changes_the_retry_identity():
+    """Live p6v-cli-r1: Maven 3.8.7 failed the version gate, the harness
+    registered 3.9.9, and the retry of the SAME compile was refused as
+    RETRY_WITHOUT_DELTA — the registry change is toolchain state, and spec
+    §C7 names changed toolchain state a material difference."""
+    from sag.agent.retry_authority import compute_retry_key, toolchain_state_fingerprint
+
+    contract = {
+        "requested_call": {"tool": "build"},
+        "effective_action": "compile",
+        "expected_argv": "--fail-at-end compile",
+        "config_fingerprint": "cfg-1",
+    }
+    before = toolchain_state_fingerprint(_RegistryOrch("{}"))
+    after = toolchain_state_fingerprint(
+        _RegistryOrch('{"maven": {"3.9.9": "/workspace/apache-maven-3.9.9"}}')
+    )
+
+    key_before = compute_retry_key(contract, "expectation_unmet", toolchain_state=before)
+    key_after = compute_retry_key(contract, "expectation_unmet", toolchain_state=after)
+
+    assert key_before != key_after
+
+
+def test_an_unchanged_registry_keeps_the_retry_identity():
+    from sag.agent.retry_authority import compute_retry_key, toolchain_state_fingerprint
+
+    contract = {"requested_call": {"tool": "build"}, "effective_action": "compile"}
+    state = toolchain_state_fingerprint(_RegistryOrch('{"maven": {}}'))
+
+    assert compute_retry_key(contract, "expectation_unmet", toolchain_state=state) == \
+        compute_retry_key(contract, "expectation_unmet", toolchain_state=state)
+
+
+def test_an_absent_registry_contributes_no_key_material():
+    from sag.agent.retry_authority import compute_retry_key, toolchain_state_fingerprint
+
+    contract = {"requested_call": {"tool": "build"}, "effective_action": "compile"}
+    absent = toolchain_state_fingerprint(_RegistryOrch(None))
+
+    assert absent is None
+    assert compute_retry_key(contract, "x", toolchain_state=absent) == \
+        compute_retry_key(contract, "x")

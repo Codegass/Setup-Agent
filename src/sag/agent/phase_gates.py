@@ -769,6 +769,11 @@ def _condemned_receipt_ids(
     conflicts: list[str] = []
     for record in assessments:
         receipt_id = str(record.get("receipt_id") or "").strip()
+        if not receipt_id and isinstance(record.get("event_or_intent_id"), str):
+            # A ControlAssessment interprets a pre-dispatch event, not a
+            # receipt (spec §C4) — same directory, different subject. It can
+            # neither condemn a receipt nor count as a missing reference.
+            continue
         if receipt_id not in known:
             logger.warning(
                 f"evidence assessment {record.get('assessment_id')!r} names unknown "

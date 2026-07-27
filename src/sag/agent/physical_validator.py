@@ -458,6 +458,16 @@ def assessment_schema_error(payload):
     version = payload.get("schema_version", 1)
     if isinstance(version, bool) or version not in (1, 2):
         return "unsupported schema_version " + repr(payload.get("schema_version"))
+    # Live p6v-cli-r1: the directory holds BOTH record shapes (spec §C4).
+    # A ControlAssessment interprets a pre-dispatch/dispatch event, carries
+    # `event_or_intent_id` and no receipt_id — it is a different record, not
+    # a corrupt ReceiptAssessment, and it can never condemn a receipt.
+    if "receipt_id" not in payload and isinstance(payload.get("event_or_intent_id"), str):
+        for key in ("assessment_id", "typed_code"):
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return "missing " + key
+        return None
     for key in ("assessment_id", "receipt_id", "typed_code"):
         value = payload.get(key)
         if not isinstance(value, str) or not value.strip():

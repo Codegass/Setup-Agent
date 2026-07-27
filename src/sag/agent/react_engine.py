@@ -96,6 +96,7 @@ from .retry_authority import (
     failure_codes,
     read_frozen_contract,
     record_failure,
+    toolchain_state_fingerprint,
 )
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
@@ -4285,10 +4286,11 @@ class ReActEngine(UIEventEmitter):
             contract = read_frozen_contract(execute, contract_id)
             if not contract:
                 return
+            toolchain_state = toolchain_state_fingerprint(execute)
             for typed_code in failure_codes(execute, receipt_id):
                 record_failure(
                     execute,
-                    compute_retry_key(contract, typed_code),
+                    compute_retry_key(contract, typed_code, toolchain_state=toolchain_state),
                     contract_id,
                     typed_code,
                 )
