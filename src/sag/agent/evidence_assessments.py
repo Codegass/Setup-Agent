@@ -496,7 +496,73 @@ def assess_dispatch(
         )
     ]
     assessments.extend(capability_absences(receipt))
+    assessments.extend(dependency_incompatibilities(receipt))
     return [assessment for assessment in assessments if write_assessment(execute, assessment)]
+
+
+# Spec §5 S2: a FAILED testcase whose message matches a known dependency-
+# mismatch shape emits its own distinct typed code, so targeted retrieval can
+# route to dependency metadata instead of the module docs. Data, not project
+# names — extend by adding rows.
+DEPENDENCY_FAILURE_PATTERNS = (
+    {"name": "numpy", "pattern": r"NumPy dtype|numpy\.dtype|numpy dtype"},
+)
+DEPENDENCY_PREFIX = "dependency_incompatible_"
+
+
+def dependency_incompatibilities(
+    receipt: Optional[Mapping[str, Any]],
+) -> List[ReceiptAssessment]:
+    """`dependency_incompatible_<name>` for failure reasons the table names.
+
+    Rides alongside the primary verdict exactly like `capability_absences`:
+    the distinct code is what lets the R2 repair chain start from dependency
+    metadata (live TVM S2: `ValueError: Could not convert T.float32 to a
+    NumPy dtype` after the LLVM rebuild made execution real).
+    """
+    identifier = _text((receipt or {}).get("receipt_id"))
+    reasons = _failure_reasons(receipt)
+    if not identifier or not reasons:
+        return []
+    findings: List[ReceiptAssessment] = []
+    for entry in DEPENDENCY_FAILURE_PATTERNS:
+        name = _text(entry.get("name"))
+        pattern = str(entry.get("pattern") or "")
+        if not name or not pattern:
+            continue
+        try:
+            matcher = re.compile(pattern)
+        except re.error:
+            logger.debug(f"dependency pattern for {name} is not a valid expression")
+            continue
+        hit = next(((node, reason) for node, reason in reasons if matcher.search(reason)), None)
+        if hit is None:
+            continue
+        node_id, reason = hit
+        findings.append(
+            ReceiptAssessment(
+                receipt_id=identifier,
+                typed_code=f"{DEPENDENCY_PREFIX}{name}",
+                detail=f"{node_id}: {reason}"[:400],
+            )
+        )
+    return findings
+
+
+def _failure_reasons(receipt: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
+    """`(node_id, reason)` for every FAILED/ERROR testcase with a message."""
+    outcomes = (receipt or {}).get("testcase_outcomes")
+    nodes = outcomes.get("nodes") if isinstance(outcomes, Mapping) else None
+    if not isinstance(nodes, (list, tuple)):
+        return []
+    reasons: List[Tuple[str, str]] = []
+    for node in nodes:
+        if not isinstance(node, Mapping) or _text(node.get("status")) not in ("failed", "error"):
+            continue
+        reason = _text(node.get("reason"))
+        if reason:
+            reasons.append((_text(node.get("node_id")), reason))
+    return reasons
 
 
 def _blocked_class(

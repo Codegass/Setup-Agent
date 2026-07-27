@@ -190,7 +190,11 @@ _PIP_REQUIREMENT = re.compile(
 _APT_PACKAGE = re.compile(
     r"^(?P<package>[A-Za-z0-9][A-Za-z0-9.+_-]*)" r"(?:(?P<specifier>=)(?P<version>\S+))?$"
 )
-_SHELL_ASSIGNMENT = re.compile(r"^(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$")
+# `name=value` but NEVER `name==constraint`: a pip pin is not an assignment
+# (live tvm r3: `numpy==1.26.*` minted an env claim with value "=1.26.*").
+_SHELL_ASSIGNMENT = re.compile(
+    r"^(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>(?!=).*)$"
+)
 _CMAKE_DEFINITION = re.compile(r"-D(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>[^\s\"']+)")
 _CMAKE_SET = re.compile(
     r"^\s*set\s*\(\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<value>[^\s()\"']+)[^)]*\)",
@@ -728,12 +732,41 @@ def _dockerfile_command_lines(lines: Sequence[str]) -> list[_CommandLine]:
 
 
 def _shell_command_lines(lines: Sequence[str]) -> list[_CommandLine]:
+    """Logical shell commands: backslash continuations join their opener.
+
+    Live tvm r3: `pip3 install \\` + `    numpy==1.26.* \\` are ONE command in
+    shell semantics; reading the continuation as its own line hid the pin from
+    the dependency extractor and fed `numpy==1.26.*` to the env-assignment
+    parser as a mangled assignment.
+    """
     commands: list[_CommandLine] = []
+    pending: Optional[list] = None  # [start, end, parts]
     for number, raw in enumerate(lines, start=1):
         stripped = raw.strip()
+        if pending is not None:
+            if not stripped or stripped.startswith("#"):
+                start, end, parts = pending
+                commands.append(_CommandLine(start, end, " ".join(parts), "shell_command"))
+                pending = None
+                continue
+            if stripped.endswith("\\"):
+                pending[1] = number
+                pending[2].append(stripped[:-1].strip())
+            else:
+                start, _, parts = pending
+                parts.append(stripped)
+                commands.append(_CommandLine(start, number, " ".join(parts), "shell_command"))
+                pending = None
+            continue
         if not stripped or stripped.startswith("#"):
             continue
+        if stripped.endswith("\\"):
+            pending = [number, number, [stripped[:-1].strip()]]
+            continue
         commands.append(_CommandLine(number, number, stripped, "shell_command"))
+    if pending is not None:
+        start, end, parts = pending
+        commands.append(_CommandLine(start, end, " ".join(parts), "shell_command"))
     return commands
 
 

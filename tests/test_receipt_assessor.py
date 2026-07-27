@@ -859,3 +859,42 @@ def test_backstop_assesses_a_facade_external_receipt_once():
     # second pass: already assessed => no-op
     assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is False
     assert len(written) == 1
+
+
+def test_a_failed_node_with_a_dependency_reason_emits_the_distinct_code():
+    """Spec §5 S2: after the LLVM rebuild made execution real, the NumPy
+    failure must emit its OWN typed code so R2 can start from dependency
+    metadata."""
+    from sag.agent.evidence_assessments import dependency_incompatibilities
+
+    receipt = {
+        "receipt_id": "inv-python-3-0005",
+        "testcase_outcomes": {
+            "nodes": [
+                {
+                    "node_id": "tests.python.x.test_minimal_target_codegen_llvm#test_llvm_add_pipeline",
+                    "status": "failed",
+                    "reason": "ValueError: Could not convert T.float32 to a NumPy dtype",
+                },
+                {"node_id": "tests.python.x#test_cuda", "status": "skipped", "reason": "CUDA"},
+            ]
+        },
+    }
+
+    findings = dependency_incompatibilities(receipt)
+
+    assert [f.typed_code for f in findings] == ["dependency_incompatible_numpy"]
+    assert "test_llvm_add_pipeline" in findings[0].detail
+
+
+def test_a_failed_node_without_a_matching_reason_emits_nothing():
+    from sag.agent.evidence_assessments import dependency_incompatibilities
+
+    receipt = {
+        "receipt_id": "inv-x",
+        "testcase_outcomes": {
+            "nodes": [{"node_id": "a#b", "status": "failed", "reason": "assert 1 == 2"}]
+        },
+    }
+
+    assert dependency_incompatibilities(receipt) == []

@@ -395,8 +395,8 @@ def test_testcase_outcomes_parse_this_invocations_own_report_delta():
 
     assert outcomes == {
         "nodes": [
-            {"node_id": "a.Suite#test_error", "status": "error"},
-            {"node_id": "a.Suite#test_fail", "status": "failed"},
+            {"node_id": "a.Suite#test_error", "reason": "kaput", "status": "error"},
+            {"node_id": "a.Suite#test_fail", "reason": "boom", "status": "failed"},
             {"node_id": "a.Suite#test_skip", "status": "skipped", "reason": "needs llvm"},
             {"node_id": "a.Suite#test_pass", "status": "passed"},
         ]
@@ -425,7 +425,9 @@ def test_testcase_outcomes_record_a_self_closing_passed_node():
     }
 
 
-def test_testcase_outcomes_carry_a_reason_only_for_skips():
+def test_testcase_outcomes_carry_the_failure_message_too():
+    """Spec §5 S2 (revised from Stage 0's skips-only rule): the failure's own
+    message is the distinct typed evidence the R2 chain starts from."""
     execute = FakeExecute(
         rules=[
             (
@@ -441,7 +443,7 @@ def test_testcase_outcomes_carry_a_reason_only_for_skips():
     delta = {"new": [{"path": SUREFIRE, "sha256": HASH_A}], "changed": []}
 
     (node,) = read_testcase_outcomes(execute, delta)["nodes"]
-    assert node == {"node_id": "a.S#f", "status": "failed"}
+    assert node == {"node_id": "a.S#f", "status": "failed", "reason": "boom"}
 
 
 def test_testcase_outcomes_are_capped_and_record_the_truncation():
@@ -456,7 +458,11 @@ def test_testcase_outcomes_are_capped_and_record_the_truncation():
 
     assert outcomes["truncated"] is True
     assert len(outcomes["nodes"]) == TESTCASE_OUTCOME_CAP
-    assert outcomes["nodes"][0] == {"node_id": "a.S#test_boom", "status": "failed"}
+    assert outcomes["nodes"][0] == {
+        "node_id": "a.S#test_boom",
+        "reason": "boom",
+        "status": "failed",
+    }
 
 
 def test_testcase_outcomes_are_not_truncated_at_exactly_the_cap():

@@ -582,8 +582,17 @@ def _parse_testcase_tags(output: str) -> Tuple[List[Dict[str, str]], int]:
                     pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
             elif tag == "failure":
                 pending["status"] = "failed"
+                # Spec §5 S2: the FAILURE's own message is the distinct typed
+                # evidence (live TVM: the NumPy dtype error) — a failed node
+                # with no reason cannot emit a distinct failure code.
+                reason = _tag_attribute(attributes, "message")
+                if reason:
+                    pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
             elif tag == "error":
                 pending["status"] = "error"
+                reason = _tag_attribute(attributes, "message")
+                if reason:
+                    pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
     close(pending)
     ordered = sorted(
         nodes.values(),

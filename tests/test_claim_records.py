@@ -1083,3 +1083,34 @@ def test_an_entry_without_provenance_extracts_nothing():
     broken["source_hash"] = ""
 
     assert extract_policy_claims(broken, BIGTOP_README, checkout_root=CHECKOUT) == []
+
+
+def test_shell_continuations_join_and_yield_the_pip_pin():
+    """Live tvm r3: docker/install/ubuntu_install_python_package.sh pins
+    numpy==1.26.* on a backslash-continued pip line. The continuation joins
+    its opener, the pin becomes a dependency claim, and the env-assignment
+    parser no longer mints a mangled `numpy` variable."""
+    entry = {
+        "entry_id": "doc-c96963c0f048",
+        "source_hash": "ec" * 32,
+        "path": "/workspace/tvm/docker/install/ubuntu_install_python_package.sh",
+        "kind": "shell",
+    }
+    text = (
+        "#!/bin/bash\n"
+        "pip3 install --upgrade \\\n"
+        "    cloudpickle \\\n"
+        "    numpy==1.26.* \\\n"
+        "    packaging\n"
+    )
+
+    pins = extract_dependency_pins(entry, text)
+    numpy_pins = [
+        pin for pin in pins if pin.typed_value.get("package") == "numpy"
+    ]
+    assert len(numpy_pins) == 1
+    assert numpy_pins[0].typed_value["specifier"] == "=="
+    assert numpy_pins[0].typed_value["version"] == "1.26.*"
+
+    envs = extract_env_definitions(entry, text)
+    assert not any(claim.typed_value.get("name") == "numpy" for claim in envs)
