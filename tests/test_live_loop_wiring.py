@@ -141,6 +141,28 @@ class FakeContainer:
             if body is None:
                 return fail(f"head: {path}: No such file or directory")
             return ok(body[: int(arguments[2])])
+        if ": > " in command and command.split(": > ", 1)[1].split()[0].endswith(".b64"):
+            # streamed document-map write, step 1: reset the base64 staging
+            if not self.writable:
+                return fail("Read-only file system")
+            self._staged_chunks = []
+            return ok("")
+        if "cat >> " in command and ".b64" in command and "\n" in command:
+            if not self.writable:
+                return fail("Read-only file system")
+            header, _, rest = command.partition("\n")
+            heredoc = header.rsplit("<<'", 1)[1].split("'", 1)[0]
+            chunk, _, _ = rest.partition(f"\n{heredoc}")
+            getattr(self, "_staged_chunks", []).append(chunk)
+            return ok("")
+        if "base64 -d " in command and "mv -f " in command:
+            if not self.writable:
+                return fail("Read-only file system")
+            import base64 as _b64
+
+            body = _b64.b64decode("".join(getattr(self, "_staged_chunks", [])).encode()).decode()
+            self.files[command.rsplit("mv -f ", 1)[1].split()[1]] = body
+            return ok("")
         if "mv -f " in command and "\n" in command:
             if not self.writable:
                 return fail("Read-only file system")

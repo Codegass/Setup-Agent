@@ -9,7 +9,11 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.evidence_assessments import ReceiptAssessment, write_assessment
-from sag.agent.invocation_contracts import contract_receipt_fields
+from sag.agent.invocation_contracts import (
+    contract_receipt_fields,
+    dispatch_contract,
+    ensure_dispatch_contract,
+)
 from sag.agent.invocation_receipts import (
     record_invocation,
     snapshot_reports,
@@ -300,17 +304,30 @@ class GradleTool(BaseTool):
                 # P0-A: bracket the physical dispatch with report-XML content
                 # hashes so the reports THIS invocation wrote are attributable,
                 # instead of being inferred from a later global scan.
-                before = snapshot_reports(self.orchestrator.execute_command, [working_directory])
-                dispatched = _run_build()
-                self._record_invocation_receipt(
-                    requested_action=tasks,
-                    argv=gradle_cmd,
-                    working_directory=working_directory,
-                    attempt=attempt,
-                    result=dispatched,
-                    before=before,
+                # §C3: a dispatch the facade never froze (tool-recovery's
+                # delegate path) freezes its OWN contract before running.
+                contract, _created = ensure_dispatch_contract(
+                    self.orchestrator.execute_command,
+                    tool="gradle",
+                    effective_action=str(tasks or "build"),
+                    expected_cwd=working_directory,
+                    expected_argv=gradle_cmd,
                     requirements=requirements,
                 )
+                with dispatch_contract(contract):
+                    before = snapshot_reports(
+                        self.orchestrator.execute_command, [working_directory]
+                    )
+                    dispatched = _run_build()
+                    self._record_invocation_receipt(
+                        requested_action=tasks,
+                        argv=gradle_cmd,
+                        working_directory=working_directory,
+                        attempt=attempt,
+                        result=dispatched,
+                        before=before,
+                        requirements=requirements,
+                    )
                 return dispatched
 
             result = _run_build_with_receipt(1)

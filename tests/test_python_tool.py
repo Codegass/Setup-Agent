@@ -52,6 +52,8 @@ def pytest_runs(orch):
         and "--collect-only" not in command
         and "--version" not in command
         and RECEIPT_DIR not in command
+        # The §C3 fallback contract freeze also quotes the argv in its body.
+        and "invocation_contracts" not in command
     ]
 
 

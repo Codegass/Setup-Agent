@@ -438,7 +438,9 @@ def test_pytest_receipt_hashes_the_report_after_the_attempt_tagger_rewrote_it():
     run = next(
         index
         for index, command in enumerate(orch.commands)
-        if "--junitxml" in command and "-m pytest" in command
+        if "--junitxml" in command
+            and "-m pytest" in command
+            and "invocation_contracts" not in command
     )
     tagged = next(
         index for index, command in enumerate(orch.commands) if "SAG_ATTEMPT_TAGGED" in command

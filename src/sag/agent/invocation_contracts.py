@@ -444,6 +444,53 @@ def dispatch_contract(contract: Optional[Mapping[str, Any]]):
         _SCOPE.contract = previous
 
 
+def ensure_dispatch_contract(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    *,
+    tool: str,
+    effective_action: str,
+    expected_cwd: str,
+    expected_argv: Optional[str],
+    requirements: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """The dispatch's contract: the facade's when bound, else a fresh freeze.
+
+    Live p6v-bigtop-r2: the tool-recovery path dispatches the internal runner
+    DIRECTLY, so its receipt carried no contract while the same session froze
+    three — `contracts.chain` correctly failed. Every runner dispatch owns a
+    frozen commitment; a dispatch the facade never saw freezes its own here,
+    with the engine's action context as identity.
+
+    Returns `(contract, created)`. Unlike the facade path, a failed freeze
+    does NOT refuse the dispatch: this is a recovery re-dispatch already in
+    flight, and recording it un-contracted (the verifier's finding) beats
+    silently dropping the recovery the model was promised. The gap stays
+    visible either way.
+    """
+    existing = current_contract()
+    if existing:
+        return dict(existing), False
+    context = current_action_context()
+    contract = freeze_contract(
+        execute,
+        envelope_id=context.envelope_id or unrecorded_envelope_id(),
+        tool=tool,
+        params={"action": _text(effective_action)},
+        effective_action=effective_action,
+        expected_cwd=expected_cwd,
+        expected_argv=expected_argv,
+        intent_source=context.intent_source,
+        requirements=requirements or {},
+    )
+    if contract is None:
+        logger.warning(
+            f"fallback contract for a facade-external {tool} dispatch did not freeze; "
+            "the dispatch proceeds and its receipt will carry no contract"
+        )
+        return None, False
+    return contract, True
+
+
 def contract_receipt_fields(actual_argv: Optional[str]) -> Dict[str, Any]:
     """The receipt keys that bind one dispatch back to its contract.
 

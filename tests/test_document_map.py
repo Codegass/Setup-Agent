@@ -185,6 +185,31 @@ class FakeTree:
             if relative in self.unreadable or relative not in self.files:
                 return fail(f"head: {path}: No such file or directory")
             return ok(self.files[relative][: int(arguments[2])])
+        if ": > " in command and command.split(": > ", 1)[1].split()[0].endswith(".b64"):
+            # streamed write, step 1: reset the base64 staging file
+            if not self.writable:
+                return fail("Read-only file system")
+            self._staged = {"path": command.split(": > ", 1)[1].split()[0], "chunks": []}
+            return ok("")
+        if "cat >> " in command and "\n" in command:
+            # streamed write, step 2..n: append one bounded base64 chunk
+            if not self.writable:
+                return fail("Read-only file system")
+            header, _, rest = command.partition("\n")
+            heredoc = header.rsplit("<<'", 1)[1].split("'", 1)[0]
+            chunk, _, _ = rest.partition(f"\n{heredoc}")
+            getattr(self, "_staged", {"chunks": []})["chunks"].append(chunk)
+            return ok("")
+        if "base64 -d " in command and "mv -f " in command:
+            # streamed write, final step: decode + atomic move
+            if not self.writable:
+                return fail("Read-only file system")
+            import base64 as _b64
+
+            staged = getattr(self, "_staged", {"chunks": []})
+            body = _b64.b64decode("".join(staged["chunks"]).encode("ascii")).decode("utf-8")
+            self.persisted[command.rsplit("mv -f ", 1)[1].split()[1]] = body
+            return ok("")
         if "mv -f " in command and "\n" in command:
             if not self.writable:
                 return fail("Read-only file system")
@@ -931,11 +956,13 @@ def test_write_document_map_persists_atomically_to_the_pinned_path():
 
     assert write_document_map(execute, result) is True
 
-    write = [command for command in execute.commands if "mv -f " in command][-1]
-    assert f"mkdir -p {shlex.quote('/workspace/.setup_agent')}" in write
-    assert f"{DOCUMENT_MAP_PATH}.tmp" in write
-    assert write.split("mv -f ", 1)[1].split()[1] == DOCUMENT_MAP_PATH
-    assert DOCUMENT_MAP_HEREDOC in write
+    setup = [command for command in execute.commands if ": > " in command][-1]
+    assert f"mkdir -p {shlex.quote('/workspace/.setup_agent')}" in setup
+    appends = [command for command in execute.commands if "cat >> " in command]
+    assert appends and all(DOCUMENT_MAP_HEREDOC in command for command in appends)
+    finish = [command for command in execute.commands if "base64 -d " in command][-1]
+    assert f"{DOCUMENT_MAP_PATH}.tmp" in finish
+    assert finish.rsplit("mv -f ", 1)[1].split()[1] == DOCUMENT_MAP_PATH
 
 
 def test_the_persisted_body_is_the_map_its_fingerprint_and_its_conflicts():
@@ -1038,3 +1065,45 @@ def test_document_map_entry_is_constructible_for_downstream_fixtures():
 
     assert entry.payload()["parser_version"] == PARSER_VERSION
     assert entry.discovery_status == "indexed"
+
+
+def test_a_map_larger_than_one_argument_streams_in_bounded_chunks():
+    """Live p6v-bigtop-r2: the whole map as ONE heredoc argument exceeded the
+    kernel's ~128KB per-argument bound and the write failed silently. Large
+    bodies must stream; every append must stay under the chunk bound."""
+    from sag.agent.document_map import WRITE_CHUNK_CHARS
+
+    big_entries = [
+        {
+            "entry_id": f"doc-{index:012d}",
+            "path": f"/workspace/proj/docs/file{index}.md",
+            "realpath": f"/workspace/proj/docs/file{index}.md",
+            "source_hash": "ab" * 32,
+            "kind": "markdown",
+            "section_index": [
+                {
+                    "section_id": f"sec-{sec:04d}",
+                    "kind": "heading",
+                    "title_or_key": "x" * 120,
+                    "start_line": sec,
+                    "end_line": sec + 1,
+                }
+                for sec in range(40)
+            ],
+            "parser_version": "1",
+            "discovery_status": "indexed",
+        }
+        for index in range(60)
+    ]
+    execute = FakeTree(files={})
+    plain = {"entries": big_entries, "document_map_fingerprint": "f" * 64, "partial_map": []}
+
+    assert write_document_map(execute, plain) is True
+
+    appends = [command for command in execute.commands if "cat >> " in command]
+    assert len(appends) >= 2  # genuinely streamed
+    for command in appends:
+        chunk = command.partition("\n")[2].rpartition("\n")[0]
+        assert len(chunk) <= WRITE_CHUNK_CHARS
+    body = json.loads(execute.persisted[DOCUMENT_MAP_PATH])
+    assert body["entries"] == big_entries

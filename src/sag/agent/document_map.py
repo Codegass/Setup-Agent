@@ -34,6 +34,7 @@ module never raises. A transport failure degrades to an empty map with a
 visible conflict, never to a map that pretends to be complete.
 """
 
+import base64
 import hashlib
 import json
 import posixpath
@@ -53,6 +54,9 @@ DOCUMENT_MAP_PATH = f"{DOCUMENT_MAP_DIR}/document_map.json"
 # Heredoc delimiter for the atomic write. The body is single-line JSON, so no
 # map content can ever collide with it.
 DOCUMENT_MAP_HEREDOC = "SAGDOCMAP"
+# Streamed-write chunk size: safely under the kernel's ~128KB per-argument
+# bound with heredoc framing overhead included.
+WRITE_CHUNK_CHARS = 100_000
 
 WORKSPACE_ROOT = "/workspace"
 
@@ -928,18 +932,37 @@ def write_document_map(
         logger.debug(f"document map is not serializable: {exc}")
         return False
     temp = f"{DOCUMENT_MAP_PATH}.tmp"
-    command = (
-        f"mkdir -p {shlex.quote(DOCUMENT_MAP_DIR)} && "
-        f"cat > {shlex.quote(temp)} <<'{DOCUMENT_MAP_HEREDOC}' && "
-        f"mv -f {shlex.quote(temp)} {shlex.quote(DOCUMENT_MAP_PATH)}\n"
-        f"{body}\n{DOCUMENT_MAP_HEREDOC}"
+    encoded_temp = f"{temp}.b64"
+    # Live p6v-bigtop-r2: the whole map as ONE heredoc argument exceeded the
+    # kernel's per-argument bound (~128KB) and the write failed silently. The
+    # body streams as base64 in bounded chunks (heredoc newlines are harmless
+    # inside base64), is decoded container-side, and the reader still only
+    # ever sees the atomic `mv`.
+    encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    chunks = [
+        encoded[start : start + WRITE_CHUNK_CHARS]
+        for start in range(0, len(encoded), WRITE_CHUNK_CHARS)
+    ] or [""]
+    commands = [f"mkdir -p {shlex.quote(DOCUMENT_MAP_DIR)} && : > {shlex.quote(encoded_temp)}"]
+    for chunk in chunks:
+        commands.append(
+            f"cat >> {shlex.quote(encoded_temp)} <<'{DOCUMENT_MAP_HEREDOC}'\n"
+            f"{chunk}\n{DOCUMENT_MAP_HEREDOC}"
+        )
+    commands.append(
+        f"base64 -d {shlex.quote(encoded_temp)} > {shlex.quote(temp)} && "
+        f"rm -f {shlex.quote(encoded_temp)} && "
+        f"mv -f {shlex.quote(temp)} {shlex.quote(DOCUMENT_MAP_PATH)}"
     )
     try:
-        result = execute(command) or {}
+        for command in commands:
+            result = execute(command) or {}
+            if not _succeeded(result):
+                return False
     except Exception as exc:
         logger.debug(f"document map not persisted: {exc}")
         return False
-    return _succeeded(result)
+    return True
 
 
 # ---------------------------------------------------------------------------

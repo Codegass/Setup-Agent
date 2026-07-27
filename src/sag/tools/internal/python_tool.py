@@ -24,7 +24,11 @@ from sag.agent.evidence_assessments import (
     next_control_event_id,
     write_assessment,
 )
-from sag.agent.invocation_contracts import contract_receipt_fields
+from sag.agent.invocation_contracts import (
+    contract_receipt_fields,
+    dispatch_contract,
+    ensure_dispatch_contract,
+)
 from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.evidence import TestStats
 from sag.testcases.compileall_metrics import (
@@ -1576,46 +1580,57 @@ class PythonTool(BaseTool):
         # attempt's JUnit output is attributable to this attempt alone —
         # a rerun overwriting the same path is a content change, not a
         # second report.
+        # §C3: a dispatch the facade never froze (recovery/delegate paths)
+        # freezes its OWN contract before running.
+        pytest_contract, _created = ensure_dispatch_contract(
+            self.orchestrator.execute_command,
+            tool="python",
+            effective_action="test",
+            expected_cwd=working_directory,
+            expected_argv=command,
+            requirements=requirements,
+        )
         reports_before = snapshot_reports(
             self.orchestrator.execute_command,
             [working_directory, PYTEST_REPORT_DIR],
         )
-        result = self._run(command, working_directory, timeout)
-        exit_code = result.get("exit_code")
-        output = result.get("output") or ""
-        attempt_tag_command = (
-            f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_ATTEMPT_TAG_SCRIPT)} "
-            f"{shlex.quote(report)} {attempt_id}"
-        )
-        attempt_tag_result = self.orchestrator.execute_command(attempt_tag_command)
-        attempt_tagged = attempt_tag_result.get("success")
-        if attempt_tagged is None:
-            attempt_tagged = attempt_tag_result.get("exit_code") == 0
-        # The after-snapshot follows the attempt tagger on purpose: tagging
-        # REWRITES the JUnit XML, so hashing before it would bind the receipt
-        # to bytes that no longer exist and every consumer would read the
-        # report as stale.
-        receipt_metadata = record_invocation(
-            self.orchestrator.execute_command,
-            tool="python",
-            attempt=attempt_id,
-            requested_action="test",
-            effective_action="test",
-            argv=command,
-            working_directory=working_directory,
-            exit_code=exit_code,
-            before=reports_before,
-            after=snapshot_reports(
+        with dispatch_contract(pytest_contract):
+            result = self._run(command, working_directory, timeout)
+            exit_code = result.get("exit_code")
+            output = result.get("output") or ""
+            attempt_tag_command = (
+                f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_ATTEMPT_TAG_SCRIPT)} "
+                f"{shlex.quote(report)} {attempt_id}"
+            )
+            attempt_tag_result = self.orchestrator.execute_command(attempt_tag_command)
+            attempt_tagged = attempt_tag_result.get("success")
+            if attempt_tagged is None:
+                attempt_tagged = attempt_tag_result.get("exit_code") == 0
+            # The after-snapshot follows the attempt tagger on purpose: tagging
+            # REWRITES the JUnit XML, so hashing before it would bind the receipt
+            # to bytes that no longer exist and every consumer would read the
+            # report as stale.
+            receipt_metadata = record_invocation(
                 self.orchestrator.execute_command,
-                [working_directory, PYTEST_REPORT_DIR],
-            ),
-            output=result.get("full_output") or output,
-            requirements=requirements,
-            # Plan 6 Stage B: bind this dispatch back to the contract the build
-            # facade froze for it. Absent when the runner was called outside
-            # the facade, and `compliance` is the argv comparison's verdict.
-            **contract_receipt_fields(command),
-        )
+                tool="python",
+                attempt=attempt_id,
+                requested_action="test",
+                effective_action="test",
+                argv=command,
+                working_directory=working_directory,
+                exit_code=exit_code,
+                before=reports_before,
+                after=snapshot_reports(
+                    self.orchestrator.execute_command,
+                    [working_directory, PYTEST_REPORT_DIR],
+                ),
+                output=result.get("full_output") or output,
+                requirements=requirements,
+                # Plan 6 Stage B: bind this dispatch back to the contract the
+                # build facade froze for it — or the fallback frozen above.
+                # `compliance` is the argv comparison's verdict.
+                **contract_receipt_fields(command),
+            )
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
         success, error, error_code = _classify_pytest_result(exit_code, output)
