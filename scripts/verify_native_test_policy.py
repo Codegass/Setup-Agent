@@ -34,6 +34,16 @@ RECEIPT_HASH_KEYS = ("receipt_sha256", "receipt_content_hash", "receipt_hash")
 # Pre-dispatch invocation contracts (Plan 6 Stage B, spec §C3). Plan 5 sessions
 # persist none; `contracts.chain` is silent for them by construction.
 CONTRACT_DIRNAME = os.path.join(".setup_agent", "invocation_contracts")
+# Typed verdicts ABOUT receipts (Plan 6 Stage 0/C, spec §C4-C5) and the survey's
+# persisted document map (spec §C1). Both are Plan 6 artifacts, so the
+# assertions that read them arm only when the session froze contracts.
+ASSESSMENT_DIRNAME = os.path.join(".setup_agent", "evidence_assessments")
+DOCUMENT_MAP_PATH = os.path.join(".setup_agent", "document_map.json")
+# What a receipt's `outcome` says when the dispatch did what it promised.
+COMPLETED_OUTCOME = "completed"
+# A dispatch that did not run the frozen vector: exit 0 cannot speak for the
+# contract it declined to honour, so the assessor owes it a typed verdict too.
+DEVIATED_COMPLIANCE = "deviated"
 # Names the contract module may export its own hash formula under. The module
 # is authoritative when present — the verifier must never carry a SECOND copy
 # of the formula it is checking.
@@ -113,6 +123,42 @@ def _junit_passed(meta: dict):
 def _receipt_files(session: str):
     """Every archived invocation-receipt file, sorted. Empty when none exist."""
     return sorted(glob.glob(os.path.join(session, RECEIPT_DIRNAME, "*.json")))
+
+
+def _contract_files(session: str):
+    """Every persisted invocation contract, sorted. Empty for a Plan 5 run.
+
+    A non-empty result is the ONLY thing that arms the Plan 6 assertions: it is
+    physical evidence that this session froze contracts, which no version field
+    can fake and no pre-Plan-6 recording can accidentally acquire.
+    """
+    return sorted(glob.glob(os.path.join(session, CONTRACT_DIRNAME, "*.json")))
+
+
+def _assessment_files(session: str):
+    """Every persisted evidence assessment, sorted."""
+    return sorted(glob.glob(os.path.join(session, ASSESSMENT_DIRNAME, "*.json")))
+
+
+def _load_json(path: str):
+    """The parsed file, or None when it is missing, unreadable or malformed."""
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _receipts(session: str):
+    """(path, payload) for every receipt whose bytes parse as an object.
+
+    Malformed bytes are skipped deliberately: they are `receipts.immutable`'s
+    finding, and one defect must not be reported by two assertions.
+    """
+    for path in _receipt_files(session):
+        payload = _load_json(path)
+        if isinstance(payload, dict):
+            yield path, payload
 
 
 def _recorded_receipt_hashes(session: str) -> dict:
@@ -262,32 +308,43 @@ class Verifier:
         * its `envelope_id` names an action the session actually emitted, so a
           contract cannot be minted for a dispatch the control plane never saw.
 
-        Version gating is by evidence, not by a version field: a session whose
-        receipts carry no `contract_id` is pre-Stage-B and this assertion states
-        NOTHING — it neither passes nor fails, so every Plan 5 recording keeps
-        its exact assertion set.
+        Version gating is by evidence, not by a version field, and it has two
+        settings (Plan 6 Stage F2):
+
+        * the session persisted NO contracts and no receipt names one — it is
+          pre-Stage-B, and this assertion states NOTHING, so every Plan 5
+          recording keeps its exact assertion set;
+        * the session persisted contracts — it is a Plan 6 run, and the chain is
+          REQUIRED: a receipt with no `contract_id` is now a failure, because a
+          run that freezes contracts and then dispatches without one has left
+          exactly the pre-dispatch gap the contract loop exists to close.
         """
+        contracts_persisted = _contract_files(self.session)
         bound: list[tuple[str, str, dict]] = []
-        for path in _receipt_files(self.session):
-            try:
-                with open(path) as handle:
-                    receipt = json.load(handle)
-            except (OSError, TypeError, ValueError):
-                continue  # malformed receipt bytes belong to receipts.immutable
-            if not isinstance(receipt, dict):
-                continue
+        unbound: list[str] = []
+        for path, receipt in _receipts(self.session):
             contract_id = str(receipt.get("contract_id") or "").strip()
             if contract_id:
                 bound.append((path, contract_id, receipt))
-        if not bound:
+            else:
+                unbound.append(path)
+        if not contracts_persisted and not bound:
             return
+
+        problems: list[str] = []
+        if contracts_persisted:
+            for path in unbound:
+                problems.append(
+                    f"{os.path.basename(path)}: receipt carries no contract_id, but the "
+                    f"session froze {len(contracts_persisted)} contract(s) — this dispatch "
+                    "was never frozen before it ran"
+                )
 
         envelope_ids = {
             str(event.get("payload", {}).get("envelope_id") or "")
             for event in _events(self.session)
             if event.get("kind") in ENVELOPE_KINDS
         }
-        problems: list[str] = []
         for path, contract_id, receipt in bound:
             name = os.path.basename(path)
             contract_path = os.path.join(self.session, CONTRACT_DIRNAME, f"{contract_id}.json")
@@ -330,6 +387,88 @@ class Verifier:
                     "the session's action_envelope/forced_action events"
                 )
         self.check("contracts.chain", not problems, "; ".join(problems[:5]))
+
+    def assert_evidence_assessments(self) -> None:
+        """`evidence.assessments_present` — a failure never passes in silence.
+
+        Plan 5 rewrote a finalized receipt to record what it MEANT; Plan 6 makes
+        that a separate append-only `ReceiptAssessment`. The risk that swap
+        introduces is silence: delete the rewrite, forget the assessment, and a
+        failed run leaves a receipt nobody ever graded.
+
+        So for a session that has both receipts and contracts, every
+        failure-outcome receipt must be named by at least one assessment file:
+
+        * `outcome` other than `completed` — the runner itself failed;
+        * `compliance == "deviated"` — exit 0, but not the frozen vector, which
+          is the semantic downgrade the taxonomy calls `deviated_receipt`.
+
+        The verdict is NOT re-derived here. Whether an exit 0 was semantically
+        empty is the assessor's judgement (spec §C5), and a verifier that
+        re-ran the taxonomy would only prove it agrees with itself; what it
+        asserts is that the assessor SPOKE about every receipt that failed.
+
+        Silent unless both facts are present: a Plan 5 recording has no
+        assessor, and a receipt-free or failure-free session owes nothing.
+        """
+        if not _contract_files(self.session):
+            return
+        needing: dict[str, str] = {}
+        for path, receipt in _receipts(self.session):
+            receipt_id = (
+                str(receipt.get("receipt_id") or "").strip()
+                or os.path.basename(path)[: -len(".json")]
+            )
+            outcome = str(receipt.get("outcome") or "").strip().lower()
+            compliance = str(receipt.get("compliance") or "").strip().lower()
+            if outcome and outcome != COMPLETED_OUTCOME:
+                needing[receipt_id] = f"outcome={outcome}"
+            elif compliance == DEVIATED_COMPLIANCE:
+                needing[receipt_id] = f"compliance={compliance}"
+        if not needing:
+            return
+
+        assessed: set[str] = set()
+        for path in _assessment_files(self.session):
+            payload = _load_json(path)
+            if not isinstance(payload, dict):
+                continue
+            subject = str(payload.get("receipt_id") or "").strip()
+            if subject:
+                assessed.add(subject)
+        problems = [
+            f"{receipt_id} ({reason}) has no assessment in {ASSESSMENT_DIRNAME}"
+            for receipt_id, reason in sorted(needing.items())
+            if receipt_id not in assessed
+        ]
+        self.check("evidence.assessments_present", not problems, "; ".join(problems[:5]))
+
+    def assert_document_map(self) -> None:
+        """`survey.document_map` — a Plan 6 run surveyed the documents.
+
+        The contract loop pins `document_map_fingerprint` so a late receipt
+        cannot speak for a map that has since changed (spec §C1/§C3). That pin
+        is only meaningful if the map itself was persisted and carries a
+        fingerprint, so a session that froze contracts must show one on disk.
+
+        Silent for contract-free sessions, which never pinned a map at all.
+        """
+        if not _contract_files(self.session):
+            return
+        path = os.path.join(self.session, DOCUMENT_MAP_PATH)
+        problems: list[str] = []
+        if not os.path.exists(path):
+            problems.append(f"{DOCUMENT_MAP_PATH} was never persisted for a contract-bearing run")
+        else:
+            payload = _load_json(path)
+            if not isinstance(payload, dict):
+                problems.append(f"{DOCUMENT_MAP_PATH} is unreadable, unparseable or not an object")
+            elif not str(payload.get("document_map_fingerprint") or "").strip():
+                problems.append(
+                    f"{DOCUMENT_MAP_PATH} records no document_map_fingerprint, so no "
+                    "contract's map pin can be checked against it"
+                )
+        self.check("survey.document_map", not problems, "; ".join(problems))
 
     def _verdict(self) -> dict:
         with open(os.path.join(self.session, ".setup_agent", "verdict.json")) as handle:
@@ -515,6 +654,8 @@ def main() -> int:
     verifier.assert_pairing_and_hashes()
     verifier.assert_receipts_immutable()
     verifier.assert_contract_chain()
+    verifier.assert_evidence_assessments()
+    verifier.assert_document_map()
     getattr(verifier, f"assert_{options.profile}")()
 
     print(f"== {options.profile} :: {options.session}")
