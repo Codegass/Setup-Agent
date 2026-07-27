@@ -43,6 +43,9 @@ CONTROL_EVENT_KINDS = (
     "phase_transition",
     "loop_decision",
     "evidence_close",
+    # Plan 6 Stage C: appended, never inserted — the ten kinds above keep their
+    # positions so anything reading this tuple by order stays correct.
+    "claim_transition",
 )
 ControlEventKind = Literal[
     "planner_response",
@@ -55,6 +58,7 @@ ControlEventKind = Literal[
     "phase_transition",
     "loop_decision",
     "evidence_close",
+    "claim_transition",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -475,6 +479,59 @@ class EvidenceClosePayload(_StrictPayload):
     ]
 
 
+# The evidence vocabulary a claim moves through (spec §C5). It is spelled out
+# here rather than imported because `claim_records` imports THIS module for its
+# canonical digests; tests/test_claim_graph.py asserts the two agree.
+ClaimEvidenceStatus = Literal[
+    "untested", "unknown", "confirmed", "blocked", "contradicted", "not_applicable"
+]
+
+
+class ClaimTransitionPayload(_StrictPayload):
+    """One step of a grouped claim-graph commit (plan §Stage C note (a)).
+
+    Every event of a group carries the same `group_id`, and the group ends with
+    the terminal record `{group_id, terminal: true}`. Replay treats a group
+    with no terminal record as absent, so a run that died mid-commit leaves the
+    graph exactly where it was rather than half-retracted.
+
+    Two shapes, one kind: a TRANSITION names the claim and both statuses; the
+    TERMINAL record names only its group. Neither may borrow the other's
+    fields, so a reader can tell a commit from a mutation without context.
+    """
+
+    group_id: str = Field(min_length=1)
+    claim_id: str | None = Field(default=None, min_length=1)
+    from_status: ClaimEvidenceStatus | None = None
+    to_status: ClaimEvidenceStatus | None = None
+    cause_assessment_id: str | None = Field(default=None, min_length=1)
+    terminal: bool | None = None
+
+    @model_serializer(mode="wrap")
+    def _absent_facts_stay_absent(self, handler):
+        """A key the event never carried is never dumped back into it.
+
+        Same hash-stability rule `TestCandidateResolutionPayload` learned: any
+        digest taken over this dump must see the recorded bytes, not the
+        model's defaults.
+        """
+        data = handler(self)
+        for field in ("claim_id", "from_status", "to_status", "cause_assessment_id", "terminal"):
+            if field not in self.model_fields_set:
+                data.pop(field, None)
+        return data
+
+    @model_validator(mode="after")
+    def _one_shape_or_the_other(self) -> "ClaimTransitionPayload":
+        if self.terminal:
+            if self.claim_id or self.from_status or self.to_status or self.cause_assessment_id:
+                raise ValueError("a group-commit record carries only its group id")
+            return self
+        if not self.claim_id or not self.from_status or not self.to_status:
+            raise ValueError("a claim transition requires claim_id, from_status and to_status")
+        return self
+
+
 _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "planner_response": PlannerResponsePayload,
     "scheduler_decision": SchedulerDecisionPayload,
@@ -486,6 +543,7 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "phase_transition": PhaseTransitionPayload,
     "loop_decision": LoopDecisionPayload,
     "evidence_close": EvidenceClosePayload,
+    "claim_transition": ClaimTransitionPayload,
 }
 
 
