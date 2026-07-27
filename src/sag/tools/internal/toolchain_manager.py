@@ -6,7 +6,7 @@ import re
 import shlex
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -29,6 +29,18 @@ CandidateSource = Literal[
     "path",
     "system",
 ]
+
+# The registry is the toolchain state a dispatch's identity is taken over
+# (`sag.agent.retry_authority.TOOLCHAIN_REGISTRY_PATH`). Registering a runtime
+# and dispatching a build must therefore read the same file.
+TOOLCHAIN_REGISTRY_PATH = "/workspace/.setup_agent/toolchains.json"
+
+# Which rule chose one executable out of an overlay that offered several. The
+# overlay records candidates, not a decision procedure; naming the rule is what
+# makes the decision auditable after the fact.
+OVERLAY_RULE_ACTIVE = "overlay_active"
+OVERLAY_RULE_PROJECT_REQUIREMENT = "project_required_version"
+OVERLAY_RULE_HIGHEST_VERSION = "highest_registered_version"
 
 
 @dataclass(frozen=True)
@@ -83,15 +95,70 @@ class ToolExecutableCandidate:
 
 
 @dataclass(frozen=True)
+class OverlaySelection:
+    """The one overlay candidate a resolution used, and the rule that chose it."""
+
+    candidate: ToolExecutableCandidate
+    rule: str
+    candidate_count: int
+
+
+@dataclass(frozen=True)
 class ResolvedToolExecutable:
     candidate: ToolExecutableCandidate
     reason: str
+    selection_rule: Optional[str] = None
+
+
+def record_registered_runtime(
+    orchestrator,
+    tool: str,
+    executable: str,
+    *,
+    version: Optional[str] = None,
+    source: CandidateSource = "registered",
+) -> bool:
+    """Record one registered runtime in the toolchain registry.
+
+    Live polaris (`logs/session_20260727_065557_97847`): Java 21 was installed,
+    registered and activated, and the compile that was meant to inherit it was
+    refused three times as an identical retry — the same `retry_key` before and
+    after the registration. The retry identity's toolchain component hashes the
+    REGISTRY; every real registration wrote only the env OVERLAY, and no session
+    of the 23-project campaign produced a registry file at all. The two stores
+    were disconnected, so the registered runtime could not reach a dispatch.
+
+    Registration writes both from here: the overlay stays the execution
+    consumer (it is what the dispatch shell sources) and the registry states
+    that the toolchain changed. Best effort by construction — a registry the
+    container will not accept must never fail the registration the model asked
+    for.
+    """
+    if orchestrator is None or not hasattr(orchestrator, "execute_command"):
+        return False
+    path = str(executable or "").strip()
+    if not path:
+        return False
+    try:
+        ToolchainManager(orchestrator).register(
+            ToolExecutableCandidate(
+                name=str(tool),
+                executable=posixpath.basename(path) or str(tool),
+                path=path,
+                version=str(version) if version is not None else None,
+                source=source,
+            )
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"Toolchain registry record failed for {path}: {exc}")
+        return False
 
 
 class ToolchainManager:
     """Resolve tool executables from requirements, registry, and container state."""
 
-    registry_path = "/workspace/.setup_agent/toolchains.json"
+    registry_path = TOOLCHAIN_REGISTRY_PATH
 
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
@@ -101,7 +168,6 @@ class ToolchainManager:
         self, spec: ToolchainSpec, working_directory: str = "/workspace"
     ) -> Optional[ResolvedToolExecutable]:
         overlay = self._env_overlay_snapshot()
-        candidates = self._discover_with_overlay(spec, working_directory, overlay)
         observed_requirements = self._observed_requirements_from_overlay(
             spec.name,
             overlay,
@@ -113,6 +179,12 @@ class ToolchainManager:
                 item.raw for item in requirements
             }:
                 requirements.append(requirement)
+        candidates, overlay_selection = self._discover(
+            spec,
+            working_directory,
+            overlay,
+            requirements,
+        )
         compatible = [
             candidate
             for candidate in candidates
@@ -133,13 +205,24 @@ class ToolchainManager:
             compatible,
             key=lambda candidate: self._rank_candidate(candidate, spec),
         )[0]
+        reason = self._resolution_reason(
+            selected,
+            spec.version_requirement
+            or (observed_requirements[0] if observed_requirements else None),
+        )
+        selection_rule = None
+        if overlay_selection and overlay_selection.candidate.path == selected.path:
+            selection_rule = overlay_selection.rule
+            if selection_rule != OVERLAY_RULE_ACTIVE:
+                reason = (
+                    f"{reason}; overlay resolution rule: {selection_rule} among "
+                    f"{overlay_selection.candidate_count} registered candidates"
+                )
+                logger.info(f"[toolchain] {reason}")
         return ResolvedToolExecutable(
             candidate=selected,
-            reason=self._resolution_reason(
-                selected,
-                spec.version_requirement
-                or (observed_requirements[0] if observed_requirements else None),
-            ),
+            reason=reason,
+            selection_rule=selection_rule,
         )
 
     def matches_requirement(
@@ -186,6 +269,20 @@ class ToolchainManager:
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
         }
+        # A registry the dispatch identity is hashed over must state the
+        # toolchain, not how many times a model asked for it: re-registering
+        # the same executable with the same facts leaves the file byte-stable,
+        # so only a genuinely new registration is material progress. The head
+        # entry is the only one that can be re-stated without moving a byte —
+        # promoting a candidate from further down the list DOES change the
+        # file, and is therefore written like any other change.
+        if (
+            entries
+            and entries[0].get("path") == candidate.path
+            and {key: value for key, value in entries[0].items() if key != "registered_at"}
+            == asdict(candidate)
+        ):
+            return
         entries[:] = [entry for entry in entries if entry.get("path") != candidate.path]
         entries.insert(0, serialized)
         self._save_registry(registry)
@@ -202,10 +299,20 @@ class ToolchainManager:
         working_directory: str,
         overlay: Optional[Dict[str, Any]],
     ) -> List[ToolExecutableCandidate]:
+        candidates, _selection = self._discover(spec, working_directory, overlay, ())
+        return candidates
+
+    def _discover(
+        self,
+        spec: ToolchainSpec,
+        working_directory: str,
+        overlay: Optional[Dict[str, Any]],
+        requirements: Sequence[ToolVersionRequirement],
+    ) -> Tuple[List[ToolExecutableCandidate], Optional[OverlaySelection]]:
         candidates: List[ToolExecutableCandidate] = []
-        overlay_candidate = self._env_overlay_candidate(spec, overlay)
-        if overlay_candidate:
-            candidates.append(overlay_candidate)
+        overlay_selection = self._env_overlay_selection(spec, overlay, requirements)
+        if overlay_selection:
+            candidates.append(overlay_selection.candidate)
 
         if spec.prefer_wrapper:
             if spec.executable == "mvn":
@@ -234,7 +341,14 @@ class ToolchainManager:
         if path_candidate:
             candidates.append(path_candidate)
 
-        return self._filter_blocked_candidates(self._dedupe_candidates(candidates), spec, overlay)
+        filtered = self._filter_blocked_candidates(
+            self._dedupe_candidates(candidates), spec, overlay
+        )
+        if overlay_selection and all(
+            candidate.path != overlay_selection.candidate.path for candidate in filtered
+        ):
+            overlay_selection = None
+        return filtered, overlay_selection
 
     def _observed_requirements_from_overlay(
         self,
@@ -302,27 +416,97 @@ class ToolchainManager:
         overlay, _warnings = self.env_overlay._load_overlay()
         return overlay
 
-    def _env_overlay_candidate(
-        self, spec: ToolchainSpec, overlay: Optional[Dict[str, Any]]
-    ) -> Optional[ToolExecutableCandidate]:
+    def _env_overlay_selection(
+        self,
+        spec: ToolchainSpec,
+        overlay: Optional[Dict[str, Any]],
+        requirements: Sequence[ToolVersionRequirement] = (),
+    ) -> Optional[OverlaySelection]:
+        """The one overlay candidate this resolution uses, and the rule that chose it.
+
+        Live camel-quarkus (`logs/session_20260727_063915_96714`): the overlay
+        listed two Mavens for one tool with no active candidate, and the test
+        phase closed with nothing to run because the harness offered a question
+        instead of an answer. An overlay that names more than one executable
+        now resolves in a fixed order — the version the project requires, then
+        the highest registered version — and names the rule that decided.
+
+        An ACTIVE candidate is not a tie to break: activation is a recorded
+        decision, and the dispatch shell exports that candidate's PATH, so
+        overruling it here would make the resolver and the environment the
+        build actually runs in disagree.
+
+        Ambiguity is the ONLY thing this resolves. An overlay that lists one
+        executable states no question, so it keeps its existing answer exactly:
+        activated means selected, not activated means the overlay contributes
+        nothing and ordinary discovery decides.
+        """
         if self.env_overlay is None or overlay is None:
             return None
         tool_name = self.env_overlay._normalize_tool(spec.name)
         entry = overlay.get("tools", {}).get(tool_name, {})
+        registered = entry.get("candidates", {}) or {}
+
         active_path = entry.get("active")
-        if not active_path:
+        if active_path:
+            active = registered.get(active_path)
+            if active and self._is_executable(active_path):
+                return OverlaySelection(
+                    candidate=self._overlay_candidate(spec, active_path, active),
+                    rule=OVERLAY_RULE_ACTIVE,
+                    candidate_count=len(registered),
+                )
             return None
-        active = entry.get("candidates", {}).get(active_path)
-        if not active:
+
+        if len(registered) < 2:
             return None
-        path = active_path
-        if not path or not self._is_executable(path):
+
+        usable: List[ToolExecutableCandidate] = []
+        for path, record in sorted(registered.items()):
+            if not self._is_executable(path):
+                continue
+            candidate = self._overlay_candidate(spec, path, record)
+            if self._is_blocked_by_overlay(candidate, spec, overlay):
+                continue
+            usable.append(candidate)
+        if not usable:
             return None
+
+        required = [
+            candidate
+            for candidate in usable
+            if requirements
+            and all(
+                self._matches_requirement(candidate.version, requirement)
+                for requirement in requirements
+            )
+        ]
+        rule = OVERLAY_RULE_PROJECT_REQUIREMENT if required else OVERLAY_RULE_HIGHEST_VERSION
+        pool = required or usable
+        selected = sorted(
+            pool,
+            key=lambda candidate: (
+                self._negative_version_tuple(candidate.version),
+                candidate.path,
+            ),
+        )[0]
+        return OverlaySelection(
+            candidate=selected,
+            rule=rule,
+            candidate_count=len(registered),
+        )
+
+    def _overlay_candidate(
+        self,
+        spec: ToolchainSpec,
+        path: str,
+        record: Dict[str, Any],
+    ) -> ToolExecutableCandidate:
         return ToolExecutableCandidate(
             name=spec.name,
             executable=spec.executable,
             path=path,
-            version=active.get("version") or self._probe_version(path),
+            version=record.get("version") or self._probe_version(path),
             source="env_overlay",
         )
 

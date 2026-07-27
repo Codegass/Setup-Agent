@@ -11,7 +11,11 @@ from typing import Any, Optional
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
-from .toolchain_manager import ToolVersionRequirement, ToolchainManager
+from .toolchain_manager import (
+    ToolchainManager,
+    ToolVersionRequirement,
+    record_registered_runtime,
+)
 
 _MAVEN_VERSION_RE = re.compile(r"(?:^|\n)\s*Apache Maven\s+([0-9]+(?:\.[0-9]+){0,3})\b")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -140,6 +144,11 @@ class EnvTool(BaseTool):
                         },
                         metadata={"action": "register", "activation_confirmed": False},
                     )
+                self._record_registered_runtime(
+                    params["tool"],
+                    params["executable"],
+                    version=params.get("version"),
+                )
                 return self._result(
                     "register",
                     overlay,
@@ -160,10 +169,16 @@ class EnvTool(BaseTool):
                 if validation_error:
                     return validation_error
                 overlay = self.store.activate(params["tool"], params["executable"])
+                active_candidate = self.store.active_candidate(params["tool"])
+                self._record_registered_runtime(
+                    params["tool"],
+                    params["executable"],
+                    version=(active_candidate or {}).get("version"),
+                )
                 return self._result(
                     "activate",
                     overlay,
-                    active_candidate=self.store.active_candidate(params["tool"]),
+                    active_candidate=active_candidate,
                 )
 
             if action_name == "block":
@@ -221,6 +236,29 @@ class EnvTool(BaseTool):
                 ],
                 raw_data={"action": params.get("action")},
             )
+
+    def _record_registered_runtime(
+        self,
+        tool: str,
+        executable: str,
+        *,
+        version: Optional[str] = None,
+    ) -> None:
+        """Mirror one registration into the toolchain registry.
+
+        The overlay is the execution consumer — the dispatch shell sources it.
+        The registry is the toolchain state a dispatch's identity is taken
+        over. Live polaris and camel-quarkus both registered a runtime and were
+        then refused the very build that would have used it, because only the
+        overlay moved. Registration writes both, and never fails on the second.
+        """
+        record_registered_runtime(
+            getattr(self.store, "orchestrator", None),
+            tool,
+            executable,
+            version=version,
+            source="registered",
+        )
 
     def _normalize_request(self, **kwargs: Any) -> dict[str, Any]:
         action = kwargs.pop("action")
