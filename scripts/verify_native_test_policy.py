@@ -37,7 +37,12 @@ CONTRACT_DIRNAME = os.path.join(".setup_agent", "invocation_contracts")
 # Names the contract module may export its own hash formula under. The module
 # is authoritative when present — the verifier must never carry a SECOND copy
 # of the formula it is checking.
-CONTRACT_HASH_EXPORTS = ("contract_hash_for", "contract_sha256", "compute_contract_hash")
+CONTRACT_HASH_EXPORTS = (
+    "contract_hash",
+    "contract_hash_for",
+    "contract_sha256",
+    "compute_contract_hash",
+)
 # Event kinds that carry an action identity a contract may bind to.
 ENVELOPE_KINDS = ("action_envelope", "forced_action")
 
