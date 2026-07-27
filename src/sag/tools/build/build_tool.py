@@ -3,9 +3,13 @@
 import posixpath
 import re
 import shlex
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
-from sag.agent.evidence_assessments import ControlAssessment, write_assessment
+from sag.agent.evidence_assessments import (
+    ControlAssessment,
+    next_control_event_id,
+    write_assessment,
+)
 from sag.agent.invocation_contracts import (
     CONTRACT_DIR,
     CONTRACT_PERSIST_FAILED,
@@ -29,6 +33,48 @@ from .backends import BUILD_MARKERS, GradleBackend, MavenBackend, PythonBackend
 # Verbs that actually invoke the JDK; `deps` resolution is not gated on a
 # matching toolchain, so it skips the pre-flight (spec §1b: no-op when moot).
 _PREFLIGHT_VERBS = ("compile", "test", "package", "install")
+
+# Verbs the domain-edge execution law governs (spec §C2). They are the verbs
+# that PRODUCE something; `deps` resolves coordinates and env/probe verbs only
+# inspect, and refusing those would hide the very mismatch the edge records.
+_EDGE_GATED_VERBS = ("compile", "test", "package", "install")
+
+# The edge statuses that lock a consumer, worst first. `compatible` unlocks and
+# `not_applicable` disposes, so neither appears here.
+_EDGE_REFUSALS = {
+    "version_incompatible": ("DOMAIN_EDGE_BLOCKED", "domain_edge_blocked"),
+    "unverified": ("DOMAIN_EDGE_UNVERIFIED", "domain_edge_unverified"),
+}
+_SEALED_CLAUSE = "this consumer is sealed blocked; record the mismatch, do not silently alias"
+
+
+def _absolute_root(value: Any) -> Optional[str]:
+    """A normalized absolute container path, or None when it is not one."""
+    raw = str(value or "").strip()
+    if not raw or not raw.startswith("/") or "\x00" in raw or "\n" in raw:
+        return None
+    return posixpath.normpath(raw)
+
+
+def _is_contained(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _manifest_domain_edges(requirements: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """The manifest's domain edges — projected key first, recommendation second.
+
+    Same dual read every other recommendation fact gets (`attempt_policy`), so
+    a manifest written before the projection existed still carries the law.
+    Anything that is not a list of mappings is no graph, not a broken one.
+    """
+    raw = requirements.get("domain_edges")
+    if raw is None:
+        recommendation = requirements.get("build_recommendation")
+        if isinstance(recommendation, Mapping):
+            raw = recommendation.get("domain_edges")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item for item in raw if isinstance(item, Mapping)]
 
 
 class BuildTool(BaseTool):
@@ -131,6 +177,17 @@ class BuildTool(BaseTool):
             )
 
         requirements = read_build_requirements(self.docker_orchestrator)
+
+        # --- domain-edge execution law (spec §C2) — PRE-MATERIALIZATION -----
+        # Runs before the island promotion, the JDK pre-flight and any backend
+        # touches argv, so a doomed consumer is structurally incapable of
+        # reaching a runner. Everything below this block assumes the edges
+        # already permitted this invocation.
+        edge_refusal = self._domain_edge_refusal(verb, working_directory, requirements)
+        if edge_refusal is not None:
+            return edge_refusal
+        # --- end domain-edge execution law ----------------------------------
+
         effective_verb, island_context = self._effective_island_action(
             requested_verb=verb,
             system=system,
@@ -318,6 +375,141 @@ class BuildTool(BaseTool):
             jdk_retry_meta,
             contract,
         ).with_execution_trace(actual_executions)
+
+    # --- domain-edge execution law (spec §C2) -------------------------------
+
+    def _domain_edge_refusal(
+        self,
+        verb: str,
+        working_directory: str,
+        requirements: Dict[str, Any],
+    ) -> Optional[ToolResult]:
+        """Refuse a build the manifest's edges already doom, or None to proceed.
+
+        Spec §C2 gives dependency edges an EXECUTION law: a
+        `version_incompatible` consumer "is sealed blocked ... and receives no
+        runner invocation", and an `unverified` consumer's build/test dispatch
+        "is locked". Plan 5 derived both statuses honestly and dispatched
+        anyway, so every stale bigtop consumer spent a full reactor run
+        rediscovering a mismatch the manifest had already stated.
+
+        The refusal is a control fact, not a build result: it mints no receipt,
+        so it also records a `ControlAssessment` — a reader who only sees the
+        evidence directory must still learn that this intent was stopped and
+        why. Persisting that is best effort and never gates the refusal.
+        """
+        if verb not in _EDGE_GATED_VERBS:
+            return None
+        edge = self._binding_domain_edge(working_directory, requirements)
+        if edge is None:
+            return None
+        status = str(edge.get("status") or "").strip().lower()
+        error_code, typed_code = _EDGE_REFUSALS[status]
+        consumer = _absolute_root(edge.get("consumer")) or str(edge.get("consumer") or "")
+        producer = _absolute_root(edge.get("producer")) or str(edge.get("producer") or "")
+        # Verbatim: the detail carries the mismatched coordinates, and a
+        # paraphrase is how a mismatch becomes an alias.
+        detail = str(edge.get("detail") or "").strip()
+
+        if status == "version_incompatible":
+            headline = (
+                f"[domain-edge] {consumer} consumes an artifact of {producer} "
+                "across a version_incompatible edge"
+            )
+            closing = _SEALED_CLAUSE
+            error = f"domain edge blocks {consumer}"
+            suggestions = [
+                f"Record the mismatch as a project fact, then build {producer} "
+                "at the version this consumer requires",
+                "Do not retarget the consumer at a different artifact version",
+            ]
+        else:
+            headline = (
+                f"[domain-edge] {consumer} consumes an artifact {producer} builds, "
+                "on an unverified edge"
+            )
+            closing = (
+                f"{producer} must produce first; this consumer stays locked until "
+                "that edge is verified"
+            )
+            error = f"domain edge is unverified for {consumer}"
+            suggestions = [
+                f"Build {producer} first, then retry this consumer",
+                f"Read {producer}'s declared coordinates to verify or refute the edge",
+            ]
+
+        facts: Dict[str, Any] = {
+            "domain_edge_status": status,
+            "domain_edge_consumer": consumer,
+            "domain_edge_producer": producer,
+            "requested_action": verb,
+            "working_directory": working_directory,
+        }
+        metadata: Dict[str, Any] = dict(facts)
+        metadata["runner_dispatched"] = False
+        edge_id = str(edge.get("edge_id") or "").strip()
+        if edge_id:
+            facts["edge_id"] = edge_id
+            metadata["edge_id"] = edge_id
+        if detail:
+            facts["domain_edge_detail"] = detail
+
+        write_assessment(
+            self.docker_orchestrator.execute_command,
+            ControlAssessment(
+                event_or_intent_id=next_control_event_id("build-domain-edge"),
+                stage="precondition",
+                typed_code=typed_code,
+                detail=detail or headline,
+            ),
+        )
+        return ToolResult.completed_failure(
+            output="\n".join(line for line in (headline, detail, closing) if line),
+            error=error,
+            error_code=error_code,
+            facts=facts,
+            metadata=metadata,
+            suggestions=suggestions,
+        )
+
+    @staticmethod
+    def _binding_domain_edge(
+        working_directory: str,
+        requirements: Dict[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        """The edge that governs this invocation, or None when none does.
+
+        Nearest-root binding. The invocation binds to the DEEPEST edge endpoint
+        that contains its working directory, and only a binding to a CONSUMER
+        refuses:
+
+        * an aggregator above both endpoints contains neither, so it is nobody's
+          consumer — a reactor build from the top is not the blocked module;
+        * a producer nested inside a consumer root binds to the producer,
+          because producing first is exactly what the edge asks for.
+
+        `version_incompatible` outranks `unverified` at the same root: proven
+        wrong is a stronger fact than unknown.
+        """
+        target = _absolute_root(working_directory)
+        if target is None:
+            return None
+        edges = _manifest_domain_edges(requirements)
+        nearest = ""
+        for item in edges:
+            for role in ("consumer", "producer"):
+                root = _absolute_root(item.get(role))
+                if root is not None and _is_contained(target, root) and len(root) > len(nearest):
+                    nearest = root
+        if not nearest:
+            return None
+        for status in ("version_incompatible", "unverified"):
+            for item in edges:
+                if str(item.get("status") or "").strip().lower() != status:
+                    continue
+                if _absolute_root(item.get("consumer")) == nearest:
+                    return item
+        return None
 
     def _detect_system(self, working_directory: str):
         checked = []
