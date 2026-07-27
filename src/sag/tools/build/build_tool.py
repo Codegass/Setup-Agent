@@ -1,13 +1,17 @@
-"""build(action: deps|compile|test|package) — one tool over all ecosystems."""
+"""build(action: deps|compile|test|package|install|native) — one tool over all
+ecosystems."""
 
 import posixpath
 import re
 import shlex
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
+from sag.agent.claim_records import CLAIM_DIR
 from sag.agent.evidence_assessments import (
+    ASSESSMENT_DIR,
+    CAPABILITY_PREFIX,
     ControlAssessment,
     assess_dispatch,
     next_control_event_id,
@@ -22,6 +26,7 @@ from sag.agent.invocation_contracts import (
     freeze_contract,
     unrecorded_envelope_id,
 )
+from sag.agent.repair_contracts import read_records
 from sag.agent.retry_authority import (
     RETRY_WITHOUT_DELTA,
     RETRY_WITHOUT_DELTA_CODE,
@@ -39,16 +44,62 @@ from sag.tools.internal.build_preflight import (
     read_build_requirements,
 )
 
-from .backends import BUILD_MARKERS, GradleBackend, MavenBackend, PythonBackend
+from .backends import (
+    BUILD_MARKERS,
+    NATIVE_DEFINITION_KEY,
+    NATIVE_DEFINITION_VALUES,
+    NATIVE_FEATURE_RESOLVER,
+    GradleBackend,
+    MavenBackend,
+    PythonBackend,
+    native_definition_feature,
+    native_feature_definition,
+)
+
+_ACTIONS = ("deps", "compile", "test", "package", "install", "native")
 
 # Verbs that actually invoke the JDK; `deps` resolution is not gated on a
 # matching toolchain, so it skips the pre-flight (spec §1b: no-op when moot).
+# `native` is python-system machinery and never reaches a JVM toolchain.
 _PREFLIGHT_VERBS = ("compile", "test", "package", "install")
 
 # Verbs the domain-edge execution law governs (spec §C2). They are the verbs
 # that PRODUCE something; `deps` resolves coordinates and env/probe verbs only
 # inspect, and refusing those would hide the very mismatch the edge records.
+# `native` repairs the ENVIRONMENT a consumer builds in rather than consuming a
+# producer's artifact, so a locked edge is not a reason to refuse it.
 _EDGE_GATED_VERBS = ("compile", "test", "package", "install")
+
+# --- the typed native affordance (spec §C8, plan §Stage E) ------------------
+# The refusal the plan names verbatim: provenance is necessary for a repair and
+# the harness has none, so the honest answer is that nothing is known to fix.
+NATIVE_WITHOUT_PROVENANCE = "NATIVE_WITHOUT_PROVENANCE"
+NATIVE_WITHOUT_PROVENANCE_CODE = "native_without_provenance"
+NATIVE_UNSOURCED_CLAUSE = "no project-owned repair policy — the state is unknown, not repairable"
+# The allowlist refusals. Separate codes because they are separate defects: an
+# unknown feature is a request the platform cannot resolve, a bad definition is
+# a token the environment must never carry, and an inconsistent pair is a
+# request that contradicts itself (spec §C8: "`features` and definitions must
+# be consistent").
+NATIVE_FEATURE_UNKNOWN = "NATIVE_FEATURE_UNKNOWN"
+NATIVE_FEATURE_UNKNOWN_CODE = "native_feature_unknown"
+NATIVE_DEFINITION_REJECTED = "NATIVE_DEFINITION_REJECTED"
+NATIVE_DEFINITION_REJECTED_CODE = "native_definition_rejected"
+NATIVE_DEFINITIONS_INCONSISTENT = "NATIVE_DEFINITIONS_INCONSISTENT"
+NATIVE_DEFINITIONS_INCONSISTENT_CODE = "native_definitions_inconsistent"
+NATIVE_SYSTEM_UNSUPPORTED = "NATIVE_SYSTEM_UNSUPPORTED"
+NATIVE_SYSTEM_UNSUPPORTED_CODE = "native_system_unsupported"
+
+# --- claim-backed exact pins on the deps verb (plan §Stage E item 3) --------
+PIN_WITHOUT_PROVENANCE = "PIN_WITHOUT_PROVENANCE"
+PIN_WITHOUT_PROVENANCE_CODE = "pin_without_provenance"
+# `pkg==literal` and nothing else. A range, an extra, a flag or a URL is not an
+# exact pin, and the only args this verb accepts are exact pins a claim states.
+EXACT_PIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9.*+!_-]*$")
+# The claim scopes whose typed_value may state a native definition. `env`
+# claims carry all four (a CI `CMAKE_ARGS` assignment, a `-DUSE_X=ON` inside
+# it, `set(USE_X ...)` and `option(USE_X ...)`), and nothing else does.
+NATIVE_CLAIM_SCOPES = ("environment", "cmake_definition", "cmake_set", "cmake_option")
 
 # The edge statuses that lock a consumer, worst first. `compatible` unlocks and
 # `not_applicable` disposes, so neither appears here.
@@ -127,13 +178,15 @@ class BuildTool(BaseTool):
         working_directory: str = "/workspace",
         timeout: Optional[int] = None,
         maven_version_requirement: Optional[str] = None,
+        features: Optional[Sequence[str]] = None,
+        definitions: Optional[Mapping[str, str]] = None,
     ) -> ToolResult:
         verb = (action or "").strip().lower()
-        if verb not in ("deps", "compile", "test", "package", "install"):
+        if verb not in _ACTIONS:
             return ToolResult.completed_failure(
                 output=f"Unknown build action: {action!r}",
                 error="invalid action",
-                suggestions=["Use action= deps | compile | test | package | install"],
+                suggestions=[f"Use action= {' | '.join(_ACTIONS)}"],
             )
 
         # Whether the caller scoped this invocation itself. PR #12's
@@ -143,12 +196,17 @@ class BuildTool(BaseTool):
         # The call AS SUBMITTED. The facade may re-target the working directory
         # below; the contract records both, because a normalization the caller
         # never asked for is exactly the kind of fact §C3 keeps separate.
+        # `provenance` is deliberately NOT a parameter here (spec §C8): the
+        # supporting claim ids are looked up from stored evidence, so nothing
+        # the model writes can appear in them.
         requested_call_params = {
             "action": verb,
             "args": args,
             "working_directory": working_directory,
             "timeout": timeout,
             "maven_version_requirement": maven_version_requirement,
+            "features": list(features) if features is not None else None,
+            "definitions": dict(definitions) if definitions is not None else None,
         }
 
         system, checked = self._detect_system(working_directory)
@@ -188,6 +246,37 @@ class BuildTool(BaseTool):
             )
 
         requirements = read_build_requirements(self.docker_orchestrator)
+
+        # --- typed native affordance (spec §C8) — PRE-MATERIALIZATION -------
+        # Validate the allowlists, resolve the platform feature and PROVE the
+        # provenance before anything is materialized. A native call that gets
+        # past here is one the evidence directory already authorizes; one that
+        # does not never reaches a backend, so it cannot install a package or
+        # set an environment variable on the strength of a model parameter.
+        native_bundle: Optional[Dict[str, Any]] = None
+        if verb == "native":
+            gate = self._native_intent(
+                features=features,
+                definitions=definitions,
+                system=system,
+                working_directory=working_directory,
+            )
+            if isinstance(gate, ToolResult):
+                return gate
+            native_bundle = gate
+        # --- end typed native affordance ------------------------------------
+
+        # --- claim-backed exact pins on `deps` (plan §Stage E item 3) -------
+        # `deps` args are a passthrough for the JVM backends (a `-pl` selection
+        # is the caller's own scoping). On the python backend an arg IS an
+        # install target, so it may only ever be a literal pin a dependency
+        # claim already states.
+        pin_refusal = self._pin_without_provenance_refusal(
+            verb=verb, system=system, args=args, working_directory=working_directory
+        )
+        if pin_refusal is not None:
+            return pin_refusal
+        # --- end claim-backed exact pins ------------------------------------
 
         # --- domain-edge execution law (spec §C2) — PRE-MATERIALIZATION -----
         # Runs before the island promotion, the JDK pre-flight and any backend
@@ -264,6 +353,14 @@ class BuildTool(BaseTool):
                 timeout,
                 maven_version_requirement=maven_version_requirement,
             )
+        elif native_bundle is not None:
+            materialized = backend.materialize(
+                effective_verb,
+                args,
+                working_directory,
+                timeout,
+                native=native_bundle["native"],
+            )
         else:
             materialized = backend.materialize(effective_verb, args, working_directory, timeout)
 
@@ -301,6 +398,11 @@ class BuildTool(BaseTool):
             expected_argv=expected_argv,
             intent_source=scope.intent_source,
             requirements=requirements,
+            # Spec §C8: "the contract stores claim IDs". The ids come from the
+            # gate's lookup of stored evidence, never from a call parameter,
+            # so a frozen native contract carries the provenance that
+            # authorized it and a reader can follow it back to the documents.
+            supporting_claim_ids=(native_bundle or {}).get("supporting_claim_ids"),
         )
         if contract is None:
             write_assessment(
@@ -413,6 +515,365 @@ class BuildTool(BaseTool):
             jdk_retry_meta,
             contract,
         ).with_execution_trace(actual_executions)
+
+    # --- typed native affordance (spec §C8) ---------------------------------
+
+    def _native_intent(
+        self,
+        *,
+        features: Optional[Sequence[str]],
+        definitions: Optional[Mapping[str, str]],
+        system: str,
+        working_directory: str,
+    ) -> Any:
+        """The validated, provenance-backed native bundle, or a ToolResult refusal.
+
+        Four gates, in this order, because each one makes the next meaningful:
+
+        1. the ALLOWLISTS — a feature the platform resolver does not name and a
+           definition outside `USE_*`/`BUILD_TESTING` = `ON|OFF` are refused
+           before they are ever echoed into a command line;
+        2. CONSISTENCY — a requested feature whose switch is not turned on, and
+           a switch for a feature nobody requested, are the two directions of
+           the same contradiction (spec §C8);
+        3. the SYSTEM — this is python machinery, and a maven/gradle tree gets
+           a plain answer rather than a native install it cannot use;
+        4. PROVENANCE — a `capability_absent_<feature>` assessment on record
+           AND a stored claim for every definition. Model parameters carry no
+           provenance, so this is the only place authority can come from.
+
+        Every refusal records a `ControlAssessment`: it mints no receipt, and a
+        reader of the evidence directory must still learn what was stopped.
+        """
+        requested = list(features or ())
+        supplied = dict(definitions or {})
+
+        unknown = [
+            str(feature)
+            for feature in requested
+            if not isinstance(feature, str) or feature.strip() not in NATIVE_FEATURE_RESOLVER
+        ]
+        if not requested or unknown:
+            named = ", ".join(repr(item) for item in unknown) or "nothing"
+            return self._native_refusal(
+                error_code=NATIVE_FEATURE_UNKNOWN,
+                typed_code=NATIVE_FEATURE_UNKNOWN_CODE,
+                headline=(
+                    f"[native] the platform resolver states no feature {named}; "
+                    f"it resolves {', '.join(sorted(NATIVE_FEATURE_RESOLVER))}"
+                ),
+                closing=(
+                    "a feature is resolved to packages and a probe by the harness, never "
+                    "described by the call — an unresolvable name installs nothing"
+                ),
+                working_directory=working_directory,
+                suggestions=[
+                    "Name a feature the resolver already carries, or record the "
+                    "capability as a project fact first",
+                ],
+            )
+        resolved = [feature.strip() for feature in requested]
+
+        rejected = [
+            f"{key}={value}"
+            for key, value in supplied.items()
+            if not NATIVE_DEFINITION_KEY.match(str(key))
+            or str(value) not in NATIVE_DEFINITION_VALUES
+        ]
+        if not supplied or rejected:
+            named = ", ".join(repr(item) for item in rejected) or "nothing"
+            return self._native_refusal(
+                error_code=NATIVE_DEFINITION_REJECTED,
+                typed_code=NATIVE_DEFINITION_REJECTED_CODE,
+                headline=(
+                    f"[native] {named} is not an allowlisted native definition: keys must "
+                    f"match {NATIVE_DEFINITION_KEY.pattern} and values must be "
+                    f"{' or '.join(NATIVE_DEFINITION_VALUES)}"
+                ),
+                closing=(
+                    "compiler launchers, toolchain files and escaped or absolute paths are "
+                    "not definitions — they are commands wearing a definition's shape"
+                ),
+                working_directory=working_directory,
+                suggestions=[
+                    "State the capability switch itself (USE_<FEATURE>=ON|OFF)",
+                    "Configure a toolchain through the project's own build files, not a call",
+                ],
+            )
+        validated = {str(key): str(value) for key, value in supplied.items()}
+
+        inconsistent = self._native_inconsistency(resolved, validated)
+        if inconsistent:
+            return self._native_refusal(
+                error_code=NATIVE_DEFINITIONS_INCONSISTENT,
+                typed_code=NATIVE_DEFINITIONS_INCONSISTENT_CODE,
+                headline=f"[native] {inconsistent}",
+                closing=(
+                    "features and definitions state the same request twice; a request that "
+                    "disagrees with itself names no capability to build"
+                ),
+                working_directory=working_directory,
+                suggestions=[
+                    "Turn on exactly the features you name: features=[f] with "
+                    "definitions={USE_F: ON}",
+                ],
+            )
+
+        if system != "python":
+            return self._native_refusal(
+                error_code=NATIVE_SYSTEM_UNSUPPORTED,
+                typed_code=NATIVE_SYSTEM_UNSUPPORTED_CODE,
+                headline=(
+                    f"[native] build(action='native') re-materializes a PYTHON project's "
+                    f"own editable install under CMAKE_ARGS; {working_directory} is a "
+                    f"{system} project"
+                ),
+                closing=(
+                    f"a {system} build configures its native parts through its own build "
+                    "files, and this facade will not install packages on its behalf"
+                ),
+                working_directory=working_directory,
+                suggestions=[
+                    f"Run the {system} build itself: build(action='compile', "
+                    f"working_directory='{working_directory}')",
+                ],
+            )
+
+        assessed = self._capability_absences()
+        missing_evidence = [
+            f"{CAPABILITY_PREFIX}{feature}"
+            for feature in resolved
+            if f"{CAPABILITY_PREFIX}{feature}" not in assessed
+        ]
+        claims = self._definition_claims(validated)
+        unsupported = sorted(set(validated) - set(claims))
+        if missing_evidence or unsupported:
+            missing = "; ".join(
+                part
+                for part in (
+                    (
+                        f"no assessment on record states {', '.join(missing_evidence)}"
+                        if missing_evidence
+                        else ""
+                    ),
+                    (f"no project claim states {', '.join(unsupported)}" if unsupported else ""),
+                )
+                if part
+            )
+            return self._native_refusal(
+                error_code=NATIVE_WITHOUT_PROVENANCE,
+                typed_code=NATIVE_WITHOUT_PROVENANCE_CODE,
+                headline=f"[native] {missing}",
+                closing=NATIVE_UNSOURCED_CLAUSE,
+                working_directory=working_directory,
+                suggestions=[
+                    "Run the project's own test/build first — a receipt is what proves a "
+                    "capability absent",
+                    "Let targeted retrieval read the project's CI/CMake documents, then "
+                    "accept the repair it proposes",
+                ],
+            )
+
+        supporting: List[str] = []
+        for key in sorted(claims):
+            for identifier in claims[key]:
+                if identifier not in supporting:
+                    supporting.append(identifier)
+        return {
+            "native": {"features": resolved, "definitions": validated},
+            "supporting_claim_ids": supporting,
+        }
+
+    @staticmethod
+    def _native_inconsistency(
+        features: Sequence[str],
+        definitions: Mapping[str, str],
+    ) -> Optional[str]:
+        """Why these features and definitions disagree, or None when they agree.
+
+        Both directions, because both are ways to build something nobody asked
+        for: a named feature whose switch is absent or OFF requests a
+        capability the definitions do not turn on, and a `USE_X` switch whose
+        feature is unnamed turns on a capability the request never declared.
+        """
+        for feature in features:
+            key = native_feature_definition(feature)
+            value = definitions.get(key)
+            if value != "ON":
+                stated = f"{key}={value}" if value is not None else f"no {key}"
+                return (
+                    f"features name {feature!r} but the definitions state {stated} — "
+                    f"a requested feature must be turned on by {key}=ON"
+                )
+        named = {str(feature).strip().lower() for feature in features}
+        for key in sorted(definitions):
+            feature = native_definition_feature(key)
+            if feature is not None and feature not in named:
+                return (
+                    f"definitions state {key}={definitions[key]} but features do not name "
+                    f"{feature!r} — a capability switch needs the feature that resolves it"
+                )
+        return None
+
+    def _capability_absences(self) -> set:
+        """Every `capability_absent_<name>` code the assessment directory holds.
+
+        The assessments are the c2 assessor's own output: a capability is
+        absent because a RECEIPT said so, never because a call said so.
+        """
+        return {
+            str(record.get("typed_code") or "").strip()
+            for record in read_records(self.docker_orchestrator, ASSESSMENT_DIR)
+            if str(record.get("typed_code") or "").strip().startswith(CAPABILITY_PREFIX)
+        }
+
+    def _definition_claims(self, definitions: Mapping[str, str]) -> Dict[str, List[str]]:
+        """`{definition key: [claim_id, ...]}` for the keys stored claims state.
+
+        A key with no claim is simply absent from the mapping — that absence is
+        what the provenance gate refuses on. Matching is on the definition NAME
+        the claim carries, because the claim is what proves the switch is
+        project-owned; which value the project's own default happens to be is a
+        separate fact, and reading it as consent would let a documented
+        `set(USE_X OFF)` authorize nothing at all.
+        """
+        found: Dict[str, List[str]] = {}
+        for record in read_records(self.docker_orchestrator, CLAIM_DIR):
+            if str(record.get("kind") or "").strip() != "env":
+                continue
+            typed_value = record.get("typed_value")
+            if not isinstance(typed_value, Mapping):
+                continue
+            if str(typed_value.get("scope") or "").strip() not in NATIVE_CLAIM_SCOPES:
+                continue
+            name = str(typed_value.get("name") or "").strip()
+            identifier = str(record.get("claim_id") or "").strip()
+            if not identifier or name not in definitions:
+                continue
+            found.setdefault(name, [])
+            if identifier not in found[name]:
+                found[name].append(identifier)
+        return found
+
+    def _native_refusal(
+        self,
+        *,
+        error_code: str,
+        typed_code: str,
+        headline: str,
+        closing: str,
+        working_directory: str,
+        suggestions: List[str],
+    ) -> ToolResult:
+        """One refusal shape for every native gate: no receipt, one control fact."""
+        facts: Dict[str, Any] = {
+            "requested_action": "native",
+            "working_directory": working_directory,
+        }
+        metadata: Dict[str, Any] = dict(facts)
+        metadata["runner_dispatched"] = False
+        write_assessment(
+            self.docker_orchestrator.execute_command,
+            ControlAssessment(
+                event_or_intent_id=next_control_event_id("build-native"),
+                stage="precondition",
+                typed_code=typed_code,
+                detail=headline,
+            ),
+        )
+        return ToolResult.completed_failure(
+            output="\n".join((headline, closing)),
+            error=headline,
+            error_code=error_code,
+            facts=facts,
+            metadata=metadata,
+            suggestions=suggestions,
+        )
+
+    # --- claim-backed exact pins on `deps` (plan §Stage E item 3) -----------
+
+    def _pin_without_provenance_refusal(
+        self,
+        *,
+        verb: str,
+        system: str,
+        args: Optional[str],
+        working_directory: str,
+    ) -> Optional[ToolResult]:
+        """Refuse a python `deps` arg no dependency claim states, or None.
+
+        On the python backend a `deps` arg is an install TARGET — the harness
+        would type it into a `pip install`. So it may only ever be an exact pin
+        (`pkg==literal`) that a stored dependency claim already carries. Every
+        other arg, pin-shaped or not, is a package choice with no project
+        source behind it.
+        """
+        requested = str(args or "").strip()
+        if verb != "deps" or system != "python" or not requested:
+            return None
+        pinned = EXACT_PIN.match(requested) is not None
+        if pinned and self._pin_claim_ids(requested):
+            return None
+        detail = (
+            f"[deps] {requested!r} is not an exact pin (pkg==literal)"
+            if not pinned
+            else f"[deps] no dependency claim states the pin {requested!r}"
+        )
+        facts: Dict[str, Any] = {
+            "requested_action": verb,
+            "requested_args": requested,
+            "working_directory": working_directory,
+            "system": system,
+        }
+        metadata: Dict[str, Any] = dict(facts)
+        metadata["runner_dispatched"] = False
+        write_assessment(
+            self.docker_orchestrator.execute_command,
+            ControlAssessment(
+                event_or_intent_id=next_control_event_id("build-deps-pin"),
+                stage="precondition",
+                typed_code=PIN_WITHOUT_PROVENANCE_CODE,
+                detail=detail,
+            ),
+        )
+        return ToolResult.completed_failure(
+            output="\n".join(
+                (
+                    detail,
+                    "a python dependency install runs the literal a project document "
+                    "already states; an unsourced version is a choice, not a repair",
+                )
+            ),
+            error=detail,
+            error_code=PIN_WITHOUT_PROVENANCE,
+            facts=facts,
+            metadata=metadata,
+            suggestions=[
+                "Call build(action='deps') with no args to install the project's own "
+                "declared dependencies",
+                "Accept a repair proposal — its pin is cited from a stored claim",
+            ],
+        )
+
+    def _pin_claim_ids(self, pin: str) -> List[str]:
+        """The dependency claims whose typed_value carries this literal pin."""
+        found: List[str] = []
+        for record in read_records(self.docker_orchestrator, CLAIM_DIR):
+            if str(record.get("kind") or "").strip() != "dependency":
+                continue
+            typed_value = record.get("typed_value")
+            if not isinstance(typed_value, Mapping):
+                continue
+            package = str(typed_value.get("package") or "").strip()
+            specifier = str(typed_value.get("specifier") or "").strip()
+            version = str(typed_value.get("version") or "").strip()
+            literals = {f"{package}{specifier}{version}"} | {
+                str(value).strip() for value in typed_value.values() if isinstance(value, str)
+            }
+            identifier = str(record.get("claim_id") or "").strip()
+            if identifier and pin in literals and identifier not in found:
+                found.append(identifier)
+        return found
 
     # --- contract-vs-receipt assessment (spec §C5) --------------------------
 
@@ -754,9 +1215,7 @@ class BuildTool(BaseTool):
         if requirements.get("root_shape") != "pathological_aggregator":
             return requested_verb, {}
 
-        survey_root = str(
-            ((requirements.get("survey") or {}).get("project_path") or "")
-        ).strip()
+        survey_root = str(((requirements.get("survey") or {}).get("project_path") or "")).strip()
 
         def normalized(path: Any) -> str:
             value = str(path or "").strip()
@@ -924,14 +1383,18 @@ class BuildTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["deps", "compile", "test", "package", "install"],
+                    "enum": list(_ACTIONS),
                     "description": "What to do; the build system is auto-selected. "
                     "Use install for a multi-module reactor whose modules depend on "
-                    "siblings' built artifacts (shaded jars, code-gen).",
+                    "siblings' built artifacts (shaded jars, code-gen). native "
+                    "re-installs a python project with a native capability enabled, "
+                    "and only after a receipt proved that capability absent.",
                 },
                 "args": {
                     "type": "string",
-                    "description": "Extra flags passed through to the underlying tool",
+                    "description": "Extra flags passed through to the underlying tool. "
+                    "On a python deps call this is an install target, so it accepts "
+                    "only an exact pin (pkg==literal) a project document states.",
                 },
                 "working_directory": {"type": "string", "default": "/workspace"},
                 "timeout": {
@@ -943,6 +1406,26 @@ class BuildTool(BaseTool):
                     "description": (
                         "Maven-only constraint preserved across registration and retry "
                         "(for example '[3.9,)'). Never omit a detected requirement."
+                    ),
+                },
+                "features": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "action=native only: the named capabilities to enable, for "
+                        f"example {list(sorted(NATIVE_FEATURE_RESOLVER))}. The harness "
+                        "resolves each to packages and a probe; the call never names "
+                        "either."
+                    ),
+                },
+                "definitions": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": (
+                        "action=native only: build definitions, "
+                        f"{NATIVE_DEFINITION_KEY.pattern} = "
+                        f"{'|'.join(NATIVE_DEFINITION_VALUES)}. Must agree with "
+                        "features, and each key needs a stored project claim."
                     ),
                 },
             },

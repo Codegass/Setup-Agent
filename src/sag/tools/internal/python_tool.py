@@ -34,6 +34,18 @@ from sag.testcases.compileall_metrics import (
 )
 
 from ..base import BaseTool, ToolResult
+
+# The native allowlists are the FACADE's module data (spec §C8). They are
+# re-read here rather than trusted from the materialized params so the physical
+# command line is derived from the same tables the facade validated against —
+# no path into this executor can widen them.
+from ..build.backends import (
+    NATIVE_DEFINITION_ENV,
+    NATIVE_DEFINITION_KEY,
+    NATIVE_DEFINITION_VALUES,
+    NATIVE_FEATURE_RESOLVER,
+    native_cmake_args,
+)
 from .build_preflight import (
     PythonPreflight,
     active_python_version,
@@ -71,6 +83,17 @@ _PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
 # never succeed. Install the root project without resolving, then the declared
 # dependencies the provider does not supply.
 _PIP_NO_DEPS = "{venv}/bin/python -m pip install -e . --no-deps"
+# The exact-pin rung: a `deps` args install the facade already proved a stored
+# dependency claim states. The pin is shell-quoted for transport only; it
+# reached here as a literal from a project document, never from a parameter.
+_PIP_PIN = "{venv}/bin/python -m pip install {pin}"
+# The resolver's package install, in the house form (`project_setup_tool`'s JDK
+# install): refresh first, then a non-interactive install so a live run cannot
+# hang on a prompt. Every token outside `{packages}` is harness-owned, and
+# `{packages}` is the resolver's own allowlisted list — spec §C8's "no
+# model-controlled tokens" holds across the whole command line.
+_APT_REFRESH = "apt-get update"
+_APT_INSTALL = "DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}"
 
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 # The SELECTED count of a filtered collection: the X of pytest's
@@ -236,7 +259,7 @@ def verified_python_smoke_candidate(
     return None
 
 
-_OPERATIONS = ("setup_env", "test", "build", "compile")
+_OPERATIONS = ("setup_env", "test", "build", "compile", "native")
 _PYTEST_JUNIT_CONFLICT = "pytest_junit_unavailable"
 _PYTEST_ATTEMPT_ID_CONFLICT = "pytest_attempt_id_unpersisted"
 _PYTEST_JUNIT_MAX_COUNT = (1 << 63) - 1
@@ -600,6 +623,7 @@ class PythonTool(BaseTool):
         working_directory: str = "/workspace",
         args: str = None,
         timeout: int = 600,
+        native: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         op = (operation or "").strip().lower()
         if op not in _OPERATIONS:
@@ -611,6 +635,8 @@ class PythonTool(BaseTool):
             )
         requirements = read_build_requirements(self.orchestrator)
         venv = requirements.get("python_venv") or f"{working_directory.rstrip('/')}/.venv"
+        if op == "native":
+            return self._native(working_directory, timeout, requirements, venv, native)
         handler = {
             "setup_env": self._setup_env,
             "test": self._run_tests,
@@ -618,6 +644,178 @@ class PythonTool(BaseTool):
             "compile": self._compileall,
         }[op]
         return handler(working_directory, args, timeout, requirements, venv)
+
+    # ------------------------------------------------------------------
+    # native (spec §C8 — the resolved capability, then the same deps ladder)
+    # ------------------------------------------------------------------
+
+    def _native(
+        self,
+        working_directory: str,
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
+        native: Optional[Dict[str, Any]],
+    ) -> ToolResult:
+        """Resolve the capability physically, then re-run the project's install.
+
+        Three steps, in the order that makes each one meaningful:
+
+        1. install the resolver's own `debian_packages` — the model named a
+           FEATURE, the harness owns every token on the command line;
+        2. run the feature's probe VERBATIM and keep its first line: a package
+           that installed is not a capability, an executable that answers is;
+        3. re-run the project's OWN editable install through `_setup_env` under
+           a `CMAKE_ARGS` overlay composed from the validated definitions —
+           which is why the local-provider and `--no-deps` rungs still apply.
+
+        The receipt records the probe lines as `capability_observations`. The
+        bounded-smoke capability receipt is deliberately NOT written here: a
+        rebuild is not a test, and only an executed test may unlock collection.
+        """
+        bundle = dict(native or {})
+        features, definitions, refusal = self._validated_native(bundle)
+        if refusal is not None:
+            return refusal
+
+        preamble: List[str] = []
+        commands: List[str] = []
+        observations: List[Dict[str, str]] = []
+
+        packages: List[str] = []
+        for feature in features:
+            for package in NATIVE_FEATURE_RESOLVER[feature]["debian_packages"]:
+                if package not in packages:
+                    packages.append(package)
+        install_command = _APT_INSTALL.format(packages=" ".join(packages))
+        self._run(_APT_REFRESH, working_directory, timeout)
+        installed = self._run(install_command, working_directory, timeout)
+        commands.append(install_command)
+        preamble.append(
+            f"[native] resolved {', '.join(features)} to {', '.join(packages)}"
+            + ("" if installed.get("success") else " — the package install reported a failure")
+        )
+
+        for feature in features:
+            probe = NATIVE_FEATURE_RESOLVER[feature]["probe"]
+            probed = self._run(probe, working_directory, timeout)
+            commands.append(probe)
+            line = next(
+                (
+                    row.strip()
+                    for row in str(probed.get("output") or "").splitlines()
+                    if row.strip()
+                ),
+                "",
+            )
+            observation: Dict[str, str] = {"feature": feature, "probe": probe}
+            if line:
+                # Absent facts stay absent: a probe that answered nothing states
+                # no version, and inventing "unknown" would be a fact nobody saw.
+                observation["observation"] = line
+            observations.append(observation)
+            preamble.append(f"[native] {probe} -> {line or 'no output'}")
+
+        overlay = {NATIVE_DEFINITION_ENV: native_cmake_args(definitions)}
+        preamble.append(
+            f"[native] re-running the project's own install with "
+            f"{NATIVE_DEFINITION_ENV}={overlay[NATIVE_DEFINITION_ENV]!r}"
+        )
+        rebuilt = self._setup_env(
+            working_directory, None, timeout, requirements, venv, env_overlay=overlay
+        )
+        commands.extend(
+            self._with_env(command, overlay)
+            for command in (rebuilt.metadata or {}).get("install_commands") or ()
+        )
+
+        succeeded = bool(installed.get("success")) and rebuilt.succeeded
+        receipt_metadata = record_invocation(
+            self.orchestrator.execute_command,
+            tool="python",
+            attempt="native",
+            requested_action="native",
+            effective_action="native",
+            # The native materialization is a fixed sequence, so the receipt
+            # records the sequence it ran rather than one line of it.
+            argv=" && ".join(commands),
+            working_directory=working_directory,
+            exit_code=0 if succeeded else 1,
+            # A rebuild writes no test reports; an empty delta on both sides is
+            # the honest statement that none were expected.
+            before={},
+            after={},
+            output=rebuilt.raw_output or rebuilt.output,
+            requirements=requirements,
+            capability_observations=observations,
+            **contract_receipt_fields(" && ".join(commands)),
+        )
+        metadata: Dict[str, Any] = dict(rebuilt.metadata or {})
+        metadata.update(
+            {
+                "operation": "native",
+                "native_features": features,
+                "native_definitions": definitions,
+                "native_packages": packages,
+                "capability_observations": observations,
+                NATIVE_DEFINITION_ENV.lower(): overlay[NATIVE_DEFINITION_ENV],
+            }
+        )
+        metadata.update(receipt_metadata)
+        return self._finish(
+            ToolResult.completed(
+                operation_outcome="success" if succeeded else "failed",
+                output=rebuilt.output or "",
+                raw_output=rebuilt.raw_output,
+                error=(
+                    None
+                    if succeeded
+                    else (rebuilt.error or f"the {', '.join(packages)} install reported a failure")
+                ),
+                error_code=None if succeeded else (rebuilt.error_code or "NATIVE_BUILD_FAILED"),
+                metadata=metadata,
+            ),
+            preamble,
+        )
+
+    @staticmethod
+    def _validated_native(
+        bundle: Dict[str, Any],
+    ) -> Tuple[List[str], Dict[str, str], Optional[ToolResult]]:
+        """The bundle re-checked against the allowlists, or a refusal.
+
+        The facade already validated this; re-checking costs a dict lookup and
+        means no caller — including a future one — can reach a physical apt
+        install or an environment overlay through an unvalidated bundle.
+        """
+        features = [
+            str(feature).strip()
+            for feature in bundle.get("features") or ()
+            if str(feature).strip() in NATIVE_FEATURE_RESOLVER
+        ]
+        definitions = {
+            str(key): str(value)
+            for key, value in dict(bundle.get("definitions") or {}).items()
+            if NATIVE_DEFINITION_KEY.match(str(key)) and str(value) in NATIVE_DEFINITION_VALUES
+        }
+        if (
+            features
+            and definitions
+            and len(features) == len(bundle.get("features") or ())
+            and len(definitions) == len(bundle.get("definitions") or {})
+        ):
+            return features, definitions, None
+        return (
+            [],
+            {},
+            ToolResult.completed_failure(
+                output="",
+                error="the native bundle is not an allowlisted feature/definition set",
+                error_code="NATIVE_BUNDLE_REJECTED",
+                suggestions=["Call build(action='native') so the facade validates the intent"],
+                metadata={"operation": "native"},
+            ),
+        )
 
     # ------------------------------------------------------------------
     # setup_env
@@ -630,7 +828,18 @@ class PythonTool(BaseTool):
         timeout: int,
         requirements: Dict[str, Any],
         venv: str,
+        env_overlay: Optional[Dict[str, str]] = None,
     ) -> ToolResult:
+        """Install the project's dependencies through its own declared ladder.
+
+        `args`, when present, is an EXACT pin the build facade already matched
+        against a stored dependency claim (plan §Stage E item 3); it replaces
+        the ladder for that one install rather than being appended to it, and
+        it is the only shape this parameter accepts. `env_overlay` is the
+        native affordance's validated `CMAKE_ARGS` (spec §C8): it rides every
+        rung, so the local-provider and `--no-deps` recoveries rebuild under
+        exactly the definitions the contract froze.
+        """
         # Pre-flight FIRST (narration prepended, same pattern as the ported
         # maven/gradle tools): check-and-fix, never a hard block.
         preamble: List[str] = []
@@ -670,10 +879,17 @@ class PythonTool(BaseTool):
 
         installer = requirements.get("python_installer") or "pip"
         note = requirements.get("python_install_note")
-        commands = [
-            c.replace("{venv}", venv).replace("{dir}", working_directory)
-            for c in (requirements.get("python_install_commands") or [])
-        ]
+        pin = str(args or "").strip()
+        commands = (
+            [_PIP_PIN.replace("{venv}", venv).replace("{pin}", shlex.quote(pin))]
+            if pin
+            else [
+                c.replace("{venv}", venv).replace("{dir}", working_directory)
+                for c in (requirements.get("python_install_commands") or [])
+            ]
+        )
+        if pin:
+            preamble.append(f"[setup] installing the claim-backed exact pin {pin}")
         if not commands:
             # Bug #13 defect 4: self-healing deps — an empty manifest (the
             # agent skipped project analyze) must not no-op green; the marker
@@ -727,7 +943,7 @@ class PythonTool(BaseTool):
         )
         for cmd in commands:
             result_already_recorded = False
-            result = self._run(cmd, working_directory, install_timeout)
+            result = self._run(cmd, working_directory, install_timeout, env_overlay)
             install_failed = self._effective_install_failure(result)
 
             # Bounded retry (spec: exactly once): pip's Requires-Python
@@ -746,7 +962,7 @@ class PythonTool(BaseTool):
                             f"re-provisioned, retry 1/1"
                         )
                         retry_meta = {"from": active or "unknown", "to": needed}
-                        result = self._run(cmd, working_directory, install_timeout)
+                        result = self._run(cmd, working_directory, install_timeout, env_overlay)
                         install_failed = self._effective_install_failure(result)
 
             if install_failed and not provider_recovery_attempted:
@@ -757,21 +973,23 @@ class PythonTool(BaseTool):
                     timeout=install_timeout,
                     requirements=requirements,
                     venv=venv,
+                    env_overlay=env_overlay,
                 )
                 if recovery is not None:
                     provider_recovery_attempted = True
                     provider_recovery_meta = recovery["metadata"]
-                    transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
                     transcript.append(
-                        f"$ {recovery['provider_command']}\n"
+                        f"$ {self._with_env(cmd, env_overlay)}\n"
+                        f"{self._tail(result.get('output') or '')}"
+                    )
+                    transcript.append(
+                        f"$ {self._with_env(recovery['provider_command'], env_overlay)}\n"
                         f"{self._tail(recovery['provider_result'].get('output') or '')}"
                     )
                     preamble.append(recovery["narration"])
-                    provider_failed = self._effective_install_failure(
-                        recovery["provider_result"]
-                    )
+                    provider_failed = self._effective_install_failure(recovery["provider_result"])
                     if not provider_failed:
-                        result = self._run(cmd, working_directory, install_timeout)
+                        result = self._run(cmd, working_directory, install_timeout, env_overlay)
                         provider_recovery_meta["root_retry"] = True
                     else:
                         result = recovery["provider_result"]
@@ -789,7 +1007,10 @@ class PythonTool(BaseTool):
                         and self._missing_distribution_name(result.get("output") or "")
                         == provider_recovery_meta["distribution_name"]
                     ):
-                        transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
+                        transcript.append(
+                            f"$ {self._with_env(cmd, env_overlay)}\n"
+                            f"{self._tail(result.get('output') or '')}"
+                        )
                         preamble.append(
                             f"[recovery] the local {provider_recovery_meta['distribution_name']} "
                             "build resolves below the declared floor; installed the root "
@@ -801,6 +1022,7 @@ class PythonTool(BaseTool):
                             timeout=install_timeout,
                             requirements=requirements,
                             venv=venv,
+                            env_overlay=env_overlay,
                         )
                         transcript.extend(rung["transcript"])
                         result = rung["result"]
@@ -817,14 +1039,20 @@ class PythonTool(BaseTool):
                     f"pip install -e . — setup docs must list the fallback"
                 )
                 preamble.append(deviation)
-                transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
+                transcript.append(
+                    f"$ {self._with_env(cmd, env_overlay)}\n"
+                    f"{self._tail(result.get('output') or '')}"
+                )
                 cmd = _PIP_FALLBACK.replace("{venv}", venv)
-                result = self._run(cmd, working_directory, timeout)
+                result = self._run(cmd, working_directory, timeout, env_overlay)
                 result_already_recorded = False
                 install_failed = self._effective_install_failure(result)
 
             if not result_already_recorded:
-                transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
+                transcript.append(
+                    f"$ {self._with_env(cmd, env_overlay)}\n"
+                    f"{self._tail(result.get('output') or '')}"
+                )
             # Bug #13 defect 2: honest failure — a non-zero exit OR an
             # install-error signature in the output (a wrapper reporting
             # exit 0 while stderr said "No module named pip") is a FAILURE,
@@ -907,14 +1135,18 @@ class PythonTool(BaseTool):
         timeout: int,
         requirements: Dict[str, Any],
         venv: str,
+        env_overlay: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Install the root project without resolving, then the declared
         dependencies the local provider does not supply. Stops at the first
         failure — the caller renders it as an honest failure, rung narrated."""
         transcript: List[str] = []
         no_deps_command = _PIP_NO_DEPS.replace("{venv}", venv)
-        result = self._run(no_deps_command, working_directory, timeout)
-        transcript.append(f"$ {no_deps_command}\n{self._tail(result.get('output') or '')}")
+        result = self._run(no_deps_command, working_directory, timeout, env_overlay)
+        transcript.append(
+            f"$ {self._with_env(no_deps_command, env_overlay)}\n"
+            f"{self._tail(result.get('output') or '')}"
+        )
         if not self._effective_install_failure(result):
             remaining = self._remaining_declared_dependencies(
                 requirements, {self._normalized_distribution_name(distribution_name)}
@@ -923,8 +1155,11 @@ class PythonTool(BaseTool):
                 deps_command = f"{venv}/bin/python -m pip install " + " ".join(
                     shlex.quote(item) for item in remaining
                 )
-                result = self._run(deps_command, working_directory, timeout)
-                transcript.append(f"$ {deps_command}\n{self._tail(result.get('output') or '')}")
+                result = self._run(deps_command, working_directory, timeout, env_overlay)
+                transcript.append(
+                    f"$ {self._with_env(deps_command, env_overlay)}\n"
+                    f"{self._tail(result.get('output') or '')}"
+                )
         return {"result": result, "transcript": transcript}
 
     def _recover_local_provider(
@@ -936,6 +1171,7 @@ class PythonTool(BaseTool):
         timeout: int,
         requirements: Dict[str, Any],
         venv: str,
+        env_overlay: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Install one exact in-repo provider, then let the caller retry once."""
         missing = self._missing_distribution_name(output)
@@ -999,7 +1235,7 @@ class PythonTool(BaseTool):
             return None
 
         provider_command = f"{venv}/bin/python -m pip install -e {shlex.quote(provider_root)}"
-        provider_result = self._run(provider_command, working_directory, timeout)
+        provider_result = self._run(provider_command, working_directory, timeout, env_overlay)
         return {
             "provider_command": provider_command,
             "provider_result": provider_result,
@@ -2104,9 +2340,35 @@ class PythonTool(BaseTool):
     # helpers
     # ------------------------------------------------------------------
 
-    def _run(self, command: str, workdir: str, timeout: int) -> Dict[str, Any]:
+    @staticmethod
+    def _with_env(command: str, env_overlay: Optional[Dict[str, str]]) -> str:
+        """`NAME=value command`, in sorted name order; the command when empty.
+
+        Sorted so the same overlay always renders the same prefix — the
+        environment a dispatch ran under is a fact the receipt records, and a
+        fact whose spelling depends on dict order is not one.
+        """
+        if not env_overlay:
+            return command
+        prefix = " ".join(
+            f"{name}={shlex.quote(str(env_overlay[name]))}" for name in sorted(env_overlay)
+        )
+        return f"{prefix} {command}"
+
+    def _run(
+        self,
+        command: str,
+        workdir: str,
+        timeout: int,
+        env_overlay: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """One container command; monitored path when the orchestrator has it
-        (installs and test runs are long), plain execute_command otherwise."""
+        (installs and test runs are long), plain execute_command otherwise.
+
+        `env_overlay` is prepended as a shell assignment prefix rather than
+        exported: it applies to THIS command and cannot leak into the next one.
+        """
+        command = self._with_env(command, env_overlay)
         if hasattr(self.orchestrator, "execute_command_with_monitoring"):
             return self.orchestrator.execute_command_with_monitoring(
                 command,

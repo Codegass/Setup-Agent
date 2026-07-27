@@ -39,7 +39,7 @@ import posixpath
 import re
 import shlex
 import threading
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -340,6 +340,7 @@ def build_receipt(
     contract_id: Optional[str] = None,
     contract_hash: Optional[str] = None,
     compliance: Optional[str] = None,
+    capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble a schema-v2 receipt. Absent facts serialize as absent keys.
 
@@ -383,6 +384,17 @@ def build_receipt(
         receipt["toolchain_fingerprint"] = dict(toolchain_fingerprint)
     if testcase_outcomes:
         receipt["testcase_outcomes"] = dict(testcase_outcomes)
+    # Spec §C8: what a PHYSICAL probe observed about a resolved capability.
+    # A dispatch that probed nothing states nothing — the key is absent, never
+    # an empty list, because "no capability was probed" and "a probe found
+    # nothing" are different facts.
+    observations = [
+        {str(key): str(value) for key, value in dict(entry).items()}
+        for entry in capability_observations or ()
+        if isinstance(entry, Mapping) and entry
+    ]
+    if observations:
+        receipt["capability_observations"] = observations
     return receipt
 
 
@@ -435,6 +447,7 @@ def record_invocation(
     contract_id: Optional[str] = None,
     contract_hash: Optional[str] = None,
     compliance: Optional[str] = None,
+    capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Persist the receipt for one runner call; return its ToolResult metadata.
 
@@ -475,6 +488,7 @@ def record_invocation(
         contract_id=contract_id,
         contract_hash=contract_hash,
         compliance=compliance,
+        capability_observations=capability_observations,
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):

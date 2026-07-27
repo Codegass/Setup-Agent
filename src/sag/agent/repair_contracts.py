@@ -161,6 +161,16 @@ ARGV_ACTIONS = {
 # spells: `pip install X` installs a dependency, not a build.
 DEPENDENCY_RUNNERS = ("pip",)
 DEPENDENCY_ACTION = "deps"
+# The typed native affordance (spec §C8).
+NATIVE_ACTION = "native"
+# The value that ENABLES a capability. The `capability_absent_<f>` code is the
+# evidence that makes this the repair; it is never read off a claim, whose
+# stated value is just as likely to be the project's OFF default.
+NATIVE_ENABLED = "ON"
+# The `env` claim scopes whose typed_value may state a build definition: a CI
+# `CMAKE_ARGS` assignment and the `-DUSE_X=ON` inside it, plus CMake's own
+# `set()`/`option()` declarations.
+NATIVE_CLAIM_SCOPES = ("environment", "cmake_definition", "cmake_set", "cmake_option")
 # The typed observations Stage C2 freezes per action. `deps` resolves
 # coordinates and states no typed observation, so it records no key at all.
 EXPECTED_OBSERVATIONS = {
@@ -337,12 +347,15 @@ def propose_public_call(
     retriever's own order wins, and the retriever's order is the map's path
     order. Two orderings of the same claims cannot produce two proposals.
 
+    * a `capability_absent_<feature>` code whose definition switch a stored
+      claim states proposes the typed native affordance (spec §C8);
     * a lifecycle claim scoped to the domain proposes its documented verb
       against that domain's root;
-    * dependency pins propose `deps`, citing every pin;
-    * a `capability_absent_*` code proposes NOTHING unless a lifecycle claim
-      directly applies — turning a capability on is Stage E's typed native
-      affordance, and inventing it here would be an unsourced action.
+    * a SINGLE exact dependency pin proposes `deps` targeting that literal;
+      several pins propose the plain `deps` resolution, because choosing one
+      of them would be a guess rather than a citation;
+    * a `capability_absent_*` code proposes NOTHING otherwise — turning a
+      capability on without a project-owned switch is an unsourced action.
     """
     views = [view for view in (_claim_view(claim) for claim in claims or ()) if view]
     if not views:
@@ -350,6 +363,14 @@ def propose_public_call(
 
     code = _text((trigger or {}).get("typed_code"))
     root = _normalized_root(domain_root)
+
+    # The native affordance runs FIRST for a capability code: the absent
+    # capability IS the failure, and a lifecycle command that happens to be
+    # documented nearby answers a different question.
+    native = _native_proposal(code, views, root)
+    if native is not None:
+        return native, ""
+
     for view in views:
         if view["kind"] != "lifecycle":
             continue
@@ -377,6 +398,13 @@ def propose_public_call(
         directory = root or _normalized_root(pins[0]["applicability"].get("domain"))
         if directory:
             params["working_directory"] = directory
+        # One exact pin IDENTIFIES the repair, so the proposal targets it and
+        # cites the claim it came from. Several pins identify a dependency SET,
+        # which the project's own manifest already resolves; naming one of them
+        # would cite a claim for a choice the claim does not state.
+        literal = _exact_pin(pins[0]["typed_value"]) if len(pins) == 1 else ""
+        if literal:
+            params["args"] = literal
         return (
             {
                 "tool": REPAIR_TOOL,
@@ -387,6 +415,99 @@ def propose_public_call(
         )
 
     return None, NO_SAFE_PROPOSAL
+
+
+def _native_proposal(
+    typed_code: str,
+    views: Sequence[Mapping[str, Any]],
+    domain_root: str,
+) -> Optional[Dict[str, Any]]:
+    """The `build(action='native', ...)` these claims support, or None.
+
+    Two halves, both required (spec §C8):
+
+    * the typed code names the ABSENT capability, which is what makes `ON` the
+      repair rather than a preference — the value is derived from the evidence,
+      never read off a claim whose project default may well be `OFF`;
+    * a stored `env` claim states the feature's own `USE_<FEATURE>` switch,
+      which is what makes the switch project-owned rather than invented.
+
+    Definitions that name no feature (`BUILD_TESTING`) join only when a claim
+    states them too, with the claim's own value — they configure the same
+    build, so they need the same provenance.
+
+    The allowlists are the build facade's module data, imported HERE rather
+    than at module scope: `sag.agent` must not depend on `sag.tools` (the same
+    reason `invocation_contracts` defers its import of this module). Restating
+    the tables locally would be the other option, and two copies of an EXACT
+    allowlist eventually disagree — which is how a proposal the facade must
+    refuse gets composed.
+    """
+    if not typed_code.startswith(CAPABILITY_CODE_PREFIX):
+        return None
+    feature = typed_code[len(CAPABILITY_CODE_PREFIX) :].strip().lower()
+    if not feature:
+        return None
+    from sag.tools.build.backends import (
+        NATIVE_DEFINITION_KEY,
+        NATIVE_DEFINITION_VALUES,
+        NATIVE_FEATURE_DEFINITION_PREFIX,
+        native_feature_definition,
+    )
+
+    switch = native_feature_definition(feature)
+
+    definitions: Dict[str, str] = {}
+    supporting: List[str] = []
+    for view in views:
+        if view["kind"] != "env":
+            continue
+        typed_value = view["typed_value"]
+        if _text(typed_value.get("scope")) not in NATIVE_CLAIM_SCOPES:
+            continue
+        name = _text(typed_value.get("name"))
+        if not NATIVE_DEFINITION_KEY.match(name) or name in definitions:
+            continue
+        if name == switch:
+            definitions[name] = NATIVE_ENABLED
+        elif name.startswith(NATIVE_FEATURE_DEFINITION_PREFIX):
+            # A switch for a capability this failure did not name would request
+            # a feature nobody resolved; the facade rejects that pair, so it is
+            # never proposed either.
+            continue
+        elif _text(typed_value.get("value")) in NATIVE_DEFINITION_VALUES:
+            definitions[name] = _text(typed_value.get("value"))
+        else:
+            continue
+        supporting.append(view["claim_id"])
+    if switch not in definitions:
+        return None
+
+    params: Dict[str, Any] = {
+        "action": NATIVE_ACTION,
+        "features": [feature],
+        "definitions": {key: definitions[key] for key in sorted(definitions)},
+    }
+    if domain_root:
+        params["working_directory"] = domain_root
+    return {
+        "tool": REPAIR_TOOL,
+        "params": params,
+        "supporting_claim_ids": supporting,
+    }
+
+
+def _exact_pin(typed_value: Mapping[str, Any]) -> str:
+    """`pkg==literal` when this dependency claim states one, else empty.
+
+    Only `==`: a range states what a project TOLERATES, and installing one
+    version out of a range is a decision the claim never made.
+    """
+    if _text(typed_value.get("specifier")) != "==":
+        return ""
+    package = _text(typed_value.get("package"))
+    version = _text(typed_value.get("version"))
+    return f"{package}=={version}" if package and version else ""
 
 
 def build_repair(
@@ -551,7 +672,7 @@ def surfacing_block(orchestrator: Any, receipt_id: str) -> Optional[str]:
     triggers = sorted(
         {
             _text(record.get("assessment_id"))
-            for record in _read_records(orchestrator, ASSESSMENT_DIR)
+            for record in read_records(orchestrator, ASSESSMENT_DIR)
             if _text(record.get("receipt_id")) == subject
             and is_failure_class(record.get("typed_code"))
         }
@@ -561,7 +682,7 @@ def surfacing_block(orchestrator: Any, receipt_id: str) -> Optional[str]:
         return None
     proposals = {
         _text(record.get("trigger_assessment_id")): record
-        for record in _read_records(orchestrator, REPAIR_DIR)
+        for record in read_records(orchestrator, REPAIR_DIR)
     }
     for assessment_id in triggers:
         block = repair_block(proposals.get(assessment_id))
@@ -592,7 +713,7 @@ def accepted_repair_for(
     if requested_tool != REPAIR_TOOL:
         return None
     for record in sorted(
-        _read_records(orchestrator, REPAIR_DIR),
+        read_records(orchestrator, REPAIR_DIR),
         key=lambda item: _text(item.get("repair_id")),
     ):
         call = record.get("proposed_public_call")
@@ -772,12 +893,16 @@ def _lifecycle_action(typed_value: Mapping[str, Any]) -> Optional[str]:
     return ARGV_ACTIONS.get(runner)
 
 
-def _read_records(orchestrator: Any, directory: str) -> List[Dict[str, Any]]:
+def read_records(orchestrator: Any, directory: str) -> List[Dict[str, Any]]:
     """Every readable single-line JSON record in one evidence directory.
 
     Same bounded read the phase gate uses: one glob `cat`, and a line that does
     not parse is skipped rather than failing the read — a corrupt neighbour
     must not hide the records we do understand.
+
+    Public because the build facade's Stage E provenance gate needs the same
+    read over `claims/` and `evidence_assessments/`: two readers of the same
+    directories must not disagree about what a stored record is.
     """
     execute = getattr(orchestrator, "execute_command", None)
     if not callable(execute):
@@ -854,6 +979,9 @@ __all__ = [
     "EXPECTED_OBSERVATIONS",
     "FAILURE_CLASS_CODES",
     "MAX_RETRIEVED_ENTRIES",
+    "NATIVE_ACTION",
+    "NATIVE_CLAIM_SCOPES",
+    "NATIVE_ENABLED",
     "NO_SAFE_PROPOSAL",
     "NO_SUPPORTING_CLAIMS",
     "REPAIR_DIR",
@@ -867,6 +995,7 @@ __all__ = [
     "intent_source_for_dispatch",
     "is_failure_class",
     "propose_public_call",
+    "read_records",
     "repair_block",
     "repair_identity",
     "retrieve_for",
