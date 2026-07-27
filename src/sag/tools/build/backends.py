@@ -117,14 +117,39 @@ class MavenBackend:
             reasons=(_TEST_OWNERSHIP_REASON,) if added else (),
         )
 
-    def execute(
+    @staticmethod
+    def effective_action(params: Dict[str, Any]) -> str:
+        """The Maven lifecycle these params hand the runner."""
+        return str(params.get("command") or "")
+
+    @staticmethod
+    def expected_argv(params: Dict[str, Any]) -> Optional[str]:
+        """The argument vector these params materialize, runner excluded.
+
+        Token order mirrors `MavenTool._build_maven_command`: the fail-at-end
+        flag, the lifecycle, then the extra args. Which `mvn` binary the
+        toolchain resolves is the runner's own resolution, so the head token
+        is not part of the frozen vector (see `compliance_class`).
+        """
+        tokens = ["--fail-at-end"] if params.get("fail_at_end") else []
+        tokens.extend(shlex.split(str(params.get("command") or "")))
+        tokens.extend(shlex.split(str(params.get("extra_args") or "")))
+        return " ".join(shlex.quote(token) for token in tokens) or None
+
+    def materialize(
         self,
         verb: str,
         args: Optional[str],
         working_directory: str,
         timeout: Optional[int],
         maven_version_requirement: Optional[str] = None,
-    ) -> ActualToolExecution:
+    ) -> Dict[str, Any]:
+        """The exact params this backend will hand the runner. Dispatches nothing.
+
+        Split out of `execute` so the facade can freeze an invocation contract
+        over the materialized action BEFORE any physical command runs
+        (Plan 6 Stage B, spec §C3 step 3).
+        """
         kwargs: Dict[str, Any] = {
             "command": self.VERBS[verb],
             "working_directory": working_directory,
@@ -148,6 +173,28 @@ class MavenBackend:
             kwargs["timeout"] = timeout
         if maven_version_requirement:
             kwargs["maven_version_requirement"] = maven_version_requirement
+        return kwargs
+
+    def execute(
+        self,
+        verb: str,
+        args: Optional[str],
+        working_directory: str,
+        timeout: Optional[int],
+        maven_version_requirement: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> ActualToolExecution:
+        kwargs = (
+            dict(params)
+            if params is not None
+            else self.materialize(
+                verb,
+                args,
+                working_directory,
+                timeout,
+                maven_version_requirement=maven_version_requirement,
+            )
+        )
         try:
             result = self.maven_tool.execute(**kwargs)
         except OutputPersistenceError as exc:
@@ -192,9 +239,26 @@ class PythonBackend:
         wheel build runs no tests, so packaging already owns nothing of test."""
         return ExecutedAction(argv_fragment=str(params.get("operation") or verb))
 
-    def execute(
+    @staticmethod
+    def effective_action(params: Dict[str, Any]) -> str:
+        """The python operation these params hand the runner."""
+        return str(params.get("operation") or "")
+
+    @staticmethod
+    def expected_argv(params: Dict[str, Any]) -> Optional[str]:
+        """None: this backend materializes an operation, not an argv.
+
+        The interpreter (the project's own venv) and the JUnit report path are
+        resolved inside `python_tool` at dispatch time, so the facade would
+        have to GUESS the argument vector — and a guessed pin is worse than an
+        absent one.
+        """
+        return None
+
+    def materialize(
         self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
-    ) -> ActualToolExecution:
+    ) -> Dict[str, Any]:
+        """The exact params this backend will hand the runner. Dispatches nothing."""
         kwargs: Dict[str, Any] = {
             "operation": self.VERBS[verb],
             "working_directory": working_directory,
@@ -203,6 +267,21 @@ class PythonBackend:
             kwargs["args"] = args
         if timeout:
             kwargs["timeout"] = timeout
+        return kwargs
+
+    def execute(
+        self,
+        verb: str,
+        args: Optional[str],
+        working_directory: str,
+        timeout: Optional[int],
+        params: Optional[Dict[str, Any]] = None,
+    ) -> ActualToolExecution:
+        kwargs = (
+            dict(params)
+            if params is not None
+            else self.materialize(verb, args, working_directory, timeout)
+        )
         try:
             result = self.python_tool.execute(**kwargs)
         except OutputPersistenceError as exc:
@@ -369,9 +448,34 @@ class GradleBackend:
             reasons=tuple(reasons),
         )
 
-    def execute(
+    @staticmethod
+    def effective_action(params: Dict[str, Any]) -> str:
+        """The Gradle task list these params hand the runner."""
+        return str(params.get("tasks") or "")
+
+    @staticmethod
+    def expected_argv(params: Dict[str, Any]) -> Optional[str]:
+        """The argument vector these params materialize, runner excluded.
+
+        Token order mirrors `GradleTool._build_gradle_command`: `--continue`,
+        the gradle args, then the tasks. Which gradle binary runs (`./gradlew`
+        or a resolved distribution) is the runner's own resolution, so the head
+        token is not part of the frozen vector (see `compliance_class`).
+        """
+        tokens = ["--continue"] if params.get("fail_at_end") else []
+        tokens.extend(shlex.split(str(params.get("gradle_args") or "")))
+        tokens.extend(str(params.get("tasks") or "").split())
+        return " ".join(shlex.quote(token) for token in tokens) or None
+
+    def materialize(
         self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
-    ) -> ActualToolExecution:
+    ) -> Dict[str, Any]:
+        """The exact params this backend will hand the runner. Dispatches nothing.
+
+        The task probes here READ the project (settings files, source
+        directories); none of them builds anything, so the facade can freeze a
+        contract over the resulting task list before the runner is called.
+        """
         compile_languages: List[str] = []
         if verb == "install":
             task = self._install_task(working_directory)
@@ -401,6 +505,21 @@ class GradleBackend:
             # The languages this compile MUST cover, so the tool can refuse to
             # score an all-NO-SOURCE compile as a compile of these sources.
             kwargs["_compile_source_languages"] = compile_languages
+        return kwargs
+
+    def execute(
+        self,
+        verb: str,
+        args: Optional[str],
+        working_directory: str,
+        timeout: Optional[int],
+        params: Optional[Dict[str, Any]] = None,
+    ) -> ActualToolExecution:
+        kwargs = (
+            dict(params)
+            if params is not None
+            else self.materialize(verb, args, working_directory, timeout)
+        )
         try:
             result = self.gradle_tool.execute(**kwargs)
         except OutputPersistenceError as exc:

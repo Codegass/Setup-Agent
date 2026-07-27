@@ -24,6 +24,7 @@ from sag.agent.evidence_assessments import (
     next_control_event_id,
     write_assessment,
 )
+from sag.agent.invocation_contracts import contract_receipt_fields
 from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.evidence import TestStats
 from sag.testcases.compileall_metrics import (
@@ -1374,6 +1375,10 @@ class PythonTool(BaseTool):
             ),
             output=result.get("full_output") or output,
             requirements=requirements,
+            # Plan 6 Stage B: bind this dispatch back to the contract the build
+            # facade froze for it. Absent when the runner was called outside
+            # the facade, and `compliance` is the argv comparison's verdict.
+            **contract_receipt_fields(command),
         )
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.

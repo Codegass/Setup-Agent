@@ -45,6 +45,7 @@ from .control_events import (
     forced_action_sha256,
 )
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
+from .invocation_contracts import action_context, clear_action_context, set_action_context
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
 from .native_messages import render_messages
 from .output_storage import OutputStorageManager, attach_durable_output_ref
@@ -1314,7 +1315,14 @@ class ReActEngine(UIEventEmitter):
                 source_step_index=getattr(self, "current_iteration", 0),
                 model_used="harness",
             )
-            execution = self._execute_tool_call(call)
+            # The harness authored this intent, so the contract the facade
+            # freezes for it must say `controller` — a forced attempt is never
+            # the model's call (Plan 6 Stage B, spec §C3).
+            with action_context(
+                envelope_id=forced_payload["envelope_id"],
+                intent_source="controller",
+            ):
+                execution = self._execute_tool_call(call)
             if tool == "build":
                 self._mark_forced_test_refusals(execution, requirement)
             if tool == "project":
@@ -2426,9 +2434,15 @@ class ReActEngine(UIEventEmitter):
         result — replay, the A/B collector and the webui timeline with it.
         `plan_index` survives only in the hash helper, for transcripts recorded
         before Plan 2.
+
+        Emitting the envelope also OPENS the request scope the build facade
+        freezes its invocation contract against (Plan 6 Stage B): the tool
+        layer has no other view of this identity, and the scope is cleared
+        first so a dispatch can never inherit the previous call's envelope.
         """
         if getattr(self, "_suppress_control_action_envelope", False):
             return None
+        clear_action_context()
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return None
@@ -2458,6 +2472,7 @@ class ReActEngine(UIEventEmitter):
         if emitted is None:
             return None
         self._active_control_envelope_id = envelope_id
+        set_action_context(envelope_id=envelope_id, intent_source="model")
         return envelope_id
 
     @staticmethod

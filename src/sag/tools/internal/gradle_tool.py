@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.evidence_assessments import ReceiptAssessment, write_assessment
+from sag.agent.invocation_contracts import contract_receipt_fields
 from sag.agent.invocation_receipts import (
     record_invocation,
     snapshot_reports,
@@ -587,6 +588,10 @@ class GradleTool(BaseTool):
             after=after,
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,
+            # Plan 6 Stage B: bind this dispatch back to the contract the build
+            # facade froze for it. Absent when the runner was called outside
+            # the facade, and `compliance` is the argv comparison's verdict.
+            **contract_receipt_fields(argv),
         )
 
     def _record_receipt_assessment(self, *, typed_code: str, detail: str) -> bool:
