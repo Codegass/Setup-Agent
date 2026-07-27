@@ -95,15 +95,66 @@ sessions unchanged (cli 5/5, bigtop 9/9, tvm 9/9 ×2).
 
 ## Stage A — Bounded survey (DocumentMap + PolicyClaims + DomainFacts)
 
-Spec §C1/C2. Bind concretely at launch on Stage 0's merged HEAD. Scope:
-deterministic discovery with pinned budgets (files/bytes/depth in the run
-pin), section-level indexes, typed claim union with per-variant source_ref
-validation, applicability matching, equal-applicability conflicts,
-`partial_map` conflict on any exclusion, DomainFacts projection (facts
-only — documented_actions are claim IDs), edge law data (`edge_id`,
-support claims, revision invalidation). Negative controls: symlink escape,
-oversized/binary/vendored input, headings-only markdown stays unextracted,
-malicious text cannot become executable policy.
+Spec §C1/C2. Bound on `9d3636c`. Three lanes; cross-lane contracts EXACT.
+
+**Shared contracts.**
+- `DocumentMapEntry` (spec §C1 fields verbatim; `entry_id =
+  "doc-" + sha256(path)[:12]`; `section_index` = list of
+  `{section_id, kind, title_or_key, start_line, end_line}`).
+- Budgets (constants, copied into the run pin): `MAX_FILES=400`,
+  `MAX_TOTAL_BYTES=8_000_000`, `MAX_FILE_BYTES=512_000`, `MAX_DEPTH=6`.
+- Persistence: `/workspace/.setup_agent/document_map.json` (map +
+  `document_map_fingerprint` = sha256 of sorted `entry_id:source_hash`
+  pairs + `partial_map` conflict list); claims at
+  `/workspace/.setup_agent/claims/<claim_id>.json`
+  (`claim_id = "<kind>-" + sha256(canonical source_ref)[:12]`).
+- Claim union per spec §C1: `source_class` discriminates; wrong-variant
+  `source_ref` is schema-invalid (validation error, never coerced).
+
+**Task A1 (lane a1): document map.** NEW `src/sag/agent/document_map.py`
+(+ tests). Bounded enumeration under the verified checkout only (realpath
+containment; symlink escapes/binaries/generated/vendored trees/over-budget
+→ excluded + `partial_map` entries). Kind detection by extension+content;
+section indexing: markdown headings + fenced command blocks; YAML
+top-level keys and job/step paths; XML tag paths (depth ≤4); TOML tables;
+CMake `set()/option()` lines; shell variable assignments and command
+lines. One in-container `find` for enumeration + bounded `cat` per
+indexed file. Deterministic output ordering.
+
+**Task A2 (lane a2): claim records + extractors.** NEW
+`src/sag/agent/claim_records.py` (+ tests). The union types with
+per-variant validation; deterministic extractors (input: DocumentMapEntry
++ file text) producing `PolicyClaim`s for: tool version constraints
+(maven enforcer / README prose patterns with explicit version literals),
+lifecycle commands (fenced blocks and CI `run:` steps that invoke
+mvn/gradle/pip/pytest/cmake — argv + cwd preserved verbatim),
+dependency pins (`pip install` / requirements lines / Docker RUN),
+env/CMake definitions (`CMAKE_ARGS`, `set(USE_X ...)`, `option()`).
+Applicability record `{domain?, os?, arch?, workflow_job?, goal?}` from
+the entry's context; equal-applicability duplicates with differing
+typed_value → both recorded + one conflict record. Headings alone extract
+nothing. `UntrustedDocInterpretation` type exists but has no path into
+claims (enforced by construction + test).
+
+**Task A3 (lane a3): DomainFacts projection + Category-3 boundary.**
+Files: `src/sag/agent/physical_survey.py`,
+`src/sag/tools/internal/project_analyzer.py` (+ tests). Emit `DomainFacts`
+(spec §C2 shape) alongside the existing keys: `role`/`environment`
+default `"unknown"` (never guessed), `capability_state` from existing
+native probes where present, `documented_actions` = claim IDs matched to
+the domain by applicability (consume lane a2's claim files by documented
+schema; hand-written fixtures in tests), `fact_epoch` = monotonic int
+starting 1, `open_conflicts` from existing conflict sources +
+`partial_map`. Existing `build_domains`/`domain_edges` keys unchanged;
+edges gain `edge_id = "edge-" + sha256(consumer+producer+coordinate)[:12]`
+and `support_claim_ids` (absent when none). Rendering constraint tests:
+analyze output / phase intro / handoff contain coordinates, constraints
+and open conflicts only — no goal, no recommended call, no probe sequence
+(Category-3 boundary assertions, spec §6 row 1).
+
+Stage exit: negative controls (symlink escape, oversized/binary/vendored,
+headings-only markdown, malicious text → no executable claim), full suite,
+Plan 5 profiles unchanged on recorded sessions.
 
 ## Stage B — Execution binding (ActionIntent → InvocationContract)
 
