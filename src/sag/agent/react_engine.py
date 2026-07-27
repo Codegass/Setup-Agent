@@ -74,6 +74,13 @@ from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_types import ReactModelMode, ReActStep, StepType
+from .repair_contracts import (
+    REPAIR_TOOL,
+    accepted_repair_for,
+    clear_accepted_repair,
+    set_accepted_repair,
+    surfacing_block,
+)
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ActualToolExecution,
@@ -2419,6 +2426,29 @@ class ReActEngine(UIEventEmitter):
             logger.warning(f"Control-event emission failed for {kind}: {exc}")
             return None
 
+    def _detect_accepted_repair(
+        self,
+        tool: str,
+        params: Dict[str, Any],
+    ) -> Optional[str]:
+        """Open the acceptance scope when this call IS a live repair proposal.
+
+        Acceptance is exact equality with a stored proposal's public call (Plan
+        6 Stage C3, spec §C6). The model cannot self-attest it: the `repair_id`
+        comes from the proposal file the call matched, and a call that matches
+        nothing clears the scope rather than inheriting the previous one.
+
+        Bounded — only the facade a repair may propose is looked up at all."""
+        clear_accepted_repair()
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return None
+        repair_id = accepted_repair_for(orchestrator, tool, compact_control_value(params))
+        if repair_id:
+            logger.info(f"Repair {repair_id} accepted by the model's own {tool} call")
+            set_accepted_repair(repair_id)
+        return repair_id
+
     def _emit_control_action_envelope(
         self,
         tool: str,
@@ -2443,6 +2473,10 @@ class ReActEngine(UIEventEmitter):
         if getattr(self, "_suppress_control_action_envelope", False):
             return None
         clear_action_context()
+        # Plan 6 Stage C3: the same place a stale envelope is dropped is where a
+        # stale acceptance must be, so the repair scope never outlives the call
+        # that accepted it.
+        self._detect_accepted_repair(tool, params)
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return None
@@ -3977,6 +4011,33 @@ class ReActEngine(UIEventEmitter):
 
         return None
 
+    def _repair_surfacing_block(self, source_tool: Optional[str]) -> Optional[str]:
+        """The bounded `[repair]` block this observation must carry, if any.
+
+        Reactive, never anticipatory (Plan 6 Stage C3, spec §C6): a proposal is
+        surfaced only after a receipt this dispatch minted was assessed as a
+        typed failure, and only when a repair for THAT assessment is already on
+        disk. No receipt in the metadata means no assessment to react to, so the
+        evidence directories are not even read.
+
+        The receipt is read from the ACTION step this observation answers — the
+        same published-on-the-engine seam `_observation_source_tool` uses, so no
+        caller has to thread a result through the observation path."""
+        if source_tool != REPAIR_TOOL:
+            return None
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return None
+        result = None
+        for step in reversed(getattr(self, "steps", None) or ()):
+            if getattr(step, "step_type", None) is StepType.ACTION:
+                result = getattr(step, "tool_result", None)
+                break
+        receipt_id = str((getattr(result, "metadata", None) or {}).get("receipt_id") or "").strip()
+        if not receipt_id:
+            return None
+        return surfacing_block(orchestrator, receipt_id)
+
     def _append_native_observation(
         self,
         tool_call_id: Optional[str],
@@ -3990,6 +4051,11 @@ class ReActEngine(UIEventEmitter):
         the physical-evidence trigger. It is published on the engine rather
         than passed down, because `_add_observation_step` is a one-argument
         seam that callers (and tests) substitute."""
+        block = self._repair_surfacing_block(source_tool)
+        if block:
+            # One block per observation: this is the only place an observation
+            # is appended, so the bound is structural rather than a counter.
+            observation = f"{str(observation or '').rstrip()}\n\n{block}".lstrip()
         previous_source_tool = getattr(self, "_observation_source_tool", None)
         self._observation_source_tool = source_tool
         try:
