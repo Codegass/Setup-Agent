@@ -23,6 +23,7 @@ from sag.tools.base import (
     is_output_storage_ref,
     new_execution_id,
 )
+from sag.tools.internal.build_utils import DETACHED_HANDOFF_STATUSES
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .attempt_ledger import compact_steps
@@ -80,6 +81,13 @@ from .repair_contracts import (
     clear_accepted_repair,
     set_accepted_repair,
     surfacing_block,
+)
+from .retry_authority import (
+    RETRY_TOOL,
+    compute_retry_key,
+    failure_codes,
+    read_frozen_contract,
+    record_failure,
 )
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
@@ -4011,6 +4019,16 @@ class ReActEngine(UIEventEmitter):
 
         return None
 
+    def _answered_action_result(self):
+        """The tool result of the ACTION step this observation answers.
+
+        The published-on-the-engine seam `_observation_source_tool` uses, so no
+        caller has to thread a result through the observation path."""
+        for step in reversed(getattr(self, "steps", None) or ()):
+            if getattr(step, "step_type", None) is StepType.ACTION:
+                return getattr(step, "tool_result", None)
+        return None
+
     def _repair_surfacing_block(self, source_tool: Optional[str]) -> Optional[str]:
         """The bounded `[repair]` block this observation must carry, if any.
 
@@ -4018,25 +4036,58 @@ class ReActEngine(UIEventEmitter):
         surfaced only after a receipt this dispatch minted was assessed as a
         typed failure, and only when a repair for THAT assessment is already on
         disk. No receipt in the metadata means no assessment to react to, so the
-        evidence directories are not even read.
-
-        The receipt is read from the ACTION step this observation answers — the
-        same published-on-the-engine seam `_observation_source_tool` uses, so no
-        caller has to thread a result through the observation path."""
+        evidence directories are not even read."""
         if source_tool != REPAIR_TOOL:
             return None
         orchestrator = getattr(self, "orchestrator", None)
         if orchestrator is None:
             return None
-        result = None
-        for step in reversed(getattr(self, "steps", None) or ()):
-            if getattr(step, "step_type", None) is StepType.ACTION:
-                result = getattr(step, "tool_result", None)
-                break
+        result = self._answered_action_result()
         receipt_id = str((getattr(result, "metadata", None) or {}).get("receipt_id") or "").strip()
         if not receipt_id:
             return None
         return surfacing_block(orchestrator, receipt_id)
+
+    def _record_retry_authority(self, source_tool: Optional[str]) -> None:
+        """Sign the retry key of a dispatch a failure-class assessment closed.
+
+        Plan 6 Stage D1 (spec §C7): the CONTROLLER owns recurrence state, and
+        this is the one seam where receipt, contract and assessment are all on
+        disk together — the same observation seam the repair block is surfaced
+        from. The build facade reads this ledger before it freezes the next
+        contract; it never keeps a second one.
+
+        Lifecycle is not a retry: a dispatch handed off detached has not failed
+        yet, so it signs nothing and there is nothing for the eventual poll to
+        be refused by.
+
+        Never raises: a key that could not be recorded is a missing authority
+        record, not a failed build."""
+        if source_tool != RETRY_TOOL:
+            return
+        execute = getattr(getattr(self, "orchestrator", None), "execute_command", None)
+        if not callable(execute):
+            return
+        try:
+            metadata = getattr(self._answered_action_result(), "metadata", None) or {}
+            if str(metadata.get("dispatch_status") or "") in DETACHED_HANDOFF_STATUSES:
+                return
+            receipt_id = str(metadata.get("receipt_id") or "").strip()
+            contract_id = str(metadata.get("contract_id") or "").strip()
+            if not receipt_id or not contract_id:
+                return
+            contract = read_frozen_contract(execute, contract_id)
+            if not contract:
+                return
+            for typed_code in failure_codes(execute, receipt_id):
+                record_failure(
+                    execute,
+                    compute_retry_key(contract, typed_code),
+                    contract_id,
+                    typed_code,
+                )
+        except Exception as exc:  # the authority never breaks an observation
+            logger.debug(f"retry authority not signed for this observation: {exc}")
 
     def _append_native_observation(
         self,
@@ -4051,6 +4102,7 @@ class ReActEngine(UIEventEmitter):
         the physical-evidence trigger. It is published on the engine rather
         than passed down, because `_add_observation_step` is a one-argument
         seam that callers (and tests) substitute."""
+        self._record_retry_authority(source_tool)
         block = self._repair_surfacing_block(source_tool)
         if block:
             # One block per observation: this is the only place an observation

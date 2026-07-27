@@ -22,6 +22,13 @@ from sag.agent.invocation_contracts import (
     freeze_contract,
     unrecorded_envelope_id,
 )
+from sag.agent.retry_authority import (
+    RETRY_WITHOUT_DELTA,
+    RETRY_WITHOUT_DELTA_CODE,
+    blocking_entry,
+    candidate_contract,
+    read_ledger,
+)
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.internal.build_preflight import (
@@ -260,6 +267,28 @@ class BuildTool(BaseTool):
         else:
             materialized = backend.materialize(effective_verb, args, working_directory, timeout)
 
+        effective_action = backend.effective_action(materialized)
+        expected_argv = backend.expected_argv(materialized)
+
+        # --- material-progress retry law (spec §C7) — PRE-FREEZE ------------
+        # The CONTROLLER signs recurrence after each failure-class assessment;
+        # this facade only validates it and keeps no second store of its own.
+        # A refused dispatch must leave nothing behind, so the check runs
+        # BEFORE the freeze: no contract, no receipt, no runner.
+        retry_refusal = self._retry_without_delta_refusal(
+            system=system,
+            requested_verb=verb,
+            effective_verb=effective_verb,
+            effective_action=effective_action,
+            working_directory=working_directory,
+            expected_argv=expected_argv,
+            requirements=requirements,
+            preamble_lines=preamble_lines,
+        )
+        if retry_refusal is not None:
+            return retry_refusal
+        # --- end material-progress retry law --------------------------------
+
         scope = current_action_context()
         envelope_id = scope.envelope_id or unrecorded_envelope_id()
         contract = freeze_contract(
@@ -267,9 +296,9 @@ class BuildTool(BaseTool):
             envelope_id=envelope_id,
             tool=self.name,
             params=requested_call_params,
-            effective_action=backend.effective_action(materialized),
+            effective_action=effective_action,
             expected_cwd=working_directory,
-            expected_argv=backend.expected_argv(materialized),
+            expected_argv=expected_argv,
             intent_source=scope.intent_source,
             requirements=requirements,
         )
@@ -453,6 +482,110 @@ class BuildTool(BaseTool):
         if target_sha:
             current["target_sha"] = target_sha
         return current
+
+    # --- material-progress retry law (spec §C7) -----------------------------
+
+    def _retry_without_delta_refusal(
+        self,
+        *,
+        system: str,
+        requested_verb: str,
+        effective_verb: str,
+        effective_action: str,
+        working_directory: str,
+        expected_argv: Optional[str],
+        requirements: Mapping[str, Any],
+        preamble_lines: List[str],
+    ) -> Optional[ToolResult]:
+        """Refuse a dispatch the ledger has already seen fail, or None to proceed.
+
+        Spec §C7 gives deterministic failures a law: the same action, against
+        the same tree, in the same environment, that already failed the same
+        typed way may not simply be run again. It needs a material delta — a
+        different argv, a different environment fingerprint, an accepted repair
+        or a newer fact epoch — and prose, revisions and restated expectations
+        are not deltas.
+
+        The recurrence state is the controller's (`retry_authority`); this
+        facade reads it and answers. The refusal mints no receipt, so it also
+        records a `ControlAssessment`: a reader of the evidence directory must
+        still learn that this intent was stopped and why. Persisting that is
+        best effort and never gates the refusal.
+
+        Never raises: a ledger this facade cannot read states no recurrence,
+        and an unreadable file is not authority to stop a build.
+        """
+        execute = self.docker_orchestrator.execute_command
+        try:
+            # A run that has recorded no failure has no recurrence to validate,
+            # so the ledger read is the whole cost of the law on a first
+            # dispatch — the candidate (and its target-sha probe) is only built
+            # when there is something to compare it against.
+            ledger = read_ledger(execute)
+            if not ledger:
+                return None
+            candidate = candidate_contract(
+                execute,
+                tool=self.name,
+                effective_action=effective_action,
+                expected_cwd=working_directory,
+                expected_argv=expected_argv,
+                requirements=requirements,
+            )
+            blocked = blocking_entry(execute, candidate, ledger=ledger)
+        except Exception as exc:  # the authority never breaks a first dispatch
+            logger.debug(f"retry authority not consulted for {working_directory}: {exc}")
+            return None
+        if blocked is None:
+            return None
+        retry_key, entry = blocked
+        typed_code = str(entry.get("typed_code") or "").strip()
+        count = entry.get("count")
+        headline = (
+            f"[retry] {system} {effective_verb} at {working_directory} already failed "
+            f"as {typed_code} ×{count} with this exact action, tree and environment"
+        )
+        closing = (
+            "a repeat needs material progress: change the argv, change the toolchain "
+            "or environment, accept a repair proposal, or record a new project fact — "
+            "a rerun on its own cannot fail differently"
+        )
+        facts: Dict[str, Any] = {
+            "retry_key": retry_key,
+            "prior_typed_code": typed_code,
+            "prior_failure_count": count,
+            "requested_action": requested_verb,
+            "effective_action": effective_verb,
+            "working_directory": working_directory,
+            "system": system,
+        }
+        metadata: Dict[str, Any] = dict(facts)
+        metadata["runner_dispatched"] = False
+        write_assessment(
+            self.docker_orchestrator.execute_command,
+            ControlAssessment(
+                event_or_intent_id=next_control_event_id("build-retry"),
+                stage="precondition",
+                typed_code=RETRY_WITHOUT_DELTA_CODE,
+                detail=(
+                    f"{retry_key} already failed as {typed_code} ×{count}; this dispatch "
+                    "states no material delta"
+                ),
+            ),
+        )
+        return ToolResult.completed_failure(
+            output="\n".join(preamble_lines + [headline, closing]),
+            error=f"identical retry after {typed_code}",
+            error_code=RETRY_WITHOUT_DELTA,
+            facts=facts,
+            metadata=metadata,
+            suggestions=[
+                "Read the recorded failure before rerunning: search(target='output_...') "
+                "on the prior attempt's output ref",
+                "Change the invocation itself (args, working_directory, action) or the "
+                "environment it runs in, then retry",
+            ],
+        )
 
     # --- domain-edge execution law (spec §C2) -------------------------------
 
