@@ -91,6 +91,8 @@ EXPECTATION_MET = "expectation_met"
 # domain's own documentation. Prefix-matched so the vocabulary stays extensible
 # without this module learning a new name each time.
 DEPENDENCY_CODE_PREFIXES = ("dependency_",)
+# The assessor's dependency-mismatch family; the suffix names the subject.
+DEPENDENCY_INCOMPATIBLE_PREFIX = "dependency_incompatible_"
 CAPABILITY_CODE_PREFIX = "capability_absent_"
 FALSIFIER_CODE_PREFIX = "falsifier_"
 # The Stage C base failure/blocked codes. `deviated_receipt` is included as a
@@ -396,6 +398,19 @@ def propose_public_call(
         return None, NO_SAFE_PROPOSAL
 
     pins = [view for view in views if view["kind"] == "dependency"]
+    # A `dependency_incompatible_<name>` code STATES its subject: filtering
+    # the pins to that package is a citation, not a choice (live p6v-tvm-r6:
+    # the docker script pins several packages, and the un-filtered rule
+    # proposed a bare `deps` that would never install the 1.26 line).
+    if code.startswith(DEPENDENCY_INCOMPATIBLE_PREFIX):
+        subject = code[len(DEPENDENCY_INCOMPATIBLE_PREFIX) :]
+        subject_pins = [
+            view
+            for view in pins
+            if _text(view["typed_value"].get("package")).lower() == subject.lower()
+        ]
+        if subject_pins:
+            pins = subject_pins
     if pins:
         params: Dict[str, Any] = {"action": DEPENDENCY_ACTION}
         directory = root or _normalized_root(pins[0]["applicability"].get("domain"))

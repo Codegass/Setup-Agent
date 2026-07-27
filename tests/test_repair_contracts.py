@@ -865,3 +865,48 @@ def test_acceptance_detection_only_probes_for_the_facade_it_can_propose(
 
     assert orchestrator.filesystem.commands == []
     assert current_acceptance() is None
+
+
+def test_the_dependency_code_subject_filters_a_multi_pin_set():
+    """Live p6v-tvm-r6: the docker script pins several packages, and the
+    unfiltered single-pin rule proposed a bare `deps` with no args. The
+    typed code names its subject — filtering to it is a citation."""
+    from sag.agent.repair_contracts import build_repair
+
+    trigger = {
+        "assessment_id": "asm-x-dependency_incompatible_numpy-0daebc4b",
+        "receipt_id": "inv-python-2-0003",
+        "typed_code": "dependency_incompatible_numpy",
+        "detail": "ValueError: Could not convert T.float32 to a NumPy dtype",
+    }
+    claims = [
+        {
+            "claim_id": "dependency-numpy",
+            "kind": "dependency",
+            "typed_value": {
+                "ecosystem": "pip",
+                "package": "numpy",
+                "specifier": "==",
+                "version": "1.26.*",
+            },
+            "applicability": {},
+        },
+        {
+            "claim_id": "dependency-other",
+            "kind": "dependency",
+            "typed_value": {
+                "ecosystem": "pip",
+                "package": "tensorflow-aarch64",
+                "specifier": "==",
+                "version": "2.16.1",
+            },
+            "applicability": {},
+        },
+    ]
+
+    repair = build_repair(trigger, claims, domain_root="/workspace/tvm")
+
+    call = repair["proposed_public_call"]
+    assert call["params"]["action"] == "deps"
+    assert call["params"]["args"] == "numpy==1.26.*"
+    assert repair["supporting_claim_ids"] == ["dependency-numpy"]
