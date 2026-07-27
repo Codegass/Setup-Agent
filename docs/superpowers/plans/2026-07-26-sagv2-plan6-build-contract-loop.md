@@ -294,9 +294,38 @@ group invisible; cycle rejected).
 
 ## Stage D — Retry authority
 
-Spec §C7. Retry identity vector, material-delta validation, transient/flaky
-budget, poll/resume exemption; controller-signed token validated by the
-facade against authoritative LoopMemory.
+Spec §C7. Bound on `4c8d65a`. Single lane.
+
+**Retry identity (EXACT):** `retry_key = sha256(canonical({target_sha,
+domain_id?, normalized_action: {tool, verb, argv_tokens_sorted:false —
+tokens in order}, typed_code, environment_fingerprint?}))[:16]`, computed
+from the FAILED dispatch's contract + its ReceiptAssessment (or
+ControlAssessment for receiptless refusals).
+
+**Task D1 (lane d1):** NEW `src/sag/agent/retry_authority.py` (+ tests);
+integrate: `src/sag/agent/react_engine.py` (controller signs), 
+`src/sag/tools/build/build_tool.py` (facade validates).
+1. After each failure-class assessment the controller records the
+   `retry_key` in the authoritative LoopMemory-adjacent store
+   (`/workspace/.setup_agent/retry_ledger.json`, atomic rewrite:
+   `{retry_key: {count, last_contract_id, typed_code}}`).
+2. Before freezing a contract for a build/test dispatch, the facade
+   computes the candidate's retry_key-equivalent (same normalization
+   over the ABOUT-TO-RUN action). If the key exists in the ledger, the
+   dispatch needs a material delta: different argv tokens, different
+   environment fingerprint, a contract with `intent_source=
+   accepted_repair`, or a changed fact_epoch. Prose/expectation changes
+   are NOT deltas. No delta ⇒ REFUSE (completed_failure,
+   error_code=RETRY_WITHOUT_DELTA, ControlAssessment
+   typed_code="retry_without_delta", the prior typed_code + count named
+   in the output).
+3. Transient budget: typed codes `transient_network`/`timeout` allow up
+   to 2 identical retries (count tracked per key; the 3rd refuses).
+4. Poll/resume + detached completions never touch the ledger (they are
+   lifecycle, not retries — assert via the existing detached statuses).
+Stage exit: full suite; Plan 5 profiles unchanged; negative controls
+(identical deterministic retry refused; repair-stamped retry allowed;
+transient allows 2; detached poll exempt).
 
 ## Stage E — Native affordance
 
