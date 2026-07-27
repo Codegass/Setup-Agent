@@ -820,3 +820,26 @@ def test_handoff_manifest_stays_prescription_free_with_documented_actions():
     _assert_no_prescription(body)
     # The documented action is present — as an ID only.
     assert TF_LIFECYCLE_ID in body
+
+
+def test_relative_argv_paths_resolve_against_the_claim_cwd():
+    """Spec §5 Bigtop anchor: the README lifecycle runs from the repository
+    root with `-f ./bigtop-test-framework/pom.xml`. The relative token must
+    resolve against the claim's cwd, or the documented action never reaches
+    its domain."""
+    claim = {
+        "claim_id": "lifecycle-abcdef123456",
+        "kind": "lifecycle",
+        "typed_value": {
+            "tool": "maven",
+            "argv": ["mvn", "clean", "install", "-f", "./bigtop-test-framework/pom.xml"],
+            "cwd": "/workspace/bigtop",
+        },
+        "applicability": {"domain": None},
+    }
+    facts = build_domain_facts(
+        None,
+        [{"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven"}],
+        claims=[claim],
+    )
+    assert facts[0]["documented_actions"] == ["lifecycle-abcdef123456"]

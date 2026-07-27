@@ -1883,7 +1883,21 @@ def _claim_argv_paths(claim: Dict[str, Any]) -> List[str]:
         tokens.append(cwd)
     argv = typed_value.get("argv")
     if isinstance(argv, (list, tuple)):
-        tokens.extend(token for token in argv if isinstance(token, str))
+        for token in argv:
+            if not isinstance(token, str):
+                continue
+            tokens.append(token)
+            # Spec §5 Bigtop anchor: documented commands run from a recorded
+            # cwd with RELATIVE paths (`-f ./module/pom.xml`). The verbatim
+            # token stays; its cwd-resolved form is what containment sees.
+            if (
+                isinstance(cwd, str)
+                and cwd.startswith("/")
+                and token
+                and not token.startswith(("/", "-"))
+                and "/" in token
+            ):
+                tokens.append(posixpath.normpath(posixpath.join(cwd, token)))
     return tokens
 
 
