@@ -329,9 +329,51 @@ transient allows 2; detached poll exempt).
 
 ## Stage E — Native affordance
 
-Spec §C8. `build(action="native", features, definitions)` behind contract
-freeze only; allowlists; platform resolver; capability probes close the
-receipt; TVM S0→S3 battery per spec §5.
+Spec §C8. Bound on `524baa0`. Single lane; the LIVE TVM S0→S3 battery
+runs with Stage F's acceptance runs — E ships the machinery + negative
+controls.
+
+**Allowlists (EXACT, module data):** definitions keys must match
+`^(USE_[A-Z0-9_]+|BUILD_TESTING)$` with values `ON|OFF` only; features
+resolve through `NATIVE_FEATURE_RESOLVER = {"llvm": {"debian_packages":
+["llvm-dev", "libxml2-dev"], "probe": "llvm-config --version"}}`
+(extensible data, no project names). Anything else — compiler launchers,
+toolchain files, absolute/escaped paths, arbitrary -D keys — is rejected
+with a ControlAssessment.
+
+**Task E1 (lane e1):** files: `src/sag/tools/build/build_tool.py`
+(native verb), `src/sag/tools/build/backends.py` (PythonBackend native
+materialization), `src/sag/tools/internal/python_tool.py` (native rebuild
+execution path), `src/sag/agent/repair_contracts.py` (capability +
+dependency-pin proposals), NEW `tests/test_native_affordance.py`.
+1. `build(action='native', features=[...], definitions={...},
+   working_directory=...)`: validated against the allowlists; dispatch
+   REQUIRES (a) a `capability_absent_<feature>` assessment on record for
+   the domain AND (b) supporting policy claims for the definitions
+   (CI/docs `CMAKE_ARGS`/`set(USE_X ...)` claims) — the freeze records
+   those claim IDs; model params carry no provenance. Missing either ⇒
+   refusal error_code=NATIVE_WITHOUT_PROVENANCE, typed_code
+   `native_without_provenance` ("no project-owned repair policy — the
+   state is unknown, not repairable").
+2. Execution (python system): resolver installs the feature's
+   debian_packages (apt, allowlisted list only), runs the feature probe,
+   then re-runs the project's own editable install with
+   `CMAKE_ARGS="<definitions>"` through the EXISTING python deps
+   machinery (env overlay, --no-deps rung preserved); receipt
+   `capability_observations` records the probe output line.
+3. `repair_contracts.build_repair` extensions: `capability_absent_<n>` +
+   a matching `USE_<N>`-definition claim ⇒ propose
+   `build(action='native', features=[n], definitions={...from claims})`;
+   a dependency-class failure + an exact-pin dependency claim
+   (`pkg==literal`) ⇒ propose `build(action='deps', args="<pin>")` —
+   and the deps path accepts an allowlisted exact-pin args install
+   (literal pins from claims only; wire minimally in python_tool).
+4. Negative controls: bad definition key/value rejected; unknown feature
+   rejected; no capability assessment ⇒ refused; no supporting claims ⇒
+   refused; model-supplied provenance ignored; a positive smoke after
+   native never unlocks unbounded collect (existing receipt semantics —
+   assert unchanged).
+Stage exit: full suite; Plan 5 profiles unchanged.
 
 ## Stage F — Proof
 
