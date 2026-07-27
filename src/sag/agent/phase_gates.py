@@ -60,6 +60,34 @@ _CLAIM_VALIDATOR_STATE = {
 # these states has NOT closed, so no gate may refine a claim upward past it.
 _UNCLOSED_DOMAIN_STATES = frozenset({"failed", "blocked", "untried"})
 
+# Append-only evidence assessments (Plan 6 Stage 0, spec §C4). Lane z1 owns the
+# writer; this is the documented cross-lane storage path — the sibling of
+# ``RECEIPT_DIR`` under the same ``.setup_agent`` root, one single-line JSON
+# file per assessment, named by its ``assessment_id``.
+ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
+
+# Receipt/assessment schema versions this reader understands. v1 wrote no
+# ``schema_version`` guarantee beyond the constant 1 and v2 only ADDS keys, so
+# both derive identically; an unknown FUTURE version is skipped rather than
+# coerced (spec §C4: no silent coercion).
+_SUPPORTED_RECORD_VERSIONS = frozenset({1, 2})
+
+# Failure-class typed codes (spec §C4/§C5). ONLY these turn a receipt
+# semantically failed, overriding its own exit 0. Deliberately small and
+# explicit: per §C5 a mismatch is not automatically a contradiction, so
+# unknown/blocked/diagnostic codes leave the raw exit standing and a typed code
+# nobody writes yet cannot silently acquire failure authority.
+#   compile_no_source_mismatch — the gradle NO-SOURCE downgrade migrated off
+#       the deleted ``mark_semantic_failure`` receipt rewrite.
+#   semantic_failure — the generic successor of that same field, for any runner
+#       that condemns its own zero-exit invocation.
+_FAILURE_CLASS_ASSESSMENT_CODES = frozenset(
+    {
+        "compile_no_source_mismatch",
+        "semantic_failure",
+    }
+)
+
 _ANALYSIS_STATUS_PROJECTIONS = {
     "analysis_trunk_missing": (
         "Project survey facts are not persisted on the trunk.",
@@ -605,26 +633,42 @@ def _receipt_order(receipt: Mapping[str, Any]) -> tuple[int, str]:
     return (sequence, receipt_id)
 
 
-def _read_invocation_receipts(orchestrator) -> tuple[Mapping[str, Any], ...]:
-    """Every Stage B invocation receipt, one shell round-trip.
+def _record_version(payload: Mapping[str, Any]) -> int | None:
+    """A record's schema version, or ``None`` when it is not a version we read.
 
-    ``write_receipt`` persists single-line JSON per file, so one ``cat`` of the
-    directory yields one receipt per line. Evidence collection never breaks a
-    gate: unreadable transport yields no receipts (absent facts stay absent),
-    and the caller then reports the domains as untried rather than guessing.
+    An absent ``schema_version`` is v1 (receipts written before the key was a
+    stated contract). ``True``/``False`` are not versions.
+    """
+    raw = payload.get("schema_version", 1)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if raw in _SUPPORTED_RECORD_VERSIONS else None
+
+
+def _read_json_records(orchestrator, directory: str) -> list[Mapping[str, Any]]:
+    """Every single-line JSON record in ``directory``, one shell round-trip.
+
+    The writers persist single-line JSON per file, so one ``cat`` of the
+    directory yields one record per line; the glob is ``*.json``, so an atomic
+    writer's ``<id>.json.tmp`` temp file is invisible here exactly as it is in
+    the container — a partially written record is absent, never half-read.
+
+    Evidence collection never breaks a gate: unreadable transport yields no
+    records (absent facts stay absent) and the caller degrades rather than
+    guessing.
     """
     if orchestrator is None:
-        return ()
+        return []
     try:
         probe = orchestrator.execute_command(
-            f"cat {shlex.quote(RECEIPT_DIR)}/*.json 2>/dev/null",
+            f"cat {shlex.quote(directory)}/*.json 2>/dev/null",
             workdir=None,
             timeout=30,
         )
     except Exception as exc:
-        logger.debug(f"invocation receipts unavailable at the gate: {exc}")
-        return ()
-    receipts: list[Mapping[str, Any]] = []
+        logger.debug(f"{directory} unavailable at the gate: {exc}")
+        return []
+    records: list[Mapping[str, Any]] = []
     for line in str((probe or {}).get("output") or "").splitlines():
         stripped = line.strip()
         if not stripped.startswith("{"):
@@ -633,19 +677,126 @@ def _read_invocation_receipts(orchestrator) -> tuple[Mapping[str, Any], ...]:
             payload = json.loads(stripped)
         except (TypeError, ValueError):
             continue
-        if isinstance(payload, Mapping) and payload.get("working_directory"):
-            receipts.append(payload)
-    return tuple(receipts)
+        if isinstance(payload, Mapping):
+            records.append(payload)
+    return records
+
+
+def _read_invocation_receipts(
+    orchestrator,
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[str, ...]]:
+    """Every readable Stage B invocation receipt, plus named read conflicts.
+
+    Version-gated (spec §C4): v1 and v2 are both derived, an unknown future
+    version is SKIPPED with a named conflict. Failing closed on the file rather
+    than the run keeps one unreadable receipt from erasing the domains whose
+    receipts we do understand — the skipped domain simply stays untried, which
+    the truth table already forbids from closing green.
+    """
+    receipts: list[Mapping[str, Any]] = []
+    conflicts: list[str] = []
+    for payload in _read_json_records(orchestrator, RECEIPT_DIR):
+        # Version FIRST: a future receipt may name its fields differently, so
+        # checking the payload's keys before its version would drop it silently
+        # — which is the one outcome version gating exists to prevent.
+        if _record_version(payload) is None:
+            logger.warning(
+                f"invocation receipt {payload.get('receipt_id')!r} has unsupported "
+                f"schema_version {payload.get('schema_version')!r} and was skipped"
+            )
+            conflicts.append("receipt_schema_unsupported")
+            continue
+        if not payload.get("working_directory"):
+            continue
+        receipts.append(payload)
+    return tuple(receipts), tuple(dict.fromkeys(conflicts))
+
+
+def _read_evidence_assessments(
+    orchestrator,
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[str, ...]]:
+    """Every readable ReceiptAssessment, plus named read conflicts.
+
+    An assessment is the append-only typed interpretation of ONE receipt
+    (``{assessment_id, receipt_id, typed_code, detail}``). Records that name no
+    receipt or no typed code carry no interpretation and are not evidence.
+    """
+    assessments: list[Mapping[str, Any]] = []
+    conflicts: list[str] = []
+    for payload in _read_json_records(orchestrator, ASSESSMENT_DIR):
+        if _record_version(payload) is None:
+            logger.warning(
+                f"evidence assessment {payload.get('assessment_id')!r} has unsupported "
+                f"schema_version {payload.get('schema_version')!r} and was skipped"
+            )
+            conflicts.append("assessment_schema_unsupported")
+            continue
+        if not str(payload.get("receipt_id") or "").strip():
+            continue
+        if not str(payload.get("typed_code") or "").strip():
+            continue
+        assessments.append(payload)
+    return tuple(assessments), tuple(dict.fromkeys(conflicts))
+
+
+@dataclass(frozen=True)
+class _DomainDerivation:
+    """Derived per-domain states plus the named conflicts the read produced.
+
+    ``states`` is ``None`` when no build domains were surveyed; conflicts are
+    reported either way, because an unreadable evidence record is a fact about
+    the run whether or not the project decomposes into domains.
+    """
+
+    states: dict[str, dict[str, str]] | None = None
+    conflicts: tuple[str, ...] = ()
+
+
+def _condemned_receipt_ids(
+    receipts: Iterable[Mapping[str, Any]],
+    assessments: Iterable[Mapping[str, Any]],
+) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Receipt ids a failure-class assessment condemns, plus named conflicts.
+
+    A SET, so append-only storage holding the same verdict twice (two
+    assessment ids, one receipt) is one state transition and not two. An
+    assessment naming a receipt we never read is a named conflict rather than a
+    crash or an invented failure: without the receipt there is no working
+    directory to attribute it to.
+    """
+    known = {str(receipt.get("receipt_id") or "").strip() for receipt in receipts}
+    condemned: set[str] = set()
+    conflicts: list[str] = []
+    for record in assessments:
+        receipt_id = str(record.get("receipt_id") or "").strip()
+        if receipt_id not in known:
+            logger.warning(
+                f"evidence assessment {record.get('assessment_id')!r} names unknown "
+                f"receipt {receipt_id!r}"
+            )
+            conflicts.append("assessment_receipt_missing")
+            continue
+        if str(record.get("typed_code") or "").strip() in _FAILURE_CLASS_ASSESSMENT_CODES:
+            condemned.add(receipt_id)
+    return frozenset(condemned), tuple(dict.fromkeys(conflicts))
 
 
 def _domain_states(
     requirements: Mapping[str, Any] | None,
     receipts: Iterable[Mapping[str, Any]],
-) -> dict[str, dict[str, str]] | None:
-    """Per-domain state from the coordinate graph plus Stage B receipts.
+    assessments: Iterable[Mapping[str, Any]] = (),
+) -> _DomainDerivation:
+    """Per-domain state from the coordinate graph, receipts and assessments.
 
-    ``None`` when no build domains were surveyed — the single-domain (cli, tvm)
-    path, where the rollups keep their pre-Stage-C shape exactly.
+    ``states`` is ``None`` when no build domains were surveyed — the
+    single-domain (cli, tvm) path, where the rollups keep their pre-Stage-C
+    shape exactly.
+
+    Semantic failure has TWO immutable sources (spec §C4): the receipt's own
+    ``outcome == "failed"`` OR a failure-class ``ReceiptAssessment`` naming it.
+    The assessment wins over a raw exit 0 — that is the whole point of deleting
+    the ``mark_semantic_failure`` rewrite: the receipt keeps saying what the
+    command did, and the append-only assessment says what it means.
 
     Precedence, strictest first: a FAILED receipt outranks a classified blocker
     (accurate classification never erases an observed failure), a blocker
@@ -657,15 +808,19 @@ def _domain_states(
     containing domain root. Crediting an aggregator because a nested domain
     built is the overclaim this stage exists to remove.
     """
+    receipts = tuple(receipts)
+    condemned, conflicts = _condemned_receipt_ids(receipts, assessments)
     roots = _surveyed_domain_roots(requirements)
     if not roots:
-        return None
+        return _DomainDerivation(None, conflicts)
     blockers = _domain_blockers(requirements)
     attempted: dict[str, str] = {}
     for receipt in sorted(receipts, key=_receipt_order):
         outcome = str(receipt.get("outcome") or "").strip().lower()
         if outcome not in {"completed", "failed"}:
             continue
+        if str(receipt.get("receipt_id") or "").strip() in condemned:
+            outcome = "failed"
         directory = _normalized_domain_root(receipt.get("working_directory"))
         if not directory:
             continue
@@ -694,29 +849,41 @@ def _domain_states(
         if blocker:
             entry["blocker"] = blocker
         states[root] = entry
-    return states
+    return _DomainDerivation(states, conflicts)
 
 
 def _gate_domain_states(
     orchestrator,
     requirements: Mapping[str, Any] | None = None,
-) -> dict[str, dict[str, str]] | None:
+) -> _DomainDerivation:
     """Domain states for one gate pass; never raises, never blocks the gate.
 
     ``requirements`` lets a caller that already read the survey manifest reuse
     it instead of paying a second container round-trip.
+
+    Replay-safe: the derivation is a pure function of the two record
+    directories, so reading the same receipts and assessments twice yields
+    byte-identical states and the same named conflicts.
     """
     if orchestrator is None:
-        return None
+        return _DomainDerivation()
     try:
         if requirements is None:
             from sag.tools.internal.build_preflight import read_build_requirements
 
             requirements = read_build_requirements(orchestrator) or {}
-        return _domain_states(requirements, _read_invocation_receipts(orchestrator))
+        receipts, receipt_conflicts = _read_invocation_receipts(orchestrator)
+        assessments, assessment_conflicts = _read_evidence_assessments(orchestrator)
+        derived = _domain_states(requirements, receipts, assessments)
+        return replace(
+            derived,
+            conflicts=tuple(
+                dict.fromkeys((*receipt_conflicts, *assessment_conflicts, *derived.conflicts))
+            ),
+        )
     except Exception as exc:
         logger.debug(f"domain states unavailable at the gate: {exc}")
-        return None
+        return _DomainDerivation()
 
 
 def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
@@ -839,9 +1006,14 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     # Plan 5 Task C2 (P0-B/P0-F): per-domain outcomes ride WITH the build
     # rollup they scope. Absent when no build domains were surveyed, so
     # single-domain projects seal the pre-Stage-C shape byte-identically.
-    domain_states = _gate_domain_states(orchestrator, requirements)
-    if domain_states is not None:
-        validated_facts["build.domain_states"] = domain_states
+    derived = _gate_domain_states(orchestrator, requirements)
+    if derived.states is not None:
+        validated_facts["build.domain_states"] = derived.states
+    if derived.conflicts:
+        # Plan 6 Stage 0: a record we could not read is named, never silently
+        # dropped. Absent when the read was clean, so single-domain and
+        # recorded-replay runs seal the pre-Plan-6 fact set byte-identically.
+        validated_facts["build.evidence_conflicts"] = list(derived.conflicts)
     return _ValidatorObservation(
         state,
         reason=reason,
@@ -908,9 +1080,15 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
         # Plan 5 Task C2: the domain decomposition scopes the test rollup the
         # same way it scopes the build one. Key absent when no domains were
         # surveyed (established absent-when-inapplicable pattern above).
-        domain_states = _gate_domain_states(orchestrator)
-        if domain_states is not None:
-            rollup["domain_states"] = domain_states
+        derived = _gate_domain_states(orchestrator)
+        if derived.states is not None:
+            rollup["domain_states"] = derived.states
+        if derived.conflicts:
+            # Plan 6 Stage 0: named evidence-read conflicts ride the rollup's
+            # existing conflicts channel into the sealed snapshot.
+            rollup["conflicts"] = list(
+                dict.fromkeys([*(rollup.get("conflicts") or ()), *derived.conflicts])
+            )
     return _ValidatorObservation(
         state,
         reason=reason,
