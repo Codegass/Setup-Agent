@@ -8,7 +8,7 @@ later ecosystems (python/node) add a module here, never a schema change.
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sag.runtime.container_io import read_container_text
 from sag.tools.base import ActualToolExecution, OutputPersistenceError, ToolResult
@@ -74,6 +74,59 @@ BUILD_MARKERS = {
     ),
     "python": ("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
 }
+
+# --- native affordance allowlists (spec §C8, plan §Stage E) ----------------
+# EXACT, and module DATA rather than policy: a row is how an ecosystem grows,
+# and nothing here can learn a project name. Everything outside these tables —
+# compiler launchers, toolchain files, absolute or escaped paths, arbitrary -D
+# keys, any value that is not the switch itself — is not a native definition,
+# and the facade refuses it with a ControlAssessment rather than quoting it.
+NATIVE_DEFINITION_KEY = re.compile(r"^(USE_[A-Z0-9_]+|BUILD_TESTING)$")
+NATIVE_DEFINITION_VALUES = ("ON", "OFF")
+# The feature prefix that binds a definition to a NAMED capability. `USE_LLVM`
+# is the llvm feature's switch; `BUILD_TESTING` names no capability, so it is
+# an allowlisted definition that no feature has to justify.
+NATIVE_FEATURE_DEFINITION_PREFIX = "USE_"
+# The platform resolver (spec §C8): a named feature -> the packages that supply
+# it and the PHYSICAL probe that verifies the resolution. The model never
+# writes a token in either list; it only names a row that must already exist.
+NATIVE_FEATURE_RESOLVER = {
+    "llvm": {
+        "debian_packages": ["llvm-dev", "libxml2-dev"],
+        "probe": "llvm-config --version",
+    },
+}
+# The one environment variable a validated definition set materializes into.
+NATIVE_DEFINITION_ENV = "CMAKE_ARGS"
+
+
+def native_feature_definition(feature: Any) -> str:
+    """The definition key that switches `feature` on (`llvm` -> `USE_LLVM`)."""
+    return f"{NATIVE_FEATURE_DEFINITION_PREFIX}{str(feature or '').strip().upper()}"
+
+
+def native_definition_feature(key: Any) -> Optional[str]:
+    """The feature a definition key names, or None when it names none.
+
+    `BUILD_TESTING` is the None case and the reason this is a function: an
+    allowlisted definition that belongs to no capability must not be read as a
+    capability request nobody declared.
+    """
+    text = str(key or "").strip()
+    if not text.startswith(NATIVE_FEATURE_DEFINITION_PREFIX):
+        return None
+    return text[len(NATIVE_FEATURE_DEFINITION_PREFIX) :].lower() or None
+
+
+def native_cmake_args(definitions: Mapping[str, str]) -> str:
+    """`-DKEY=VALUE` for every definition, in SORTED key order.
+
+    Sorted rather than as-supplied: the model chose the mapping's order, so
+    honouring it would make the environment a dispatch runs under depend on a
+    model parameter. The same definitions must compose the same string however
+    they arrived, or the contract commits to nothing.
+    """
+    return " ".join(f"-D{key}={definitions[key]}" for key in sorted(definitions))
 
 
 class MavenBackend:
@@ -228,6 +281,10 @@ class PythonBackend:
         # (spec settled decision: never required for a green verdict).
         "package": "build",
         "install": "build",
+        # Spec §C8: the typed native affordance is python-system machinery —
+        # it re-materializes THIS project's own editable install under a
+        # validated CMAKE_ARGS overlay. No JVM backend exposes it.
+        "native": "native",
     }
 
     def __init__(self, python_tool):
@@ -256,9 +313,19 @@ class PythonBackend:
         return None
 
     def materialize(
-        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+        self,
+        verb: str,
+        args: Optional[str],
+        working_directory: str,
+        timeout: Optional[int],
+        native: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """The exact params this backend will hand the runner. Dispatches nothing."""
+        """The exact params this backend will hand the runner. Dispatches nothing.
+
+        `native` is the facade's ALREADY-VALIDATED feature/definition bundle
+        (spec §C8). It is copied verbatim and never repaired here: a bundle
+        this backend had to fix would be one the facade let through unchecked.
+        """
         kwargs: Dict[str, Any] = {
             "operation": self.VERBS[verb],
             "working_directory": working_directory,
@@ -267,6 +334,15 @@ class PythonBackend:
             kwargs["args"] = args
         if timeout:
             kwargs["timeout"] = timeout
+        if verb == "native":
+            bundle = dict(native or {})
+            kwargs["native"] = {
+                "features": [str(feature) for feature in bundle.get("features") or ()],
+                "definitions": {
+                    str(key): str(value)
+                    for key, value in dict(bundle.get("definitions") or {}).items()
+                },
+            }
         return kwargs
 
     def execute(

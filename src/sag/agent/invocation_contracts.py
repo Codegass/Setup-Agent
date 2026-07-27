@@ -173,12 +173,17 @@ def build_contract(
     predecessor_contract_id: Optional[str] = None,
     expected_observations: Optional[Sequence[str]] = None,
     direct_falsifiers: Optional[Sequence[Mapping[str, Any]]] = None,
+    supporting_claim_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Assemble one schema-v1 contract. Pure — no probes, no I/O.
 
     Field names and shapes are the plan's Stage B v1 list verbatim, plus the
     Stage C typed expectations (`expected_observations`/`direct_falsifiers`)
     the assessor reads back; `supersedes_contract_id` is not invented here.
+
+    `supporting_claim_ids` are the STORED claims that authorized this dispatch
+    (spec §C8: "the contract stores claim IDs"). A dispatch that needed no
+    project-owned authority states none, as an absent key.
     """
     argv = _text(expected_argv)
     identifier = contract_identity(envelope_id, argv)
@@ -222,6 +227,10 @@ def build_contract(
         ]
         if predicates:
             contract["direct_falsifiers"] = predicates
+    supporting = [_text(value) for value in supporting_claim_ids or ()]
+    supporting = [value for value in supporting if value]
+    if supporting:
+        contract["supporting_claim_ids"] = supporting
     conflicts = [_text(value) for value in blocking_conflict_ids or ()]
     conflicts = [value for value in conflicts if value]
     if conflicts:
@@ -279,6 +288,7 @@ def freeze_contract(
     requirements: Optional[Mapping[str, Any]],
     document_map_fingerprint: Optional[str] = None,
     predecessor_contract_id: Optional[str] = None,
+    supporting_claim_ids: Optional[Sequence[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Freeze and persist the contract for ONE dispatch; None when it failed.
 
@@ -314,6 +324,7 @@ def freeze_contract(
             predecessor_contract_id=predecessor_contract_id,
             expected_observations=expected_observations(action),
             direct_falsifiers=direct_falsifiers(action),
+            supporting_claim_ids=supporting_claim_ids,
         )
     except (TypeError, ValueError) as exc:
         # A call the canonical form cannot represent cannot be committed to,
