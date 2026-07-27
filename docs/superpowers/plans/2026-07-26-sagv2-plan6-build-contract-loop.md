@@ -377,6 +377,57 @@ Stage exit: full suite; Plan 5 profiles unchanged.
 
 ## Stage F — Proof
 
-Spec §6 in full: architecture/causal-safety assertions, untrusted-input
-negative controls, three anchors, metamorphic renamed fixtures,
-held-out regressions (pyyaml, httpcomponents-client, all Plan 5 anchors).
+Spec §6. Bound on the Stage E merge. Two lanes + the live battery (run by
+the reviewer). Verified gap driving f1: `discover_document_map`,
+claim extraction, `claim_graph`, and live repair CREATION have zero
+production callers — the loop exists but is not wired into a run.
+
+**Task F1 (lane f1): live wiring.** Files:
+`src/sag/tools/internal/project_analyzer.py`, `src/sag/agent/react_engine.py`,
+`src/sag/tools/build/build_tool.py` (one bounded hunk), NEW
+`tests/test_live_loop_wiring.py`.
+1. Analyze path: after the survey facts land, run
+   `discover_document_map` + `write_document_map`, then the claim
+   extractors over indexed entries (bounded text fetch per entry budget)
+   + `write_claims`; DomainFacts projection then sees real claims. Failure
+   of either is a recorded conflict, never an analyze failure.
+2. Repair creation: after a failure-class ReceiptAssessment is persisted
+   (the c3 surfacing seam), when no repair exists for it yet, call
+   `retrieve_for` (text fetch via orchestrator over the persisted map) +
+   `build_repair` + `write_repair`; surfacing then finds it. Bounded: one
+   creation attempt per assessment.
+3. Claim transitions: after `expectation_met`, group-transition the
+   contract's `supporting_claim_ids` from untested → confirmed; after a
+   `falsifier_*` assessment on an exact/equivalent fresh receipt,
+   group-transition those claims → contradicted + `invalidate_dependents`
+   (one event group per binding note (a), emitted via the engine's
+   control sink; claim_graph.materialize refreshes the snapshot).
+4. Live-wiring tests with fake orchestrator: analyze produces map+claims
+   files; a failure assessment yields a persisted repair + surfaced
+   block; expectation_met confirms supporting claims; falsifier
+   contradicts + invalidates; all replay fixtures untouched.
+
+**Task F2 (lane f2): proof suites + verifier.** Files:
+`scripts/verify_native_test_policy.py`, NEW
+`tests/test_metamorphic_fixtures.py`, NEW
+`tests/test_no_project_name_policy.py`.
+1. Metamorphic: the bigtop-shaped domain/edge fixtures re-run with
+   renamed roots/groups/artifacts/versions must produce structurally
+   identical facts/edges/contract shapes (ids differ, structure equal).
+2. No-project-name policy: a test walks `src/sag/**/*.py` and asserts the
+   names commons-cli, bigtop, bigpetstore, tvm appear ONLY in comments/
+   docstrings, never in executable code (ast-based: scan Name/Str
+   comparisons and literals inside conditionals).
+3. Verifier Plan 6 upgrades (auto-armed only when the session carries
+   contracts): every runner receipt has contract_id + the chain holds
+   (upgrade contracts.chain from silent to REQUIRED when
+   invocation_contracts/ is non-empty); an assessments dir exists when
+   receipts exist; analyze sessions carry document_map.json.
+Stage exit: full suite; Plan 5 recorded profiles STILL 6/10/10/10
+(pre-Plan-6 sessions have no contracts — assertions stay silent there).
+
+**Live battery (reviewer-run, after F merges):** cli + bigtop + tvm
+(serial), --record, machine-verified; TVM additionally graded on the
+S0→S3 expectations (capability assessment present, repair persisted with
+CI-claim provenance, accepted_repair contract if the model takes it,
+honest outcome either way); Plan 6 final acceptance report.
