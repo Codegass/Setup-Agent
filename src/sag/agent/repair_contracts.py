@@ -44,6 +44,7 @@ the tool layer has no other view of what the model just accepted.
 
 import hashlib
 import json
+import re
 import posixpath
 import shlex
 import threading
@@ -100,6 +101,7 @@ FALSIFIER_CODE_PREFIX = "falsifier_"
 # still forbids it from contradicting the contract it deviated from.
 FAILURE_CLASS_CODES = frozenset(
     {
+        "java_version_mismatch",
         "no_dispatch",
         "transient_network",
         "timeout",
@@ -362,11 +364,22 @@ def propose_public_call(
     * a `capability_absent_*` code proposes NOTHING otherwise — turning a
       capability on without a project-owned switch is an unsourced action.
     """
+    code = _text((trigger or {}).get("typed_code"))
+
+    # A stated java version mismatch is answerable BEFORE any document is read,
+    # and it is the only code here that needs no claim. The rule it appears to
+    # break — no claims, no proposal — exists to stop the harness inventing a
+    # remedy out of nothing; here the build itself named both the version it
+    # requires and the one it ran under, which is receipt evidence and the
+    # strongest provenance the loop has. The assessment IS the support.
+    java_repair = _java_version_proposal(code, trigger)
+    if java_repair is not None:
+        return java_repair, ""
+
     views = [view for view in (_claim_view(claim) for claim in claims or ()) if view]
     if not views:
         return None, NO_SUPPORTING_CLAIMS
 
-    code = _text((trigger or {}).get("typed_code"))
     root = _normalized_root(domain_root)
 
     # The native affordance runs FIRST for a capability code: the absent
@@ -433,6 +446,41 @@ def propose_public_call(
         )
 
     return None, NO_SAFE_PROPOSAL
+
+
+JAVA_MISMATCH_CODE = "java_version_mismatch"
+# The public facade that installs a JDK. `project(action='provision', ...)` is
+# the call a model already has; a repair that cannot be expressed as one is a
+# plan, not a repair (spec §C6).
+PROVISION_TOOL = "project"
+PROVISION_ACTION = "provision"
+_REQUIRED_MAJOR = re.compile(r"requires\s+java\s+(\d+)", re.IGNORECASE)
+
+
+def _java_version_proposal(
+    typed_code: str,
+    trigger: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """`project(action='provision', java_version=N)` for a stated mismatch.
+
+    The required major is read from the assessment's own detail — the assessor
+    wrote it there from the build's output — never from a model parameter and
+    never guessed. No major in the detail means no proposal.
+    """
+    if typed_code != JAVA_MISMATCH_CODE:
+        return None
+    detail = _text((trigger or {}).get("detail"))
+    match = _REQUIRED_MAJOR.search(detail)
+    if not match:
+        return None
+    assessment_id = _text((trigger or {}).get("assessment_id"))
+    if not assessment_id:
+        return None
+    return {
+        "tool": PROVISION_TOOL,
+        "params": {"action": PROVISION_ACTION, "java_version": match.group(1)},
+        "supporting_claim_ids": [assessment_id],
+    }
 
 
 def _native_proposal(

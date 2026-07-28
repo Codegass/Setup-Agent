@@ -477,12 +477,18 @@ def assess_dispatch(
     current_fingerprints: Optional[Mapping[str, str]] = None,
     dispatch_status: Optional[str] = None,
     error_code: Optional[str] = None,
+    output: Optional[str] = None,
 ) -> List[ReceiptAssessment]:
     """Assess ONE dispatch and persist every verdict; return the ones that landed.
 
     The primary verdict first, then any capability absence. Persistence is
     idempotent (`write_assessment`), so re-assessing the same receipt — a
     replay, a second pass over the same execution trace — writes nothing new.
+
+    `output` is the dispatch's complete runner output when the caller still
+    holds it. The receipt keeps only a hash of that text, so a fault the build
+    stated in prose — a java version mismatch, say — is readable here and
+    nowhere else.
     """
     if not _text((receipt or {}).get("receipt_id")):
         return []
@@ -497,7 +503,56 @@ def assess_dispatch(
     ]
     assessments.extend(capability_absences(receipt))
     assessments.extend(dependency_incompatibilities(receipt))
+    assessments.extend(java_version_mismatch(receipt, output))
     return [assessment for assessment in assessments if write_assessment(execute, assessment)]
+
+
+def java_version_mismatch(
+    receipt: Optional[Mapping[str, Any]],
+    output: Optional[str],
+) -> List[ReceiptAssessment]:
+    """`java_version_mismatch` when the build stated both majors it disagreed on.
+
+    Rides alongside the primary verdict like the capability and dependency
+    findings. Both majors must be present and different: one alone, or two that
+    agree, is not a mismatch, and inferring the missing half would be the
+    harness inventing a requirement the build never stated.
+    """
+    identifier = _text((receipt or {}).get("receipt_id"))
+    text = str(output or "")
+    if not identifier or not text:
+        return []
+    for row in JAVA_MISMATCH_PATTERNS:
+        required = _first_major(row.get("required"), text)
+        detected = _first_major(row.get("detected"), text)
+        if required is None or detected is None or required == detected:
+            continue
+        return [
+            ReceiptAssessment(
+                receipt_id=identifier,
+                typed_code=JAVA_MISMATCH_CODE,
+                detail=f"build requires java {required}, ran under java {detected}",
+            )
+        ]
+    return []
+
+
+def _first_major(pattern: Any, text: str) -> Optional[int]:
+    """The first java major a pattern finds, or None when it finds none."""
+    expression = str(pattern or "")
+    if not expression:
+        return None
+    try:
+        match = re.search(expression, text, re.IGNORECASE)
+    except re.error:
+        logger.debug(f"java mismatch pattern is not a valid expression: {expression!r}")
+        return None
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 # Spec §5 S2: a FAILED testcase whose message matches a known dependency-
@@ -508,6 +563,37 @@ DEPENDENCY_FAILURE_PATTERNS = (
     {"name": "numpy", "pattern": r"NumPy dtype|numpy\.dtype|numpy dtype"},
 )
 DEPENDENCY_PREFIX = "dependency_incompatible_"
+
+# Plan 7 round two: a build that states BOTH the java it needs and the java it
+# got has diagnosed itself, and that statement is the strongest provenance
+# there is — the runner said it, in its own output. Live p7-polaris: Gradle
+# printed "requires Java 21." / "Detected Java version: 17"; live p7-camel: the
+# wrapper ran under 17 against a build needing 17+. In both runs the model read
+# the sentence and closed the phase without provisioning, because no typed code
+# named the failure and so no repair could be proposed for it.
+#
+# Each row needs BOTH majors. A pattern that finds only one is not a mismatch —
+# guessing the other half is how a harness invents a requirement.
+JAVA_MISMATCH_PATTERNS = (
+    {
+        # Gradle: "... requires Java 21.\n Detected Java version: 17"
+        "required": r"requires\s+Java\s+(?:version\s+)?(\d+)",
+        "detected": r"Detected\s+Java\s+version\s*:?\s*(\d+)",
+    },
+    {
+        # Maven Enforcer RequireJavaVersion: "Detected JDK Version: 11.0.22 is
+        # not in the allowed range [17,)."
+        "required": r"allowed\s+range\s+[\[\(]\s*(\d+)",
+        "detected": r"Detected\s+JDK\s+Version\s*:?\s*(\d+)",
+    },
+    {
+        # javac / toolchain: "release version 21 not supported" against a
+        # stated current version.
+        "required": r"(?:release|target)\s+version\s+(\d+)\s+not\s+supported",
+        "detected": r"(?:java|jdk)\s+version\s*[\":]*\s*(\d+)",
+    },
+)
+JAVA_MISMATCH_CODE = "java_version_mismatch"
 
 
 def dependency_incompatibilities(

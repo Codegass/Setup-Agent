@@ -2659,9 +2659,37 @@ class MavenTool(BaseTool):
         output: str,
         working_directory: Optional[str],
     ) -> bool:
-        """Persist the Enforcer fact so later env/build calls need no model relay."""
+        """Persist the Enforcer fact so later env/build calls need no model relay.
+
+        Two guards decide whether a runtime may be blocked at all. Live
+        p7-camel-quarkus: Maven 3.9.15 was blocked for failing `[3.9.0,)` — a
+        range it plainly satisfies — because the only thing checked was that
+        SOME requirement value existed. The real failure was Java 11 against a
+        project needing 17+, so every retry installed a newer Maven and blocked
+        that one too until the overlay held no usable candidate at all
+        (`active: None`, 64 refusals, the test phase unreachable).
+
+        1. ATTRIBUTION. Only the build's own statement may condemn a runtime.
+           `extract_version_requirement_from_output` stamps `build_error` and
+           already demands Maven's identity and its range on one diagnostic
+           line; a requirement that arrived as a tool PARAMETER
+           (`tool_parameter`) is the caller's constraint and says nothing about
+           what the build rejected.
+        2. SATISFACTION. A version that satisfies the requirement is never
+           blocked. An undecidable comparison (no detected version, unparseable
+           range) is not evidence either, so it does not block.
+        """
         raw_requirement = str(requirement.get("raw") or "").strip()
         if not raw_requirement:
+            return False
+
+        source = str(requirement.get("source") or "").strip()
+        if source != "build_error":
+            logger.info(
+                f"[toolchain] refusing to block the Maven runtime for {raw_requirement!r}: "
+                f"the requirement came from {source or 'an unstated source'}, not from a "
+                "Maven-version failure the build stated"
+            )
             return False
 
         executable = (maven_runtime or {}).get("executable")
@@ -2676,6 +2704,13 @@ class MavenTool(BaseTool):
         )
         version = version_match.group(1) if version_match else (maven_runtime or {}).get("version")
 
+        if self._version_satisfies_requirement(version, raw_requirement, requirement.get("kind")):
+            logger.info(
+                f"[toolchain] refusing to block Maven {version} for {raw_requirement!r}: "
+                "this runtime satisfies the requirement, so the failure lies elsewhere"
+            )
+            return False
+
         try:
             EnvOverlayStore(self.orchestrator).record_requirement_failure(
                 "maven",
@@ -2689,6 +2724,32 @@ class MavenTool(BaseTool):
             return True
         except Exception as exc:
             logger.warning(f"Failed to persist Maven runtime requirement: {exc}")
+            return False
+
+    def _version_satisfies_requirement(
+        self,
+        version: Optional[str],
+        raw_requirement: str,
+        kind: Optional[str] = None,
+    ) -> bool:
+        """Whether `version` meets `raw_requirement` — False when undecidable.
+
+        The comparison is the toolchain manager's own, never a second
+        implementation: two comparators eventually disagree, and the one that
+        decides whether a runtime is usable must be the one that decides
+        whether it may be condemned.
+        """
+        if not version or not raw_requirement:
+            return False
+        try:
+            requirement = ToolVersionRequirement(
+                raw=raw_requirement,
+                source="build_error",
+                kind=str(kind or "range"),
+            )
+            return bool(self.toolchain_manager.matches_requirement(str(version), requirement))
+        except Exception as exc:  # an undecidable comparison is not evidence
+            logger.debug(f"could not compare Maven {version} against {raw_requirement!r}: {exc}")
             return False
 
     def _record_test_summary(

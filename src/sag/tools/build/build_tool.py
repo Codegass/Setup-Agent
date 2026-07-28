@@ -925,6 +925,10 @@ class BuildTool(BaseTool):
                     current_fingerprints=self._current_fingerprints(requirements, receipt),
                     dispatch_status=getattr(result.invocation_status, "value", None),
                     error_code=result.error_code,
+                    # The complete runner text, while the facade still holds it:
+                    # the receipt keeps only its hash, and a fault the build
+                    # stated in prose is readable nowhere else.
+                    output=getattr(result, "raw_output", None) or getattr(result, "output", None),
                 )
             except Exception as exc:  # evidence never breaks the build result
                 logger.debug(f"receipt {receipt_id} was not assessed: {exc}")
