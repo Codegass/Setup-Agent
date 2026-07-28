@@ -345,6 +345,12 @@ _VERSION_ERROR_PATTERNS = [
     # javac: "invalid target release: 21" / "release version 17 not supported"
     re.compile(r"invalid (?:target|source) release:?\s*(?:1\.)?(\d+)", re.IGNORECASE),
     re.compile(r"release version (\d+) not supported", re.IGNORECASE),
+    # Gradle's own toolchain checks (live p7b-polaris):
+    #   "Dependency requires at least JVM runtime version 21."
+    #   "Build requires Java 21."
+    # Both name the version the build needs, in the build's own words.
+    re.compile(r"requires at least JVM runtime version\s+(\d+)", re.IGNORECASE),
+    re.compile(r"(?:build|project|settings)\s+requires\s+Java\s+(\d+)", re.IGNORECASE),
 ]
 _CLASS_FILE_VERSION = re.compile(r"class file version (\d+)\.")
 
