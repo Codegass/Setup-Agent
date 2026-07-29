@@ -854,7 +854,27 @@ def test_a_harness_authored_call_is_never_an_accepted_repair(forced_engine):  # 
         assert intent_source_for_dispatch() == "controller"
 
 
-def test_acceptance_detection_only_probes_for_the_facade_it_can_propose(
+def test_acceptance_detection_only_probes_for_facades_it_can_propose(
+    forced_engine,  # noqa: F811
+):
+    """`PROPOSABLE_TOOLS` bounds the probe, so an ordinary call costs no read.
+
+    It used to be the single constant `REPAIR_TOOL`, which made the java
+    proposal — `project(action='provision', ...)` — unacceptable by
+    construction (live p7b-polaris). The set is now the two facades the
+    generators actually emit; everything else still probes nothing.
+    """
+    orchestrator = ScriptedOrchestrator()
+    engine, _ = forced_engine()
+    engine.orchestrator = orchestrator
+
+    engine._detect_accepted_repair("search", {"action": "grep"})
+
+    assert orchestrator.filesystem.commands == []
+    assert current_acceptance() is None
+
+
+def test_a_proposable_facade_probes_but_still_accepts_nothing_unproposed(
     forced_engine,  # noqa: F811
 ):
     orchestrator = ScriptedOrchestrator()
@@ -863,7 +883,6 @@ def test_acceptance_detection_only_probes_for_the_facade_it_can_propose(
 
     engine._detect_accepted_repair("project", {"action": "analyze"})
 
-    assert orchestrator.filesystem.commands == []
     assert current_acceptance() is None
 
 

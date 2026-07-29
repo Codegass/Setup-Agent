@@ -16,6 +16,7 @@ from sag.agent.attempt_policy import (
     untried_islands_requirement,
 )
 from sag.agent.phase_transitions import RepairRequest
+from sag.agent.repair_contracts import pending_repair_call, render_public_call
 
 from .base import BaseTool, ToolResult
 
@@ -93,6 +94,33 @@ class PhaseTool(BaseTool):
                     output="repair proposals do not accept a phase outcome",
                     error="outcome is forbidden for repair",
                     error_code="phase_repair_outcome_forbidden",
+                )
+            # A proposal the model can simply perform never needed this
+            # channel. Live p7/p7b polaris: the model agreed with a stated
+            # `java_version_mismatch` and submitted it as a build→build repair;
+            # that edge is illegal, and the engine closes the attempt before it
+            # checks legality, so both runs lost the build phase to a diagnosis
+            # they had got right. The proposed call is available in this phase
+            # already — say so, and change nothing.
+            proposal = pending_repair_call(self.orchestrator, reason_code)
+            if proposal is not None:
+                call = render_public_call(proposal["tool"], proposal["params"])
+                return ToolResult.completed_failure(
+                    output=(
+                        f"{reason_code} already has a proposed call, and it needs no "
+                        f"phase repair — make the call: {call}"
+                    ),
+                    error=f"{reason_code} is answered by a public call, not a phase repair",
+                    error_code="PHASE_REPAIR_ALREADY_PROPOSED",
+                    suggestions=[call],
+                    metadata={
+                        "phase": phase,
+                        "repair_id": proposal["repair_id"],
+                        "proposed_call": {
+                            "tool": proposal["tool"],
+                            "params": proposal["params"],
+                        },
+                    },
                 )
             required_attempt = required_test_attempt(
                 self.run_evidence_state,

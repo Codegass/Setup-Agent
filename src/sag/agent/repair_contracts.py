@@ -454,6 +454,14 @@ JAVA_MISMATCH_CODE = "java_version_mismatch"
 # plan, not a repair (spec §C6).
 PROVISION_TOOL = "project"
 PROVISION_ACTION = "provision"
+# Every public facade a proposal may name. Acceptance probes the repair store
+# only for these, so an ordinary `search` or `phase` call costs no container
+# read. A generator that proposes a facade missing here emits a proposal
+# nothing can accept — the live p7b-polaris defect, where the java proposal
+# named `project` and acceptance compared against `build` alone — so a new
+# generator must add its facade to this set and to
+# `test_every_proposable_facade_can_be_accepted`.
+PROPOSABLE_TOOLS = frozenset({REPAIR_TOOL, PROVISION_TOOL})
 _REQUIRED_MAJOR = re.compile(r"requires\s+java\s+(\d+)", re.IGNORECASE)
 
 
@@ -701,13 +709,20 @@ def write_repair(execute: Callable[..., Any], repair: Optional[Mapping[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def repair_block(repair: Optional[Mapping[str, Any]]) -> Optional[str]:
-    """The plan's block format, verbatim. None when the repair states too little.
+def render_public_call(tool: Any, params: Optional[Mapping[str, Any]]) -> str:
+    """The ONE spelling of a proposed call.
 
-    The params are rendered canonically so the model sees the exact call it
-    must issue to accept — acceptance is compared by equality, and a prettier
-    rendering here would be a call it cannot reproduce.
+    Every surface that shows a proposal renders it through here — the observed
+    `[repair]` block and the phase channel's refusal — so a model is never
+    shown the same call two ways and left to guess which spelling accepts it.
+    Canonical params, because acceptance is compared by equality and a prettier
+    rendering would be a call the model cannot reproduce.
     """
+    return f"{_text(tool)}({canonical_json(dict(params or {}))})"
+
+
+def repair_block(repair: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The plan's block format, verbatim. None when the repair states too little."""
     body = dict(repair or {})
     code = _text(body.get("typed_failure_or_capability"))
     call = body.get("proposed_public_call") or {}
@@ -718,9 +733,52 @@ def repair_block(repair: Optional[Mapping[str, Any]]) -> Optional[str]:
     if not code or not tool or not identifiers:
         return None
     return (
-        f"[repair] {code}: proposed {tool}({canonical_json(dict(params or {}))}) "
+        f"[repair] {code}: proposed {render_public_call(tool, params)} "
         f"— provenance {', '.join(identifiers)}; accept by calling it, or state why not."
     )
+
+
+def pending_repair_call(
+    orchestrator: Any,
+    typed_code: str,
+) -> Optional[Dict[str, Any]]:
+    """The live proposal for `typed_code`, when one is already on disk.
+
+    Spec §C6 says acceptance is the model calling the proposed call. That call
+    is an ordinary public call, available in the phase the model is already in,
+    needing no rollback and no permission — which means the phase repair
+    channel, whose job is rolling BACK to an earlier phase, is not how this
+    proposal gets accepted.
+
+    Live p7 and p7b polaris: the model submitted exactly this typed code
+    through `phase(action='repair', target_phase='build')`. `build→build` is
+    not a legal repair edge, and neither is `build→provision`, so no edge from
+    build could reach the JDK install the proposal named. The engine closes the
+    attempt before it checks legality, so both runs lost the build phase to a
+    proposal they had already agreed with. Naming the call and keeping the
+    phase costs one turn; the alternative cost the run.
+    """
+    code = _text(typed_code)
+    if not code:
+        return None
+    for record in sorted(
+        read_records(orchestrator, REPAIR_DIR),
+        key=lambda item: _text(item.get("repair_id")),
+    ):
+        if _text(record.get("typed_failure_or_capability")) != code:
+            continue
+        call = record.get("proposed_public_call")
+        if not isinstance(call, Mapping):
+            continue
+        tool = _text(call.get("tool"))
+        if not tool:
+            continue
+        return {
+            "repair_id": _text(record.get("repair_id")),
+            "tool": tool,
+            "params": dict(call.get("params") or {}),
+        }
+    return None
 
 
 def surfacing_block(orchestrator: Any, receipt_id: str) -> Optional[str]:
@@ -773,10 +831,17 @@ def accepted_repair_for(
     a different directory or one extra parameter is a different intent, and
     borrowing a repair's provenance for it would be the self-attestation spec
     §C6 forbids.
+
+    The tool compared against is the one the STORED PROPOSAL names, not a
+    constant. Live p7b-polaris: `_java_version_proposal` proposes
+    `project(action='provision', ...)` — the facade that installs a JDK — while
+    this matcher required `build`, so the single call the harness asked for
+    could never be recognised as accepting the proposal that asked for it. A
+    proposal only a different half of the module can accept is not a proposal.
     """
     requested_tool = _text(tool)
     requested_params = dict(params or {})
-    if requested_tool != REPAIR_TOOL:
+    if requested_tool not in PROPOSABLE_TOOLS:
         return None
     for record in sorted(
         read_records(orchestrator, REPAIR_DIR),
@@ -1050,6 +1115,7 @@ __all__ = [
     "NATIVE_ENABLED",
     "NO_SAFE_PROPOSAL",
     "NO_SUPPORTING_CLAIMS",
+    "PROPOSABLE_TOOLS",
     "REPAIR_DIR",
     "REPAIR_HEREDOC",
     "REPAIR_SCHEMA_VERSION",
@@ -1060,8 +1126,10 @@ __all__ = [
     "current_acceptance",
     "intent_source_for_dispatch",
     "is_failure_class",
+    "pending_repair_call",
     "propose_public_call",
     "read_records",
+    "render_public_call",
     "repair_block",
     "repair_identity",
     "retrieve_for",

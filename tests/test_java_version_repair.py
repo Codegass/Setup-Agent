@@ -3,19 +3,23 @@
 code and a repair proposal.
 
 Live evidence. p7-polaris (`logs/session_20260727_182218_41763`): Gradle
-printed "requires Java 21." and "Detected Java version: 17"; the harness
-surfaced it and the model closed the phase without provisioning anything.
-p7-camel (`logs/session_20260727_182221_41809`): the project's own wrapper ran
-under Java 17 against a build needing 17+. In both runs the sentence was right
-there and no typed code named it, so the repair loop had nothing to react to.
+printed "requires Java 21." and "Detected Java version: 17", and no typed code
+named it, so the repair loop had nothing to react to. p7-camel
+(`logs/session_20260727_182221_41809`): the project's own wrapper ran under
+Java 17 against a build needing 17+. In both runs the sentence was right there
+and nothing read it.
 
 This is the one repair whose support is an assessment rather than a document
 claim: the requirement was stated by the runner, in its own output, which is
 receipt evidence — the strongest provenance the loop has.
 """
 
+import json
+
+from test_repair_contracts import ScriptedOrchestrator
+
 from sag.agent.evidence_assessments import java_version_mismatch
-from sag.agent.repair_contracts import build_repair
+from sag.agent.repair_contracts import REPAIR_DIR, accepted_repair_for, build_repair
 
 GRADLE_OUTPUT = (
     "FAILURE: Build failed with an exception.\n"
@@ -122,3 +126,91 @@ def test_another_code_with_no_claims_still_proposes_nothing():
     }
 
     assert build_repair(trigger, [], domain_root="/workspace/demo") is None
+
+
+# ---------------------------------------------------------------------------
+# accepting it — §C6: "acceptance is the model calling that exact call"
+# ---------------------------------------------------------------------------
+
+PROPOSAL = {
+    "schema_version": 1,
+    "repair_id": "rep-790e1a3c9e0c",
+    "typed_failure_or_capability": "java_version_mismatch",
+    "trigger_receipt_id": "inv-gradle-1-0001",
+    "trigger_assessment_id": "asm-inv_gradle_1_0001-java_version_mismatch-947fb39f",
+    "supporting_claim_ids": ["asm-inv_gradle_1_0001-java_version_mismatch-947fb39f"],
+    "proposed_public_call": {
+        "tool": "project",
+        "params": {"action": "provision", "java_version": "21"},
+    },
+    "permitted_semantic_envelope": {"tool": "project", "actions": ["provision"]},
+}
+
+
+def _orchestrator(*repairs):
+    return ScriptedOrchestrator(
+        files={
+            f"{REPAIR_DIR}/{repair['repair_id']}.json": json.dumps(repair, sort_keys=True)
+            for repair in repairs
+        }
+    )
+
+
+def test_a_provision_proposal_is_acceptable_by_making_the_call():
+    """Live p7b-polaris: the proposal named `project`, and acceptance matched
+    only `build`, so the one call the harness asked for could never be
+    recognised as accepting it. The proposal states its own tool; that is the
+    tool acceptance compares against."""
+    orchestrator = _orchestrator(PROPOSAL)
+
+    accepted = accepted_repair_for(
+        orchestrator, "project", {"action": "provision", "java_version": "21"}
+    )
+
+    assert accepted == "rep-790e1a3c9e0c"
+
+
+def test_a_different_tool_never_borrows_the_proposal():
+    orchestrator = _orchestrator(PROPOSAL)
+
+    assert (
+        accepted_repair_for(
+            orchestrator, "build", {"action": "provision", "java_version": "21"}
+        )
+        is None
+    )
+
+
+def test_a_different_major_is_a_different_intent():
+    orchestrator = _orchestrator(PROPOSAL)
+
+    assert (
+        accepted_repair_for(
+            orchestrator, "project", {"action": "provision", "java_version": "17"}
+        )
+        is None
+    )
+
+
+def test_every_proposable_facade_can_be_accepted():
+    """The two halves that disagreed in p7b are pinned together here.
+
+    `build_repair` may name only these facades, and `accepted_repair_for`
+    probes only these facades. A new generator that proposes a third one must
+    extend `PROPOSABLE_TOOLS` in the same change, or it ships a proposal
+    nothing can accept.
+    """
+    from sag.agent.repair_contracts import PROPOSABLE_TOOLS
+
+    (assessment,) = java_version_mismatch(RECEIPT, GRADLE_OUTPUT)
+    trigger = {
+        "assessment_id": assessment.assessment_id,
+        "receipt_id": assessment.receipt_id,
+        "typed_code": assessment.typed_code,
+        "detail": assessment.detail,
+    }
+
+    repair = build_repair(trigger, [], domain_root="/workspace/polaris")
+
+    assert repair["proposed_public_call"]["tool"] in PROPOSABLE_TOOLS
+    assert PROPOSABLE_TOOLS == {"build", "project"}
