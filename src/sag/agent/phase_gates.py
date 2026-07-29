@@ -995,7 +995,10 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     # on acceptance too, not only on rejection. Same computation the finalizer
     # folds at evidence-close (sag.agent.module_coverage): one algorithm, so
     # mid-run guidance can never disagree with the sealed verdict.
-    from sag.agent.module_coverage import coverage_checklist_line, module_coverage
+    # Plan 8 §3.5: `shared_module_scan` returns the scan `validate_build_status`
+    # just decided on, so the checklist half of this sentence and the verdict
+    # half cannot come from two different walks of the tree.
+    from sag.agent.module_coverage import coverage_checklist_line, shared_module_scan
 
     requirements: Mapping[str, Any] | None = None
     islands = None
@@ -1008,7 +1011,9 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         except Exception:
             requirements = None
             islands = None
-    checklist = coverage_checklist_line(module_coverage(validator, project_name), islands=islands)
+    checklist = coverage_checklist_line(
+        shared_module_scan(validator, project_name), islands=islands
+    )
     if checklist:
         reason = f"{reason} · {checklist}"
         if "no output yet" in checklist or "remaining:" in checklist:

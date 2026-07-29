@@ -42,6 +42,7 @@ from sag.config.settings import (
     DEFAULT_TEST_EXECUTION_THRESHOLD,
     DEFAULT_TEST_PASS_THRESHOLD,
 )
+from sag.agent.receipt_structure import module_key as _receipt_module_key
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
@@ -1063,6 +1064,19 @@ def evaluate_run_verdict(
     if not build_green:
         return "failed"
     return "success" if pass_rate >= test_pass_threshold * 100.0 else "failed"
+
+
+def _coverage_basis(coverage_info: Dict[str, Any]) -> str:
+    """`derived` or `none` for one expected-artifact check (Plan 8 §3.4).
+
+    Stated by `_verify_expected_artifacts`; inferred from the expectation count
+    for a caller that predates the field, so an old rollup still classifies the
+    same way it always did rather than defaulting to "met".
+    """
+    stated = str((coverage_info or {}).get("basis") or "").strip()
+    if stated in ("derived", "none"):
+        return stated
+    return "derived" if int((coverage_info or {}).get("classes_expected") or 0) > 0 else "none"
 
 
 def _format_build_duration(seconds: float) -> str:
@@ -2194,6 +2208,51 @@ class PhysicalValidator:
                     modules.append(name)
         return tuple(modules) or None
 
+    def _receipt_structure(self) -> Dict[str, Any]:
+        """The receipt-proven module structure, or {} (Plan 8 §3.6).
+
+        A survey guess (`root_shape: single_module`, `build_islands: []`) is a
+        proposal; a terminal receipt that named its modules is a statement.
+        This reads the statement, so the denominator can stand on it even in a
+        phase whose own dispatches stated nothing.
+        """
+        if not self.docker_orchestrator:
+            return {}
+        try:
+            from sag.agent.receipt_structure import read_module_structure
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            return read_module_structure(read_build_requirements(self.docker_orchestrator)) or {}
+        except Exception as exc:
+            logger.debug(f"receipt-proven structure unavailable: {exc}")
+            return {}
+
+    def _module_scan_result(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """One walk of the tree: which modules exist, which produced output."""
+        try:
+            from sag.agent.module_coverage import module_coverage
+
+            return module_coverage(self, project_name)
+        except Exception as exc:
+            logger.debug(f"module scan unavailable: {exc}")
+            return None
+
+    def module_scan(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """The scan THIS gate pass decided on (Plan 8 §3.5 / P3).
+
+        `validate_build_status` scans and stores; the checklist line the gate
+        appends reads the stored object. Before p7d these were two walks, and
+        the two halves of one sentence disagreed: "Built 100% of expected
+        classes · Module coverage: 1/26 built". Two computations answering one
+        question is how the wrong one ends up deciding.
+        """
+        cached = getattr(self, "_last_module_scan", None)
+        if cached and cached[0] == project_name:
+            return cached[1]
+        scan = self._module_scan_result(project_name)
+        self._last_module_scan = (project_name, scan)
+        return scan
+
     @staticmethod
     def _module_key(value: str) -> str:
         """Comparable form of a module label: lowercase alphanumerics only.
@@ -2203,10 +2262,12 @@ class PhysicalValidator:
         only match this claims; anything less certain is left unmatched, and
         an unmatched expectation keeps the denominator rather than quietly
         leaving it.
+
+        The formula lives in `sag.agent.receipt_structure` because the
+        persisted structure fact (Plan 8 §3.6) keys its module list the same
+        way. Two copies of a key formula is two copies that drift.
         """
-        tail = str(value or "").replace("\\", "/").rstrip("/").split("/")[-1]
-        tail = tail.split("::")[-1]
-        return "".join(ch for ch in tail.lower() if ch.isalnum())
+        return _receipt_module_key(value)
 
     def _scope_expectations_to_attempted(
         self,
@@ -3126,6 +3187,13 @@ class PhysicalValidator:
         # every source tree on disk (Plan 7: the reactor summary sets the
         # scope, the file count verifies the substance).
         attempted_modules = self._attempted_modules()
+        # Plan 8 §3.6: a receipt-proven structure outranks the survey's guess,
+        # and it OUTLIVES the dispatch that proved it — a phase whose own
+        # dispatches stated nothing still measures against what real work said
+        # the project is made of.
+        receipt_structure = self._receipt_structure()
+        if not attempted_modules and receipt_structure.get("modules"):
+            attempted_modules = tuple(str(name) for name in receipt_structure["modules"])
         scoped_artifacts, untried_modules, scope_conflict = (
             self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
         )
@@ -3149,6 +3217,19 @@ class PhysicalValidator:
         threshold = self.build_coverage_threshold
         class_count = artifacts_result.get("class_count", 0)
         has_real_output = evidence["has_build_fingerprints"] or class_count > 0
+        # Plan 8 §3.5: ONE scan, two consumers. The walk happens here, the gate
+        # renders its checklist from this same object (module_scan holds it),
+        # and the denominator's authority is a stated ladder — a terminal
+        # receipt, else this scan, else the survey's expectations.
+        from sag.agent.module_coverage import module_basis
+
+        self._last_module_scan = (project_name, self._module_scan_result(project_name))
+        module_scan = self._last_module_scan[1]
+        basis = module_basis(
+            module_scan,
+            receipt_modules=attempted_modules,
+            receipt_id=str(receipt_structure.get("provenance") or ""),
+        )
 
         # Hard JVM gate (Part 1 principle, applied to EVERY branch): a maven/gradle
         # build is green only with compiled .class evidence. With zero compiled
@@ -3180,6 +3261,33 @@ class PhysicalValidator:
                 f"compiled (an empty target/classes dir or a coverage default is not "
                 f"proof of compilation)"
             )
+        elif coverage_info is not None and _coverage_basis(coverage_info) == "none":
+            # Plan 8 §3.4 (P2): the check could derive no per-module class
+            # expectation, so it states that, and the caller decides what it
+            # means. Two arms of ONE rule, not two ad-hoc branches:
+            #
+            #  * classes compiled -> PARTIAL. Real output happened; how much of
+            #    the project it is remains unknown. p7d polaris was graded
+            #    "Built 100% of expected classes" on this exact state, with
+            #    1,706 classes from an in-flight job and a survey that had
+            #    parsed no modules at all.
+            #  * nothing compiled -> BLOCKED. This is the hard JVM gate
+            #    (commons-chain, 0 classes under a non-standard src layout)
+            #    stated as the zero arm of the general rule; the branch above
+            #    still catches the no-artifacts case with its own wording.
+            if class_count > 0:
+                success, complete = True, False
+                reason = (
+                    f"compiled {class_count:,} classes; no per-module expectation "
+                    f"could be derived — coverage has no basis"
+                )
+            else:
+                success, complete = False, False
+                reason = (
+                    f"No compiled .class files found for {build_system} build — nothing "
+                    f"compiled, and no per-module expectation could be derived, so "
+                    f"coverage has no basis"
+                )
         elif coverage_info is not None:
             coverage = coverage_info.get("class_coverage", 1.0)
             missing = coverage_info.get("missing", [])
@@ -3266,6 +3374,19 @@ class PhysicalValidator:
                 "Maven reactor could not be fully verified: " + maven_reactor_snapshot.reason
             )
             reason = f"{reason}; {reactor_reason}" if reason else reactor_reason
+
+        # Plan 8 §3.5: the scan that knew is no longer commentary. When no
+        # receipt outranks it, the scan OWNS the denominator, and a denominator
+        # that counted a minority cannot also report a complete build — the
+        # p7d polaris sentence ("Built 100% of expected classes · Module
+        # coverage: 1/26 built") is unconstructible from here on. Under a
+        # receipt-stated denominator the scan is deliberately not a cap: a
+        # module the build never attempted is untried, not unbuilt, which is
+        # the whole point of the #17 narrowing.
+        if build_system in ("maven", "gradle"):
+            if basis.states_a_shortfall:
+                complete = False
+            reason = f"{reason} · {basis.phrase()}" if reason else basis.phrase()
 
         # Surface the build command + timed duration (if a command tracker with a
         # recorded build is attached) and the primary artifact for the metrics
@@ -6385,14 +6506,19 @@ class PhysicalValidator:
                     result["missing"].append(expected["artifact"])
                     result["all_present"] = False
 
-        # Source-weighted fraction of expected classes actually produced. 1.0 when
-        # nothing class-based was expected (jar/file-only projects), so it never
-        # downgrades a build that has no per-module class expectations.
-        result["class_coverage"] = (
-            result["classes_found"] / result["classes_expected"]
-            if result["classes_expected"] > 0
-            else 1.0
-        )
+        # Source-weighted fraction of expected classes actually produced —
+        # stated ONLY when there was something to measure against. Plan 8 §3.4
+        # (P2, "no basis is its own answer"): the old else-branch returned 1.0
+        # for "nothing class-based was expected", and p7d polaris read that as
+        # a met threshold — "Built 100% of expected classes" over a survey that
+        # had derived no expectation at all. A basis of `none` carries NO
+        # `class_coverage` key, so no caller can compare against a number
+        # nothing produced.
+        if result["classes_expected"] > 0:
+            result["basis"] = "derived"
+            result["class_coverage"] = result["classes_found"] / result["classes_expected"]
+        else:
+            result["basis"] = "none"
         return result
 
     def _validate_gradle_cache(self, project_dir: str) -> Dict[str, any]:

@@ -14,9 +14,101 @@ Never raises: coverage is guidance and honesty, not a failure mode.
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 from loguru import logger
+
+# Denominator authority, in order (Plan 8 spec §3.5). p7d polaris graded a
+# build against a denominator NOTHING derived — the survey could not read
+# `settings.gradle.kts`, so "100% of expected classes" was 100% of zero — while
+# the scan that had walked 26 subprojects only decorated the sentence. Which
+# computation owns the denominator is now a stated ladder, and the reason names
+# the rung it stood on.
+BASIS_RECEIPT = "receipt"
+BASIS_SCAN = "scan"
+BASIS_SURVEY = "survey"
+
+
+@dataclass(frozen=True)
+class ModuleBasis:
+    """Which computation set the coverage denominator, and what it stated.
+
+    ``built``/``total`` are stated only by the scan rung: a receipt states
+    which modules the build ATTEMPTED (the class-weighted coverage is measured
+    against those, unchanged since #17/d5dc330), and the survey states an
+    expectation list, not a module tally.
+    """
+
+    authority: str
+    provenance: str
+    total: int = 0
+    built: int = 0
+
+    @property
+    def states_a_shortfall(self) -> bool:
+        """True only when the rung that OWNS the denominator counted a
+        minority. A scan under a receipt-stated denominator counts modules the
+        build never tried, which is untried, not unbuilt."""
+        return self.authority == BASIS_SCAN and self.built < self.total
+
+    def phrase(self) -> str:
+        if self.authority == BASIS_RECEIPT:
+            tally = f" ({self.total} module(s) attempted)" if self.total else ""
+            return f"denominator: receipt {self.provenance}{tally}"
+        if self.authority == BASIS_SCAN:
+            return (
+                f"denominator: the module scan on disk "
+                f"({self.built}/{self.total} modules built)"
+            )
+        return "denominator: the survey's expectations"
+
+
+def module_basis(
+    coverage: dict[str, Any] | None,
+    *,
+    receipt_modules: Sequence[str] | None = None,
+    receipt_id: str = "",
+) -> ModuleBasis:
+    """The ladder: a terminal receipt, else the scan on disk, else the survey."""
+    modules = tuple(str(name) for name in (receipt_modules or ()) if str(name).strip())
+    if modules:
+        return ModuleBasis(BASIS_RECEIPT, receipt_id or "module outcomes", total=len(modules))
+    summary = (coverage or {}).get("summary") or {}
+    total = int(summary.get("modules_total") or 0)
+    # The scan earns the denominator by enumerating a STRUCTURE the expectation
+    # walk did not have — polaris's 26 subprojects against a survey that parsed
+    # none. A one-module scan is not a structure: it is the same module the
+    # expectation check already measured, with a coarser instrument (a
+    # directory probe, not a source-weighted class count). Letting it decide
+    # there would re-create the split-brain P3 exists to prevent, pointing the
+    # other way.
+    if total > 1:
+        return ModuleBasis(
+            BASIS_SCAN,
+            "the module scan on disk",
+            total=total,
+            built=int(summary.get("modules_built") or 0),
+        )
+    return ModuleBasis(BASIS_SURVEY, "the survey's expectations")
+
+
+def shared_module_scan(validator, project_name) -> dict[str, Any] | None:
+    """The ONE scan of this gate pass (spec §3.5 / P3).
+
+    ``validate_build_status`` performs the scan and holds its result; the
+    checklist reads that same object rather than walking the tree a second
+    time. A validator without the hook (fakes, older callers) falls back to
+    scanning here, which is exactly the pre-Plan-8 behaviour.
+    """
+    method = getattr(validator, "module_scan", None)
+    if callable(method):
+        try:
+            return method(project_name)
+        except Exception as exc:  # pragma: no cover - guidance never raises
+            logger.debug(f"shared module scan unavailable: {exc}")
+            return None
+    return module_coverage(validator, project_name)
 
 
 def _record_richness(module: dict[str, Any]) -> int:
