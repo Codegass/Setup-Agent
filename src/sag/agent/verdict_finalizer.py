@@ -306,10 +306,15 @@ def _module_coverage_conflicts(validator, project_name) -> tuple[str, ...]:
     Delegates to the SHARED coverage module (sag.agent.module_coverage) — the
     same computation the phase gates render mid-run as an agent-facing
     checklist. One algorithm, two consumers, no drift.
-    """
-    from sag.agent.module_coverage import coverage_conflicts, module_coverage
 
-    return coverage_conflicts(module_coverage(validator, project_name))
+    Plan 8 §3.5: the same OBJECT, now. `_physical_build_status` has just made
+    the validator scan; folding the conflicts from that result rather than from
+    a second walk is what keeps the sealed verdict and the sentence the model
+    read describing one tree.
+    """
+    from sag.agent.module_coverage import coverage_conflicts, shared_module_scan
+
+    return coverage_conflicts(shared_module_scan(validator, project_name))
 
 
 _DOMAIN_STATES = frozenset({"success", "failed", "blocked", "untried"})

@@ -43,6 +43,8 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from loguru import logger
 
+from sag.agent.receipt_structure import promote_structure
+
 RECEIPT_SCHEMA_VERSION = 2
 RECEIPT_DIR = "/workspace/.setup_agent/invocation_receipts"
 # Heredoc delimiter for the atomic write. The body is single-line JSON, so no
@@ -530,6 +532,13 @@ def record_invocation(
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):
+        # Plan 8 §3.6: a terminal receipt that named its modules has PROVEN the
+        # project's structure, and the survey only proposed it. Promoting here
+        # means one writer for both facts — a receipt settled late (§3.2)
+        # promotes exactly like a synchronous one, with no second bookkeeping
+        # system to keep in step. A receipt that named no modules writes
+        # nothing at all.
+        promote_structure(execute, receipt)
         return {"receipt_id": receipt["receipt_id"]}
     return {"receipt_persisted": False}
 
