@@ -362,6 +362,7 @@ def build_receipt(
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
     module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
     cached_report_roots: Optional[Iterable[str]] = None,
+    excluded_claimed_paths: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Assemble a schema-v2 receipt. Absent facts serialize as absent keys.
 
@@ -429,6 +430,14 @@ def build_receipt(
     ]
     if modules:
         receipt["module_outcomes"] = modules
+    # Plan 8 §3.2. A dispatch that settled LATE states how much of its own
+    # write window an intervening receipt had already claimed — first claim
+    # wins, and the loss is counted rather than hidden. Absent (never zero) on
+    # every synchronous receipt and on every settlement with no interleaving,
+    # so the settled path stays field-for-field the synchronous one.
+    if isinstance(excluded_claimed_paths, int) and not isinstance(excluded_claimed_paths, bool):
+        if excluded_claimed_paths > 0:
+            receipt["excluded_claimed_paths"] = excluded_claimed_paths
     return receipt
 
 
@@ -484,6 +493,7 @@ def record_invocation(
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
     module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
     cached_report_roots: Optional[Iterable[str]] = None,
+    excluded_claimed_paths: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Persist the receipt for one runner call; return its ToolResult metadata.
 
@@ -527,6 +537,7 @@ def record_invocation(
         capability_observations=capability_observations,
         module_outcomes=module_outcomes,
         cached_report_roots=cached_report_roots,
+        excluded_claimed_paths=excluded_claimed_paths,
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):

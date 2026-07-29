@@ -66,6 +66,13 @@ _UNCLOSED_DOMAIN_STATES = frozenset({"failed", "blocked", "untried"})
 # file per assessment, named by its ``assessment_id``.
 ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 
+# Plan 8 §3.2/§3.3: the job ids of every obligation the ledger still has open
+# when this phase was graded. Present ONLY when something is open, so a run
+# that never detached anything seals byte-identical facts — and a transcript
+# recorded before Plan 8 carries no such key, which is why the cap below reads
+# the fact rather than the container (replay must reproduce a gate offline).
+OPEN_OBLIGATIONS_FACT = "run.open_job_obligations"
+
 # Receipt/assessment schema versions this reader understands. v1 wrote no
 # ``schema_version`` guarantee beyond the constant 1 and v2 only ADDS keys, so
 # both derive identically; an unknown FUTURE version is skipped rather than
@@ -354,7 +361,46 @@ def check_phase_done(
     }
 
 
+def _settle_before_grading(orchestrator) -> tuple[str, ...]:
+    """Settle the job ledger, then name whatever is still open. Never raises.
+
+    Plan 8 §3.2 trigger 2. The polaris build gate (p7d,
+    `session_20260729_111737_22356`) graded a compile job that was still
+    running and upgraded an honest `partial` to success on the snapshot it
+    saw. A gate may only ever grade settled books, so settlement runs BEFORE
+    the physical inspection — the receipts it writes are the evidence the
+    inspection is about to read.
+
+    A run that never detached anything costs one glob `cat` that matches no
+    file, and states no fact.
+    """
+    if orchestrator is None:
+        return ()
+    try:
+        from .job_obligations import open_job_ids, settle_open_obligations
+
+        settle_open_obligations(orchestrator)
+        return tuple(open_job_ids(orchestrator))
+    except Exception as exc:  # the ledger never breaks a phase claim
+        logger.debug(f"job obligations were not settled before grading: {exc}")
+        return ()
+
+
 def _inspect_phase(phase, validator, orchestrator, project_name) -> _ValidatorObservation:
+    open_jobs = _settle_before_grading(orchestrator)
+    observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
+    if not open_jobs:
+        return observation
+    return replace(
+        observation,
+        validated_facts={
+            **dict(observation.validated_facts),
+            OPEN_OBLIGATIONS_FACT: list(open_jobs),
+        },
+    )
+
+
+def _inspect_phase_evidence(phase, validator, orchestrator, project_name) -> _ValidatorObservation:
     try:
         if phase == "provision":
             return _inspect_provision(orchestrator, project_name)

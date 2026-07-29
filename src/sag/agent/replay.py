@@ -764,6 +764,14 @@ class ControlReplayRunner:
                     # claim_graph.load(), not by this walker — pass through so
                     # a transcript that carries them still verifies end-to-end.
                     pass
+                elif event.kind == "job_settled":
+                    # Plan 8 Stage 1: a detached job's books closing is an
+                    # evidence-layer fact (a receipt on disk), not a control
+                    # decision this walk re-derives. It carries no envelope, no
+                    # claim and no attempt lineage, so it consumes nothing and
+                    # blocks nothing — including between a gate_decision and
+                    # the phase_transition that must follow it.
+                    pass
                 else:  # pragma: no cover - ControlEvent validation owns this
                     raise ReplayValidationError(f"unsupported event kind: {event.kind}")
             except ReplayValidationError:

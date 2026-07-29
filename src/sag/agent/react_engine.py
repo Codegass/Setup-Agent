@@ -48,12 +48,20 @@ from .control_events import (
     forced_action_sha256,
 )
 from .evidence_assessments import ASSESSMENT_DIR, ensure_receipt_assessed
+from .job_obligations import (
+    OBLIGATION_DIR,
+    open_obligations,
+    read_obligations,
+    settle_open_obligations,
+    settlement_from_ledger,
+)
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .invocation_contracts import action_context, clear_action_context, set_action_context
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
 from .native_messages import render_messages
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_gates import (
+    OPEN_OBLIGATIONS_FACT,
     ClaimDisposition,
     GateResult,
     ValidatorState,
@@ -985,6 +993,12 @@ class ReActEngine(UIEventEmitter):
         if state is None or finalizer is None:
             raise RuntimeError("setup evidence finalization is not configured")
         was_sealed = state.sealed
+        if not was_sealed:
+            # Plan 8 §3.2 trigger 3: the closing sweep. A job that terminated
+            # while the run was finishing still owes a receipt, and a job that
+            # never terminated owes the verdict an honest conflict.
+            self._sweep_job_obligations()
+            self._record_unsettled_job_conflicts()
         snapshot = finalizer.finalize(state, reason)
         if not was_sealed:
             self._emit_control_event("evidence_close", {"reason": reason.value})
@@ -4292,6 +4306,95 @@ class ReActEngine(UIEventEmitter):
         except Exception as exc:
             logger.debug(f"observed-receipt assessment backstop skipped: {exc}")
 
+    def _pending_settlement_notices(self) -> List[str]:
+        """The `[settled]` lines the next observation owes the model.
+
+        Published lazily on the engine, like `_assessment_guard`: the seam is
+        reached from constructors the tests substitute."""
+        notices = getattr(self, "_settlement_notice_queue", None)
+        if notices is None:
+            notices = []
+            self._settlement_notice_queue = notices
+        return notices
+
+    def _sweep_job_obligations(self) -> None:
+        """Settle every detached job that has terminated, and announce it once.
+
+        Plan 8 §3.2. p7d polaris polled its test job for the rest of the run
+        and nothing ever went back to ask whether it had finished; 321 passing
+        tests were left unclaimable. This runs after every executed action
+        batch REGARDLESS of which tools the batch used, so a poll-heavy model
+        cannot starve settlement (spec §7).
+
+        Announcement is keyed on the LEDGER, not on who settled: the phase
+        gate settles too (so that a claim is never graded against moving
+        books), and its settlements must still produce their event, their one
+        bounded notice and the post-receipt hooks. One announcement per job,
+        for the life of the run.
+
+        Never raises: an unswept ledger is an open obligation, which the
+        closing sweep and evidence-close already state honestly."""
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return
+        try:
+            settled_now = {
+                settlement.job_id: settlement
+                for settlement in settle_open_obligations(orchestrator)
+            }
+            announced = self._assessment_guard("_announced_job_settlements")
+            for record in read_obligations(orchestrator):
+                job_id = str(record.get("job_id") or "").strip()
+                receipt_id = str(record.get("settled_receipt_id") or "").strip()
+                if not job_id or not receipt_id or job_id in announced:
+                    continue
+                settlement = settled_now.get(job_id) or settlement_from_ledger(
+                    orchestrator, record
+                )
+                if settlement is None:
+                    continue
+                announced.add(job_id)
+                self._emit_control_event("job_settled", settlement.event_payload())
+                self._pending_settlement_notices().append(settlement.notice())
+                # The same post-receipt hook a synchronous failure gets at the
+                # observation seam. The assessment itself already ran inside
+                # settlement; this is the proposal that may follow it, so a
+                # settled failure is proposable exactly like a synchronous one.
+                self._create_missing_repairs(
+                    orchestrator, settlement.receipt_id, settlement.contract_id
+                )
+        except Exception as exc:  # settlement never breaks the loop
+            logger.debug(f"job obligations were not swept for this batch: {exc}")
+
+    def _record_unsettled_job_conflicts(self) -> None:
+        """Name every job the run never heard back from, at evidence-close.
+
+        Spec §3.2: a job that never terminates stays an OPEN obligation and is
+        recorded on the verdict as `job_unsettled:<job_id>`, with the
+        obligation file as the fact's provenance. Nothing is guessed from a
+        partial log — an unfinished job is neither a pass nor a failure."""
+        state = getattr(self, "run_evidence_state", None)
+        orchestrator = getattr(self, "orchestrator", None)
+        if state is None or orchestrator is None or state.sealed:
+            return
+        try:
+            for record in open_obligations(orchestrator):
+                job_id = str(record.get("job_id") or "").strip()
+                if not job_id:
+                    continue
+                state.set_fact(
+                    f"{OPEN_OBLIGATIONS_FACT}.{job_id}",
+                    {
+                        key: record.get(key)
+                        for key in ("tool", "effective_action", "argv", "log_path")
+                        if record.get(key)
+                    },
+                    evidence_ref=f"{OBLIGATION_DIR}/{job_id}.json",
+                )
+                state.record_conflict(f"job_unsettled:{job_id}")
+        except Exception as exc:  # the ledger never breaks a close
+            logger.debug(f"unsettled job obligations were not recorded: {exc}")
+
     def _record_retry_authority(self, source_tool: Optional[str]) -> None:
         """Sign the retry key of a dispatch a failure-class assessment closed.
 
@@ -4350,6 +4453,14 @@ class ReActEngine(UIEventEmitter):
         self._ensure_observed_receipt_assessed(source_tool)
         self._record_retry_authority(source_tool)
         self._commit_claim_transitions(source_tool)
+        # Plan 8 §3.2.7: the settlement the run has not been told about yet.
+        # One bounded line per settled job, on the NEXT observation, and never
+        # a synthetic tool result — a receipt appearing from nowhere is the
+        # surprise §7 names.
+        notices = self._pending_settlement_notices()
+        if notices:
+            observation = "\n".join([str(observation or "").rstrip(), "", *notices]).lstrip()
+            notices.clear()
         block = self._repair_surfacing_block(source_tool)
         if block:
             # One block per observation: this is the only place an observation
@@ -4398,6 +4509,10 @@ class ReActEngine(UIEventEmitter):
             if batch_break_reason is not None:
                 cancelled_reason = batch_break_reason
 
+        # Plan 8 §3.2 trigger 1: after each executed action batch, whatever
+        # tools it used. A model that spends its turns polling a log is
+        # exactly the model whose job is about to finish.
+        self._sweep_job_obligations()
         return executed
 
     def _output_refs_from_text(self, value: str) -> List[str]:
