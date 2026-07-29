@@ -28,6 +28,7 @@ import json
 
 from test_repair_contracts import ContainerFS, ScriptedOrchestrator
 
+from sag.agent.invocation_receipts import next_sequence
 from sag.agent.job_obligations import (
     OBLIGATION_DIR,
     OBLIGATION_SCHEMA_VERSION,
@@ -105,6 +106,68 @@ def test_the_gradle_detach_seam_records_what_it_was_about_to_drop():
     assert obligation["log_path"] == "/tmp/sag_jobs/373f63e5a0a4.log"
     assert obligation["exit_code_path"] == "/tmp/sag_jobs/373f63e5a0a4.log.exit"
     assert obligation["settled_receipt_id"] is None
+
+
+def test_the_detach_seam_records_where_the_dispatch_sits_in_receipt_order():
+    """Settlement runs turns later and has to tell a receipt written INSIDE its
+    window from one written before it. Without an ordinal recorded here it
+    cannot: the reviewer's camel case is a detached retry losing its own rewrite
+    to the receipt its own earlier attempt wrote. Receipts are already ordered
+    by the process-global counter, so the dispatch takes a number from it.
+    """
+    orchestrator = ScriptedOrchestrator()
+    before_dispatch = next_sequence()
+
+    _gradle(orchestrator)._record_invocation_receipt(
+        requested_action="test",
+        argv="/workspace/polaris/gradlew --continue test",
+        working_directory="/workspace/polaris",
+        attempt=2,
+        result=POLARIS_HANDOFF,
+        before=BEFORE,
+    )
+
+    recorded = _obligation(orchestrator.filesystem)["dispatch_sequence"]
+    assert isinstance(recorded, int)
+    assert recorded > before_dispatch
+    assert recorded < next_sequence()
+
+
+def test_the_maven_detach_seam_records_its_ordinal_too():
+    orchestrator = ScriptedOrchestrator()
+
+    _maven(orchestrator)._record_invocation_receipt(
+        requested_action="verify",
+        effective_action="verify",
+        argv="/usr/local/bin/mvn -B verify",
+        working_directory="/workspace/camel",
+        attempt=1,
+        result=POLARIS_HANDOFF,
+        before={},
+    )
+
+    assert isinstance(_obligation(orchestrator.filesystem)["dispatch_sequence"], int)
+
+
+def test_a_dispatch_that_never_started_burns_no_ordinal():
+    """An obligation nobody can settle is a leak; an ordinal spent on one is a
+    hole in receipt order for no fact."""
+    orchestrator = ScriptedOrchestrator()
+    before_dispatch = next_sequence()
+
+    record_dispatch_obligation(
+        orchestrator.execute_command,
+        result={"dispatch_status": "running_detached", "dispatch": {"started": False}},
+        tool="gradle",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="gradlew test",
+        working_directory="/workspace/polaris",
+        before={},
+    )
+
+    assert next_sequence() == before_dispatch + 1
 
 
 def test_the_detached_dispatch_still_mints_no_receipt():

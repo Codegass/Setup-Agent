@@ -44,6 +44,7 @@ from .invocation_contracts import contract_receipt_fields
 from .invocation_receipts import (
     RECEIPT_DIR,
     nearest_domain_root,
+    next_sequence,
     record_invocation,
     report_delta,
     snapshot_reports,
@@ -74,6 +75,7 @@ def build_obligation(
     compliance: Optional[str] = None,
     requirements_pins: Optional[Mapping[str, str]] = None,
     domain_id: Optional[str] = None,
+    dispatch_sequence: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Assemble one obligation body. Absent facts serialize as absent keys.
 
@@ -82,6 +84,16 @@ def build_obligation(
     manifest is not carried into the ledger — settlement happens turns later
     and must state what was pinned at DISPATCH time, not what a re-read would
     say now.
+
+    `dispatch_sequence` is WHERE this dispatch sits in receipt order. Receipt
+    ids already carry a process-global monotonic ordinal
+    (`next_receipt_id`/`next_sequence`), so a receipt whose ordinal is greater
+    than this one was written after the dispatch — which is the only way
+    settlement can tell a receipt written INSIDE its window from one an earlier,
+    already-closed attempt wrote before it (spec §3.2). Absent when the caller
+    could not state it; settlement then falls back to excluding every claim,
+    because an obligation that cannot order itself must not claim a path
+    somebody else vouched for.
     """
     obligation: Dict[str, Any] = {
         "schema_version": OBLIGATION_SCHEMA_VERSION,
@@ -108,6 +120,8 @@ def build_obligation(
     pins = {str(key): str(value) for key, value in dict(requirements_pins or {}).items() if value}
     if pins:
         obligation["requirements_pins"] = pins
+    if isinstance(dispatch_sequence, int) and not isinstance(dispatch_sequence, bool):
+        obligation["dispatch_sequence"] = dispatch_sequence
     # The one mutable field, and it is present as an explicit null from birth:
     # "not settled yet" is a state the ledger states, not one a reader infers
     # from a missing key.
@@ -158,6 +172,9 @@ def record_dispatch_obligation(
         exit_code_path=exit_code_path,
         requirements_pins=survey_pins(requirements),
         domain_id=nearest_domain_root(requirements, working_directory),
+        # Taken AFTER the handle check above: an ordinal spent on a dispatch
+        # that never started would be a hole in receipt order for no fact.
+        dispatch_sequence=next_sequence(),
         **contract_receipt_fields(argv),
     )
     return job_id if write_obligation(execute, obligation) else None
@@ -284,7 +301,11 @@ class Settlement:
             f"receipt {self.receipt_id}, {self.claimed_paths} report paths claimed"
         )
         if self.excluded_claimed_paths:
-            line += f" ({self.excluded_claimed_paths} already claimed by an earlier receipt)"
+            # "earlier" would be false: a receipt that takes a path out of this
+            # window was written AFTER the dispatch, which is exactly why it
+            # takes it (Category 3 — the harness never states a fact that is
+            # not true).
+            line += f" ({self.excluded_claimed_paths} already claimed by an intervening receipt)"
         return line
 
     def event_payload(self) -> Dict[str, Any]:
@@ -310,8 +331,9 @@ def settle_open_obligations(
     pay two container round trips per batch to be told so twice.
 
     Obligations are settled in job-id order and each settlement's claims are
-    folded into the claimed set as it goes, so two jobs that terminated in the
-    same window cannot both claim one report file.
+    folded into the ordered claim list as it goes — under the ordinal of the
+    receipt that made them — so two jobs that terminated in the same window
+    cannot both claim one report file.
     """
     execute = getattr(orchestrator, "execute_command", None)
     if not callable(execute):
@@ -324,11 +346,11 @@ def settle_open_obligations(
         return []
     if not pending:
         return []
-    claimed = _claimed_report_paths(execute)
+    claims = _receipt_claims(execute)
     settlements: List[Settlement] = []
     for obligation in pending:
         try:
-            settlement = _settle_one(orchestrator, obligation, claimed)
+            settlement = _settle_one(orchestrator, obligation, claims)
         except Exception as exc:  # settlement never breaks the run
             logger.debug(f"job {obligation.get('job_id')} could not be settled: {exc}")
             continue
@@ -403,7 +425,7 @@ def read_exit_code(
 def _settle_one(
     orchestrator: Any,
     obligation: Mapping[str, Any],
-    claimed: Set[str],
+    claims: List[Tuple[Optional[int], Tuple[str, ...]]],
 ) -> Optional[Settlement]:
     execute = orchestrator.execute_command
     exit_code = read_exit_code(execute, obligation.get("exit_code_path"))
@@ -417,11 +439,24 @@ def _settle_one(
     module_outcomes, cached_roots = _parse_outcomes(tool, log, working_directory)
 
     # Attribution (spec §3.2). The window is this job's own `before` against
-    # its own `after`; another dispatch may have written into the same roots
-    # while it ran, and receipts are ORDERED, so a path an earlier receipt
-    # already claimed is excluded here rather than counted twice. Dropping it
-    # from `after` is exactly that exclusion: `report_delta` records no
-    # deletions, so a path that is not in `after` is claimed by nobody here.
+    # its own `after`, and the one real caveat is INTERVENING work: another
+    # dispatch may have written into the same roots while this job ran. Receipts
+    # are ordered, so "intervening" is decidable — a receipt whose ordinal is
+    # greater than this dispatch's was written after it — and only those paths
+    # are excluded. Dropping one from `after` is the exclusion: `report_delta`
+    # records no deletions, so a path that is not in `after` is claimed by
+    # nobody here.
+    #
+    # The scope matters in both directions. A receipt from BEFORE the dispatch
+    # is outside the window and takes nothing: it vouched for a version of the
+    # report that this job has since rewritten, and excluding it is how a
+    # detached retry lost its own evidence — the delta came out empty, the file
+    # on disk matched only the superseded claim, and the report landed in
+    # `stale_test_reports` instead of the main count. Measured on the real
+    # in-container parser: pre-dispatch claim alone -> 0 counted, 1 stale; both
+    # claims present -> 3 counted, 0 stale, counted exactly ONCE (claims are
+    # path -> set(sha), so overlap cannot double count).
+    claimed = _intervening_claims(claims, _dispatch_sequence(obligation))
     excluded = sorted(
         path for path in _delta_paths(report_delta(before, after, cached_roots)) if path in claimed
     )
@@ -454,7 +489,9 @@ def _settle_one(
         # The receipt did not land. The obligation stays open and the next
         # sweep tries again; a settled book with no receipt would be a lie.
         return None
-    claimed.update(mine)
+    # Folded in under the ordinal of the receipt that made them, so a later
+    # obligation in this same sweep sees them as intervening — which they are.
+    claims.append((_receipt_sequence(receipt_id), tuple(mine)))
     write_obligation(execute, {**dict(obligation), "settled_receipt_id": receipt_id})
     # The same post-receipt hook the synchronous path runs at the observation
     # seam, so a settled failure is assessed exactly like a synchronous one.
@@ -539,18 +576,22 @@ def _read_complete_log(orchestrator: Any, log_path: Any) -> str:
     return str(result.get("output") or "") if _succeeded(result) else ""
 
 
-def _claimed_report_paths(execute: Callable[..., Optional[Mapping[str, Any]]]) -> Set[str]:
-    """Every report path any existing receipt already claims.
+def _receipt_claims(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+) -> List[Tuple[Optional[int], Tuple[str, ...]]]:
+    """What every existing receipt claims, each under its own ordinal.
 
     One glob `cat` of the receipt directory, read with the same discipline as
-    every other evidence directory: a line that does not parse is skipped.
+    every other evidence directory: a line that does not parse is skipped. The
+    ordinal is what makes the list ORDERED against a dispatch, which is the
+    whole basis of the first-claim rule.
     """
     try:
         probe = execute(f"cat {shlex.quote(RECEIPT_DIR)}/*.json 2>/dev/null") or {}
     except Exception as exc:
         logger.debug(f"{RECEIPT_DIR} unavailable for attribution: {exc}")
-        return set()
-    claimed: Set[str] = set()
+        return []
+    claims: List[Tuple[Optional[int], Tuple[str, ...]]] = []
     for line in str(probe.get("output") or "").splitlines():
         stripped = line.strip()
         if not stripped.startswith("{"):
@@ -559,9 +600,55 @@ def _claimed_report_paths(execute: Callable[..., Optional[Mapping[str, Any]]]) -
             payload = json.loads(stripped)
         except (TypeError, ValueError):
             continue
-        if isinstance(payload, Mapping):
-            claimed.update(_delta_paths(payload.get("report_delta")))
-    return claimed
+        if not isinstance(payload, Mapping):
+            continue
+        paths = tuple(_delta_paths(payload.get("report_delta")))
+        if paths:
+            claims.append((_receipt_sequence(payload.get("receipt_id")), paths))
+    return claims
+
+
+def _intervening_claims(
+    claims: Sequence[Tuple[Optional[int], Tuple[str, ...]]],
+    dispatch_sequence: Optional[int],
+) -> Set[str]:
+    """The paths receipts written AFTER this dispatch already claimed.
+
+    Two unknowns are treated the same way, and conservatively: an obligation
+    with no recorded ordinal cannot tell a window from a history, and a receipt
+    whose id carries no ordinal cannot be placed in one. Either way the path is
+    excluded — a settling receipt never takes a path some other receipt vouched
+    for when the harness cannot prove the vouching came later.
+    """
+    paths: Set[str] = set()
+    for sequence, claimed in claims:
+        if dispatch_sequence is None or sequence is None or sequence > dispatch_sequence:
+            paths.update(claimed)
+    return paths
+
+
+def _dispatch_sequence(obligation: Mapping[str, Any]) -> Optional[int]:
+    """Where this dispatch sits in receipt order, or None when unrecorded."""
+    value = (obligation or {}).get("dispatch_sequence")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _receipt_sequence(receipt_id: Any) -> Optional[int]:
+    """The ordinal `next_receipt_id` stamped on a receipt id, or None.
+
+    Ids are `inv-<slug>-<slug>-<seq:04d>` and `_slug` replaces every
+    non-alphanumeric character with `_`, so the trailing dash-delimited field is
+    the sequence and nothing else can be.
+    """
+    text = _text(receipt_id)
+    if "-" not in text:
+        return None
+    try:
+        return int(text.rsplit("-", 1)[-1])
+    except ValueError:
+        return None
 
 
 def _delta_paths(delta: Any) -> List[str]:

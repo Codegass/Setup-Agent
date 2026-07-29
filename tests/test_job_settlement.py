@@ -15,17 +15,20 @@ receipt through `record_invocation`. One schema, one writer, no second
 bookkeeping system — the only thing that moved is WHEN (acceptance §6.5).
 
 Attribution does not move at all. The settling receipt's window is its own
-`before` against its own `after`, and receipts are ordered: a path an
-intervening receipt already claimed is EXCLUDED here and the exclusion is
-counted on the receipt. An untouched file nobody vouched for stays unclaimed —
-the Bigtop rule is not negotiable.
+`before` against its own `after`, and receipts are ordered: a path claimed by a
+receipt written INSIDE that window — between the dispatch and its settlement —
+is EXCLUDED here and the exclusion is counted on the receipt. A receipt from
+BEFORE the dispatch is outside the window and takes nothing: the whole point of
+Stage 1 is that a detached retry finally gets to claim its own rewrite of a
+report an earlier, already-closed attempt had produced. An untouched file
+nobody vouched for stays unclaimed — the Bigtop rule is not negotiable.
 """
 
 import json
 
 from test_repair_contracts import ContainerFS, ScriptedOrchestrator, ok
 
-from sag.agent.invocation_receipts import RECEIPT_DIR
+from sag.agent.invocation_receipts import RECEIPT_DIR, next_sequence
 from sag.agent.job_obligations import (
     OBLIGATION_DIR,
     build_obligation,
@@ -123,6 +126,14 @@ def _orchestrator(*, exit_code="0", reports=None, files=None):
 
 
 def _obligation(**overrides):
+    """One obligation in the shape the real detach seam writes it.
+
+    `dispatch_sequence` is part of that shape: it is the receipt ordinal in
+    hand at dispatch, and it is the only thing that lets settlement tell a
+    receipt written inside its window from one written before it. Tests that
+    need two obligations, or that rewrite one body twice, keep the body they
+    built rather than calling this again — a second call is a second dispatch.
+    """
     body = build_obligation(
         job_id=JOB,
         tool="gradle",
@@ -139,9 +150,19 @@ def _obligation(**overrides):
             "config_fingerprint": "cf-04ab",
         },
         domain_id=ROOT,
+        dispatch_sequence=next_sequence(),
     )
     body.update(overrides)
     return body
+
+
+def _settled_receipt(orchestrator, job_id=JOB):
+    """The receipt THIS obligation settled into, named by the ledger itself.
+
+    Picking it out by id would guess; the ledger states it.
+    """
+    receipt_id = _ledger(orchestrator, job_id)["settled_receipt_id"]
+    return json.loads(orchestrator.filesystem.files[f"{RECEIPT_DIR}/{receipt_id}.json"])
 
 
 def _with_obligation(orchestrator, **overrides):
@@ -270,21 +291,21 @@ def test_an_untouched_report_nobody_vouched_for_stays_unclaimed():
 # ---------------------------------------------------------------------------
 
 
-def _intervening_receipt(*paths):
-    """A receipt written between this job's dispatch and its settlement."""
+def _other_receipt(receipt_id, paths, digest=SHA_CORE, exit_code=0):
+    """One receipt some OTHER dispatch wrote, claiming `paths` at `digest`."""
     return json.dumps(
         {
             "schema_version": 2,
-            "receipt_id": "inv-gradle-3-0042",
+            "receipt_id": receipt_id,
             "tool": "gradle",
             "requested_action": "test",
             "effective_action": "test",
             "argv": f"{ROOT}/gradlew :polaris-core:test",
             "working_directory": ROOT,
-            "exit_code": 0,
-            "outcome": "completed",
+            "exit_code": exit_code,
+            "outcome": "completed" if exit_code == 0 else "failed",
             "report_delta": {
-                "new": [{"path": path, "sha256": SHA_CORE} for path in paths],
+                "new": [{"path": path, "sha256": digest} for path in paths],
                 "changed": [],
             },
         },
@@ -292,22 +313,29 @@ def _intervening_receipt(*paths):
     )
 
 
-def test_a_path_an_intervening_receipt_already_claimed_is_excluded():
-    """First claim wins. Two receipts counting one report file is how a
-    passing suite gets counted twice."""
-    orchestrator = _with_obligation(
-        _orchestrator(
-            files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)}
-        )
+def _with_intervening(*paths):
+    """This job's obligation, plus a receipt written AFTER its dispatch.
+
+    The order is the fact under test: the obligation's `dispatch_sequence` is
+    taken first, the other receipt's id second, so the receipt is provably
+    inside the window between dispatch and settlement.
+    """
+    orchestrator = _with_obligation(_orchestrator())
+    receipt_id = f"inv-gradle-3-{next_sequence():04d}"
+    orchestrator.filesystem.files[f"{RECEIPT_DIR}/{receipt_id}.json"] = _other_receipt(
+        receipt_id, paths
     )
+    return orchestrator
+
+
+def test_a_path_an_intervening_receipt_already_claimed_is_excluded():
+    """First claim wins inside the window. Two receipts counting one report
+    file is how a passing suite gets counted twice."""
+    orchestrator = _with_intervening(CORE_REPORT)
 
     settle_open_obligations(orchestrator)
 
-    settled = next(
-        receipt
-        for receipt in _receipts(orchestrator)
-        if receipt["receipt_id"] != "inv-gradle-3-0042"
-    )
+    settled = _settled_receipt(orchestrator)
     assert settled["report_delta"]["new"] == []
     assert settled["excluded_claimed_paths"] == 1
 
@@ -315,19 +343,11 @@ def test_a_path_an_intervening_receipt_already_claimed_is_excluded():
 def test_the_exclusion_never_touches_what_nobody_claimed():
     """Only the intervening receipt's own paths move; this job keeps the rest
     of its window."""
-    orchestrator = _with_obligation(
-        _orchestrator(
-            files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)}
-        )
-    )
+    orchestrator = _with_intervening(CORE_REPORT)
 
     settle_open_obligations(orchestrator)
 
-    settled = next(
-        receipt
-        for receipt in _receipts(orchestrator)
-        if receipt["receipt_id"] != "inv-gradle-3-0042"
-    )
+    settled = _settled_receipt(orchestrator)
     assert [entry["path"] for entry in settled["report_delta"]["cached"]] == [API_REPORT]
 
 
@@ -335,20 +355,102 @@ def test_a_settlement_whose_mark_never_landed_cannot_double_count():
     """Risk §7, two writers to one job: if the ledger mark fails after the
     receipt was written, the next sweep settles again — and the FIRST receipt
     now owns every path, so the second one claims nothing. The exclusion rule
-    is what makes that harmless."""
-    orchestrator = _with_obligation(_orchestrator())
+    is what makes that harmless.
+
+    The re-read body is the SAME dispatch, ordinal included: a mark that never
+    reached disk did not re-dispatch the job.
+    """
+    body = _obligation()
+    orchestrator = _orchestrator()
+    write_obligation(orchestrator.execute_command, body)
     settle_open_obligations(orchestrator)
     # The mark that never reached disk.
     orchestrator.filesystem.files[f"{OBLIGATION_DIR}/{JOB}.json"] = json.dumps(
-        _obligation(), sort_keys=True
+        body, sort_keys=True
     )
 
     settle_open_obligations(orchestrator)
 
-    first, second = _receipts(orchestrator)
+    first, second = sorted(_receipts(orchestrator), key=lambda receipt: receipt["receipt_id"])
     assert len(_delta_paths(first)) == 2
     assert _delta_paths(second) == []
     assert second["excluded_claimed_paths"] == 2
+
+
+# ---------------------------------------------------------------------------
+# attribution: a receipt from BEFORE the dispatch is outside the window
+# ---------------------------------------------------------------------------
+
+SHA_CORE_ATTEMPT_1 = "dd" * 32
+
+
+def test_a_receipt_from_before_this_dispatch_does_not_take_the_rewrite():
+    """The camel case Stage 1 exists to retire, in miniature.
+
+    Attempt 1 ran synchronously, exited 1, and wrote a receipt claiming
+    TEST-Core.xml at sha A. Attempt 2 dispatched the same command and detached,
+    holding A in its `before`. The job finished and REWROTE the report at sha B.
+
+    B is attempt 2's own evidence. The earlier receipt vouched for a version
+    that is no longer on disk, and it was closed before this dispatch existed —
+    first claim applies to the window between dispatch and settlement (spec
+    §3.2), not to the whole history of the run. Excluding it here is how 11,492
+    passing tests stayed unclaimable: the path leaves `after`, the settled
+    receipt claims nothing, and the file on disk hashes to a sha only the stale
+    earlier claim names.
+    """
+    earlier = f"inv-gradle-1-{next_sequence():04d}"
+    orchestrator = _orchestrator(
+        files={
+            f"{RECEIPT_DIR}/{earlier}.json": _other_receipt(
+                earlier, [CORE_REPORT], digest=SHA_CORE_ATTEMPT_1, exit_code=1
+            )
+        }
+    )
+    _with_obligation(orchestrator, before={CORE_REPORT: SHA_CORE_ATTEMPT_1, **BEFORE})
+
+    settle_open_obligations(orchestrator)
+
+    settled = _settled_receipt(orchestrator)
+    assert settled["report_delta"]["changed"] == [{"path": CORE_REPORT, "sha256": SHA_CORE}]
+    assert "excluded_claimed_paths" not in settled
+
+
+def test_the_pre_dispatch_receipt_is_still_the_only_claim_it_ever_made():
+    """Scoping the exclusion adds no claim to anyone else's books."""
+    earlier = f"inv-gradle-1-{next_sequence():04d}"
+    orchestrator = _orchestrator(
+        files={
+            f"{RECEIPT_DIR}/{earlier}.json": _other_receipt(
+                earlier, [CORE_REPORT], digest=SHA_CORE_ATTEMPT_1, exit_code=1
+            )
+        }
+    )
+    _with_obligation(orchestrator, before={CORE_REPORT: SHA_CORE_ATTEMPT_1, **BEFORE})
+
+    settle_open_obligations(orchestrator)
+
+    untouched = json.loads(orchestrator.filesystem.files[f"{RECEIPT_DIR}/{earlier}.json"])
+    assert untouched["report_delta"]["new"] == [
+        {"path": CORE_REPORT, "sha256": SHA_CORE_ATTEMPT_1}
+    ]
+
+
+def test_an_obligation_that_cannot_order_itself_excludes_every_claim():
+    """A ledger entry with no dispatch ordinal cannot tell a window from a
+    history, so it refuses to claim a path any receipt already vouched for.
+    Conservative, and stated: the notice counts what it gave up."""
+    receipt_id = f"inv-gradle-3-{next_sequence():04d}"
+    orchestrator = _orchestrator(
+        files={f"{RECEIPT_DIR}/{receipt_id}.json": _other_receipt(receipt_id, [CORE_REPORT])}
+    )
+    body = _obligation()
+    body.pop("dispatch_sequence")
+    write_obligation(orchestrator.execute_command, body)
+
+    settle_open_obligations(orchestrator)
+
+    assert _settled_receipt(orchestrator)["excluded_claimed_paths"] == 1
 
 
 def _delta_paths(receipt):
@@ -445,12 +547,10 @@ def test_the_notice_is_one_bounded_line():
 
 
 def test_the_notice_states_the_exclusion_when_there_was_one():
-    orchestrator = _with_obligation(
-        _orchestrator(
-            files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)}
-        )
-    )
+    """"Earlier" would be false: the receipt that took the path was written
+    AFTER this dispatch, which is precisely why it took it."""
+    orchestrator = _with_intervening(CORE_REPORT)
 
     (settlement,) = settle_open_obligations(orchestrator)
 
-    assert settlement.notice().endswith("1 already claimed by an earlier receipt)")
+    assert settlement.notice().endswith("1 already claimed by an intervening receipt)")
