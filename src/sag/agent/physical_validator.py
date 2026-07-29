@@ -1026,6 +1026,11 @@ def _test_report_attempt_id(xml_content: str) -> Tuple[Optional[int], Optional[s
     return next(iter(values)), None
 
 
+def _carries_unresolved_property(value: str) -> bool:
+    """Whether a coordinate still holds an unexpanded `${...}` placeholder."""
+    return "${" in str(value or "")
+
+
 def evaluate_run_verdict(
     build_green: bool,
     pass_rate: float,
@@ -3192,11 +3197,21 @@ class PhysicalValidator:
             elif coverage > 0 or has_real_output:
                 # Real build output, but some ACTIVE modules did not compile —
                 # honest PARTIAL, not a clean success.
+                #
+                # Counts, not a rounded percentage. Live ignite: 17,779 classes
+                # compiled and 20 short across four modules rounded to "Built
+                # 100% of expected classes (< 100% threshold)" — a sentence
+                # that contradicts itself and tells the model nothing it can
+                # act on.
                 success, complete = True, False
+                found_classes = coverage_info.get("classes_found", 0)
+                expected_classes = coverage_info.get("classes_expected", 0)
+                shortfall = max(expected_classes - found_classes, 0)
                 reason = (
-                    f"Built {coverage * 100:.0f}% of expected classes "
-                    f"(< {threshold * 100:.0f}% threshold); "
-                    f"{len(missing)} module(s) incomplete"
+                    f"Built {found_classes} of {expected_classes} expected classes"
+                    + (f", {shortfall} short" if shortfall else "")
+                    + f" (below the {threshold * 100:.0f}% threshold); "
+                    + f"{len(missing)} module(s) incomplete"
                     + (f": {', '.join(missing[:5])}" if missing else "")
                     + (" ..." if len(missing) > 5 else "")
                 )
@@ -6160,8 +6175,15 @@ class PhysicalValidator:
                         }
                     )
 
-        # Expected JAR/WAR artifact
-        if artifact_id and version:
+        # Expected JAR/WAR artifact. A coordinate that still carries a Maven
+        # property (`${revision}`, `${sha1}`, `${changelist}` — the CI-friendly
+        # versions) was never resolved, so the path it produces can never
+        # exist. Live ignite: `ignite-checkstyle-${revision}.jar` was reported
+        # missing on every run, a permanent shortfall no build could close.
+        # An expectation we cannot state is not an expectation.
+        if artifact_id and version and not _carries_unresolved_property(
+            f"{artifact_id}{version}{packaging}"
+        ):
             expected_path = f"{project_dir}/target/{artifact_id}-{version}.{packaging}"
             expected.append(
                 {

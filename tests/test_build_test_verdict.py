@@ -184,7 +184,11 @@ def test_validate_build_status_partial_below_coverage_threshold():
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
     assert "build_modules_incomplete" in result["conflicts"]
-    assert "50%" in result["reason"]
+    # Counts, not a rounded percentage: live ignite rounded 17,779-of-17,799 to
+    # "Built 100% of expected classes (< 100% threshold)", a sentence that
+    # contradicts itself and states nothing the model can act on.
+    assert "2 of 4 expected classes" in result["reason"]
+    assert "2 short" in result["reason"]
     assert "incomplete" in result["reason"].lower()
 
 

@@ -143,3 +143,22 @@ def test_an_expectation_with_no_module_of_its_own_is_never_dropped():
     scoped, _untried, _conflict = scope([root_expectation], ("core",))
 
     assert root_expectation in scoped
+
+
+# --------------------------------------------------------------------------
+# expectations the project itself never resolved
+# --------------------------------------------------------------------------
+
+
+def test_an_unresolved_maven_property_states_no_expectation():
+    """Live ignite: `ignite-checkstyle-${revision}.jar` was reported missing on
+    every run — a shortfall no build could ever close, because Maven's
+    CI-friendly versions (`${revision}`, `${sha1}`, `${changelist}`) leave a
+    placeholder that resolves at build time and not in the pom we read. An
+    expectation we cannot state is not an expectation."""
+    from sag.agent.physical_validator import _carries_unresolved_property
+
+    assert _carries_unresolved_property("ignite-checkstyle-${revision}.jar") is True
+    assert _carries_unresolved_property("${sha1}") is True
+    assert _carries_unresolved_property("commons-cli-1.6.0.jar") is False
+    assert _carries_unresolved_property("") is False
