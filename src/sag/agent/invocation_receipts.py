@@ -135,23 +135,42 @@ def snapshot_reports(
 def report_delta(
     before: Mapping[str, str],
     after: Mapping[str, str],
+    cached_roots: Optional[Iterable[str]] = None,
 ) -> Dict[str, List[Dict[str, str]]]:
-    """What THIS invocation wrote: reports that appeared or changed content.
+    """What THIS invocation produced: written, rewritten, or vouched for.
 
-    Unchanged files never appear — a byte-identical XML from an earlier
-    attempt is not this invocation's evidence. Both keys are always present:
-    an empty list is the stated fact "this invocation wrote no new/changed
-    reports", which is exactly what the primary rollup needs to hear.
+    `new` and `changed` are what the dispatch physically wrote. A byte-identical
+    XML from an earlier attempt is not this invocation's evidence and appears in
+    neither; both keys are always present, so an empty list states "this
+    invocation wrote no reports", which is what the primary rollup needs.
+
+    `cached` is the third case, and it is not a weaker one. Live kafka:
+    `--build-cache` served most test tasks FROM-CACHE, so their reports were
+    never rewritten, the hashes did not move, and 4,686 passing tests could be
+    claimed by nothing — they sat in auxiliary while the main count read 546.
+    A cache hit is Gradle stating that the report on disk IS this build's
+    result for that task, which is a stronger guarantee than a file merely
+    existing. `cached_roots` are the directories the build system vouched for;
+    reports under them are claimable, and kept in their own bucket so a reader
+    can always tell what ran from what was vouched for. The key is absent when
+    nothing was vouched for.
     """
     new: List[Dict[str, str]] = []
     changed: List[Dict[str, str]] = []
+    cached: List[Dict[str, str]] = []
+    roots = [str(root).rstrip("/") for root in (cached_roots or ()) if str(root or "").strip()]
     for path in sorted(after):
         digest = after[path]
         if path not in before:
             new.append({"path": path, "sha256": digest})
         elif before[path] != digest:
             changed.append({"path": path, "sha256": digest})
-    return {"new": new, "changed": changed}
+        elif any(path == root or path.startswith(root + "/") for root in roots):
+            cached.append({"path": path, "sha256": digest})
+    delta: Dict[str, List[Dict[str, str]]] = {"new": new, "changed": changed}
+    if cached:
+        delta["cached"] = cached
+    return delta
 
 
 def target_sha(
@@ -342,6 +361,7 @@ def build_receipt(
     compliance: Optional[str] = None,
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
     module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
+    cached_report_roots: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Assemble a schema-v2 receipt. Absent facts serialize as absent keys.
 
@@ -360,7 +380,7 @@ def build_receipt(
     if isinstance(exit_code, int) and not isinstance(exit_code, bool):
         receipt["exit_code"] = exit_code
     receipt["outcome"] = "completed" if exit_code == 0 else "failed"
-    receipt["report_delta"] = report_delta(before, after)
+    receipt["report_delta"] = report_delta(before, after, cached_report_roots)
     # v2 (spec §C4). `actual_cwd` is the directory the dispatch physically
     # used; `contract_id`/`contract_hash` bind this receipt to the contract the
     # facade froze BEFORE the dispatch, and `compliance` is that comparison's
@@ -463,6 +483,7 @@ def record_invocation(
     compliance: Optional[str] = None,
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
     module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
+    cached_report_roots: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Persist the receipt for one runner call; return its ToolResult metadata.
 
@@ -505,6 +526,7 @@ def record_invocation(
         compliance=compliance,
         capability_observations=capability_observations,
         module_outcomes=module_outcomes,
+        cached_report_roots=cached_report_roots,
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):

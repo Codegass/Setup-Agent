@@ -64,13 +64,15 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _receipt(receipt_id: str, working_directory: Path, new=(), changed=()) -> dict:
+def _receipt(receipt_id: str, working_directory: Path, new=(), changed=(), cached=()) -> dict:
     """One schema-v1 invocation receipt (exact cross-lane contract)."""
     report_delta = {}
     if new:
         report_delta["new"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in new]
     if changed:
         report_delta["changed"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in changed]
+    if cached:
+        report_delta["cached"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in cached]
     return {
         "schema_version": 1,
         "receipt_id": receipt_id,
@@ -541,3 +543,26 @@ def test_legacy_rollup_shape_is_unchanged(bigtop, monkeypatch):
         "collection_errors_skipped",
     }
     assert rollup["unique"]["executed"] == 54
+
+
+def test_a_cached_claim_counts_toward_the_primary_rollup(bigtop, monkeypatch):
+    """kafka's shape: the dispatch rewrote nothing, the build vouched for the
+    reports it served from cache, and those reports are this run's evidence.
+
+    Before this, a `--build-cache` run could claim nothing it did not rewrite:
+    kafka observed 5,232 tests and reported 546.
+    """
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    bigtop.write_receipt(
+        _receipt(
+            "inv-test-1-0001",
+            bigtop.primary_root,
+            cached=sorted((bigtop.primary_root / "target" / "surefire-reports").glob("*.xml")),
+        )
+    )
+    validator, _ = _validator(bigtop)
+
+    result = validator.parse_test_reports(str(bigtop.project))
+
+    assert result["total_tests"] == 50
+    assert result["receipt_scoped"] is True

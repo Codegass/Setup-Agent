@@ -429,7 +429,7 @@ def receipt_schema_error(payload):
         return None
     if not isinstance(delta, dict):
         return "report_delta is not an object"
-    for bucket in ("new", "changed"):
+    for bucket in ("new", "changed", "cached"):
         entries = delta.get(bucket)
         if entries is None:
             continue
@@ -556,7 +556,12 @@ def read_invocation_receipts():
         ):
             continue
         delta = payload.get("report_delta") or {}
-        for bucket in ("new", "changed"):
+        # `cached` joins the claim set: the build system vouched that those
+        # reports ARE this build's result for their task, which is a stronger
+        # statement than a file existing (live kafka: --build-cache served most
+        # test tasks FROM-CACHE, so 4,686 passing tests could be claimed by
+        # nothing and the main count read 546 of 5,232 observed).
+        for bucket in ("new", "changed", "cached"):
             for entry in delta.get(bucket) or []:
                 claims.setdefault(entry["path"], set()).add(entry["sha256"].strip().lower())
     return True, claims, corrupt

@@ -46,9 +46,44 @@ from .toolchain_manager import ToolchainManager, ToolchainSpec
 # attempted, and whether any of its tasks failed outright. `no-source` is an
 # outcome of a task, not of a module, and is deliberately not a module status.
 _GRADLE_TASK_ROW = re.compile(
-    r"^>\s*Task\s+:?([A-Za-z0-9_.:-]*?):([A-Za-z0-9_]+)(?:\s+(FAILED|NO-SOURCE|SKIPPED|UP-TO-DATE))?\s*$",
+    r"^>\s*Task\s+:?([A-Za-z0-9_.:-]*?):([A-Za-z0-9_]+)"
+    r"(?:\s+(FAILED|NO-SOURCE|SKIPPED|UP-TO-DATE|FROM-CACHE))?\s*$",
     re.MULTILINE,
 )
+# Outcomes where Gradle guarantees the task's outputs match THIS build's
+# inputs without rewriting them. Live kafka: `--build-cache` served most test
+# tasks FROM-CACHE, their report files were never touched, the content hash
+# did not move, and 4,686 passing tests could not be claimed by any receipt —
+# they sat in auxiliary while the main count read 546. A cache hit is a
+# stronger statement than "a file exists on disk": the build system vouches
+# that the report on disk IS this build's result for that task.
+_GRADLE_CURRENT_WITHOUT_REWRITE = ("FROM-CACHE", "UP-TO-DATE")
+# The task whose outputs are test reports. Only its cache hits may claim one.
+_GRADLE_TEST_TASKS = ("test", "integrationTest", "check")
+
+
+def _gradle_cached_report_dirs(output: str, working_directory: str) -> List[str]:
+    """Report directories a cached/up-to-date TEST task vouches for.
+
+    Only test tasks, because only they produce test reports; a cached
+    `compileJava` says nothing about any report. The directory is Gradle's own
+    layout for the module the task belongs to.
+    """
+    root = str(working_directory or "").rstrip("/")
+    if not root:
+        return []
+    dirs: List[str] = []
+    for path, task, outcome in _GRADLE_TASK_ROW.findall(str(output or "")):
+        if (outcome or "").upper() not in _GRADLE_CURRENT_WITHOUT_REWRITE:
+            continue
+        if task not in _GRADLE_TEST_TASKS:
+            continue
+        module_path = path.strip(":").replace(":", "/").strip()
+        base = f"{root}/{module_path}" if module_path else root
+        candidate = f"{base}/build/test-results/{task}"
+        if candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
 
 
 def _gradle_module_outcomes(output: str) -> List[Dict[str, str]]:
@@ -369,6 +404,13 @@ class GradleTool(BaseTool):
                         module_outcomes=_gradle_module_outcomes(
                             dispatched.get("full_output") or dispatched.get("output") or ""
                         ),
+                        # Reports Gradle vouched for without rewriting them
+                        # (`--build-cache`): claimable, and kept distinct from
+                        # what this dispatch physically wrote.
+                        cached_report_roots=_gradle_cached_report_dirs(
+                            dispatched.get("full_output") or dispatched.get("output") or "",
+                            working_directory,
+                        ),
                     )
                 return dispatched
 
@@ -626,6 +668,7 @@ class GradleTool(BaseTool):
         before: Dict[str, str],
         requirements: Optional[Dict[str, Any]] = None,
         module_outcomes: Optional[List[Dict[str, str]]] = None,
+        cached_report_roots: Optional[List[str]] = None,
     ) -> None:
         """Persist the P0-A invocation receipt for one physical dispatch.
 
@@ -652,6 +695,7 @@ class GradleTool(BaseTool):
             before=before,
             after=after,
             module_outcomes=module_outcomes,
+            cached_report_roots=cached_report_roots,
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,
             # Plan 6 Stage B: bind this dispatch back to the contract the build
