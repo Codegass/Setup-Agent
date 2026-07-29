@@ -239,6 +239,68 @@ def test_a_settled_job_is_no_conflict_at_all(forced_engine):  # noqa: F811
     assert engine.run_evidence_state.conflicts == ()
 
 
+def _sealed_engine(forced_engine_factory, orchestrator):
+    engine = _closing_engine(forced_engine_factory, orchestrator)
+    engine.run_evidence_state.seal(
+        finalized_at="2026-07-29T11:17:37Z",
+        close_reason="test_terminated",
+    )
+    return engine
+
+
+def test_a_sealed_run_settles_nothing_on_a_later_batch(forced_engine):  # noqa: F811
+    """A sealed run accepts no further evidence.
+
+    The report phase still executes action batches after evidence-close, and the
+    sweep had no `sealed` guard: a job that terminated in that window settled
+    anyway, writing a receipt, an assessment, a repair proposal and a
+    `job_settled` event AFTER `evidence_close` — contradicting the sealed
+    verdict's own `job_unsettled` conflict for the same job.
+    """
+    orchestrator = Orchestrator()
+    engine = _sealed_engine(forced_engine, orchestrator)
+
+    engine._sweep_job_obligations()
+
+    assert _receipts(orchestrator) == []
+    assert engine.control_events == []
+    assert _ledger(orchestrator)["settled_receipt_id"] is None
+
+
+def test_a_sealed_run_owes_the_model_no_settled_notice(forced_engine):  # noqa: F811
+    """Nothing settled, so there is nothing to announce — and a `[settled]` line
+    for a receipt that was never written would be a fabricated fact."""
+    orchestrator = Orchestrator()
+    engine = _sealed_engine(forced_engine, orchestrator)
+
+    engine._sweep_job_obligations()
+    engine._append_native_observation("call-1", "report generated")
+
+    assert "[settled]" not in engine.steps[0].content
+
+
+def test_the_batch_seam_itself_is_guarded(forced_engine):  # noqa: F811
+    """The guard belongs to the sweep, so the seam that calls it after every
+    executed action batch inherits it."""
+    orchestrator = Orchestrator()
+    engine = _sealed_engine(forced_engine, orchestrator)
+    turn = type("Turn", (), {"tool_calls": [], "text": "", "model_used": "m"})()
+
+    engine._execute_native_calls(turn)
+
+    assert _receipts(orchestrator) == []
+
+
+def test_an_unsealed_run_still_settles_after_every_batch(forced_engine):  # noqa: F811
+    """The guard is the seal, not the presence of a verdict state."""
+    orchestrator = Orchestrator()
+    engine = _closing_engine(forced_engine, orchestrator)
+
+    engine._sweep_job_obligations()
+
+    assert len(_receipts(orchestrator)) == 1
+
+
 def test_the_unsettled_verdict_state_is_written_by_a_control_event(forced_engine):  # noqa: F811
     """Spec §3.2 asks for one control event so REPLAY reproduces the state, and
     the settled branch had one while the unsettled branch wrote straight onto

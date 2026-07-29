@@ -4332,10 +4332,20 @@ class ReActEngine(UIEventEmitter):
         bounded notice and the post-receipt hooks. One announcement per job,
         for the life of the run.
 
+        A SEALED run sweeps nothing. The report phase still executes action
+        batches after evidence-close, and settling in that window would write a
+        receipt, an assessment, a repair proposal and a `job_settled` event AFTER
+        `evidence_close` — for a job the sealed verdict has already recorded as
+        `job_unsettled`. A sealed run accepts no further evidence, and the
+        obligation staying open is the honest end state, not a gap.
+
         Never raises: an unswept ledger is an open obligation, which the
         closing sweep and evidence-close already state honestly."""
         orchestrator = getattr(self, "orchestrator", None)
         if orchestrator is None:
+            return
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and state.sealed:
             return
         try:
             # ONE ledger read per batch: the common case is a run that never
