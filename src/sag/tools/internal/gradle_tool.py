@@ -37,6 +37,42 @@ from .build_utils import (
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 
+# Gradle prints no reactor summary; what it prints is per-task outcomes:
+#   > Task :camel-core:compileJava
+#   > Task :camel-jms:compileJava NO-SOURCE
+#   > Task :camel-ftp:test FAILED
+# The project path in front of the task name is the module. Gradle states no
+# per-module verdict, so this records only what it can prove: the module was
+# attempted, and whether any of its tasks failed outright. `no-source` is an
+# outcome of a task, not of a module, and is deliberately not a module status.
+_GRADLE_TASK_ROW = re.compile(
+    r"^>\s*Task\s+:?([A-Za-z0-9_.:-]*?):([A-Za-z0-9_]+)(?:\s+(FAILED|NO-SOURCE|SKIPPED|UP-TO-DATE))?\s*$",
+    re.MULTILINE,
+)
+
+
+def _gradle_module_outcomes(output: str) -> List[Dict[str, str]]:
+    """`[{module, status}]` for every module whose tasks this build ran.
+
+    `status` is "failure" when any of that module's tasks FAILED, else
+    "attempted" — never "success", because a task list is not a statement
+    that the module built correctly, and inventing that verdict here is
+    exactly the overclaim the physical check exists to catch.
+    """
+    statuses: Dict[str, str] = {}
+    order: List[str] = []
+    for path, _task, outcome in _GRADLE_TASK_ROW.findall(str(output or "")):
+        module = path.strip(":").strip()
+        if not module:
+            module = ":root"
+        if module not in statuses:
+            statuses[module] = "attempted"
+            order.append(module)
+        if (outcome or "").upper() == "FAILED":
+            statuses[module] = "failure"
+    return [{"module": module, "status": statuses[module]} for module in order]
+
+
 class GradleTool(BaseTool):
     """Gradle build tool with enhanced error handling and Gradle-specific features."""
 
@@ -327,6 +363,12 @@ class GradleTool(BaseTool):
                         result=dispatched,
                         before=before,
                         requirements=requirements,
+                        # What Gradle itself ran, module by module — the
+                        # coverage denominator is built from this rather than
+                        # from every source tree on disk.
+                        module_outcomes=_gradle_module_outcomes(
+                            dispatched.get("full_output") or dispatched.get("output") or ""
+                        ),
                     )
                 return dispatched
 
@@ -583,6 +625,7 @@ class GradleTool(BaseTool):
         result: Dict[str, Any],
         before: Dict[str, str],
         requirements: Optional[Dict[str, Any]] = None,
+        module_outcomes: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """Persist the P0-A invocation receipt for one physical dispatch.
 
@@ -608,6 +651,7 @@ class GradleTool(BaseTool):
             exit_code=result.get("exit_code"),
             before=before,
             after=after,
+            module_outcomes=module_outcomes,
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,
             # Plan 6 Stage B: bind this dispatch back to the contract the build

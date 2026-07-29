@@ -341,6 +341,7 @@ def build_receipt(
     contract_hash: Optional[str] = None,
     compliance: Optional[str] = None,
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
+    module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble a schema-v2 receipt. Absent facts serialize as absent keys.
 
@@ -395,6 +396,19 @@ def build_receipt(
     ]
     if observations:
         receipt["capability_observations"] = observations
+    # What THIS invocation attempted, module by module, in the build system's
+    # own words (Maven's reactor summary; the modules whose tasks Gradle ran).
+    # The coverage denominator is built from this: a module the build never
+    # tried is untried, not missing, and counting it as missing is how a
+    # scoped build (`-pl`) or a reactor that stopped early looks like a
+    # catastrophe. Absent when the runner stated nothing.
+    modules = [
+        {str(key): entry[key] for key in ("module", "status") if key in entry}
+        for entry in module_outcomes or ()
+        if isinstance(entry, Mapping) and entry.get("module")
+    ]
+    if modules:
+        receipt["module_outcomes"] = modules
     return receipt
 
 
@@ -448,6 +462,7 @@ def record_invocation(
     contract_hash: Optional[str] = None,
     compliance: Optional[str] = None,
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
+    module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Persist the receipt for one runner call; return its ToolResult metadata.
 
@@ -489,6 +504,7 @@ def record_invocation(
         contract_hash=contract_hash,
         compliance=compliance,
         capability_observations=capability_observations,
+        module_outcomes=module_outcomes,
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):

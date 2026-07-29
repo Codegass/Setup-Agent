@@ -37,6 +37,31 @@ from .command_tracker import CommandTracker
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
 
+# The reactor summary Maven prints at the end of every multi-module build:
+#   [INFO] camel-core ......................... SUCCESS [ 12.345 s]
+#   [INFO] camel-jms .......................... FAILURE [  3.210 s]
+#   [INFO] camel-ftp .......................... SKIPPED
+# It is the build system's own record of what THIS invocation attempted. A
+# single-module build prints none, which is the honest absence: there is one
+# module and the exit code already speaks for it.
+_REACTOR_ROW = re.compile(
+    r"\[INFO\]\s+([^\.\[]+?)\s+\.{2,}\s+(SUCCESS|FAILURE|SKIPPED)\b"
+)
+
+
+def _reactor_module_outcomes(output: Optional[str]) -> List[Dict[str, str]]:
+    """`[{module, status}]` from the reactor summary, or [] when it printed none."""
+    rows: List[Dict[str, str]] = []
+    seen = set()
+    for label, status in _REACTOR_ROW.findall(str(output or "")):
+        module = label.strip()
+        if not module or module in seen:
+            continue
+        seen.add(module)
+        rows.append({"module": module, "status": status.lower()})
+    return rows
+
+
 class MavenTool(BaseTool):
     """Maven build tool with enhanced error handling and raw output access."""
 
@@ -1049,6 +1074,13 @@ class MavenTool(BaseTool):
             after=after,
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,
+            # What the reactor itself said it attempted, module by module. The
+            # coverage denominator is built from this instead of from every
+            # source tree on disk, so a scoped build (`-pl`) or a reactor that
+            # stopped early is measured against what it tried.
+            module_outcomes=_reactor_module_outcomes(
+                result.get("full_output") or result.get("output")
+            ),
             # Plan 6 Stage B: bind this dispatch back to the contract the build
             # facade froze for it. Absent when the runner was called outside
             # the facade, and `compliance` is the argv comparison's verdict.

@@ -32,7 +32,7 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
@@ -2148,6 +2148,97 @@ class PhysicalValidator:
         """The schema-v1 receipt directory for this workspace."""
         return f"{self.project_path.rstrip('/')}/{INVOCATION_RECEIPTS_DIRNAME}"
 
+    def _attempted_modules(self) -> Optional[Tuple[str, ...]]:
+        """Modules THIS run's dispatches attempted, in the build system's words.
+
+        Read from the receipts' `module_outcomes` — Maven's reactor summary,
+        the modules whose tasks Gradle ran. `None` means no dispatch stated
+        anything, which is the honest answer for a single-module build (Maven
+        prints no reactor summary for one module) and for a receipt-free run.
+
+        This is the coverage SCOPE. Counting `src/main/java` across the whole
+        tree measures modules a scoped build (`-pl`), an early-stopping reactor
+        or a disabled profile never tried, and calls them missing.
+        """
+        if not self.docker_orchestrator or not self._invocation_receipts_present():
+            return None
+        try:
+            probe = self.docker_orchestrator.execute_command(
+                f"cat {shlex.quote(self._invocation_receipts_dir())}/*.json 2>/dev/null"
+            )
+        except Exception as exc:
+            logger.debug(f"attempted-module read failed: {exc}")
+            return None
+        modules: List[str] = []
+        for line in ((probe or {}).get("output") or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            for entry in payload.get("module_outcomes") or ():
+                name = str((entry or {}).get("module") or "").strip()
+                if name and name not in modules:
+                    modules.append(name)
+        return tuple(modules) or None
+
+    @staticmethod
+    def _module_key(value: str) -> str:
+        """Comparable form of a module label: lowercase alphanumerics only.
+
+        Maven prints `<name>` ("Apache Camel :: Core"), the expectation path
+        carries the directory ("core"). Equality on the normalized tail is the
+        only match this claims; anything less certain is left unmatched, and
+        an unmatched expectation keeps the denominator rather than quietly
+        leaving it.
+        """
+        tail = str(value or "").replace("\\", "/").rstrip("/").split("/")[-1]
+        tail = tail.split("::")[-1]
+        return "".join(ch for ch in tail.lower() if ch.isalnum())
+
+    def _scope_expectations_to_attempted(
+        self,
+        expected_artifacts: List[Dict[str, Any]],
+        attempted: Optional[Tuple[str, ...]],
+    ) -> Tuple[List[Dict[str, Any]], List[str], Optional[str]]:
+        """`(scoped, untried, conflict)` — narrow coverage to what ran.
+
+        The narrowing happens ONLY when every attempted module maps to an
+        expectation. A partial mapping would drop expectations for modules
+        that did run and inflate the score, which is worse than the wide
+        denominator it replaces; in that case the expectations stand and the
+        disagreement is recorded instead.
+        """
+        if not expected_artifacts or not attempted:
+            return list(expected_artifacts), [], None
+        attempted_keys = {self._module_key(name) for name in attempted} - {""}
+        if not attempted_keys:
+            return list(expected_artifacts), [], None
+        scoped: List[Dict[str, Any]] = []
+        untried: List[str] = []
+        matched_keys = set()
+        for expectation in expected_artifacts:
+            key = self._module_key(str(expectation.get("path") or "").rsplit("/target", 1)[0])
+            if key and key in attempted_keys:
+                matched_keys.add(key)
+                scoped.append(expectation)
+            elif key:
+                untried.append(key)
+            else:
+                scoped.append(expectation)
+        if matched_keys != attempted_keys:
+            # The build named modules this expectation list does not contain:
+            # the mapping is incomplete, so the wide denominator stands and
+            # says so rather than a narrowed one nobody can check.
+            return (
+                list(expected_artifacts),
+                [],
+                "build_coverage_scope_unverified",
+            )
+        return scoped, untried, None
+
     def _invocation_receipts_present(self) -> bool:
         """One cheap probe; a receipt-free run must pay nothing beyond it."""
         if not self.docker_orchestrator:
@@ -3021,9 +3112,28 @@ class PhysicalValidator:
                 evidence["warnings"].append(
                     "Maven reactor could not be fully verified: " + maven_reactor_snapshot.reason
                 )
+        # Coverage is measured against what THIS run attempted, not against
+        # every source tree on disk (Plan 7: the reactor summary sets the
+        # scope, the file count verifies the substance).
+        attempted_modules = self._attempted_modules()
+        scoped_artifacts, untried_modules, scope_conflict = (
+            self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
+        )
+        if attempted_modules:
+            evidence["modules_attempted"] = list(attempted_modules)
+        if untried_modules:
+            evidence["modules_untried"] = untried_modules
+        if scope_conflict:
+            evidence.setdefault("conflicts", []).append(scope_conflict)
+            evidence["warnings"].append(
+                f"Build coverage is measured against {len(expected_artifacts)} module "
+                f"expectation(s) while the build stated it attempted "
+                f"{len(attempted_modules or ())}; the two could not be matched, so the "
+                "wider denominator stands"
+            )
         coverage_info = (
-            self._verify_expected_artifacts(project_dir, expected_artifacts)
-            if expected_artifacts
+            self._verify_expected_artifacts(project_dir, scoped_artifacts)
+            if scoped_artifacts
             else None
         )
         threshold = self.build_coverage_threshold
