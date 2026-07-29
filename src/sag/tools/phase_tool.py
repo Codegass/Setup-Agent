@@ -15,7 +15,7 @@ from sag.agent.attempt_policy import (
     required_test_attempt,
     untried_islands_requirement,
 )
-from sag.agent.phase_transitions import RepairRequest, repair_targets_for
+from sag.agent.phase_transitions import RepairRequest, repair_moves, repair_targets_for
 from sag.agent.repair_contracts import pending_repair_call, render_public_call
 
 from .base import BaseTool, ToolResult
@@ -413,10 +413,23 @@ class PhaseTool(BaseTool):
                     "description": "refs supporting the claim (output_*, job:*, file:*)",
                 },
                 "text": {"type": "string", "description": "note: working note"},
+                # The enum is the UNION of targets, so `build` is a valid value
+                # here while `build->build` is not a move at all — which is
+                # what p7/p7b polaris read it as. Both halves are derived from
+                # the policy table, and the description carries the per-source
+                # rule the enum cannot express.
                 "target_phase": {
                     "type": "string",
-                    "enum": ["analyze", "build"],
-                    "description": "repair: direct dependency target",
+                    "enum": sorted(
+                        {target for _, targets in repair_moves() for target in targets}
+                    ),
+                    "description": (
+                        "repair: the phase to roll back to. The only moves that exist are "
+                        + ", ".join(
+                            f"{source}->{'/'.join(targets)}" for source, targets in repair_moves()
+                        )
+                        + "; a phase never repairs to itself."
+                    ),
                 },
                 "reason_code": {
                     "type": "string",

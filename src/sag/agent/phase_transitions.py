@@ -37,6 +37,18 @@ def repair_targets_for(phase: str) -> tuple[str, ...]:
     return tuple(sorted(target for origin, target in _REPAIR_EDGES if origin == source))
 
 
+def repair_moves() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Every legal repair edge, grouped by source phase.
+
+    The documented form of the same table `repair_targets_for` answers from, so
+    the parameter description the model reads and the policy that judges it are
+    one statement. `target_phase` used to be documented as "direct dependency
+    target" with no enum, which left the legal set stated nowhere at all.
+    """
+    sources = sorted({origin for origin, _ in _REPAIR_EDGES})
+    return tuple((source, repair_targets_for(source)) for source in sources)
+
+
 def _normalized_signature(value: str) -> str:
     return " ".join(str(value).strip().lower().split())
 

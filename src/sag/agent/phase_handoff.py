@@ -153,7 +153,14 @@ class HandoffRepairRoute(BaseModel):
     from_phase: str
     target_phase: str
     accepted: bool
+    # Why the MODEL asked. Never why the policy answered — that is
+    # `decision_reason`, and reading one as the other is the mistake the old
+    # single-`reason_code` line invited (live p7b-polaris).
     reason_code: str
+    # The policy's typed verdict. Computed on every decision and, until now,
+    # dropped by this projection, so a refusal reached the model as the bare
+    # word "rejected". Defaulted: replayed transcripts predate the field.
+    decision_reason: str = ""
     failure_signature: str
     hypothesis: str
     evidence_refs: tuple[str, ...] = ()
@@ -256,9 +263,15 @@ class HandoffProjection(BaseModel):
             lines.append("REPAIR ROUTES:")
             for repair in self.repair_routes:
                 decision = "accepted" if repair.accepted else "rejected"
+                # An acceptance's reason is always `repair_accepted`, which
+                # restates the word before it; a refusal's is the one thing the
+                # line never said.
+                if not repair.accepted and repair.decision_reason:
+                    decision = f"{decision} ({repair.decision_reason})"
                 lines.append(
                     f"- {repair.source_attempt_id}: {repair.from_phase}->{repair.target_phase} "
-                    f"{decision} signature={repair.failure_signature}"
+                    f"{decision} asked={repair.reason_code} "
+                    f"signature={repair.failure_signature}"
                 )
 
         if self.next_hypothesis:
@@ -515,6 +528,7 @@ class PhaseHandoff:
                 target_phase=record.target_phase,
                 accepted=record.accepted,
                 reason_code=record.reason_code,
+                decision_reason=getattr(record, "decision_reason", "") or "",
                 failure_signature=record.failure_signature,
                 hypothesis=record.hypothesis,
                 evidence_refs=_dedupe(record.evidence_refs),
