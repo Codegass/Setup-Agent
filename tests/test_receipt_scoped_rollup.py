@@ -472,8 +472,21 @@ def test_empty_receipts_directory_keeps_the_global_scan(bigtop, monkeypatch):
     assert "receipt_scoped" not in result
 
 
-def test_unresolved_primary_coordinate_falls_back_and_says_so(bigtop, monkeypatch):
-    """Receipts without a resolvable primary coordinate cannot claim scoping."""
+def test_an_unresolved_primary_coordinate_still_counts_only_claimed_reports(bigtop, monkeypatch):
+    """The coordinate NARROWS the claim set; it never authorizes a whole-tree scan.
+
+    Live p7b-camel (`logs/session_20260728_020936_55719`): the coordinate could
+    not be resolved, scoping fell back to the legacy scan, and 17,798 tests
+    entered the MAIN count with no receipt behind any of them — the same
+    unscoped number this machinery exists to remove. Not knowing which subset
+    is primary is a reason to count every claimed report, never a reason to
+    count everything on disk.
+
+    Here the one receipt claims the primary module's 50 reports, so 50 is the
+    main count and the auxiliary 4 stay out of it, exactly as they would with
+    the coordinate resolved. The conflict is still recorded: the run should
+    say that it could not narrow further.
+    """
     _unbound_primary_coordinate(monkeypatch)
     bigtop.write_receipt(
         _receipt(
@@ -486,9 +499,28 @@ def test_unresolved_primary_coordinate_falls_back_and_says_so(bigtop, monkeypatc
 
     result = validator.parse_test_reports(str(bigtop.project))
 
-    assert result["total_tests"] == 54
-    assert "receipt_scoped" not in result
+    assert result["total_tests"] == 50
+    assert result["receipt_scoped"] is True
     assert "test_primary_coordinate_unresolved" in result["metrics_conflicts"]
+
+
+def test_a_receipt_claiming_nothing_leaves_the_main_count_empty(bigtop, monkeypatch):
+    """The camel shape: one compile receipt, zero reports claimed.
+
+    Every report on disk was produced by something the harness never
+    dispatched, so the main count is zero and the reports are auxiliary. The
+    alternative — counting them because we cannot attribute them — is how a
+    number nobody can vouch for becomes the headline.
+    """
+    _unbound_primary_coordinate(monkeypatch)
+    bigtop.write_receipt(_receipt("inv-compile-1-0001", bigtop.primary_root, new=[]))
+    validator, _ = _validator(bigtop)
+
+    result = validator.parse_test_reports(str(bigtop.project))
+
+    assert result["total_tests"] == 0
+    assert result["receipt_scoped"] is True
+    assert (result.get("auxiliary_test_stats") or {}).get("executed") == 54
 
 
 def test_legacy_rollup_shape_is_unchanged(bigtop, monkeypatch):

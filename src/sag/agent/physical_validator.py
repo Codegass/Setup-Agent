@@ -518,7 +518,7 @@ def read_invocation_receipts():
     failure with one mechanism and one message naming the file.
     """
     receipts_root = Path(receipts_dir)
-    if not primary_root or not receipts_root.is_dir():
+    if not receipts_root.is_dir():
         return False, {}, []
     try:
         receipt_files = sorted(
@@ -530,7 +530,7 @@ def read_invocation_receipts():
         return False, {}, []
     claims = {}
     corrupt = read_evidence_assessments()
-    primary_prefix = primary_root.rstrip("/")
+    primary_prefix = (primary_root or "").rstrip("/")
     for receipt_file in receipt_files:
         try:
             payload = json.loads(Path(receipt_file).read_text())
@@ -542,8 +542,17 @@ def read_invocation_receipts():
             corrupt.append(receipt_file + ": " + reason)
             continue
         working_directory = payload["working_directory"].rstrip("/") or "/"
-        if working_directory != primary_prefix and not working_directory.startswith(
-            primary_prefix + "/"
+        # The primary coordinate NARROWS the claim set; it does not authorize
+        # it. Live p7b-camel: the coordinate could not be resolved, scoping
+        # fell back to a whole-tree scan, and 17,798 tests entered the main
+        # count with no receipt behind any of them — the same unscoped number
+        # this machinery exists to remove. Once a receipt exists we know what
+        # our own dispatches produced; not knowing which subset is primary is
+        # a reason to count all of them, never a reason to count everything on
+        # disk.
+        if primary_prefix and (
+            working_directory != primary_prefix
+            and not working_directory.startswith(primary_prefix + "/")
         ):
             continue
         delta = payload.get("report_delta") or {}
