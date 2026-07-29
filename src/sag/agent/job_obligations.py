@@ -295,12 +295,19 @@ class Settlement:
         }
 
 
-def settle_open_obligations(orchestrator: Any) -> List[Settlement]:
+def settle_open_obligations(
+    orchestrator: Any,
+    obligations: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> List[Settlement]:
     """Settle every obligation whose job has terminated. Never raises.
 
     Idempotent by construction: an obligation with a `settled_receipt_id` is
     skipped, and a missing exit file leaves its obligation open for the next
     sweep. A job that never terminates is never guessed at.
+
+    `obligations` is the ledger the caller has ALREADY read. The sweep runs
+    after every action batch, and a run that never detached anything must not
+    pay two container round trips per batch to be told so twice.
 
     Obligations are settled in job-id order and each settlement's claims are
     folded into the claimed set as it goes, so two jobs that terminated in the
@@ -310,7 +317,8 @@ def settle_open_obligations(orchestrator: Any) -> List[Settlement]:
     if not callable(execute):
         return []
     try:
-        pending = open_obligations(orchestrator)
+        records = read_obligations(orchestrator) if obligations is None else obligations
+        pending = [record for record in records if is_open(record)]
     except Exception as exc:  # a ledger read never breaks the run
         logger.debug(f"job obligations could not be swept: {exc}")
         return []
@@ -330,7 +338,10 @@ def settle_open_obligations(orchestrator: Any) -> List[Settlement]:
     return settlements
 
 
-def settlement_from_ledger(orchestrator: Any, obligation: Mapping[str, Any]) -> Optional[Settlement]:
+def settlement_from_ledger(
+    orchestrator: Any,
+    obligation: Mapping[str, Any],
+) -> Optional[Settlement]:
     """Rebuild the `Settlement` of an ALREADY settled obligation, from disk.
 
     The engine announces settlements (one control event, one notice, the
@@ -416,6 +427,7 @@ def _settle_one(
     )
     if excluded:
         after = {path: digest for path, digest in after.items() if path not in set(excluded)}
+    mine = _delta_paths(report_delta(before, after, cached_roots))
 
     metadata = record_invocation(
         execute,
@@ -442,7 +454,7 @@ def _settle_one(
         # The receipt did not land. The obligation stays open and the next
         # sweep tries again; a settled book with no receipt would be a lie.
         return None
-    claimed.update(_delta_paths(report_delta(before, after, cached_roots)))
+    claimed.update(mine)
     write_obligation(execute, {**dict(obligation), "settled_receipt_id": receipt_id})
     # The same post-receipt hook the synchronous path runs at the observation
     # seam, so a settled failure is assessed exactly like a synchronous one.
@@ -451,7 +463,7 @@ def _settle_one(
         job_id=_text(obligation.get("job_id")),
         receipt_id=receipt_id,
         exit_code=exit_code,
-        claimed_paths=len(_delta_paths(report_delta(before, after, cached_roots))),
+        claimed_paths=len(mine),
         excluded_claimed_paths=len(excluded),
         contract_id=_text(obligation.get("contract_id")),
     )

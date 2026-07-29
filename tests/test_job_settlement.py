@@ -296,13 +296,17 @@ def test_a_path_an_intervening_receipt_already_claimed_is_excluded():
     """First claim wins. Two receipts counting one report file is how a
     passing suite gets counted twice."""
     orchestrator = _with_obligation(
-        _orchestrator(files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)})
+        _orchestrator(
+            files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)}
+        )
     )
 
     settle_open_obligations(orchestrator)
 
     settled = next(
-        receipt for receipt in _receipts(orchestrator) if receipt["receipt_id"] != "inv-gradle-3-0042"
+        receipt
+        for receipt in _receipts(orchestrator)
+        if receipt["receipt_id"] != "inv-gradle-3-0042"
     )
     assert settled["report_delta"]["new"] == []
     assert settled["excluded_claimed_paths"] == 1
@@ -312,15 +316,47 @@ def test_the_exclusion_never_touches_what_nobody_claimed():
     """Only the intervening receipt's own paths move; this job keeps the rest
     of its window."""
     orchestrator = _with_obligation(
-        _orchestrator(files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)})
+        _orchestrator(
+            files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)}
+        )
     )
 
     settle_open_obligations(orchestrator)
 
     settled = next(
-        receipt for receipt in _receipts(orchestrator) if receipt["receipt_id"] != "inv-gradle-3-0042"
+        receipt
+        for receipt in _receipts(orchestrator)
+        if receipt["receipt_id"] != "inv-gradle-3-0042"
     )
     assert [entry["path"] for entry in settled["report_delta"]["cached"]] == [API_REPORT]
+
+
+def test_a_settlement_whose_mark_never_landed_cannot_double_count():
+    """Risk §7, two writers to one job: if the ledger mark fails after the
+    receipt was written, the next sweep settles again — and the FIRST receipt
+    now owns every path, so the second one claims nothing. The exclusion rule
+    is what makes that harmless."""
+    orchestrator = _with_obligation(_orchestrator())
+    settle_open_obligations(orchestrator)
+    # The mark that never reached disk.
+    orchestrator.filesystem.files[f"{OBLIGATION_DIR}/{JOB}.json"] = json.dumps(
+        _obligation(), sort_keys=True
+    )
+
+    settle_open_obligations(orchestrator)
+
+    first, second = _receipts(orchestrator)
+    assert len(_delta_paths(first)) == 2
+    assert _delta_paths(second) == []
+    assert second["excluded_claimed_paths"] == 2
+
+
+def _delta_paths(receipt):
+    return [
+        entry["path"]
+        for bucket in ("new", "changed", "cached")
+        for entry in receipt["report_delta"].get(bucket, ())
+    ]
 
 
 def test_no_interleaving_records_no_exclusion():
@@ -402,16 +438,17 @@ def test_the_notice_is_one_bounded_line():
 
     (settlement,) = settle_open_obligations(orchestrator)
 
-    assert settlement.notice() == (
-        f"[settled] job {JOB}: exit 0 — receipt {settlement.receipt_id}, "
-        "2 report paths claimed"
-    )
+    receipt_id = settlement.receipt_id
+    expected = f"[settled] job {JOB}: exit 0 — receipt {receipt_id}, 2 report paths claimed"
+    assert settlement.notice() == expected
     assert "\n" not in settlement.notice()
 
 
 def test_the_notice_states_the_exclusion_when_there_was_one():
     orchestrator = _with_obligation(
-        _orchestrator(files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)})
+        _orchestrator(
+            files={f"{RECEIPT_DIR}/inv-gradle-3-0042.json": _intervening_receipt(CORE_REPORT)}
+        )
     )
 
     (settlement,) = settle_open_obligations(orchestrator)

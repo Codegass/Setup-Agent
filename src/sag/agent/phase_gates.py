@@ -440,10 +440,20 @@ def _settle_before_grading(orchestrator) -> tuple[str, ...]:
     if orchestrator is None:
         return ()
     try:
-        from .job_obligations import open_job_ids, settle_open_obligations
+        from .job_obligations import is_open, read_obligations, settle_open_obligations
 
-        settle_open_obligations(orchestrator)
-        return tuple(open_job_ids(orchestrator))
+        records = read_obligations(orchestrator)
+        if not records:
+            return ()
+        settled = {
+            settlement.job_id
+            for settlement in settle_open_obligations(orchestrator, obligations=records)
+        }
+        return tuple(
+            str(record.get("job_id") or "").strip()
+            for record in records
+            if is_open(record) and str(record.get("job_id") or "").strip() not in settled
+        )
     except Exception as exc:  # the ledger never breaks a phase claim
         logger.debug(f"job obligations were not settled before grading: {exc}")
         return ()

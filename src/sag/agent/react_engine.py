@@ -4338,19 +4338,26 @@ class ReActEngine(UIEventEmitter):
         if orchestrator is None:
             return
         try:
+            # ONE ledger read per batch: the common case is a run that never
+            # detached anything, and it must not pay two round trips to be
+            # told so twice.
+            records = read_obligations(orchestrator)
+            if not records:
+                return
             settled_now = {
                 settlement.job_id: settlement
-                for settlement in settle_open_obligations(orchestrator)
+                for settlement in settle_open_obligations(orchestrator, obligations=records)
             }
             announced = self._assessment_guard("_announced_job_settlements")
-            for record in read_obligations(orchestrator):
+            for record in records:
                 job_id = str(record.get("job_id") or "").strip()
-                receipt_id = str(record.get("settled_receipt_id") or "").strip()
-                if not job_id or not receipt_id or job_id in announced:
+                if not job_id or job_id in announced:
                     continue
-                settlement = settled_now.get(job_id) or settlement_from_ledger(
-                    orchestrator, record
-                )
+                settlement = settled_now.get(job_id)
+                if settlement is None:
+                    if not str(record.get("settled_receipt_id") or "").strip():
+                        continue
+                    settlement = settlement_from_ledger(orchestrator, record)
                 if settlement is None:
                     continue
                 announced.add(job_id)
