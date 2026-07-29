@@ -55,6 +55,25 @@ evidence-triggered repair. What the recorded runs show:
   state the ground-truth review reached manually. In r5 the model saw the
   surfaced proposal twice and declined it; the run stayed honestly FAILED.
   The harness proposes with provenance; the model disposes.
+
+  > ⚠️ **"Declined" is wrong (corrected 2026-07-29, while walking the polaris
+  > transcripts for the same defect).** The proposal was
+  > `build(action='native', definitions={"BUILD_TESTING":"OFF","USE_LLVM":"ON"},
+  > features=["llvm"], ...)`. Immediately after seeing it the model called
+  > `build(action='compile', args='-DUSE_LLVM=ON', ...)` (`envelope-000062`)
+  > and then `build(action='compile', args='-DUSE_LLVM=ON -DBUILD_TESTING=ON',
+  > ...)` (`envelope-000075`). It turned on exactly the switch the proposal
+  > named, twice, within forty seconds. What it did not do was use the typed
+  > `action='native'` verb, so exact-equality acceptance matched nothing and
+  > the run recorded no acceptance at all.
+  >
+  > Exact equality stays — borrowing a proposal's provenance for a different
+  > call is the self-attestation §C6 forbids, and r5's second attempt also
+  > inverted `BUILD_TESTING`, so the calls are genuinely not the same intent.
+  > But "the model disposes" describes a refusal that did not happen. The
+  > model agreed and spelled it differently, and nothing in the run could tell
+  > those two apart. Same family as p7/p7b polaris; see
+  > `2026-07-29-plan7-round3-acceptance.md`.
 - **S2→R2 (live, r6/r7):** the NumPy failure emits its distinct
   `dependency_incompatible_numpy` code from the per-testcase failure
   message; the project's own `numpy==1.26.*` pin — a backslash-continued

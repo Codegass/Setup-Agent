@@ -101,6 +101,16 @@ Every affordance was in place and the run still failed. With the classifier
 fix the harness will now act on that sentence itself rather than asking — that
 change is committed but has not yet been graded by a rerun.
 
+> ⚠️ **The paragraph above is wrong and is corrected in
+> `2026-07-29-plan7-round3-acceptance.md`.** The repair phase was **not**
+> granted: the model asked for `build→build`, which is not an edge the policy
+> has, and the engine closes the attempt before it checks legality — so the
+> refusal arrived with the build phase already terminal and test skipped. The
+> model did not choose to write a report; the engine routed it there. Nor was
+> every affordance in place: `accepted_repair_for` could not have recognised
+> the proposed call even if the model had made it, and `target_phase`'s enum
+> listed `build` as a legal value. Fixed in `166e9bd`, `054ad7f`, `364a797`.
+
 ## Corrections to the 23-project report
 
 Two attributions in `reports/2026-07-27-23-project-campaign-report.md` were
