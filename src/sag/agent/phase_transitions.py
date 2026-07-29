@@ -20,6 +20,23 @@ _REPAIR_EDGES = {("test", "build"), ("build", "analyze")}
 _REASON_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
+def repair_targets_for(phase: str) -> tuple[str, ...]:
+    """The phases a repair from `phase` may roll back to, in order.
+
+    Whether an edge exists is a property of the request, answerable with no
+    gate, no validator and no physical evidence — which is why the surface can
+    answer it before anything moves. `_repair_rejection` asks the same question
+    from inside `request_repair`, and the engine calls that only AFTER
+    `machine.close_attempt`, so an edge the policy never had still cost the
+    phase it was proposed from (live p7/p7b polaris, `build→build`).
+
+    Derived from `_REPAIR_EDGES` rather than restated, so the surface and the
+    policy cannot come to disagree about what a legal move is.
+    """
+    source = str(phase or "").strip().lower()
+    return tuple(sorted(target for origin, target in _REPAIR_EDGES if origin == source))
+
+
 def _normalized_signature(value: str) -> str:
     return " ".join(str(value).strip().lower().split())
 

@@ -64,6 +64,10 @@ POLARIS_REPAIR = {
     "evidence": ["output_7c4da0b66f89"],
 }
 
+# The one edge a repair from build actually has, for the cases that must still
+# reach the engine untouched.
+LEGAL_REPAIR = {**POLARIS_REPAIR, "target_phase": "analyze"}
+
 
 def _tool(*repairs, phase="build"):
     orchestrator = ScriptedOrchestrator(
@@ -124,7 +128,7 @@ def test_another_typed_code_still_reaches_the_rollback_channel():
     """The channel is not removed. It is declined for the one case that never
     needed it — a proposal the model can simply perform."""
     result = _tool(JAVA_PROPOSAL).execute(
-        **{**POLARIS_REPAIR, "reason_code": "compile_no_source_mismatch"}
+        **{**LEGAL_REPAIR, "reason_code": "compile_no_source_mismatch"}
     )
 
     assert result.succeeded is True
@@ -132,7 +136,7 @@ def test_another_typed_code_still_reaches_the_rollback_channel():
 
 
 def test_no_proposal_on_disk_changes_nothing():
-    result = _tool().execute(**POLARIS_REPAIR)
+    result = _tool().execute(**LEGAL_REPAIR)
 
     assert result.succeeded is True
     assert result.metadata["phase_signal"] == "repair"
@@ -145,7 +149,96 @@ def test_a_tool_with_no_orchestrator_changes_nothing():
     )
     tool = PhaseTool(machine=machine, validator=None, orchestrator=None, project_name="x")
 
-    result = tool.execute(**POLARIS_REPAIR)
+    result = tool.execute(**LEGAL_REPAIR)
 
     assert result.succeeded is True
     assert result.metadata["phase_signal"] == "repair"
+
+
+def test_the_proposal_refusal_outranks_the_edge_refusal():
+    """polaris named an illegal edge AND had a live proposal. "Make this call"
+    is the more useful of the two answers, so it is the one it gets."""
+    result = _tool(JAVA_PROPOSAL).execute(**POLARIS_REPAIR)
+
+    assert result.error_code == "PHASE_REPAIR_ALREADY_PROPOSED"
+
+
+# ---------------------------------------------------------------------------
+# the edge the policy does not have is answerable without any evidence
+# ---------------------------------------------------------------------------
+#
+# `_repair_rejection` runs inside `request_repair`, which the engine calls
+# AFTER `machine.close_attempt(gate)`. So a proposal naming an edge the policy
+# has never had still costs the phase it was proposed from — the p7/p7b polaris
+# shape, minus the proposal. Whether an edge exists needs no gate, no validator
+# and no physical evidence: it is a property of the request. Answering it at
+# the surface means nothing has moved yet when the answer is no.
+
+
+def test_an_edge_the_policy_does_not_have_is_refused_at_the_surface():
+    result = _tool().execute(**{**POLARIS_REPAIR, "reason_code": "semantic_failure"})
+
+    assert result.succeeded is False
+    assert result.error_code == "PHASE_REPAIR_ILLEGAL_TARGET"
+    assert "phase_signal" not in result.metadata
+
+
+def test_the_refusal_states_the_targets_this_phase_does_have():
+    result = _tool().execute(**{**POLARIS_REPAIR, "reason_code": "semantic_failure"})
+
+    assert "analyze" in result.output
+    assert result.metadata["legal_targets"] == ["analyze"]
+
+
+def test_a_legal_edge_still_reaches_the_engine():
+    result = _tool().execute(
+        **{**POLARIS_REPAIR, "reason_code": "semantic_failure", "target_phase": "analyze"}
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["phase_signal"] == "repair"
+
+
+def test_a_phase_with_no_repair_target_says_so():
+    """provision and report have no repair edge at all; listing none would
+    read as "you named the wrong one" rather than "there is no such move"."""
+    result = _tool(phase="provision").execute(
+        **{**POLARIS_REPAIR, "reason_code": "semantic_failure"}
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PHASE_REPAIR_ILLEGAL_TARGET"
+    assert result.metadata["legal_targets"] == []
+    assert "no repair target" in result.output
+
+
+def test_the_legal_targets_are_derived_from_the_policy_table():
+    """One source of truth: the tool must not restate the edge set."""
+    from sag.agent.phase_transitions import _REPAIR_EDGES, repair_targets_for
+
+    for source, target in _REPAIR_EDGES:
+        assert target in repair_targets_for(source)
+    assert repair_targets_for("build") == ("analyze",)
+    assert repair_targets_for("test") == ("build",)
+    assert repair_targets_for("report") == ()
+
+
+# ---------------------------------------------------------------------------
+# what deliberately still closes the phase
+# ---------------------------------------------------------------------------
+#
+# `_repair_rejection` has three more refusals, and they stay behind the gate on
+# purpose:
+#
+# * `repair_budget_exhausted` — the budget exists to bound how many times a run
+#   may roll back. Asking again once it is spent is where the phase is supposed
+#   to close, so closing is the designed outcome and not an accident.
+# * the recurrence guard — same shape: it exists to end a loop.
+# * `repair_source_green` — the gate validated the attempt as SUCCESS, so
+#   closing and advancing is the correct route, not a penalty.
+#
+# `stale_repair_evidence` is the one open case. It is malformed-request shaped
+# like the edge check, but the attempt's evidence refs reach
+# `RunEvidenceState` on the gate path, so a surface check could refuse a
+# legitimate repair whose refs simply have not landed yet. Moving it needs a
+# live run to confirm the ordering; it is not the defect p7/p7b showed.

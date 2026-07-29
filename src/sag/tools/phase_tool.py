@@ -15,7 +15,7 @@ from sag.agent.attempt_policy import (
     required_test_attempt,
     untried_islands_requirement,
 )
-from sag.agent.phase_transitions import RepairRequest
+from sag.agent.phase_transitions import RepairRequest, repair_targets_for
 from sag.agent.repair_contracts import pending_repair_call, render_public_call
 
 from .base import BaseTool, ToolResult
@@ -121,6 +121,32 @@ class PhaseTool(BaseTool):
                             "params": proposal["params"],
                         },
                     },
+                )
+            # Whether the policy has this edge needs no evidence, so the
+            # answer costs nothing when it is no. `_repair_rejection` asks the
+            # same question from inside `request_repair`, which the engine
+            # reaches only after `machine.close_attempt` — which is how p7/p7b
+            # polaris paid for `build→build` with the whole build phase.
+            legal_targets = repair_targets_for(phase)
+            if str(target_phase or "").strip().lower() not in legal_targets:
+                if legal_targets:
+                    detail = (
+                        f"repair from {phase} may target: " + ", ".join(legal_targets)
+                    )
+                else:
+                    detail = f"{phase} has no repair target"
+                return ToolResult.completed_failure(
+                    output=f"{detail}; {target_phase!r} is not a move this run has.",
+                    error=f"no repair edge {phase}->{target_phase}",
+                    error_code="PHASE_REPAIR_ILLEGAL_TARGET",
+                    suggestions=[
+                        f"phase(action='repair', target_phase='{target}', ...)"
+                        for target in legal_targets
+                    ]
+                    or [
+                        "phase(action='done', outcome='failed', reason=..., evidence=[refs])"
+                    ],
+                    metadata={"phase": phase, "legal_targets": list(legal_targets)},
                 )
             required_attempt = required_test_attempt(
                 self.run_evidence_state,
