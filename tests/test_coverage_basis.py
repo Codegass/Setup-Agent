@@ -121,7 +121,9 @@ def test_no_derivable_class_expectation_states_no_basis_instead_of_full_coverage
 
 def test_a_derived_expectation_still_states_its_fraction():
     """basis `derived` is today's arithmetic, byte for byte."""
-    orch = FakeBuildOrchestrator(files={f"/workspace/m/target/classes/C{n}.class" for n in range(5)})
+    orch = FakeBuildOrchestrator(
+        files={f"/workspace/m/target/classes/C{n}.class" for n in range(5)}
+    )
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
     result = validator._verify_expected_artifacts(
@@ -218,7 +220,7 @@ def test_a_one_module_scan_is_not_a_structure_and_does_not_claim_the_denominator
 
 
 def test_the_message_names_the_denominator_it_used():
-    """"Which computation decided this?" must be answerable from the sentence."""
+    """Which computation decided this must be answerable from the sentence."""
     assert "receipt inv-gradle-1-2" in ModuleBasis("receipt", "inv-gradle-1-2", 2, 2).phrase()
     assert "the module scan on disk" in module_basis(_polaris_scan()).phrase()
     assert "1/26" in module_basis(_polaris_scan()).phrase()
@@ -240,6 +242,32 @@ def test_the_polaris_sentence_is_unconstructible():
     assert "Module coverage: 1/26 built" in observation.reason
     assert "100%" not in observation.reason
     assert "All expected build artifacts found" not in observation.reason
+
+
+def test_the_two_halves_of_the_sentence_always_state_the_same_ratio():
+    """The pin, as a property rather than one example: whatever the tree looks
+    like, the ratio the verdict stood on and the ratio the checklist printed
+    are read out of one object, so the sentence cannot say 100% and 1/26.
+
+    Both halves are parsed back out of the composed gate reason — the exact
+    string p7d's model was shown — and compared.
+    """
+    import re
+
+    from sag.agent.phase_gates import ValidatorState, _inspect_build
+
+    for built in (POLARIS_MODULES[:1], POLARIS_MODULES[:13], POLARIS_MODULES):
+        scan = _polaris_scan(built=tuple(built))
+
+        observation = _inspect_build(_polaris_validator(scan=scan), "polaris")
+
+        decided = re.search(
+            r"denominator: the module scan on disk \((\d+)/(\d+)", observation.reason
+        )
+        displayed = re.search(r"Module coverage: (\d+)/(\d+) built", observation.reason)
+        assert decided and displayed
+        assert decided.groups() == displayed.groups() == (str(len(built)), "26")
+        assert (observation.state is ValidatorState.GREEN) is False  # basis is still none
 
 
 def test_a_minority_scan_can_never_be_a_complete_build():
