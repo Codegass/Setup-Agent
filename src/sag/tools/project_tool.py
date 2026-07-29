@@ -50,6 +50,38 @@ class ProjectTool(BaseTool):
                 output=f"{verb} unavailable",
                 error="delegate missing",
             )
+        unexpected = self._unaccepted_parameters(delegate, kwargs)
+        if unexpected:
+            # Live p7b-camel-quarkus: the model passed JAVA_HOME=... to
+            # project(action='env') and the run recorded "Tool project crashed:
+            # EnvTool.execute() got an unexpected keyword argument". A facade
+            # that forwards **kwargs into a typed signature turns every wrong
+            # guess into a crash; a wrong parameter is a thing to refuse and
+            # name, never a thing to fall over on.
+            accepted = self._accepted_parameters(delegate)
+            suggestions = [
+                f"project(action='{verb}') accepts: "
+                + ", ".join(sorted(accepted - {"self", "action"}))
+            ]
+            if verb == "env" and any(name.isupper() for name in unexpected):
+                suggestions.insert(
+                    0,
+                    "Environment variables go in env={...}, e.g. "
+                    "project(action='env', tool='java', executable='/path/to/java', "
+                    "env={'JAVA_HOME': '/path/to/jdk'})",
+                )
+            return ToolResult.completed_failure(
+                output="",
+                error=f"unexpected parameter(s) for project(action='{verb}'): "
+                + ", ".join(sorted(unexpected)),
+                error_code="PROJECT_UNEXPECTED_PARAMETERS",
+                suggestions=suggestions,
+                raw_data={
+                    "action": verb,
+                    "unexpected": sorted(unexpected),
+                    "accepted": sorted(accepted - {"self", "action"}),
+                },
+            )
         if verb == "clone":
             # ProjectSetupTool's real parameter is repository_url; accept the
             # facade's repo_url spelling and translate.
@@ -88,6 +120,37 @@ class ProjectTool(BaseTool):
         kwargs.setdefault("action", "register")
         kwargs["activate"] = True
         return delegate.execute(**kwargs)
+
+    @staticmethod
+    def _accepted_parameters(delegate: Any) -> set:
+        """Parameter names the delegate's own signature accepts.
+
+        A delegate that takes **kwargs accepts anything, so nothing is
+        refused for it — the facade must not be stricter than the tool it
+        forwards to.
+        """
+        import inspect
+
+        try:
+            signature = inspect.signature(delegate.execute)
+        except (TypeError, ValueError):
+            return set()
+        names = set()
+        for parameter in signature.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                return set()  # accepts anything
+            if parameter.name != "self":
+                names.add(parameter.name)
+        return names
+
+    def _unaccepted_parameters(self, delegate: Any, kwargs: Dict[str, Any]) -> set:
+        """Supplied names the delegate cannot take, after the facade's own
+        translations (`repo_url` -> `repository_url`) are accounted for."""
+        accepted = self._accepted_parameters(delegate)
+        if not accepted:
+            return set()
+        translated = {"repo_url"} if "repository_url" in accepted else set()
+        return {name for name in kwargs if name not in accepted and name not in translated}
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
         return {

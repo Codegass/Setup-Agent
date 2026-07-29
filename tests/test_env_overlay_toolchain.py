@@ -1,3 +1,5 @@
+import json
+
 from sag.tools.internal.env_tool import EnvTool
 from sag.tools.internal.toolchain_manager import (
     ToolchainManager,
@@ -92,3 +94,71 @@ def test_toolchain_manager_discovers_workspace_maven_for_version_requirement():
     assert resolved is not None
     assert resolved.candidate.path == "/workspace/apache-maven-3.9.9/bin/mvn"
     assert resolved.candidate.version == "3.9.9"
+
+
+def test_a_refused_executable_names_what_is_already_registered():
+    """Live p7b-camel-quarkus: the model asked for
+    /usr/lib/jvm/java-17-openjdk-amd64/bin/java on an arm64 machine while the
+    arm64 path for the same JDK was already registered, and the refusal said
+    only that the path does not exist. What the overlay already knows is the
+    cheapest correction available, so it is stated."""
+    orchestrator = FakeOverlayOrchestrator()
+    orchestrator.files["/workspace/.setup_agent/env_overlay.json"] = json.dumps(
+        {
+            "tools": {
+                "java": {
+                    "active": "/usr/lib/jvm/java-11-openjdk-arm64/bin/java",
+                    "blocked": [],
+                    "candidates": {
+                        "/usr/lib/jvm/java-11-openjdk-arm64/bin/java": {"version": "11"},
+                        "/usr/lib/jvm/java-17-openjdk-arm64/bin/java": {"version": "17"},
+                    },
+                }
+            }
+        }
+    )
+    tool = EnvTool(orchestrator)
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        activate=True,
+    )
+
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    named = " ".join(result.suggestions)
+    assert "/usr/lib/jvm/java-17-openjdk-arm64/bin/java" in named
+    assert result.raw_data["registered_candidates"]
+
+
+def test_a_blocked_candidate_is_never_offered_as_a_correction():
+    orchestrator = FakeOverlayOrchestrator()
+    orchestrator.files["/workspace/.setup_agent/env_overlay.json"] = json.dumps(
+        {
+            "tools": {
+                "maven": {
+                    "active": None,
+                    "blocked": [{"executable": "/usr/share/maven/bin/mvn", "version": "3.8.7"}],
+                    "candidates": {
+                        "/usr/share/maven/bin/mvn": {"version": "3.8.7"},
+                        "/opt/maven/bin/mvn": {"version": "3.9.9"},
+                    },
+                }
+            }
+        }
+    )
+    tool = EnvTool(orchestrator)
+
+    assert tool._registered_candidates("maven") == ["/opt/maven/bin/mvn"]
+
+
+def test_an_unknown_tool_offers_nothing_and_still_refuses_cleanly():
+    tool = EnvTool(FakeOverlayOrchestrator())
+
+    result = tool.execute(
+        action="register", tool="rustc", executable="/nowhere/rustc", activate=True
+    )
+
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert "registered_candidates" not in result.raw_data

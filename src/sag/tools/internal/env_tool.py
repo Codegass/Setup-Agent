@@ -8,6 +8,8 @@ import re
 import shlex
 from typing import Any, Optional
 
+from loguru import logger
+
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
@@ -88,7 +90,7 @@ class EnvTool(BaseTool):
                     if canonical_error:
                         return canonical_error
                     params["executable"] = canonical_executable
-                validation_error = self._validate_executable(params["executable"])
+                validation_error = self._validate_executable(params["executable"], params.get("tool"))
                 if validation_error:
                     return validation_error
                 measured_version: Optional[str] = None
@@ -165,7 +167,7 @@ class EnvTool(BaseTool):
                     if canonical_error:
                         return canonical_error
                     params["executable"] = canonical_executable
-                validation_error = self._validate_executable(params["executable"])
+                validation_error = self._validate_executable(params["executable"], params.get("tool"))
                 if validation_error:
                     return validation_error
                 overlay = self.store.activate(params["tool"], params["executable"])
@@ -334,7 +336,7 @@ class EnvTool(BaseTool):
             # simply does not exist or is not executable.  A path that passes
             # that check but cannot be canonicalized remains a distinct
             # fail-closed realpath error.
-            validation_error = self._validate_executable(normalized_requested)
+            validation_error = self._validate_executable(normalized_requested, "maven")
             if validation_error:
                 return None, validation_error
             return None, ToolResult.completed_failure(
@@ -395,7 +397,9 @@ class EnvTool(BaseTool):
     def _path_in_roots(self, path: str, roots: tuple[str, ...]) -> bool:
         return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
 
-    def _validate_executable(self, executable: str) -> Optional[ToolResult]:
+    def _validate_executable(
+        self, executable: str, tool: Optional[str] = None
+    ) -> Optional[ToolResult]:
         orchestrator = getattr(self.store, "orchestrator", None)
         if orchestrator is None or not hasattr(orchestrator, "execute_command"):
             return None
@@ -407,18 +411,55 @@ class EnvTool(BaseTool):
         if result.get("exit_code") == 0 and "EXISTS" in output:
             return None
 
+        # Live p7b-camel-quarkus: the model asked for
+        # /usr/lib/jvm/java-17-openjdk-AMD64/bin/java on an arm64 machine while
+        # the arm64 path for the same JDK was already registered, and the
+        # refusal said only that the path does not exist. What the overlay
+        # already knows is the cheapest correction there is, so it is stated.
+        registered = self._registered_candidates(tool)
+        suggestions = []
+        if registered:
+            suggestions.append(
+                "Already registered and executable: " + ", ".join(registered[:6])
+            )
+        suggestions.extend(
+            [
+                "Use bash to verify the exact installed executable path before registering it.",
+                "For downloaded runtimes, register the actual bin executable path under /workspace, /opt, /tmp, or /usr/local.",
+                "Use env inspect to review the current active candidate before retrying a build.",
+            ]
+        )
         return ToolResult.completed_failure(
             output="",
             error=f"Env overlay executable is not executable or does not exist: {executable}",
             error_code="ENV_EXECUTABLE_NOT_FOUND",
-            suggestions=[
-                "Use bash to verify the exact installed executable path before registering it.",
-                "For downloaded runtimes, register the actual bin executable path under /workspace, /opt, /tmp, or /usr/local.",
-                "Use env inspect to review the current active candidate before retrying a build.",
-            ],
-            raw_data={"executable": executable},
+            suggestions=suggestions,
+            raw_data={
+                "executable": executable,
+                **({"registered_candidates": registered} if registered else {}),
+            },
             metadata={"action": "validate_executable"},
         )
+
+    def _registered_candidates(self, tool: Optional[str]) -> list:
+        """Executables the overlay already holds for this tool, blocked ones out.
+
+        Best effort by design: an unreadable overlay costs the caller nothing
+        beyond the refusal it was already getting.
+        """
+        try:
+            overlay = self.store.inspect()
+        except Exception as exc:
+            logger.debug(f"registered-candidate lookup skipped: {exc}")
+            return []
+        entry = ((overlay or {}).get("tools") or {}).get(str(tool or "").strip().lower()) or {}
+        blocked = {
+            str((item or {}).get("executable") or "")
+            for item in entry.get("blocked") or ()
+        }
+        return [
+            path for path in sorted((entry.get("candidates") or {}).keys()) if path not in blocked
+        ]
 
     def _probe_maven_runtime(
         self,

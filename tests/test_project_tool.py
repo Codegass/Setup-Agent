@@ -124,3 +124,88 @@ def test_unknown_action_fails_with_options():
     result = tool.execute(action="dance")
     assert result.operation_outcome.value == "failed"
     assert any("clone" in s for s in result.suggestions)
+
+
+class TypedEnvDouble:
+    """A delegate with a REAL signature, like the tools the facade forwards to."""
+
+    def __init__(self):
+        self.calls = []
+
+    def execute(
+        self,
+        action=None,
+        tool=None,
+        executable=None,
+        version=None,
+        env=None,
+        activate=False,
+    ):
+        self.calls.append(
+            {
+                "action": action,
+                "tool": tool,
+                "executable": executable,
+                "version": version,
+                "env": env,
+                "activate": activate,
+            }
+        )
+        return ToolResult.completed_success(output="env ok")
+
+
+def _typed_tool():
+    env = TypedEnvDouble()
+    return ProjectTool(setup_tool=None, analyzer_tool=None, system_tool=None, env_tool=env), env
+
+
+def test_an_unexpected_parameter_is_refused_not_crashed():
+    """Live p7b-camel-quarkus recorded 'Tool project crashed:
+    EnvTool.execute() got an unexpected keyword argument JAVA_HOME'. A facade
+    that forwards **kwargs into a typed signature turns every wrong guess into
+    a crash; a wrong parameter is a thing to refuse and name."""
+    tool, env = _typed_tool()
+
+    result = tool.execute(action="env", tool="java", executable="/x/java", JAVA_HOME="/x")
+
+    assert result.error_code == "PROJECT_UNEXPECTED_PARAMETERS"
+    assert "JAVA_HOME" in result.error
+    assert env.calls == []  # nothing was dispatched
+
+
+def test_the_refusal_names_what_the_action_does_accept():
+    tool, _env = _typed_tool()
+
+    result = tool.execute(action="env", tool="java", nonsense=1)
+
+    accepted = " ".join(result.suggestions)
+    assert "executable" in accepted and "env" in accepted
+
+
+def test_an_uppercase_parameter_is_pointed_at_the_env_mapping():
+    """JAVA_HOME is an environment variable; env={...} is where they go."""
+    tool, _env = _typed_tool()
+
+    result = tool.execute(action="env", tool="java", JAVA_HOME="/x")
+
+    assert any("env={" in suggestion for suggestion in result.suggestions)
+
+
+def test_accepted_parameters_still_route():
+    tool, env = _typed_tool()
+
+    result = tool.execute(action="env", tool="java", executable="/x/java", env={"JAVA_HOME": "/x"})
+
+    assert result.succeeded
+    assert env.calls[0]["env"] == {"JAVA_HOME": "/x"}
+    assert env.calls[0]["activate"] is True
+
+
+def test_a_delegate_that_takes_kwargs_refuses_nothing():
+    """The facade must never be stricter than the tool it forwards to."""
+    tool, setup, *_ = _tool()
+
+    result = tool.execute(action="clone", repo_url="https://github.com/x/y.git", anything=1)
+
+    assert result.succeeded
+    assert setup.calls[0]["anything"] == 1
