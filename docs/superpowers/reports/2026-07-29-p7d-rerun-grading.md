@@ -42,7 +42,7 @@ count at zero, now confirmed on a second project.
 |---|---|---|
 | build | 4,451 classes, reactor unverified | **18,592 classes**, claimed unknown → validated PARTIAL |
 | test | 11,596 auxiliary (11,444 passed) | 11,492 auxiliary (11,347 passed, 1 failed, 144 skipped), `receipt_scoped: true` |
-| wrapper | `mvnw`, zero `NoSuchMethodError` | held — zero `NoSuchMethodError` |
+| runner | `mvnw`, zero `NoSuchMethodError` | ⚠️ **corrected 2026-07-29:** the one terminal receipt shows `/usr/local/bin/mvn` → distro **Maven 3.8.7**, not the wrapper. Zero `NoSuchMethodError` and 18,592 classes are facts, but "wrapper held" was wrong; why 3.8.7 passes where the campaign's 3.9.15 failed, and why the wrapper preference did not engage, is unexplained and open |
 | verdict | PARTIAL | PARTIAL |
 
 The reactor got roughly four times further than p7c before the budget ended.
@@ -76,30 +76,47 @@ was still running. The **gate upgraded the claim to success**, on this
 evidence: `Built 100% of expected classes (>= 100% threshold) · Module
 coverage: 1/26 built [build-logic]`.
 
-One hundred percent and one-of-twenty-six in the same sentence. The
-scope-narrowing from `d5dc330` behaved as specified — every module the build
-output had named so far mapped to an expectation — but the build output was a
-snapshot of a job in progress, and the only module it had named was the only
-module it had reached. The wide denominator at that moment was about 5%.
+One hundred percent and one-of-twenty-six in the same sentence.
+
+⚠️ **The mechanism below replaces this report's first explanation, which was
+wrong (corrected 2026-07-29 after walking the receipt).** The first version
+attributed the 100% to the `d5dc330` scope-narrowing. The narrowing never
+ran: its input is a receipt's `module_outcomes`, and the run's only receipt —
+the failed Java-17 compile — has no such field. The actual chain is three
+older defaults stacking:
+
+1. the survey cannot parse polaris's Kotlin settings
+   (`root_shape: single_module`, `build_islands: []`), so **no per-module
+   class expectation could be derived**;
+2. with no derivable expectations, `class_coverage` **defaults to 1.0** —
+   "nothing to check" read as "everything passed". The hard JVM gate only
+   catches the zero-classes case, and the in-flight job had already compiled
+   `build-logic` (the build scripts' own helper project), so classes > 0;
+3. the module scan that knew the truth — `1/26 built · no output yet: [+25]
+   · tests ran in 0/8 test-bearing modules` — is **commentary appended to
+   the reason string**, not an input to the verdict.
 
 The P0-F truth table exists to stop exactly this ("the gate may confirm or
 downgrade, never upgrade") and did not fire, because its cap is keyed on
 unclosed survey domains and polaris has `build_islands: []` — no domains, no
-cap. camel escaped by luck of shape: its incomplete mapping kept the wide
-denominator (`maven_reactor_unverified`), so the gate said partial.
+cap. camel escaped by luck of shape: its survey parsed the reactor, the
+incomplete mapping kept the wide denominator (`maven_reactor_unverified`),
+and the gate said partial.
 
-Two faults, recorded as one open item:
+The faults, restated after the correction:
 
-1. Narrowing must not treat an in-flight task list as the reactor's statement
-   of scope. A task list is the reactor's statement only when the job has a
-   terminal receipt.
-2. The no-upgrade cap must also key on a non-terminal receipt, not only on
-   unclosed domains. An empty domain graph is not evidence that nothing is
-   unfinished.
+1. A detached job writes no receipt, ever — both runners drop the evidence at
+   an explicit early return (`gradle_tool.py:682`, `maven_tool.py:1061`) —
+   so everything downstream graded either a snapshot or an orphan.
+2. Coverage with no derivable expectations must say "no basis", not 100%.
+3. The computation that knew the truth decorated the sentence instead of
+   deciding it.
+4. The no-upgrade cap must also key on unfinished work, not only on unclosed
+   domains. An empty domain graph is not evidence that nothing is unfinished.
 
-Both roll up into the long-running-jobs item, which these two runs have
-promoted from "camel's problem" to the single fault holding back both
-projects' main counts and now the build gate's integrity.
+All four are absorbed into the evidence-lifecycle design
+(`specs/2026-07-29-evidence-lifecycle-design.md`), which these two runs
+motivated.
 
 ## Still open, re-ranked
 
