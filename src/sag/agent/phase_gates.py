@@ -72,6 +72,9 @@ ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 # recorded before Plan 8 carries no such key, which is why the cap below reads
 # the fact rather than the container (replay must reproduce a gate offline).
 OPEN_OBLIGATIONS_FACT = "run.open_job_obligations"
+# How many job ids a capped reason spells out before it says "+N more". The
+# count itself is never dropped: a bound on a message is not a bound on a fact.
+_MAX_NAMED_JOBS = 3
 
 # Receipt/assessment schema versions this reader understands. v1 wrote no
 # ``schema_version`` guarantee beyond the constant 1 and v2 only ADDS keys, so
@@ -221,6 +224,31 @@ def _unclosed_domains(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(unclosed)
 
 
+def _open_obligations(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
+    """The job ids this phase was graded with still unsettled.
+
+    Read from the sealed fact, never from the container: replay re-runs this
+    gate offline, long after the job and its ledger are gone, and a gate that
+    probed would grade a different world each time. A shape this reader does
+    not understand states nothing — a corrupt key must not invent a blocker.
+    """
+    raw = validated_facts.get(OPEN_OBLIGATIONS_FACT)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict.fromkeys(str(item).strip() for item in raw if str(item or "").strip()))
+
+
+def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
+    """`job <id>` / `jobs <id>, <id>` — bounded, and the count is never lost."""
+    named = open_jobs[:_MAX_NAMED_JOBS]
+    subject = "job" if len(open_jobs) == 1 else "jobs"
+    listed = ", ".join(named)
+    if len(open_jobs) > len(named):
+        listed += f" (+{len(open_jobs) - len(named)} more)"
+    verb = "has" if len(open_jobs) == 1 else "have"
+    return f"{subject} {listed} {verb} no terminal receipt"
+
+
 @dataclass(frozen=True)
 class _ValidatorObservation:
     state: ValidatorState
@@ -258,10 +286,19 @@ def validate_phase_claim(
     # claim, never refine it upward — a classified blocker is not a green
     # waiver. The cap stops AT the claim: it never manufactures a contradiction
     # the physical oracle did not observe.
+    #
+    # Plan 8 §3.3 broadens the TRIGGER and leaves the direction alone. The p7d
+    # polaris build was graded while its compile job was still running: the
+    # model honestly claimed `partial`, the gate said `Built 100% of expected
+    # classes … Module coverage: 1/26 built` and upgraded the claim to success.
+    # The cap did not fire because polaris's survey reads no Kotlin settings,
+    # so its domain list was empty — and an empty domain graph is not evidence
+    # that nothing is unfinished. An unsettled obligation is.
     facts = dict(validated_facts or {})
     blocking_domains = _unclosed_domains(facts)
+    open_jobs = _open_obligations(facts)
     if (
-        blocking_domains
+        (blocking_domains or open_jobs)
         and claimed in _OUTCOME_RANK
         and validated in _OUTCOME_RANK
         and _OUTCOME_RANK[claimed] < _OUTCOME_RANK[validated]
@@ -272,8 +309,34 @@ def validate_phase_claim(
             part
             for part in (
                 reason,
-                "no refinement above the claim while surveyed build domains are "
-                f"unclosed: {', '.join(blocking_domains)}",
+                (
+                    "no refinement above the claim while surveyed build domains are "
+                    f"unclosed: {', '.join(blocking_domains)}"
+                    if blocking_domains
+                    else ""
+                ),
+                (
+                    f"{_unsettled_clause(open_jobs)} — the claim is confirmable at most"
+                    if open_jobs
+                    else ""
+                ),
+            )
+            if part
+        )
+
+    # And success requires settled books: while a job is still out, the run
+    # does not yet know what its own dispatch did, so green is not available
+    # to it. A downgrade, never an upgrade — a success claim capped this way
+    # is contradicted by the ordinary truth table below and must be re-made
+    # honestly.
+    if open_jobs and state is ValidatorState.GREEN:
+        state = ValidatorState.PARTIAL
+        validated = _VALIDATED_OUTCOMES[state]
+        reason = " · ".join(
+            part
+            for part in (
+                reason,
+                f"{_unsettled_clause(open_jobs)} — success requires settled books",
             )
             if part
         )
