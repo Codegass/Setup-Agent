@@ -63,7 +63,7 @@ from .attempt_policy import (
 )
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
-from .phase_gates import ValidatorState, validate_phase_claim
+from .phase_gates import OPEN_OBLIGATIONS_FACT, ValidatorState, validate_phase_claim
 from .phase_machine import PhaseAttemptRecord, PhaseClaim, PhaseMachine
 from .phase_transitions import (
     PhaseTransitionPolicy,
@@ -764,6 +764,21 @@ class ControlReplayRunner:
                     # claim_graph.load(), not by this walker — pass through so
                     # a transcript that carries them still verifies end-to-end.
                     pass
+                elif event.kind == "job_unsettled":
+                    # Plan 8 Stage 1, the other branch of §3.2. A job that never
+                    # terminated is a CONFLICT on the verdict, so unlike
+                    # `job_settled` this row carries state and the walk applies
+                    # it — from the transcript, not from a container that is long
+                    # gone. Nothing is derived from the partial log here either:
+                    # the event states which job, what it was, and where the
+                    # obligation that says so lives.
+                    unsettled_job = payload["job_id"]
+                    state.set_fact(
+                        f"{OPEN_OBLIGATIONS_FACT}.{unsettled_job}",
+                        payload.get("obligation") or {},
+                        evidence_ref=payload["evidence_ref"],
+                    )
+                    state.record_conflict(f"job_unsettled:{unsettled_job}")
                 elif event.kind == "job_settled":
                     # Plan 8 Stage 1: a detached job's books closing is an
                     # evidence-layer fact (a receipt on disk), not a control

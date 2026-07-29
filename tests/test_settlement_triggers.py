@@ -239,6 +239,137 @@ def test_a_settled_job_is_no_conflict_at_all(forced_engine):  # noqa: F811
     assert engine.run_evidence_state.conflicts == ()
 
 
+def test_the_unsettled_verdict_state_is_written_by_a_control_event(forced_engine):  # noqa: F811
+    """Spec §3.2 asks for one control event so REPLAY reproduces the state, and
+    the settled branch had one while the unsettled branch wrote straight onto
+    `RunEvidenceState` — a conflict on the verdict that no transcript carried,
+    so no replay could reproduce it."""
+    orchestrator = Orchestrator(terminated=False)
+    engine = _closing_engine(forced_engine, orchestrator)
+
+    engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
+
+    payloads = [payload for kind, payload in engine.control_events if kind == "job_unsettled"]
+    assert payloads == [
+        {
+            "job_id": JOB,
+            "evidence_ref": f"{OBLIGATION_DIR}/{JOB}.json",
+            "obligation": {
+                "tool": "gradle",
+                "effective_action": "test",
+                "argv": f"{ROOT}/gradlew --continue test",
+                "log_path": LOG_PATH,
+            },
+        }
+    ]
+
+
+def test_the_unsettled_event_precedes_the_close_it_is_a_conflict_on(forced_engine):  # noqa: F811
+    """Evidence-close is immutable, so the conflict has to be in the stream
+    before it — otherwise replay reaches a sealed state and cannot record it."""
+    orchestrator = Orchestrator(terminated=False)
+    engine = _closing_engine(forced_engine, orchestrator)
+
+    engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
+
+    kinds = [kind for kind, _ in engine.control_events]
+    assert kinds.index("job_unsettled") < kinds.index("evidence_close")
+
+
+def test_the_event_and_the_fact_are_one_projection(forced_engine):  # noqa: F811
+    """P3, one question one computation: the fact the verdict carries IS the
+    payload the event carries, so a replayed run cannot differ from the live
+    one in the provenance it states."""
+    orchestrator = Orchestrator(terminated=False)
+    engine = _closing_engine(forced_engine, orchestrator)
+
+    engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
+
+    (payload,) = [payload for kind, payload in engine.control_events if kind == "job_unsettled"]
+    state = engine.run_evidence_state
+    assert state.fact_value(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == payload["obligation"]
+    assert state.fact_provenance(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == (
+        payload["evidence_ref"]
+    )
+
+
+def _transcript_with(tmp_path, name, extra_rows):
+    """The paramiko fixture with `extra_rows` spliced in before evidence_close."""
+    source = [
+        json.loads(line)
+        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    rows = [source[0]]
+    for row in source[1:]:
+        if row.get("kind") == "evidence_close":
+            for extra in extra_rows:
+                rows.append({**extra, "source": row["source"]})
+        rows.append(row)
+    for sequence, row in enumerate(rows[1:], 1):
+        row["sequence"] = sequence
+    transcript = tmp_path / name
+    transcript.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return transcript
+
+
+def test_replay_reproduces_the_unsettled_conflict_from_the_transcript(tmp_path):
+    """The point of the event: an offline replay of a run whose job never came
+    back states the same conflict, with the obligation as provenance, without
+    the container the obligation lived in."""
+    transcript = _transcript_with(
+        tmp_path,
+        "unsettled-paramiko.jsonl",
+        [
+            {
+                "kind": "job_unsettled",
+                "payload": {
+                    "job_id": JOB,
+                    "evidence_ref": f"{OBLIGATION_DIR}/{JOB}.json",
+                    "obligation": {"tool": "gradle", "argv": f"{ROOT}/gradlew test"},
+                },
+            }
+        ],
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert f"job_unsettled:{JOB}" in result.snapshot.conflicts
+
+
+def test_a_pre_plan_8_transcript_still_replays_byte_identically():
+    """Additive means additive (spec §4). The fixture predates Plan 8 and its
+    frozen snapshot and event digest must still verify unchanged."""
+    result = ControlReplayRunner.offline().run(FIXTURES / "paramiko.jsonl")
+
+    assert result.produced_event_digest == result.expected_event_digest
+    assert result.snapshot.model_dump(mode="json") == result.expected_snapshot
+    assert not any(conflict.startswith("job_unsettled:") for conflict in result.snapshot.conflicts)
+
+
+def test_job_unsettled_is_appended_after_job_settled():
+    assert CONTROL_EVENT_KINDS[11] == "job_settled"
+    assert CONTROL_EVENT_KINDS[12] == "job_unsettled"
+    assert len(CONTROL_EVENT_KINDS) == 13
+
+
+def test_the_job_unsettled_payload_states_the_job_its_file_and_what_it_was():
+    event = ControlEvent(
+        sequence=1,
+        kind="job_unsettled",
+        payload={
+            "job_id": JOB,
+            "evidence_ref": f"{OBLIGATION_DIR}/{JOB}.json",
+            "obligation": {"tool": "gradle"},
+        },
+    )
+
+    assert event.typed_payload.job_id == JOB
+    assert event.payload["obligation"] == {"tool": "gradle"}
+
+
 # ---------------------------------------------------------------------------
 # replay: the new kind is additive
 # ---------------------------------------------------------------------------

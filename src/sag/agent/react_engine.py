@@ -4379,7 +4379,14 @@ class ReActEngine(UIEventEmitter):
         Spec §3.2: a job that never terminates stays an OPEN obligation and is
         recorded on the verdict as `job_unsettled:<job_id>`, with the
         obligation file as the fact's provenance. Nothing is guessed from a
-        partial log — an unfinished job is neither a pass nor a failure."""
+        partial log — an unfinished job is neither a pass nor a failure.
+
+        The state goes into the stream, not just onto the object: §3.2 asks for
+        one control event so replay reproduces the state, and that is owed by
+        BOTH branches. The settled branch has had its event since Stage 1
+        landed; this one emits `job_unsettled` for the same reason, from the
+        SAME projection the fact carries (P3 — one question, one computation),
+        and before `evidence_close`, because a sealed verdict accepts nothing."""
         state = getattr(self, "run_evidence_state", None)
         orchestrator = getattr(self, "orchestrator", None)
         if state is None or orchestrator is None or state.sealed:
@@ -4389,14 +4396,22 @@ class ReActEngine(UIEventEmitter):
                 job_id = str(record.get("job_id") or "").strip()
                 if not job_id:
                     continue
+                payload = compact_control_value(
+                    {
+                        "job_id": job_id,
+                        "evidence_ref": f"{OBLIGATION_DIR}/{job_id}.json",
+                        "obligation": {
+                            key: record.get(key)
+                            for key in ("tool", "effective_action", "argv", "log_path")
+                            if record.get(key)
+                        },
+                    }
+                )
+                self._emit_control_event("job_unsettled", payload)
                 state.set_fact(
                     f"{OPEN_OBLIGATIONS_FACT}.{job_id}",
-                    {
-                        key: record.get(key)
-                        for key in ("tool", "effective_action", "argv", "log_path")
-                        if record.get(key)
-                    },
-                    evidence_ref=f"{OBLIGATION_DIR}/{job_id}.json",
+                    payload["obligation"],
+                    evidence_ref=payload["evidence_ref"],
                 )
                 state.record_conflict(f"job_unsettled:{job_id}")
         except Exception as exc:  # the ledger never breaks a close
