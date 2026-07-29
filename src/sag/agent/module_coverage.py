@@ -54,8 +54,15 @@ class ModuleBasis:
 
     def phrase(self) -> str:
         if self.authority == BASIS_RECEIPT:
-            tally = f" ({self.total} module(s) attempted)" if self.total else ""
-            return f"denominator: receipt {self.provenance}{tally}"
+            # Named by id once a structure fact has been promoted (§3.6);
+            # before that, the receipts collectively, which is still the
+            # receipt rung and says so.
+            stated_by = (
+                f"receipt {self.provenance}"
+                if self.provenance
+                else "the receipts' module outcomes"
+            )
+            return f"denominator: {stated_by} ({self.total} module(s) attempted)"
         if self.authority == BASIS_SCAN:
             return (
                 f"denominator: the module scan on disk "
@@ -73,7 +80,7 @@ def module_basis(
     """The ladder: a terminal receipt, else the scan on disk, else the survey."""
     modules = tuple(str(name) for name in (receipt_modules or ()) if str(name).strip())
     if modules:
-        return ModuleBasis(BASIS_RECEIPT, receipt_id or "module outcomes", total=len(modules))
+        return ModuleBasis(BASIS_RECEIPT, str(receipt_id or "").strip(), total=len(modules))
     summary = (coverage or {}).get("summary") or {}
     total = int(summary.get("modules_total") or 0)
     # The scan earns the denominator by enumerating a STRUCTURE the expectation

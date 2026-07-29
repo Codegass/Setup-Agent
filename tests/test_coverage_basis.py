@@ -225,6 +225,12 @@ def test_the_message_names_the_denominator_it_used():
     assert "the module scan on disk" in module_basis(_polaris_scan()).phrase()
     assert "1/26" in module_basis(_polaris_scan()).phrase()
     assert "the survey's expectations" in module_basis(None).phrase()
+    # A run whose manifest predates the structure fact still stands on the
+    # receipt rung, and says so rather than naming an id it does not have.
+    unpromoted = module_basis(_polaris_scan(), receipt_modules=("core", "jms"))
+    assert unpromoted.phrase() == (
+        "denominator: the receipts' module outcomes (2 module(s) attempted)"
+    )
 
 
 def test_the_polaris_sentence_is_unconstructible():

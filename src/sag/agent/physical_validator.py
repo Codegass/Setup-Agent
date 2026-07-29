@@ -37,12 +37,12 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from sag.agent.receipt_structure import module_key as _receipt_module_key
 from sag.config.settings import (
     DEFAULT_BUILD_COVERAGE_THRESHOLD,
     DEFAULT_TEST_EXECUTION_THRESHOLD,
     DEFAULT_TEST_PASS_THRESHOLD,
 )
-from sag.agent.receipt_structure import module_key as _receipt_module_key
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
@@ -3224,9 +3224,8 @@ class PhysicalValidator:
         from sag.agent.module_coverage import module_basis
 
         self._last_module_scan = (project_name, self._module_scan_result(project_name))
-        module_scan = self._last_module_scan[1]
         basis = module_basis(
-            module_scan,
+            self._last_module_scan[1],
             receipt_modules=attempted_modules,
             receipt_id=str(receipt_structure.get("provenance") or ""),
         )
