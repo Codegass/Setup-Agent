@@ -22,6 +22,7 @@ surprise §7 names.
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
@@ -46,12 +47,15 @@ FIXTURES = Path(__file__).parent / "fixtures" / "control_layer"
 
 
 class Orchestrator:
-    def __init__(self, *, terminated=True):
+    def __init__(self, *, terminated=True, obligation=None):
         files = {LOG_PATH: POLARIS_LOG}
         if terminated:
             files[EXIT_PATH] = "0\n"
         self.filesystem = JobContainer(files=files, reports=AFTER)
-        write_obligation(self.execute_command, _obligation())
+        # Obligations are append-only, so a body that differs in anything but
+        # its settlement cannot be written over this one: a test that needs a
+        # different dispatch states it here, at dispatch time.
+        write_obligation(self.execute_command, obligation or _obligation())
 
     def execute_command(self, command, **kwargs):
         return self.filesystem(command, **kwargs)
@@ -302,6 +306,75 @@ def test_an_unsealed_run_still_settles_after_every_batch(forced_engine):  # noqa
     assert len(_receipts(orchestrator)) == 1
 
 
+# ---------------------------------------------------------------------------
+# the seal guards the SETTLEMENT, not only its announcer (round-3 finding 2)
+# ---------------------------------------------------------------------------
+#
+# Round two guarded `ReActEngine._sweep_job_obligations`, which is at once the
+# second settler AND the only channel that emits `job_settled` and the
+# `[settled]` notice. `phase_gates._settle_before_grading` — the settler at the
+# gate — stayed unguarded, so a post-seal settlement still wrote a receipt and
+# marked the ledger while the new guard permanently suppressed its event, its
+# notice and its repair hooks: round one announced a post-seal settlement, round
+# two wrote it silently. A sealed run accepts no further evidence: no receipt, no
+# ledger mutation, no event.
+
+
+def _nudging_engine(forced_engine_factory, orchestrator, *, sealed):
+    """The report phase still nudges its gate after a `test_terminated` close."""
+    from sag.agent.phase_machine import PhaseMachine
+
+    engine = _closing_engine(forced_engine_factory, orchestrator)
+    engine.phase_machine = PhaseMachine(start_phase="report")
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orchestrator)
+    engine._phase_iterations = engine.NUDGE_EVERY
+    if sealed:
+        engine.run_evidence_state.seal(
+            finalized_at="2026-07-29T11:17:37Z",
+            close_reason="test_terminated",
+        )
+    return engine
+
+
+def test_a_sealed_run_settles_nothing_at_the_phase_gate(forced_engine):  # noqa: F811
+    """The reachable path: the report-phase nudge checks the gate for its own
+    phase, and the gate settles before it grades."""
+    orchestrator = Orchestrator()
+    engine = _nudging_engine(forced_engine, orchestrator, sealed=True)
+
+    engine._maybe_nudge_phase_done()
+
+    assert _receipts(orchestrator) == []
+    assert _ledger(orchestrator)["settled_receipt_id"] is None
+    assert [kind for kind, _ in engine.control_events if kind == "job_settled"] == []
+
+
+def test_an_unsealed_run_still_settles_at_the_phase_gate(forced_engine):  # noqa: F811
+    """The guard is the seal, not the gate: an open run's gate grades settled
+    books exactly as trigger 2 requires."""
+    orchestrator = Orchestrator()
+    engine = _nudging_engine(forced_engine, orchestrator, sealed=False)
+
+    engine._maybe_nudge_phase_done()
+
+    assert len(_receipts(orchestrator)) == 1
+    assert _ledger(orchestrator)["settled_receipt_id"]
+
+
+def test_a_sealed_gate_still_names_the_obligation_it_will_not_settle():
+    """Refusing to settle is not refusing to look. The ledger's own open
+    obligation is still stated as a fact of the phase, so a post-seal claim
+    cannot be graded green on books the sealed verdict recorded as unsettled."""
+    orchestrator = Orchestrator()
+
+    observation = phase_gates.check_phase_done(
+        "provision", None, orchestrator, "polaris", sealed=True
+    )
+
+    assert observation["validated_facts"][phase_gates.OPEN_OBLIGATIONS_FACT] == [JOB]
+    assert _receipts(orchestrator) == []
+
+
 def test_the_unsettled_verdict_state_is_written_by_a_control_event(forced_engine):  # noqa: F811
     """Spec §3.2 asks for one control event so REPLAY reproduces the state, and
     the settled branch had one while the unsettled branch wrote straight onto
@@ -339,17 +412,27 @@ def test_the_unsettled_event_precedes_the_close_it_is_a_conflict_on(forced_engin
     assert kinds.index("job_unsettled") < kinds.index("evidence_close")
 
 
+# An argv longer than a control payload may carry. `compact_control_value`
+# bounds strings, so the BOUNDED projection is the only value the event and the
+# fact can share: a fact computed a second time from the ledger record states an
+# argv the event does not, whatever else the two computations agree on.
+LONG_ARGV = f"{ROOT}/gradlew --continue test " + " ".join(f"-Dsag.module{n}=on" for n in range(60))
+
+
 def test_the_event_and_the_fact_are_one_projection(forced_engine):  # noqa: F811
     """P3, one question one computation: the fact the verdict carries IS the
     payload the event carries, so a replayed run cannot differ from the live
     one in the provenance it states."""
-    orchestrator = Orchestrator(terminated=False)
+    orchestrator = Orchestrator(terminated=False, obligation=_obligation(argv=LONG_ARGV))
     engine = _closing_engine(forced_engine, orchestrator)
 
     engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
 
     (payload,) = [payload for kind, payload in engine.control_events if kind == "job_unsettled"]
     state = engine.run_evidence_state
+    # The event is bounded, so equality below can only hold for a fact that came
+    # from this payload rather than from a second look at the record.
+    assert len(payload["obligation"]["argv"]) < len(LONG_ARGV)
     assert state.fact_value(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == payload["obligation"]
     assert state.fact_provenance(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == (
         payload["evidence_ref"]

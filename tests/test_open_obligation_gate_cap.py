@@ -28,6 +28,9 @@ settled books. An honest `partial`/`unknown` claim passes exactly as it does
 today. Honesty is never punished.
 """
 
+from types import SimpleNamespace
+
+from test_react_engine_phase_wiring import _engine_with_machine
 from test_settlement_triggers import Orchestrator
 
 from sag.agent import phase_gates
@@ -290,6 +293,179 @@ def test_the_whole_path_caps_the_polaris_claim_from_the_ledger_on_disk(monkeypat
     assert gate.validated_outcome is PhaseOutcome.PARTIAL
     assert gate.validated_facts[OPEN_OBLIGATIONS_FACT] == [JOB]
     assert f"job {JOB} has no terminal receipt" in gate.reason
+
+
+# ---------------------------------------------------------------------------
+# the floor safety net still closes a starved attempt (round-3 blocker)
+# ---------------------------------------------------------------------------
+#
+# `_enforce_phase_floors` is the safety net that stops a budget-exhausted phase
+# from hanging, and it closes UNCONDITIONALLY: it derives its own claim from the
+# validator state, so claim == validated always held and the gate always
+# confirmed it. Round two's cap rewrote `validated` and left the derived claim
+# at SUCCESS, so the gate CONTRADICTED the harness's own claim,
+# `PhaseMachine.close_attempt` raised ValueError('a rejected phase claim cannot
+# close an attempt'), the run loop's `except Exception` turned it into
+# `abort(reason='engine exception: ValueError')` — and a starved phase with one
+# job still out terminated the whole run ABORTED with the report phase skipped.
+# Every precondition co-occurs by construction: `_inspect_phase` returns the
+# GREEN state and the open-obligation fact from the SAME probe dict.
+#
+# The invariant the floor relies on is that the claim it derives is the outcome
+# the gate will validate. The cap is a pure function of (validator state, open
+# obligations), so the derived claim is capped the same way.
+
+
+def _starved_engine(phase, facts, *, iteration):
+    """A phase whose floor has been reached, with `facts` on the probe."""
+    engine = _engine_with_machine(start_phase=phase)
+    engine.current_iteration = iteration
+    engine.gates = []
+    engine._phase_gate_check = lambda _phase: {
+        "ok": True,
+        "reason": POLARIS_REASON,
+        "suggestions": [],
+        "validator_state": "green",
+        "evidence_refs": ["file:///workspace/polaris/build.log"],
+        "validated_facts": dict(facts),
+    }
+    # A spy on the gate the floor actually built — not a re-implementation of
+    # it. `_emit_control_gate` is the one seam both claim and gate pass through.
+    engine._emit_control_gate = lambda claim, gate: engine.gates.append((claim, gate))
+    return engine
+
+
+def test_the_starved_build_floor_closes_an_honest_partial_while_a_job_is_open():
+    """p7d polaris, at floor exhaustion: green evidence, one compile job with no
+    terminal receipt. The attempt closes `partial` and the phase routes."""
+    engine = _starved_engine(
+        "build",
+        {"build.test_entry_ready": True, **OPEN},
+        iteration=131,
+    )
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    record = engine.phase_machine.records[0]
+    assert record.termination.value == "completed"
+    assert record.outcome is PhaseOutcome.PARTIAL
+    assert record.transition is not None
+    assert engine.phase_machine.current_phase == "test"
+    assert engine.finalized_reasons == []  # nothing aborted the run
+
+
+def test_the_floor_derives_the_claim_the_gate_confirms():
+    """The floor cannot decline: it has no second move. So the claim it derives
+    must be the one the gate accepts, cap included."""
+    engine = _starved_engine(
+        "build",
+        {"build.test_entry_ready": True, **OPEN},
+        iteration=131,
+    )
+
+    engine._enforce_phase_floors()
+
+    (claim, gate) = engine.gates[-1]
+    assert claim.claimed_outcome is PhaseOutcome.PARTIAL
+    assert gate.validated_outcome is claim.claimed_outcome
+    assert gate.disposition is ClaimDisposition.CONFIRMED
+    assert gate.accepted is True
+    assert f"job {JOB} has no terminal receipt" in gate.reason
+
+
+def test_a_settled_ledger_leaves_the_starved_floor_exactly_as_it_was():
+    """The provision template this reproduction was copied from: with nothing
+    open, the floor closes `success` on green evidence, as it always has."""
+    engine = _starved_engine(
+        "provision",
+        {"provision.workspace_ready": True},
+        iteration=121,
+    )
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    record = engine.phase_machine.records[0]
+    assert record.outcome is PhaseOutcome.SUCCESS
+    assert engine.phase_machine.current_phase == "analyze"
+
+
+def test_the_starved_floor_still_reports_red_evidence_as_failed():
+    """The cap only ever removes strength from GREEN. A red probe is untouched,
+    open obligation or not."""
+    engine = _starved_engine(
+        "provision",
+        {"provision.workspace_ready": False, **OPEN},
+        iteration=121,
+    )
+    engine._phase_gate_check = lambda _phase: {
+        "ok": False,
+        "reason": "no workspace",
+        "suggestions": [],
+        "validator_state": "red",
+        "evidence_refs": ["workspace:///missing"],
+        "validated_facts": {"provision.workspace_ready": False, **OPEN},
+    }
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    assert engine.phase_machine.records[0].outcome is PhaseOutcome.FAILED
+
+
+def _floor_engine_on_the_real_gate(monkeypatch, orchestrator):
+    """A starved build phase whose probe is the PRODUCTION `_phase_gate_check`.
+
+    Only the physical inspection is stubbed green. The validator state and the
+    open-obligation fact then reach the floor the way they do in a live run —
+    out of the same probe dict, through `check_phase_done` -> `_inspect_phase`
+    -> the container's own ledger — instead of out of a hand-written dict.
+    """
+    monkeypatch.setattr(
+        phase_gates,
+        "_inspect_phase_evidence",
+        lambda phase, validator, orchestrator, project_name: _ValidatorObservation(
+            ValidatorState.GREEN,
+            reason=POLARIS_REASON,
+            code="build_verified",
+            validated_facts={"build.test_entry_ready": True},
+        ),
+    )
+    engine = _engine_with_machine(start_phase="build")
+    engine.current_iteration = 131
+    engine.orchestrator = orchestrator
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orchestrator)
+    return engine
+
+
+def test_the_floor_closes_partial_on_the_obligation_the_real_gate_found(monkeypatch):
+    """End to end at the seam that aborted the run: a job with no exit file in
+    the container's ledger, a green inspection, a starved build floor."""
+    engine = _floor_engine_on_the_real_gate(monkeypatch, Orchestrator(terminated=False))
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    record = engine.phase_machine.records[0]
+    assert record.termination.value == "completed"
+    assert record.outcome is PhaseOutcome.PARTIAL
+    assert engine.phase_machine.current_phase == "test"
+    assert engine.finalized_reasons == []
+    assert engine.run_evidence_state.fact_value(OPEN_OBLIGATIONS_FACT) == [JOB]
+
+
+def test_the_floor_closes_success_once_the_gate_settles_the_books(monkeypatch):
+    """The other half of the same seam: trigger 2 settles the terminated job
+    BEFORE grading, so nothing is open and the floor closes success. The cap
+    costs an honest run nothing."""
+    engine = _floor_engine_on_the_real_gate(monkeypatch, Orchestrator(terminated=True))
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    assert engine.phase_machine.records[0].outcome is PhaseOutcome.SUCCESS
+    assert engine.run_evidence_state.fact_value(OPEN_OBLIGATIONS_FACT) is None
 
 
 def test_a_malformed_obligation_fact_caps_nothing():

@@ -66,6 +66,7 @@ from .phase_gates import (
     GateResult,
     ValidatorState,
     check_phase_claim,
+    claimable_outcome,
     validate_phase_claim,
 )
 from .phase_handoff import PhaseHandoff
@@ -1711,6 +1712,7 @@ class ReActEngine(UIEventEmitter):
             getattr(self, "physical_validator", None),
             getattr(getattr(self, "physical_validator", None), "docker_orchestrator", None),
             self._project_name_for_gate(),
+            sealed=self._evidence_is_sealed(),
         )
         gate = self._cap_unresolved_test_gate(claim, gate)
         self._emit_control_gate(claim, gate)
@@ -1879,6 +1881,15 @@ class ReActEngine(UIEventEmitter):
             step_span=len(self.steps),
         )
 
+    def _evidence_is_sealed(self) -> bool:
+        """Whether this run has closed its evidence and accepts no more of it.
+
+        The one reader of the seal for every settler downstream of it: the batch
+        sweep, and the gate — which settles the job ledger before it grades. A
+        sealed run must not settle (spec §3.2: the sealed verdict has already
+        recorded the job as `job_unsettled`, and evidence-close is immutable)."""
+        return bool(getattr(getattr(self, "run_evidence_state", None), "sealed", False))
+
     def _phase_gate_check(self, phase: str) -> Dict[str, Any]:
         """Run the phase-boundary evidence gate from engine context.
 
@@ -1909,6 +1920,7 @@ class ReActEngine(UIEventEmitter):
             validator=validator,
             orchestrator=getattr(validator, "docker_orchestrator", None),
             project_name=project_name,
+            sealed=self._evidence_is_sealed(),
         )
 
     NUDGE_EVERY = 15
@@ -2011,12 +2023,18 @@ class ReActEngine(UIEventEmitter):
             if unresolved is not None or refusals
             else ValidatorState(probe.get("validator_state", ValidatorState.UNAVAILABLE.value))
         )
-        claimed_outcome = {
-            ValidatorState.GREEN: PhaseOutcome.SUCCESS,
-            ValidatorState.PARTIAL: PhaseOutcome.PARTIAL,
-            ValidatorState.RED: PhaseOutcome.FAILED,
-            ValidatorState.UNAVAILABLE: PhaseOutcome.UNKNOWN,
-        }[validator_state]
+        validated_facts = dict(probe.get("validated_facts") or {})
+        # The floor is the safety net for a starved attempt: it derives its own
+        # claim from the evidence and then closes UNCONDITIONALLY, because it has
+        # no second move. Every other `close_attempt` caller can decline on a
+        # rejected gate; this one cannot, so the claim it derives must be the
+        # outcome the gate validates — including the §3.3 cap, which is a pure
+        # function of (validator state, open obligations) and therefore knowable
+        # here. Deriving SUCCESS from a GREEN probe that carries an open
+        # obligation made the gate CONTRADICT the harness's own claim, and
+        # `close_attempt` then raised into the loop's `except Exception`, which
+        # ABORTED a merely starved run with its report phase skipped.
+        claimed_outcome = claimable_outcome(validator_state, validated_facts)
         claim = PhaseClaim(
             phase=phase,
             claimed_outcome=claimed_outcome,
@@ -2050,7 +2068,7 @@ class ReActEngine(UIEventEmitter):
                     else str(probe.get("code") or "phase_floor_exhausted")
                 )
             ),
-            validated_facts=dict(probe.get("validated_facts") or {}),
+            validated_facts=validated_facts,
         )
         self._emit_control_gate(claim, gate)
         self._record_gate_facts(phase, gate)
@@ -4342,10 +4360,7 @@ class ReActEngine(UIEventEmitter):
         Never raises: an unswept ledger is an open obligation, which the
         closing sweep and evidence-close already state honestly."""
         orchestrator = getattr(self, "orchestrator", None)
-        if orchestrator is None:
-            return
-        state = getattr(self, "run_evidence_state", None)
-        if state is not None and state.sealed:
+        if orchestrator is None or self._evidence_is_sealed():
             return
         try:
             # ONE ledger read per batch: the common case is a run that never

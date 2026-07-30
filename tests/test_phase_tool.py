@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseOutcome
 from sag.tools.phase_tool import PhaseTool
@@ -30,8 +31,9 @@ class GateRecorder:
             suggestions=tuple(suggestions or ()),
         )
 
-    def __call__(self, phase, claim, validator, orchestrator, project_name):
+    def __call__(self, phase, claim, validator, orchestrator, project_name, *, sealed=False):
         self.calls.append(phase)
+        self.sealed = sealed
         return self.result.with_claim(claim)
 
 
@@ -61,6 +63,25 @@ def test_done_passes_gate_and_signals_engine():
     assert result.metadata["phase_signal"] == "done"
     assert result.metadata["phase_claim"]["key_results"] == "compiled 115 classes"
     assert gate.calls == ["build"]
+
+
+def test_a_claim_carries_the_evidence_seal_to_the_gate():
+    """The gate settles the job ledger before it grades (spec §3.2 trigger 2),
+    and a SEALED run accepts no further evidence: the report phase can still
+    claim after evidence-close, and settling for it would write a receipt the
+    sealed verdict has already recorded as `job_unsettled`."""
+    gate = GateRecorder(ok=True)
+    tool = _tool(gate)
+    tool.run_evidence_state = RunEvidenceState(run_id="phase-tool-seal")
+
+    tool.execute(action="done", outcome="success", key_results="115 classes", evidence=["ref"])
+    assert gate.sealed is False
+
+    tool.run_evidence_state.seal(
+        finalized_at="2026-07-29T11:17:37Z", close_reason="test_terminated"
+    )
+    tool.execute(action="done", outcome="success", key_results="115 classes", evidence=["ref"])
+    assert gate.sealed is True
 
 
 def test_done_rejected_by_gate_returns_options_no_signal():

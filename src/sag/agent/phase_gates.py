@@ -249,6 +249,44 @@ def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
     return f"{subject} {listed} {verb} no terminal receipt"
 
 
+def settled_validator_state(
+    validator_state: ValidatorState | str,
+    validated_facts: Mapping[str, Any] | None = None,
+) -> ValidatorState:
+    """The strongest state this evidence supports once open books are counted.
+
+    GREEN with an obligation still open is at most PARTIAL (§3.3: success
+    requires settled books). Every other state is returned unchanged — the cap
+    only ever removes strength, and it is a pure function of the state and the
+    facts, with no view of any claim.
+
+    This is the ONE computation of that cap (P3). `validate_phase_claim` applies
+    it when it grades a claim; a caller that DERIVES its claim from validator
+    evidence rather than from a model must derive it from THIS state, or it
+    states a claim the same gate is about to contradict. The engine's phase
+    floor is exactly such a caller: it is the safety net for a starved attempt,
+    it has no second move, and a contradiction there is a ValueError out of
+    `PhaseMachine.close_attempt` that aborts the whole run.
+    """
+    state = ValidatorState(validator_state)
+    if state is ValidatorState.GREEN and _open_obligations(dict(validated_facts or {})):
+        return ValidatorState.PARTIAL
+    return state
+
+
+def claimable_outcome(
+    validator_state: ValidatorState | str,
+    validated_facts: Mapping[str, Any] | None = None,
+) -> PhaseOutcome:
+    """The outcome a machine-derived claim may state on this evidence.
+
+    The floor's claim is not a model's opinion: it is a projection of the same
+    evidence the gate is about to grade, so it is the gate's own validated
+    outcome by construction.
+    """
+    return _VALIDATED_OUTCOMES[settled_validator_state(validator_state, validated_facts)]
+
+
 @dataclass(frozen=True)
 class _ValidatorObservation:
     state: ValidatorState
@@ -326,11 +364,13 @@ def validate_phase_claim(
 
     # And success requires settled books: while a job is still out, the run
     # does not yet know what its own dispatch did, so green is not available
-    # to it. A downgrade, never an upgrade — a success claim capped this way
-    # is contradicted by the ordinary truth table below and must be re-made
-    # honestly.
-    if open_jobs and state is ValidatorState.GREEN:
-        state = ValidatorState.PARTIAL
+    # to it. A downgrade, never an upgrade — a MODEL's success claim capped this
+    # way is contradicted by the ordinary truth table below and must be re-made
+    # honestly, while a machine-derived claim states the capped outcome from the
+    # start (`claimable_outcome`) and is confirmed.
+    capped = settled_validator_state(state, facts)
+    if capped is not state:
+        state = capped
         validated = _VALIDATED_OUTCOMES[state]
         reason = " · ".join(
             part
@@ -385,11 +425,18 @@ def check_phase_claim(
     validator,
     orchestrator,
     project_name: Optional[str],
+    *,
+    sealed: bool = False,
 ) -> GateResult:
-    """Inspect physical evidence and validate one terminal phase claim."""
+    """Inspect physical evidence and validate one terminal phase claim.
+
+    `sealed` is the run's evidence seal: a sealed run accepts no further
+    evidence, so the gate grades the ledger it finds without settling it (see
+    :func:`_settle_before_grading`).
+    """
     if claim.phase != phase:
         raise ValueError(f"claim for {claim.phase!r} cannot validate phase {phase!r}")
-    observation = _inspect_phase(phase, validator, orchestrator, project_name)
+    observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
     return validate_phase_claim(
         claim,
         observation.state,
@@ -406,13 +453,16 @@ def check_phase_done(
     validator,
     orchestrator,
     project_name: Optional[str],
+    *,
+    sealed: bool = False,
 ) -> dict[str, Any]:
     """Read-only compatibility projection for engine nudges during WS3.
 
     Live model claims use :func:`check_phase_claim`; this adapter carries no
-    claim and therefore cannot close or advance a phase.
+    claim and therefore cannot close or advance a phase. It does reach the
+    settler at the gate, so it carries the run's evidence seal too.
     """
-    observation = _inspect_phase(phase, validator, orchestrator, project_name)
+    observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
     return {
         "ok": observation.state is ValidatorState.GREEN,
         "reason": observation.reason,
@@ -424,7 +474,7 @@ def check_phase_done(
     }
 
 
-def _settle_before_grading(orchestrator) -> tuple[str, ...]:
+def _settle_before_grading(orchestrator, *, sealed: bool = False) -> tuple[str, ...]:
     """Settle the job ledger, then name whatever is still open. Never raises.
 
     Plan 8 §3.2 trigger 2. The polaris build gate (p7d,
@@ -433,6 +483,16 @@ def _settle_before_grading(orchestrator) -> tuple[str, ...]:
     saw. A gate may only ever grade settled books, so settlement runs BEFORE
     the physical inspection — the receipts it writes are the evidence the
     inspection is about to read.
+
+    A SEALED run settles nothing. The report phase still checks gates after
+    evidence-close (the mid-phase nudge, and a report claim of its own), and
+    settling in that window would write a receipt, an assessment and a repair
+    proposal for a job the sealed verdict has already recorded as
+    `job_unsettled` — evidence the run can no longer state. Refusing to settle
+    is not refusing to LOOK: the obligation the ledger still holds open is
+    returned exactly as before, so the §3.3 cap keeps applying to any claim made
+    in that window and the gate cannot grade green on the very books the verdict
+    calls unsettled.
 
     A run that never detached anything costs one glob `cat` that matches no
     file, and states no fact.
@@ -445,10 +505,12 @@ def _settle_before_grading(orchestrator) -> tuple[str, ...]:
         records = read_obligations(orchestrator)
         if not records:
             return ()
-        settled = {
-            settlement.job_id
-            for settlement in settle_open_obligations(orchestrator, obligations=records)
-        }
+        settled: set[str] = set()
+        if not sealed:
+            settled = {
+                settlement.job_id
+                for settlement in settle_open_obligations(orchestrator, obligations=records)
+            }
         return tuple(
             str(record.get("job_id") or "").strip()
             for record in records
@@ -459,8 +521,10 @@ def _settle_before_grading(orchestrator) -> tuple[str, ...]:
         return ()
 
 
-def _inspect_phase(phase, validator, orchestrator, project_name) -> _ValidatorObservation:
-    open_jobs = _settle_before_grading(orchestrator)
+def _inspect_phase(
+    phase, validator, orchestrator, project_name, *, sealed: bool = False
+) -> _ValidatorObservation:
+    open_jobs = _settle_before_grading(orchestrator, sealed=sealed)
     observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
     if not open_jobs:
         return observation

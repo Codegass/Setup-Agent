@@ -333,12 +333,17 @@ class PhaseTool(BaseTool):
             reason=reason,
             evidence_refs=tuple(evidence or ()),
         )
+        # The gate settles the job ledger before it grades (spec §3.2 trigger
+        # 2), and a sealed run accepts no further evidence: after evidence-close
+        # the report phase can still make a claim, and settling for it would
+        # write a receipt the sealed verdict cannot state.
         gate = self.gate_fn(
             phase,
             claim,
             self.validator,
             self.orchestrator,
             self.project_name,
+            sealed=bool(getattr(self.run_evidence_state, "sealed", False)),
         )
         if gate.claim is None:
             gate = gate.with_claim(claim)
