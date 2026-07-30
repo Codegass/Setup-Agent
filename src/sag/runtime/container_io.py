@@ -65,8 +65,16 @@ def read_container_text(
 ) -> Optional[str]:
     """Read UTF-8 text without presentation truncation.
 
-    ``None`` means the file is absent.  Malformed transport or invalid UTF-8
-    raises ``ContainerFileReadError`` so callers can fail closed.
+    ``None`` means the file is absent.  On the ``exact_bytes`` path, absent
+    means MARKER-VERIFIED absent (``__SAG_FILE_MISSING__`` / exit 44): a
+    command that did not succeed raises ``ContainerFileReadError`` instead of
+    masquerading as absence, because "could not look" and "looked and found
+    nothing" license opposite actions — the first caps, the second may create.
+    Malformed transport or invalid UTF-8 raises the same error.
+
+    Scope (Plan 8 §3.9, first half): ``_direct_read`` and the non-exact
+    readers still return ``None`` on failure; their callers and test doubles
+    migrate separately.
 
     ``exact_bytes`` additionally preserves terminal newlines and every other
     UTF-8 byte via base64 transport.  It is required for transactional
@@ -104,11 +112,33 @@ def read_container_text(
                 raise ContainerFileReadError(
                     f"lossless container read returned invalid payload for {path}"
                 ) from exc
-        # Compatibility for a small orchestrator that does not understand the
-        # transport probe: fall through to an untruncated cat. Production
-        # always emits one of the trusted markers above.
+        # Plan 8 §3.9: a probe that DID NOT SUCCEED proves nothing about the
+        # file, and returning None here reported it as absent. Live shape:
+        # DockerOrchestrator converts every within-command failure into
+        # {"success": False, ...} without raising, so this branch — not an
+        # exception — is how a transient docker failure arrives. Reading it
+        # as absence is what let a settlement-time hiccup replace the whole
+        # survey manifest with one structure key ("absent → create").
+        if not _command_succeeded(result):
+            raise ContainerFileReadError(
+                f"lossless container read did not succeed for {path}: "
+                f"{str(result.get('output') or '')[:120]}"
+            )
+        # Compatibility for a small orchestrator that answered the transport
+        # probe successfully but without a marker: fall through to an
+        # untruncated cat. Production always emits one of the trusted markers.
 
     result = _execute_untruncated(orchestrator, f"cat -- {shlex.quote(path)}")
     if not _command_succeeded(result):
+        if exact_bytes:
+            # A plain `cat` cannot prove absence — only the marker probe can —
+            # so on the transactional path its failure is a failed READ. The
+            # non-exact parsers keep None-on-failure until their doubles
+            # migrate to an explicit absence protocol (measured: 17 doubles
+            # express "absent" as a plain failure today).
+            raise ContainerFileReadError(
+                f"container read did not succeed for {path}: "
+                f"{str(result.get('output') or '')[:120]}"
+            )
         return None
     return str(result.get("output") or "")

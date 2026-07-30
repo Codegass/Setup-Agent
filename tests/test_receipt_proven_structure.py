@@ -21,6 +21,7 @@ Deliberately NOT in scope: parsing Kotlin settings or imperative version checks
 statically. Pre-flight owns stated-requirement recovery and owns it well.
 """
 
+import base64
 import json
 
 from sag.agent.invocation_receipts import build_receipt, record_invocation
@@ -63,6 +64,15 @@ class ManifestOrchestrator:
         self.commands.append(command)
         self.calls.append((command, kwargs))
         text = command.strip()
+        if text.startswith("if test -f") and BUILD_REQUIREMENTS_PATH in text:
+            # §3.9 absence protocol: absence is STATED (marker / exit 44),
+            # never implied by an ordinary failure — a plain failed read on
+            # the exact path now raises, because "could not look" is not
+            # "looked and found nothing".
+            if self.manifest is None:
+                return {"success": False, "exit_code": 44, "output": "__SAG_FILE_MISSING__"}
+            payload = base64.b64encode(self.manifest.encode()).decode()
+            return {"success": True, "exit_code": 0, "output": f"__SAG_FILE_BASE64__{payload}"}
         if text.startswith("cat ") and "<<" not in text and BUILD_REQUIREMENTS_PATH in text:
             if self.manifest is None:
                 return {"success": False, "exit_code": 1, "output": ""}

@@ -218,6 +218,15 @@ def promote_structure(
 
     Never raises: the caller is mid-invocation and owes the model a result, and
     a manifest we could not update is a missing improvement, not a failure.
+
+    §3.9 makes the read fail LOUDLY instead of reporting "absent" (which once
+    let a settlement-time read failure replace the whole manifest with one
+    structure key — the merged-lanes wipe). The failure lands in the except
+    below: no write, promotion lost for THIS receipt. Accepted, and bounded:
+    settlement is idempotent so the settled obligation never retries, but
+    every LATER terminal receipt runs this same promotion, so the structure
+    lands with the next real dispatch. Pinned by
+    test_a_failed_promotion_is_recovered_by_the_next_terminal_receipt.
     """
     structure = structure_from_receipt(receipt)
     if not structure:
@@ -254,7 +263,13 @@ def promote_structure(
         )
         return bool(result.get("success") or result.get("exit_code") == 0)
     except Exception as exc:
-        logger.debug(f"receipt-proven structure not persisted: {exc}")
+        # Warning, not debug: a lost promotion is invisible in every other
+        # channel, and the round-four review found the debug line was the only
+        # trace a permanently-lost improvement left.
+        logger.warning(
+            f"receipt-proven structure not persisted for "
+            f"{str((receipt or {}).get('receipt_id') or 'unknown receipt')}: {exc}"
+        )
         return False
 
 

@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from loguru import logger
 
-from sag.runtime.container_io import read_container_text
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
 from sag.tools.internal.python_env import (
     _REPAIR_ACTION_PHRASE,
@@ -39,11 +39,37 @@ def write_build_requirements(orchestrator, data: Dict[str, Any]) -> bool:
     the same blind spot the first survey had (polaris's Kotlin settings are
     unparsed on every pass). A receipt-proven module structure therefore
     survives the rewrite — only a receipt may replace a receipt.
-    """
-    try:
-        from sag.agent.receipt_structure import preserve_receipt_structure
 
-        data = preserve_receipt_structure(dict(data), read_build_requirements(orchestrator))
+    Plan 8 §3.9: the preservation read is STRICT. `read_build_requirements`'
+    degrade-to-{} contract serves its eighteen read-only consumers, but this
+    is a read-modify-WRITE: degrading a failed read to {} here would conclude
+    "no proven structure exists" from "could not look" and overwrite a
+    manifest that may hold one. A read that did not succeed refuses the whole
+    write; verified absence (None) and a corrupt body (whose structure no
+    reader can recover anyway) proceed.
+    """
+    from sag.agent.receipt_structure import preserve_receipt_structure
+
+    try:
+        content = read_container_text(orchestrator, REQUIREMENTS_PATH, exact_bytes=True)
+    except ContainerFileReadError as exc:
+        logger.warning(
+            f"Refusing to rewrite build requirements: the current manifest "
+            f"could not be read ({exc})"
+        )
+        return False
+    try:
+        current: Dict[str, Any] = {}
+        if content is not None:
+            try:
+                loaded = json.loads(content)
+                if isinstance(loaded, dict):
+                    current = loaded
+            except (TypeError, ValueError):
+                # A corrupt manifest is unreadable to EVERY consumer; nothing
+                # recoverable is lost by replacing it with fresh survey data.
+                logger.warning("Existing build requirements did not parse; replacing")
+        data = preserve_receipt_structure(dict(data), current)
         body = json.dumps(data, indent=2, sort_keys=True)
         orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
         result = orchestrator.execute_command(
