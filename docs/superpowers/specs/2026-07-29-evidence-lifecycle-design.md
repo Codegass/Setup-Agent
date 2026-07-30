@@ -87,6 +87,30 @@ as permanently unready and skips build and test — absence collapsed to
 > tiers: a receipt-proven statement of structure outranks a survey guess the
 > moment it exists — which is the provenance ladder this project already has,
 > applied to structure.
+>
+> **P4 — removing evidence must never improve a verdict.** Discarding a
+> receipt, failing to read one, or swallowing an exception into `None` may make
+> a verdict less certain. It may never make it better.
+
+P4 was added after three implementation rounds each shipped an upward
+refinement in the same file, and it is the diagnosis of why. The #17 narrowing
+has an inverted incentive built into it: the coverage denominator shrinks with
+the attempted-module set, so **anything that removes a module from that set
+makes the build look more complete**. Three changes, each defensible on its own
+terms, each tripped it:
+
+| round | the change | the effect |
+|---|---|---|
+| 1 | fall back to the persisted structure when the receipt probe returns nothing | a stale single-module structure narrowed a 26-module denominator to 1 |
+| 2 | key the authority on "a receipt stated modules" | the minority-scan cap was disarmed by a receipt's mere existence |
+| 3 | filter non-terminal receipts out of `_attempted_modules` | dropping an OOM-killed reactor's 26 modules let a scoped `-pl m0` retry narrow to 1 and grade GREEN — a regression from both main and round two |
+
+All three are the same bug. So the rule is structural, not a patch: a receipt
+the harness will not trust as a *prover* must still be counted as a *claimant*.
+An unreadable, non-terminal, or crashed dispatch **caps** the verdict — exactly
+as §3.3 already does for an unsettled obligation — and never shrinks the
+denominator. Narrowing is licensed only by evidence the harness is willing to
+stand behind in both directions.
 
 ## 3. Components
 
