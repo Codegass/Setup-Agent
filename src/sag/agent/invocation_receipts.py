@@ -43,6 +43,8 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from loguru import logger
 
+from sag.agent.receipt_structure import promote_structure
+
 RECEIPT_SCHEMA_VERSION = 2
 RECEIPT_DIR = "/workspace/.setup_agent/invocation_receipts"
 # Heredoc delimiter for the atomic write. The body is single-line JSON, so no
@@ -348,6 +350,8 @@ def build_receipt(
     exit_code: Optional[int],
     before: Mapping[str, str],
     after: Mapping[str, str],
+    lifecycle_state: Optional[str] = None,
+    termination_reason: Optional[str] = None,
     target_sha: Optional[str] = None,
     survey_fingerprint: Optional[str] = None,
     config_fingerprint: Optional[str] = None,
@@ -388,7 +392,17 @@ def build_receipt(
     # verdict (invocation_contracts.compliance_class). A dispatch with no
     # frozen contract states none of the three — a receipt never claims
     # compliance with a contract that does not exist.
+    # HOW the dispatch ended, which the exit code alone cannot say: a detached
+    # job whose process vanished carries a SYNTHESIZED exit code (orch's
+    # `collect_detached_result`) and a log truncated at the kill, and a dispatch
+    # a timeout monitor stopped states its reason. Both were invisible on the
+    # receipt, so a reader could not tell a recorded terminal status from a
+    # manufactured one — and `receipt_structure` promoted a partial module list
+    # as receipt-proven fact. Absent when the dispatch returned in band, which
+    # IS the process's own status.
     for key, value in (
+        ("lifecycle_state", lifecycle_state),
+        ("termination_reason", termination_reason),
         ("actual_cwd", actual_cwd or working_directory),
         ("contract_id", contract_id),
         ("contract_hash", contract_hash),
@@ -485,6 +499,8 @@ def record_invocation(
     exit_code: Optional[int],
     before: Mapping[str, str],
     after: Mapping[str, str],
+    lifecycle_state: Optional[str] = None,
+    termination_reason: Optional[str] = None,
     output: Optional[str] = None,
     requirements: Optional[Mapping[str, Any]] = None,
     contract_id: Optional[str] = None,
@@ -520,6 +536,8 @@ def record_invocation(
         exit_code=exit_code,
         before=before,
         after=after,
+        lifecycle_state=lifecycle_state,
+        termination_reason=termination_reason,
         target_sha=target_sha(execute, working_directory),
         domain_id=nearest_domain_root(requirements, working_directory),
         actual_cwd=working_directory,
@@ -541,6 +559,13 @@ def record_invocation(
         **survey_pins(requirements),
     )
     if write_receipt(execute, receipt):
+        # Plan 8 §3.6: a terminal receipt that named its modules has PROVEN the
+        # project's structure, and the survey only proposed it. Promoting here
+        # means one writer for both facts — a receipt settled late (§3.2)
+        # promotes exactly like a synchronous one, with no second bookkeeping
+        # system to keep in step. A receipt that named no modules writes
+        # nothing at all.
+        promote_structure(execute, receipt)
         return {"receipt_id": receipt["receipt_id"]}
     return {"receipt_persisted": False}
 

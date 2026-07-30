@@ -33,8 +33,17 @@ REQUIREMENTS_PATH = BUILD_REQUIREMENTS_PATH
 
 
 def write_build_requirements(orchestrator, data: Dict[str, Any]) -> bool:
-    """Persist the analyzer's build requirements into the container."""
+    """Persist the analyzer's build requirements into the container.
+
+    Plan 8 §3.6: this rewrites the WHOLE manifest, and a survey re-run carries
+    the same blind spot the first survey had (polaris's Kotlin settings are
+    unparsed on every pass). A receipt-proven module structure therefore
+    survives the rewrite — only a receipt may replace a receipt.
+    """
     try:
+        from sag.agent.receipt_structure import preserve_receipt_structure
+
+        data = preserve_receipt_structure(dict(data), read_build_requirements(orchestrator))
         body = json.dumps(data, indent=2, sort_keys=True)
         orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
         result = orchestrator.execute_command(

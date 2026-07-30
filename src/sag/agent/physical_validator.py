@@ -32,11 +32,13 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from sag.agent.receipt_structure import dispatch_terminated as _dispatch_terminated
+from sag.agent.receipt_structure import module_key as _receipt_module_key
 from sag.config.settings import (
     DEFAULT_BUILD_COVERAGE_THRESHOLD,
     DEFAULT_TEST_EXECUTION_THRESHOLD,
@@ -203,6 +205,75 @@ def _dist_record_matches(record_dir: str, project_name: str) -> bool:
 # live in the documented SIBLING directory (.setup_agent/evidence_assessments),
 # which the in-container parser derives from this one.
 INVOCATION_RECEIPTS_DIRNAME = ".setup_agent/invocation_receipts"
+
+
+class _ExpectationScope(NamedTuple):
+    """What scoping coverage to the attempted modules produced (Plan 8 §3.5).
+
+    `denominator_modules` is the outcome's OWN statement of which computation set
+    the denominator: the attempted list when the narrowing took effect, `None`
+    when it refused and the survey's wide expectation list stood. Round two
+    computed that authority a second time, in parallel, from "a receipt stated
+    some modules" — so a receipt whose modules could not be mapped onto any
+    expectation (`build_coverage_scope_unverified` recorded in the same pass)
+    still claimed the receipt rung and disarmed the §3.5 minority-scan cap.
+    Authority is a property of the denominator a run ACTUALLY used, and this is
+    the one computation that knows which that was.
+    """
+
+    expectations: List[Dict[str, Any]]
+    untried: List[str]
+    conflict: Optional[str]
+    denominator_modules: Optional[Tuple[str, ...]]
+
+
+class _AttemptedModules(NamedTuple):
+    """What this run's dispatches STATED they attempted, and whether the harness
+    will narrow the coverage denominator on that statement (Plan 8 §2 P4).
+
+    Two answers, because collapsing them into one is the bug this plan is about.
+    The #17 narrowing shrinks the denominator with this set, so anything that
+    removes a module from it makes the build look MORE complete — and three
+    rounds each removed something for a good reason and each improved a verdict.
+
+    * ``modules`` — every module ANY readable receipt named, terminal or not.
+      A receipt the harness will not trust as a PROVER is still a CLAIMANT: the
+      modules a crashed reactor printed are modules this run attempted, so they
+      belong in the denominator. Round three deleted them, and a scoped
+      `mvn -pl m0` retry beside an OOM-killed 26-module reactor then narrowed the
+      denominator to one module and graded GREEN.
+    * ``narrowing_licensed`` — False when a statement exists that the harness
+      will not narrow on. "No dispatch stated anything" (a single-module build,
+      a receipt-free run) is the honest wide default and licenses nothing to
+      narrow; "a dispatch stated something we refuse to narrow on" is a
+      different fact and must produce the wide denominator AND a cap.
+    * ``cap`` — the conflict code naming why, or None. Never a silent None: a
+      swallowed exception is the second case above, not the first.
+    """
+
+    modules: Tuple[str, ...]
+    narrowing_licensed: bool
+    cap: Optional[str]
+
+
+# One clause per reason the denominator could not be narrowed to what ran, used
+# by BOTH the warning and the capped reason sentence, so the model can never be
+# shown two different explanations of one refusal (spec §2 P3).
+_DENOMINATOR_REFUSALS = {
+    "build_coverage_scope_unverified": (
+        "the build named modules the expectation list does not contain"
+    ),
+    "build_receipt_not_terminal": (
+        "a dispatch that did not end on its own stated the modules it had reached"
+    ),
+    "build_receipts_unreadable": "this run's invocation receipts could not be read",
+}
+
+# Whether the receipt directory could be READ, which is three answers and not
+# two: a probe that threw is not the same fact as a run that wrote no receipts.
+_RECEIPTS_PRESENT = "present"
+_RECEIPTS_ABSENT = "absent"
+_RECEIPTS_UNREADABLE = "unreadable"
 
 
 # In-container test-report parser (executed via `python3 - <<'PY'`). The four
@@ -1063,6 +1134,25 @@ def evaluate_run_verdict(
     if not build_green:
         return "failed"
     return "success" if pass_rate >= test_pass_threshold * 100.0 else "failed"
+
+
+def _coverage_basis(coverage_info: Dict[str, Any]) -> str:
+    """Does the CLASS-weighted coverage fraction have a basis? (Plan 8 §3.4)
+
+    `derived` when class expectations were derived and the fraction is stated;
+    `none` when they were not, which is why `class_coverage` is then absent
+    rather than 1.0. It says nothing about the other expectations: a jar or file
+    expectation is still a basis, and a met one still decides — "no class-based
+    expectation" and "no expectation of any kind" are different facts.
+
+    Stated by `_verify_expected_artifacts`; inferred from the expectation count
+    for a caller that predates the field, so an old rollup still classifies the
+    same way it always did rather than defaulting to "met".
+    """
+    stated = str((coverage_info or {}).get("basis") or "").strip()
+    if stated in ("derived", "none"):
+        return stated
+    return "derived" if int((coverage_info or {}).get("classes_expected") or 0) > 0 else "none"
 
 
 def _format_build_duration(seconds: float) -> str:
@@ -2158,28 +2248,58 @@ class PhysicalValidator:
         """The schema-v1 receipt directory for this workspace."""
         return f"{self.project_path.rstrip('/')}/{INVOCATION_RECEIPTS_DIRNAME}"
 
-    def _attempted_modules(self) -> Optional[Tuple[str, ...]]:
-        """Modules THIS run's dispatches attempted, in the build system's words.
+    def _attempted_module_evidence(self) -> "_AttemptedModules":
+        """Modules THIS run's dispatches attempted, and whether we may narrow.
 
-        Read from the receipts' `module_outcomes` — Maven's reactor summary,
-        the modules whose tasks Gradle ran. `None` means no dispatch stated
-        anything, which is the honest answer for a single-module build (Maven
-        prints no reactor summary for one module) and for a receipt-free run.
+        Read from the receipts' `module_outcomes` — Maven's reactor summary, the
+        modules whose tasks Gradle ran. This is the coverage SCOPE: counting
+        `src/main/java` across the whole tree measures modules a scoped build
+        (`-pl`), an early-stopping reactor or a disabled profile never tried, and
+        calls them missing.
 
-        This is the coverage SCOPE. Counting `src/main/java` across the whole
-        tree measures modules a scoped build (`-pl`), an early-stopping reactor
-        or a disabled profile never tried, and calls them missing.
+        THE ONE RULE (spec §2 P4, §3.6): a receipt the harness will not trust as
+        a PROVER is still counted as a CLAIMANT. Every module any readable
+        receipt named goes into `modules`, because they are modules this run
+        attempted; what a receipt's untrustworthiness costs is the LICENCE TO
+        NARROW, and the refusal caps the verdict exactly as §3.3 caps on an
+        unsettled obligation.
+
+        Two kinds of statement the harness will not narrow on:
+
+        * a NON-TERMINAL dispatch (`dispatch_terminated` False — a detached job
+          that vanished with a synthesized exit code, one a timeout monitor
+          killed). Its module list is a PREFIX: Gradle prints
+          `> Task :m:compileJava` incrementally, so a 300-module build OOM-killed
+          at module 40 names exactly 40, and narrowing to those 40 would read the
+          260 the build never reached as "untried, not unbuilt". Round three drew
+          the right conclusion (do not narrow) from the wrong mechanism (drop the
+          receipt), and dropping it let a scoped `-pl m0` retry narrow 26 modules
+          to one.
+        * a receipt LINE THAT DID NOT PARSE, or a probe that threw. It states
+          nothing we may act on AND hides whatever it did state, so the honest
+          answer is the wide denominator plus a cap. Swallowing it into "nothing
+          stated" is P4's third verb, and it is the one that lets a wide receipt
+          disappear while a narrow one decides.
+
+        `narrowing_licensed` with an empty `modules` is the honest default of a
+        single-module build (Maven prints no reactor summary for one module) and
+        of a receipt-free run: nothing to narrow on, and nothing to cap.
         """
-        if not self.docker_orchestrator or not self._invocation_receipts_present():
-            return None
+        receipts = self._invocation_receipts_state()
+        if receipts == _RECEIPTS_UNREADABLE:
+            return _AttemptedModules((), False, "build_receipts_unreadable")
+        if receipts != _RECEIPTS_PRESENT:
+            return _AttemptedModules((), True, None)
         try:
             probe = self.docker_orchestrator.execute_command(
                 f"cat {shlex.quote(self._invocation_receipts_dir())}/*.json 2>/dev/null"
             )
         except Exception as exc:
             logger.debug(f"attempted-module read failed: {exc}")
-            return None
+            return _AttemptedModules((), False, "build_receipts_unreadable")
         modules: List[str] = []
+        unreadable = False
+        unproven = False
         for line in ((probe or {}).get("output") or "").splitlines():
             line = line.strip()
             if not line.startswith("{"):
@@ -2187,12 +2307,75 @@ class PhysicalValidator:
             try:
                 payload = json.loads(line)
             except ValueError:
+                # A half-written or clipped receipt line. It is a receipt, and we
+                # cannot say what it claimed.
+                unreadable = True
                 continue
+            stated = False
             for entry in payload.get("module_outcomes") or ():
                 name = str((entry or {}).get("module") or "").strip()
-                if name and name not in modules:
+                if not name:
+                    continue
+                stated = True
+                if name not in modules:
                     modules.append(name)
-        return tuple(modules) or None
+            # A non-terminal receipt that stated NO modules said nothing about
+            # the structure, so there is nothing to refuse and nothing to cap;
+            # its own unsettled-obligation cap is §3.3's job, not the
+            # denominator's.
+            if stated and not _dispatch_terminated(payload):
+                unproven = True
+        cap = (
+            "build_receipts_unreadable"
+            if unreadable
+            else "build_receipt_not_terminal" if unproven else None
+        )
+        return _AttemptedModules(tuple(modules), cap is None, cap)
+
+    def _receipt_structure(self) -> Dict[str, Any]:
+        """The receipt-proven module structure, or {} (Plan 8 §3.6).
+
+        A survey guess (`root_shape: single_module`, `build_islands: []`) is a
+        proposal; a terminal receipt that named its modules is a statement.
+        This reads the statement, so the denominator can stand on it even in a
+        phase whose own dispatches stated nothing.
+        """
+        if not self.docker_orchestrator:
+            return {}
+        try:
+            from sag.agent.receipt_structure import read_module_structure
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            return read_module_structure(read_build_requirements(self.docker_orchestrator)) or {}
+        except Exception as exc:
+            logger.debug(f"receipt-proven structure unavailable: {exc}")
+            return {}
+
+    def _module_scan_result(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """One walk of the tree: which modules exist, which produced output."""
+        try:
+            from sag.agent.module_coverage import module_coverage
+
+            return module_coverage(self, project_name)
+        except Exception as exc:
+            logger.debug(f"module scan unavailable: {exc}")
+            return None
+
+    def module_scan(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """The scan THIS gate pass decided on (Plan 8 §3.5 / P3).
+
+        `validate_build_status` scans and stores; the checklist line the gate
+        appends reads the stored object. Before p7d these were two walks, and
+        the two halves of one sentence disagreed: "Built 100% of expected
+        classes · Module coverage: 1/26 built". Two computations answering one
+        question is how the wrong one ends up deciding.
+        """
+        cached = getattr(self, "_last_module_scan", None)
+        if cached and cached[0] == project_name:
+            return cached[1]
+        scan = self._module_scan_result(project_name)
+        self._last_module_scan = (project_name, scan)
+        return scan
 
     @staticmethod
     def _module_key(value: str) -> str:
@@ -2203,29 +2386,36 @@ class PhysicalValidator:
         only match this claims; anything less certain is left unmatched, and
         an unmatched expectation keeps the denominator rather than quietly
         leaving it.
+
+        The formula lives in `sag.agent.receipt_structure` because the
+        persisted structure fact (Plan 8 §3.6) keys its module list the same
+        way. Two copies of a key formula is two copies that drift.
         """
-        tail = str(value or "").replace("\\", "/").rstrip("/").split("/")[-1]
-        tail = tail.split("::")[-1]
-        return "".join(ch for ch in tail.lower() if ch.isalnum())
+        return _receipt_module_key(value)
 
     def _scope_expectations_to_attempted(
         self,
         expected_artifacts: List[Dict[str, Any]],
         attempted: Optional[Tuple[str, ...]],
-    ) -> Tuple[List[Dict[str, Any]], List[str], Optional[str]]:
-        """`(scoped, untried, conflict)` — narrow coverage to what ran.
+    ) -> "_ExpectationScope":
+        """Narrow coverage to what ran, and state WHICH denominator came out.
 
         The narrowing happens ONLY when every attempted module maps to an
         expectation. A partial mapping would drop expectations for modules
         that did run and inflate the score, which is worse than the wide
         denominator it replaces; in that case the expectations stand and the
         disagreement is recorded instead.
+
+        `denominator_modules` is the outcome's own answer to "which computation
+        set the denominator": the attempted list when the narrowing took effect,
+        `None` when the survey's wide expectation list stood. It is the single
+        place that question is answered (spec §2 P3) — see the call site.
         """
         if not expected_artifacts or not attempted:
-            return list(expected_artifacts), [], None
+            return _ExpectationScope(list(expected_artifacts), [], None, None)
         attempted_keys = {self._module_key(name) for name in attempted} - {""}
         if not attempted_keys:
-            return list(expected_artifacts), [], None
+            return _ExpectationScope(list(expected_artifacts), [], None, None)
         scoped: List[Dict[str, Any]] = []
         untried: List[str] = []
         matched_keys = set()
@@ -2241,26 +2431,42 @@ class PhysicalValidator:
         if matched_keys != attempted_keys:
             # The build named modules this expectation list does not contain:
             # the mapping is incomplete, so the wide denominator stands and
-            # says so rather than a narrowed one nobody can check.
-            return (
+            # says so rather than a narrowed one nobody can check. The receipt
+            # did NOT set the denominator here, so it is not the authority
+            # either — `denominator_modules` stays None and the scan cap is live.
+            return _ExpectationScope(
                 list(expected_artifacts),
                 [],
                 "build_coverage_scope_unverified",
+                None,
             )
-        return scoped, untried, None
+        return _ExpectationScope(scoped, untried, None, tuple(attempted))
 
-    def _invocation_receipts_present(self) -> bool:
-        """One cheap probe; a receipt-free run must pay nothing beyond it."""
+    def _invocation_receipts_state(self) -> str:
+        """One cheap probe, THREE answers; a receipt-free run pays nothing more.
+
+        A probe that threw is not the fact "this run wrote no receipts" — it is
+        "we do not know", and the denominator reader must be able to tell them
+        apart (spec §2 P4: failing to read evidence may not improve a verdict).
+        Every caller that only needs presence keeps its two-answer view below.
+        """
         if not self.docker_orchestrator:
-            return False
+            return _RECEIPTS_ABSENT
         try:
             probe = self.docker_orchestrator.execute_command(
                 f"test -d {shlex.quote(self._invocation_receipts_dir())} && echo EXISTS"
             )
         except Exception as exc:
             logger.debug(f"Invocation-receipt probe failed: {exc}")
-            return False
-        return "EXISTS" in ((probe or {}).get("output") or "")
+            return _RECEIPTS_UNREADABLE
+        if "EXISTS" in ((probe or {}).get("output") or ""):
+            return _RECEIPTS_PRESENT
+        return _RECEIPTS_ABSENT
+
+    def _invocation_receipts_present(self) -> bool:
+        """Presence, byte-identically to before: only a probe that SAW the
+        directory is presence, and a probe that failed is not."""
+        return self._invocation_receipts_state() == _RECEIPTS_PRESENT
 
     def _primary_test_coordinate_root(self) -> Optional[str]:
         """attempt_policy's primary test coordinate (Plan 4), or None.
@@ -3125,21 +3331,55 @@ class PhysicalValidator:
         # Coverage is measured against what THIS run attempted, not against
         # every source tree on disk (Plan 7: the reactor summary sets the
         # scope, the file count verifies the substance).
-        attempted_modules = self._attempted_modules()
+        # Plan 8 §2 P4: the read states BOTH what the dispatches claimed and
+        # whether the harness will narrow on that claim. A receipt it will not
+        # narrow on still contributes its modules (they were attempted) and caps
+        # the verdict; it never shrinks the denominator.
+        attempted = self._attempted_module_evidence()
+        attempted_modules = attempted.modules or None
+        # Plan 8 §3.6, and only as far as it may honestly go: the persisted
+        # receipt-proven structure NAMES the receipt behind a denominator; it is
+        # never a substitute for this pass's attempted-module list. Narrowing the
+        # denominator is licensed only by what THIS pass's receipts say they
+        # attempted — a structure proved by an earlier `mvn -pl core` would drop
+        # every other module's expectation as "untried" and refine a partial
+        # build UPWARD into a complete success, which is the exact P0-F
+        # direction the plan forbids.
+        receipt_structure = self._receipt_structure()
+        scope = self._scope_expectations_to_attempted(
+            list(expected_artifacts),
+            attempted_modules if attempted.narrowing_licensed else None,
+        )
         scoped_artifacts, untried_modules, scope_conflict = (
-            self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
+            scope.expectations,
+            scope.untried,
+            scope.conflict,
         )
         if attempted_modules:
             evidence["modules_attempted"] = list(attempted_modules)
         if untried_modules:
             evidence["modules_untried"] = untried_modules
+        # Every reason the denominator was NOT narrowed to what ran, in one list.
+        # Each is a cap below complete: the narrowing is licensed only by evidence
+        # the harness will stand behind in both directions, and a refusal that
+        # left no trace is how the p7d polaris sentence graded green.
+        denominator_refusals: List[str] = []
         if scope_conflict:
+            denominator_refusals.append(scope_conflict)
             evidence.setdefault("conflicts", []).append(scope_conflict)
             evidence["warnings"].append(
                 f"Build coverage is measured against {len(expected_artifacts)} module "
                 f"expectation(s) while the build stated it attempted "
                 f"{len(attempted_modules or ())}; the two could not be matched, so the "
                 "wider denominator stands"
+            )
+        if attempted.cap:
+            denominator_refusals.append(attempted.cap)
+            evidence.setdefault("conflicts", []).append(attempted.cap)
+            evidence["warnings"].append(
+                "Build coverage was NOT narrowed to the modules this run attempted: "
+                f"{_DENOMINATOR_REFUSALS.get(attempted.cap, attempted.cap)}; the wider "
+                "denominator stands and the build cannot be graded complete"
             )
         coverage_info = (
             self._verify_expected_artifacts(project_dir, scoped_artifacts)
@@ -3149,6 +3389,25 @@ class PhysicalValidator:
         threshold = self.build_coverage_threshold
         class_count = artifacts_result.get("class_count", 0)
         has_real_output = evidence["has_build_fingerprints"] or class_count > 0
+        # Plan 8 §3.5: ONE scan, two consumers. The walk happens here, the gate
+        # renders its checklist from this same object (module_scan holds it),
+        # and the denominator's authority is a stated ladder — a terminal
+        # receipt, else this scan, else the survey's expectations.
+        #
+        # The rung comes from `scope.denominator_modules`, i.e. from the scoping
+        # OUTCOME, not from "a receipt exists": when the narrowing was refused
+        # (`build_coverage_scope_unverified` above) the receipt did not set this
+        # pass's denominator — the survey's wide expectation list did — so the
+        # receipt is not the authority and the scan cap below stays live. One
+        # question, one computation (spec §2 P3).
+        from sag.agent.module_coverage import module_basis
+
+        self._last_module_scan = (project_name, self._module_scan_result(project_name))
+        basis = module_basis(
+            self._last_module_scan[1],
+            denominator_modules=scope.denominator_modules,
+            structure=receipt_structure,
+        )
 
         # Hard JVM gate (Part 1 principle, applied to EVERY branch): a maven/gradle
         # build is green only with compiled .class evidence. With zero compiled
@@ -3180,21 +3439,90 @@ class PhysicalValidator:
                 f"compiled (an empty target/classes dir or a coverage default is not "
                 f"proof of compilation)"
             )
+        elif (
+            coverage_info is not None
+            and _coverage_basis(coverage_info) == "none"
+            and (not coverage_info["all_present"] or class_count == 0)
+        ):
+            # Plan 8 §3.4 (P2): no CLASS-weighted expectation could be derived,
+            # so there is no fraction to grade — and the expectations that WERE
+            # derived are not met. The check states that and the caller decides;
+            # it never reads "nothing to measure" as "everything passed", which
+            # is how p7d polaris earned "Built 100% of expected classes" from a
+            # `class_coverage` that defaulted to 1.0.
+            #
+            # TWO independent questions, and each has its own arm. Round one
+            # keyed the branch on "no class-based expectation" alone and a met
+            # JAR expectation could not reach a full success; round two added
+            # `and not all_present` and re-opened the zero-classes direction, so
+            # a build that compiled NOTHING beside a jar on disk graded complete.
+            # The table, entered on either trigger:
+            #
+            #  * nothing compiled -> BLOCKED, whether or not the derived
+            #    expectations are met. This is the hard JVM gate (commons-chain,
+            #    0 classes under a non-standard src layout); the
+            #    `jvm_no_compiled_evidence` branch above catches only the case
+            #    with no artifacts at all, and a checked-in or stale jar IS an
+            #    artifact. Measuring compilation in `.class` files is a JVM-only
+            #    contract, and this whole chain is JVM-only by construction: for
+            #    any other build system `expected_artifacts` is `[]` (see where it
+            #    is derived above), so `coverage_info` is None and no arm here is
+            #    reachable. An extra `build_system in ("maven", "gradle")` test
+            #    would be dead code that reads like a live guard.
+            #  * classes compiled, an expectation unmet -> PARTIAL. Real output
+            #    happened; how much of the project it is remains unknown, and the
+            #    sentence names the artifacts that are missing rather than
+            #    implying nothing was expected.
+            #
+            # A met expectation WITH classes compiled never reaches here: it is a
+            # basis, it decided, and the Kotlin/Scala/Groovy module whose parsers
+            # emit only the JAR expectation still gets its full success below.
+            absent = coverage_info.get("missing") or []
+            listed = ", ".join(absent[:5]) + (" ..." if len(absent) > 5 else "")
+            named = f" ({listed})" if absent else ""
+            if class_count > 0:
+                success, complete = True, False
+                reason = (
+                    f"compiled {class_count:,} classes; {len(absent)} expected "
+                    f"artifact(s) missing{named} and no class-based expectation "
+                    f"could be derived — coverage has no basis"
+                )
+            elif coverage_info["all_present"]:
+                success, complete = False, False
+                present = ", ".join(coverage_info.get("found") or [])
+                reason = (
+                    f"No compiled .class files found for {build_system} build — the "
+                    f"expected artifact(s) are present ({present}) but nothing compiled, "
+                    f"and no class-based expectation could be derived; an existing JAR is "
+                    f"not evidence this build compiled the project"
+                )
+            else:
+                success, complete = False, False
+                reason = (
+                    f"No compiled .class files found for {build_system} build — nothing "
+                    f"compiled, and no class-based expectation could be derived, so "
+                    f"coverage has no basis"
+                )
         elif coverage_info is not None:
-            coverage = coverage_info.get("class_coverage", 1.0)
+            # `class_coverage` is ABSENT when nothing class-based was expected
+            # (Plan 8 §3.4), and absent is not 1.0 — the old `.get(..., 1.0)`
+            # default is what read "nothing to measure" as a met threshold. The
+            # only way into this branch without a fraction is with every derived
+            # expectation present, which decides on its own.
+            coverage = coverage_info.get("class_coverage")
             missing = coverage_info.get("missing", [])
-            if coverage_info["all_present"] or coverage >= threshold:
+            if coverage_info["all_present"] or (coverage is not None and coverage >= threshold):
                 success, complete = True, True
                 reason = (
                     f"All expected build artifacts found: "
                     f"{', '.join(coverage_info['found'][:5])}"
                     if coverage_info["all_present"]
                     else (
-                        f"Built {coverage * 100:.0f}% of expected classes "
+                        f"Built {(coverage or 0) * 100:.0f}% of expected classes "
                         f"(>= {threshold * 100:.0f}% threshold)"
                     )
                 )
-            elif coverage > 0 or has_real_output:
+            elif (coverage or 0) > 0 or has_real_output:
                 # Real build output, but some ACTIVE modules did not compile —
                 # honest PARTIAL, not a clean success.
                 #
@@ -3218,7 +3546,7 @@ class PhysicalValidator:
             else:
                 success, complete = False, False
                 reason = (
-                    f"Only {coverage * 100:.0f}% of expected classes built "
+                    f"Only {(coverage or 0) * 100:.0f}% of expected classes built "
                     f"(< {threshold * 100:.0f}% threshold) — missing: "
                     f"{', '.join(missing[:8])}" + (" ..." if len(missing) > 8 else "")
                 )
@@ -3227,6 +3555,27 @@ class PhysicalValidator:
             # Fingerprints but no determinable per-module expectations (e.g. an
             # aggregator/empty root pom with no parseable modules or sources):
             # treat as a real, complete build (nothing to be incomplete against).
+            #
+            # STATED PLAINLY (Plan 8 §3.4, and NOT changed here): this — not the
+            # branch above — is the arm where NO expectation of any kind could be
+            # derived, so §3.4's own words ("basis none, classes > 0 -> PARTIAL;
+            # classes = 0 -> BLOCKED") describe THIS branch, and this branch
+            # returns a complete build. The consequence is exact: the "no
+            # class-based expectation could be derived / coverage has no basis"
+            # sentence above is unreachable for an input that derived NOTHING; it
+            # only ever speaks for an input that derived a jar-or-file expectation
+            # and no class expectation (which is the p7d polaris shape, and is why
+            # polaris does reach it).
+            #
+            # Left at today's verdict deliberately, and measured rather than
+            # assumed: routing `coverage_info is None` to partial/blocked for
+            # maven/gradle turns three long-standing fences red — including
+            # `test_validate_build_status_maven_unaffected` (commons-cli shape:
+            # pom.xml, a jar, an empty target/classes, no derivable expectation)
+            # and `test_build_validation_refs_prefer_artifact_samples`. That is a
+            # verdict change for every single-module JVM project whose sources we
+            # cannot enumerate, which is a spec decision and not this round's
+            # finding. It is unchanged from main, so it is not a regression here.
             success, complete = True, True
             reason = f"Build fingerprints found for {build_system} project"
 
@@ -3267,6 +3616,57 @@ class PhysicalValidator:
             )
             reason = f"{reason}; {reactor_reason}" if reason else reactor_reason
 
+        # Plan 8 §3.5: the scan that knew is no longer commentary. When no
+        # receipt outranks it, the scan OWNS the denominator, and a denominator
+        # that counted a minority cannot also report a complete build — the
+        # p7d polaris sentence ("Built 100% of expected classes · Module
+        # coverage: 1/26 built") is unconstructible from here on. Under a
+        # receipt-stated denominator the scan is deliberately not a cap: a
+        # module the build never attempted is untried, not unbuilt, which is
+        # the whole point of the #17 narrowing.
+        if build_system in ("maven", "gradle"):
+            if basis.states_a_shortfall or denominator_refusals:
+                if complete:
+                    # A completeness claim must not be left standing at the head
+                    # of the sentence beside a minority count. What DECIDED goes
+                    # first; what the earlier check found stays, subordinated,
+                    # because it is still a fact (the derived expectation list
+                    # really was met — it just did not cover the tree).
+                    #
+                    # The parenthetical is labelled with the check that ACTUALLY
+                    # produced it. `coverage_info is None` means no expectation of
+                    # any kind could be derived and no coverage check ran at all
+                    # (the fingerprint and artifact branches); calling that
+                    # sentence a coverage finding states something untrue about
+                    # where it came from (Category 3).
+                    if reason:
+                        label = "coverage check" if coverage_info is not None else "build check"
+                        found_clause = f" ({label}: {reason})"
+                    else:
+                        found_clause = ""
+                    if basis.states_a_shortfall:
+                        reason = (
+                            f"Not a complete build — the module scan owns the denominator "
+                            f"and {basis.built} of {basis.total} modules produced "
+                            f"output{found_clause}"
+                        )
+                    else:
+                        # §3.5's cap, reachable in EVERY state where the narrowing
+                        # did not take effect — including one where the module scan
+                        # is unavailable and cannot count a shortfall. The run
+                        # recorded that it could not check its own denominator;
+                        # that is uncertainty, and uncertainty is never complete.
+                        stated = "; ".join(
+                            _DENOMINATOR_REFUSALS.get(code, code)
+                            for code in dict.fromkeys(denominator_refusals)
+                        )
+                        reason = (
+                            f"Not a complete build — the coverage denominator could not be "
+                            f"narrowed to what this run attempted: {stated}{found_clause}"
+                        )
+                complete = False
+            reason = f"{reason} · {basis.phrase()}" if reason else basis.phrase()
+
         # Surface the build command + timed duration (if a command tracker with a
         # recorded build is attached) and the primary artifact for the metrics
         # read model. validate_build_status itself does not execute the build, so
@@ -3296,6 +3696,13 @@ class PhysicalValidator:
             conflicts = []
 
         conflicts.extend(self._collect_env_conflicts())
+        # A denominator the run could not check rides the verdict's OWN conflicts
+        # channel, not only the evidence dict: the finalizer and the report kernel
+        # cap on `result["conflicts"]`, and a disagreement that never reaches
+        # there is a disagreement nothing downstream can act on.
+        for code in denominator_refusals:
+            if code not in conflicts:
+                conflicts.append(code)
         if (
             isinstance(maven_reactor_snapshot, _MavenReactorSnapshot)
             and not maven_reactor_snapshot.complete
@@ -6385,14 +6792,19 @@ class PhysicalValidator:
                     result["missing"].append(expected["artifact"])
                     result["all_present"] = False
 
-        # Source-weighted fraction of expected classes actually produced. 1.0 when
-        # nothing class-based was expected (jar/file-only projects), so it never
-        # downgrades a build that has no per-module class expectations.
-        result["class_coverage"] = (
-            result["classes_found"] / result["classes_expected"]
-            if result["classes_expected"] > 0
-            else 1.0
-        )
+        # Source-weighted fraction of expected classes actually produced —
+        # stated ONLY when there was something to measure against. Plan 8 §3.4
+        # (P2, "no basis is its own answer"): the old else-branch returned 1.0
+        # for "nothing class-based was expected", and p7d polaris read that as
+        # a met threshold — "Built 100% of expected classes" over a survey that
+        # had derived no expectation at all. A basis of `none` carries NO
+        # `class_coverage` key, so no caller can compare against a number
+        # nothing produced.
+        if result["classes_expected"] > 0:
+            result["basis"] = "derived"
+            result["class_coverage"] = result["classes_found"] / result["classes_expected"]
+        else:
+            result["basis"] = "none"
         return result
 
     def _validate_gradle_cache(self, project_dir: str) -> Dict[str, any]:

@@ -14,9 +14,177 @@ Never raises: coverage is guidance and honesty, not a failure mode.
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
 
 from loguru import logger
+
+# Denominator authority, in order (Plan 8 spec §3.5). p7d polaris graded a
+# build against a denominator NOTHING derived — the survey could not read
+# `settings.gradle.kts`, so "100% of expected classes" was 100% of zero — while
+# the scan that had walked 26 subprojects only decorated the sentence. Which
+# computation owns the denominator is now a stated ladder, and the reason names
+# the rung it stood on.
+BASIS_RECEIPT = "receipt"
+BASIS_SCAN = "scan"
+BASIS_SURVEY = "survey"
+
+
+@dataclass(frozen=True)
+class ModuleBasis:
+    """Which computation set the coverage denominator, and what it stated.
+
+    ``built`` is stated only by the scan rung: a receipt states which modules the
+    build ATTEMPTED (the class-weighted coverage is measured against those,
+    unchanged since #17/d5dc330), and the survey states an expectation list, not
+    a module tally. ``total`` on the receipt rung is the number of MODULES the
+    denominator holds, counted on `module_key` exactly as the denominator is
+    keyed (`_module_count`) — not the number of labels the receipts printed.
+    """
+
+    authority: str
+    provenance: str
+    total: int = 0
+    built: int = 0
+
+    @property
+    def states_a_shortfall(self) -> bool:
+        """True only when the rung that OWNS the denominator counted a
+        minority. A scan under a receipt-stated denominator counts modules the
+        build never tried, which is untried, not unbuilt.
+
+        "Owns" means the denominator the run actually measured against — the
+        caller passes the scoping outcome's own answer. When the narrowing was
+        refused, the authority is this scan even though receipts exist, and the
+        cap fires: that is what makes "a passing coverage verdict beside a
+        minority module scan" unconstructible (spec §6 acceptance 1).
+        """
+        return self.authority == BASIS_SCAN and self.built < self.total
+
+    def phrase(self) -> str:
+        if self.authority == BASIS_RECEIPT:
+            # Named by id only when ONE promoted receipt stated exactly this
+            # module set (§3.6); otherwise the receipts collectively, which is
+            # still the receipt rung and says so.
+            stated_by = (
+                f"receipt {self.provenance}"
+                if self.provenance
+                else "the receipts' module outcomes"
+            )
+            return f"denominator: {stated_by} ({self.total} module(s) attempted)"
+        if self.authority == BASIS_SCAN:
+            return (
+                f"denominator: the module scan on disk "
+                f"({self.built}/{self.total} modules built)"
+            )
+        return "denominator: the survey's expectations"
+
+
+def _receipt_that_stated(structure: Mapping[str, Any] | None, modules: Sequence[str]) -> str:
+    """The receipt id to NAME for this denominator, or "" when none stated it.
+
+    The denominator is the union of every receipt's `module_outcomes`, while the
+    promoted structure fact (§3.6) is ONE receipt's statement. Naming that id
+    over a union it never made attributes a denominator to a receipt that did
+    not claim it — a Category-3 falsehood in one word. So the id is named only
+    when that receipt stated exactly the module set being counted; otherwise the
+    sentence credits the receipts collectively, which is true and is still the
+    receipt rung.
+    """
+    from sag.agent.receipt_structure import module_key
+
+    provenance = str((structure or {}).get("provenance") or "").strip()
+    if not provenance:
+        return ""
+    stated = {module_key(name) for name in (structure or {}).get("modules") or ()} - {""}
+    counted = {module_key(name) for name in modules} - {""}
+    return provenance if stated and stated == counted else ""
+
+
+def _module_count(modules: Sequence[str]) -> int:
+    """How many MODULES a label list names, counted the way the denominator is.
+
+    The denominator is keyed on `module_key` — that is why `Apache Camel :: Core`
+    can match the directory `core` at all — so counting labels instead of keys
+    tells the model more modules were attempted than the denominator contains
+    (two receipts spelling one module two ways, a reactor summary and a Gradle
+    task list naming the same subproject). A label that normalizes to nothing is
+    still a label the build printed and stays counted as itself; deduplicating on
+    a key that does not exist would be a guess.
+    """
+    from sag.agent.receipt_structure import module_key
+
+    counted = set()
+    for name in modules:
+        key = module_key(name)
+        counted.add(key if key else f"\0{name}")
+    return len(counted)
+
+
+def module_basis(
+    coverage: dict[str, Any] | None,
+    *,
+    denominator_modules: Sequence[str] | None = None,
+    structure: Mapping[str, Any] | None = None,
+) -> ModuleBasis:
+    """The ladder: a terminal receipt, else the scan on disk, else the survey.
+
+    ``denominator_modules`` is the modules that ACTUALLY SET this pass's
+    denominator — the answer the scoping outcome already computed
+    (`_ExpectationScope.denominator_modules`), not "the modules some receipt
+    mentioned". The distinction is the whole of round three's blocker: a receipt
+    naming `build-logic` against a lone `/build/libs` expectation cannot be
+    mapped, so scoping keeps the survey's wide list and records
+    `build_coverage_scope_unverified` — that receipt set no denominator, and
+    reading authority off its mere existence disarmed the §3.5 scan cap in the
+    exact p7d polaris state. Deciding it here a second time is the parallel
+    computation P3 forbids, so this function decides nothing: it reports.
+
+    ``structure`` is the promoted receipt-proven structure, consulted only to
+    name the receipt that stated this denominator.
+    """
+    modules = tuple(str(name) for name in (denominator_modules or ()) if str(name).strip())
+    if modules:
+        return ModuleBasis(
+            BASIS_RECEIPT,
+            _receipt_that_stated(structure, modules),
+            total=_module_count(modules),
+        )
+    summary = (coverage or {}).get("summary") or {}
+    total = int(summary.get("modules_total") or 0)
+    # The scan earns the denominator by enumerating a STRUCTURE the expectation
+    # walk did not have — polaris's 26 subprojects against a survey that parsed
+    # none. A one-module scan is not a structure: it is the same module the
+    # expectation check already measured, with a coarser instrument (a
+    # directory probe, not a source-weighted class count). Letting it decide
+    # there would re-create the split-brain P3 exists to prevent, pointing the
+    # other way.
+    if total > 1:
+        return ModuleBasis(
+            BASIS_SCAN,
+            "the module scan on disk",
+            total=total,
+            built=int(summary.get("modules_built") or 0),
+        )
+    return ModuleBasis(BASIS_SURVEY, "the survey's expectations")
+
+
+def shared_module_scan(validator, project_name) -> dict[str, Any] | None:
+    """The ONE scan of this gate pass (spec §3.5 / P3).
+
+    ``validate_build_status`` performs the scan and holds its result; the
+    checklist reads that same object rather than walking the tree a second
+    time. A validator without the hook (fakes, older callers) falls back to
+    scanning here, which is exactly the pre-Plan-8 behaviour.
+    """
+    method = getattr(validator, "module_scan", None)
+    if callable(method):
+        try:
+            return method(project_name)
+        except Exception as exc:  # pragma: no cover - guidance never raises
+            logger.debug(f"shared module scan unavailable: {exc}")
+            return None
+    return module_coverage(validator, project_name)
 
 
 def _record_richness(module: dict[str, Any]) -> int:
