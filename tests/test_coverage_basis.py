@@ -34,10 +34,12 @@ same object. Spec §3.5: the denominator has an authority order, and the message
 names which one it used.
 """
 
+import json
+
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
 
 from sag.agent.module_coverage import ModuleBasis, module_basis
-from sag.agent.physical_validator import PhysicalValidator
+from sag.agent.physical_validator import INVOCATION_RECEIPTS_DIRNAME, PhysicalValidator
 
 # The 26 subprojects polaris's `settings.gradle.kts` registers imperatively and
 # the survey never saw. Only `build-logic` had output when the gate graded.
@@ -73,7 +75,15 @@ def _polaris_scan(built=("build-logic",)):
     }
 
 
-def _polaris_validator(*, class_count=1706, has_artifacts=True, scan=None, jar_on_disk=False):
+def _polaris_validator(
+    *,
+    class_count=1706,
+    has_artifacts=True,
+    scan=None,
+    jar_on_disk=False,
+    attempted=None,
+    structure=None,
+):
     """A gradle build whose expectations are jar-only: nothing class-based can
     be derived, which is exactly what polaris's unparsed settings produced.
 
@@ -104,8 +114,8 @@ def _polaris_validator(*, class_count=1706, has_artifacts=True, scan=None, jar_o
         {"path": "/workspace/polaris/build/libs", "type": "jar", "artifact": "main JAR"}
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
-    validator._attempted_modules = lambda: None
-    validator._receipt_structure = lambda: {}
+    validator._attempted_modules = lambda: attempted
+    validator._receipt_structure = lambda: structure or {}
     return validator
 
 
@@ -114,7 +124,19 @@ def _polaris_validator(*, class_count=1706, has_artifacts=True, scan=None, jar_o
 MAVEN_MODULES = [f"m{index}" for index in range(26)]
 
 
-def _maven_reactor_validator(*, attempted=None, structure=None):
+def _maven_scan(built=("m0",)):
+    """The module scan's rollup for that same 26-module tree."""
+    return {
+        "project_dir": "/workspace/proj",
+        "summary": {"modules_total": len(MAVEN_MODULES), "modules_built": len(built)},
+        "modules": [
+            {"path": path, "build_status": "success" if path in built else "no_output"}
+            for path in MAVEN_MODULES
+        ],
+    }
+
+
+def _maven_reactor_validator(*, attempted=None, structure=None, scan=None):
     """A 26-module Maven project where only `m0` compiled (10 of 260 classes)."""
     files = {f"/workspace/proj/m0/target/classes/C{index}.class" for index in range(10)}
     files |= {"/workspace/proj/pom.xml", "/workspace/proj/m0/target/app.jar"}
@@ -139,10 +161,72 @@ def _maven_reactor_validator(*, attempted=None, structure=None):
         }
         for module in MAVEN_MODULES
     ]
-    validator._module_scan_result = lambda *_a, **_k: None
+    validator._module_scan_result = lambda *_a, **_k: scan
     validator._attempted_modules = lambda: attempted
     validator._receipt_structure = lambda: structure or {}
     return validator
+
+
+def _met_expectation_validator(*, scan, attempted=None, structure=None, class_count=10):
+    """A Maven build whose ONE derived class expectation is fully MET on disk.
+
+    The point of the shape: with `all_present` True and `class_coverage` 1.0 at a
+    100% threshold, nothing else in `validate_build_status` stands between this
+    state and a complete success — so whether the build is complete is decided by
+    the §3.5 denominator rung alone, and deleting the cap changes the verdict.
+    `_verify_expected_artifacts` is the real one: the classes are on the fake
+    filesystem and are counted there.
+    """
+    files = {f"/workspace/proj/m0/target/classes/C{index}.class" for index in range(10)}
+    files |= {"/workspace/proj/pom.xml", "/workspace/proj/m0/target/app.jar"}
+    orch = FakeBuildOrchestrator(files=files)
+    validator = PhysicalValidator(
+        docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
+    )
+    validator._detect_build_system = lambda *_a, **_k: "maven"
+    validator._check_build_artifacts_complete = lambda _d: {
+        "exist": True,
+        "count": class_count,
+        "class_count": class_count,
+        "jar_count": 1,
+    }
+    validator._collect_artifact_samples = lambda *_a, **_k: []
+    validator._get_expected_artifacts = lambda *_a, **_k: [
+        {
+            "path": "/workspace/proj/m0/target/classes",
+            "type": "classes",
+            "artifact": "m0 classes",
+            "min_count": 10,
+        }
+    ]
+    validator._module_scan_result = lambda *_a, **_k: scan
+    validator._attempted_modules = lambda: attempted
+    validator._receipt_structure = lambda: structure or {}
+    return validator
+
+
+class ReceiptOrchestrator:
+    """A container holding invocation receipts, one JSON object per line —
+    which is what `cat <receipts dir>/*.json` returns for the schema-v1 files."""
+
+    def __init__(self, receipts, *, present=True):
+        self.receipts = list(receipts)
+        self.present = present
+
+    def execute_command(self, command, **_kwargs):
+        text = command.strip()
+        if INVOCATION_RECEIPTS_DIRNAME not in text:
+            return {"success": True, "exit_code": 0, "output": ""}
+        if text.startswith("test -d"):
+            return {
+                "success": self.present,
+                "exit_code": 0 if self.present else 1,
+                "output": "EXISTS" if self.present else "",
+            }
+        if text.startswith("cat "):
+            body = "\n".join(json.dumps(receipt) for receipt in self.receipts)
+            return {"success": True, "exit_code": 0, "output": body}
+        return {"success": True, "exit_code": 0, "output": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +342,57 @@ def test_an_unmet_expectation_with_no_class_number_names_what_is_missing():
     assert "no class-based expectation could be derived" in result["reason"]
 
 
+def test_a_met_expectation_with_nothing_compiled_is_blocked_not_a_complete_success():
+    """The arm round two re-opened.
+
+    `and not coverage_info["all_present"]` routed basis-`none` with ZERO compiled
+    classes into the met branch, so a jar on disk (checked in, vendored, or left
+    by an earlier build) and nothing compiled graded as a complete success. §3.4
+    mandates BLOCKED for the zero-classes arm, and `jvm_no_compiled_evidence` does
+    not catch it: that branch also requires `not has_artifacts`, and the jar IS an
+    artifact.
+    """
+    result = _polaris_validator(class_count=0, jar_on_disk=True).validate_build_status("polaris")
+
+    assert result["success"] is False
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "blocked"
+    assert "No compiled .class files found for gradle build" in result["reason"]
+    # And the sentence states which of the two zero-class shapes this is: the
+    # expectations were MET and nothing compiled, which is a different fact from
+    # "nothing compiled and the expectations are missing too".
+    assert (
+        "the expected artifact(s) are present (main JAR) but nothing compiled" in result["reason"]
+    )
+    assert "All expected build artifacts found" not in result["reason"]
+
+
+def test_the_four_arms_of_the_no_basis_rule_are_pinned_as_a_set():
+    """§3.4's four cases, stated together because fixing one re-opened the other.
+
+    Round one keyed the branch on "no class-based expectation" alone, so a met JAR
+    expectation (a Kotlin module: sources under `src/main/kotlin`, no `classes`
+    entry derived) could not reach a full success. Round two added
+    `and not all_present`, which re-opened the zero-classes direction. The two
+    questions are orthogonal — was a derived expectation MET, and did anything
+    compile — and only pinning the whole table keeps a later fix to one arm from
+    breaking another.
+    """
+
+    def _verdict(**kwargs):
+        result = _polaris_validator(**kwargs).validate_build_status("polaris")
+        return result["evidence_status"], result["success"], result["build_complete"]
+
+    # (expectation unmet, classes compiled) -> PARTIAL: real output, unknown share
+    assert _verdict(class_count=1706, jar_on_disk=False) == ("partial", True, False)
+    # (expectation unmet, nothing compiled) -> BLOCKED
+    assert _verdict(class_count=0, jar_on_disk=False) == ("blocked", False, False)
+    # (expectation MET, classes compiled) -> SUCCESS: a met expectation is a basis
+    assert _verdict(class_count=900, jar_on_disk=True) == ("success", True, True)
+    # (expectation MET, nothing compiled) -> BLOCKED: the hard JVM gate
+    assert _verdict(class_count=0, jar_on_disk=True) == ("blocked", False, False)
+
+
 def test_a_derived_basis_keeps_todays_thresholds_and_messages():
     """Regression fence: nothing about the derived path moves."""
     result = _coverage_validator(0.5, found=["a"], missing=["b", "c", "d"], threshold=0.75)
@@ -270,6 +405,70 @@ def test_a_derived_basis_keeps_todays_thresholds_and_messages():
 
 
 # ---------------------------------------------------------------------------
+# one predicate, one answer: terminality gates the denominator too
+# ---------------------------------------------------------------------------
+def _receipt_validator(receipts):
+    return PhysicalValidator(
+        docker_orchestrator=ReceiptOrchestrator(receipts), project_path="/workspace"
+    )
+
+
+def _killed_receipt():
+    """The OOM case: `collect_detached_result` synthesized exit 1 and recorded
+    `lifecycle_state: vanished`, and Gradle had printed 40 of 300 modules."""
+    return {
+        "receipt_id": "inv-gradle-1-0007",
+        "exit_code": 1,
+        "lifecycle_state": "vanished",
+        "module_outcomes": [{"module": f"m{index}", "status": "SUCCESS"} for index in range(40)],
+    }
+
+
+def test_a_crashed_dispatchs_truncated_module_list_is_not_a_denominator():
+    """`dispatch_terminated` refuses this receipt as a STRUCTURE prover; the
+    denominator ladder asked the same question of the same receipt and answered
+    differently, so a truncated list became the `receipt` rung — coverage narrowed
+    to the 40 modules the kill happened to reach, and the shortfall in the other
+    260 read as untried rather than unbuilt. One predicate, one answer."""
+    assert _receipt_validator([_killed_receipt()])._attempted_modules() is None
+
+
+def test_a_dispatch_something_else_stopped_is_not_a_denominator_either():
+    """A timeout monitor's kill states its reason and truncates the log the same
+    way; the exit code (143) is an int, which is exactly what could not tell them
+    apart."""
+    killed = dict(_killed_receipt(), lifecycle_state=None, termination_reason="silent_timeout")
+    killed.pop("lifecycle_state")
+
+    assert _receipt_validator([killed])._attempted_modules() is None
+
+
+def test_a_terminal_receipt_still_sets_the_denominator():
+    """The regression fence for the guard above: a dispatch that recorded its own
+    exit (and a synchronous one, which states no lifecycle at all) still narrows
+    coverage to what it attempted — and a crashed receipt beside it contributes
+    nothing rather than poisoning the list."""
+    finished = {
+        "receipt_id": "inv-maven-1-0001",
+        "exit_code": 1,
+        "lifecycle_state": "finished",
+        "module_outcomes": [{"module": "core", "status": "SUCCESS"}],
+    }
+    synchronous = {
+        "receipt_id": "inv-maven-1-0002",
+        "exit_code": 0,
+        "module_outcomes": [{"module": "jms", "status": "SUCCESS"}],
+    }
+
+    assert _receipt_validator([finished])._attempted_modules() == ("core",)
+    assert _receipt_validator([synchronous])._attempted_modules() == ("jms",)
+    assert _receipt_validator([_killed_receipt(), finished, synchronous])._attempted_modules() == (
+        "core",
+        "jms",
+    )
+
+
+# ---------------------------------------------------------------------------
 # §3.5 — the decider and the display are one computation
 # ---------------------------------------------------------------------------
 def test_the_denominator_authority_is_a_ladder_receipt_then_scan_then_survey():
@@ -279,7 +478,7 @@ def test_the_denominator_authority_is_a_ladder_receipt_then_scan_then_survey():
 
     from_receipt = module_basis(
         scan,
-        receipt_modules=("core", "jms"),
+        denominator_modules=("core", "jms"),
         structure={"provenance": "inv-gradle-1-2", "modules": ["core", "jms"]},
     )
     from_scan = module_basis(scan)
@@ -316,7 +515,7 @@ def test_the_message_names_the_denominator_it_used():
     assert "the survey's expectations" in module_basis(None).phrase()
     # A run whose manifest predates the structure fact still stands on the
     # receipt rung, and says so rather than naming an id it does not have.
-    unpromoted = module_basis(_polaris_scan(), receipt_modules=("core", "jms"))
+    unpromoted = module_basis(_polaris_scan(), denominator_modules=("core", "jms"))
     assert unpromoted.phrase() == (
         "denominator: the receipts' module outcomes (2 module(s) attempted)"
     )
@@ -329,12 +528,12 @@ def test_a_receipt_is_named_only_for_a_denominator_it_actually_stated():
     not claim it — a falsehood in one word."""
     stated_by_one = module_basis(
         None,
-        receipt_modules=("core", "jms"),
+        denominator_modules=("core", "jms"),
         structure={"provenance": "inv-maven-1-0001", "modules": ["core", "jms"]},
     )
     union_of_several = module_basis(
         None,
-        receipt_modules=("core", "jms", "http"),
+        denominator_modules=("core", "jms", "http"),
         structure={"provenance": "inv-maven-1-0001", "modules": ["core", "jms"]},
     )
 
@@ -454,16 +653,156 @@ def test_this_passs_own_receipts_still_narrow_exactly_as_before():
 def test_a_receipt_outranks_the_scan_so_the_narrowing_survives():
     """#17/d5dc330 unchanged: a build that stated which modules it attempted is
     measured against those, not against every directory on disk. Capping on the
-    scan here would re-break the scoped-build case that narrowing fixed."""
-    validator = _coverage_validator(1.0, found=["a", "b"], missing=[], threshold=1.0)
-    validator._module_scan_result = lambda *_a, **_k: _polaris_scan()
-    validator._attempted_modules = lambda: ("a", "b")
-    validator._receipt_structure = lambda: {"provenance": "inv-maven-1-0001", "modules": ["a", "b"]}
+    scan here would re-break the scoped-build case that narrowing fixed.
 
-    result = validator.validate_build_status("m")
+    The state is one where the narrowing SUCCEEDS — `mvn -pl m0` against 26
+    derived module expectations, so every attempted module maps and the other 25
+    leave the denominator as `modules_untried`. The earlier version of this fence
+    used an expectation path ('x') that the attempted modules ('a','b') could not
+    map onto, which is the state where scoping REFUSES to narrow: it pinned the
+    premise the round-three blocker was about.
+    """
+    result = _maven_reactor_validator(
+        attempted=("m0",),
+        scan=_maven_scan(),
+        structure={"provenance": "inv-maven-1-0001", "modules": ["m0"], "keys": ["m0"]},
+    ).validate_build_status("proj")
+
+    assert result["evidence"]["modules_untried"] and result["evidence"]["modules_attempted"] == [
+        "m0"
+    ]
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert "receipt inv-maven-1-0001" in result["reason"]
+    assert "1/26" not in result["reason"]
+
+
+# ---------------------------------------------------------------------------
+# §3.5 round three — the authority follows the denominator the run ACTUALLY used
+# ---------------------------------------------------------------------------
+def test_a_receipt_that_did_not_set_the_denominator_leaves_the_scan_cap_live():
+    """The reviewer's round-three reproduction, which is the p7d polaris state.
+
+    The survey cannot read `settings.gradle.kts`, so the whole derived expectation
+    list is the single root `main JAR` — and it IS on disk; 1,706 classes are
+    compiled; the scan walked 26 subprojects and found one built; the run's one
+    receipt names `build-logic`. `build-logic` cannot be mapped onto a
+    `/build/libs` expectation, so `_scope_expectations_to_attempted` returns the
+    WIDE list and records `build_coverage_scope_unverified` — the call itself
+    states the denominator was NOT narrowed to what the build attempted. The
+    receipt therefore did not set the denominator; the survey's wide expectation
+    list did. So the authority is not `receipt` in this state and the §3.5
+    minority-scan cap is live.
+
+    Before this fix the mere EXISTENCE of a receipt returned authority `receipt`,
+    `states_a_shortfall` was False by construction, and this exact sentence graded
+    as a complete success: "All expected build artifacts found: main JAR ·
+    denominator: the receipts' module outcomes (1 module(s) attempted) · Module
+    coverage: 1/26 built [build-logic]".
+    """
+    result = _polaris_validator(
+        jar_on_disk=True, scan=_polaris_scan(), attempted=("build-logic",)
+    ).validate_build_status("polaris")
+
+    assert "build_coverage_scope_unverified" in result["evidence"]["conflicts"]
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "the module scan on disk" in result["reason"]
+    assert "1/26" in result["reason"]
+    assert "module(s) attempted" not in result["reason"]
+
+
+def test_the_unnarrowed_state_cannot_pair_a_passing_verdict_with_a_minority_scan():
+    """Spec §6 acceptance 1, on the state that reached it in p7d.
+
+    The gate's composed sentence is the thing the model was shown, so the pin is
+    on that string. The verdict is no longer passing; and the clause that DECIDED
+    now leads it, with the coverage check's own finding kept but subordinated — a
+    met one-jar expectation is a true fact and stays in the sentence, it just may
+    not stand at the head of a sentence whose next clause says 1/26.
+    """
+    from sag.agent.phase_gates import ValidatorState, _inspect_build
+
+    observation = _inspect_build(
+        _polaris_validator(jar_on_disk=True, scan=_polaris_scan(), attempted=("build-logic",)),
+        "polaris",
+    )
+
+    assert observation.state is not ValidatorState.GREEN
+    assert observation.reason.startswith(
+        "Not a complete build — the module scan owns the denominator and 1 of 26 modules"
+    )
+    assert "(coverage check: All expected build artifacts found: main JAR)" in observation.reason
+    assert "Module coverage: 1/26 built" in observation.reason
+    assert "100%" not in observation.reason
+
+
+def test_the_authority_is_the_scoping_outcome_not_the_existence_of_a_receipt():
+    """P3 applied to the mechanism that was supposed to implement P3.
+
+    `module_basis` used to decide the authority in PARALLEL with the scoping call
+    — from "a receipt stated some modules" — while the scoping outcome recorded
+    that the denominator had not been narrowed. Two computations answering one
+    question; the wrong one decided. The authority now takes the modules the
+    scoping outcome says actually SET the denominator, so an unnarrowed pass
+    stands on the scan.
+    """
+    scan = _polaris_scan()
+    validator = _polaris_validator(jar_on_disk=True, scan=scan, attempted=("build-logic",))
+    wide = validator._get_expected_artifacts()
+
+    scope = validator._scope_expectations_to_attempted(list(wide), ("build-logic",))
+    narrowed = validator._scope_expectations_to_attempted(
+        [{"path": "/workspace/polaris/build-logic/target/classes", "type": "classes"}],
+        ("build-logic",),
+    )
+
+    assert (scope.conflict, scope.denominator_modules) == (
+        "build_coverage_scope_unverified",
+        None,
+    )
+    assert narrowed.denominator_modules == ("build-logic",)
+    assert module_basis(scan, denominator_modules=scope.denominator_modules).authority == "scan"
+    assert (
+        module_basis(scan, denominator_modules=narrowed.denominator_modules).authority == "receipt"
+    )
+
+
+def test_the_minority_scan_cap_is_what_stops_a_met_coverage_from_completing():
+    """The §3.5 cap itself, pinned where deleting it changes the verdict.
+
+    One derived class expectation, fully met, at a 100% threshold: `all_present`
+    and `class_coverage == 1.0`, so every other arm of `validate_build_status`
+    says complete. What makes this build incomplete is the denominator rung — the
+    scan owns it (no receipt narrowed anything) and it counted 1 of 26. Delete
+    `ModuleBasis.states_a_shortfall`'s scan clause and this build is a full
+    success again, which is the p7d polaris grade.
+    """
+    validator = _met_expectation_validator(scan=_maven_scan())
+
+    coverage = validator._verify_expected_artifacts(
+        "/workspace/proj", validator._get_expected_artifacts()
+    )
+    result = validator.validate_build_status("proj")
+
+    assert (coverage["all_present"], coverage["class_coverage"]) == (True, 1.0)
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "build_modules_incomplete" in result["conflicts"]
+    assert "denominator: the module scan on disk (1/26 modules built)" in result["reason"]
+
+
+def test_a_full_scan_under_a_met_coverage_is_still_a_complete_success():
+    """The cap is a shortfall cap. The same state with every module built stays
+    green, so the test above is pinning the shortfall and not the scan rung."""
+    result = _met_expectation_validator(
+        scan=_maven_scan(built=tuple(MAVEN_MODULES))
+    ).validate_build_status("proj")
 
     assert result["build_complete"] is True
-    assert "receipt inv-maven-1-0001" in result["reason"]
+    assert result["evidence_status"] == "success"
+    assert "26/26 modules built" in result["reason"]
 
 
 def test_the_decider_and_the_display_read_one_scan_not_two():

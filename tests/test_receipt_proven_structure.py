@@ -31,6 +31,7 @@ from sag.agent.receipt_structure import (
     promote_structure,
     read_module_structure,
     structure_from_receipt,
+    structure_updates,
 )
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
 from sag.tools.internal.build_preflight import read_build_requirements, write_build_requirements
@@ -313,6 +314,60 @@ def test_a_scoped_receipt_may_not_narrow_a_wider_proven_structure():
     assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
     assert orch.stored()[STRUCTURE_KEY]["provenance"] == "inv-maven-1-0001"
     assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
+
+
+def test_a_disjoint_receipt_may_not_replace_a_wider_proven_structure():
+    """§3.6 (revised): "Only a terminal receipt whose statement is at least as
+    wide may restate the structure."
+
+    `structure_updates` promised WIDEN-or-nothing and delivered
+    not-a-subset-therefore-replace. A dispatch that walked one module nobody had
+    seen (`mvn -pl http`, or a second build island) is disjoint from the proven
+    three, so it is not a subset — and it replaced a three-module proven fact with
+    a one-module one, narrowing the persisted receipt-proven structure in exactly
+    the direction the subset guard existed to forbid. Neither is a union the
+    answer: no receipt ever stated one, and the provenance would name a receipt
+    for a list it did not state.
+    """
+    orch = ManifestOrchestrator(BLIND_SURVEY)
+    promote_structure(orch.execute_command, _receipt())
+    writes = len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c])
+
+    disjoint = promote_structure(
+        orch.execute_command,
+        _receipt(
+            "inv-maven-3-0003",
+            outcomes=[{"module": "Apache Camel :: HTTP", "status": "SUCCESS"}],
+        ),
+    )
+    overlapping = promote_structure(
+        orch.execute_command,
+        _receipt(
+            "inv-maven-4-0004",
+            outcomes=[
+                {"module": "Apache Camel :: Core", "status": "SUCCESS"},
+                {"module": "Apache Camel :: HTTP", "status": "SUCCESS"},
+            ],
+        ),
+    )
+
+    assert (disjoint, overlapping) == (False, False)
+    assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
+    assert orch.stored()[STRUCTURE_KEY]["provenance"] == "inv-maven-1-0001"
+    assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
+
+
+def test_only_an_at_least_as_wide_statement_restates_the_structure():
+    """The predicate itself, over the four shapes a second receipt can have."""
+    proven = {"keys": ["core", "jms", "ftp"]}
+
+    assert structure_updates(proven, {"keys": ["core", "jms", "ftp", "http"]}) is True
+    assert structure_updates({}, {"keys": ["core"]}) is True
+    assert structure_updates(proven, {"keys": ["core", "jms", "ftp"]}) is False
+    assert structure_updates(proven, {"keys": ["core"]}) is False
+    assert structure_updates(proven, {"keys": ["http"]}) is False
+    assert structure_updates(proven, {"keys": ["core", "http"]}) is False
+    assert structure_updates(proven, {"keys": []}) is False
 
 
 def test_a_manifest_that_could_not_be_read_whole_is_never_rewritten():

@@ -93,14 +93,22 @@ def test_gradle_states_attempted_and_failed_but_never_success():
 
 
 def test_a_module_the_build_never_tried_leaves_the_denominator():
-    """The `-pl core` case: two modules on disk, one in the build."""
+    """The `-pl core` case: two modules on disk, one in the build.
+
+    The outcome also states WHICH denominator came out of it (Plan 8 §3.5): the
+    narrowing took effect, so the receipt's modules set the denominator and the
+    §3.5 module-scan cap does not apply to modules this build never attempted.
+    """
     expectations = [expectation("core"), expectation("jms")]
 
-    scoped, untried, conflict = scope(expectations, ("Apache Camel :: Core",))
+    outcome = scope(expectations, ("Apache Camel :: Core",))
 
-    assert [item["path"] for item in scoped] == ["/workspace/proj/core/target/classes"]
-    assert untried == ["jms"]
-    assert conflict is None
+    assert [item["path"] for item in outcome.expectations] == [
+        "/workspace/proj/core/target/classes"
+    ]
+    assert outcome.untried == ["jms"]
+    assert outcome.conflict is None
+    assert outcome.denominator_modules == ("Apache Camel :: Core",)
 
 
 def test_maven_module_names_match_their_directories_after_normalising():
@@ -118,31 +126,34 @@ def test_an_incomplete_mapping_keeps_the_wide_denominator_and_says_so():
     """
     expectations = [expectation("core")]
 
-    scoped, untried, conflict = scope(expectations, ("core", "an-unmapped-module"))
+    outcome = scope(expectations, ("core", "an-unmapped-module"))
 
-    assert len(scoped) == 1
-    assert untried == []
-    assert conflict == "build_coverage_scope_unverified"
+    assert len(outcome.expectations) == 1
+    assert outcome.untried == []
+    assert outcome.conflict == "build_coverage_scope_unverified"
+    # And the receipt did NOT set this denominator — the expectation list did.
+    # Round two read authority off the receipts' existence anyway, which disarmed
+    # the §3.5 minority-scan cap in exactly this state.
+    assert outcome.denominator_modules is None
 
 
 def test_no_stated_modules_changes_nothing():
     """Single-module builds and receipt-free runs keep their numbers."""
     expectations = [expectation("core"), expectation("jms")]
 
-    scoped, untried, conflict = scope(expectations, None)
+    outcome = scope(expectations, None)
 
-    assert scoped == expectations
-    assert untried == []
-    assert conflict is None
+    assert outcome.expectations == expectations
+    assert outcome.untried == []
+    assert outcome.conflict is None
+    assert outcome.denominator_modules is None
 
 
 def test_an_expectation_with_no_module_of_its_own_is_never_dropped():
     """A root-level or unparseable expectation stays in the denominator."""
     root_expectation = {"path": "/target/classes", "type": "classes", "min_count": 3}
 
-    scoped, _untried, _conflict = scope([root_expectation], ("core",))
-
-    assert root_expectation in scoped
+    assert root_expectation in scope([root_expectation], ("core",)).expectations
 
 
 # --------------------------------------------------------------------------

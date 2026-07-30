@@ -87,6 +87,23 @@ def dispatch_terminated(receipt: Mapping[str, Any] | None) -> bool:
     stopped states its `termination_reason`, and its log is a prefix too.
     Neither has stated anything about the project (§3.2 settles the first kind
     later); "isinstance(exit_code, int)" could not tell them apart.
+
+    ONE GAP, KEPT KNOWINGLY, and stated here so the next reader need not
+    re-derive it. A job the KERNEL killed (the OOM killer's SIGKILL) whose
+    launcher wrapper still wrote the exit file reports `lifecycle_state:
+    "finished"` with a signal-shaped code (137), and this predicate calls it
+    terminal — so its truncated module list can prove structure and can set the
+    coverage denominator. Excluding it would require inferring "was killed" from
+    the NUMBER: 128+N is not a reserved range, build tools and shell wrappers
+    return codes there for ordinary failures, and every receipt written before
+    this design carries no lifecycle at all. Keying on the number's shape would
+    therefore demote a large population of genuinely terminal dispatches on a
+    guess about an integer, to close a narrow case where the launcher's own
+    recorded status is the only physical fact available — and this project's
+    provenance ladder says a recorded fact outranks an inference about one. So
+    the trade is deliberate: the two cases where the status was SYNTHESIZED
+    (`vanished`) or IMPOSED from outside (`termination_reason`) are refused,
+    because there the receipt itself states that it was, and nothing is inferred.
     """
     payload = receipt or {}
     exit_code = payload.get("exit_code")
@@ -166,25 +183,31 @@ def structure_updates(
 ) -> bool:
     """May `incoming` replace the already-proven structure?
 
-    §3.6 says a newer terminal receipt "may update the structure". Update means
-    WIDEN or state something new — never narrow. `mvn -pl core` states what that
-    dispatch ATTEMPTED; it does not state that the other 25 modules stopped
-    existing, and replacing unconditionally let that narrow statement demote a
-    full reactor's (a structure fact is read as a statement about the PROJECT).
-    So a module list that is a subset of what is already proven — the equal case
-    included, which is also the same-body no-op every evidence writer here
-    follows — proves nothing new and the wider statement stands.
+    §3.6 (revised): "Only a terminal receipt whose statement is at least as wide
+    may restate the structure." At least as wide means a SUPERSET of the proven
+    keys, and nothing else:
 
-    A list that is neither subset nor superset is a receipt that walked modules
-    the older one did not: it replaces, and its own id stays the provenance.
-    Merging the two into a union was rejected deliberately — a union is a
-    statement no single receipt ever made, and provenance would then name a
-    receipt for a list it did not state.
+    * a superset that adds modules — new knowledge, it replaces;
+    * the same set — the same-body no-op every evidence writer here follows;
+    * a subset (`mvn -pl core`) — that dispatch states what it ATTEMPTED, not
+      that the other 25 modules stopped existing, and a structure fact is read as
+      a statement about the PROJECT. The wider statement stands;
+    * a DISJOINT or partly-overlapping list (`mvn -pl http` after a full
+      reactor, or a second build island) — "not a subset" is not the same test as
+      "at least as wide", and the earlier version's `not issubset` let exactly
+      this narrow a three-module proven fact down to one. It stands too.
+
+    Merging into a union was rejected deliberately: a union is a statement no
+    single receipt ever made, and the provenance would then name a receipt for a
+    list it did not state. So a receipt narrower than what is proven leaves the
+    proven fact alone — losing a strictly-newer-but-narrower list is a missing
+    improvement, while narrowing the persisted denominator is a wrong fact.
     """
     new_keys = {key for key in (incoming or {}).get("keys") or () if key}
     if not new_keys:
         return False
-    return not new_keys.issubset({key for key in (proven or {}).get("keys") or () if key})
+    proven_keys = {key for key in (proven or {}).get("keys") or () if key}
+    return proven_keys.issubset(new_keys) and new_keys != proven_keys
 
 
 def promote_structure(

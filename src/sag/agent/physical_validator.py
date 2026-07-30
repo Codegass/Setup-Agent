@@ -32,11 +32,12 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from sag.agent.receipt_structure import dispatch_terminated as _dispatch_terminated
 from sag.agent.receipt_structure import module_key as _receipt_module_key
 from sag.config.settings import (
     DEFAULT_BUILD_COVERAGE_THRESHOLD,
@@ -204,6 +205,26 @@ def _dist_record_matches(record_dir: str, project_name: str) -> bool:
 # live in the documented SIBLING directory (.setup_agent/evidence_assessments),
 # which the in-container parser derives from this one.
 INVOCATION_RECEIPTS_DIRNAME = ".setup_agent/invocation_receipts"
+
+
+class _ExpectationScope(NamedTuple):
+    """What scoping coverage to the attempted modules produced (Plan 8 §3.5).
+
+    `denominator_modules` is the outcome's OWN statement of which computation set
+    the denominator: the attempted list when the narrowing took effect, `None`
+    when it refused and the survey's wide expectation list stood. Round two
+    computed that authority a second time, in parallel, from "a receipt stated
+    some modules" — so a receipt whose modules could not be mapped onto any
+    expectation (`build_coverage_scope_unverified` recorded in the same pass)
+    still claimed the receipt rung and disarmed the §3.5 minority-scan cap.
+    Authority is a property of the denominator a run ACTUALLY used, and this is
+    the one computation that knows which that was.
+    """
+
+    expectations: List[Dict[str, Any]]
+    untried: List[str]
+    conflict: Optional[str]
+    denominator_modules: Optional[Tuple[str, ...]]
 
 
 # In-container test-report parser (executed via `python3 - <<'PY'`). The four
@@ -2189,6 +2210,16 @@ class PhysicalValidator:
         This is the coverage SCOPE. Counting `src/main/java` across the whole
         tree measures modules a scoped build (`-pl`), an early-stopping reactor
         or a disabled profile never tried, and calls them missing.
+
+        Only TERMINAL dispatches are read, by the SAME predicate that decides
+        whether a receipt may prove structure (`dispatch_terminated`). A crashed
+        detached job's module list is a prefix of the build — Gradle prints
+        `> Task :m:compileJava` incrementally, so a 300-module build OOM-killed at
+        module 40 names exactly 40 — and narrowing the denominator to those 40
+        would read the 260 the build never reached as "untried, not unbuilt" and
+        refine a partial build upward. `dispatch_terminated` already refuses that
+        receipt as a structure prover; a predicate with two answers depending on
+        which consumer asks is the P3 split this plan exists to close.
         """
         if not self.docker_orchestrator or not self._invocation_receipts_present():
             return None
@@ -2207,6 +2238,8 @@ class PhysicalValidator:
             try:
                 payload = json.loads(line)
             except ValueError:
+                continue
+            if not _dispatch_terminated(payload):
                 continue
             for entry in payload.get("module_outcomes") or ():
                 name = str((entry or {}).get("module") or "").strip()
@@ -2279,20 +2312,25 @@ class PhysicalValidator:
         self,
         expected_artifacts: List[Dict[str, Any]],
         attempted: Optional[Tuple[str, ...]],
-    ) -> Tuple[List[Dict[str, Any]], List[str], Optional[str]]:
-        """`(scoped, untried, conflict)` — narrow coverage to what ran.
+    ) -> "_ExpectationScope":
+        """Narrow coverage to what ran, and state WHICH denominator came out.
 
         The narrowing happens ONLY when every attempted module maps to an
         expectation. A partial mapping would drop expectations for modules
         that did run and inflate the score, which is worse than the wide
         denominator it replaces; in that case the expectations stand and the
         disagreement is recorded instead.
+
+        `denominator_modules` is the outcome's own answer to "which computation
+        set the denominator": the attempted list when the narrowing took effect,
+        `None` when the survey's wide expectation list stood. It is the single
+        place that question is answered (spec §2 P3) — see the call site.
         """
         if not expected_artifacts or not attempted:
-            return list(expected_artifacts), [], None
+            return _ExpectationScope(list(expected_artifacts), [], None, None)
         attempted_keys = {self._module_key(name) for name in attempted} - {""}
         if not attempted_keys:
-            return list(expected_artifacts), [], None
+            return _ExpectationScope(list(expected_artifacts), [], None, None)
         scoped: List[Dict[str, Any]] = []
         untried: List[str] = []
         matched_keys = set()
@@ -2308,13 +2346,16 @@ class PhysicalValidator:
         if matched_keys != attempted_keys:
             # The build named modules this expectation list does not contain:
             # the mapping is incomplete, so the wide denominator stands and
-            # says so rather than a narrowed one nobody can check.
-            return (
+            # says so rather than a narrowed one nobody can check. The receipt
+            # did NOT set the denominator here, so it is not the authority
+            # either — `denominator_modules` stays None and the scan cap is live.
+            return _ExpectationScope(
                 list(expected_artifacts),
                 [],
                 "build_coverage_scope_unverified",
+                None,
             )
-        return scoped, untried, None
+        return _ExpectationScope(scoped, untried, None, tuple(attempted))
 
     def _invocation_receipts_present(self) -> bool:
         """One cheap probe; a receipt-free run must pay nothing beyond it."""
@@ -3202,8 +3243,11 @@ class PhysicalValidator:
         # build UPWARD into a complete success, which is the exact P0-F
         # direction the plan forbids.
         receipt_structure = self._receipt_structure()
+        scope = self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
         scoped_artifacts, untried_modules, scope_conflict = (
-            self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
+            scope.expectations,
+            scope.untried,
+            scope.conflict,
         )
         if attempted_modules:
             evidence["modules_attempted"] = list(attempted_modules)
@@ -3229,12 +3273,19 @@ class PhysicalValidator:
         # renders its checklist from this same object (module_scan holds it),
         # and the denominator's authority is a stated ladder — a terminal
         # receipt, else this scan, else the survey's expectations.
+        #
+        # The rung comes from `scope.denominator_modules`, i.e. from the scoping
+        # OUTCOME, not from "a receipt exists": when the narrowing was refused
+        # (`build_coverage_scope_unverified` above) the receipt did not set this
+        # pass's denominator — the survey's wide expectation list did — so the
+        # receipt is not the authority and the scan cap below stays live. One
+        # question, one computation (spec §2 P3).
         from sag.agent.module_coverage import module_basis
 
         self._last_module_scan = (project_name, self._module_scan_result(project_name))
         basis = module_basis(
             self._last_module_scan[1],
-            receipt_modules=attempted_modules,
+            denominator_modules=scope.denominator_modules,
             structure=receipt_structure,
         )
 
@@ -3271,7 +3322,7 @@ class PhysicalValidator:
         elif (
             coverage_info is not None
             and _coverage_basis(coverage_info) == "none"
-            and not coverage_info["all_present"]
+            and (not coverage_info["all_present"] or class_count == 0)
         ):
             # Plan 8 §3.4 (P2): no CLASS-weighted expectation could be derived,
             # so there is no fraction to grade — and the expectations that WERE
@@ -3280,20 +3331,32 @@ class PhysicalValidator:
             # is how p7d polaris earned "Built 100% of expected classes" from a
             # `class_coverage` that defaulted to 1.0.
             #
-            # `all_present` is checked FIRST and deliberately: a derived jar
-            # expectation that the build MET is a basis, and a Kotlin/Scala/
-            # Groovy module (sources under `src/main/kotlin`, so the parsers emit
-            # only the JAR expectation) must still be able to reach a full
-            # success. Two arms of ONE rule, not two ad-hoc branches:
+            # TWO independent questions, and each has its own arm. Round one
+            # keyed the branch on "no class-based expectation" alone and a met
+            # JAR expectation could not reach a full success; round two added
+            # `and not all_present` and re-opened the zero-classes direction, so
+            # a build that compiled NOTHING beside a jar on disk graded complete.
+            # The table, entered on either trigger:
             #
-            #  * classes compiled -> PARTIAL. Real output happened; how much of
-            #    the project it is remains unknown, and the sentence names the
-            #    artifacts that are missing rather than implying nothing was
-            #    expected.
-            #  * nothing compiled -> BLOCKED. This is the hard JVM gate
-            #    (commons-chain, 0 classes under a non-standard src layout)
-            #    stated as the zero arm of the general rule; the branch above
-            #    still catches the no-artifacts case with its own wording.
+            #  * nothing compiled -> BLOCKED, whether or not the derived
+            #    expectations are met. This is the hard JVM gate (commons-chain,
+            #    0 classes under a non-standard src layout); the
+            #    `jvm_no_compiled_evidence` branch above catches only the case
+            #    with no artifacts at all, and a checked-in or stale jar IS an
+            #    artifact. Measuring compilation in `.class` files is a JVM-only
+            #    contract, and this whole chain is JVM-only by construction: for
+            #    any other build system `expected_artifacts` is `[]` (see where it
+            #    is derived above), so `coverage_info` is None and no arm here is
+            #    reachable. An extra `build_system in ("maven", "gradle")` test
+            #    would be dead code that reads like a live guard.
+            #  * classes compiled, an expectation unmet -> PARTIAL. Real output
+            #    happened; how much of the project it is remains unknown, and the
+            #    sentence names the artifacts that are missing rather than
+            #    implying nothing was expected.
+            #
+            # A met expectation WITH classes compiled never reaches here: it is a
+            # basis, it decided, and the Kotlin/Scala/Groovy module whose parsers
+            # emit only the JAR expectation still gets its full success below.
             absent = coverage_info.get("missing") or []
             listed = ", ".join(absent[:5]) + (" ..." if len(absent) > 5 else "")
             named = f" ({listed})" if absent else ""
@@ -3303,6 +3366,15 @@ class PhysicalValidator:
                     f"compiled {class_count:,} classes; {len(absent)} expected "
                     f"artifact(s) missing{named} and no class-based expectation "
                     f"could be derived — coverage has no basis"
+                )
+            elif coverage_info["all_present"]:
+                success, complete = False, False
+                present = ", ".join(coverage_info.get("found") or [])
+                reason = (
+                    f"No compiled .class files found for {build_system} build — the "
+                    f"expected artifact(s) are present ({present}) but nothing compiled, "
+                    f"and no class-based expectation could be derived; an existing JAR is "
+                    f"not evidence this build compiled the project"
                 )
             else:
                 success, complete = False, False
@@ -3363,6 +3435,27 @@ class PhysicalValidator:
             # Fingerprints but no determinable per-module expectations (e.g. an
             # aggregator/empty root pom with no parseable modules or sources):
             # treat as a real, complete build (nothing to be incomplete against).
+            #
+            # STATED PLAINLY (Plan 8 §3.4, and NOT changed here): this — not the
+            # branch above — is the arm where NO expectation of any kind could be
+            # derived, so §3.4's own words ("basis none, classes > 0 -> PARTIAL;
+            # classes = 0 -> BLOCKED") describe THIS branch, and this branch
+            # returns a complete build. The consequence is exact: the "no
+            # class-based expectation could be derived / coverage has no basis"
+            # sentence above is unreachable for an input that derived NOTHING; it
+            # only ever speaks for an input that derived a jar-or-file expectation
+            # and no class expectation (which is the p7d polaris shape, and is why
+            # polaris does reach it).
+            #
+            # Left at today's verdict deliberately, and measured rather than
+            # assumed: routing `coverage_info is None` to partial/blocked for
+            # maven/gradle turns three long-standing fences red — including
+            # `test_validate_build_status_maven_unaffected` (commons-cli shape:
+            # pom.xml, a jar, an empty target/classes, no derivable expectation)
+            # and `test_build_validation_refs_prefer_artifact_samples`. That is a
+            # verdict change for every single-module JVM project whose sources we
+            # cannot enumerate, which is a spec decision and not this round's
+            # finding. It is unchanged from main, so it is not a regression here.
             success, complete = True, True
             reason = f"Build fingerprints found for {build_system} project"
 
@@ -3413,6 +3506,18 @@ class PhysicalValidator:
         # the whole point of the #17 narrowing.
         if build_system in ("maven", "gradle"):
             if basis.states_a_shortfall:
+                if complete:
+                    # A completeness claim must not be left standing at the head
+                    # of the sentence beside a minority count. What DECIDED goes
+                    # first; what the coverage check found stays, subordinated,
+                    # because it is still a fact (the derived expectation list
+                    # really was met — it just did not cover the tree).
+                    coverage_clause = f" (coverage check: {reason})" if reason else ""
+                    reason = (
+                        f"Not a complete build — the module scan owns the denominator "
+                        f"and {basis.built} of {basis.total} modules produced "
+                        f"output{coverage_clause}"
+                    )
                 complete = False
             reason = f"{reason} · {basis.phrase()}" if reason else basis.phrase()
 

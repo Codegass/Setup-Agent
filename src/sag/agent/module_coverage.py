@@ -49,7 +49,14 @@ class ModuleBasis:
     def states_a_shortfall(self) -> bool:
         """True only when the rung that OWNS the denominator counted a
         minority. A scan under a receipt-stated denominator counts modules the
-        build never tried, which is untried, not unbuilt."""
+        build never tried, which is untried, not unbuilt.
+
+        "Owns" means the denominator the run actually measured against — the
+        caller passes the scoping outcome's own answer. When the narrowing was
+        refused, the authority is this scan even though receipts exist, and the
+        cap fires: that is what makes "a passing coverage verdict beside a
+        minority module scan" unconstructible (spec §6 acceptance 1).
+        """
         return self.authority == BASIS_SCAN and self.built < self.total
 
     def phrase(self) -> str:
@@ -95,16 +102,26 @@ def _receipt_that_stated(structure: Mapping[str, Any] | None, modules: Sequence[
 def module_basis(
     coverage: dict[str, Any] | None,
     *,
-    receipt_modules: Sequence[str] | None = None,
+    denominator_modules: Sequence[str] | None = None,
     structure: Mapping[str, Any] | None = None,
 ) -> ModuleBasis:
     """The ladder: a terminal receipt, else the scan on disk, else the survey.
 
-    ``receipt_modules`` is what THIS pass's receipts said they attempted;
+    ``denominator_modules`` is the modules that ACTUALLY SET this pass's
+    denominator — the answer the scoping outcome already computed
+    (`_ExpectationScope.denominator_modules`), not "the modules some receipt
+    mentioned". The distinction is the whole of round three's blocker: a receipt
+    naming `build-logic` against a lone `/build/libs` expectation cannot be
+    mapped, so scoping keeps the survey's wide list and records
+    `build_coverage_scope_unverified` — that receipt set no denominator, and
+    reading authority off its mere existence disarmed the §3.5 scan cap in the
+    exact p7d polaris state. Deciding it here a second time is the parallel
+    computation P3 forbids, so this function decides nothing: it reports.
+
     ``structure`` is the promoted receipt-proven structure, consulted only to
     name the receipt that stated this denominator.
     """
-    modules = tuple(str(name) for name in (receipt_modules or ()) if str(name).strip())
+    modules = tuple(str(name) for name in (denominator_modules or ()) if str(name).strip())
     if modules:
         return ModuleBasis(
             BASIS_RECEIPT, _receipt_that_stated(structure, modules), total=len(modules)
