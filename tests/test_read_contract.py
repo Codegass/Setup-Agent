@@ -294,6 +294,128 @@ def test_a_verified_absent_manifest_is_still_writable():
 
 
 # ---------------------------------------------------------------------------
+# §6.8 fence 1 — an unreadable obligations ledger HOLDS the §3.3 cap
+# ---------------------------------------------------------------------------
+#
+# The round-four review attacked P4 four ways — delete the obligation file,
+# corrupt it, make the ledger cat raise, make settlement raise — and every one
+# upgraded a contradicted success to a confirmed one, because a failed ledger
+# read parsed as "no obligations". Removing evidence improved the verdict.
+#
+# "Could not read the ledger" and "read it, it is empty" are told apart by the
+# one unambiguous signature DockerOrchestrator's failure dict carries
+# (exit -1 / dispatch_status): a glob cat over an empty directory exits 1,
+# which stays "no obligations" for every existing double.
+
+from sag.agent.job_obligations import LEDGER_UNREADABLE, read_obligations
+
+
+class LedgerSurface:
+    """Serves the obligations glob according to `mode`."""
+
+    def __init__(self, mode):
+        self.mode = mode
+
+    def execute_command(self, command, **kwargs):
+        if "job_obligations" in command and command.startswith("cat "):
+            if self.mode == "empty":
+                return fail("", exit_code=1)  # glob matched nothing: ran, empty
+            if self.mode == "transport":
+                return {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": "Failed to execute command: transport hiccup",
+                    "dispatch_status": "dispatch_failed",
+                }
+            if self.mode == "raises":
+                raise RuntimeError("Container missing does not exist. Create it first.")
+        return ok()
+
+
+def test_an_empty_ledger_reads_as_no_obligations():
+    assert read_obligations(LedgerSurface("empty")) == []
+
+
+def test_a_transport_failure_reads_as_could_not_read():
+    assert read_obligations(LedgerSurface("transport")) is None
+
+
+def test_a_raised_container_error_reads_as_could_not_read():
+    """The pre-command container checks DO raise (the review's correction to
+    'execute_command never raises'); that is a failed read too."""
+    assert read_obligations(LedgerSurface("raises")) is None
+
+
+def test_an_unreadable_ledger_holds_the_gate_cap(monkeypatch):
+    """The P4 fence: with the ledger unreadable, a GREEN success claim is NOT
+    confirmed — the cap holds on a stated inability, never lifts on one."""
+    from sag.agent import phase_gates
+    from sag.agent.phase_gates import (
+        OPEN_OBLIGATIONS_FACT,
+        _inspect_phase,
+        _ValidatorObservation,
+        ValidatorState,
+    )
+
+    monkeypatch.setattr(
+        phase_gates,
+        "_inspect_phase_evidence",
+        lambda phase, validator, orchestrator, project_name: _ValidatorObservation(
+            ValidatorState.GREEN,
+            reason="build verified",
+            code="build_verified",
+            validated_facts={"build.test_entry_ready": True},
+        ),
+    )
+
+    observation = _inspect_phase("build", None, LedgerSurface("transport"), "polaris")
+
+    assert observation.validated_facts[OPEN_OBLIGATIONS_FACT] == [LEDGER_UNREADABLE]
+
+
+def test_a_readable_empty_ledger_states_no_fact(monkeypatch):
+    """The other direction: genuinely-no-obligations changes nothing."""
+    from sag.agent import phase_gates
+    from sag.agent.phase_gates import (
+        OPEN_OBLIGATIONS_FACT,
+        _inspect_phase,
+        _ValidatorObservation,
+        ValidatorState,
+    )
+
+    monkeypatch.setattr(
+        phase_gates,
+        "_inspect_phase_evidence",
+        lambda phase, validator, orchestrator, project_name: _ValidatorObservation(
+            ValidatorState.GREEN,
+            reason="build verified",
+            code="build_verified",
+            validated_facts={"build.test_entry_ready": True},
+        ),
+    )
+
+    observation = _inspect_phase("build", None, LedgerSurface("empty"), "polaris")
+
+    assert OPEN_OBLIGATIONS_FACT not in observation.validated_facts
+
+
+def test_the_unreadable_ledger_refusal_names_the_ledger():
+    from sag.agent.phase_gates import OPEN_OBLIGATIONS_FACT, validate_phase_claim
+    from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+    from sag.agent.phase_gates import ValidatorState
+
+    gate = validate_phase_claim(
+        PhaseClaim(phase="build", signal="done", claimed_outcome=PhaseOutcome.SUCCESS),
+        ValidatorState.GREEN,
+        validated_facts={OPEN_OBLIGATIONS_FACT: [LEDGER_UNREADABLE]},
+    )
+
+    assert gate.accepted is False
+    assert gate.validated_outcome is PhaseOutcome.PARTIAL
+    assert "ledger" in gate.reason
+
+
+# ---------------------------------------------------------------------------
 # the loss is bounded: the next terminal receipt recovers the promotion
 # ---------------------------------------------------------------------------
 

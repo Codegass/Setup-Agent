@@ -404,9 +404,15 @@ def test_open_job_ids_names_only_the_books_still_out():
     assert open_job_ids(orchestrator) == ("bbbbbbbbbbbb",)
 
 
-def test_an_unreadable_ledger_states_no_obligations():
-    """A directory that does not exist yet is the normal case for every run
-    that never detached anything."""
+def test_an_unreadable_ledger_reads_as_could_not_read():
+    """Premise corrected (§6.8 fence 1 / P4). This test used to assert that a
+    RAISING container reads as "no obligations" — but "container gone" is a
+    failed read, not an empty directory, and reading it as empty is exactly
+    what let the round-four review lift the §3.3 cap by deleting evidence
+    (delete/corrupt/failed-cat/failed-settle each upgraded a contradicted
+    success to a confirmed one). Could-not-read is now its own answer: None.
+    The announcement surface still invents no job (open_job_ids stays ()) —
+    the GATE is where an unreadable ledger has teeth."""
 
     class Broken(ContainerFS):
         def __call__(self, command, **kwargs):
@@ -414,6 +420,15 @@ def test_an_unreadable_ledger_states_no_obligations():
 
     orchestrator = ScriptedOrchestrator()
     orchestrator.filesystem = Broken()
+
+    assert read_obligations(orchestrator) is None
+    assert open_job_ids(orchestrator) == ()
+
+
+def test_an_absent_ledger_directory_states_no_obligations():
+    """The normal case for every run that never detached anything: the glob
+    matches nothing, the read RAN, and the answer is genuinely empty."""
+    orchestrator = ScriptedOrchestrator()
 
     assert read_obligations(orchestrator) == []
     assert open_job_ids(orchestrator) == ()

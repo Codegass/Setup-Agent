@@ -254,6 +254,13 @@ def _open_obligations(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
 
 def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
     """`job <id>` / `jobs <id>, <id>` — bounded, and the count is never lost."""
+    from .job_obligations import LEDGER_UNREADABLE
+
+    if open_jobs == (LEDGER_UNREADABLE,):
+        # §6.8 fence 1: the cap held because the LEDGER could not be read, not
+        # because a named job is open — say that, or the model hunts for a job
+        # id that does not exist.
+        return "the job obligations ledger could not be read"
     named = open_jobs[:_MAX_NAMED_JOBS]
     subject = "job" if len(open_jobs) == 1 else "jobs"
     listed = ", ".join(named)
@@ -599,10 +606,22 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> tuple[str, 
     """
     if orchestrator is None:
         return ()
-    try:
-        from .job_obligations import is_open, read_obligations, settle_open_obligations
+    from .job_obligations import (
+        LEDGER_UNREADABLE,
+        is_open,
+        read_obligations,
+        settle_open_obligations,
+    )
 
+    try:
         records = read_obligations(orchestrator)
+        if records is None:
+            # §6.8 fence 1 / P4: a ledger that could not be read once parsed
+            # as "no obligations" and LIFTED the cap — the round-four review's
+            # four removals (delete, corrupt, failed cat, failed settle) each
+            # upgraded a contradicted success into a confirmed one. The
+            # sentinel keeps the cap held on a stated inability instead.
+            return (LEDGER_UNREADABLE,)
         if not records:
             return ()
         settled: set[str] = set()
@@ -616,9 +635,9 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> tuple[str, 
             for record in records
             if is_open(record) and str(record.get("job_id") or "").strip() not in settled
         )
-    except Exception as exc:  # the ledger never breaks a phase claim
-        logger.debug(f"job obligations were not settled before grading: {exc}")
-        return ()
+    except Exception as exc:  # the ledger never breaks a phase claim outright
+        logger.warning(f"job obligations were not settled before grading: {exc}")
+        return (LEDGER_UNREADABLE,)
 
 
 def _inspect_phase(

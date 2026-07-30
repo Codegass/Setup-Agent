@@ -227,12 +227,26 @@ def write_obligation(
     return _succeeded(result)
 
 
-def read_obligations(orchestrator: Any) -> List[Dict[str, Any]]:
-    """Every readable obligation, in job-id order.
+# The §3.3 cap's stand-in job id when the ledger itself could not be read.
+# §6.8 / P4: a failed ledger read once parsed as "no obligations", which
+# LIFTED the cap — removing evidence improved the verdict. The sentinel keeps
+# the cap held on a stated inability instead.
+LEDGER_UNREADABLE = "job-obligations-ledger-unreadable"
+
+
+def read_obligations(orchestrator: Any) -> Optional[List[Dict[str, Any]]]:
+    """Every readable obligation, in job-id order — or None for COULD NOT READ.
 
     One glob `cat`, and a line that does not parse is skipped rather than
     failing the read — the same discipline `repair_contracts.read_records`
     applies to every other evidence directory.
+
+    §3.9 tri-state: `[]` means the read ran and found nothing (an empty glob
+    exits 1, and every double that answers `ok("")` still reads as empty).
+    `None` means the read DID NOT RUN, recognised by the two unambiguous
+    signatures only: the failure dict `DockerOrchestrator.execute_command`
+    returns for a within-command failure (exit -1 / `dispatch_status`), and
+    the pre-command container checks that raise. Nothing else changes shape.
     """
     execute = getattr(orchestrator, "execute_command", None)
     if not callable(execute):
@@ -242,10 +256,19 @@ def read_obligations(orchestrator: Any) -> List[Dict[str, Any]]:
     try:
         probe = execute(f"cat {shlex.quote(OBLIGATION_DIR)}/*.json 2>/dev/null")
     except Exception as exc:
-        logger.debug(f"{OBLIGATION_DIR} unavailable: {exc}")
-        return []
+        logger.warning(f"{OBLIGATION_DIR} could not be read: {exc}")
+        return None
+    probe = probe or {}
+    if isinstance(probe, Mapping) and (
+        probe.get("exit_code") == -1 or probe.get("dispatch_status")
+    ):
+        logger.warning(
+            f"{OBLIGATION_DIR} could not be read: "
+            f"{str(probe.get('output') or '')[:120]}"
+        )
+        return None
     records: List[Dict[str, Any]] = []
-    for line in str((probe or {}).get("output") or "").splitlines():
+    for line in str(probe.get("output") or "").splitlines():
         stripped = line.strip()
         if not stripped.startswith("{"):
             continue
@@ -259,8 +282,10 @@ def read_obligations(orchestrator: Any) -> List[Dict[str, Any]]:
 
 
 def open_obligations(orchestrator: Any) -> List[Dict[str, Any]]:
-    """The obligations no receipt has settled yet."""
-    return [record for record in read_obligations(orchestrator) if is_open(record)]
+    """The obligations no receipt has settled yet ([] when unreadable: the
+    announcement surfaces read from here, and an announcement must not invent
+    a job — the GATE is where an unreadable ledger has teeth)."""
+    return [record for record in (read_obligations(orchestrator) or []) if is_open(record)]
 
 
 def open_job_ids(orchestrator: Any) -> tuple:
@@ -340,7 +365,10 @@ def settle_open_obligations(
         return []
     try:
         records = read_obligations(orchestrator) if obligations is None else obligations
-        pending = [record for record in records if is_open(record)]
+        # None = the ledger could not be read (§3.9): nothing to settle
+        # AGAINST — settling on a guess could double-claim. The gate holds the
+        # cap for this state; the sweep just waits for the next batch.
+        pending = [record for record in (records or []) if is_open(record)]
     except Exception as exc:  # a ledger read never breaks the run
         logger.debug(f"job obligations could not be swept: {exc}")
         return []
