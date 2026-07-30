@@ -368,6 +368,84 @@ question and explicitly **out of scope**: it is a multi-project-repository
 design question, not an evidence-lifecycle one. Stating the finding is what
 makes it answerable later.
 
+### 3.8 Narrowing bounds blame, never visibility
+
+> A receipt may excuse a module from **this dispatch's verdict**. Nothing may
+> remove it from what the run **reports as not yet built**.
+
+The two are different questions and the code must never fuse them:
+
+| question | denominator | narrowing |
+|---|---|---|
+| did this dispatch do what it said? | what a terminal receipt states it attempted | licensed (#17) |
+| is the project fully built? | everything discoverable on disk, plus the survey | **never** |
+
+The second row is why this section exists. A build tool's own omissions do not
+appear in its own output: a profile that never activated, `-pl` without `-am`, a
+`<modules>` list conditional on a property, a `pom`-packaging module, an
+inherited `maven.test.skip`. A denominator taken from the receipt inherits every
+one of those blind spots, so "we under-built" becomes undiscoverable — by the
+harness *and* by the model. The project-scoped view is therefore computed from
+disk and the survey, never from a receipt, and it is reported even when the
+dispatch-scoped verdict is green.
+
+That mechanism already exists and is receipt-independent: `module_coverage`
+walks the tree, `coverage_checklist_line` renders it, and the phase gate appends
+a suggestion whenever the line says `no output yet`. So `mvn -pl core` may
+legitimately grade 100% of what it attempted while the model is still told that
+twenty-five modules have no output and that it may build them or close honestly
+as partial. Keep it that way.
+
+**Two live defects against this, both found while checking it:**
+
+1. The checklist can be **silently lost**. `module_coverage` reads through the
+   container and returns `None` on failure — and `execute_command` never raises,
+   it returns `{"success": False, ...}`, so a failed probe and "not a JVM
+   project" leave by the same exit. One quiet read failure removes the module
+   list, removes the suggestion, and the model can no longer discover that it
+   under-built. This is the §3.9 read-contract defect, and this consequence is
+   what makes it the highest-priority item in the plan.
+2. `untried_modules` is computed by `_scope_expectations_to_attempted`, written
+   to `evidence["modules_untried"]` (physical_validator.py:3361), and **read by
+   nothing**. A computed-and-dropped fact is exactly how the p7d sentence
+   happened. Surface it or delete it.
+
+**Required fences** (§6 acceptance 7 and 8), both of which must fail when the
+behaviour is removed:
+
+- with the narrowing SUCCEEDED and the verdict GREEN, the model-facing text
+  still names the modules with no output **and** carries an actionable
+  suggestion;
+- with the disk scan's read failing, the result is a **cap plus a stated
+  inability to read**, never "no unbuilt modules".
+
+### 3.9 A read that did not succeed is not a read that found nothing
+
+`DockerOrchestrator.execute_command` catches every exception and returns
+`{"success": False, "exit_code": -1, "output": str(e), ...}` (orch.py:687-698).
+It never raises. Four independent implementation rounds each wrote a guard of
+the form
+
+```python
+try:
+    probe = execute(...)
+except Exception:
+    return UNREADABLE      # unreachable through the real orchestrator
+```
+
+so every one of them was dead code, and the failure dict was then read as
+"nothing there". Measured consequences, all of them verdict-improving and all
+inherited rather than introduced: an unreadable obligations ledger lifts the
+§3.3 cap (phase_gates.py:619, confirmed by both round-four reviewers); an
+`_invocation_receipts_state` that keys UNREADABLE on an exception never fires
+(physical_validator.py:2445); an ordinary failed container probe — no exception
+required — disarms the §3.5 minority-scan cap (module_coverage.py:162).
+
+Every evidence read returns a three-way answer — **content**, **empty**,
+**did-not-succeed** — and the third is a cap, never a synonym for the second.
+Fix it once at the read boundary; per-site guards are what produced four rounds
+of the same dead code.
+
 ## 4. What does not change
 
 - **The Bigtop rule.** An untouched file nobody vouched for stays unclaimed.
@@ -430,6 +508,15 @@ point — the expensive version was the wrong one.
    production method, so deleting the production caching left all 3,611 tests
    green. Each stage's key test must be shown to fail when the behaviour it
    pins is removed, and the demonstration recorded in the acceptance report.
+7. **A green narrowed verdict still reports what is not built (§3.8).** With the
+   narrowing succeeded and the dispatch verdict GREEN, the model-facing text
+   names the modules with no output and carries an actionable suggestion. The
+   fence fails when that is removed.
+8. **A failed read caps, and says it failed (§3.8, §3.9).** With the disk scan's
+   probe returning `{"success": False}` — not raising — the result is a cap plus
+   a stated inability to read, never "no unbuilt modules" and never a lifted
+   cap. Fenced for the obligations ledger, the receipts directory and the module
+   scan.
 
 ## 7. Risks and their answers
 
