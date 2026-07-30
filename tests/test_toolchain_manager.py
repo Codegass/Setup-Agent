@@ -31,7 +31,10 @@ class FakeToolchainOrchestrator:
     def read_file(self, path):
         self.reads.append(path)
         if path not in self.files:
-            return {"success": False, "content": "", "exit_code": 1}
+            # §3.9 absence protocol: absence is STATED (None), never implied
+            # by an ordinary failure — a failed read now raises on the exact
+            # path, because "could not look" is not "looked and found nothing".
+            return None
         return {"success": True, "content": self.files[path], "exit_code": 0}
 
     def read_count(self, path):

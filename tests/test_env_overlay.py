@@ -171,17 +171,19 @@ class ReadLimitedEnvOverlayOrchestrator(FakeEnvOverlayOrchestrator):
     def read_file(self, path):
         self.read_calls += 1
         if self.read_calls > 6:
+            # The tripwire, deliberately a FAILURE and not absence: under the
+            # §3.9 contract a seventh read raises out of the exact path, so a
+            # transaction that re-reads past its own verified snapshot cannot
+            # quietly see an empty overlay — it fails loudly.
             return {
                 "success": False,
                 "content": "",
                 "exit_code": 1,
             }
         if path not in self.files:
-            return {
-                "success": False,
-                "content": "",
-                "exit_code": 1,
-            }
+            # §3.9 absence protocol: absence is STATED (None), never implied
+            # by an ordinary failure.
+            return None
         return {
             "success": True,
             "content": self.files[path],
@@ -921,7 +923,10 @@ class MavenContractE2EOrchestrator:
 
     def read_file(self, path):
         if path not in self.files:
-            return {"success": False, "content": "", "exit_code": 1}
+            # §3.9 absence protocol: absence is STATED (None), never implied
+            # by an ordinary failure — a failed read now raises on the exact
+            # path, because "could not look" is not "looked and found nothing".
+            return None
         return {"success": True, "content": self.files[path], "exit_code": 0}
 
     def write_file(self, path, content):

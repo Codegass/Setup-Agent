@@ -206,6 +206,45 @@ def test_the_non_exact_path_keeps_its_none_on_failure_semantics():
 
 
 # ---------------------------------------------------------------------------
+# the direct-read (test-double) surface speaks the same contract
+# ---------------------------------------------------------------------------
+#
+# `read_file` exists ONLY on test doubles — production DockerOrchestrator has
+# no such method, so production always takes the transport path above. The
+# doubles' protocol still has to state the same three answers, or every test
+# exercises a contract production does not have: None = absent, a mapping
+# that did not succeed = a failed READ (raises on the exact path), content
+# otherwise.
+
+
+def test_a_direct_read_failure_raises_on_the_exact_path():
+    class FailingReadFile:
+        def read_file(self, path):
+            return {"success": False, "content": "", "exit_code": 1}
+
+    with pytest.raises(ContainerFileReadError):
+        read_container_text(FailingReadFile(), "/x", exact_bytes=True)
+
+
+def test_a_direct_read_none_still_means_absent():
+    class AbsentReadFile:
+        def read_file(self, path):
+            return None
+
+    assert read_container_text(AbsentReadFile(), "/x", exact_bytes=True) is None
+
+
+def test_a_direct_read_failure_keeps_none_on_the_non_exact_path():
+    """Same scoping as the transport path: parsers migrate separately."""
+
+    class FailingReadFile:
+        def read_file(self, path):
+            return {"success": False, "content": "", "exit_code": 1}
+
+    assert read_container_text(FailingReadFile(), "/x") is None
+
+
+# ---------------------------------------------------------------------------
 # the two manifest fences (the defect this closes)
 # ---------------------------------------------------------------------------
 

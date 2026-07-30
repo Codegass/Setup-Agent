@@ -40,13 +40,29 @@ def _execute_untruncated(orchestrator: Any, command: str) -> Mapping[str, Any]:
     return result
 
 
-def _direct_read(orchestrator: Any, path: str) -> tuple[bool, Optional[str]]:
+def _direct_read(
+    orchestrator: Any, path: str, *, exact_bytes: bool = False
+) -> tuple[bool, Optional[str]]:
+    """`read_file` exists only on test doubles; production has no such method.
+
+    The doubles' protocol states the same three answers as the transport
+    (§3.9): ``None`` = absent, a mapping that did not succeed = a failed READ
+    — which raises on the exact path, exactly as a failed transport does —
+    and anything else is content. Before this, a double returning
+    ``{"success": False}`` read as "absent", so every test written against it
+    exercised a conflation production does not have.
+    """
     reader = getattr(orchestrator, "read_file", None)
     if not callable(reader):
         return False, None
     result = reader(path)
     if isinstance(result, Mapping):
         if not _command_succeeded(result):
+            if exact_bytes:
+                raise ContainerFileReadError(
+                    f"direct read did not succeed for {path}: "
+                    f"{str(result.get('output') or result.get('content') or '')[:120]}"
+                )
             return True, None
         content = result.get("content")
         if content is None:
@@ -80,7 +96,7 @@ def read_container_text(
     UTF-8 byte via base64 transport.  It is required for transactional
     readback.  XML/JSON parsers normally need only the untruncated path.
     """
-    handled, direct = _direct_read(orchestrator, path)
+    handled, direct = _direct_read(orchestrator, path, exact_bytes=exact_bytes)
     if handled:
         return direct
 
