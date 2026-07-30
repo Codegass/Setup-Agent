@@ -1067,7 +1067,13 @@ def evaluate_run_verdict(
 
 
 def _coverage_basis(coverage_info: Dict[str, Any]) -> str:
-    """`derived` or `none` for one expected-artifact check (Plan 8 §3.4).
+    """Does the CLASS-weighted coverage fraction have a basis? (Plan 8 §3.4)
+
+    `derived` when class expectations were derived and the fraction is stated;
+    `none` when they were not, which is why `class_coverage` is then absent
+    rather than 1.0. It says nothing about the other expectations: a jar or file
+    expectation is still a basis, and a met one still decides — "no class-based
+    expectation" and "no expectation of any kind" are different facts.
 
     Stated by `_verify_expected_artifacts`; inferred from the expectation count
     for a caller that predates the field, so an old rollup still classifies the
@@ -3187,13 +3193,15 @@ class PhysicalValidator:
         # every source tree on disk (Plan 7: the reactor summary sets the
         # scope, the file count verifies the substance).
         attempted_modules = self._attempted_modules()
-        # Plan 8 §3.6: a receipt-proven structure outranks the survey's guess,
-        # and it OUTLIVES the dispatch that proved it — a phase whose own
-        # dispatches stated nothing still measures against what real work said
-        # the project is made of.
+        # Plan 8 §3.6, and only as far as it may honestly go: the persisted
+        # receipt-proven structure NAMES the receipt behind a denominator; it is
+        # never a substitute for this pass's attempted-module list. Narrowing the
+        # denominator is licensed only by what THIS pass's receipts say they
+        # attempted — a structure proved by an earlier `mvn -pl core` would drop
+        # every other module's expectation as "untried" and refine a partial
+        # build UPWARD into a complete success, which is the exact P0-F
+        # direction the plan forbids.
         receipt_structure = self._receipt_structure()
-        if not attempted_modules and receipt_structure.get("modules"):
-            attempted_modules = tuple(str(name) for name in receipt_structure["modules"])
         scoped_artifacts, untried_modules, scope_conflict = (
             self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
         )
@@ -3227,7 +3235,7 @@ class PhysicalValidator:
         basis = module_basis(
             self._last_module_scan[1],
             receipt_modules=attempted_modules,
-            receipt_id=str(receipt_structure.get("provenance") or ""),
+            structure=receipt_structure,
         )
 
         # Hard JVM gate (Part 1 principle, applied to EVERY branch): a maven/gradle
@@ -3260,48 +3268,69 @@ class PhysicalValidator:
                 f"compiled (an empty target/classes dir or a coverage default is not "
                 f"proof of compilation)"
             )
-        elif coverage_info is not None and _coverage_basis(coverage_info) == "none":
-            # Plan 8 §3.4 (P2): the check could derive no per-module class
-            # expectation, so it states that, and the caller decides what it
-            # means. Two arms of ONE rule, not two ad-hoc branches:
+        elif (
+            coverage_info is not None
+            and _coverage_basis(coverage_info) == "none"
+            and not coverage_info["all_present"]
+        ):
+            # Plan 8 §3.4 (P2): no CLASS-weighted expectation could be derived,
+            # so there is no fraction to grade — and the expectations that WERE
+            # derived are not met. The check states that and the caller decides;
+            # it never reads "nothing to measure" as "everything passed", which
+            # is how p7d polaris earned "Built 100% of expected classes" from a
+            # `class_coverage` that defaulted to 1.0.
+            #
+            # `all_present` is checked FIRST and deliberately: a derived jar
+            # expectation that the build MET is a basis, and a Kotlin/Scala/
+            # Groovy module (sources under `src/main/kotlin`, so the parsers emit
+            # only the JAR expectation) must still be able to reach a full
+            # success. Two arms of ONE rule, not two ad-hoc branches:
             #
             #  * classes compiled -> PARTIAL. Real output happened; how much of
-            #    the project it is remains unknown. p7d polaris was graded
-            #    "Built 100% of expected classes" on this exact state, with
-            #    1,706 classes from an in-flight job and a survey that had
-            #    parsed no modules at all.
+            #    the project it is remains unknown, and the sentence names the
+            #    artifacts that are missing rather than implying nothing was
+            #    expected.
             #  * nothing compiled -> BLOCKED. This is the hard JVM gate
             #    (commons-chain, 0 classes under a non-standard src layout)
             #    stated as the zero arm of the general rule; the branch above
             #    still catches the no-artifacts case with its own wording.
+            absent = coverage_info.get("missing") or []
+            listed = ", ".join(absent[:5]) + (" ..." if len(absent) > 5 else "")
+            named = f" ({listed})" if absent else ""
             if class_count > 0:
                 success, complete = True, False
                 reason = (
-                    f"compiled {class_count:,} classes; no per-module expectation "
+                    f"compiled {class_count:,} classes; {len(absent)} expected "
+                    f"artifact(s) missing{named} and no class-based expectation "
                     f"could be derived — coverage has no basis"
                 )
             else:
                 success, complete = False, False
                 reason = (
                     f"No compiled .class files found for {build_system} build — nothing "
-                    f"compiled, and no per-module expectation could be derived, so "
+                    f"compiled, and no class-based expectation could be derived, so "
                     f"coverage has no basis"
                 )
         elif coverage_info is not None:
-            coverage = coverage_info.get("class_coverage", 1.0)
+            # `class_coverage` is ABSENT when nothing class-based was expected
+            # (Plan 8 §3.4), and absent is not 1.0 — the old `.get(..., 1.0)`
+            # default is what read "nothing to measure" as a met threshold. The
+            # only way into this branch without a fraction is with every derived
+            # expectation present, which decides on its own.
+            coverage = coverage_info.get("class_coverage")
             missing = coverage_info.get("missing", [])
-            if coverage_info["all_present"] or coverage >= threshold:
+            if coverage_info["all_present"] or (coverage is not None and coverage >= threshold):
                 success, complete = True, True
                 reason = (
                     f"All expected build artifacts found: "
                     f"{', '.join(coverage_info['found'][:5])}"
                     if coverage_info["all_present"]
                     else (
-                        f"Built {coverage * 100:.0f}% of expected classes "
+                        f"Built {(coverage or 0) * 100:.0f}% of expected classes "
                         f"(>= {threshold * 100:.0f}% threshold)"
                     )
                 )
-            elif coverage > 0 or has_real_output:
+            elif (coverage or 0) > 0 or has_real_output:
                 # Real build output, but some ACTIVE modules did not compile —
                 # honest PARTIAL, not a clean success.
                 #
@@ -3325,7 +3354,7 @@ class PhysicalValidator:
             else:
                 success, complete = False, False
                 reason = (
-                    f"Only {coverage * 100:.0f}% of expected classes built "
+                    f"Only {(coverage or 0) * 100:.0f}% of expected classes built "
                     f"(< {threshold * 100:.0f}% threshold) — missing: "
                     f"{', '.join(missing[:8])}" + (" ..." if len(missing) > 8 else "")
                 )

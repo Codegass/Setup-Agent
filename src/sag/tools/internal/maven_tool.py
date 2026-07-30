@@ -1072,6 +1072,12 @@ class MavenTool(BaseTool):
             exit_code=result.get("exit_code"),
             before=before,
             after=after,
+            # HOW this dispatch ended. A detached job whose process vanished
+            # carries a synthesized exit code and a log truncated at the kill;
+            # the exit code alone cannot say so, and a reader of the receipt
+            # must be able to tell.
+            lifecycle_state=result.get("lifecycle_state"),
+            termination_reason=result.get("termination_reason"),
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,
             # What the reactor itself said it attempted, module by module. The

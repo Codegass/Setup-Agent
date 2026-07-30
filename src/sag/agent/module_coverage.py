@@ -15,7 +15,7 @@ Never raises: coverage is guidance and honesty, not a failure mode.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from loguru import logger
 
@@ -54,9 +54,9 @@ class ModuleBasis:
 
     def phrase(self) -> str:
         if self.authority == BASIS_RECEIPT:
-            # Named by id once a structure fact has been promoted (§3.6);
-            # before that, the receipts collectively, which is still the
-            # receipt rung and says so.
+            # Named by id only when ONE promoted receipt stated exactly this
+            # module set (§3.6); otherwise the receipts collectively, which is
+            # still the receipt rung and says so.
             stated_by = (
                 f"receipt {self.provenance}"
                 if self.provenance
@@ -71,16 +71,44 @@ class ModuleBasis:
         return "denominator: the survey's expectations"
 
 
+def _receipt_that_stated(structure: Mapping[str, Any] | None, modules: Sequence[str]) -> str:
+    """The receipt id to NAME for this denominator, or "" when none stated it.
+
+    The denominator is the union of every receipt's `module_outcomes`, while the
+    promoted structure fact (§3.6) is ONE receipt's statement. Naming that id
+    over a union it never made attributes a denominator to a receipt that did
+    not claim it — a Category-3 falsehood in one word. So the id is named only
+    when that receipt stated exactly the module set being counted; otherwise the
+    sentence credits the receipts collectively, which is true and is still the
+    receipt rung.
+    """
+    from sag.agent.receipt_structure import module_key
+
+    provenance = str((structure or {}).get("provenance") or "").strip()
+    if not provenance:
+        return ""
+    stated = {module_key(name) for name in (structure or {}).get("modules") or ()} - {""}
+    counted = {module_key(name) for name in modules} - {""}
+    return provenance if stated and stated == counted else ""
+
+
 def module_basis(
     coverage: dict[str, Any] | None,
     *,
     receipt_modules: Sequence[str] | None = None,
-    receipt_id: str = "",
+    structure: Mapping[str, Any] | None = None,
 ) -> ModuleBasis:
-    """The ladder: a terminal receipt, else the scan on disk, else the survey."""
+    """The ladder: a terminal receipt, else the scan on disk, else the survey.
+
+    ``receipt_modules`` is what THIS pass's receipts said they attempted;
+    ``structure`` is the promoted receipt-proven structure, consulted only to
+    name the receipt that stated this denominator.
+    """
     modules = tuple(str(name) for name in (receipt_modules or ()) if str(name).strip())
     if modules:
-        return ModuleBasis(BASIS_RECEIPT, str(receipt_id or "").strip(), total=len(modules))
+        return ModuleBasis(
+            BASIS_RECEIPT, _receipt_that_stated(structure, modules), total=len(modules)
+        )
     summary = (coverage or {}).get("summary") or {}
     total = int(summary.get("modules_total") or 0)
     # The scan earns the denominator by enumerating a STRUCTURE the expectation

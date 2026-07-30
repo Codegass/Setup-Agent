@@ -23,7 +23,7 @@ statically. Pre-flight owns stated-requirement recovery and owns it well.
 
 import json
 
-from sag.agent.invocation_receipts import record_invocation
+from sag.agent.invocation_receipts import build_receipt, record_invocation
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.receipt_structure import (
     STRUCTURE_KEY,
@@ -56,9 +56,11 @@ class ManifestOrchestrator:
     def __init__(self, manifest=None):
         self.manifest = json.dumps(manifest, sort_keys=True) if manifest is not None else None
         self.commands = []
+        self.calls = []
 
-    def execute_command(self, command, **_kwargs):
+    def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        self.calls.append((command, kwargs))
         text = command.strip()
         if text.startswith("cat ") and "<<" not in text and BUILD_REQUIREMENTS_PATH in text:
             if self.manifest is None:
@@ -74,11 +76,35 @@ class ManifestOrchestrator:
         return json.loads(self.manifest) if self.manifest else {}
 
 
-def _receipt(receipt_id="inv-maven-1-0001", *, exit_code=0, outcomes=CAMEL_OUTCOMES):
+def _receipt(
+    receipt_id="inv-maven-1-0001",
+    *,
+    exit_code=0,
+    outcomes=CAMEL_OUTCOMES,
+    lifecycle_state=None,
+    termination_reason=None,
+):
     receipt = {"receipt_id": receipt_id, "module_outcomes": list(outcomes)}
     if exit_code is not None:
         receipt["exit_code"] = exit_code
+    if lifecycle_state is not None:
+        receipt["lifecycle_state"] = lifecycle_state
+    if termination_reason is not None:
+        receipt["termination_reason"] = termination_reason
     return receipt
+
+
+V1_RECEIPT_ARGS = dict(
+    receipt_id="inv-gradle-1-0007",
+    tool="gradle",
+    requested_action="build",
+    effective_action="build",
+    argv="/workspace/camel/gradlew build",
+    working_directory="/workspace/camel",
+    exit_code=1,
+    before={},
+    after={},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +144,112 @@ def test_a_failed_build_still_states_what_the_project_is_made_of():
 
 
 # ---------------------------------------------------------------------------
+# terminality is a property of how the dispatch ENDED, not of the exit code
+# ---------------------------------------------------------------------------
+def test_a_crashed_detached_job_proves_nothing_though_it_carries_an_exit_code():
+    """The OOM case, live on this machine.
+
+    `execute_command_with_soft_timeout` polls a job whose process is gone;
+    `collect_detached_result` SYNTHESIZES `exit_code = 1` and reports
+    `lifecycle_state: 'vanished'`, and `dispatch_status: 'completed_detached'`
+    is NOT in DETACHED_HANDOFF_STATUSES — so the runner writes an ordinary
+    receipt whose `module_outcomes` were parsed from a log the kill truncated.
+    Gradle prints `> Task :m:compileJava` incrementally, so a 300-module build
+    killed at module 40 names exactly 40. "exit_code is an int" said terminal;
+    the dispatch never terminated.
+    """
+    killed = _receipt(
+        "inv-gradle-1-0007",
+        exit_code=1,
+        outcomes=[{"module": f"m{index}", "status": "SUCCESS"} for index in range(40)],
+        lifecycle_state="vanished",
+    )
+
+    assert structure_from_receipt(killed) is None
+
+    orch = ManifestOrchestrator(BLIND_SURVEY)
+    assert promote_structure(orch.execute_command, killed) is False
+    assert orch.stored() == BLIND_SURVEY
+
+
+def test_a_dispatch_something_else_stopped_proves_nothing():
+    """A soft/absolute timeout kill states its reason, and the log stops where
+    the kill landed: its module list is a prefix of the build, not a statement
+    about the project."""
+    killed = _receipt(exit_code=143, termination_reason="silent_timeout")
+
+    assert structure_from_receipt(killed) is None
+
+
+def test_a_receipt_records_how_its_dispatch_ended():
+    """A reader could not tell a synthesized exit code from a recorded one —
+    neither fact rode the receipt. Now both do, and absent still means unknown
+    (every receipt written before this design reads exactly as it did)."""
+    crashed = build_receipt(**V1_RECEIPT_ARGS, lifecycle_state="vanished")
+    timed_out = build_receipt(**V1_RECEIPT_ARGS, termination_reason="absolute_timeout")
+
+    assert crashed["lifecycle_state"] == "vanished"
+    assert timed_out["termination_reason"] == "absolute_timeout"
+    assert "lifecycle_state" not in build_receipt(**V1_RECEIPT_ARGS)
+    assert "termination_reason" not in build_receipt(**V1_RECEIPT_ARGS)
+
+
+def test_a_receipt_that_finished_normally_still_proves_its_structure():
+    """The regression fence for the guard above: a detached job that DID write
+    its own exit code is terminal, and a synchronous dispatch states no
+    lifecycle at all — both keep promoting exactly as before."""
+    assert structure_from_receipt(_receipt(lifecycle_state="finished"))["keys"] == [
+        "core",
+        "jms",
+        "ftp",
+    ]
+    assert structure_from_receipt(_receipt())["keys"] == ["core", "jms", "ftp"]
+
+
+def test_the_runner_puts_the_dispatch_lifecycle_on_the_receipt_it_writes():
+    """The link between the two: a vanished dispatch's own facts reach
+    `record_invocation`, so the promotion guard has something to read."""
+    captured = {}
+
+    class StubOrchestrator:
+        def execute_command(self, command, **_kwargs):
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    from sag.tools.internal import gradle_tool as gradle_module
+    from sag.tools.internal import maven_tool as maven_module
+
+    vanished = {
+        "exit_code": 1,
+        "output": "> Task :core:compileJava",
+        "full_output": "> Task :core:compileJava",
+        "dispatch_status": "completed_detached",
+        "lifecycle_state": "vanished",
+        "termination_reason": None,
+    }
+    for module, tool_class, kwargs in (
+        (gradle_module, gradle_module.GradleTool, {}),
+        (maven_module, maven_module.MavenTool, {"effective_action": "test"}),
+    ):
+        original = module.record_invocation
+        module.record_invocation = lambda _execute, **fields: captured.update(fields) or {}
+        try:
+            tool = tool_class(StubOrchestrator())
+            tool._record_invocation_receipt(
+                requested_action="test",
+                argv="./gradlew test",
+                working_directory="/workspace/camel",
+                attempt=1,
+                result=vanished,
+                before={},
+                **kwargs,
+            )
+        finally:
+            module.record_invocation = original
+        assert captured["lifecycle_state"] == "vanished"
+        assert captured["exit_code"] == 1
+
+
+# ---------------------------------------------------------------------------
 # the ladder, persisted
 # ---------------------------------------------------------------------------
 def test_the_first_terminal_receipt_persists_the_structure_at_receipt_provenance():
@@ -141,18 +273,90 @@ def test_the_same_receipt_twice_is_a_no_op():
     assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
 
 
-def test_a_newer_terminal_receipt_may_restate_the_structure():
+def test_a_newer_terminal_receipt_may_widen_the_structure():
+    """§3.6's "may update": a receipt that walked modules nobody had seen states
+    a wider project, and that is new knowledge."""
     orch = ManifestOrchestrator(BLIND_SURVEY)
     promote_structure(orch.execute_command, _receipt())
 
     promoted = promote_structure(
         orch.execute_command,
-        _receipt("inv-maven-2-0004", outcomes=[{"module": "core", "status": "SUCCESS"}]),
+        _receipt(
+            "inv-maven-2-0004",
+            outcomes=[*CAMEL_OUTCOMES, {"module": "Apache Camel :: HTTP", "status": "SUCCESS"}],
+        ),
     )
 
     assert promoted is True
     assert orch.stored()[STRUCTURE_KEY]["provenance"] == "inv-maven-2-0004"
-    assert orch.stored()[STRUCTURE_KEY]["modules"] == ["core"]
+    assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp", "http"]
+
+
+def test_a_scoped_receipt_may_not_narrow_a_wider_proven_structure():
+    """`mvn -pl core` states what the dispatch ATTEMPTED, not what the project
+    is made of. Replacing unconditionally let that narrow statement demote a
+    full reactor's — and a structure is only ever read as a statement about the
+    project, so a subset proves nothing new and the wider statement stands."""
+    orch = ManifestOrchestrator(BLIND_SURVEY)
+    promote_structure(orch.execute_command, _receipt())
+    writes = len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c])
+
+    scoped = promote_structure(
+        orch.execute_command,
+        _receipt(
+            "inv-maven-2-0002",
+            outcomes=[{"module": "Apache Camel :: Core", "status": "SUCCESS"}],
+        ),
+    )
+
+    assert scoped is False
+    assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
+    assert orch.stored()[STRUCTURE_KEY]["provenance"] == "inv-maven-1-0001"
+    assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
+
+
+def test_a_manifest_that_could_not_be_read_whole_is_never_rewritten():
+    """The write is a read-MODIFY-write of the survey's ENTIRE manifest.
+
+    Treating an unparseable body as an empty manifest replaced every stated
+    requirement — java_version, build_islands, the survey pins — with one
+    structure key. A manifest we could not read is not a manifest we may
+    rewrite.
+    """
+    mangled = "...[output truncated]...\n" + json.dumps(BLIND_SURVEY)
+    orch = ManifestOrchestrator(BLIND_SURVEY)
+    orch.manifest = mangled
+
+    assert promote_structure(orch.execute_command, _receipt()) is False
+    assert orch.manifest == mangled
+    assert [c for c in orch.commands if "SAG_STRUCTURE_EOF" in c] == []
+
+
+def test_the_manifest_is_read_through_the_lossless_path():
+    """DockerOrchestrator strips and may TRUNCATE ordinary command output before
+    it reaches the model; `sag/runtime/container_io.py` exists so machine
+    consumers bypass that, and a read-modify-write of the survey's manifest is
+    exactly such a consumer. A bare `cat` on the presentation path is how a
+    large manifest comes back mangled in the first place."""
+    orch = ManifestOrchestrator(BLIND_SURVEY)
+
+    promote_structure(orch.execute_command, _receipt())
+
+    reads = [
+        kwargs
+        for command, kwargs in orch.calls
+        if BUILD_REQUIREMENTS_PATH in command and "SAG_STRUCTURE_EOF" not in command
+    ]
+    assert reads
+    assert all(kwargs.get("truncate_output") is False for kwargs in reads)
+
+
+def test_a_container_with_no_manifest_yet_gets_one():
+    """Creating is not clobbering: absent and unreadable are different facts."""
+    orch = ManifestOrchestrator()
+
+    assert promote_structure(orch.execute_command, _receipt()) is True
+    assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
 
 
 def test_a_survey_rerun_may_never_demote_a_receipt_proven_structure():
