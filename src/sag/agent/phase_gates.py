@@ -72,6 +72,20 @@ ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 # recorded before Plan 8 carries no such key, which is why the cap below reads
 # the fact rather than the container (replay must reproduce a gate offline).
 OPEN_OBLIGATIONS_FACT = "run.open_job_obligations"
+# The state the PHYSICAL inspection returned, recorded beside the obligations
+# that cap it. The cap rewrites the validator state, so the gate result alone
+# cannot say whether a PARTIAL came from the physical oracle or from the cap on
+# a GREEN one — and two consumers need that distinction (the untried-islands
+# rule and the blocked-on-green guard, both of which keyed on `success` being
+# reachable). Written by `_inspect_phase` under the same presence rule as the
+# obligations fact — only when something is open — so a run that never detached
+# anything seals byte-identical facts and a pre-Plan-8 transcript carries
+# neither key.
+PHYSICAL_STATE_FACT = "run.physical_validator_state"
+# Whether the run's evidence was already sealed when this phase was graded. A
+# sealed run settles nothing (§3.2), so an obligation it names can never be
+# discharged; see `settled_validator_state`.
+EVIDENCE_SEALED_FACT = "run.evidence_sealed"
 # How many job ids a capped reason spells out before it says "+N more". The
 # count itself is never dropped: a bound on a message is not a bound on a fact.
 _MAX_NAMED_JOBS = 3
@@ -249,6 +263,11 @@ def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
     return f"{subject} {listed} {verb} no terminal receipt"
 
 
+def _evidence_sealed(validated_facts: Mapping[str, Any]) -> bool:
+    """Whether the run had closed its evidence when this phase was graded."""
+    return validated_facts.get(EVIDENCE_SEALED_FACT) is True
+
+
 def settled_validator_state(
     validator_state: ValidatorState | str,
     validated_facts: Mapping[str, Any] | None = None,
@@ -261,17 +280,54 @@ def settled_validator_state(
     facts, with no view of any claim.
 
     This is the ONE computation of that cap (P3). `validate_phase_claim` applies
-    it when it grades a claim; a caller that DERIVES its claim from validator
+    it when it grades a claim, `check_phase_done` when it projects the same
+    question for a nudge, and a caller that DERIVES its claim from validator
     evidence rather than from a model must derive it from THIS state, or it
     states a claim the same gate is about to contradict. The engine's phase
     floor is exactly such a caller: it is the safety net for a starved attempt,
     it has no second move, and a contradiction there is a ValueError out of
     `PhaseMachine.close_attempt` that aborts the whole run.
+
+    A cap is a hold on a verdict until the evidence arrives, so it lives exactly
+    as long as the evidence can arrive. After evidence-close the run settles
+    NOTHING (§3.2: the sealed verdict has already recorded the job as
+    `job_unsettled`, and evidence-close is immutable), so the obligation it
+    still names can never be discharged — and a hold nothing can discharge is
+    not a cap, it is a dead end. It cost the report phase its own claim: a
+    delivered report was CONTRADICTED on a build job's books, with no move that
+    could ever change the answer, and a job that DID terminate before the report
+    claim recorded `partial` where the evidence was complete. Removing the cap
+    here removes no evidence (P4): the unsettled job is on the verdict as a
+    conflict, at a strictly higher fidelity than a phase outcome, and the OTHER
+    half of §3.3 — no refinement above the claim while an obligation is open —
+    is not scoped by the seal, so a sealed gate still cannot upgrade a claim.
     """
     state = ValidatorState(validator_state)
-    if state is ValidatorState.GREEN and _open_obligations(dict(validated_facts or {})):
+    facts = dict(validated_facts or {})
+    if state is ValidatorState.GREEN and _open_obligations(facts) and not _evidence_sealed(facts):
         return ValidatorState.PARTIAL
     return state
+
+
+def settled_observation(
+    validator_state: ValidatorState | str,
+    reason: str = "",
+    validated_facts: Mapping[str, Any] | None = None,
+) -> tuple[ValidatorState, str]:
+    """The capped state AND the sentence that says why — one determination.
+
+    P3 is a rule about pairs as much as about deciders: a state whose reason does
+    not mention the cap is the same two computations again, one deciding and one
+    decorating. Both the gate and the read-only probe the engine nudges from take
+    their state and their sentence from here.
+    """
+    state = ValidatorState(validator_state)
+    facts = dict(validated_facts or {})
+    capped = settled_validator_state(state, facts)
+    if capped is state:
+        return state, reason
+    clause = f"{_unsettled_clause(_open_obligations(facts))} — success requires settled books"
+    return capped, " · ".join(part for part in (reason, clause) if part)
 
 
 def claimable_outcome(
@@ -285,6 +341,32 @@ def claimable_outcome(
     outcome by construction.
     """
     return _VALIDATED_OUTCOMES[settled_validator_state(validator_state, validated_facts)]
+
+
+def settlement_capped_outcome(
+    validated_facts: Mapping[str, Any] | None = None,
+) -> PhaseOutcome | None:
+    """The outcome the §3.3 cap leaves in place of `success`, or None.
+
+    PARTIAL exactly when the physical inspection was GREEN and the cap fired on
+    it — the one state where `success` is unavailable while the physical oracle
+    saw a complete phase. Every caller that keyed on `success` being the top of
+    the ladder needs this and not the capped state: the capped PARTIAL and a
+    physically partial build are different facts, and the gate result alone
+    cannot tell them apart.
+
+    Absent basis is not a green light (P2): a fact dict with no recorded physical
+    state states nothing about it, so this returns None rather than assuming the
+    inspection was green. The conservative answer keeps every guard armed.
+    """
+    facts = dict(validated_facts or {})
+    physical = str(facts.get(PHYSICAL_STATE_FACT) or "").strip().lower()
+    if physical != ValidatorState.GREEN.value:
+        return None
+    capped = settled_validator_state(ValidatorState.GREEN, facts)
+    if capped is ValidatorState.GREEN:
+        return None
+    return _VALIDATED_OUTCOMES[capped]
 
 
 @dataclass(frozen=True)
@@ -367,18 +449,23 @@ def validate_phase_claim(
     # to it. A downgrade, never an upgrade — a MODEL's success claim capped this
     # way is contradicted by the ordinary truth table below and must be re-made
     # honestly, while a machine-derived claim states the capped outcome from the
-    # start (`claimable_outcome`) and is confirmed.
-    capped = settled_validator_state(state, facts)
+    # start (`claimable_outcome`) and is confirmed. The state and its sentence
+    # come from `settled_observation`, the one computation of the cap, so the
+    # engine's read-only probe cannot answer this question differently.
+    capped, reason = settled_observation(state, reason, facts)
     if capped is not state:
         state = capped
         validated = _VALIDATED_OUTCOMES[state]
-        reason = " · ".join(
-            part
-            for part in (
-                reason,
-                f"{_unsettled_clause(open_jobs)} — success requires settled books",
-            )
-            if part
+        # A refusal states the move it leaves. This one was a bare sentence: the
+        # model learned success was unavailable and nothing about what was, which
+        # on the report phase (whose objective is literally "claim success") is a
+        # dead end dressed as a check.
+        suggestions = (
+            *tuple(suggestions),
+            (
+                f"claim phase(action='done', outcome='{validated.value}') on the evidence "
+                f"in hand, or wait for the terminal result of {_unsettled_clause(open_jobs)}"
+            ),
         )
 
     if claimed is PhaseOutcome.UNKNOWN:
@@ -461,13 +548,26 @@ def check_phase_done(
     Live model claims use :func:`check_phase_claim`; this adapter carries no
     claim and therefore cannot close or advance a phase. It does reach the
     settler at the gate, so it carries the run's evidence seal too.
+
+    `ok` answers "would the completion gate pass", which is the SAME question
+    `validate_phase_claim` answers — so it is capped by the same computation
+    (§3.3 via `settled_observation`). It was not, and the two answers diverged in
+    exactly one state: green physical evidence with a job still out. The
+    mid-phase nudge then announced "the completion gate passes on physical
+    evidence" and the gate contradicted the success claim it had just invited,
+    leaving the model between two harness computations of one question (P3). The
+    engine's starved-phase floor reads this same dict, and it closes
+    unconditionally, so its probe must carry the cap and the sentence too.
     """
     observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
+    state, reason = settled_observation(
+        observation.state, observation.reason, observation.validated_facts
+    )
     return {
-        "ok": observation.state is ValidatorState.GREEN,
-        "reason": observation.reason,
+        "ok": state is ValidatorState.GREEN,
+        "reason": reason,
         "suggestions": list(observation.suggestions),
-        "validator_state": observation.state.value,
+        "validator_state": state.value,
         "evidence_refs": list(observation.evidence_refs),
         "code": observation.code,
         "validated_facts": dict(observation.validated_facts),
@@ -528,11 +628,18 @@ def _inspect_phase(
     observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
     if not open_jobs:
         return observation
+    # The three facts the §3.3 cap is a function of, stated together at the one
+    # place that knows all three: which jobs are open, what the PHYSICAL oracle
+    # said before anything capped it, and whether the run can still settle
+    # anything. Replay re-grades this claim offline from these facts alone, so a
+    # cap that read the container instead would grade a different world.
     return replace(
         observation,
         validated_facts={
             **dict(observation.validated_facts),
             OPEN_OBLIGATIONS_FACT: list(open_jobs),
+            PHYSICAL_STATE_FACT: ValidatorState(observation.state).value,
+            EVIDENCE_SEALED_FACT: bool(sealed),
         },
     )
 

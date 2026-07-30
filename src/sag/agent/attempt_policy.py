@@ -1006,19 +1006,46 @@ def untried_islands_requirement(
     phase: str | None,
     signal: str | None,
     outcome: str | None,
+    capped_outcome: str | None = None,
 ) -> UntriedIslandsRequirement | None:
     """Reject giving-up closure while surveyed islands were never attempted.
 
     Exemptions: no islands surveyed; every island bound to a receipt (success
-    or failure — attempted is the bar); and a ``done``/``success`` claim,
-    which the physical gate already checks.  An unreadable manifest raises no
-    island requirement: Plan 1's attempt gate owns the no-attempt case.
+    or failure — attempted is the bar); and a ``done`` claim of the outcome the
+    physical gate below validates, because that gate checks it.  An unreadable
+    manifest raises no island requirement: Plan 1's attempt gate owns the
+    no-attempt case.
+
+    That last exemption used to read ``done``/``success`` and nothing else, on
+    the stated ground that the physical gate checks a success claim for
+    completeness — an untried island cannot hide behind ``success`` because the
+    oracle looks.  Plan 8 §3.3 then made ``success`` the ONE outcome the gate
+    cannot accept while a job obligation is open, and the ground stopped being
+    true: with green evidence, an untried island and one open obligation, this
+    rule exempted the only claim the gate would refuse and refused every claim
+    the gate would accept, so the phase had NO accepted terminal claim at all and
+    the two refusals pointed at each other.
+
+    ``capped_outcome`` is what the caller's gate says it validates in place of
+    ``success`` on THIS evidence (``phase_gates.settlement_capped_outcome``,
+    which is PARTIAL only when the physical oracle was green and the cap fired on
+    it).  It is the same claim the old exemption meant, under the name §3.3 gives
+    it, so the leniency does not grow: green physical evidence licensed closure
+    with an untried island before this parameter existed, and an open obligation
+    on its own licenses nothing — a red or physically partial build still owes
+    every surveyed island an attempt, which is the bigtop case the rule exists
+    for.  Absent (the default) means the caller has no such gate determination,
+    and the rule behaves exactly as it did.
     """
     if state is None or phase != "build":
         return None
+    exempt_outcomes = {"success"}
+    capped = str(capped_outcome or "").strip().lower()
+    if capped:
+        exempt_outcomes.add(capped)
     if (
         str(signal or "").strip().lower() == "done"
-        and str(outcome or "").strip().lower() == "success"
+        and str(outcome or "").strip().lower() in exempt_outcomes
     ):
         return None
     manifest = _read_requirements_manifest(orchestrator)
