@@ -7,7 +7,12 @@ selects the next phase."""
 
 from typing import Any, Dict, List, Optional
 
-from sag.agent.phase_gates import ClaimDisposition, check_phase_claim
+from sag.agent.job_obligations import open_job_ids
+from sag.agent.phase_gates import (
+    ClaimDisposition,
+    check_phase_claim,
+    settlement_capped_outcome,
+)
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.agent.attempt_policy import (
     build_attempt_requirement,
@@ -48,6 +53,24 @@ class PhaseTool(BaseTool):
         self.project_name = project_name
         self.gate_fn = gate_fn
         self.run_evidence_state = run_evidence_state
+
+    def _grade(self, claim: PhaseClaim, phase: str, *, sealed: bool):
+        """One graded claim, from the one gate. Called at most once per claim.
+
+        The gate settles the job ledger before it grades (spec §3.2 trigger 2),
+        and a sealed run accepts no further evidence: after evidence-close the
+        report phase can still make a claim, and settling for it would write a
+        receipt the sealed verdict cannot state.
+        """
+        gate = self.gate_fn(
+            phase,
+            claim,
+            self.validator,
+            self.orchestrator,
+            self.project_name,
+            sealed=sealed,
+        )
+        return gate if gate.claim is not None else gate.with_claim(claim)
 
     def execute(
         self,
@@ -306,15 +329,43 @@ class PhaseTool(BaseTool):
                     metadata={"phase": phase, "prerequisite": prerequisite},
                 )
 
+        claim = PhaseClaim(
+            phase=phase,
+            signal=verb,
+            claimed_outcome=claimed_outcome,
+            key_results=key_results,
+            reason=reason,
+            evidence_refs=tuple(evidence or ()),
+        )
+        sealed = bool(getattr(self.run_evidence_state, "sealed", False))
+
+        # The §3.3 cap can make `success` unavailable, and the island rule below
+        # exempts the claim the gate checks — so in that ONE state the two must
+        # read one determination rather than contradict each other. The gate is
+        # what knows it, so it runs first, but only in the state where the
+        # question exists: the build phase, unsealed, with something actually
+        # open in the ledger. The extra read is one glob `cat` (the same read
+        # `_settle_before_grading` makes a moment later), and a refusal that
+        # costs no physical probe stays free for every other run — a giving-up
+        # claim with untried islands is still answered before any inspection.
+        gate = None
+        capped_outcome = None
+        if phase == "build" and not sealed and open_job_ids(self.orchestrator):
+            gate = self._grade(claim, phase, sealed=sealed)
+            capped_outcome = settlement_capped_outcome(gate.validated_facts)
+
         # Closure-by-giving-up may not abandon surveyed islands that were
-        # never attempted (spec §3.4 island guarantee, named per §3.3). A
-        # done/success claim is exempt: the physical gate below checks it.
+        # never attempted (spec §3.4 island guarantee, named per §3.3). A `done`
+        # claim of the outcome the gate validates is exempt: the physical gate
+        # below checks it — which is `success` on settled books, and the capped
+        # `partial` while an obligation is open.
         islands = untried_islands_requirement(
             self.run_evidence_state,
             self.orchestrator,
             phase=phase,
             signal=verb,
             outcome=claimed_outcome.value,
+            capped_outcome=capped_outcome.value if capped_outcome is not None else None,
         )
         if islands is not None:
             return ToolResult.completed_failure(
@@ -325,27 +376,20 @@ class PhaseTool(BaseTool):
                 metadata={"phase": phase, **islands.to_metadata()},
             )
 
-        claim = PhaseClaim(
-            phase=phase,
-            signal=verb,
-            claimed_outcome=claimed_outcome,
-            key_results=key_results,
-            reason=reason,
-            evidence_refs=tuple(evidence or ()),
-        )
-        gate = self.gate_fn(
-            phase,
-            claim,
-            self.validator,
-            self.orchestrator,
-            self.project_name,
-        )
-        if gate.claim is None:
-            gate = gate.with_claim(claim)
+        if gate is None:
+            gate = self._grade(claim, phase, sealed=sealed)
 
         # A blocked record cannot carry the otherwise-valid pessimistic
-        # ``blocked + success`` combination from the generic claim matrix.
-        if verb == "blocked" and gate.validated_outcome is PhaseOutcome.SUCCESS:
+        # ``blocked + success`` combination from the generic claim matrix. The
+        # guard is on the physical evidence, not on the label: the §3.3 cap
+        # rewrites a green phase's validated outcome to `partial` while a job is
+        # open, which disarmed this guard exactly when the model was most likely
+        # to reach for `blocked` — mid-dispatch, with a green build on disk.
+        green_evidence = (
+            gate.validated_outcome is PhaseOutcome.SUCCESS
+            or settlement_capped_outcome(gate.validated_facts) is not None
+        )
+        if verb == "blocked" and green_evidence:
             gate = type(gate)(
                 accepted=False,
                 validated_outcome=gate.validated_outcome,

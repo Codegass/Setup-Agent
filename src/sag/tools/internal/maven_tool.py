@@ -16,6 +16,7 @@ from sag.agent.invocation_contracts import (
     ensure_dispatch_contract,
 )
 from sag.agent.invocation_receipts import record_invocation, snapshot_reports
+from sag.agent.job_obligations import record_dispatch_obligation
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
 from sag.runtime.env_overlay import EnvOverlayStore
@@ -1054,11 +1055,27 @@ class MavenTool(BaseTool):
         """Persist the P0-A invocation receipt for one physical dispatch.
 
         A build still in flight (detached hand-off) has no terminal outcome
-        and no meaningful report delta yet, so it mints nothing; the poll that
-        observes its completion is what carries evidence.
+        and no meaningful report delta yet, so it mints no receipt here. It no
+        longer mints NOTHING: live camel `session_20260729_111740_22389` ran
+        11,492 tests behind this early return and could claim none of them.
+        The `before` snapshot, the frozen contract and the detach handle
+        become one obligation (Plan 8 §3.1), and settlement writes the
+        ordinary receipt when the job's exit code lands.
         """
         self._pending_invocation_receipt = None
         if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
+            record_dispatch_obligation(
+                self.orchestrator.execute_command,
+                result=result,
+                tool="maven",
+                attempt=attempt,
+                requested_action=requested_action,
+                effective_action=effective_action,
+                argv=argv,
+                working_directory=working_directory,
+                before=before,
+                requirements=requirements,
+            )
             return
         after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
         self._pending_invocation_receipt = record_invocation(

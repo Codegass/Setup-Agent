@@ -95,7 +95,7 @@ class AcceptingGate:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, phase, claim, validator, orchestrator, project_name):
+    def __call__(self, phase, claim, validator, orchestrator, project_name, *, sealed=False):
         self.calls.append(phase)
         return GateResult(
             accepted=True,

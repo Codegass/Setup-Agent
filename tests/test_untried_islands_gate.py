@@ -296,7 +296,7 @@ class GateRecorder:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, phase, claim, validator, orchestrator, project_name):
+    def __call__(self, phase, claim, validator, orchestrator, project_name, *, sealed=False):
         self.calls.append(phase)
         raise AssertionError("the gate must not be reached")
 
@@ -359,7 +359,7 @@ def test_phase_done_partial_with_untried_islands_is_rejected():
 def test_phase_done_success_reaches_the_gate_with_untried_islands():
     calls = []
 
-    def gate(phase, claim, validator, orchestrator, project_name):
+    def gate(phase, claim, validator, orchestrator, project_name, *, sealed=False):
         calls.append(phase)
         raise RuntimeError("gate reached")
 

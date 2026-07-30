@@ -66,6 +66,30 @@ _UNCLOSED_DOMAIN_STATES = frozenset({"failed", "blocked", "untried"})
 # file per assessment, named by its ``assessment_id``.
 ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 
+# Plan 8 §3.2/§3.3: the job ids of every obligation the ledger still has open
+# when this phase was graded. Present ONLY when something is open, so a run
+# that never detached anything seals byte-identical facts — and a transcript
+# recorded before Plan 8 carries no such key, which is why the cap below reads
+# the fact rather than the container (replay must reproduce a gate offline).
+OPEN_OBLIGATIONS_FACT = "run.open_job_obligations"
+# The state the PHYSICAL inspection returned, recorded beside the obligations
+# that cap it. The cap rewrites the validator state, so the gate result alone
+# cannot say whether a PARTIAL came from the physical oracle or from the cap on
+# a GREEN one — and two consumers need that distinction (the untried-islands
+# rule and the blocked-on-green guard, both of which keyed on `success` being
+# reachable). Written by `_inspect_phase` under the same presence rule as the
+# obligations fact — only when something is open — so a run that never detached
+# anything seals byte-identical facts and a pre-Plan-8 transcript carries
+# neither key.
+PHYSICAL_STATE_FACT = "run.physical_validator_state"
+# Whether the run's evidence was already sealed when this phase was graded. A
+# sealed run settles nothing (§3.2), so an obligation it names can never be
+# discharged; see `settled_validator_state`.
+EVIDENCE_SEALED_FACT = "run.evidence_sealed"
+# How many job ids a capped reason spells out before it says "+N more". The
+# count itself is never dropped: a bound on a message is not a bound on a fact.
+_MAX_NAMED_JOBS = 3
+
 # Receipt/assessment schema versions this reader understands. v1 wrote no
 # ``schema_version`` guarantee beyond the constant 1 and v2 only ADDS keys, so
 # both derive identically; an unknown FUTURE version is skipped rather than
@@ -214,6 +238,137 @@ def _unclosed_domains(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(unclosed)
 
 
+def _open_obligations(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
+    """The job ids this phase was graded with still unsettled.
+
+    Read from the sealed fact, never from the container: replay re-runs this
+    gate offline, long after the job and its ledger are gone, and a gate that
+    probed would grade a different world each time. A shape this reader does
+    not understand states nothing — a corrupt key must not invent a blocker.
+    """
+    raw = validated_facts.get(OPEN_OBLIGATIONS_FACT)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict.fromkeys(str(item).strip() for item in raw if str(item or "").strip()))
+
+
+def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
+    """`job <id>` / `jobs <id>, <id>` — bounded, and the count is never lost."""
+    named = open_jobs[:_MAX_NAMED_JOBS]
+    subject = "job" if len(open_jobs) == 1 else "jobs"
+    listed = ", ".join(named)
+    if len(open_jobs) > len(named):
+        listed += f" (+{len(open_jobs) - len(named)} more)"
+    verb = "has" if len(open_jobs) == 1 else "have"
+    return f"{subject} {listed} {verb} no terminal receipt"
+
+
+def _evidence_sealed(validated_facts: Mapping[str, Any]) -> bool:
+    """Whether the run had closed its evidence when this phase was graded."""
+    return validated_facts.get(EVIDENCE_SEALED_FACT) is True
+
+
+def settled_validator_state(
+    validator_state: ValidatorState | str,
+    validated_facts: Mapping[str, Any] | None = None,
+) -> ValidatorState:
+    """The strongest state this evidence supports once open books are counted.
+
+    GREEN with an obligation still open is at most PARTIAL (§3.3: success
+    requires settled books). Every other state is returned unchanged — the cap
+    only ever removes strength, and it is a pure function of the state and the
+    facts, with no view of any claim.
+
+    This is the ONE computation of that cap (P3). `validate_phase_claim` applies
+    it when it grades a claim, `check_phase_done` when it projects the same
+    question for a nudge, and a caller that DERIVES its claim from validator
+    evidence rather than from a model must derive it from THIS state, or it
+    states a claim the same gate is about to contradict. The engine's phase
+    floor is exactly such a caller: it is the safety net for a starved attempt,
+    it has no second move, and a contradiction there is a ValueError out of
+    `PhaseMachine.close_attempt` that aborts the whole run.
+
+    A cap is a hold on a verdict until the evidence arrives, so it lives exactly
+    as long as the evidence can arrive. After evidence-close the run settles
+    NOTHING (§3.2: the sealed verdict has already recorded the job as
+    `job_unsettled`, and evidence-close is immutable), so the obligation it
+    still names can never be discharged — and a hold nothing can discharge is
+    not a cap, it is a dead end. It cost the report phase its own claim: a
+    delivered report was CONTRADICTED on a build job's books, with no move that
+    could ever change the answer, and a job that DID terminate before the report
+    claim recorded `partial` where the evidence was complete. Removing the cap
+    here removes no evidence (P4): the unsettled job is on the verdict as a
+    conflict, at a strictly higher fidelity than a phase outcome, and the OTHER
+    half of §3.3 — no refinement above the claim while an obligation is open —
+    is not scoped by the seal, so a sealed gate still cannot upgrade a claim.
+    """
+    state = ValidatorState(validator_state)
+    facts = dict(validated_facts or {})
+    if state is ValidatorState.GREEN and _open_obligations(facts) and not _evidence_sealed(facts):
+        return ValidatorState.PARTIAL
+    return state
+
+
+def settled_observation(
+    validator_state: ValidatorState | str,
+    reason: str = "",
+    validated_facts: Mapping[str, Any] | None = None,
+) -> tuple[ValidatorState, str]:
+    """The capped state AND the sentence that says why — one determination.
+
+    P3 is a rule about pairs as much as about deciders: a state whose reason does
+    not mention the cap is the same two computations again, one deciding and one
+    decorating. Both the gate and the read-only probe the engine nudges from take
+    their state and their sentence from here.
+    """
+    state = ValidatorState(validator_state)
+    facts = dict(validated_facts or {})
+    capped = settled_validator_state(state, facts)
+    if capped is state:
+        return state, reason
+    clause = f"{_unsettled_clause(_open_obligations(facts))} — success requires settled books"
+    return capped, " · ".join(part for part in (reason, clause) if part)
+
+
+def claimable_outcome(
+    validator_state: ValidatorState | str,
+    validated_facts: Mapping[str, Any] | None = None,
+) -> PhaseOutcome:
+    """The outcome a machine-derived claim may state on this evidence.
+
+    The floor's claim is not a model's opinion: it is a projection of the same
+    evidence the gate is about to grade, so it is the gate's own validated
+    outcome by construction.
+    """
+    return _VALIDATED_OUTCOMES[settled_validator_state(validator_state, validated_facts)]
+
+
+def settlement_capped_outcome(
+    validated_facts: Mapping[str, Any] | None = None,
+) -> PhaseOutcome | None:
+    """The outcome the §3.3 cap leaves in place of `success`, or None.
+
+    PARTIAL exactly when the physical inspection was GREEN and the cap fired on
+    it — the one state where `success` is unavailable while the physical oracle
+    saw a complete phase. Every caller that keyed on `success` being the top of
+    the ladder needs this and not the capped state: the capped PARTIAL and a
+    physically partial build are different facts, and the gate result alone
+    cannot tell them apart.
+
+    Absent basis is not a green light (P2): a fact dict with no recorded physical
+    state states nothing about it, so this returns None rather than assuming the
+    inspection was green. The conservative answer keeps every guard armed.
+    """
+    facts = dict(validated_facts or {})
+    physical = str(facts.get(PHYSICAL_STATE_FACT) or "").strip().lower()
+    if physical != ValidatorState.GREEN.value:
+        return None
+    capped = settled_validator_state(ValidatorState.GREEN, facts)
+    if capped is ValidatorState.GREEN:
+        return None
+    return _VALIDATED_OUTCOMES[capped]
+
+
 @dataclass(frozen=True)
 class _ValidatorObservation:
     state: ValidatorState
@@ -251,10 +406,19 @@ def validate_phase_claim(
     # claim, never refine it upward — a classified blocker is not a green
     # waiver. The cap stops AT the claim: it never manufactures a contradiction
     # the physical oracle did not observe.
+    #
+    # Plan 8 §3.3 broadens the TRIGGER and leaves the direction alone. The p7d
+    # polaris build was graded while its compile job was still running: the
+    # model honestly claimed `partial`, the gate said `Built 100% of expected
+    # classes … Module coverage: 1/26 built` and upgraded the claim to success.
+    # The cap did not fire because polaris's survey reads no Kotlin settings,
+    # so its domain list was empty — and an empty domain graph is not evidence
+    # that nothing is unfinished. An unsettled obligation is.
     facts = dict(validated_facts or {})
     blocking_domains = _unclosed_domains(facts)
+    open_jobs = _open_obligations(facts)
     if (
-        blocking_domains
+        (blocking_domains or open_jobs)
         and claimed in _OUTCOME_RANK
         and validated in _OUTCOME_RANK
         and _OUTCOME_RANK[claimed] < _OUTCOME_RANK[validated]
@@ -265,10 +429,43 @@ def validate_phase_claim(
             part
             for part in (
                 reason,
-                "no refinement above the claim while surveyed build domains are "
-                f"unclosed: {', '.join(blocking_domains)}",
+                (
+                    "no refinement above the claim while surveyed build domains are "
+                    f"unclosed: {', '.join(blocking_domains)}"
+                    if blocking_domains
+                    else ""
+                ),
+                (
+                    f"{_unsettled_clause(open_jobs)} — the claim is confirmable at most"
+                    if open_jobs
+                    else ""
+                ),
             )
             if part
+        )
+
+    # And success requires settled books: while a job is still out, the run
+    # does not yet know what its own dispatch did, so green is not available
+    # to it. A downgrade, never an upgrade — a MODEL's success claim capped this
+    # way is contradicted by the ordinary truth table below and must be re-made
+    # honestly, while a machine-derived claim states the capped outcome from the
+    # start (`claimable_outcome`) and is confirmed. The state and its sentence
+    # come from `settled_observation`, the one computation of the cap, so the
+    # engine's read-only probe cannot answer this question differently.
+    capped, reason = settled_observation(state, reason, facts)
+    if capped is not state:
+        state = capped
+        validated = _VALIDATED_OUTCOMES[state]
+        # A refusal states the move it leaves. This one was a bare sentence: the
+        # model learned success was unavailable and nothing about what was, which
+        # on the report phase (whose objective is literally "claim success") is a
+        # dead end dressed as a check.
+        suggestions = (
+            *tuple(suggestions),
+            (
+                f"claim phase(action='done', outcome='{validated.value}') on the evidence "
+                f"in hand, or wait for the terminal result of {_unsettled_clause(open_jobs)}"
+            ),
         )
 
     if claimed is PhaseOutcome.UNKNOWN:
@@ -315,11 +512,18 @@ def check_phase_claim(
     validator,
     orchestrator,
     project_name: Optional[str],
+    *,
+    sealed: bool = False,
 ) -> GateResult:
-    """Inspect physical evidence and validate one terminal phase claim."""
+    """Inspect physical evidence and validate one terminal phase claim.
+
+    `sealed` is the run's evidence seal: a sealed run accepts no further
+    evidence, so the gate grades the ledger it finds without settling it (see
+    :func:`_settle_before_grading`).
+    """
     if claim.phase != phase:
         raise ValueError(f"claim for {claim.phase!r} cannot validate phase {phase!r}")
-    observation = _inspect_phase(phase, validator, orchestrator, project_name)
+    observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
     return validate_phase_claim(
         claim,
         observation.state,
@@ -336,25 +540,111 @@ def check_phase_done(
     validator,
     orchestrator,
     project_name: Optional[str],
+    *,
+    sealed: bool = False,
 ) -> dict[str, Any]:
     """Read-only compatibility projection for engine nudges during WS3.
 
     Live model claims use :func:`check_phase_claim`; this adapter carries no
-    claim and therefore cannot close or advance a phase.
+    claim and therefore cannot close or advance a phase. It does reach the
+    settler at the gate, so it carries the run's evidence seal too.
+
+    `ok` answers "would the completion gate pass", which is the SAME question
+    `validate_phase_claim` answers — so it is capped by the same computation
+    (§3.3 via `settled_observation`). It was not, and the two answers diverged in
+    exactly one state: green physical evidence with a job still out. The
+    mid-phase nudge then announced "the completion gate passes on physical
+    evidence" and the gate contradicted the success claim it had just invited,
+    leaving the model between two harness computations of one question (P3). The
+    engine's starved-phase floor reads this same dict, and it closes
+    unconditionally, so its probe must carry the cap and the sentence too.
     """
-    observation = _inspect_phase(phase, validator, orchestrator, project_name)
+    observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
+    state, reason = settled_observation(
+        observation.state, observation.reason, observation.validated_facts
+    )
     return {
-        "ok": observation.state is ValidatorState.GREEN,
-        "reason": observation.reason,
+        "ok": state is ValidatorState.GREEN,
+        "reason": reason,
         "suggestions": list(observation.suggestions),
-        "validator_state": observation.state.value,
+        "validator_state": state.value,
         "evidence_refs": list(observation.evidence_refs),
         "code": observation.code,
         "validated_facts": dict(observation.validated_facts),
     }
 
 
-def _inspect_phase(phase, validator, orchestrator, project_name) -> _ValidatorObservation:
+def _settle_before_grading(orchestrator, *, sealed: bool = False) -> tuple[str, ...]:
+    """Settle the job ledger, then name whatever is still open. Never raises.
+
+    Plan 8 §3.2 trigger 2. The polaris build gate (p7d,
+    `session_20260729_111737_22356`) graded a compile job that was still
+    running and upgraded an honest `partial` to success on the snapshot it
+    saw. A gate may only ever grade settled books, so settlement runs BEFORE
+    the physical inspection — the receipts it writes are the evidence the
+    inspection is about to read.
+
+    A SEALED run settles nothing. The report phase still checks gates after
+    evidence-close (the mid-phase nudge, and a report claim of its own), and
+    settling in that window would write a receipt, an assessment and a repair
+    proposal for a job the sealed verdict has already recorded as
+    `job_unsettled` — evidence the run can no longer state. Refusing to settle
+    is not refusing to LOOK: the obligation the ledger still holds open is
+    returned exactly as before, so the §3.3 cap keeps applying to any claim made
+    in that window and the gate cannot grade green on the very books the verdict
+    calls unsettled.
+
+    A run that never detached anything costs one glob `cat` that matches no
+    file, and states no fact.
+    """
+    if orchestrator is None:
+        return ()
+    try:
+        from .job_obligations import is_open, read_obligations, settle_open_obligations
+
+        records = read_obligations(orchestrator)
+        if not records:
+            return ()
+        settled: set[str] = set()
+        if not sealed:
+            settled = {
+                settlement.job_id
+                for settlement in settle_open_obligations(orchestrator, obligations=records)
+            }
+        return tuple(
+            str(record.get("job_id") or "").strip()
+            for record in records
+            if is_open(record) and str(record.get("job_id") or "").strip() not in settled
+        )
+    except Exception as exc:  # the ledger never breaks a phase claim
+        logger.debug(f"job obligations were not settled before grading: {exc}")
+        return ()
+
+
+def _inspect_phase(
+    phase, validator, orchestrator, project_name, *, sealed: bool = False
+) -> _ValidatorObservation:
+    open_jobs = _settle_before_grading(orchestrator, sealed=sealed)
+    observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
+    if not open_jobs:
+        return observation
+    # The three facts the §3.3 cap is a function of, stated together at the one
+    # place that knows all three: which jobs are open, what the PHYSICAL oracle
+    # said before anything capped it, and whether the run can still settle
+    # anything. Replay re-grades this claim offline from these facts alone, so a
+    # cap that read the container instead would grade a different world.
+    return replace(
+        observation,
+        validated_facts={
+            **dict(observation.validated_facts),
+            OPEN_OBLIGATIONS_FACT: list(open_jobs),
+            PHYSICAL_STATE_FACT: ValidatorState(observation.state).value,
+            EVIDENCE_SEALED_FACT: bool(sealed),
+        },
+    )
+
+
+def _inspect_phase_evidence(phase, validator, orchestrator, project_name) -> _ValidatorObservation:
     try:
         if phase == "provision":
             return _inspect_provision(orchestrator, project_name)

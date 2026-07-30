@@ -18,6 +18,7 @@ from sag.agent.invocation_receipts import (
     record_invocation,
     snapshot_reports,
 )
+from sag.agent.job_obligations import record_dispatch_obligation
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, TestStats
 
@@ -677,12 +678,30 @@ class GradleTool(BaseTool):
         all, where _build_gradle_command substitutes `build`. That
         substitution is exactly the kind of divergence the receipt exists to
         record, so it is written down rather than smoothed over.
+
+        A build still in flight (detached hand-off) has no terminal outcome
+        yet, so it mints no receipt here — but the evidence it is holding is
+        no longer dropped: the `before` snapshot, the frozen contract and the
+        detach handle become one obligation (Plan 8 §3.1), and settlement
+        writes the ordinary receipt when the job's exit code lands.
         """
         self._pending_invocation_receipt = None
+        requested = " ".join(shlex.split(str(requested_action or "")))
         if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
+            record_dispatch_obligation(
+                self.orchestrator.execute_command,
+                result=result,
+                tool="gradle",
+                attempt=attempt,
+                requested_action=requested,
+                effective_action=requested or "build",
+                argv=argv,
+                working_directory=working_directory,
+                before=before,
+                requirements=requirements,
+            )
             return
         after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
-        requested = " ".join(shlex.split(str(requested_action or "")))
         self._pending_invocation_receipt = record_invocation(
             self.orchestrator.execute_command,
             tool="gradle",

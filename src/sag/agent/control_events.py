@@ -46,6 +46,12 @@ CONTROL_EVENT_KINDS = (
     # Plan 6 Stage C: appended, never inserted — the ten kinds above keep their
     # positions so anything reading this tuple by order stays correct.
     "claim_transition",
+    # Plan 8 Stage 1: the books of a detached job, closed after the call that
+    # started it returned. Appended for the same reason.
+    "job_settled",
+    # …and the other outcome: a job the run never heard back from. Both branches
+    # of §3.2 are in the stream, so replay reproduces either state.
+    "job_unsettled",
 )
 ControlEventKind = Literal[
     "planner_response",
@@ -59,6 +65,8 @@ ControlEventKind = Literal[
     "loop_decision",
     "evidence_close",
     "claim_transition",
+    "job_settled",
+    "job_unsettled",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -532,6 +540,40 @@ class ClaimTransitionPayload(_StrictPayload):
         return self
 
 
+class JobSettledPayload(_StrictPayload):
+    """One detached job's books, closed (Plan 8 §3.2).
+
+    Three facts and no more: which job, which receipt it finally wrote, and
+    the terminal exit code it wrote it from. Everything else about the
+    settlement is IN that receipt, and a second copy here would be a second
+    place to disagree.
+    """
+
+    job_id: str = Field(min_length=1)
+    receipt_id: str = Field(min_length=1)
+    exit_code: int
+
+
+class JobUnsettledPayload(_StrictPayload):
+    """One detached job the run never heard back from (Plan 8 §3.2).
+
+    The settled branch has been in the stream since Stage 1 landed; this is its
+    other half. A job with no terminal exit code is recorded on the verdict as
+    `job_unsettled:<job_id>` with the obligation file as provenance, and that is
+    a STATE — so it belongs in the transcript, or an offline replay of the run
+    reaches evidence-close with a conflict it can neither see nor reproduce.
+
+    `obligation` is the same bounded projection the verdict's fact carries (what
+    was dispatched, and where its log is), so the two cannot disagree. Nothing
+    here is guessed from the partial log: an unfinished job is neither a pass
+    nor a failure, and the payload states only what the dispatch was.
+    """
+
+    job_id: str = Field(min_length=1)
+    evidence_ref: str = Field(min_length=1)
+    obligation: dict[str, Any] = Field(default_factory=dict)
+
+
 _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "planner_response": PlannerResponsePayload,
     "scheduler_decision": SchedulerDecisionPayload,
@@ -544,6 +586,8 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "loop_decision": LoopDecisionPayload,
     "evidence_close": EvidenceClosePayload,
     "claim_transition": ClaimTransitionPayload,
+    "job_settled": JobSettledPayload,
+    "job_unsettled": JobUnsettledPayload,
 }
 
 
