@@ -1,8 +1,10 @@
 # Evidence Lifecycle Completion — SAG v2 Plan 8 Design
 
 **Date:** 2026-07-29
-**Status:** approved direction (2026-07-29 review with Chenhao); design-only,
-implementation not started
+**Status:** revised 2026-07-29 after round one of implementation. Stages 1–4
+exist on lane branches under review; §3.7 was found wrong at its root and is
+rewritten below, so Stage 5 has not been implemented against the corrected
+text. §3.4, §3.6 and §7 carry constraints the round-one code violated.
 **Author:** worked out jointly against the p7d graded evidence
 **Compatibility:** preserves the Category-3 facts-only boundary
 (`2026-07-19-analyzer-diet.md`), the Bigtop attribution rule, the provenance
@@ -85,6 +87,30 @@ as permanently unready and skips build and test — absence collapsed to
 > tiers: a receipt-proven statement of structure outranks a survey guess the
 > moment it exists — which is the provenance ladder this project already has,
 > applied to structure.
+>
+> **P4 — removing evidence must never improve a verdict.** Discarding a
+> receipt, failing to read one, or swallowing an exception into `None` may make
+> a verdict less certain. It may never make it better.
+
+P4 was added after three implementation rounds each shipped an upward
+refinement in the same file, and it is the diagnosis of why. The #17 narrowing
+has an inverted incentive built into it: the coverage denominator shrinks with
+the attempted-module set, so **anything that removes a module from that set
+makes the build look more complete**. Three changes, each defensible on its own
+terms, each tripped it:
+
+| round | the change | the effect |
+|---|---|---|
+| 1 | fall back to the persisted structure when the receipt probe returns nothing | a stale single-module structure narrowed a 26-module denominator to 1 |
+| 2 | key the authority on "a receipt stated modules" | the minority-scan cap was disarmed by a receipt's mere existence |
+| 3 | filter non-terminal receipts out of `_attempted_modules` | dropping an OOM-killed reactor's 26 modules let a scoped `-pl m0` retry narrow to 1 and grade GREEN — a regression from both main and round two |
+
+All three are the same bug. So the rule is structural, not a patch: a receipt
+the harness will not trust as a *prover* must still be counted as a *claimant*.
+An unreadable, non-terminal, or crashed dispatch **caps** the verdict — exactly
+as §3.3 already does for an unsettled obligation — and never shrinks the
+denominator. Narrowing is licensed only by evidence the harness is willing to
+stand behind in both directions.
 
 ## 3. Components
 
@@ -188,8 +214,14 @@ where the classes and reports actually land.
 
 ### 3.4 Coverage carries its basis
 
-`coverage_info` gains `basis: "derived" | "none"`. When no per-module class
-expectation could be derived, `class_coverage` is **absent**, not 1.0:
+`coverage_info` gains `basis: "derived" | "none"`. Basis is `none` only when
+**no expectation of any kind** could be derived. A jar-only expectation that was
+derived and found IS a basis — `classes_expected == 0` means "no class-based
+expectation", which is a different statement and must not be read as this one
+(round-one implementation error, caught by both reviewers: a Kotlin/Scala module
+whose only expectation was its JAR, all_present, was downgraded to PARTIAL and
+told falsely that nothing could be derived). When basis is `none`,
+`class_coverage` is **absent**, not 1.0:
 
 - basis `none`, classes > 0 → **PARTIAL**:
   `compiled 1,706 classes; no per-module expectation could be derived —
@@ -233,18 +265,108 @@ It deliberately does NOT attempt to parse Kotlin settings or imperative
 version checks statically. Pre-flight owns stated-requirement recovery and
 owns it well.
 
-### 3.7 The analyze gate can conclude
+Three constraints the round-one implementation violated, now explicit:
 
-P2 applied to the other collapse. "No static test count derivable" becomes a
-recorded fact (`analysis.test_count_basis = "none"`, provenance the survey),
-and analysis readiness stops requiring a static count. Build and test
-proceed; the final count is whatever receipts prove, which is the only count
-the verdict trusts anyway. A repository that genuinely has no unified build
-(rocketmq-externals as a bag of subprojects, ofbiz-plugins outside its parent
-tree) produces a run that *attempts* its parts and states what it found,
-instead of `analysis_not_ready` skipping both phases. The stated finding —
-"this repository declares no unified build" — is admissible evidence for an
-honest `blocked`/`partial` close, not a missing prerequisite.
+**Terminal means the dispatch ended, not that the exit code is an integer.**
+An OOM-killed detached build gets a synthesized exit code (`orch.py:1237-1240`
+returns 1 for a vanished poll) and a truncated log; Gradle prints task lines
+incrementally, so a build killed at module 40 of 300 names exactly 40 and would
+enshrine that guess at the top provenance tier. §3.2's "nothing is guessed from
+a partial log" governs here too, so the receipt must carry enough for a reader
+to tell how the dispatch ended.
+
+**A persisted structure is not this pass's attempted-module list.** Narrowing
+the coverage denominator is licensed only by what THIS run's receipts say they
+attempted (§3.5 rung (a)). Substituting the stored structure when the receipt
+probe returns nothing shrinks the denominator on evidence that never said
+anything about this dispatch, which refines a partial build upward — the
+violation this whole plan exists to prevent.
+
+**Update is not unconditional replacement.** A scoped dispatch (`mvn -pl m0`)
+states one module; that must not demote a wide reactor's statement of
+twenty-six. Only a terminal receipt whose statement is at least as wide may
+restate the structure.
+
+### 3.7 A refusal that carries what it saw
+
+> **This section replaces an earlier version that was wrong at its root, and
+> the correction is worth recording because the wrong version survived a spec
+> review.** The first version said analysis readiness required a static test
+> count and should stop requiring one. Readiness never required a static count:
+> `_inspect_analyze` (`phase_gates.py:939-947`) returns PARTIAL with
+> `build_entry_ready: True` whenever `analyzed` is truthy, and `analyzed` is set
+> by ANY survey marker — `project_type`, `build_system`,
+> `build_recommendation`, `survey`. Implementing the wrong version relaxed the
+> only remaining precondition that analysis produced anything, granting build
+> entry to runs where nothing was surveyed and sealing a verified fact and a
+> verdict sentence asserting a survey finding no survey ever produced. Both
+> round-one reviewers found it independently, each with a measured five-input
+> enumeration across the two commits.
+
+The live shape, read from the sealed evidence of
+`session_20260727_082937_1609` (rocketmq-externals) and
+`session_20260727_082940_1649` (ofbiz-plugins):
+
+```
+validator_state: red   build_entry_ready: false
+code: analysis_static_count_missing
+facts: {trunk_context_found: true, static_test_count_present: false}
+```
+
+and, in the control events, **five** `project(action='analyze')` calls all
+returning `PROJECT_NOT_FOUND` — on `/workspace/rocketmq-externals`, on the same
+path with a trailing slash, via `.git/..`, and on two guessed nestings. The
+model then gave up on the survey and closed the phase.
+
+**The refusal is correct.** `/workspace/rocketmq-externals` contains
+`README.md`, `dev`, `docs`, and twenty-six sibling subproject directories. It
+holds none of the twelve project indicators `is_valid_project_directory`
+(`physical_survey.py:2342-2397`) looks for, and no `src`/`lib`/`app`/`source`.
+The root genuinely is not a project. The campaign report's characterization —
+"a bag of unrelated subprojects with no unified build" — was right; its
+*mechanism* ("the gate requires a static test count as a precondition") was
+wrong, and this is the third correction to that one entry.
+
+So the defect is not readiness, and not the analyzer's judgement. It is that a
+correct refusal is a **dead end** and then gets **mislabelled**:
+
+**(a) The refusal states only what it was asked, never what it saw.**
+`PROJECT_NOT_FOUND` carries `requested_path` and nothing else. The same walk
+that rejected the root passed twenty-six directories each holding a `pom.xml`.
+That is a fact, and stating it costs one more observation:
+
+> `PROJECT_NOT_FOUND: /workspace/rocketmq-externals holds no project indicator
+> and no source directory. 26 subdirectories each contain a build file:
+> rocketmq-connect, rocketmq-console, rocketmq-flink, … (+23).`
+
+This is Category-3 clean — an observation, not a recommendation, and no plan.
+It replaces five path guesses with one statement the model can act on or close
+on. Bound the enumeration (a name list plus a count, like every other bounded
+projection in the loop).
+
+**(b) The status code contradicts the state.** `analysis_static_count_missing`
+projects "Project survey facts exist, but no static test-count fact was
+observed" — and on this path no survey facts exist at all. The truthful code
+`analysis_facts_missing` ("No persisted project survey facts were observed") is
+**unreachable**: `physical_validator.py:4462` claims the code slot when
+`static_test_count` is absent, and the fallback at `:4488` only fires
+`if not analyzed and not analysis_status_code`. So the sentence that misled the
+campaign report is emitted by construction whenever a trunk exists and the
+survey found nothing. Assign the code from what was actually observed: no
+survey markers → `analysis_facts_missing`; markers but no count →
+`analysis_static_count_missing`. This is §2 P3 again — the sentence and the
+state must come from one determination.
+
+**(c) Readiness is unchanged.** No survey → RED → `analysis_not_ready` is the
+honest outcome, and this section must not touch it. What changes is that the
+run now carries a stated finding about the repository instead of a false
+sentence about a missing count, and the model reaches that finding in one
+refusal instead of five.
+
+Whether a run should go on to attempt the twenty-six subprojects is a real
+question and explicitly **out of scope**: it is a multi-project-repository
+design question, not an evidence-lifecycle one. Stating the finding is what
+makes it answerable later.
 
 ## 4. What does not change
 
@@ -274,10 +396,15 @@ the next begins.
 | 2 | gate cap on unsettled obligations (`validate_phase_claim` trigger broadened; green capped to partial) | the partial→success upgrade |
 | 3 | coverage `basis` tri-state | "100%" from nothing to check |
 | 4 | unified module-scan object (decider = display, pinned by test); receipt-proven structure promotion | the sentence that contradicted itself; the disarmed-guard chain |
-| 5 | analyze-gate conclusion (`test_count_basis`, readiness change) | rocketmq-externals / ofbiz-plugins `analysis_not_ready` |
+| 5 | the refusal states what it saw; the status code matches the state (`analysis_facts_missing` made reachable). **Readiness unchanged.** | the five blind path guesses, and the sentence that misattributed the cause three times |
 
 Live anchors after stages 1–2: rerun polaris and camel, grade from control
 events. After stage 5: rerun rocketmq-externals and ofbiz-plugins.
+
+**Stage 5 is now the smallest of the five, not the largest.** The first version
+of §3.7 made it a readiness change; the corrected version is an observation and
+a code assignment. If a future reader finds it suspiciously cheap, that is the
+point — the expensive version was the wrong one.
 
 ## 6. Acceptance
 
@@ -288,20 +415,29 @@ events. After stage 5: rerun rocketmq-externals and ofbiz-plugins.
    a passing coverage verdict with a minority module scan.
 2. **camel rerun:** same, at 11k scale; wrapper/runner selection stated
    truthfully in the graded report.
-3. **rocketmq-externals, ofbiz-plugins:** analyze concludes with the stated
-   finding; build is attempted; whatever happens next is evidence, not a
-   skip.
+3. **rocketmq-externals, ofbiz-plugins:** one `project(action='analyze')` call,
+   not five; the refusal names the twenty-six subprojects it saw; the sealed
+   code is `analysis_facts_missing` and the sentence it projects is true of the
+   run. Readiness stays RED and the run closes honestly on that finding.
 4. **No sealed-run regression:** all four locked profiles byte-identical;
    replay of every existing recorded session unchanged.
 5. **The settled path is the synchronous path:** one test dispatches, forces
    a detach, settles, and asserts the receipt is field-for-field what the
    synchronous path would have written (timing aside) — one schema, one
    writer, no second bookkeeping system.
+6. **Every new test fails under the mutation it exists to catch.** Round one
+   shipped a test for P3 that asserted against a fake re-implementing the
+   production method, so deleting the production caching left all 3,611 tests
+   green. Each stage's key test must be shown to fail when the behaviour it
+   pins is removed, and the demonstration recorded in the acceptance report.
 
 ## 7. Risks and their answers
 
 - **Late `after` snapshots misattribute intervening writes** → first-claim
-  exclusion against ordered receipts (§3.2), recorded, tested.
+  exclusion scoped to receipts written AFTER the dispatch, not to every receipt
+  on disk (§3.2). Round one applied it to all of them, which cost a detached
+  retry its own rewrite — the very case Stage 1 exists to retire. The ledger
+  must record enough at dispatch time to order receipts against it.
 - **Settlement surprises the model** ("where did this receipt come from?") →
   the one bounded `[settled]` notice line; no synthetic tool results.
 - **A poll-heavy model starves settlement** → the engine sweep runs after
