@@ -23,6 +23,7 @@ surprise §7 names.
 import json
 from pathlib import Path
 
+import pytest
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 from test_job_settlement import (
     EXIT_PATH,
@@ -37,7 +38,7 @@ from sag.agent.control_events import CONTROL_EVENT_KINDS, ControlEvent
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.invocation_receipts import RECEIPT_DIR
 from sag.agent.job_obligations import OBLIGATION_DIR, write_obligation
-from sag.agent.replay import ControlReplayRunner
+from sag.agent.replay import ControlReplayRunner, ReplayValidationError
 from sag.agent.verdict_finalizer import EvidenceCloseReason
 from test_job_settlement import LOG_PATH, POLARIS_LOG, AFTER
 
@@ -399,6 +400,38 @@ def test_replay_reproduces_the_unsettled_conflict_from_the_transcript(tmp_path):
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
     assert f"job_unsettled:{JOB}" in result.snapshot.conflicts
+
+
+def test_an_unsettled_row_after_the_close_is_impossible(tmp_path):
+    """Evidence-close is immutable in replay too. A transcript that claims a
+    conflict was recorded on a sealed verdict is rejected, not absorbed."""
+    source = [
+        json.loads(line)
+        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    rows = list(source)
+    close = next(row for row in rows if row.get("kind") == "evidence_close")
+    rows.append(
+        {
+            "kind": "job_unsettled",
+            "payload": {
+                "job_id": JOB,
+                "evidence_ref": f"{OBLIGATION_DIR}/{JOB}.json",
+                "obligation": {"tool": "gradle"},
+            },
+            "source": close["source"],
+        }
+    )
+    for sequence, row in enumerate(rows[1:], 1):
+        row["sequence"] = sequence
+    transcript = tmp_path / "late-unsettled-paramiko.jsonl"
+    transcript.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReplayValidationError):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
 
 def test_a_pre_plan_8_transcript_still_replays_byte_identically():
