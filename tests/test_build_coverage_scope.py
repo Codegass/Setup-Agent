@@ -150,9 +150,24 @@ def test_no_stated_modules_changes_nothing():
 
 
 def test_an_expectation_with_no_module_of_its_own_is_never_dropped():
-    """A root-level or unparseable expectation stays in the denominator."""
+    """A root-level or unparseable expectation stays in the NARROWED denominator.
+
+    The fence has to stand where the narrowing actually TOOK EFFECT. With the
+    keyless expectation alone, `core` maps to nothing, the mapping is incomplete
+    and the wide list comes back from the other branch — so dropping keyless
+    expectations was invisible to the suite: the guarantee had no fence anywhere.
+    Here `core` maps, the narrowing happens, and the keyless expectation has to
+    survive it on its own account.
+    """
     root_expectation = {"path": "/target/classes", "type": "classes", "min_count": 3}
 
+    narrowed = scope([expectation("core"), root_expectation], ("core",))
+
+    assert narrowed.conflict is None  # the narrowing took effect
+    assert narrowed.denominator_modules == ("core",)
+    assert root_expectation in narrowed.expectations
+    assert len(narrowed.expectations) == 2
+    # And the unnarrowable shape keeps it too, by the wide-list route.
     assert root_expectation in scope([root_expectation], ("core",)).expectations
 
 

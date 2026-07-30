@@ -34,10 +34,12 @@ BASIS_SURVEY = "survey"
 class ModuleBasis:
     """Which computation set the coverage denominator, and what it stated.
 
-    ``built``/``total`` are stated only by the scan rung: a receipt states
-    which modules the build ATTEMPTED (the class-weighted coverage is measured
-    against those, unchanged since #17/d5dc330), and the survey states an
-    expectation list, not a module tally.
+    ``built`` is stated only by the scan rung: a receipt states which modules the
+    build ATTEMPTED (the class-weighted coverage is measured against those,
+    unchanged since #17/d5dc330), and the survey states an expectation list, not
+    a module tally. ``total`` on the receipt rung is the number of MODULES the
+    denominator holds, counted on `module_key` exactly as the denominator is
+    keyed (`_module_count`) — not the number of labels the receipts printed.
     """
 
     authority: str
@@ -99,6 +101,26 @@ def _receipt_that_stated(structure: Mapping[str, Any] | None, modules: Sequence[
     return provenance if stated and stated == counted else ""
 
 
+def _module_count(modules: Sequence[str]) -> int:
+    """How many MODULES a label list names, counted the way the denominator is.
+
+    The denominator is keyed on `module_key` — that is why `Apache Camel :: Core`
+    can match the directory `core` at all — so counting labels instead of keys
+    tells the model more modules were attempted than the denominator contains
+    (two receipts spelling one module two ways, a reactor summary and a Gradle
+    task list naming the same subproject). A label that normalizes to nothing is
+    still a label the build printed and stays counted as itself; deduplicating on
+    a key that does not exist would be a guess.
+    """
+    from sag.agent.receipt_structure import module_key
+
+    counted = set()
+    for name in modules:
+        key = module_key(name)
+        counted.add(key if key else f"\0{name}")
+    return len(counted)
+
+
 def module_basis(
     coverage: dict[str, Any] | None,
     *,
@@ -124,7 +146,9 @@ def module_basis(
     modules = tuple(str(name) for name in (denominator_modules or ()) if str(name).strip())
     if modules:
         return ModuleBasis(
-            BASIS_RECEIPT, _receipt_that_stated(structure, modules), total=len(modules)
+            BASIS_RECEIPT,
+            _receipt_that_stated(structure, modules),
+            total=_module_count(modules),
         )
     summary = (coverage or {}).get("summary") or {}
     total = int(summary.get("modules_total") or 0)

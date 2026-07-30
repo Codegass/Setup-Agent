@@ -39,7 +39,11 @@ import json
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
 
 from sag.agent.module_coverage import ModuleBasis, module_basis
-from sag.agent.physical_validator import INVOCATION_RECEIPTS_DIRNAME, PhysicalValidator
+from sag.agent.physical_validator import (
+    INVOCATION_RECEIPTS_DIRNAME,
+    PhysicalValidator,
+    _AttemptedModules,
+)
 
 # The 26 subprojects polaris's `settings.gradle.kts` registers imperatively and
 # the survey never saw. Only `build-logic` had output when the gate graded.
@@ -75,6 +79,14 @@ def _polaris_scan(built=("build-logic",)):
     }
 
 
+def _orchestrator(files, receipts, degrade):
+    """A plain filesystem fake, or one that also serves receipts when the test
+    wants the denominator read by production code."""
+    if receipts is None:
+        return FakeBuildOrchestrator(files=files)
+    return ReceiptFilesystem(files=files, receipts=receipts, **(degrade or {}))
+
+
 def _polaris_validator(
     *,
     class_count=1706,
@@ -83,6 +95,8 @@ def _polaris_validator(
     jar_on_disk=False,
     attempted=None,
     structure=None,
+    receipts=None,
+    degrade=None,
 ):
     """A gradle build whose expectations are jar-only: nothing class-based can
     be derived, which is exactly what polaris's unparsed settings produced.
@@ -93,7 +107,7 @@ def _polaris_validator(
     files = {"/workspace/polaris/settings.gradle.kts"}
     if jar_on_disk:
         files.add("/workspace/polaris/build/libs/polaris-1.0.jar")
-    orch = FakeBuildOrchestrator(files=files)
+    orch = _orchestrator(files, receipts, degrade)
     validator = PhysicalValidator(
         docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
     )
@@ -114,7 +128,10 @@ def _polaris_validator(
         {"path": "/workspace/polaris/build/libs", "type": "jar", "artifact": "main JAR"}
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
-    validator._attempted_modules = lambda: attempted
+    if receipts is None:
+        validator._attempted_module_evidence = lambda: _AttemptedModules(
+            tuple(attempted or ()), True, None
+        )
     validator._receipt_structure = lambda: structure or {}
     return validator
 
@@ -136,11 +153,13 @@ def _maven_scan(built=("m0",)):
     }
 
 
-def _maven_reactor_validator(*, attempted=None, structure=None, scan=None):
+def _maven_reactor_validator(
+    *, attempted=None, structure=None, scan=None, receipts=None, degrade=None
+):
     """A 26-module Maven project where only `m0` compiled (10 of 260 classes)."""
     files = {f"/workspace/proj/m0/target/classes/C{index}.class" for index in range(10)}
     files |= {"/workspace/proj/pom.xml", "/workspace/proj/m0/target/app.jar"}
-    orch = FakeBuildOrchestrator(files=files)
+    orch = _orchestrator(files, receipts, degrade)
     validator = PhysicalValidator(
         docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
     )
@@ -162,12 +181,17 @@ def _maven_reactor_validator(*, attempted=None, structure=None, scan=None):
         for module in MAVEN_MODULES
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
-    validator._attempted_modules = lambda: attempted
+    if receipts is None:
+        validator._attempted_module_evidence = lambda: _AttemptedModules(
+            tuple(attempted or ()), True, None
+        )
     validator._receipt_structure = lambda: structure or {}
     return validator
 
 
-def _met_expectation_validator(*, scan, attempted=None, structure=None, class_count=10):
+def _met_expectation_validator(
+    *, scan, attempted=None, structure=None, class_count=10, receipts=None, degrade=None
+):
     """A Maven build whose ONE derived class expectation is fully MET on disk.
 
     The point of the shape: with `all_present` True and `class_coverage` 1.0 at a
@@ -179,7 +203,7 @@ def _met_expectation_validator(*, scan, attempted=None, structure=None, class_co
     """
     files = {f"/workspace/proj/m0/target/classes/C{index}.class" for index in range(10)}
     files |= {"/workspace/proj/pom.xml", "/workspace/proj/m0/target/app.jar"}
-    orch = FakeBuildOrchestrator(files=files)
+    orch = _orchestrator(files, receipts, degrade)
     validator = PhysicalValidator(
         docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
     )
@@ -200,7 +224,10 @@ def _met_expectation_validator(*, scan, attempted=None, structure=None, class_co
         }
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
-    validator._attempted_modules = lambda: attempted
+    if receipts is None:
+        validator._attempted_module_evidence = lambda: _AttemptedModules(
+            tuple(attempted or ()), True, None
+        )
     validator._receipt_structure = lambda: structure or {}
     return validator
 
@@ -227,6 +254,47 @@ class ReceiptOrchestrator:
             body = "\n".join(json.dumps(receipt) for receipt in self.receipts)
             return {"success": True, "exit_code": 0, "output": body}
         return {"success": True, "exit_code": 0, "output": ""}
+
+
+class ReceiptFilesystem(FakeBuildOrchestrator):
+    """The container filesystem AND this run's invocation receipts.
+
+    Every P4 test below reads the denominator through production code — the
+    presence probe, the `cat` of the receipt directory, the terminality
+    predicate, the scoping outcome — so a DEGRADED READ is a degraded container
+    and not a patched method. `corrupt` truncates a receipt line the way a
+    half-written file or a clipped `cat` does: it still starts with `{`, and it
+    still does not parse.
+    """
+
+    def __init__(
+        self, files=(), *, receipts=(), corrupt=(), cat_raises=False, present_raises=False
+    ):
+        super().__init__(files=files)
+        self.receipt_bodies = []
+        for index, receipt in enumerate(receipts):
+            body = json.dumps(receipt)
+            if index in corrupt:
+                body = body[: max(len(body) // 2, 1)]
+            self.receipt_bodies.append(body)
+        self.cat_raises = cat_raises
+        self.present_raises = present_raises
+
+    def execute_command(self, command, **_kwargs):
+        text = command.strip()
+        if INVOCATION_RECEIPTS_DIRNAME in text:
+            if text.startswith("test -d"):
+                if self.present_raises:
+                    raise RuntimeError("container flake on the receipt-directory probe")
+                return {
+                    "exit_code": 0,
+                    "output": "EXISTS" if self.receipt_bodies else "",
+                }
+            if text.startswith("cat "):
+                if self.cat_raises:
+                    raise RuntimeError("container flake reading the receipts")
+                return {"exit_code": 0, "output": "\n".join(self.receipt_bodies)}
+        return super().execute_command(command)
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +497,18 @@ def test_a_crashed_dispatchs_truncated_module_list_is_not_a_denominator():
     denominator ladder asked the same question of the same receipt and answered
     differently, so a truncated list became the `receipt` rung — coverage narrowed
     to the 40 modules the kill happened to reach, and the shortfall in the other
-    260 read as untried rather than unbuilt. One predicate, one answer."""
-    assert _receipt_validator([_killed_receipt()])._attempted_modules() is None
+    260 read as untried rather than unbuilt. One predicate, one answer.
+
+    What the refusal costs is the LICENCE TO NARROW, and nothing else: the 40
+    modules it printed are still 40 modules this run attempted, and they stay in
+    the claimant list (spec §2 P4). Deleting them — round three's mechanism — is
+    what let a scoped retry beside the crash narrow the denominator instead.
+    """
+    evidence = _receipt_validator([_killed_receipt()])._attempted_module_evidence()
+
+    assert evidence.narrowing_licensed is False
+    assert evidence.cap == "build_receipt_not_terminal"
+    assert evidence.modules == tuple(f"m{index}" for index in range(40))
 
 
 def test_a_dispatch_something_else_stopped_is_not_a_denominator_either():
@@ -440,14 +518,22 @@ def test_a_dispatch_something_else_stopped_is_not_a_denominator_either():
     killed = dict(_killed_receipt(), lifecycle_state=None, termination_reason="silent_timeout")
     killed.pop("lifecycle_state")
 
-    assert _receipt_validator([killed])._attempted_modules() is None
+    evidence = _receipt_validator([killed])._attempted_module_evidence()
+
+    assert evidence.narrowing_licensed is False
+    assert evidence.cap == "build_receipt_not_terminal"
+    assert evidence.modules == tuple(f"m{index}" for index in range(40))
 
 
 def test_a_terminal_receipt_still_sets_the_denominator():
     """The regression fence for the guard above: a dispatch that recorded its own
     exit (and a synchronous one, which states no lifecycle at all) still narrows
-    coverage to what it attempted — and a crashed receipt beside it contributes
-    nothing rather than poisoning the list."""
+    coverage to what it attempted.
+
+    And a crashed receipt beside them widens the claimant list back out and caps,
+    rather than being dropped: the union is what this run attempted, and the
+    narrowing waits for evidence the harness will stand behind.
+    """
     finished = {
         "receipt_id": "inv-maven-1-0001",
         "exit_code": 1,
@@ -460,12 +546,72 @@ def test_a_terminal_receipt_still_sets_the_denominator():
         "module_outcomes": [{"module": "jms", "status": "SUCCESS"}],
     }
 
-    assert _receipt_validator([finished])._attempted_modules() == ("core",)
-    assert _receipt_validator([synchronous])._attempted_modules() == ("jms",)
-    assert _receipt_validator([_killed_receipt(), finished, synchronous])._attempted_modules() == (
-        "core",
-        "jms",
+    assert _receipt_validator([finished])._attempted_module_evidence() == _AttemptedModules(
+        ("core",), True, None
     )
+    assert _receipt_validator([synchronous])._attempted_module_evidence() == _AttemptedModules(
+        ("jms",), True, None
+    )
+    beside_a_crash = _receipt_validator(
+        [_killed_receipt(), finished, synchronous]
+    )._attempted_module_evidence()
+    assert beside_a_crash.narrowing_licensed is False
+    assert beside_a_crash.cap == "build_receipt_not_terminal"
+    assert set(beside_a_crash.modules) == {f"m{index}" for index in range(40)} | {"core", "jms"}
+
+
+def test_an_unreadable_receipt_line_states_nothing_and_hides_what_it_stated():
+    """P4's third verb. A half-written or clipped receipt line was skipped as if
+    the run had never written it — so the widest statement in a container could
+    vanish and the narrowest one decide, which is an improvement bought by a
+    failed read. It is a refusal now, and refusals cap."""
+    orchestrator = ReceiptOrchestrator([_killed_receipt()])
+    orchestrator.receipts = []
+    truncated = json.dumps(_killed_receipt())[:40]
+    orchestrator.execute_command = lambda command, **_k: (
+        {"success": True, "exit_code": 0, "output": "EXISTS"}
+        if command.strip().startswith("test -d")
+        else {"success": True, "exit_code": 0, "output": truncated}
+    )
+    validator = PhysicalValidator(docker_orchestrator=orchestrator, project_path="/workspace")
+
+    evidence = validator._attempted_module_evidence()
+
+    assert truncated.startswith("{")  # it IS a receipt line; it just does not parse
+    assert evidence == _AttemptedModules((), False, "build_receipts_unreadable")
+
+
+def test_a_probe_that_threw_is_not_the_fact_that_no_receipt_exists():
+    """Both receipt probes swallowed every exception into "nothing stated", and
+    "nothing stated" is the state that licenses the widest reading of every other
+    module. One flaky `test -d` or `cat` was therefore enough to change the
+    denominator, and only ever in the direction of a better verdict."""
+
+    class Flaky:
+        def __init__(self, fail_on):
+            self.fail_on = fail_on
+
+        def execute_command(self, command, **_kwargs):
+            text = command.strip()
+            if text.startswith(self.fail_on):
+                raise RuntimeError("container flake")
+            return {"success": True, "exit_code": 0, "output": "EXISTS"}
+
+    for fail_on in ("test -d", "cat "):
+        validator = PhysicalValidator(
+            docker_orchestrator=Flaky(fail_on), project_path="/workspace"
+        )
+
+        assert validator._attempted_module_evidence() == _AttemptedModules(
+            (), False, "build_receipts_unreadable"
+        )
+
+    # And a probe that ANSWERED, saying the directory is not there, is still the
+    # honest "nothing stated": no narrowing, and nothing to cap.
+    absent = PhysicalValidator(
+        docker_orchestrator=ReceiptOrchestrator([], present=False), project_path="/workspace"
+    )
+    assert absent._attempted_module_evidence() == _AttemptedModules((), True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +690,26 @@ def test_a_receipt_is_named_only_for_a_denominator_it_actually_stated():
     )
 
 
+def test_two_labels_for_one_module_are_counted_once():
+    """The tally the model reads must be a count of MODULES, not of labels.
+
+    The denominator is keyed on `module_key` — that is the whole reason
+    `Apache Camel :: Core` and the directory `core` can match at all — while the
+    count was `len(denominator_modules)`. A reactor summary naming a module the
+    Gradle task list also named (or a receipt pair that spelled one module two
+    ways) therefore told the model more modules were attempted than the
+    denominator contains.
+    """
+    one_module = module_basis(
+        None, denominator_modules=("Apache Camel :: Core", "/workspace/camel/core")
+    )
+
+    assert one_module.total == 1
+    assert one_module.phrase() == (
+        "denominator: the receipts' module outcomes (1 module(s) attempted)"
+    )
+
+
 def test_the_polaris_sentence_is_unconstructible():
     """The whole point of stage 4: a reason whose decision half says the
     coverage passed while its commentary half says 1/26 cannot be built,
@@ -614,10 +780,9 @@ def test_a_persisted_structure_never_narrows_this_passs_denominator():
 
     26 module expectations, 10 of 260 expected classes built. The manifest
     carries a receipt-proven structure from an earlier SCOPED dispatch
-    (`mvn -pl m0` -> modules `['m0']`), and `_attempted_modules()` returns None
-    for this pass — it does so whenever the receipts probe fails, and both
-    `_invocation_receipts_present()` and `_attempted_modules()` swallow every
-    exception, so one flaky container `test -d` or `cat` is enough.
+    (`mvn -pl m0` -> modules `['m0']`), while this pass's own dispatches stated
+    nothing (`_attempted_module_evidence()` reports no modules — a single-module
+    build, or a receipt-free phase).
 
     Feeding the persisted structure into `attempted_modules` made
     `_scope_expectations_to_attempted` drop the other 25 expectations as
@@ -842,3 +1007,230 @@ def test_the_decider_and_the_display_read_one_scan_not_two():
     assert "Module coverage: 1/26 built" in observation.reason
     assert walks == ["polaris"]  # ONE walk in the whole gate pass
     assert handed_out and all(result is scan for result in handed_out)
+
+
+# ---------------------------------------------------------------------------
+# §2 P4 round four — removing evidence must never improve a verdict
+# ---------------------------------------------------------------------------
+# The diagnosis, not another case: the #17 narrowing shrinks the coverage
+# denominator with the attempted-module set, so ANYTHING that removes a module
+# from that set makes the build look more complete. Three rounds each removed
+# something for a good reason and each improved a verdict:
+#
+#   r1  fall back to the persisted structure when the receipt probe returns
+#       nothing -> a stale single-module structure narrowed 26 to 1
+#   r2  key the authority on "a receipt stated modules" -> the minority-scan cap
+#       was disarmed by a receipt's mere existence
+#   r3  filter non-terminal receipts out of the attempted set -> a scoped retry
+#       beside an OOM-killed reactor narrowed 26 to 1 and graded GREEN
+#
+# So the rule is structural (spec §2 P4, §3.6): a receipt the harness will not
+# trust as a PROVER is still counted as a CLAIMANT. A crashed, non-terminal or
+# unreadable dispatch CAPS the verdict — as §3.3 already does for an unsettled
+# obligation — and never shrinks the denominator.
+_VERDICT_RANK = {"blocked": 0, "partial": 1, "success": 2}
+
+
+def _reactor_receipts(*, wide_lifecycle="finished"):
+    """The two dispatches of the reviewer's reproduction.
+
+    `inv-maven-1-0001` is the full-reactor dispatch that named all 26 modules;
+    `wide_lifecycle="vanished"` is the OOM kill (`collect_detached_result`
+    synthesized exit 1 and the log stops there), `"finished"` is the same reactor
+    having written its own exit status. `inv-maven-1-0002` is the scoped
+    `mvn -pl m0` retry that finished, exit 0, naming one module.
+    """
+    return [
+        {
+            "receipt_id": "inv-maven-1-0001",
+            "exit_code": 1,
+            "lifecycle_state": wide_lifecycle,
+            "module_outcomes": [{"module": name, "status": "success"} for name in MAVEN_MODULES],
+        },
+        {
+            "receipt_id": "inv-maven-1-0002",
+            "exit_code": 0,
+            "lifecycle_state": "finished",
+            "module_outcomes": [{"module": "m0", "status": "success"}],
+        },
+    ]
+
+
+def _build_logic_receipt():
+    """polaris's shape: one synchronous dispatch naming a subproject that no
+    derived expectation mentions."""
+    return [
+        {
+            "receipt_id": "inv-gradle-1-0001",
+            "exit_code": 0,
+            "module_outcomes": [{"module": "build-logic", "status": "attempted"}],
+        }
+    ]
+
+
+def test_a_crashed_dispatchs_modules_still_count_as_claimants():
+    """The round-three blocker, reproduced independently on three branches.
+
+    26-module Maven reactor, expectations for m0..m25, only m0 has classes on
+    disk (10 of 260). Two receipts: the full-reactor dispatch that detached and
+    was OOM-killed (`lifecycle_state: vanished`, synthesized `exit_code: 1`)
+    whose reactor summary named all 26 modules, and a scoped `mvn -pl m0` retry
+    that finished. Filtering the crashed receipt out of the attempted set left
+    `('m0',)`, which narrowed the denominator to one module, dropped the other 25
+    expectations as "untried", and graded the build GREEN — a regression from
+    BOTH main and round two, and the exact sentence §3.5 requires to be
+    unconstructible.
+
+    The crashed dispatch cannot PROVE the structure (its log stops at the kill,
+    so its module list is a prefix). The modules it named are still modules this
+    run attempted: they are claimants, they stay in the denominator, and the
+    receipt caps the verdict instead of narrowing it.
+    """
+    result = _maven_reactor_validator(
+        receipts=_reactor_receipts(wide_lifecycle="vanished")
+    ).validate_build_status("proj")
+
+    assert result["evidence"]["modules_attempted"] == MAVEN_MODULES
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "build_modules_incomplete" in result["conflicts"]
+    assert "build_receipt_not_terminal" in result["conflicts"]
+    assert "Built 10 of 260 expected classes" in result["reason"]
+
+
+def test_two_terminal_dispatches_still_narrow_to_the_union_of_what_they_attempted():
+    """The regression fence for the claimant rule: when both dispatches ended on
+    their own the narrowing is untouched (#17/d5dc330) — it just measures against
+    the union of what they attempted, 26 modules, not the last one."""
+    result = _maven_reactor_validator(receipts=_reactor_receipts()).validate_build_status("proj")
+
+    assert result["evidence"]["modules_attempted"] == MAVEN_MODULES
+    assert result["build_complete"] is False
+    assert "build_receipt_not_terminal" not in result["conflicts"]
+    assert "26 module(s) attempted" in result["reason"]
+
+
+def test_an_unverifiable_scope_caps_the_verdict_even_with_no_module_scan():
+    """§3.5's cap must be reachable in EVERY state where the narrowing did not
+    take effect — including the state where the module scan is unavailable.
+
+    The receipt names `build-logic`, which cannot be mapped onto the single
+    `/build/libs` expectation, so the wide denominator stands and scoping records
+    `build_coverage_scope_unverified`. With a scan on hand the minority count
+    capped the verdict; with `module_coverage` returning None (a tree it could
+    not walk, a validator without the hook) the authority fell back to the survey
+    rung, `states_a_shortfall` was False by construction, and the cap was
+    silently disarmed — a met one-jar expectation graded a complete success while
+    the run had itself recorded that it could not check the denominator. The
+    disagreement never reached `result["conflicts"]` either, so nothing
+    downstream could cap on it.
+    """
+    result = _polaris_validator(
+        jar_on_disk=True, scan=None, receipts=_build_logic_receipt()
+    ).validate_build_status("polaris")
+
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "build_coverage_scope_unverified" in result["conflicts"]
+    assert "Not a complete build" in result["reason"]
+    assert "the build named modules the expectation list does not contain" in result["reason"]
+
+
+def test_the_capped_reason_names_the_check_that_actually_produced_the_clause():
+    """Category 3, in one label.
+
+    The capped rewrite subordinates whatever the deciding branch said and
+    parenthesises it. On the branch that decided from build FINGERPRINTS no
+    coverage check ran at all (`coverage_info` is None — no expectation of any
+    kind could be derived), and labelling that sentence `coverage check:` tells
+    the model a check produced a finding it never produced.
+    """
+    validator = _polaris_validator(scan=_polaris_scan())
+    validator._get_expected_artifacts = lambda *_a, **_k: []
+
+    result = validator.validate_build_status("polaris")
+
+    assert result["build_complete"] is False
+    assert "(build check: Build fingerprints found for gradle project)" in result["reason"]
+    assert "coverage check:" not in result["reason"]
+
+
+def test_no_degraded_read_of_the_same_receipts_can_improve_the_verdict():
+    """The P4 fence: a monotonicity property, not a case.
+
+    The evidence on disk is held FIXED and the harness's READ of it is degraded
+    in every way the three rounds degraded it — P4 names the verbs exactly:
+    discarding a receipt, failing to read one, swallowing an exception into
+    `None`. Here a receipt line is truncated (present, unparseable), the `cat` of
+    the receipt directory throws, and the directory probe itself throws. Each
+    degradation must leave the verdict EQUAL or WORSE than the clean read of the
+    same container.
+
+    The sharp corner is the met-expectation shape: one expectation for `m0`,
+    fully met at a 100% threshold, so nothing else in `validate_build_status`
+    stands between it and a complete success. Clean, the wide reactor receipt
+    names 26 modules the expectation list does not contain, the narrowing is
+    refused and the verdict capped. Lose that receipt to an unparseable line and
+    the scoped `-pl m0` receipt is the only statement left: it narrows cleanly,
+    the cap disappears, and a 26-module reactor with one module built grades
+    GREEN — better for having read less.
+
+    NOT asserted here, deliberately: that a run which made FEWER DISPATCHES
+    grades no better. That is a different claim and it is inconsistent with §3.5
+    rung (a) — a run whose only dispatch was `mvn -pl m0` is entitled to be
+    measured against m0 (#17), so a two-receipt container is capped where a
+    genuine one-receipt container is green. Both cannot hold while the narrowing
+    exists. The reader-side property is the one P4's own verbs state, and it is
+    the one all three rounds broke.
+    """
+    states = {
+        "met expectation, no scan": (
+            "proj",
+            lambda **degrade: _met_expectation_validator(
+                scan=None, receipts=_reactor_receipts(), degrade=degrade
+            ),
+        ),
+        "met expectation, minority scan": (
+            "proj",
+            lambda **degrade: _met_expectation_validator(
+                scan=_maven_scan(), receipts=_reactor_receipts(), degrade=degrade
+            ),
+        ),
+        "oom reactor": (
+            "proj",
+            lambda **degrade: _maven_reactor_validator(
+                receipts=_reactor_receipts(wide_lifecycle="vanished"), degrade=degrade
+            ),
+        ),
+        "polaris, jar met, minority scan": (
+            "polaris",
+            lambda **degrade: _polaris_validator(
+                jar_on_disk=True,
+                scan=_polaris_scan(),
+                receipts=_build_logic_receipt(),
+                degrade=degrade,
+            ),
+        ),
+    }
+    degradations = {
+        "the first receipt is a half-written line": {"corrupt": (0,)},
+        "the second receipt is a half-written line": {"corrupt": (1,)},
+        "every receipt is a half-written line": {"corrupt": (0, 1)},
+        "the receipt cat throws": {"cat_raises": True},
+        "the directory probe throws": {"present_raises": True},
+    }
+
+    for state, (project, build) in states.items():
+        clean = build().validate_build_status(project)
+        clean_rank = _VERDICT_RANK[clean["evidence_status"]]
+        for label, degrade in degradations.items():
+            degraded = build(**degrade).validate_build_status(project)
+            assert _VERDICT_RANK[degraded["evidence_status"]] <= clean_rank, (
+                f"{state}: {label} improved the verdict from "
+                f"{clean['evidence_status']} to {degraded['evidence_status']}"
+            )
+            assert degraded["build_complete"] <= clean["build_complete"], (
+                f"{state}: {label} completed a build the clean read did not"
+            )

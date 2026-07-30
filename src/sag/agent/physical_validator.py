@@ -227,6 +227,55 @@ class _ExpectationScope(NamedTuple):
     denominator_modules: Optional[Tuple[str, ...]]
 
 
+class _AttemptedModules(NamedTuple):
+    """What this run's dispatches STATED they attempted, and whether the harness
+    will narrow the coverage denominator on that statement (Plan 8 §2 P4).
+
+    Two answers, because collapsing them into one is the bug this plan is about.
+    The #17 narrowing shrinks the denominator with this set, so anything that
+    removes a module from it makes the build look MORE complete — and three
+    rounds each removed something for a good reason and each improved a verdict.
+
+    * ``modules`` — every module ANY readable receipt named, terminal or not.
+      A receipt the harness will not trust as a PROVER is still a CLAIMANT: the
+      modules a crashed reactor printed are modules this run attempted, so they
+      belong in the denominator. Round three deleted them, and a scoped
+      `mvn -pl m0` retry beside an OOM-killed 26-module reactor then narrowed the
+      denominator to one module and graded GREEN.
+    * ``narrowing_licensed`` — False when a statement exists that the harness
+      will not narrow on. "No dispatch stated anything" (a single-module build,
+      a receipt-free run) is the honest wide default and licenses nothing to
+      narrow; "a dispatch stated something we refuse to narrow on" is a
+      different fact and must produce the wide denominator AND a cap.
+    * ``cap`` — the conflict code naming why, or None. Never a silent None: a
+      swallowed exception is the second case above, not the first.
+    """
+
+    modules: Tuple[str, ...]
+    narrowing_licensed: bool
+    cap: Optional[str]
+
+
+# One clause per reason the denominator could not be narrowed to what ran, used
+# by BOTH the warning and the capped reason sentence, so the model can never be
+# shown two different explanations of one refusal (spec §2 P3).
+_DENOMINATOR_REFUSALS = {
+    "build_coverage_scope_unverified": (
+        "the build named modules the expectation list does not contain"
+    ),
+    "build_receipt_not_terminal": (
+        "a dispatch that did not end on its own stated the modules it had reached"
+    ),
+    "build_receipts_unreadable": "this run's invocation receipts could not be read",
+}
+
+# Whether the receipt directory could be READ, which is three answers and not
+# two: a probe that threw is not the same fact as a run that wrote no receipts.
+_RECEIPTS_PRESENT = "present"
+_RECEIPTS_ABSENT = "absent"
+_RECEIPTS_UNREADABLE = "unreadable"
+
+
 # In-container test-report parser (executed via `python3 - <<'PY'`). The four
 # header assignments (project_dir, pytest_reports_dir, receipts_dir,
 # primary_root) are prepended by _parse_test_reports_compact_in_container.
@@ -2199,38 +2248,58 @@ class PhysicalValidator:
         """The schema-v1 receipt directory for this workspace."""
         return f"{self.project_path.rstrip('/')}/{INVOCATION_RECEIPTS_DIRNAME}"
 
-    def _attempted_modules(self) -> Optional[Tuple[str, ...]]:
-        """Modules THIS run's dispatches attempted, in the build system's words.
+    def _attempted_module_evidence(self) -> "_AttemptedModules":
+        """Modules THIS run's dispatches attempted, and whether we may narrow.
 
-        Read from the receipts' `module_outcomes` — Maven's reactor summary,
-        the modules whose tasks Gradle ran. `None` means no dispatch stated
-        anything, which is the honest answer for a single-module build (Maven
-        prints no reactor summary for one module) and for a receipt-free run.
+        Read from the receipts' `module_outcomes` — Maven's reactor summary, the
+        modules whose tasks Gradle ran. This is the coverage SCOPE: counting
+        `src/main/java` across the whole tree measures modules a scoped build
+        (`-pl`), an early-stopping reactor or a disabled profile never tried, and
+        calls them missing.
 
-        This is the coverage SCOPE. Counting `src/main/java` across the whole
-        tree measures modules a scoped build (`-pl`), an early-stopping reactor
-        or a disabled profile never tried, and calls them missing.
+        THE ONE RULE (spec §2 P4, §3.6): a receipt the harness will not trust as
+        a PROVER is still counted as a CLAIMANT. Every module any readable
+        receipt named goes into `modules`, because they are modules this run
+        attempted; what a receipt's untrustworthiness costs is the LICENCE TO
+        NARROW, and the refusal caps the verdict exactly as §3.3 caps on an
+        unsettled obligation.
 
-        Only TERMINAL dispatches are read, by the SAME predicate that decides
-        whether a receipt may prove structure (`dispatch_terminated`). A crashed
-        detached job's module list is a prefix of the build — Gradle prints
-        `> Task :m:compileJava` incrementally, so a 300-module build OOM-killed at
-        module 40 names exactly 40 — and narrowing the denominator to those 40
-        would read the 260 the build never reached as "untried, not unbuilt" and
-        refine a partial build upward. `dispatch_terminated` already refuses that
-        receipt as a structure prover; a predicate with two answers depending on
-        which consumer asks is the P3 split this plan exists to close.
+        Two kinds of statement the harness will not narrow on:
+
+        * a NON-TERMINAL dispatch (`dispatch_terminated` False — a detached job
+          that vanished with a synthesized exit code, one a timeout monitor
+          killed). Its module list is a PREFIX: Gradle prints
+          `> Task :m:compileJava` incrementally, so a 300-module build OOM-killed
+          at module 40 names exactly 40, and narrowing to those 40 would read the
+          260 the build never reached as "untried, not unbuilt". Round three drew
+          the right conclusion (do not narrow) from the wrong mechanism (drop the
+          receipt), and dropping it let a scoped `-pl m0` retry narrow 26 modules
+          to one.
+        * a receipt LINE THAT DID NOT PARSE, or a probe that threw. It states
+          nothing we may act on AND hides whatever it did state, so the honest
+          answer is the wide denominator plus a cap. Swallowing it into "nothing
+          stated" is P4's third verb, and it is the one that lets a wide receipt
+          disappear while a narrow one decides.
+
+        `narrowing_licensed` with an empty `modules` is the honest default of a
+        single-module build (Maven prints no reactor summary for one module) and
+        of a receipt-free run: nothing to narrow on, and nothing to cap.
         """
-        if not self.docker_orchestrator or not self._invocation_receipts_present():
-            return None
+        receipts = self._invocation_receipts_state()
+        if receipts == _RECEIPTS_UNREADABLE:
+            return _AttemptedModules((), False, "build_receipts_unreadable")
+        if receipts != _RECEIPTS_PRESENT:
+            return _AttemptedModules((), True, None)
         try:
             probe = self.docker_orchestrator.execute_command(
                 f"cat {shlex.quote(self._invocation_receipts_dir())}/*.json 2>/dev/null"
             )
         except Exception as exc:
             logger.debug(f"attempted-module read failed: {exc}")
-            return None
+            return _AttemptedModules((), False, "build_receipts_unreadable")
         modules: List[str] = []
+        unreadable = False
+        unproven = False
         for line in ((probe or {}).get("output") or "").splitlines():
             line = line.strip()
             if not line.startswith("{"):
@@ -2238,14 +2307,30 @@ class PhysicalValidator:
             try:
                 payload = json.loads(line)
             except ValueError:
+                # A half-written or clipped receipt line. It is a receipt, and we
+                # cannot say what it claimed.
+                unreadable = True
                 continue
-            if not _dispatch_terminated(payload):
-                continue
+            stated = False
             for entry in payload.get("module_outcomes") or ():
                 name = str((entry or {}).get("module") or "").strip()
-                if name and name not in modules:
+                if not name:
+                    continue
+                stated = True
+                if name not in modules:
                     modules.append(name)
-        return tuple(modules) or None
+            # A non-terminal receipt that stated NO modules said nothing about
+            # the structure, so there is nothing to refuse and nothing to cap;
+            # its own unsettled-obligation cap is §3.3's job, not the
+            # denominator's.
+            if stated and not _dispatch_terminated(payload):
+                unproven = True
+        cap = (
+            "build_receipts_unreadable"
+            if unreadable
+            else "build_receipt_not_terminal" if unproven else None
+        )
+        return _AttemptedModules(tuple(modules), cap is None, cap)
 
     def _receipt_structure(self) -> Dict[str, Any]:
         """The receipt-proven module structure, or {} (Plan 8 §3.6).
@@ -2357,18 +2442,31 @@ class PhysicalValidator:
             )
         return _ExpectationScope(scoped, untried, None, tuple(attempted))
 
-    def _invocation_receipts_present(self) -> bool:
-        """One cheap probe; a receipt-free run must pay nothing beyond it."""
+    def _invocation_receipts_state(self) -> str:
+        """One cheap probe, THREE answers; a receipt-free run pays nothing more.
+
+        A probe that threw is not the fact "this run wrote no receipts" — it is
+        "we do not know", and the denominator reader must be able to tell them
+        apart (spec §2 P4: failing to read evidence may not improve a verdict).
+        Every caller that only needs presence keeps its two-answer view below.
+        """
         if not self.docker_orchestrator:
-            return False
+            return _RECEIPTS_ABSENT
         try:
             probe = self.docker_orchestrator.execute_command(
                 f"test -d {shlex.quote(self._invocation_receipts_dir())} && echo EXISTS"
             )
         except Exception as exc:
             logger.debug(f"Invocation-receipt probe failed: {exc}")
-            return False
-        return "EXISTS" in ((probe or {}).get("output") or "")
+            return _RECEIPTS_UNREADABLE
+        if "EXISTS" in ((probe or {}).get("output") or ""):
+            return _RECEIPTS_PRESENT
+        return _RECEIPTS_ABSENT
+
+    def _invocation_receipts_present(self) -> bool:
+        """Presence, byte-identically to before: only a probe that SAW the
+        directory is presence, and a probe that failed is not."""
+        return self._invocation_receipts_state() == _RECEIPTS_PRESENT
 
     def _primary_test_coordinate_root(self) -> Optional[str]:
         """attempt_policy's primary test coordinate (Plan 4), or None.
@@ -3233,7 +3331,12 @@ class PhysicalValidator:
         # Coverage is measured against what THIS run attempted, not against
         # every source tree on disk (Plan 7: the reactor summary sets the
         # scope, the file count verifies the substance).
-        attempted_modules = self._attempted_modules()
+        # Plan 8 §2 P4: the read states BOTH what the dispatches claimed and
+        # whether the harness will narrow on that claim. A receipt it will not
+        # narrow on still contributes its modules (they were attempted) and caps
+        # the verdict; it never shrinks the denominator.
+        attempted = self._attempted_module_evidence()
+        attempted_modules = attempted.modules or None
         # Plan 8 §3.6, and only as far as it may honestly go: the persisted
         # receipt-proven structure NAMES the receipt behind a denominator; it is
         # never a substitute for this pass's attempted-module list. Narrowing the
@@ -3243,7 +3346,10 @@ class PhysicalValidator:
         # build UPWARD into a complete success, which is the exact P0-F
         # direction the plan forbids.
         receipt_structure = self._receipt_structure()
-        scope = self._scope_expectations_to_attempted(list(expected_artifacts), attempted_modules)
+        scope = self._scope_expectations_to_attempted(
+            list(expected_artifacts),
+            attempted_modules if attempted.narrowing_licensed else None,
+        )
         scoped_artifacts, untried_modules, scope_conflict = (
             scope.expectations,
             scope.untried,
@@ -3253,13 +3359,27 @@ class PhysicalValidator:
             evidence["modules_attempted"] = list(attempted_modules)
         if untried_modules:
             evidence["modules_untried"] = untried_modules
+        # Every reason the denominator was NOT narrowed to what ran, in one list.
+        # Each is a cap below complete: the narrowing is licensed only by evidence
+        # the harness will stand behind in both directions, and a refusal that
+        # left no trace is how the p7d polaris sentence graded green.
+        denominator_refusals: List[str] = []
         if scope_conflict:
+            denominator_refusals.append(scope_conflict)
             evidence.setdefault("conflicts", []).append(scope_conflict)
             evidence["warnings"].append(
                 f"Build coverage is measured against {len(expected_artifacts)} module "
                 f"expectation(s) while the build stated it attempted "
                 f"{len(attempted_modules or ())}; the two could not be matched, so the "
                 "wider denominator stands"
+            )
+        if attempted.cap:
+            denominator_refusals.append(attempted.cap)
+            evidence.setdefault("conflicts", []).append(attempted.cap)
+            evidence["warnings"].append(
+                "Build coverage was NOT narrowed to the modules this run attempted: "
+                f"{_DENOMINATOR_REFUSALS.get(attempted.cap, attempted.cap)}; the wider "
+                "denominator stands and the build cannot be graded complete"
             )
         coverage_info = (
             self._verify_expected_artifacts(project_dir, scoped_artifacts)
@@ -3505,19 +3625,45 @@ class PhysicalValidator:
         # module the build never attempted is untried, not unbuilt, which is
         # the whole point of the #17 narrowing.
         if build_system in ("maven", "gradle"):
-            if basis.states_a_shortfall:
+            if basis.states_a_shortfall or denominator_refusals:
                 if complete:
                     # A completeness claim must not be left standing at the head
                     # of the sentence beside a minority count. What DECIDED goes
-                    # first; what the coverage check found stays, subordinated,
+                    # first; what the earlier check found stays, subordinated,
                     # because it is still a fact (the derived expectation list
                     # really was met — it just did not cover the tree).
-                    coverage_clause = f" (coverage check: {reason})" if reason else ""
-                    reason = (
-                        f"Not a complete build — the module scan owns the denominator "
-                        f"and {basis.built} of {basis.total} modules produced "
-                        f"output{coverage_clause}"
-                    )
+                    #
+                    # The parenthetical is labelled with the check that ACTUALLY
+                    # produced it. `coverage_info is None` means no expectation of
+                    # any kind could be derived and no coverage check ran at all
+                    # (the fingerprint and artifact branches); calling that
+                    # sentence a coverage finding states something untrue about
+                    # where it came from (Category 3).
+                    if reason:
+                        label = "coverage check" if coverage_info is not None else "build check"
+                        found_clause = f" ({label}: {reason})"
+                    else:
+                        found_clause = ""
+                    if basis.states_a_shortfall:
+                        reason = (
+                            f"Not a complete build — the module scan owns the denominator "
+                            f"and {basis.built} of {basis.total} modules produced "
+                            f"output{found_clause}"
+                        )
+                    else:
+                        # §3.5's cap, reachable in EVERY state where the narrowing
+                        # did not take effect — including one where the module scan
+                        # is unavailable and cannot count a shortfall. The run
+                        # recorded that it could not check its own denominator;
+                        # that is uncertainty, and uncertainty is never complete.
+                        stated = "; ".join(
+                            _DENOMINATOR_REFUSALS.get(code, code)
+                            for code in dict.fromkeys(denominator_refusals)
+                        )
+                        reason = (
+                            f"Not a complete build — the coverage denominator could not be "
+                            f"narrowed to what this run attempted: {stated}{found_clause}"
+                        )
                 complete = False
             reason = f"{reason} · {basis.phrase()}" if reason else basis.phrase()
 
@@ -3550,6 +3696,13 @@ class PhysicalValidator:
             conflicts = []
 
         conflicts.extend(self._collect_env_conflicts())
+        # A denominator the run could not check rides the verdict's OWN conflicts
+        # channel, not only the evidence dict: the finalizer and the report kernel
+        # cap on `result["conflicts"]`, and a disagreement that never reaches
+        # there is a disagreement nothing downstream can act on.
+        for code in denominator_refusals:
+            if code not in conflicts:
+                conflicts.append(code)
         if (
             isinstance(maven_reactor_snapshot, _MavenReactorSnapshot)
             and not maven_reactor_snapshot.complete
