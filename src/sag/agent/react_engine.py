@@ -988,6 +988,87 @@ class ReActEngine(UIEventEmitter):
         if state is not None and not state.sealed:
             state.record_phase_record(record)
 
+    # The wait's floor for the report phase. p7d camel spent ~5 minutes on
+    # report; the reserve doubles that so the wait can never starve it.
+    _REPORT_RESERVE_SECONDS = 600
+    _OBLIGATION_POLL_SECONDS = 30
+
+    def _await_open_obligations(self, reason, *, now=None, sleep=None) -> None:
+        """Spend leftover wall clock on a job that is still running, bounded.
+
+        p7d camel ended at ~85 minutes with the test job alive, 11,492
+        observed tests unclaimable, and ~35 minutes of the 7,200s cap unused
+        — the budget evaporated while the one thing that needed time was
+        denied it. Settlement (§3.2) can only claim a job that EXITED during
+        the run, so the close now waits for the exit file while three things
+        hold: an open obligation's job has not exited, the clock is outside
+        the report reserve, and the close is a working close. It spends only
+        budget already allocated — the cap and the reserve are hard lines —
+        never runs for ABORTED/CANCELLED closes, and never waits on a ledger
+        it cannot read (the §3.3 cap already answers for that state).
+        """
+        import time as _time
+
+        now = now or _time.time
+        sleep = sleep or _time.sleep
+        if reason in (EvidenceCloseReason.ABORTED, EvidenceCloseReason.CANCELLED):
+            return
+        started_at = getattr(self, "_run_started_at", None)
+        if started_at is None:
+            return  # margin unknown is margin absent
+        cap = getattr(self, "_wall_clock_cap", None) or getattr(
+            getattr(self, "config", None), "max_wall_clock_seconds", 7200
+        )
+        deadline = float(started_at) + float(cap) - self._REPORT_RESERVE_SECONDS
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return
+        from .job_obligations import is_open, read_obligations
+
+        waited = False
+        while now() < deadline:
+            records = read_obligations(orchestrator)
+            if records is None:
+                return  # unreadable ledger: never wait on a guess
+            pending = [
+                record
+                for record in records
+                if is_open(record) and str(record.get("exit_code_path") or "").strip()
+            ]
+            if not pending:
+                return
+            still_running = []
+            for record in pending:
+                probe = orchestrator.execute_command(
+                    f"cat {str(record.get('exit_code_path'))} 2>/dev/null"
+                )
+                exited = bool(
+                    isinstance(probe, dict)
+                    and probe.get("success") is not False
+                    and probe.get("exit_code", 0) == 0
+                    and str(probe.get("output") or "").strip()
+                )
+                if not exited:
+                    still_running.append(str(record.get("job_id") or ""))
+            if not still_running:
+                return  # every open job has exited; the sweep can settle them
+            remaining = deadline - now()
+            if remaining <= 0:
+                break
+            if not waited:
+                waited = True
+                logger.info(
+                    f"evidence-close waiting for running job(s) "
+                    f"{', '.join(still_running)}: {remaining:.0f}s of wall clock "
+                    f"remain before the report reserve"
+                )
+            sleep(min(self._OBLIGATION_POLL_SECONDS, remaining))
+        if waited:
+            logger.warning(
+                "evidence-close wait reached the report reserve with job(s) "
+                "still running; closing with job_unsettled"
+            )
+
     def _finalize_evidence(self, reason: EvidenceCloseReason):
         state = getattr(self, "run_evidence_state", None)
         finalizer = getattr(self, "verdict_finalizer", None)
@@ -995,9 +1076,12 @@ class ReActEngine(UIEventEmitter):
             raise RuntimeError("setup evidence finalization is not configured")
         was_sealed = state.sealed
         if not was_sealed:
-            # Plan 8 §3.2 trigger 3: the closing sweep. A job that terminated
-            # while the run was finishing still owes a receipt, and a job that
-            # never terminated owes the verdict an honest conflict.
+            # Plan 8 §3.2 trigger 3, in two steps: WAIT for a still-running
+            # job while allocated budget remains, then the closing sweep. A
+            # job that terminated while the run was finishing still owes a
+            # receipt, and a job that never terminated owes the verdict an
+            # honest conflict.
+            self._await_open_obligations(reason)
             self._sweep_job_obligations()
             self._record_unsettled_job_conflicts()
         snapshot = finalizer.finalize(state, reason)
@@ -2307,6 +2391,11 @@ class ReActEngine(UIEventEmitter):
 
         run_started_at = time.time()
         wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
+        # The evidence-close wait (§3.2, _await_open_obligations) needs the
+        # same clock this loop enforces; a wait that guessed its own margin
+        # could overrun the cap the loop is about to apply.
+        self._run_started_at = run_started_at
+        self._wall_clock_cap = wall_clock_cap
 
         try:
             while self.current_iteration < max_iter:
