@@ -1683,6 +1683,16 @@ class ReActEngine(UIEventEmitter):
             else f"validator:{phase}:{getattr(self.phase_machine, 'current_attempt_id', '')}"
         )
         for key, value in gate.validated_facts.items():
+            if str(key).startswith("run."):
+                # #28 (both round-four reviewers): a `run.`-prefixed control
+                # fact is the gate's working memory — the cap's inputs, carried
+                # on the gate result and the control event for replay. As a run
+                # fact it would land in StateScope.PROJECT_ANALYSIS, the epoch
+                # vector the build→analyze repair recurrence guard reads, so a
+                # DIAGNOSTIC write counted as material progress; and the phase
+                # handoff printed it into the model's prompt. No consumer reads
+                # these keys back from run state.
+                continue
             state.set_fact(
                 key,
                 value,

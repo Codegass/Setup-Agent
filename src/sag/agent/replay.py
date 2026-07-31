@@ -668,6 +668,11 @@ class ControlReplayRunner:
                         pending_record = None
                     else:
                         for key, value in gate.validated_facts.items():
+                            if str(key).startswith("run."):
+                                # Mirror of _record_gate_facts (#28): control
+                                # facts never become run facts, in production
+                                # and replay alike.
+                                continue
                             evidence_ref = next(
                                 iter(gate.evidence_refs), f"validator://{claim.phase}"
                             )

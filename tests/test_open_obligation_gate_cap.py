@@ -452,7 +452,12 @@ def test_the_floor_closes_partial_on_the_obligation_the_real_gate_found(monkeypa
     assert record.outcome is PhaseOutcome.PARTIAL
     assert engine.phase_machine.current_phase == "test"
     assert engine.finalized_reasons == []
-    assert engine.run_evidence_state.fact_value(OPEN_OBLIGATIONS_FACT) == [JOB]
+    # Premise corrected (#28, both round-four reviewers): the open-jobs list
+    # travels on the gate result and the gate_decision control event — never
+    # into run state, where the `run.` prefix would land it in the
+    # PROJECT_ANALYSIS epoch vector and a diagnostic write would count as
+    # material progress for retry authority.
+    assert engine.run_evidence_state.fact_value(OPEN_OBLIGATIONS_FACT) is None
 
 
 def test_the_floor_closes_success_once_the_gate_settles_the_books(monkeypatch):

@@ -526,3 +526,62 @@ def test_a_failed_promotion_is_recovered_by_the_next_terminal_receipt():
 
     assert recovered is True
     assert len(surface.writes) == 1
+
+
+# ---------------------------------------------------------------------------
+# #28 — a control fact is the gate's working memory, not run state
+# ---------------------------------------------------------------------------
+#
+# Both round-four reviewers, independently: the `run.`-prefixed cap-basis facts
+# fall to StateScope.PROJECT_ANALYSIS — the epoch vector the build→analyze
+# repair recurrence guard reads for material progress — so writing a
+# DIAGNOSTIC fact counted as state movement for retry authority, and the phase
+# handoff printed it into the model's prompt. No consumer reads these three
+# keys back from run state: `_open_obligations`, `settlement_capped_outcome`
+# and the phase tool all read the gate result directly. So they are never
+# registered as run facts, in production and in replay alike.
+
+
+def test_a_control_fact_never_moves_the_epoch_vector():
+    from types import SimpleNamespace
+
+    from sag.agent.evidence_state import RunEvidenceState, StateScope
+    from sag.agent.phase_gates import (
+        EVIDENCE_SEALED_FACT,
+        OPEN_OBLIGATIONS_FACT,
+        PHYSICAL_STATE_FACT,
+        GateResult,
+        ClaimDisposition,
+        ValidatorState,
+    )
+    from sag.agent.phase_machine import PhaseOutcome
+    from sag.agent.react_engine import ReActEngine
+
+    engine = ReActEngine.__new__(ReActEngine)
+    state = RunEvidenceState(run_id="r1")
+    engine.run_evidence_state = state
+    engine.phase_machine = SimpleNamespace(current_attempt_id="build-1")
+
+    before = dict(state.state_vector([StateScope.PROJECT_ANALYSIS]))
+    gate = GateResult(
+        accepted=False,
+        validated_outcome=PhaseOutcome.PARTIAL,
+        claim_disposition=ClaimDisposition.CONTRADICTED,
+        validator_state=ValidatorState.PARTIAL,
+        reason="capped",
+        evidence_refs=("output_1",),
+        validated_facts={
+            "build.test_entry_ready": True,
+            OPEN_OBLIGATIONS_FACT: ["373f63e5a0a4"],
+            PHYSICAL_STATE_FACT: "green",
+            EVIDENCE_SEALED_FACT: False,
+        },
+    )
+
+    engine._record_gate_facts("build", gate)
+
+    assert state.fact_value("build.test_entry_ready") is True
+    assert state.fact_value(OPEN_OBLIGATIONS_FACT) is None
+    assert state.fact_value(PHYSICAL_STATE_FACT) is None
+    assert state.fact_value(EVIDENCE_SEALED_FACT) is None
+    assert dict(state.state_vector([StateScope.PROJECT_ANALYSIS])) == before
