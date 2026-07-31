@@ -127,7 +127,20 @@ def snapshot_reports(
         + f" -type f \\( {predicates} \\) -exec sha256sum {{}} + 2>/dev/null"
     )
     try:
-        result = execute(command) or {}
+        # The MACHINE path, not the presentation path: DockerOrchestrator
+        # truncates ordinary output beyond ~10,000 characters, and 260 report
+        # hashes is ~34KB. Live p8a-kafka: the settled receipt claimed exactly
+        # 50 of 260 on-disk reports — and the campaign's kafka receipt claimed
+        # exactly 50 too, because the clamp, not the run, decided the claim
+        # set. The bracketing that receipt-scoping stands on must read every
+        # line. The TypeError fallback keeps small doubles working, the same
+        # pattern container_io's _execute_untruncated uses.
+        try:
+            result = execute(command, truncate_output=False) or {}
+        except TypeError as exc:
+            if "truncate_output" not in str(exc):
+                raise
+            result = execute(command) or {}
     except Exception as exc:  # evidence collection never breaks the runner
         logger.debug(f"report snapshot skipped: {exc}")
         return {}

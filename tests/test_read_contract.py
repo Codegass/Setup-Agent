@@ -585,3 +585,66 @@ def test_a_control_fact_never_moves_the_epoch_vector():
     assert state.fact_value(PHYSICAL_STATE_FACT) is None
     assert state.fact_value(EVIDENCE_SEALED_FACT) is None
     assert dict(state.state_vector([StateScope.PROJECT_ANALYSIS])) == before
+
+
+# ---------------------------------------------------------------------------
+# the snapshot reads every line, not the first hundred
+# ---------------------------------------------------------------------------
+#
+# Live p8a-kafka (session_20260731_114122_29197), and retroactively the
+# campaign's kafka run: the settled receipt claimed exactly 50 report files
+# while 260 sat on disk, all written BEFORE the job's exit file. The campaign
+# receipt claimed exactly 50 too — the same number across unrelated runs,
+# because `snapshot_reports` read its sha256sum output through the
+# presentation path, which truncates beyond ~10,000 characters. 260 lines of
+# hashes is ~34KB. The bracketing that receipt-scoping stands on was itself
+# lossy for any run large enough to matter, and 3,196 passing tests fell to
+# auxiliary as "unclaimed" when the run had claimed them perfectly well.
+
+
+class TruncatingSurface:
+    """Reproduces DockerOrchestrator's presentation clamp: output beyond
+    10,000 chars is cut unless the caller asks for the machine path."""
+
+    def __init__(self, files=200):
+        import hashlib
+
+        self.lines = [
+            f"{hashlib.sha256(str(i).encode()).hexdigest()}  "
+            f"/workspace/kafka/m{i}/build/test-results/test/TEST-{i}.xml"
+            for i in range(files)
+        ]
+
+    def execute_command(self, command, truncate_output=True, **kwargs):
+        output = "\n".join(self.lines)
+        if truncate_output and len(output) > 10000:
+            output = output[:10000]
+        return {"success": True, "exit_code": 0, "output": output}
+
+
+def test_the_snapshot_survives_the_presentation_clamp():
+    from sag.agent.invocation_receipts import snapshot_reports
+
+    surface = TruncatingSurface(files=200)
+
+    snapshot = snapshot_reports(surface.execute_command, ["/workspace/kafka"])
+
+    assert len(snapshot) == 200
+
+
+def test_a_double_without_the_flag_still_snapshots():
+    """Small test doubles predate the presentation flag; the fallback keeps
+    them working exactly as container_io's _execute_untruncated does."""
+    from sag.agent.invocation_receipts import snapshot_reports
+
+    class NoFlag:
+        def __call__(self, command):
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "a" * 64 + "  /w/target/surefire-reports/TEST-x.xml",
+            }
+
+    snapshot = snapshot_reports(NoFlag(), ["/w"])
+
+    assert len(snapshot) == 1
