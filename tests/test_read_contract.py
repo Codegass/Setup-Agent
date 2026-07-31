@@ -416,6 +416,99 @@ def test_the_unreadable_ledger_refusal_names_the_ledger():
 
 
 # ---------------------------------------------------------------------------
+# §6.8 fence 2 — the receipts directory: a failed probe is UNREADABLE, not absent
+# ---------------------------------------------------------------------------
+
+FAILURE_DICT = {
+    "success": False,
+    "exit_code": -1,
+    "output": "Failed to execute command: transport hiccup",
+    "dispatch_status": "dispatch_failed",
+}
+
+
+def _validator_with(orchestrator):
+    from sag.agent.physical_validator import PhysicalValidator
+
+    validator = PhysicalValidator.__new__(PhysicalValidator)
+    validator.docker_orchestrator = orchestrator
+    validator.project_path = "/workspace"
+    return validator
+
+
+def test_a_failed_receipts_probe_is_unreadable_not_absent():
+    """Today's dead guard: the except keyed on a raise that never comes, so
+    the failure dict fell through to "absent" and the denominator lost its
+    cap. `test -d` exit 1 stays absent; the failure shape is unreadable."""
+
+    class Failing:
+        def execute_command(self, command, **kwargs):
+            return dict(FAILURE_DICT)
+
+    class Absent:
+        def execute_command(self, command, **kwargs):
+            return {"success": False, "exit_code": 1, "output": ""}
+
+    assert _validator_with(Failing())._invocation_receipts_state() == "unreadable"
+    assert _validator_with(Absent())._invocation_receipts_state() == "absent"
+
+
+def test_a_failed_receipts_glob_read_refuses_the_narrowing():
+    """The directory exists, the read of it dies: narrowing is refused with
+    the cap, never licensed on a read that did not happen."""
+
+    class DirButNoRead:
+        def execute_command(self, command, **kwargs):
+            if command.startswith("test -d"):
+                return {"success": True, "exit_code": 0, "output": "EXISTS"}
+            return dict(FAILURE_DICT)
+
+    attempted = _validator_with(DirButNoRead())._attempted_module_evidence()
+
+    assert attempted.narrowing_licensed is False
+    assert attempted.cap == "build_receipts_unreadable"
+
+
+# ---------------------------------------------------------------------------
+# §6.8 fence 3 / §3.8 fence b — the module scan: a failed read caps and says so
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_scan_read_is_unreadable_not_a_non_jvm_project():
+    """One quiet read failure removed the checklist, the suggestion, and with
+    them the model's ability to discover that it under-built (§3.8). The scan
+    now tells "could not look" apart from "not a JVM tree"."""
+    from sag.agent.module_coverage import module_coverage
+
+    class Failing:
+        def execute_command(self, command, **kwargs):
+            return dict(FAILURE_DICT)
+
+    scan = module_coverage(_validator_with(Failing()), "polaris")
+
+    assert isinstance(scan, dict)
+    assert scan.get("unreadable") is True
+
+
+def test_the_checklist_states_the_inability_instead_of_vanishing():
+    from sag.agent.module_coverage import coverage_checklist_line
+
+    line = coverage_checklist_line({"unreadable": True, "project_dir": "/workspace/p"})
+
+    assert line != ""
+    assert "could not" in line
+
+
+def test_an_unreadable_scan_is_a_denominator_refusal():
+    """The verdict half: an unreadable scan joins denominator_refusals, so the
+    §3.5 cap fires — a run that could not check its own denominator is
+    uncertain, and uncertainty is never a complete build."""
+    from sag.agent.physical_validator import _DENOMINATOR_REFUSALS
+
+    assert "module_scan_unreadable" in _DENOMINATOR_REFUSALS
+
+
+# ---------------------------------------------------------------------------
 # the loss is bounded: the next terminal receipt recovers the promotion
 # ---------------------------------------------------------------------------
 

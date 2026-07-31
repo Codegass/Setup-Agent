@@ -14,10 +14,13 @@ Never raises: coverage is guidance and honesty, not a failure mode.
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from loguru import logger
+
+from sag.runtime.container_io import command_did_not_run
 
 # Denominator authority, in order (Plan 8 spec §3.5). p7d polaris graded a
 # build against a denominator NOTHING derived — the survey could not read
@@ -210,6 +213,19 @@ def module_coverage(validator, project_name) -> dict[str, Any] | None:
 
         project_path = str(getattr(validator, "project_path", "/workspace") or "/workspace")
         project_dir = f"{project_path}/{project_name}" if project_name else project_path
+        # §6.8 fence 3 / §3.8: one canary probe tells "could not look" apart
+        # from "not a JVM tree". Without it, a transient read failure made
+        # every detection probe "fail", the scan returned None exactly as a
+        # Python project does, and the checklist — the model's only way to
+        # discover it under-built — vanished without a trace.
+        orchestrator = getattr(validator, "docker_orchestrator", None)
+        if orchestrator is not None:
+            try:
+                canary = orchestrator.execute_command(f"test -d {shlex.quote(project_dir)}")
+            except Exception:
+                return {"unreadable": True, "project_dir": project_dir}
+            if command_did_not_run(canary):
+                return {"unreadable": True, "project_dir": project_dir}
         primary = str(validator._detect_build_system(project_dir) or "").strip().lower()
         if primary not in ("maven", "gradle"):
             return None
@@ -314,6 +330,11 @@ def coverage_conflicts(coverage: dict[str, Any] | None) -> tuple[str, ...]:
     """The two July coverage caps, from a coverage rollup."""
     if not coverage:
         return ()
+    if coverage.get("unreadable"):
+        # §6.8 fence 3, sealed at the verdict too: the finalizer folds these
+        # at evidence-close, and an inability to read must reach the verdict
+        # as a conflict, not vanish as an empty rollup.
+        return ("module_scan_unreadable",)
     summary = coverage.get("summary") or {}
     conflicts: list[str] = []
     total = int(summary.get("modules_total") or 0)
@@ -343,6 +364,10 @@ def coverage_checklist_line(
     """
     if not coverage:
         return None
+    if coverage.get("unreadable"):
+        # §3.8 fence b: a failed read caps and SAYS SO — never "no unbuilt
+        # modules", and never a silently missing line.
+        return "module scan could not read the tree — coverage unknown"
     if islands and len(islands) > 1:
         island_line = _island_checklist_line(coverage, islands, limit=limit)
         if island_line:

@@ -44,7 +44,11 @@ from sag.config.settings import (
     DEFAULT_TEST_EXECUTION_THRESHOLD,
     DEFAULT_TEST_PASS_THRESHOLD,
 )
-from sag.runtime.container_io import ContainerFileReadError, read_container_text
+from sag.runtime.container_io import (
+    ContainerFileReadError,
+    command_did_not_run as _command_did_not_run,
+    read_container_text,
+)
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
     TestCaseCatalog,
@@ -267,6 +271,7 @@ _DENOMINATOR_REFUSALS = {
         "a dispatch that did not end on its own stated the modules it had reached"
     ),
     "build_receipts_unreadable": "this run's invocation receipts could not be read",
+    "module_scan_unreadable": "the module scan could not read the tree",
 }
 
 # Whether the receipt directory could be READ, which is three answers and not
@@ -2297,6 +2302,9 @@ class PhysicalValidator:
         except Exception as exc:
             logger.debug(f"attempted-module read failed: {exc}")
             return _AttemptedModules((), False, "build_receipts_unreadable")
+        if _command_did_not_run(probe):
+            logger.debug("attempted-module read did not run")
+            return _AttemptedModules((), False, "build_receipts_unreadable")
         modules: List[str] = []
         unreadable = False
         unproven = False
@@ -2458,6 +2466,13 @@ class PhysicalValidator:
             )
         except Exception as exc:
             logger.debug(f"Invocation-receipt probe failed: {exc}")
+            return _RECEIPTS_UNREADABLE
+        if _command_did_not_run(probe):
+            # §6.8 fence 2: the failure dict, not an exception, is how a
+            # transient docker failure arrives — the except above only sees
+            # the pre-command container checks. "Could not look" is not
+            # "looked and the directory is absent".
+            logger.debug("Invocation-receipt probe did not run")
             return _RECEIPTS_UNREADABLE
         if "EXISTS" in ((probe or {}).get("output") or ""):
             return _RECEIPTS_PRESENT
@@ -3403,6 +3418,18 @@ class PhysicalValidator:
         from sag.agent.module_coverage import module_basis
 
         self._last_module_scan = (project_name, self._module_scan_result(project_name))
+        scan_result = self._last_module_scan[1]
+        if isinstance(scan_result, dict) and scan_result.get("unreadable"):
+            # §6.8 fence 3, the verdict half: a scan that could not read joins
+            # the refusals, so the §3.5 cap fires — a run that could not check
+            # its own denominator is uncertain, and uncertainty is never a
+            # complete build. The checklist half states the same inability.
+            denominator_refusals.append("module_scan_unreadable")
+            evidence.setdefault("conflicts", []).append("module_scan_unreadable")
+            evidence["warnings"].append(
+                "The module scan could not read the tree; per-module coverage "
+                "is unknown and the build cannot be graded complete"
+            )
         basis = module_basis(
             self._last_module_scan[1],
             denominator_modules=scope.denominator_modules,

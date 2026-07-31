@@ -24,6 +24,22 @@ def _command_succeeded(result: Mapping[str, Any]) -> bool:
     return result.get("success") is not False and result.get("exit_code", 0) == 0
 
 
+def command_did_not_run(result: Any) -> bool:
+    """The two unambiguous did-not-run signatures, in ONE place (§3.9, P3).
+
+    `DockerOrchestrator.execute_command` converts every within-command failure
+    into `{"success": False, "exit_code": -1, "dispatch_status": ...}` — it
+    does not raise for those. A command the CONTAINER ran and that exited
+    nonzero (an empty glob, an absent file) is not this: exit 1 keeps meaning
+    what the command said. Four independent implementation rounds each wrote a
+    per-site `except` for a raise that never comes; every consumer of this
+    distinction reads it from here.
+    """
+    return isinstance(result, Mapping) and (
+        result.get("exit_code") == -1 or bool(result.get("dispatch_status"))
+    )
+
+
 def _execute_untruncated(orchestrator: Any, command: str) -> Mapping[str, Any]:
     """Use the production no-truncation API, with a narrow test-double fallback."""
     try:
