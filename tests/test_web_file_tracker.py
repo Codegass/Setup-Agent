@@ -14,7 +14,7 @@ def test_file_tracker_detects_added_modified_and_deleted(tmp_path: Path):
     tracker = FileChangeTracker(root)
     base = tracker.snapshot("base")
 
-    keep.write_text("two", encoding="utf-8")
+    keep.write_text("changed", encoding="utf-8")
     gone.unlink()
     (root / "new.txt").write_text("new", encoding="utf-8")
 
@@ -37,6 +37,8 @@ def test_file_tracker_ignores_heavy_and_hidden_generated_dirs(tmp_path: Path):
     (root / ".git" / "index").write_text("ignored", encoding="utf-8")
     (root / "target").mkdir()
     (root / "target" / "app.jar").write_text("ignored", encoding="utf-8")
+    (root / ".setup_agent").mkdir()
+    (root / ".setup_agent" / "sessions.json").write_text("ignored", encoding="utf-8")
     (root / "src.py").write_text("tracked", encoding="utf-8")
 
     tracker = FileChangeTracker(root)
@@ -45,6 +47,7 @@ def test_file_tracker_ignores_heavy_and_hidden_generated_dirs(tmp_path: Path):
     assert "src.py" in snap.files
     assert ".git/index" not in snap.files
     assert "target/app.jar" not in snap.files
+    assert ".setup_agent/sessions.json" not in snap.files
 
 
 def test_file_tracker_prunes_ignored_subtrees_before_descending(tmp_path: Path):

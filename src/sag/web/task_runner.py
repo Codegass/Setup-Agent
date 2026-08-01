@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import asdict
 from threading import Lock, Thread
 from typing import Annotated, Any
 
@@ -51,6 +52,7 @@ class AgentTaskLauncher:
 
         success = False
         outcome = f"Task failed: {task}"
+        agent: Any | None = None
         try:
             from sag.agent.agent import SetupAgent
             from sag.config import ensure_session_logging, get_config
@@ -87,6 +89,7 @@ class AgentTaskLauncher:
                     session_id=session_id,
                     success=success,
                     outcome=outcome,
+                    evidence_records=_evidence_records(agent),
                 )
             except Exception:
                 logger.exception(
@@ -142,6 +145,21 @@ class AgentTaskLauncher:
         if not source_session:
             return task
         return f"{task}\n\nReference prior SAG session: {source_session}"
+
+
+def _evidence_records(agent: Any | None) -> list[dict[str, Any]]:
+    """Persist UI evidence when this execution mode provides it."""
+    manager = getattr(agent, "ui_manager", None)
+    snapshot = getattr(manager, "snapshot", None)
+    if not callable(snapshot):
+        return []
+    try:
+        return [
+            {**asdict(record), "timestamp": record.timestamp.isoformat()}
+            for record in snapshot().evidence
+        ]
+    except Exception:
+        return []
 
 
 class TaskRunner:

@@ -85,6 +85,7 @@ export function TestCard({
         <div>
           <span className={failed ? "text-status-failed" : ""}>{failed} failed</span>
           {errors ? <span className="text-status-failed">{" · "}{errors} errors</span> : null}
+          {test.flakyCount ? <span className="text-status-attention">{" · "}{test.flakyCount} flaky</span> : null}
           {" · "}{test.skip} skipped
           {test.reportFileCount != null ? <> · {test.reportFileCount.toLocaleString()} XML reports</> : null}
         </div>

@@ -180,7 +180,9 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
 
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:
-    """Copy setup artifacts from Docker container to local session logs.
+    """Copy setup artifacts (.setup_agent tree + setup reports) from the container
+    into the local session log dir, via the same get_archive extraction the web
+    mirror uses (no exec; works on stopped containers without reviving them).
 
     Args:
         orchestrator: Docker orchestrator for the project
@@ -192,55 +194,13 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
             logger.warning("No session logger available, skipping artifact save")
             return
 
-        # Get the session log directory
         session_dir = session_logger.session_log_dir
-        if not session_dir.exists():
-            session_dir.mkdir(parents=True, exist_ok=True)
-
         logger.info(f"Saving artifacts to {session_dir}")
 
-        # Check if .setup_agent folder exists in container
-        check_result = orchestrator.execute_command(
-            "test -d /workspace/.setup_agent && echo 'EXISTS' || echo 'NOT_FOUND'"
-        )
+        from sag.web.session_mirror import extract_artifacts
 
-        if check_result.get("output", "").strip() == "EXISTS":
-            # Copy .setup_agent folder
-            copy_cmd = (
-                f"docker cp {orchestrator.container_name}:/workspace/.setup_agent {session_dir}/"
-            )
-            import subprocess
-
-            result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info("✅ Copied .setup_agent folder from container")
-            else:
-                logger.warning(f"Failed to copy .setup_agent folder: {result.stderr}")
-        else:
-            logger.info(".setup_agent folder not found in container, skipping")
-
-        # Find and copy setup-report-*.md files
-        find_result = orchestrator.execute_command(
-            "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | head -10"
-        )
-
-        report_files = find_result.get("output", "").strip().split("\n")
-        report_files = [f for f in report_files if f.strip()]
-
-        if report_files:
-            for report_file in report_files:
-                if report_file:
-                    # Extract filename from full path
-                    filename = report_file.split("/")[-1]
-                    copy_cmd = f"docker cp {orchestrator.container_name}:{report_file} {session_dir}/{filename}"
-                    result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        logger.info(f"✅ Copied {filename} from container")
-                    else:
-                        logger.warning(f"Failed to copy {filename}: {result.stderr}")
-        else:
-            logger.info("No setup report files found in container")
-
+        container = orchestrator.client.containers.get(orchestrator.container_name)
+        extract_artifacts(container, session_dir)
         console.print(f"[dim]Artifacts saved to: {session_dir}[/dim]")
 
     except Exception as e:

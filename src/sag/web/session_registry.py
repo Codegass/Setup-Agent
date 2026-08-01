@@ -15,8 +15,11 @@ from typing import Any
 
 from loguru import logger
 
+from sag.ui.state import UIEvidenceRecord
 from sag.agent.verdict_finalizer import VERDICT_SNAPSHOT_PATH, RunVerdictSnapshot
 from sag.web.context_trace import ContextTraceBuilder
+from sag.web.evidence import EvidenceIndex
+from sag.web.file_tracker import FileChangeTracker, FileSnapshot
 from sag.web.models import (
     BuildSummary,
     ContextTrace,
@@ -26,6 +29,7 @@ from sag.web.models import (
     ExecutionSessionSummary,
     ModuleRollup,
     ModuleSummary,
+    FileChangeDigest,
     ReportDocument,
     TestSummary,
     VerdictSummary,
@@ -223,6 +227,7 @@ class ContainerSessionStore:
     ):
         self.orchestrator_factory = orchestrator_factory
         self.clock = clock if clock is not None else datetime.now
+        self._file_snapshots: dict[tuple[str, str], FileSnapshot] = {}
 
     def mark_started(
         self,
@@ -233,6 +238,10 @@ class ContainerSessionStore:
         source_session: str | None,
     ) -> None:
         now = self.clock().isoformat(timespec="seconds")
+        orchestrator = self._orchestrator(workspace_id)
+        self._file_snapshots[(workspace_id, session_id)] = _workspace_snapshot(
+            orchestrator, f"session:{session_id}:start"
+        )
         item = {
             "id": session_id,
             "workspace": workspace_id,
@@ -253,7 +262,7 @@ class ContainerSessionStore:
             "source_session": source_session,
             "updated": now,
         }
-        self._upsert(workspace_id, item)
+        self._upsert(workspace_id, item, orchestrator=orchestrator)
 
     def mark_finished(
         self,
@@ -262,6 +271,7 @@ class ContainerSessionStore:
         session_id: str,
         success: bool,
         outcome: str,
+        evidence_records: list[dict[str, Any]] | None = None,
     ) -> None:
         now = self.clock().isoformat(timespec="seconds")
         orchestrator = self._orchestrator(workspace_id)
@@ -294,11 +304,25 @@ class ContainerSessionStore:
         item["outcome"] = outcome
         item["updated"] = now
         item["evidence"] = max(_to_int(item.get("evidence")), 1)
+        if evidence_records:
+            item["evidence_records"] = evidence_records
+            item["evidence"] = len(evidence_records)
+
+        base = self._file_snapshots.pop((workspace_id, session_id), None)
+        if base is not None:
+            head = _workspace_snapshot(orchestrator, f"session:{session_id}:finish")
+            digest = FileChangeTracker(Path("/workspace")).diff(base, head)
+            item["file_digest"] = digest.model_dump(mode="json", by_alias=True)
+            item["files"] = len(digest.items)
 
         _write_index_payload(orchestrator, {"sessions": sessions})
 
-    def _upsert(self, workspace_id: str, item: dict[str, Any]) -> None:
-        orchestrator = self._orchestrator(workspace_id)
+    def _upsert(
+        self, workspace_id: str, item: dict[str, Any], *, orchestrator: Any | None = None
+    ) -> None:
+        orchestrator = (
+            orchestrator if orchestrator is not None else self._orchestrator(workspace_id)
+        )
         payload = _read_index_payload(orchestrator)
         sessions = _session_items(payload)
         sessions = [
@@ -363,17 +387,21 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
                 _value_for_keys(test, "execution_rate", "executionRate")
             ),
             errors=_to_int(test.get("errors")),
-            report_file_count=test.get("report_file_count"),
-            unique_total=test.get("unique_total"),
-            unique_passed=test.get("unique_passed"),
-            unique_failed=test.get("unique_failed"),
-            unique_errors=test.get("unique_errors"),
-            unique_skipped=test.get("unique_skipped"),
-            flaky_count=_to_int(test.get("flaky_count")),
-            raw_executions=test.get("raw_executions"),
-            declared_total=test.get("declared_total"),
-            method_execution_rate=_to_float_or_none(test.get("method_execution_rate")),
-            failing_names=test.get("failing_names") or [],
+            flaky_count=_to_int(_value_for_keys(test, "flaky_count", "flakyCount")),
+            report_file_count=_optional_int(
+                _value_for_keys(test, "report_file_count", "reportFileCount")
+            ),
+            unique_total=_optional_int(_value_for_keys(test, "unique_total", "uniqueTotal")),
+            unique_passed=_optional_int(_value_for_keys(test, "unique_passed", "uniquePassed")),
+            unique_failed=_optional_int(_value_for_keys(test, "unique_failed", "uniqueFailed")),
+            unique_errors=_optional_int(_value_for_keys(test, "unique_errors", "uniqueErrors")),
+            unique_skipped=_optional_int(_value_for_keys(test, "unique_skipped", "uniqueSkipped")),
+            declared_total=_optional_int(_value_for_keys(test, "declared_total", "declaredTotal")),
+            method_execution_rate=_to_float_or_none(
+                _value_for_keys(test, "method_execution_rate", "methodExecutionRate")
+            ),
+            failing_names=_value_for_keys(test, "failing_names", "failingNames") or [],
+            raw_executions=_optional_int(_value_for_keys(test, "raw_executions", "rawExecutions")),
             conflicts=test.get("conflicts") or [],
             evidence_refs=test.get("evidence_refs") or [],
         ),
@@ -455,7 +483,7 @@ def _session_detail(
         report_doc=report_doc,
         blocker=None,
         evidence=_evidence(item, outcome),
-        files=None,
+        files=_file_digest(item),
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
@@ -608,12 +636,33 @@ def _snapshot_test_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
     }
 
 
-def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
+def _snapshot_build_payload(
+    snapshot: RunVerdictSnapshot,
+    metrics: dict[str, Any] | None,
+    module_metrics: dict[str, Any] | None,
+    report_raw: str | None,
+) -> dict[str, Any]:
     build = snapshot.build_evidence
+    details = _merge_build_payloads(
+        _build_payload_from_metrics(metrics), _build_payload_from_report(report_raw)
+    )
+    class_count = build.compiled_classes
+    if class_count is None:
+        class_count = details.get("class_count")
+    jar_count = details.get("jar_count")
+    if jar_count is None:
+        jar_count = _module_artifact_count(module_metrics, "jar_count")
     return {
         "state": build.outcome.value,
         "tool": "sealed snapshot",
-        "note": "Canonical build evidence from verdict.json",
+        "time": details.get("time", "—"),
+        "note": details.get("note") or "Canonical build evidence from verdict.json",
+        "artifact": details.get("artifact"),
+        "class_count": class_count,
+        "jar_count": jar_count,
+        "module_output_count": details.get("module_output_count"),
+        "artifact_samples": details.get("artifact_samples") or [],
+        "warnings": details.get("warnings") or [],
         "evidence_refs": list(build.refs),
     }
 
@@ -651,18 +700,17 @@ def _setup_artifact_item(
     status = _setup_status(tasks, report_path)
     metrics = _read_report_metrics(orchestrator)
     module_metrics = _read_module_metrics(orchestrator)
-
     if snapshot is not None:
         test = _snapshot_test_payload(snapshot)
-        build_payload = _snapshot_build_payload(snapshot)
+        build_payload = _snapshot_build_payload(snapshot, metrics, module_metrics, report_raw)
         canonical_verdict = snapshot.verdict
         evidence_status = snapshot.verdict
         outcome = snapshot.verdict.upper()
         verdict_source = "snapshot"
     elif legacy:
         test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
-        build_payload = _build_payload_from_metrics(metrics) or _build_payload_from_report(
-            report_raw
+        build_payload = _merge_build_payloads(
+            _build_payload_from_metrics(metrics), _build_payload_from_report(report_raw)
         )
         canonical_verdict = "unknown"
         evidence_status = "unknown"
@@ -683,7 +731,6 @@ def _setup_artifact_item(
         evidence_status = "unknown"
         outcome = "UNKNOWN"
         verdict_source = "snapshot"
-
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     project_name = _text(
         trunk_data.get("project_name"),
@@ -1073,17 +1120,26 @@ def _build_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any
         return None
     return {
         "state": _text(build.get("state"), default="none"),
-        "system": build.get("system"),
+        "system": _value_for_keys(build, "system", "build_system", "buildSystem"),
         "tool": _text(build.get("tool"), default="—") if build.get("tool") else "—",
-        "time": _text(build.get("time"), default="—") if build.get("time") else "—",
+        "time": _text(
+            _value_for_keys(build, "time", "build_time", "buildTime", "duration"),
+            default="—",
+        ),
         "note": build.get("note"),
         "artifact": build.get("artifact"),
-        "class_count": build.get("class_count"),
-        "jar_count": build.get("jar_count"),
-        "module_output_count": build.get("module_output_count"),
-        "artifact_samples": build.get("artifact_samples") or [],
+        "class_count": _optional_int(
+            _value_for_keys(build, "class_count", "classCount", "class_files", "classFiles")
+        ),
+        "jar_count": _optional_int(
+            _value_for_keys(build, "jar_count", "jarCount", "jar_files", "jarFiles")
+        ),
+        "module_output_count": _optional_int(
+            _value_for_keys(build, "module_output_count", "moduleOutputCount")
+        ),
+        "artifact_samples": _value_for_keys(build, "artifact_samples", "artifactSamples") or [],
         "warnings": build.get("warnings") or [],
-        "evidence_refs": build.get("evidence_refs") or [],
+        "evidence_refs": _value_for_keys(build, "evidence_refs", "evidenceRefs") or [],
     }
 
 
@@ -1218,12 +1274,51 @@ def _build_payload_from_report(report_raw: str | None) -> dict[str, Any]:
     if not report_raw:
         return {"state": state}
 
+    note = _build_note_from_report(report_raw)
     return {
         "state": state,
         "tool": _build_tool_from_report(report_raw),
-        "time": "—",
-        "note": _build_note_from_report(report_raw),
+        "time": _build_time_from_report(report_raw),
+        "note": note,
+        "class_count": _build_output_count(note, "classes"),
+        "jar_count": _build_output_count(note, "jars"),
     }
+
+
+def _merge_build_payloads(metrics: dict[str, Any] | None, report: dict[str, Any]) -> dict[str, Any]:
+    if metrics is None:
+        return report
+
+    merged = dict(metrics)
+    for key, fallback in report.items():
+        value = merged.get(key)
+        if value is None or value == "" or value == "—" or value == []:
+            merged[key] = fallback
+    if merged.get("state") in {None, "", "none", "unknown"}:
+        merged["state"] = report.get("state", "none")
+    return merged
+
+
+def _module_artifact_count(metrics: dict[str, Any] | None, key: str) -> int | None:
+    if not isinstance(metrics, dict):
+        return None
+    counts = [
+        _optional_int(module.get(key))
+        for module in metrics.get("modules", [])
+        if isinstance(module, dict)
+    ]
+    known = [count for count in counts if count is not None]
+    return sum(known) if known else None
+
+
+def _build_time_from_report(report_raw: str) -> str:
+    match = re.search(r"\bbuild\s*time\s*[:|]\s*([^|\n]+)", report_raw, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else "—"
+
+
+def _build_output_count(note: str, label: str) -> int | None:
+    match = re.search(rf"([0-9][0-9,]*)\s*{label}\b", note, flags=re.IGNORECASE)
+    return _to_int(match.group(1).replace(",", "")) if match else None
 
 
 def _build_tool_from_report(report_raw: str) -> str:
@@ -1464,6 +1559,10 @@ def _build_summary(value: Any) -> BuildSummary:
 
 
 def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
+    records = _evidence_records(item.get("evidence_records"))
+    if records:
+        return EvidenceIndex().from_ui_records(records)
+
     time = _display_time(_optional_text(item.get("finish")) or _text(item.get("start"), default=""))
     status = _status_for_evidence(_evidence_status(item))
     record = EvidenceRecord(
@@ -1483,6 +1582,40 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
             records=[record],
         )
     ]
+
+
+def _evidence_records(value: Any) -> list[UIEvidenceRecord]:
+    records: list[UIEvidenceRecord] = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        timestamp = _optional_text(item.get("timestamp"))
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp) if timestamp else datetime.min
+        except ValueError:
+            parsed_timestamp = datetime.min
+        metadata = item.get("metadata")
+        records.append(
+            UIEvidenceRecord(
+                timestamp=parsed_timestamp,
+                kind=_text(item.get("kind"), default="evidence"),
+                summary=_text(item.get("summary"), default="Evidence"),
+                details=_optional_text(item.get("details")),
+                path=_optional_text(item.get("path")),
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+        )
+    return records
+
+
+def _file_digest(item: dict[str, Any]) -> FileChangeDigest | None:
+    value = _value_for_keys(item, "file_digest", "fileDigest")
+    if not isinstance(value, dict):
+        return None
+    try:
+        return FileChangeDigest.model_validate(value)
+    except Exception:
+        return None
 
 
 def _status_for_evidence(status: str) -> str:
@@ -1548,6 +1681,29 @@ def _read_container_file(orchestrator: Any, path: str) -> str | None:
         return None
 
     return output
+
+
+def _workspace_snapshot(orchestrator: Any, snapshot_id: str) -> FileSnapshot:
+    command = (
+        "find /workspace -xdev "
+        "\\( -path /workspace/.setup_agent -o -path '/workspace/.setup_agent/*' "
+        "-o -path /workspace/.git -o -path '/workspace/.git/*' "
+        "-o -path '*/node_modules' -o -path '*/node_modules/*' "
+        "-o -path '*/target' -o -path '*/target/*' "
+        "-o -path '*/build' -o -path '*/build/*' "
+        "-o -path '*/dist' -o -path '*/dist/*' \\) -prune -o "
+        "-printf '%y\\t%s\\t%T@\\t%C@\\t%p\\n'"
+    )
+    try:
+        result = orchestrator.execute_command(command, timeout=30)
+    except TypeError:
+        result = orchestrator.execute_command(command)
+    except Exception:
+        result = None
+    output = (
+        result.get("output") if isinstance(result, dict) and result.get("exit_code") == 0 else ""
+    )
+    return FileChangeTracker.snapshot_from_manifest(snapshot_id, Path("/workspace"), output or "")
 
 
 def _read_index_payload(orchestrator: Any) -> dict[str, Any]:
