@@ -1158,6 +1158,11 @@ class DockerOrchestrator:
         soft_timeout: Optional[int] = None,
         poll_interval: Optional[float] = None,
         tail_lines: int = 40,
+        *,
+        hold: str = "windowed",
+        stall_seconds: Optional[int] = None,
+        now=None,
+        sleep=None,
     ) -> Dict[str, Any]:
         """Dispatch-and-poll execution with a soft window (no hard kill).
 
@@ -1167,12 +1172,30 @@ class DockerOrchestrator:
         be established when the window closes, the result is a handoff carrying
         the log tail and poll instructions. Only terminal observations are
         collected.
+
+        Stall window (spec 2026-08-06): progress on either signal — stdout
+        growth or a build-tree write — resets a stall clock; when it reaches
+        ``stall_seconds`` the command is handed off, never killed.
+        ``hold="progress"`` (prerequisite dispatches) drops the total window
+        and holds while progress continues, bounded ONLY by the engine's
+        installed ``hold_deadline_provider``; without that provider the total
+        window applies — a missing budget basis degrades to the bounded old
+        behavior, never to an unbounded hold. ``hold="windowed"`` (default:
+        test-running and unclassifiable dispatches) keeps the total window
+        and hands off at min(stall, window).
         """
+        import time as _time
+
+        now = now or _time.time
+        sleep = sleep or _time.sleep
         config = getattr(self, "config", None)
         if soft_timeout is None:
             soft_timeout = getattr(config, "dispatch_soft_timeout_seconds", 900) or 900
         if poll_interval is None:
             poll_interval = getattr(config, "dispatch_poll_interval_seconds", 15) or 15
+        if stall_seconds is None:
+            stall_seconds = getattr(config, "dispatch_stall_seconds", 600)
+        stall_seconds = max(0, int(stall_seconds or 0))
 
         handle = self.execute_command_detached(command, workdir=workdir, environment=environment)
         if not handle.get("started"):
@@ -1186,37 +1209,130 @@ class DockerOrchestrator:
                 "dispatch": handle,
             }
 
-        deadline = time.time() + max(1, int(soft_timeout))
+        provider = getattr(self, "hold_deadline_provider", None)
+        wall_deadline: Optional[float] = None
+        if callable(provider):
+            try:
+                raw = provider()
+                wall_deadline = float(raw) if raw is not None else None
+            except Exception:
+                wall_deadline = None
+
+        start = now()
+        # Spec §3/§4.2: the total window drops ONLY when a stall clock AND a
+        # wall-clock budget both exist (P2: a missing basis is not permission).
+        unbounded = hold == "progress" and stall_seconds > 0 and wall_deadline is not None
+        window_deadline = None if unbounded else start + max(1, int(soft_timeout))
+
+        last_progress = start
+        last_stdout_growth = start
+        last_tree_write: Optional[float] = None
+        max_log_size = 0
+        since_epoch: Optional[int] = None
+
+        def _next_deadline() -> float:
+            candidates = []
+            if window_deadline is not None:
+                candidates.append(window_deadline)
+            if wall_deadline is not None:
+                candidates.append(wall_deadline)
+            if stall_seconds > 0:
+                candidates.append(last_progress + stall_seconds)
+            return min(candidates)
+
+        def _poll(with_progress: bool) -> Dict[str, Any]:
+            probe_workdir = workdir if (with_progress and stall_seconds > 0) else None
+            try:
+                return self.poll_detached_command(
+                    handle,
+                    tail_lines=tail_lines,
+                    progress_workdir=probe_workdir,
+                    progress_since=since_epoch if with_progress else None,
+                )
+            except TypeError as exc:
+                # Small test orchestrators predate the progress params.
+                if "progress_workdir" not in str(exc):
+                    raise
+                return self.poll_detached_command(handle, tail_lines=tail_lines)
+
         # Short early polls catch quick commands without paying a full interval.
         delays = [2, 5, 10]
         poll_count = 0
         while True:
-            now = time.time()
-            if now >= deadline:
+            ts = now()
+            if ts >= _next_deadline():
                 break
             delay = delays[poll_count] if poll_count < len(delays) else poll_interval
-            time.sleep(max(0.05, min(delay, deadline - now)))
+            sleep(max(0.05, min(delay, _next_deadline() - ts)))
             poll_count += 1
-            poll = self.poll_detached_command(handle, tail_lines=tail_lines)
+            poll = _poll(with_progress=True)
             if self._detached_poll_state(poll) in {"finished", "vanished"}:
                 return self.collect_detached_result(handle, poll)
+            ts = now()
+            size = int(poll.get("log_size") or 0)
+            if size > max_log_size:
+                max_log_size = size
+                last_stdout_growth = ts
+                last_progress = ts
+            if poll.get("progress_fresh"):
+                last_tree_write = ts
+                last_progress = ts
+            if poll.get("now_epoch"):
+                since_epoch = int(poll["now_epoch"])
 
-        final_poll = self.poll_detached_command(handle, tail_lines=tail_lines)
+        final_poll = _poll(with_progress=False)
         final_state = self._detached_poll_state(final_poll)
         if final_state in {"finished", "vanished"}:
             return self.collect_detached_result(handle, final_poll)
 
+        ts = now()
+        if stall_seconds > 0 and ts >= last_progress + stall_seconds:
+            handoff_reason = "stalled"
+        elif window_deadline is not None and ts >= window_deadline:
+            handoff_reason = "window"
+        else:
+            handoff_reason = "wall_clock"
+
+        held = int(ts - start)
         liveness_unknown = final_state == "unknown"
         dispatch_status = "liveness_unknown_detached" if liveness_unknown else "running_detached"
         if liveness_unknown:
             logger.warning(
-                f"Soft window of {soft_timeout}s expired without a conclusive liveness "
+                f"Hold ended ({handoff_reason}) without a conclusive liveness "
                 f"probe; preserving detached command handle (pid {handle['pid']}, "
                 f"log {handle['log_path']})"
             )
             handoff_summary = (
-                "Command liveness could not be established after the soft window. "
+                "Command liveness could not be established when the hold ended. "
                 "Its detached handle was preserved and the operation remains pending."
+            )
+        elif handoff_reason == "stalled":
+            quiet = int(ts - last_progress)
+            stdout_ago = int(ts - last_stdout_growth)
+            tree_line = (
+                f"last build-tree write observed {int(ts - last_tree_write)}s ago"
+                if last_tree_write is not None
+                else "no build-tree writes observed since dispatch"
+            )
+            logger.info(
+                f"⏳ Stall window ({stall_seconds}s) reached after {held}s; handing off "
+                f"still-running command (pid {handle['pid']}, log {handle['log_path']})"
+            )
+            handoff_summary = (
+                f"⏳ Command handed off after {held}s: no observable progress for "
+                f"{quiet}s — it was left running in the background (NOT killed).\n"
+                f"Observations: stdout last grew {stdout_ago}s ago "
+                f"(log size {max_log_size} bytes); {tree_line}."
+            )
+        elif handoff_reason == "wall_clock":
+            logger.info(
+                f"⏳ Report reserve reached after {held}s of holding; handing off "
+                f"still-running command (pid {handle['pid']}, log {handle['log_path']})"
+            )
+            handoff_summary = (
+                f"⏳ Command still running after {held}s — the run's report reserve "
+                "was reached, so the harness stopped holding. It was left running "
+                "in the background (NOT killed)."
             )
         else:
             logger.info(
@@ -1246,11 +1362,13 @@ class DockerOrchestrator:
             "runner_dispatched": True,
             "lifecycle_state": "pending",
             "liveness_state": final_state,
+            "handoff_reason": handoff_reason,
             "dispatch": {
                 **handle,
                 "last_tail": final_poll.get("tail", ""),
                 "log_size": final_poll.get("log_size", 0),
                 "soft_timeout": soft_timeout,
+                "handoff_reason": handoff_reason,
             },
         }
 
