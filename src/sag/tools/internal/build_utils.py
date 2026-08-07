@@ -31,6 +31,86 @@ def detached_poll_ref(result: Dict[str, Any]) -> str:
     return f"job:{job_id}"
 
 
+_HOLD_LAUNCHERS = frozenset({"mvn", "./mvnw", "mvnw", "gradle", "./gradlew", "gradlew"})
+_MAVEN_SKIP_FLAGS = ("-DskipTests", "-Dmaven.test.skip")
+# Goals that provably run no tests. Anything else — including plugin goals we
+# have never seen — stays on the bounded window: refusing to guess must hold
+# LESS, never more (spec §3).
+_MAVEN_SAFE_GOALS = frozenset(
+    {
+        "clean",
+        "validate",
+        "initialize",
+        "generate-sources",
+        "process-resources",
+        "compile",
+        "process-test-resources",
+        "test-compile",
+        "dependency:resolve",
+        "dependency:go-offline",
+        "dependency:tree",
+    }
+)
+_GRADLE_SAFE_TASKS = frozenset(
+    {
+        "clean",
+        "classes",
+        "testClasses",
+        "compileJava",
+        "compileTestJava",
+        "processResources",
+        "assemble",
+        "jar",
+        "dependencies",
+    }
+)
+_GRADLE_EXCLUDE_FLAGS = ("-x", "--exclude-task")
+
+
+def dispatch_hold_policy(system: str, argv: str) -> str:
+    """'progress' only when the argv provably runs no tests; else 'windowed'.
+
+    'progress' marks a PREREQUISITE dispatch (spec §3): nothing downstream can
+    proceed without it, so the harness holds while it shows progress. Every
+    test-running or unclassifiable dispatch keeps the bounded window — the
+    obligation/settlement path accounts for those after a handoff.
+    """
+    text = str(argv or "")
+    if system == "maven":
+        if any(flag in text for flag in _MAVEN_SKIP_FLAGS):
+            return "progress"
+        goals = [
+            token
+            for token in text.split()
+            if token not in _HOLD_LAUNCHERS and not token.startswith("-")
+        ]
+        if goals and all(goal in _MAVEN_SAFE_GOALS for goal in goals):
+            return "progress"
+        return "windowed"
+    if system == "gradle":
+        excluded_tests = any(
+            f"{flag} test" in text or f"{flag} check" in text
+            for flag in _GRADLE_EXCLUDE_FLAGS
+        )
+        tasks = []
+        skip_next = False
+        for token in text.split():
+            if skip_next:
+                skip_next = False
+                continue
+            if token in _GRADLE_EXCLUDE_FLAGS:
+                skip_next = True
+                continue
+            if token in _HOLD_LAUNCHERS or token.startswith("-"):
+                continue
+            tasks.append(token)
+        safe = _GRADLE_SAFE_TASKS | ({"build"} if excluded_tests else frozenset())
+        if tasks and all(task in safe for task in tasks):
+            return "progress"
+        return "windowed"
+    return "windowed"
+
+
 def detached_handoff_tool_result(
     tool_name: str, command: str, result: Dict[str, Any]
 ) -> ToolResult:
