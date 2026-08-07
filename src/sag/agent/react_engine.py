@@ -993,6 +993,28 @@ class ReActEngine(UIEventEmitter):
     _REPORT_RESERVE_SECONDS = 600
     _OBLIGATION_POLL_SECONDS = 30
 
+    def _hold_deadline(self) -> Optional[float]:
+        """When must any hold stop — ONE computation (P3, spec §4.2).
+
+        Consumed by the evidence-close wait below and, through the provider
+        installed at run start, by the orchestrator's dispatch hold. None
+        means the margin is unknown — and margin unknown is margin absent:
+        every consumer degrades to its bounded behavior, never to an
+        unbounded hold.
+        """
+        started_at = getattr(self, "_run_started_at", None)
+        if started_at is None:
+            return None
+        cap = getattr(self, "_wall_clock_cap", None) or getattr(
+            getattr(self, "config", None), "max_wall_clock_seconds", 7200
+        )
+        return float(started_at) + float(cap) - self._REPORT_RESERVE_SECONDS
+
+    def _install_hold_deadline_provider(self) -> None:
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is not None:
+            orchestrator.hold_deadline_provider = self._hold_deadline
+
     def _await_open_obligations(self, reason, *, now=None, sleep=None) -> None:
         """Spend leftover wall clock on a job that is still running, bounded.
 
@@ -1013,13 +1035,9 @@ class ReActEngine(UIEventEmitter):
         sleep = sleep or _time.sleep
         if reason in (EvidenceCloseReason.ABORTED, EvidenceCloseReason.CANCELLED):
             return
-        started_at = getattr(self, "_run_started_at", None)
-        if started_at is None:
+        deadline = self._hold_deadline()
+        if deadline is None:
             return  # margin unknown is margin absent
-        cap = getattr(self, "_wall_clock_cap", None) or getattr(
-            getattr(self, "config", None), "max_wall_clock_seconds", 7200
-        )
-        deadline = float(started_at) + float(cap) - self._REPORT_RESERVE_SECONDS
         orchestrator = getattr(self, "orchestrator", None)
         if orchestrator is None:
             return
@@ -2406,6 +2424,9 @@ class ReActEngine(UIEventEmitter):
         # could overrun the cap the loop is about to apply.
         self._run_started_at = run_started_at
         self._wall_clock_cap = wall_clock_cap
+        # The dispatch hold (stall window) must stop at the same line the
+        # evidence-close wait stops at; both consume _hold_deadline (P3).
+        self._install_hold_deadline_provider()
 
         try:
             while self.current_iteration < max_iter:

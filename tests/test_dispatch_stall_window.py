@@ -128,3 +128,58 @@ def test_progress_markers_in_the_tail_are_not_trusted():
         _HANDLE, progress_workdir="/workspace/proj", progress_since=1754500000
     )
     assert poll["progress_fresh"] is False
+
+
+from types import SimpleNamespace
+
+from sag.agent.react_engine import ReActEngine
+
+
+class _EngineStub:
+    _REPORT_RESERVE_SECONDS = ReActEngine._REPORT_RESERVE_SECONDS
+    _hold_deadline = ReActEngine._hold_deadline
+    _install_hold_deadline_provider = ReActEngine._install_hold_deadline_provider
+
+
+def test_hold_deadline_is_start_plus_cap_minus_reserve():
+    stub = _EngineStub()
+    stub._run_started_at = 1000.0
+    stub._wall_clock_cap = 7200
+    assert stub._hold_deadline() == 1000.0 + 7200 - 600
+
+
+def test_hold_deadline_without_a_start_time_is_none():
+    # Margin unknown is margin absent — consumers degrade to bounded behavior.
+    assert _EngineStub()._hold_deadline() is None
+
+
+def test_installed_provider_IS_the_shared_computation():
+    stub = _EngineStub()
+    stub.orchestrator = SimpleNamespace()
+    stub._install_hold_deadline_provider()
+    provider = stub.orchestrator.hold_deadline_provider
+    assert provider.__func__ is ReActEngine._hold_deadline
+
+
+def test_the_close_wait_consults_the_shared_deadline():
+    """Wiring pin: _await_open_obligations must read _hold_deadline, not run a
+    second lookalike computation. A patched helper returning an expired
+    deadline must stop the wait before any container poll."""
+    calls = []
+
+    class Stub(_EngineStub):
+        _await_open_obligations = ReActEngine._await_open_obligations
+
+    stub = Stub()
+    stub._run_started_at = 1000.0
+    stub._wall_clock_cap = 7200
+    stub._hold_deadline = lambda: 0.0  # expired: no margin at all
+    stub.orchestrator = SimpleNamespace(
+        execute_command=lambda *a, **k: calls.append(a) or {"exit_code": 0, "output": ""}
+    )
+    from sag.agent.react_engine import EvidenceCloseReason
+
+    stub._await_open_obligations(
+        EvidenceCloseReason.TEST_TERMINATED, now=lambda: 5000.0, sleep=lambda s: None
+    )
+    assert calls == []  # deadline already passed: the wait never polled
