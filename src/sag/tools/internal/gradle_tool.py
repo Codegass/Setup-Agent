@@ -34,6 +34,7 @@ from .build_utils import (
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
+    dispatch_hold_policy,
 )
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
@@ -351,10 +352,20 @@ class GradleTool(BaseTool):
                     # running when it closes, hand the log tail back to the agent
                     # instead of killing a legitimately long build.
                     logger.info(f"Executing Gradle command via dispatch-and-poll: {gradle_cmd}")
-                    return self.orchestrator.execute_command_with_soft_timeout(
-                        gradle_cmd,
-                        workdir=working_directory,
-                    )
+                    try:
+                        return self.orchestrator.execute_command_with_soft_timeout(
+                            gradle_cmd,
+                            workdir=working_directory,
+                            hold=dispatch_hold_policy("gradle", gradle_cmd),
+                        )
+                    except TypeError as exc:
+                        # Small test orchestrators predate the hold parameter.
+                        if "hold" not in str(exc):
+                            raise
+                        return self.orchestrator.execute_command_with_soft_timeout(
+                            gradle_cmd,
+                            workdir=working_directory,
+                        )
                 if is_long_running and hasattr(
                     self.orchestrator, "execute_command_with_monitoring"
                 ):

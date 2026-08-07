@@ -496,3 +496,109 @@ def test_hold_loop_threads_workdir_and_container_clock_into_the_probe():
     assert orch.poll_calls[0]["workdir"] == "/workspace/proj"
     assert orch.poll_calls[0]["since"] is None  # first cycle: S1 only
     assert orch.poll_calls[1]["since"] == 1754500000  # container clock, not host
+
+
+from sag.tools.internal.build_utils import detached_handoff_tool_result
+
+
+def test_handoff_tool_result_carries_the_reason():
+    raw = {
+        "output": "handed off",
+        "dispatch_status": "running_detached",
+        "runner_dispatched": True,
+        "handoff_reason": "stalled",
+        "dispatch": {
+            "job_id": "j123",
+            "pid": 4242,
+            "log_path": "/tmp/sag_jobs/j123.log",
+            "exit_code_path": "/tmp/sag_jobs/j123.log.exit",
+            "pid_path": "/tmp/sag_jobs/j123.log.pid",
+            "soft_timeout": 900,
+        },
+    }
+    result = detached_handoff_tool_result("maven", "mvn test", raw)
+    assert result.metadata["handoff_reason"] == "stalled"
+
+
+class _HoldRecordingOrchestrator:
+    """Records what the build tools hand to the dispatch path.
+
+    Answers the tools' executable/wrapper probes the way
+    tests/test_dispatch_and_poll.py's RoutingOrchestrator does, so the argv
+    the tier is computed from is the real resolved one.
+    """
+
+    def __init__(self):
+        self.dispatches = []
+
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+        if command in ("which mvn", "command -v mvn"):
+            return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
+        if command in ("which gradle", "command -v gradle"):
+            return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
+        if command.startswith("test -x /usr/bin/mvn") or command.startswith(
+            "test -x /usr/bin/gradle"
+        ):
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if command == "/usr/bin/mvn -version":
+            return {"success": True, "output": "Apache Maven 3.9.6", "exit_code": 0}
+        if command == "/usr/bin/gradle -version":
+            return {"success": True, "output": "Gradle 8.5", "exit_code": 0}
+        if "pom.xml && echo 'EXISTS'" in command:
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if "grep -q '<modules>'" in command:
+            return {"success": False, "output": "NO_MODULES", "exit_code": 1}
+        if "settings.gradle" in command and "grep -q 'include'" in command:
+            return {"success": False, "output": "", "exit_code": 1}
+        return {"exit_code": 0, "output": "", "success": True}
+
+    def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+        self.dispatches.append({"command": command, **kwargs})
+        return {
+            "success": True,
+            "runner_dispatched": True,
+            "exit_code": None,
+            "output": "still running; poll /tmp/sag_jobs/abc.log",
+            "termination_reason": None,
+            "dispatch_status": "running_detached",
+            "handoff_reason": "stalled",
+            "dispatch": {
+                "job_id": "abc",
+                "pid": 1,
+                "log_path": "/tmp/sag_jobs/abc.log",
+                "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
+            },
+        }
+
+
+def test_hold_policy_reads_a_resolved_launcher_path():
+    """What the tools dispatch is a resolved path, not a bare `mvn`. Reading
+    that path as a goal would make every real build unclassifiable."""
+    assert dispatch_hold_policy("maven", "/usr/bin/mvn clean compile") == "progress"
+    assert dispatch_hold_policy("maven", "/usr/bin/mvn test") == "windowed"
+    assert dispatch_hold_policy("gradle", "/opt/gradle/bin/gradle assemble") == "progress"
+    assert dispatch_hold_policy("gradle", "/opt/gradle/bin/gradle build") == "windowed"
+
+
+def test_maven_passes_its_hold_tier_to_the_dispatch():
+    from sag.tools.internal.maven_tool import MavenTool
+
+    orch = _HoldRecordingOrchestrator()
+    MavenTool(orch).execute(command="clean compile", working_directory="/workspace/p")
+    MavenTool(orch).execute(command="test", working_directory="/workspace/p")
+
+    compiled, tested = orch.dispatches
+    assert compiled["hold"] == dispatch_hold_policy("maven", compiled["command"]) == "progress"
+    assert tested["hold"] == dispatch_hold_policy("maven", tested["command"]) == "windowed"
+
+
+def test_gradle_passes_its_hold_tier_to_the_dispatch():
+    from sag.tools.internal.gradle_tool import GradleTool
+
+    orch = _HoldRecordingOrchestrator()
+    GradleTool(orch).execute(tasks="assemble", working_directory="/workspace/p")
+    GradleTool(orch).execute(tasks="build", working_directory="/workspace/p")
+
+    assembled, built = orch.dispatches
+    assert assembled["hold"] == dispatch_hold_policy("gradle", assembled["command"]) == "progress"
+    assert built["hold"] == dispatch_hold_policy("gradle", built["command"]) == "windowed"

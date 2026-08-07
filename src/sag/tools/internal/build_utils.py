@@ -67,6 +67,16 @@ _GRADLE_SAFE_TASKS = frozenset(
 _GRADLE_EXCLUDE_FLAGS = ("-x", "--exclude-task")
 
 
+def _is_hold_launcher(token: str) -> bool:
+    """The launcher the build tools actually dispatch is a RESOLVED path.
+
+    `/usr/bin/mvn`, `/opt/gradle/bin/gradle`, `./mvnw` — all name a launcher,
+    none is a goal. Reading one as a goal would make every real dispatch
+    unclassifiable, so the tier is matched on the basename.
+    """
+    return token in _HOLD_LAUNCHERS or token.rsplit("/", 1)[-1] in _HOLD_LAUNCHERS
+
+
 def dispatch_hold_policy(system: str, argv: str) -> str:
     """'progress' only when the argv provably runs no tests; else 'windowed'.
 
@@ -82,7 +92,7 @@ def dispatch_hold_policy(system: str, argv: str) -> str:
         goals = [
             token
             for token in text.split()
-            if token not in _HOLD_LAUNCHERS and not token.startswith("-")
+            if not _is_hold_launcher(token) and not token.startswith("-")
         ]
         if goals and all(goal in _MAVEN_SAFE_GOALS for goal in goals):
             return "progress"
@@ -101,7 +111,7 @@ def dispatch_hold_policy(system: str, argv: str) -> str:
             if token in _GRADLE_EXCLUDE_FLAGS:
                 skip_next = True
                 continue
-            if token in _HOLD_LAUNCHERS or token.startswith("-"):
+            if _is_hold_launcher(token) or token.startswith("-"):
                 continue
             tasks.append(token)
         safe = _GRADLE_SAFE_TASKS | ({"build"} if excluded_tests else frozenset())
@@ -143,6 +153,7 @@ def detached_handoff_tool_result(
             "log_path": log_path,
             "exit_code_path": dispatch.get("exit_code_path"),
             "soft_timeout": dispatch.get("soft_timeout"),
+            "handoff_reason": result.get("handoff_reason"),
         },
     )
 
