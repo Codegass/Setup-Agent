@@ -1036,8 +1036,21 @@ class DockerOrchestrator:
             "exit_code_path": f"{log_path}.exit",
         }
 
-    def poll_detached_command(self, handle: Dict[str, Any], tail_lines: int = 40) -> Dict[str, Any]:
-        """Poll a detached command: completion state, exit code, and log tail."""
+    def poll_detached_command(
+        self,
+        handle: Dict[str, Any],
+        tail_lines: int = 40,
+        progress_workdir: Optional[str] = None,
+        progress_since: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Poll a detached command: completion state, exit code, and log tail.
+
+        With ``progress_workdir`` + ``progress_since`` the probe also answers
+        (spec 2026-08-06 §2, S2): has ANY file under the workdir's build-output
+        subtrees been written since ``progress_since`` (container clock, 1s
+        slack)? ``NOW:`` always carries the container clock so the caller's
+        next ``progress_since`` never mixes host and container time.
+        """
         log_path = shlex.quote(handle["log_path"])
         exit_code_path = shlex.quote(handle["exit_code_path"])
         pid = handle.get("pid")
@@ -1046,12 +1059,25 @@ class DockerOrchestrator:
         else:
             pid_path = shlex.quote(handle.get("pid_path") or f"{handle['log_path']}.pid")
             pid_assignment = f'pid="$(cat {pid_path} 2>/dev/null)"; '
+        progress_probe = 'echo "NOW:$(date +%s)"; '
+        if progress_workdir and progress_since is not None:
+            quoted_dir = shlex.quote(progress_workdir)
+            progress_probe += (
+                f"if [ -d {quoted_dir} ]; then "
+                f"fresh=$(find {quoted_dir} "
+                f"\\( -path '*/target/*' -o -path '*/build/*' "
+                f"-o -path '*/.setup_agent/pytest-reports/*' \\) "
+                f"-type f -newermt @{int(progress_since) - 1} -print -quit 2>/dev/null); "
+                f'if [ -n "$fresh" ]; then echo "PROGRESS:FRESH"; '
+                f'else echo "PROGRESS:NONE"; fi; fi; '
+            )
         probe = pid_assignment + (
             f'if [ -f {exit_code_path} ]; then echo "STATE:EXIT:$(cat {exit_code_path})"; '
             f'elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; '
             f'then echo "STATE:RUNNING"; '
             f'else echo "STATE:VANISHED"; fi; '
             f'echo "SIZE:$(wc -c < {log_path} 2>/dev/null || echo 0)"; '
+            f"{progress_probe}"
             f'echo "---TAIL---"; tail -n {int(tail_lines)} {log_path} 2>/dev/null'
         )
         result = self.execute_command(probe, workdir=None, timeout=60)
@@ -1067,6 +1093,8 @@ class DockerOrchestrator:
         state = "unknown"
         exit_code: Optional[int] = None
         log_size = 0
+        now_epoch: Optional[int] = None
+        progress_fresh: Optional[bool] = None
         for line in head.splitlines():
             stripped = line.strip()
             if stripped.startswith("STATE:EXIT:"):
@@ -1087,6 +1115,15 @@ class DockerOrchestrator:
                     log_size = int(stripped.split(":", 1)[1].strip())
                 except ValueError:
                     log_size = 0
+            elif stripped.startswith("NOW:"):
+                try:
+                    now_epoch = int(stripped.split(":", 1)[1].strip())
+                except ValueError:
+                    now_epoch = None
+            elif stripped == "PROGRESS:FRESH":
+                progress_fresh = True
+            elif stripped == "PROGRESS:NONE":
+                progress_fresh = False
 
         return {
             "finished": finished,
@@ -1096,6 +1133,8 @@ class DockerOrchestrator:
             "log_size": log_size,
             "probe_success": result.get("exit_code") == 0,
             "state": state,
+            "now_epoch": now_epoch,
+            "progress_fresh": progress_fresh,
         }
 
     @staticmethod
