@@ -1219,6 +1219,16 @@ class DockerOrchestrator:
                 wall_deadline = None
 
         start = now()
+        # Short early polls catch quick commands without paying a full interval.
+        delays = [2, 5, 10]
+        if wall_deadline is not None:
+            # The wall guard bounds how long a hold may EXTEND, not whether the
+            # dispatch gets to look at all. Inside the report reserve the
+            # deadline is already past, and without this floor the loop would
+            # break before its first poll: a command that finishes in 2s would
+            # come back "pending" with zero observations and open an obligation
+            # nothing can settle. The floor costs the early-poll budget only.
+            wall_deadline = max(wall_deadline, start + sum(delays))
         # Spec §3/§4.2: the total window drops ONLY when a stall clock AND a
         # wall-clock budget both exist (P2: a missing basis is not permission).
         unbounded = hold == "progress" and stall_seconds > 0 and wall_deadline is not None
@@ -1229,6 +1239,7 @@ class DockerOrchestrator:
         last_tree_write: Optional[float] = None
         max_log_size = 0
         since_epoch: Optional[int] = None
+        unanswered_probes = 0
 
         def _next_deadline() -> float:
             candidates = []
@@ -1255,8 +1266,6 @@ class DockerOrchestrator:
                     raise
                 return self.poll_detached_command(handle, tail_lines=tail_lines)
 
-        # Short early polls catch quick commands without paying a full interval.
-        delays = [2, 5, 10]
         poll_count = 0
         while True:
             ts = now()
@@ -1269,6 +1278,16 @@ class DockerOrchestrator:
             if self._detached_poll_state(poll) in {"finished", "vanished"}:
                 return self.collect_detached_result(handle, poll)
             ts = now()
+            if poll.get("probe_success") is False:
+                # The probe did not answer. That is not an observation of
+                # quiet — it is no observation at all (P2: no basis is its own
+                # answer), so it may not be reported as one. The clock keeps
+                # running (a container we cannot probe must still be handed
+                # back bounded), but the handoff states what actually happened
+                # instead of a log size we never measured.
+                unanswered_probes += 1
+                continue
+            unanswered_probes = 0
             size = int(poll.get("log_size") or 0)
             if size > max_log_size:
                 max_log_size = size
@@ -1294,6 +1313,24 @@ class DockerOrchestrator:
             handoff_reason = "wall_clock"
 
         held = int(ts - start)
+        quiet = int(ts - last_progress)
+        if unanswered_probes:
+            # Spec §5: state observations. "stdout last grew Ns ago" would be a
+            # claim about a log the last probes never read.
+            stall_observations = (
+                f"the last {unanswered_probes} liveness probe(s) did not answer, "
+                f"so progress could not be observed for {quiet}s"
+            )
+        else:
+            tree_line = (
+                f"last build-tree write observed {int(ts - last_tree_write)}s ago"
+                if last_tree_write is not None
+                else "no build-tree writes observed since dispatch"
+            )
+            stall_observations = (
+                f"stdout last grew {int(ts - last_stdout_growth)}s ago "
+                f"(log size {max_log_size} bytes); {tree_line}"
+            )
         liveness_unknown = final_state == "unknown"
         dispatch_status = "liveness_unknown_detached" if liveness_unknown else "running_detached"
         if liveness_unknown:
@@ -1306,14 +1343,15 @@ class DockerOrchestrator:
                 "Command liveness could not be established when the hold ended. "
                 "Its detached handle was preserved and the operation remains pending."
             )
+            if handoff_reason == "stalled":
+                # A stall handoff carries its per-signal observations even when
+                # the last probe came back inconclusive: the reason travels in
+                # the result and the metadata, so the text must match it.
+                handoff_summary += (
+                    f"\nNo observable progress for {quiet}s before that.\n"
+                    f"Observations: {stall_observations}."
+                )
         elif handoff_reason == "stalled":
-            quiet = int(ts - last_progress)
-            stdout_ago = int(ts - last_stdout_growth)
-            tree_line = (
-                f"last build-tree write observed {int(ts - last_tree_write)}s ago"
-                if last_tree_write is not None
-                else "no build-tree writes observed since dispatch"
-            )
             logger.info(
                 f"⏳ Stall window ({stall_seconds}s) reached after {held}s; handing off "
                 f"still-running command (pid {handle['pid']}, log {handle['log_path']})"
@@ -1321,8 +1359,7 @@ class DockerOrchestrator:
             handoff_summary = (
                 f"⏳ Command handed off after {held}s: no observable progress for "
                 f"{quiet}s — it was left running in the background (NOT killed).\n"
-                f"Observations: stdout last grew {stdout_ago}s ago "
-                f"(log size {max_log_size} bytes); {tree_line}."
+                f"Observations: {stall_observations}."
             )
         elif handoff_reason == "wall_clock":
             logger.info(

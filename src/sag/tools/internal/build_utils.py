@@ -32,7 +32,11 @@ def detached_poll_ref(result: Dict[str, Any]) -> str:
 
 
 _HOLD_LAUNCHERS = frozenset({"mvn", "./mvnw", "mvnw", "gradle", "./gradlew", "gradlew"})
-_MAVEN_SKIP_FLAGS = ("-DskipTests", "-Dmaven.test.skip")
+_MAVEN_SKIP_PROPERTIES = frozenset({"skipTests", "maven.test.skip"})
+# A property that turns test execution ON is not a skip. `-DskipTests=false` is
+# the standard way to override a pom that sets the property, so only an absent
+# or truthy value may be read as "this dispatch runs no tests".
+_MAVEN_TRUTHY = frozenset({"", "true"})
 # Goals that provably run no tests. Anything else — including plugin goals we
 # have never seen — stays on the bounded window: refusing to guess must hold
 # LESS, never more (spec §3).
@@ -77,6 +81,24 @@ def _is_hold_launcher(token: str) -> bool:
     return token in _HOLD_LAUNCHERS or token.rsplit("/", 1)[-1] in _HOLD_LAUNCHERS
 
 
+def _maven_skips_tests(tokens) -> bool:
+    """True only for a `-D` token that provably turns test execution OFF.
+
+    Matched on the whole property NAME and its value, never as a substring:
+    `-DskipTests=false` and `-DskipTestsFoo=1` both run tests, and reading them
+    as skips would hand a test-running dispatch the unbounded tier.
+    """
+    for token in tokens:
+        if not token.startswith("-D"):
+            continue
+        name, sep, value = token[2:].partition("=")
+        if name not in _MAVEN_SKIP_PROPERTIES:
+            continue
+        if not sep or value.strip().lower() in _MAVEN_TRUTHY:
+            return True
+    return False
+
+
 def dispatch_hold_policy(system: str, argv: str) -> str:
     """'progress' only when the argv provably runs no tests; else 'windowed'.
 
@@ -86,26 +108,28 @@ def dispatch_hold_policy(system: str, argv: str) -> str:
     obligation/settlement path accounts for those after a handoff.
     """
     text = str(argv or "")
+    tokens = text.split()
     if system == "maven":
-        if any(flag in text for flag in _MAVEN_SKIP_FLAGS):
+        if _maven_skips_tests(tokens):
             return "progress"
         goals = [
             token
-            for token in text.split()
+            for token in tokens
             if not _is_hold_launcher(token) and not token.startswith("-")
         ]
         if goals and all(goal in _MAVEN_SAFE_GOALS for goal in goals):
             return "progress"
         return "windowed"
     if system == "gradle":
-        excluded_tests = any(
-            f"{flag} test" in text or f"{flag} check" in text
-            for flag in _GRADLE_EXCLUDE_FLAGS
-        )
         tasks = []
+        excluded = set()
         skip_next = False
-        for token in text.split():
+        for token in tokens:
             if skip_next:
+                # The token FOLLOWING an exclude flag is the excluded task, and
+                # only that exact task is excluded: `-x checkstyleMain` leaves
+                # `test` running, so it may not admit `build` to the safe set.
+                excluded.add(token)
                 skip_next = False
                 continue
             if token in _GRADLE_EXCLUDE_FLAGS:
@@ -114,6 +138,7 @@ def dispatch_hold_policy(system: str, argv: str) -> str:
             if _is_hold_launcher(token) or token.startswith("-"):
                 continue
             tasks.append(token)
+        excluded_tests = bool(excluded & {"test", "check"})
         safe = _GRADLE_SAFE_TASKS | ({"build"} if excluded_tests else frozenset())
         if tasks and all(task in safe for task in tasks):
             return "progress"
