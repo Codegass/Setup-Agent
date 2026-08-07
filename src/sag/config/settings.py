@@ -102,6 +102,10 @@ class Config(BaseModel):
     # instead of killing the process.
     dispatch_soft_timeout_seconds: int = Field(default=900)
     dispatch_poll_interval_seconds: int = Field(default=15)
+    # Stall window (spec 2026-08-06): hand off a held dispatch after this many
+    # seconds without observable progress (stdout growth or build-tree writes).
+    # 0 disables the stall clock — fixed-window behavior only.
+    dispatch_stall_seconds: int = Field(default=600)
 
     # Advisor (spec §3.2). "off" is the ablation switch §3.7.6 requires: it
     # disables the consult AND every mechanical guarantee, degrading the run to
@@ -177,6 +181,7 @@ class Config(BaseModel):
             dispatch_poll_interval_seconds=int(
                 os.getenv("SAG_DISPATCH_POLL_INTERVAL_SECONDS", "15")
             ),
+            dispatch_stall_seconds=int(os.getenv("SAG_DISPATCH_STALL_SECONDS", "600")),
             advisor_mode=os.getenv("SAG_ADVISOR_MODE", "same-model"),
             advisor_max_tokens=int(os.getenv("SAG_ADVISOR_MAX_TOKENS", "2048")),
             advisor_phase_cap=int(os.getenv("SAG_ADVISOR_PHASE_CAP", "4")),
