@@ -1039,15 +1039,16 @@ class BaseTool(ABC):
 
         The complete text is persisted as an OutputStorage `output_<id>`
         reference, which lives outside the container filesystem: `grep` and
-        `bash` cannot reach it, and `output_search` is the only tool that can.
-        Naming a tool with nothing to read is what cost the 2026-07-27
-        commons-cli run seven actions of hand-reconstruction.
+        `bash` cannot reach it, and the `search` tool is the only surface that
+        can. Naming a tool with nothing to read is what cost the 2026-07-27
+        commons-cli run seven actions of hand-reconstruction; naming a tool
+        the model cannot route to is the #19 defect class (#30).
         """
         if output_ref:
             return (
                 f"💡 The complete output is stored as '{output_ref}'. Read the omitted "
-                f"middle with output_search(action='grep', ref_id='{output_ref}', "
-                "grep_pattern='Tests run') — substitute the pattern you need.\n\n"
+                f"middle with search(target='{output_ref}', pattern='Tests run') — "
+                "substitute the pattern you need, or omit pattern for the whole log.\n\n"
             )
         return (
             "💡 This result carries no stored output reference, so the omitted middle "

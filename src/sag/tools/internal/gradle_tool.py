@@ -1215,7 +1215,8 @@ class GradleTool(BaseTool):
         if ref_id:
             output += f"\n\n📄 Full output reference: {ref_id}"
             output += (
-                f"\n💡 Use: output_search(action='retrieve', ref_id='{ref_id}') for complete log"
+                f"\n💡 Use: search(target='{ref_id}') for the complete log, or "
+                f"search(target='{ref_id}', pattern='ERROR') to grep it"
             )
 
         # Cache and performance info
@@ -1245,7 +1246,8 @@ class GradleTool(BaseTool):
         if ref_id:
             output += f"\n\n📄 Full output reference: {ref_id}"
             output += (
-                f"\n💡 Use: output_search(action='retrieve', ref_id='{ref_id}') for complete log"
+                f"\n💡 Use: search(target='{ref_id}') for the complete log, or "
+                f"search(target='{ref_id}', pattern='ERROR') to grep it"
             )
         return output
 

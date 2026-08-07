@@ -27,7 +27,8 @@ class SearchTool(BaseTool):
             description=(
                 "Search stored outputs, files, background-job logs, or the web. "
                 "target: ref id (e.g. 'output_5b9a') | 'file:<path>' | 'job:<id>' | 'web:<query>'. "
-                "pattern: grep pattern (ignored for web)."
+                "pattern: grep pattern (ignored for web); for a ref id, omit pattern "
+                "to read the stored output itself."
             ),
         )
         self.docker_orchestrator = docker_orchestrator
@@ -44,8 +45,14 @@ class SearchTool(BaseTool):
         if target.startswith("web:"):
             return self._web(target[4:], max_results)
         if target.startswith("output_") and self.output_search is not None:
+            if not pattern:
+                # No pattern = read the stored output (auto-truncated by the
+                # delegate). Grep-with-a-guessed-pattern must not be the only
+                # reachable action: guessing what to look for in a log it has
+                # never seen is exactly what a weak model cannot do (#30).
+                return self.output_search.execute(action="retrieve", ref_id=target)
             return self.output_search.execute(
-                action="grep", ref_id=target, grep_pattern=pattern or ".", limit=max_results
+                action="grep", ref_id=target, grep_pattern=pattern, limit=max_results
             )
         return ToolResult.completed_failure(
             output=f"Unrecognized search target: {target!r}",

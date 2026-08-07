@@ -185,16 +185,19 @@ LONG = "[INFO] Tests run: 982, Failures: 0, Errors: 0, Skipped: 61\n" * 400
 
 
 def test_the_notice_states_the_stored_reference_and_the_call_that_reads_it():
+    # Premise updated for #30: the notice must teach the REGISTERED surface.
+    # output_search left the tool list at stage 1, so the old wording proposed
+    # a call the model cannot route to (the #19 defect class).
     output = _truncated(ToolResult.completed_success(output=LONG, metadata={"output_ref_id": REF}))
 
     assert "OUTPUT TRUNCATED" in output
-    assert f"output_search(action='grep', ref_id='{REF}', grep_pattern='Tests run')" in output
+    assert f"search(target='{REF}', pattern='Tests run')" in output
 
 
 def test_the_notice_reads_the_reference_off_the_canonical_output_ref_field_too():
     result = ToolResult.completed_success(output=LONG, output_ref=REF)
 
-    assert f"ref_id='{REF}'" in _truncated(result)
+    assert f"target='{REF}'" in _truncated(result)
 
 
 def test_the_notice_no_longer_points_at_bash_and_grep():

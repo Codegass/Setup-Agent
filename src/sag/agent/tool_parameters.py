@@ -97,7 +97,10 @@ class ToolParameterNormalizer:
             "search",
             lambda p: {
                 "target": p.get("ref_id", ""),
-                "pattern": p.get("grep_pattern", p.get("pattern", ".")),
+                # No pattern maps to no pattern: search retrieves the stored
+                # output. The old default "." silently downgraded a retrieve
+                # intent to a grep of every line (#30).
+                "pattern": p.get("grep_pattern", p.get("pattern", "")),
             },
         ),
         # Facade verb must win over any legacy sub-action key: ProjectTool routes
