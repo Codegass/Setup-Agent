@@ -649,6 +649,22 @@ class CommandAudit:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.orchestrator, name)
 
+    def evidence_store_identity(self) -> str:
+        """Report the orchestrator's store identity, never a proxy identity.
+
+        The audit is a transparent proxy for exactly one container, and one
+        epoch authority is installed on both objects.  Deriving identity from
+        the proxy would make the same container look like a second store.
+        """
+
+        resolver = getattr(self.orchestrator, "evidence_store_identity", None)
+        if callable(resolver):
+            return str(resolver())
+        container_id = str(getattr(self.orchestrator, "container_id", "") or "").strip()
+        if container_id:
+            return f"container_id:{container_id}"
+        return f"object:{id(self.orchestrator)}"
+
     def _allocate_index(self) -> int:
         index = self._next_index
         self._next_index += 1
@@ -728,6 +744,25 @@ class CommandAudit:
             result=result,
         )
         return cast(Mapping[str, Any], result)
+
+    def execute_control_command(self, command: str, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        """Run bounded host-control I/O on the clean channel.
+
+        Bootstrap, verification, cleanup and archive reads are not project
+        evidence: they must neither require nor consume the project runtime
+        overlay, which ``DockerOrchestrator.execute_command`` now refuses to
+        build without an installed host publication authority.  The production
+        clean channel re-enters this audit through the ``execute_command``
+        proxy installed on the orchestrator, so every control command is still
+        content-addressed into the sealed archive exactly once.
+        """
+
+        clean = getattr(self.orchestrator, "execute_control_command", None)
+        if not callable(clean):
+            # Narrow unit-double fallback, matching ``resolve_control_execute``:
+            # an in-memory test orchestrator has no separate clean channel.
+            return self.execute_command(command, *args, **kwargs)
+        return cast(Mapping[str, Any], clean(command, *args, **kwargs))
 
     def execute_command_detached(
         self, command: str, *args: Any, **kwargs: Any
@@ -848,6 +883,28 @@ class ContainerEvidenceEpoch:
     authority: Any
 
 
+def _install_epoch_authority(authority: Any, audit: CommandAudit) -> Any:
+    """Install one epoch authority on both the audit proxy and its orchestrator.
+
+    Production installs the authority on the orchestrator object itself
+    (``SetupAgent._initialize_control_recording``), and
+    ``DockerOrchestrator._default_exec_environment`` resolves it from ``self``
+    before it will build a project runtime overlay.  Binding only the audit
+    proxy therefore leaves the project lane with "runtime environment has no
+    host publication authority" for every probe command and every detached
+    dispatch.  The audit keeps its own binding because evidence writers receive
+    ``audit.execute_command`` and resolve authority from that owner; both
+    objects report the same immutable container store identity.
+    """
+
+    from sag.agent.evidence_publications import install_evidence_publication_authority
+
+    orchestrator = getattr(audit, "orchestrator", None)
+    if orchestrator is not None:
+        install_evidence_publication_authority(authority, orchestrator=orchestrator)
+    return install_evidence_publication_authority(authority, orchestrator=audit)
+
+
 @dataclass
 class DockerProbeRuntime:
     repo: Path
@@ -865,6 +922,9 @@ class DockerProbeRuntime:
     )
     _epoch_audits: dict[int, CommandAudit] = field(default_factory=dict, init=False, repr=False)
     _sinks_by_path: dict[Path, Any] = field(default_factory=dict, init=False, repr=False)
+    _output_storage_by_audit_id: dict[int, Any] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @property
     def artifact_dir(self) -> Path:
@@ -899,7 +959,6 @@ class DockerProbeRuntime:
         from sag.agent.control_events import ControlEventSink
         from sag.agent.evidence_publications import (
             EvidencePublicationAuthority,
-            install_evidence_publication_authority,
             reset_evidence_publication_authority,
         )
 
@@ -916,9 +975,9 @@ class DockerProbeRuntime:
             run_id=self._epoch_run_id(suffix=suffix, ordinal=ordinal),
             sink=sink,
         )
-        # Writers normally receive ``audit.execute_command``; bind the authority
-        # to that exact store proxy, not merely to the underlying orchestrator.
-        token = install_evidence_publication_authority(authority, orchestrator=audit)
+        # Writers normally receive ``audit.execute_command``, while the project
+        # lane resolves authority from the orchestrator itself; bind both.
+        token = _install_epoch_authority(authority, audit)
         reset_evidence_publication_authority(token)
         epoch = ContainerEvidenceEpoch(
             run_id=authority.run_id,
@@ -966,13 +1025,36 @@ class DockerProbeRuntime:
         epoch = self.epoch_for(audit)
         previous_authority = current_evidence_publication_authority()
         previous_run_id = active_receipt_run_id()
-        install_evidence_publication_authority(epoch.authority, orchestrator=audit)
+        _install_epoch_authority(epoch.authority, audit)
         set_active_receipt_run_id(epoch.run_id)
         try:
             yield epoch
         finally:
             install_evidence_publication_authority(previous_authority)
             set_active_receipt_run_id(previous_run_id)
+
+    def output_storage_for(self, audit: CommandAudit) -> Any:
+        """One production OutputStorageManager per container, as the engine builds it.
+
+        Production tool calls always run inside
+        ``ToolExecutor.execute`` -> ``bind_tool_result_output_storage``.  A
+        canonical FAILED ToolResult refuses to be constructed without that
+        durable binding ("canonical failed results require durable output
+        storage before construction"), so a D0 probe that drives a public tool
+        directly must supply the same ambient storage the engine would.
+        """
+
+        from sag.agent.output_storage import OutputStorageManager
+
+        key = id(audit)
+        storage = self._output_storage_by_audit_id.get(key)
+        if storage is None:
+            storage = OutputStorageManager(
+                Path("/workspace/.setup_agent/contexts"),
+                orchestrator=audit,
+            )
+            self._output_storage_by_audit_id[key] = storage
+        return storage
 
     def _ensure_all_epochs(self) -> None:
         for index, audit in enumerate(self.audits, start=1):
@@ -1054,18 +1136,22 @@ class DockerProbeRuntime:
             raise D0Stop(f"container image pin drift: {observed_image!r} != {expected_image!r}")
         audit = CommandAudit(orchestrator)
         self._register_epoch(audit, suffix=suffix)
-        evidence_dirs = audit.execute_command("mkdir -p /workspace/.setup_agent /tmp/sag_jobs")
+        # Bootstrap I/O belongs on the clean control channel: the project lane
+        # (execute_command) refuses to run before the epoch authority is
+        # installed below, and directory creation is not project evidence.
+        evidence_dirs = audit.execute_control_command(
+            "mkdir -p /workspace/.setup_agent /tmp/sag_jobs"
+        )
         if evidence_dirs.get("exit_code") != 0:
             raise D0Error(f"fresh container {container_name} cannot create D0 evidence directories")
         self.containers.append(orchestrator)
         self.audits.append(audit)
         # The newest fresh container becomes the ambient epoch for immediate
         # producer calls. Controller scopes still switch explicitly and restore.
-        from sag.agent.evidence_publications import install_evidence_publication_authority
         from sag.agent.invocation_receipts import set_active_receipt_run_id
 
         epoch = self.epoch_for(audit)
-        install_evidence_publication_authority(epoch.authority, orchestrator=audit)
+        _install_epoch_authority(epoch.authority, audit)
         set_active_receipt_run_id(epoch.run_id)
         return audit
 
@@ -1265,7 +1351,10 @@ class DockerProbeRuntime:
     ) -> ProbeObservation:
         temporary: list[str] = []
         for audit in self.audits:
-            result = audit.execute_command(
+            # Post-probe verification sweep: control-plane, never a project
+            # command.  It must also stay runnable for a probe that failed
+            # before its epoch installed anything on the project lane.
+            result = audit.execute_control_command(
                 "find /workspace/.setup_agent -type f "
                 "\\( -name '*.tmp' -o -name '*.b64.*.tmp' \\) -print 2>/dev/null"
             )
@@ -2363,17 +2452,97 @@ def _large_report_map(minimum_json_bytes: int = MIN_LARGE_EVIDENCE_BYTES) -> dic
             return reports
 
 
-def _container_file_facts(audit: CommandAudit, path: str) -> dict[str, Any]:
+def _publish_d0_build_requirements(
+    audit: CommandAudit,
+    root: str,
+    *,
+    system: str = "maven",
+    java_version: str | None = None,
+    java_version_source: str | None = None,
+    target_sha: str | None = None,
+) -> dict[str, Any]:
+    """Host-publish one strict build-requirements v1 for a single-module fixture.
+
+    Every public runner refuses to dispatch — probe, pre-flight and all — until
+    the manifest is a complete current host publication
+    (``BUILD_REQUIREMENTS_UNAVAILABLE``).  In a real run the survey writes it;
+    D0 drives the tools directly, so the probe owns the same write.
+
+    ``build_domains``/``domain_facts`` describe a MULTI-domain graph and are
+    refused for a single root, so a one-module fixture omits them and
+    production scopes the runtime to the invocation's own root.  The survey
+    fingerprint is a pure function of the derived facts; ``write_build_requirements``
+    stamps it at the persistence boundary, and computing it here keeps the
+    body self-consistent before it leaves the runner.
+    """
+
+    from sag.tools.internal.build_preflight import (
+        BUILD_REQUIREMENTS_SCHEMA_VERSION,
+        survey_facts_fingerprint,
+        validate_build_requirements_v1,
+        write_build_requirements,
+    )
+    from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION
+
+    manifest: dict[str, Any] = {
+        "schema_version": BUILD_REQUIREMENTS_SCHEMA_VERSION,
+        "survey": {
+            "project_path": root,
+            "analyzer_version": SURVEY_FACTS_VERSION,
+            "config_fingerprint": None,
+            "target_sha": target_sha,
+            "document_map_fingerprint": None,
+        },
+        "java_version": java_version,
+        "java_version_source": java_version_source,
+        "java_version_enforced": False,
+        "root_shape": "single_module",
+        "build_root": root,
+        "fail_at_end": False,
+        "test_root": None,
+        "test_system": None,
+        "test_fail_at_end": False,
+        "build_islands": [{"root": root, "system": system, "goal": "build"}],
+        "test_islands": [],
+    }
+    manifest["survey"] = {
+        **manifest["survey"],
+        "survey_fingerprint": survey_facts_fingerprint(manifest),
+    }
+    validate_build_requirements_v1(manifest)
+    if not write_build_requirements(audit, manifest):
+        raise D0Error(f"D0 build requirements were not host published for {root}")
+    return manifest
+
+
+def _container_file_facts(
+    audit: CommandAudit,
+    path: str,
+    *,
+    expect_json: bool = True,
+) -> dict[str, Any]:
+    """Byte count and digest of one persisted file, JSON-validated on request.
+
+    Evidence records are JSON and must parse.  Some pinned fixtures are not —
+    ``maven-wrapper.properties`` is a Java properties file — and demanding JSON
+    of them fails the read on the fixture's format rather than on the fact the
+    probe is measuring (that its bytes did not change).
+    """
+
+    check = "json.loads(b.decode('utf-8'));valid=True;" if expect_json else "valid=None;"
     program = (
-        "import hashlib,json,os,sys;"
-        "p=sys.argv[1];b=open(p,'rb').read();json.loads(b.decode('utf-8'));"
+        "import hashlib,json,sys;"
+        "p=sys.argv[1];b=open(p,'rb').read();"
+        f"{check}"
         "print(json.dumps({'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest(),"
-        "'json_valid':True},sort_keys=True))"
+        "'json_valid':valid},sort_keys=True))"
     )
     command = f"python3 -c {shlex.quote(program)} {shlex.quote(path)}"
-    result = audit.execute_command(command, truncate_output=False)
+    # Reading already-persisted evidence bytes is archive I/O, not a project
+    # command: it neither produces nor consumes the project runtime overlay.
+    result = audit.execute_control_command(command, truncate_output=False)
     if result.get("exit_code") != 0:
-        raise D0Error(f"cannot validate persisted JSON {path}: {result.get('output')}")
+        raise D0Error(f"cannot read persisted file {path}: {result.get('output')}")
     try:
         value = json.loads(str(result.get("output") or "").strip().splitlines()[-1])
         if not isinstance(value, dict):
@@ -2384,7 +2553,8 @@ def _container_file_facts(audit: CommandAudit, path: str) -> dict[str, Any]:
 
 
 def _read_container_json(audit: CommandAudit, path: str) -> dict[str, Any]:
-    result = audit.execute_command(f"cat {shlex.quote(path)}", truncate_output=False)
+    # Archive read of persisted evidence: clean control channel.
+    result = audit.execute_control_command(f"cat {shlex.quote(path)}", truncate_output=False)
     if result.get("exit_code") != 0:
         raise D0Error(f"cannot read container JSON {path}")
     try:
@@ -2426,6 +2596,25 @@ def dispatch_receipts(
         ):
             selected.append(record)
     return selected
+
+
+def _receipts_in_dispatch_order(
+    records: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Order durable receipts by the process-global ordinal in their identity.
+
+    Receipt ids carry a monotonic ordinal as their final component, so this is
+    dispatch order without trusting the reader's directory listing.
+    """
+
+    def ordinal(record: Mapping[str, Any]) -> int:
+        tail = str(record.get("receipt_id") or "").rsplit("-", 1)[-1]
+        try:
+            return int(tail)
+        except ValueError:
+            return -1
+
+    return sorted((dict(record) for record in records), key=ordinal)
 
 
 _PROGRESS_RESPONSE_FIELDS = (
@@ -2553,6 +2742,10 @@ _MUTABLE_ARCHIVE_FILES = {
     "run_pin": "run-pin.json",
     "document_map": "document_map.json",
     "report_metrics": "report_metrics.json",
+    # The runtime env overlay is a host-published mutable artifact too: a
+    # dynamic-JDK repair advances its head, and an archive that cannot resolve
+    # that record cannot verify the epoch it belongs to.
+    "env_overlay": "env_overlay.json",
 }
 
 
@@ -2638,10 +2831,11 @@ def _validate_archived_semantic_identity(
         if normalized != payload:
             raise D0Stop(f"published receipt assessment is noncanonical: {record_id}")
     elif record_kind == "job_obligation":
-        from sag.agent.job_obligations import validate_obligation_v2
+        # The live obligation schema is v3 (docker-exec identity envelope).
+        from sag.agent.job_obligations import validate_obligation_v3
 
         try:
-            normalized = validate_obligation_v2(payload, expected_id=record_id)
+            normalized = validate_obligation_v3(payload, expected_id=record_id)
         except (TypeError, ValueError) as exc:
             raise D0Stop(f"published job obligation is invalid: {record_id}") from exc
         if normalized != payload:
@@ -2897,15 +3091,35 @@ def _controller_epoch(
     runtime: DockerProbeRuntime,
     *,
     audit: CommandAudit | None,
-) -> tuple[Any, str, Any]:
-    """Return the one pre-registered sink/run/scope for a container."""
+) -> tuple[Any, str, Any, CommandAudit]:
+    """Return the one pre-registered sink/run/scope/audit for a container."""
 
     if audit is None:
         if len(runtime.audits) != 1:
             raise D0Error("multi-container controller action must identify its audit")
         audit = runtime.audits[0]
     epoch = runtime.epoch_for(audit)
-    return epoch.sink, epoch.run_id, runtime.evidence_epoch(audit)
+    return epoch.sink, epoch.run_id, runtime.evidence_epoch(audit), audit
+
+
+def _controller_evidence_scope(tool: str, params: Mapping[str, Any]) -> str:
+    """The registered state scope production would assign this action.
+
+    Mirrors ``ReActEngine._tool_evidence_scope`` for the tools D0 drives: a
+    backend runner claims artifacts unless its operation is a test operation,
+    and every other D0 action is project analysis (D0 runs no phase machine,
+    which is the branch production falls back to when no phase is active).
+    """
+
+    operations = " ".join(
+        str(params.get(key) or "")
+        for key in ("action", "command", "args", "goals", "tasks")
+    ).lower()
+    if str(tool) in {"build", "maven", "gradle", "python"}:
+        if any(token in operations for token in ("test", "verify", "check")):
+            return "test_runtime"
+        return "artifacts"
+    return "project_analysis"
 
 
 @contextmanager
@@ -2926,6 +3140,16 @@ def _controller_action_scope(
     intent/envelope boundary as a normal run.  The envelope is durable before
     the tool is entered, and the thread-local action scope is restored on every
     exit path so one probe cannot lend authority to the next one.
+
+    The scope also ANSWERS its own envelope.  A control stream is a grammar,
+    not a log: an ``action_envelope`` is open until a matching ``tool_result``
+    closes it, and production's strict recovery
+    (``ReActEngine._restore_active_repair_context`` ->
+    ``recover_active_repair_context_from_path``) refuses a stream that ends on
+    an unanswered envelope.  A D0 direct dispatch has no engine tool loop to
+    emit that answer, so this scope emits it on every exit path — including a
+    raising one, which is exactly when a half-open envelope would otherwise be
+    sealed into the archive.
     """
 
     from sag.agent.action_intents import (
@@ -2934,11 +3158,13 @@ def _controller_action_scope(
     )
     from sag.agent.control_events import (
         ActionEnvelopePayload,
+        ToolResultPayload,
         action_envelope_sha256,
     )
     from sag.agent.invocation_contracts import action_context
+    from sag.tools.base import bind_tool_result_output_storage
 
-    sink, run_id, epoch_scope = _controller_epoch(runtime, audit=audit)
+    sink, run_id, epoch_scope, scope_audit = _controller_epoch(runtime, audit=audit)
     with epoch_scope:
         exact_params = bounded_exact_params(params)
         sequence = sink.sequence + 1
@@ -2984,16 +3210,48 @@ def _controller_action_scope(
             action_fingerprint=intent.action_fingerprint,
             predecessor_contract_id=intent.predecessor_contract_id,
         )
-        with action_context(
-            envelope_id=binding.envelope_id,
-            intent_source=binding.intent_source,
-            intent_id=binding.intent_id,
-            intent_domain_id=binding.domain_id,
-            intent_exact_params=binding.exact_params,
-            action_fingerprint=binding.action_fingerprint,
-            predecessor_contract_id=binding.predecessor_contract_id,
-        ):
-            yield binding
+        status = "crashed"
+        try:
+            with action_context(
+                envelope_id=binding.envelope_id,
+                intent_source=binding.intent_source,
+                intent_id=binding.intent_id,
+                intent_domain_id=binding.domain_id,
+                intent_exact_params=binding.exact_params,
+                action_fingerprint=binding.action_fingerprint,
+                predecessor_contract_id=binding.predecessor_contract_id,
+            ), bind_tool_result_output_storage(
+                runtime.output_storage_for(scope_audit),
+                task_id=binding.tool_call_id,
+                tool_name=binding.tool,
+            ):
+                yield binding
+            status = "completed"
+        finally:
+            completed = status == "completed"
+            sink.emit(
+                "tool_result",
+                ToolResultPayload(
+                    envelope_id=binding.envelope_id,
+                    execution_id=f"d0-exec-{token}",
+                    tool=binding.tool,
+                    params=exact_params,
+                    scope=_controller_evidence_scope(binding.tool, exact_params),
+                    result={
+                        "invocation_status": status,
+                        "operation_outcome": "success" if completed else "failed",
+                        "evidence_status": "verified" if completed else "unknown",
+                        "evidence_assessment": "success" if completed else "unknown",
+                        # The probe archive is the evidence body; a control
+                        # event never embeds one.
+                        "output": (
+                            "d0 controller-owned direct dispatch; "
+                            "evidence body is the sealed probe archive"
+                        ),
+                        "metadata": {"d0_probe": runtime.spec.name, "d0_label": label},
+                    },
+                ),
+            )
 
 
 @contextmanager
@@ -3012,8 +3270,15 @@ def _controller_dispatch_scope(
     requirements: Mapping[str, Any] | None = None,
     predecessor_contract_id: str | None = None,
     target_sha_value: str | None = None,
+    effective_tool: str | None = None,
 ) -> Iterator[ControllerDispatchBinding]:
-    """Freeze one exact direct-runner contract, then expose its dispatch scope."""
+    """Freeze one exact direct-runner contract, then expose its dispatch scope.
+
+    ``effective_tool`` is the executor family whose evidence conventions the
+    dispatch produces; it defaults to the public action tool.  Production keeps
+    the two separate on purpose (``EXECUTOR_ALLOWLIST_V1``), and the settlement
+    receipt's row writer reads the executor, not the public tool.
+    """
 
     from sag.agent.invocation_contracts import (
         ARGV_EXECUTION_BINDING,
@@ -3040,7 +3305,7 @@ def _controller_dispatch_scope(
             envelope_id=action.envelope_id,
             tool=action.tool,
             params=action.exact_params,
-            effective_tool=tool,
+            effective_tool=effective_tool or tool,
             effective_action=effective_action,
             expected_cwd=expected_cwd,
             expected_argv=expected_argv,
@@ -3085,23 +3350,72 @@ def _controller_lineage(
     }
 
 
-def _wait_for_exit_marker(
+def _wait_for_detached_terminal(
     audit: CommandAudit,
-    exit_path: str,
+    handle: Mapping[str, Any],
     *,
     timeout_seconds: float = 240.0,
 ) -> int:
-    from sag.agent.job_obligations import observe_exit_marker
+    """Wait on the production terminal authority: Docker's exec record.
+
+    The detached supervisor deliberately writes no container exit marker — a
+    same-uid runner could rewrite one — so ``observe_exit_marker`` is now a
+    forensic parser for a legacy file that never appears.  D0 therefore takes
+    its physical exit code from the audited production poll, which reads
+    ``inspect_detached_terminal`` and nothing in the container.
+    """
 
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        observed = observe_exit_marker(audit.execute_command, exit_path)
-        if observed.state == "terminal" and observed.exit_code is not None:
-            return int(observed.exit_code)
-        if observed.state not in {"absent"}:
-            raise D0Error(f"detached exit marker became {observed.state}: {observed.detail}")
-        time.sleep(0.25)
-    raise D0Error(f"detached job did not produce exit marker within {timeout_seconds:.0f}s")
+        poll = audit.poll_detached_command(dict(handle))
+        if poll.get("probe_success") is not True or poll.get("terminal_probe_success") is not True:
+            raise D0Error(
+                "detached terminal probe failed: " f"{poll.get('probe_error') or 'unknown'}"
+            )
+        state = str(poll.get("state") or "")
+        if state == "finished":
+            exit_code = poll.get("exit_code")
+            if type(exit_code) is not int or isinstance(exit_code, bool):
+                raise D0Error("detached terminal observation carried no integer exit code")
+            return int(exit_code)
+        if state not in {"running"}:
+            raise D0Error(f"detached job became {state or 'unknown'} before it was terminal")
+        time.sleep(0.5)
+    raise D0Error(f"detached job did not become terminal within {timeout_seconds:.0f}s")
+
+
+def _detached_identity_errors(handle: Mapping[str, Any]) -> list[str]:
+    """Reject an incomplete docker-exec identity before an obligation states it.
+
+    This is the same acceptance test ``record_dispatch_obligation_result``
+    applies to a production handle.  A D0 obligation must never assert a
+    started, identity-verified job on anything weaker.
+    """
+
+    from sag.agent.job_obligations import DETACHED_TERMINAL_AUTHORITY
+
+    errors: list[str] = []
+    if handle.get("started") is not True or handle.get("start_accepted") is not True:
+        errors.append("detached identity dispatch was not accepted by Docker")
+    if handle.get("startup_identity_verified") is not True:
+        errors.append("detached identity dispatch did not verify its startup identity")
+    if handle.get("runner_dispatch_state") != "accepted":
+        errors.append("detached identity dispatch state is not accepted")
+    if handle.get("terminal_authority") != DETACHED_TERMINAL_AUTHORITY:
+        errors.append("detached identity dispatch has no docker-exec terminal authority")
+    for field_name in ("docker_exec_id", "container_id", "process_identity_token"):
+        if re.fullmatch(r"[0-9a-f]{64}", str(handle.get(field_name) or "")) is None:
+            errors.append(f"detached identity {field_name} is not a docker-reported sha256")
+    pid = handle.get("pid")
+    pgid = handle.get("pgid")
+    if type(pid) is not int or type(pgid) is not int or pid <= 0 or pid != pgid:
+        errors.append("detached identity process is not its own session leader")
+    for field_name in ("job_id", "log_path", "exit_code_path", "pid_path", "pgid_path"):
+        if not str(handle.get(field_name) or ""):
+            errors.append(f"detached identity {field_name} is absent")
+    if not str(handle.get("identity_path") or ""):
+        errors.append("detached identity identity_path is absent")
+    return errors
 
 
 def _probe_sync_large_evidence(runtime: DockerProbeRuntime) -> ProbeObservation:
@@ -3109,6 +3423,7 @@ def _probe_sync_large_evidence(runtime: DockerProbeRuntime) -> ProbeObservation:
     from sag.agent.job_obligations import build_obligation, write_obligation
 
     audit = runtime.new_container()
+    epoch = runtime.epoch_for(audit)
     reports = _large_report_map()
     receipt = build_receipt(
         receipt_id="inv-d0-sync-large-0001",
@@ -3124,23 +3439,73 @@ def _probe_sync_large_evidence(runtime: DockerProbeRuntime) -> ProbeObservation:
     receipt_body = json.dumps(receipt, sort_keys=True)
     receipt_result = write_receipt_result(audit.execute_command, receipt)
 
+    # A schema-v3 obligation carries a docker-exec identity envelope, so it can
+    # only describe a job that Docker really accepted.  This fixture owns no
+    # controller contract and must stay contractless/non-claimable, so the
+    # identity comes from one real *control-plane* detached dispatch instead of
+    # a project-lane runner dispatch: the envelope is genuine, and the probe
+    # still performs zero physical project dispatches.  Nothing here is
+    # hand-written 64-hex.
+    identity_command = "sh -c 'exit 0'"
+    handle = audit.execute_control_command_detached(identity_command, workdir="/workspace")
+    identity_failures = _detached_identity_errors(handle)
+    if identity_failures:
+        return runtime.aggregate_observation(
+            passed=False,
+            facts={
+                "dispatch": {
+                    key: handle.get(key)
+                    for key in (
+                        "started",
+                        "job_id",
+                        "dispatch_status",
+                        "runner_dispatch_state",
+                        "start_accepted",
+                        "startup_identity_verified",
+                    )
+                },
+                "evidence_disposition": "synthetic_non_claimable",
+                "physical_dispatches": 0,
+                "expected": {},
+                "observed": {},
+                "production_entrypoints": [
+                    "invocation_receipts.write_receipt_result",
+                    "job_obligations.write_obligation",
+                ],
+            },
+            failures=tuple(identity_failures),
+        )
+    job_id = str(handle.get("job_id") or "")
     obligation = build_obligation(
-        job_id="d0-sync-large-obligation",
-        tool="maven",
+        job_id=job_id,
+        run_id=epoch.run_id,
+        tool="bash",
         attempt=1,
-        requested_action="verify",
-        effective_action="verify",
-        argv="mvn verify",
-        working_directory="/workspace/d0",
+        requested_action="run",
+        effective_action="run",
+        argv=identity_command,
+        working_directory="/workspace",
         before=reports,
-        log_path="/tmp/sag_jobs/d0-sync-large.log",
-        exit_code_path="/tmp/sag_jobs/d0-sync-large.log.exit",
+        log_path=str(handle.get("log_path") or ""),
+        exit_code_path=str(handle.get("exit_code_path") or ""),
+        terminal_authority=str(handle.get("terminal_authority") or ""),
+        docker_exec_id=str(handle.get("docker_exec_id") or ""),
+        container_id=str(handle.get("container_id") or ""),
+        start_accepted=True,
+        startup_identity_verified=True,
+        runner_dispatch_state=str(handle.get("runner_dispatch_state") or ""),
+        pid=handle.get("pid"),
+        pgid=handle.get("pgid"),
+        pid_path=str(handle.get("pid_path") or ""),
+        pgid_path=str(handle.get("pgid_path") or ""),
+        identity_path=str(handle.get("identity_path") or ""),
+        process_identity_token=str(handle.get("process_identity_token") or ""),
     )
     obligation_body = json.dumps(obligation, sort_keys=True)
     obligation_ok = write_obligation(audit.execute_command, obligation)
 
     receipt_path = "/workspace/.setup_agent/invocation_receipts/inv-d0-sync-large-0001.json"
-    obligation_path = "/workspace/.setup_agent/job_obligations/d0-sync-large-obligation.json"
+    obligation_path = f"/workspace/.setup_agent/job_obligations/{job_id}.json"
     persisted_receipt = _container_file_facts(audit, receipt_path)
     persisted_obligation = _container_file_facts(audit, obligation_path)
     expected: dict[str, dict[str, Any]] = {
@@ -3182,6 +3547,16 @@ def _probe_sync_large_evidence(runtime: DockerProbeRuntime) -> ProbeObservation:
             # synthesizes no runner claim and therefore owns no action/contract.
             "evidence_disposition": "synthetic_non_claimable",
             "physical_dispatches": 0,
+            # Stated explicitly so the sealed archive says where the v3
+            # identity envelope came from rather than leaving it implied.
+            "obligation_identity": {
+                "job_id": job_id,
+                "channel": "DockerOrchestrator.execute_control_command_detached",
+                "terminal_authority": str(handle.get("terminal_authority") or ""),
+                "docker_exec_id": str(handle.get("docker_exec_id") or ""),
+                "container_id": str(handle.get("container_id") or ""),
+                "runner_dispatch_state": str(handle.get("runner_dispatch_state") or ""),
+            },
             "receipt_persistence_code": receipt_result.code,
             "production_entrypoints": [
                 "invocation_receipts.write_receipt_result",
@@ -3195,6 +3570,12 @@ def _probe_sync_large_evidence(runtime: DockerProbeRuntime) -> ProbeObservation:
 
 def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObservation:
     from sag.agent.control_events import RunPin
+    from sag.agent.control_events import canonical_json as control_canonical_json
+    from sag.agent.evidence_publications import (
+        RUN_PIN_LOGICAL_ARTIFACT_ID,
+        latest_publication_raw_sha256,
+        publish_evidence_revision,
+    )
     from sag.agent.job_obligations import (
         read_obligations,
         reconcile_job_obligations,
@@ -3214,7 +3595,9 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
         f"{project_root}/pom.xml",
         D0_ROW_POM,
     )
-    initialized = audit.execute_command(
+    # Fixture bootstrap for the target checkout: control-plane.  The audited
+    # project lane begins at the real detached dispatch below.
+    initialized = audit.execute_control_command(
         f"mkdir -p {shlex.quote(report_root)} && "
         f"git -C {shlex.quote(project_root)} init -q && "
         f"git -C {shlex.quote(project_root)} config user.email d0@example.invalid && "
@@ -3236,6 +3619,12 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
     requirements = {
         "build_system": "maven",
         "build_root": project_root,
+        # ``nearest_domain_root`` reads ``build_domains`` (or the nested
+        # recommendation), not ``domain_facts``.  Without it the dispatch has
+        # no surveyed domain, the settlement receipt carries no ``domain_id``,
+        # and the production row writer refuses every row as
+        # ``domain_id_unavailable``.
+        "build_domains": [{"root": project_root}],
         "domain_facts": [{"domain_id": domain_id, "root": project_root, "fact_epoch": 1}],
         "build_islands": [{"root": project_root, "system": "maven", "goal": "test"}],
     }
@@ -3255,17 +3644,42 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
         host_arch=platform.machine(),
         advisor={"mode": "off", "calls": []},
     )
+    # The metrics reader takes the run pin from the exact current HOST
+    # publication, not from whatever bytes sit at the container path, so the
+    # pin must be published exactly as the agent publishes it: canonical bytes
+    # to the container mirror, then one head revision.  An unpublished mirror
+    # reads back as "no pin", which empties run.run_id and also makes the file
+    # an unexpected extra during archive epoch verification.
+    pin_body = control_canonical_json(production_pin)
+    pin_raw = pin_body.encode("utf-8")
+    expected_previous_pin = latest_publication_raw_sha256(audit, RUN_PIN_LOGICAL_ARTIFACT_ID)
     pin_write = write_container_text_atomic(
         audit,
         "/workspace/.setup_agent/run-pin.json",
-        production_pin.model_dump_json(),
+        pin_body,
         validate_json=True,
     )
-    if not pin_write.persisted:
+    pin_publication = (
+        publish_evidence_revision(
+            audit,
+            record_kind="run_pin",
+            record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            raw=pin_raw,
+            expected_previous_raw_sha256=expected_previous_pin,
+        )
+        if pin_write.persisted
+        else None
+    )
+    if not pin_write.persisted or pin_publication is None or not pin_publication.published:
         return runtime.aggregate_observation(
             passed=False,
-            facts={},
-            failures=("production metrics run pin did not persist",),
+            facts={
+                "run_pin_publication": (
+                    pin_publication.status if pin_publication is not None else "not_persisted"
+                )
+            },
+            failures=("production metrics run pin was not host published",),
         )
     # One real JUnit report carries 24k distinct runtime testcase rows.  The
     # launcher remains short; the production row parser, receipt writer, strict
@@ -3281,6 +3695,14 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
         "h.write('</testsuite>');h.close()"
     )
     detached_command = f"python3 -c {shlex.quote(program)}"
+    # The executor family, not the public tool, selects the evidence
+    # conventions the settlement receipt applies: production seals testcase
+    # execution rows only for maven/gradle/python, and `argv_v1` forbids the
+    # python executor (it demands the python_facade_v1 build binding).  The
+    # report this dispatch writes IS Maven's `target/surefire-reports` JUnit
+    # layout, so `maven` is the executor whose conventions actually describe
+    # it.  The exact physical argv and toolchain fingerprint stay on the
+    # receipt, so the archive never hides what really ran.
     with _controller_dispatch_scope(
         runtime,
         audit.execute_command,
@@ -3294,6 +3716,7 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
         expected_argv=_runner_argument_vector(detached_command),
         requirements=requirements,
         target_sha_value=target_sha,
+        effective_tool="maven",
     ) as dispatch_binding:
         handle = audit.execute_command_detached(detached_command, workdir=project_root)
         if not handle.get("started"):
@@ -3305,7 +3728,7 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
         recorded = record_dispatch_obligation_result(
             audit.execute_command,
             result={"dispatch": handle, "handoff_reason": "window"},
-            tool="bash",
+            tool="maven",
             attempt=1,
             requested_action="run",
             effective_action="run",
@@ -3320,7 +3743,7 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
             facts={"obligation": recorded.metadata()},
             failures=(f"dispatch obligation did not persist: {recorded.code}",),
         )
-    exit_code = _wait_for_exit_marker(audit, recorded.exit_code_path)
+    exit_code = _wait_for_detached_terminal(audit, handle)
     first = reconcile_job_obligations(audit)
     # A first sweep can leave persistence pending only when its first bounded
     # attempt failed.  D0 permits the production retry but not an open barrier.
@@ -3422,6 +3845,15 @@ def _probe_detached_large_settlement(runtime: DockerProbeRuntime) -> ProbeObserv
             "row_metrics": {"receipt_executions": projected_rows},
             "evaluator_metrics": {"receipt_executions": evaluator_rows},
             "settlement_emissions": settlement_ids.count(recorded.job_id),
+            # Stated so the sealed archive describes its own fixture: the
+            # physical runner is the argv above, and the executor family is the
+            # one whose report conventions that argv produces.
+            "dispatch_fixture": {
+                "public_tool": "bash",
+                "effective_tool": "maven",
+                "physical_argv": detached_command,
+                "report_path": report_path,
+            },
             "controller_lineage": _controller_lineage(
                 actions=[dispatch_binding.action],
                 contract_ids=[dispatch_binding.contract.get("contract_id")],
@@ -3449,22 +3881,42 @@ class _ReceiptFailingProxy:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.audit, name)
 
+    def _injects(self, command: str) -> bool:
+        return (
+            command.startswith(": > ")
+            and "/workspace/.setup_agent/invocation_receipts/" in command
+            and ".b64." in command
+        )
+
+    def _inject(self, command: str) -> Mapping[str, Any]:
+        self.failures += 1
+        injected_output = "injected receipt staging failure"
+        self.audit.record_injected_failure(command, injected_output, exit_code=73)
+        return {
+            "success": False,
+            "exit_code": 73,
+            "output": injected_output,
+        }
+
     def execute_command(self, command: str, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
         text = str(command)
-        if (
-            text.startswith(": > ")
-            and "/workspace/.setup_agent/invocation_receipts/" in text
-            and ".b64." in text
-        ):
-            self.failures += 1
-            injected_output = "injected receipt staging failure"
-            self.audit.record_injected_failure(text, injected_output, exit_code=73)
-            return {
-                "success": False,
-                "exit_code": 73,
-                "output": injected_output,
-            }
+        if self._injects(text):
+            return self._inject(text)
         return self.audit.execute_command(command, *args, **kwargs)
+
+    def execute_control_command(self, command: str, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        """The receipt transport stages through the clean channel, so inject here.
+
+        ``container_io`` resolves ``execute_control_command`` from whatever
+        object it is handed, so an injector that only overrides
+        ``execute_command`` is bypassed entirely and stages the receipt for
+        real.  Obligation and process I/O use different paths and pass through.
+        """
+
+        text = str(command)
+        if self._injects(text):
+            return self._inject(text)
+        return self.audit.execute_control_command(command, *args, **kwargs)
 
 
 def _configure_no_phase_engine(
@@ -3550,7 +4002,7 @@ def _probe_terminal_receipt_failure(runtime: DockerProbeRuntime) -> ProbeObserva
             facts={"obligation": recorded.metadata()},
             failures=("terminal-failure obligation did not persist",),
         )
-    exit_code = _wait_for_exit_marker(audit, recorded.exit_code_path)
+    exit_code = _wait_for_detached_terminal(audit, handle)
     failing = _ReceiptFailingProxy(audit)
     first_client = _NoModelClient()
     engine = _configure_no_phase_engine(
@@ -3593,7 +4045,13 @@ def _probe_terminal_receipt_failure(runtime: DockerProbeRuntime) -> ProbeObserva
         if line.strip()
     ]
     replay_header = dict(fixture_rows[0])
-    replay_header["schema_version"] = 2
+    # The recorded fixture's own schema version stands.  Raising it applies the
+    # schema-2 test-gate contract (source_attempt_id must be the machine's
+    # current attempt, plus a candidate resolution) to rows recorded before
+    # that contract existed, which fails the replay on the FIXTURE rather than
+    # on the live terminal-unpersisted lifecycle this probe is registered to
+    # verify.  The lifecycle events D0 inserts carry no version requirement:
+    # only `forced_action` needs >= 2 and `repair_context_opened` needs 3.
     replay_header["run_id"] = "d0-terminal-unpersisted-replay"
     replay_header["source_manifest"] = [
         *list(replay_header.get("source_manifest") or ()),
@@ -3836,7 +4294,9 @@ def _probe_terminal_receipt_failure(runtime: DockerProbeRuntime) -> ProbeObserva
 def _prepare_http_wrapper(audit: CommandAudit, root: str) -> dict[str, str]:
     properties = f"{root}/.mvn/wrapper/maven-wrapper.properties"
     wrapper = f"{root}/mvnw"
-    initialized = audit.execute_command(
+    # Copying the pinned checkout and hashing it is fixture bootstrap plus
+    # verification: control-plane on both arms so the A/B stays single-variable.
+    initialized = audit.execute_control_command(
         f"test ! -e {shlex.quote(root)} && "
         f"cp -a /opt/d0/httpcomponents-client {shlex.quote(root)} && "
         f"test -x {shlex.quote(wrapper)} && "
@@ -3851,10 +4311,14 @@ def _prepare_http_wrapper(audit: CommandAudit, root: str) -> dict[str, str]:
     lines = [line.strip() for line in str(initialized.get("output") or "").splitlines()]
     if len(lines) < 4:
         raise D0Error("HTTP wrapper fixture pin probe returned incomplete output")
+    target_sha = lines[-4]
+    # MavenTool refuses to dispatch anything — including its wrapper probe —
+    # without a host-published manifest, so both arms get the identical one.
+    _publish_d0_build_requirements(audit, root, system="maven", target_sha=target_sha)
     return {
         "properties": properties,
         "wrapper": wrapper,
-        "target_sha": lines[-4],
+        "target_sha": target_sha,
         "checkout_sha256": lines[-3].split()[0],
         "properties_sha256": lines[-2].split()[0],
         "wrapper_sha256": lines[-1].split()[0],
@@ -3883,15 +4347,18 @@ def _probe_http_wrapper_unzip_ablation(runtime: DockerProbeRuntime) -> ProbeObse
     runtime.register_container_evidence(control, root, archive_name="http-control-checkout")
     runtime.register_container_evidence(treatment, root, archive_name="http-treatment-checkout")
     original_sha = control_fixture["properties_sha256"]
-    baseline_control = control.execute_command(
+    # Baseline package-manifest verification and the one registered environment
+    # mutation are control-plane: neither is a project build command, and both
+    # must run identically on the two arms.
+    baseline_control = control.execute_control_command(
         "test ! -e /usr/bin/unzip && test -x /opt/d0/unzip && "
         "dpkg-query -W -f='${Package}=${Version}\\n' | sha256sum"
     )
-    baseline_treatment = treatment.execute_command(
+    baseline_treatment = treatment.execute_control_command(
         "test ! -e /usr/bin/unzip && test -x /opt/d0/unzip && "
         "dpkg-query -W -f='${Package}=${Version}\\n' | sha256sum"
     )
-    treatment_mutation = treatment.execute_command("ln -s /opt/d0/unzip /usr/bin/unzip")
+    treatment_mutation = treatment.execute_control_command("ln -s /opt/d0/unzip /usr/bin/unzip")
     validate_params = {
         "command": "validate",
         "raw_output": True,
@@ -3965,8 +4432,14 @@ def _probe_http_wrapper_unzip_ablation(runtime: DockerProbeRuntime) -> ProbeObse
             }
         )
 
-    control_after = _container_file_facts(control, control_fixture["properties"])
-    treatment_after = _container_file_facts(treatment, treatment_fixture["properties"])
+    # maven-wrapper.properties is a Java properties file: this probe measures
+    # whether its bytes changed, not whether it is JSON.
+    control_after = _container_file_facts(
+        control, control_fixture["properties"], expect_json=False
+    )
+    treatment_after = _container_file_facts(
+        treatment, treatment_fixture["properties"], expect_json=False
+    )
     control_dispatches = dispatch_receipts(
         _strict_container_receipts(control),
         tool="maven",
@@ -3979,12 +4452,13 @@ def _probe_http_wrapper_unzip_ablation(runtime: DockerProbeRuntime) -> ProbeObse
         working_directory=root,
         effective_action="validate",
     )
-    post_control = control.execute_command(
+    # Post-run tracked-byte verification: control-plane.
+    post_control = control.execute_control_command(
         f"git -C {shlex.quote(root)} diff --quiet && "
         f'test -z "$(git -C {shlex.quote(root)} status --porcelain)" && '
         f"git -C {shlex.quote(root)} rev-parse HEAD"
     )
-    post_treatment = treatment.execute_command(
+    post_treatment = treatment.execute_control_command(
         f"git -C {shlex.quote(root)} diff --quiet && "
         f'test -z "$(git -C {shlex.quote(root)} status --porcelain)" && '
         f"git -C {shlex.quote(root)} rev-parse HEAD"
@@ -4081,10 +4555,7 @@ def _probe_http_wrapper_unzip_ablation(runtime: DockerProbeRuntime) -> ProbeObse
 def _probe_dynamic_jdk_authority(runtime: DockerProbeRuntime) -> ProbeObservation:
     from sag.runtime.env_overlay import EnvOverlayStore
     from sag.tools.build.build_tool import BuildTool
-    from sag.tools.internal.build_preflight import (
-        active_java_runtime,
-        write_build_requirements,
-    )
+    from sag.tools.internal.build_preflight import active_java_runtime
     from sag.tools.internal.maven_tool import MavenTool
     from sag.utils.container_io import write_container_text_atomic
 
@@ -4095,7 +4566,37 @@ def _probe_dynamic_jdk_authority(runtime: DockerProbeRuntime) -> ProbeObservatio
         f"{root}/mvnw",
         '#!/bin/sh\nexec /opt/d0/jdk-maven/bin/mvn "$@"\n',
     )
-    fixture = audit.execute_command(
+    # A compile that leaves no artifact is not a success: production validates
+    # `target/classes/**.class` after a BUILD SUCCESS marker and fails the
+    # result when the tree is empty.  The pinned fixture pom carries no
+    # sources, so this probe supplies exactly one compilable class and the
+    # Java-17 dispatch has something real to produce.
+    source = write_container_text_atomic(
+        audit,
+        f"{root}/src/main/java/d0/Probe.java",
+        "package d0;\n\npublic final class Probe {\n"
+        "    private Probe() {}\n\n"
+        "    public static String marker() {\n"
+        '        return "d0-jdk-authority";\n'
+        "    }\n}\n",
+    )
+    # A wrapper without readable properties has no stated distribution, so the
+    # runner refuses it as `wrapper_properties_unreadable` before any dispatch.
+    # These are the exact distribution facts of the Maven this wrapper execs
+    # (the image downloads that same zip and unpacks it to /opt/d0/jdk-maven),
+    # so the declared archive type is the real one and its extractor — the
+    # unzip linked below — is genuinely present.
+    wrapper_properties = write_container_text_atomic(
+        audit,
+        f"{root}/.mvn/wrapper/maven-wrapper.properties",
+        "distributionType=only-script\n"
+        "distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/"
+        f"apache-maven/{MAVEN_VERSION}/{MAVEN_ZIP_NAME}\n"
+        f"distributionSha256Sum={MAVEN_ZIP_SHA256}\n",
+    )
+    # Deterministic checkout bootstrap: control-plane.  The audited project lane
+    # starts at the public BuildTool calls below.
+    fixture = audit.execute_control_command(
         f"cp /opt/d0/jdk-project/pom.xml {root}/pom.xml && "
         "ln -s /opt/d0/unzip /usr/bin/unzip && "
         f"chmod 755 {root}/mvnw && "
@@ -4107,25 +4608,33 @@ def _probe_dynamic_jdk_authority(runtime: DockerProbeRuntime) -> ProbeObservatio
         "GIT_COMMITTER_DATE=2026-08-08T00:00:00Z "
         "git -C /workspace/d0-jdk commit -qm initial"
     )
-    if not wrapper.persisted or fixture.get("exit_code") != 0:
+    if (
+        not wrapper.persisted
+        or not wrapper_properties.persisted
+        or not source.persisted
+        or fixture.get("exit_code") != 0
+    ):
         return runtime.aggregate_observation(
             passed=False,
             facts={"fixture_output": fixture.get("output")},
             failures=("could not create deterministic JDK target checkout",),
         )
     runtime.register_container_evidence(audit, root, archive_name="jdk-checkout")
-    sha_result = audit.execute_command(f"git -C {root} rev-parse HEAD")
+    sha_result = audit.execute_control_command(f"git -C {root} rev-parse HEAD")
     target_sha = str(sha_result.get("output") or "").strip()
     domain_id = "d0-jdk-domain"
-    manifest = {
-        "build_system": "maven",
-        "build_root": root,
-        "java_version": "11",
-        "java_version_source": "d0_static_survey",
-        "domain_facts": [{"domain_id": domain_id, "root": root, "fact_epoch": 1}],
-        "build_islands": [{"root": root, "system": "maven", "goal": "compile"}],
-    }
-    manifest_ok = write_build_requirements(audit, manifest)
+    # The static survey states Java 11 from the POM's compiler configuration —
+    # `java_version_source` is a closed enum in build-requirements v1, so the
+    # manifest names the real producer of that fact rather than a D0 label.
+    manifest = _publish_d0_build_requirements(
+        audit,
+        root,
+        system="maven",
+        java_version="11",
+        java_version_source="maven-compiler",
+        target_sha=target_sha,
+    )
+    manifest_ok = manifest.get("java_version") == "11"
     before_runtime = active_java_runtime(audit)
     build = BuildTool(audit, maven_tool=MavenTool(audit))
     build_params = {
@@ -4149,16 +4658,31 @@ def _probe_dynamic_jdk_authority(runtime: DockerProbeRuntime) -> ProbeObservatio
             working_directory=root,
             timeout=240,
         )
+    # The contract a dispatch was frozen against travels on the DURABLE
+    # receipt; only the public envelope's own result carries it in metadata, so
+    # the inner executions of a bounded retry state nothing.  Reading the
+    # receipts is also what the archive lineage audit compares against.
     first_contract_ids = [
-        str(actual.result.metadata.get("contract_id") or "") for actual in first.execution_trace
+        str(record.get("contract_id") or "")
+        for record in _receipts_in_dispatch_order(
+            dispatch_receipts(
+                _strict_container_receipts(audit),
+                tool="maven",
+                working_directory=root,
+                effective_action="compile",
+            )
+        )
     ]
     first_final_contract_id = first_contract_ids[-1] if first_contract_ids else ""
     after_first_runtime = active_java_runtime(audit)
     store = EnvOverlayStore(audit)
+    # A single-module manifest carries no domain projection, so BuildTool
+    # scopes the runtime requirement to the invocation's own root with no
+    # domain id.  Querying under a D0 label would look in an empty scope.
     runtime_records = store.scoped_runtime_requirements(
         "java",
         target_sha=target_sha,
-        domain_id=domain_id,
+        domain_id=None,
         domain_root=root,
     )
     dynamic: dict[str, Any] = next(
@@ -4265,7 +4789,8 @@ def _probe_gradle_runner_classification(runtime: DockerProbeRuntime) -> ProbeObs
 
     audit = runtime.new_container()
     root = "/workspace/d0-gradle"
-    audit.execute_command(f"mkdir -p {root}")
+    # Fixture bootstrap: control-plane.
+    audit.execute_control_command(f"mkdir -p {root}")
     build_file = write_container_text_atomic(
         audit,
         f"{root}/build.gradle",
@@ -4296,7 +4821,7 @@ tasks.named('test') {
             },
             failures=("Gradle project fixture did not persist atomically",),
         )
-    initialized = audit.execute_command(
+    initialized = audit.execute_control_command(
         "git init -q && git config user.email d0@example.invalid && "
         "git config user.name D0 && git add . && "
         "GIT_AUTHOR_DATE=2026-08-08T00:00:00Z "
@@ -4309,6 +4834,14 @@ tasks.named('test') {
             facts={"fixture_init_exit_code": initialized.get("exit_code")},
             failures=("Gradle project fixture did not initialize",),
         )
+    # BuildTool refuses every routing decision without a host-published manifest.
+    target_sha_result = audit.execute_control_command(f"git -C {root} rev-parse HEAD")
+    _publish_d0_build_requirements(
+        audit,
+        root,
+        system="gradle",
+        target_sha=str(target_sha_result.get("output") or "").strip() or None,
+    )
     with _controller_action_scope(
         runtime,
         audit=audit,
@@ -4449,7 +4982,8 @@ def _probe_multi_job_progress_barrier(runtime: DockerProbeRuntime) -> ProbeObser
     expected_files: dict[str, int] = {}
     for index, steps in ((1, 60), (2, 70)):
         root = f"/workspace/d0-barrier/job-{index}"
-        audit.execute_command(f"mkdir -p {root}/target/progress")
+        # Fixture bootstrap: control-plane.
+        audit.execute_control_command(f"mkdir -p {root}/target/progress")
         runtime.register_container_evidence(audit, root, archive_name=f"barrier-job-{index}")
         program = (
             "import pathlib,time;"
@@ -4578,13 +5112,14 @@ def _probe_multi_job_progress_barrier(runtime: DockerProbeRuntime) -> ProbeObser
         failures.append("each independent job did not cross the stall threshold with progress")
     progress_files: dict[str, int] = {}
     for index, job_id in enumerate(job_ids, start=1):
-        result = audit.execute_command(
+        # Post-barrier artifact verification: control-plane.
+        result = audit.execute_control_command(
             f"find /workspace/d0-barrier/job-{index}/target/progress -type f | wc -l"
         )
         progress_files[job_id] = int(str(result.get("output") or "0").strip().splitlines()[-1])
     if progress_files != expected_files:
         failures.append("barrier released before each job wrote all expected progress artifacts")
-    diagnostics = audit.execute_command(
+    diagnostics = audit.execute_control_command(
         "find /workspace/.setup_agent/job_diagnostics -type f -print 2>/dev/null"
     )
     signal_commands = sum(

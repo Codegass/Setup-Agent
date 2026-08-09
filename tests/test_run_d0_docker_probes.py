@@ -335,6 +335,140 @@ def test_archive_epoch_rejects_tombstone_resurrection(tmp_path):
         d0._verify_archived_evidence_epochs(tmp_path)
 
 
+def test_epoch_authority_is_installed_where_the_project_lane_resolves_it(tmp_path):
+    """DockerOrchestrator._default_exec_environment resolves authority from the
+    orchestrator itself, so binding only the audit proxy leaves every project
+    command refused with "runtime environment has no host publication authority".
+    """
+
+    from sag.agent.evidence_publications import current_evidence_publication_authority
+
+    runtime = _epoch_runtime(tmp_path)
+    audit, epoch = _registered_epoch(runtime, "main")
+
+    assert current_evidence_publication_authority(audit.orchestrator) is epoch.authority
+    assert current_evidence_publication_authority(audit) is epoch.authority
+    # One container store, one identity: the proxy must never report its own.
+    assert audit.evidence_store_identity() == audit.orchestrator.evidence_store_identity()
+
+
+def test_control_plane_io_uses_the_clean_channel_not_the_project_lane():
+    """Bootstrap/verification/archive I/O must not require the runtime overlay."""
+
+    class Orchestrator:
+        def __init__(self):
+            self.clean_calls = []
+            self.project_calls = []
+
+        def execute_command(self, command, *_args, **kwargs):
+            if kwargs.get("_clean_control_path"):
+                self.clean_calls.append(command)
+            else:
+                self.project_calls.append(command)
+            return {"exit_code": 0, "success": True, "output": ""}
+
+        def execute_control_command(self, command, **kwargs):
+            return self.execute_command(command, _clean_control_path=True, **kwargs)
+
+        def execute_command_detached(self, command, *_args, **_kwargs):
+            return {"started": True, "job_id": command, "output": ""}
+
+        def poll_detached_command(self, handle, *_args, **_kwargs):
+            return {"state": "terminal", "job_id": handle["job_id"]}
+
+        def collect_detached_result(self, handle, _poll, *_args, **_kwargs):
+            return {"exit_code": 0, "success": True, "output": ""}
+
+    orchestrator = Orchestrator()
+    audit = d0.CommandAudit(orchestrator)
+
+    audit.execute_control_command("find /workspace/.setup_agent -name '*.tmp'")
+
+    assert orchestrator.clean_calls == ["find /workspace/.setup_agent -name '*.tmp'"]
+    assert orchestrator.project_calls == []
+    # Clean-channel commands still reach the sealed content-addressed journal.
+    assert [row["kind"] for row in audit.records] == ["execute_command"]
+
+
+def test_detached_identity_gate_refuses_anything_short_of_a_docker_exec_envelope():
+    """A schema-v3 obligation may only state an identity Docker really issued."""
+
+    complete = {
+        "started": True,
+        "start_accepted": True,
+        "startup_identity_verified": True,
+        "runner_dispatch_state": "accepted",
+        "terminal_authority": "docker_exec_inspect_v1",
+        "docker_exec_id": "a" * 64,
+        "container_id": "b" * 64,
+        "process_identity_token": "c" * 64,
+        "pid": 42,
+        "pgid": 42,
+        "job_id": "job",
+        "log_path": "/tmp/sag_jobs/job.log",
+        "exit_code_path": "/tmp/sag_jobs/job.log.exit",
+        "pid_path": "/tmp/sag_jobs/job.pid",
+        "pgid_path": "/tmp/sag_jobs/job.pgid",
+        "identity_path": "/tmp/sag_jobs/job.identity",
+    }
+
+    assert d0._detached_identity_errors(complete) == []
+    assert d0._detached_identity_errors({**complete, "docker_exec_id": "deadbeef"})
+    assert d0._detached_identity_errors({**complete, "start_accepted": False})
+    assert d0._detached_identity_errors({**complete, "pgid": 43})
+    assert d0._detached_identity_errors({**complete, "terminal_authority": "exit_marker"})
+
+
+def test_archived_obligation_identity_is_validated_against_the_live_v3_schema():
+    from sag.agent.job_obligations import OBLIGATION_SCHEMA_VERSION, build_obligation
+
+    assert OBLIGATION_SCHEMA_VERSION == 3
+    obligation = build_obligation(
+        job_id="d0-schema-probe",
+        run_id="d0-schema-run",
+        tool="bash",
+        attempt=1,
+        requested_action="run",
+        effective_action="run",
+        argv="sh -c 'exit 0'",
+        working_directory="/workspace",
+        before={},
+        log_path="/tmp/sag_jobs/d0-schema-probe.log",
+        exit_code_path="/tmp/sag_jobs/d0-schema-probe.log.exit",
+        terminal_authority="docker_exec_inspect_v1",
+        docker_exec_id="a" * 64,
+        container_id="b" * 64,
+        start_accepted=True,
+        startup_identity_verified=True,
+        runner_dispatch_state="accepted",
+        pid=42,
+        pgid=42,
+        pid_path="/tmp/sag_jobs/d0-schema-probe.pid",
+        pgid_path="/tmp/sag_jobs/d0-schema-probe.pgid",
+        identity_path="/tmp/sag_jobs/d0-schema-probe.identity",
+        process_identity_token="c" * 64,
+    )
+    raw = json.dumps(obligation, sort_keys=True).encode("utf-8")
+
+    assert (
+        d0._validate_archived_semantic_identity(
+            record_kind="job_obligation",
+            record_id="d0-schema-probe",
+            raw=raw,
+            run_id="d0-schema-run",
+        )
+        == obligation
+    )
+    tampered = json.dumps({**obligation, "start_accepted": False}, sort_keys=True).encode("utf-8")
+    with pytest.raises(d0.D0Stop, match="job obligation is invalid"):
+        d0._validate_archived_semantic_identity(
+            record_kind="job_obligation",
+            record_id="d0-schema-probe",
+            raw=tampered,
+            run_id="d0-schema-run",
+        )
+
+
 def test_receipt_writer_fails_when_no_host_publication_authority_is_installed():
     from container_evidence_fakes import ContainerFS
     from sag.agent.evidence_publications import (
@@ -718,9 +852,12 @@ def test_controller_action_scope_emits_typed_envelope_and_restores_context(tmp_p
 
     assert current_action_context().envelope_id is None
     events = d0._control_events(runtime.control_event_path)
+    # A control stream is a grammar: production's strict recovery refuses a
+    # stream that ends on an unanswered envelope, so the scope answers its own.
     assert [event["kind"] for event in events] == [
         "evidence_store_bound",
         "action_envelope",
+        "tool_result",
     ]
     payload = events[1]["payload"]
     assert payload["envelope_id"] == binding.envelope_id
@@ -728,6 +865,51 @@ def test_controller_action_scope_emits_typed_envelope_and_restores_context(tmp_p
     assert payload["intent_source"] == "controller"
     assert payload["tool"] == "maven"
     assert payload["exact_params"]["command"] == "validate"
+    answer = events[2]["payload"]
+    assert answer["envelope_id"] == binding.envelope_id
+    assert answer["tool"] == payload["tool"]
+    assert answer["params"] == payload["exact_params"]
+    assert answer["result"]["invocation_status"] == "completed"
+
+
+def test_controller_action_scope_answers_its_envelope_even_when_the_body_raises(tmp_path):
+    runtime = _controller_runtime(tmp_path)
+
+    with pytest.raises(RuntimeError, match="probe body exploded"):
+        with d0._controller_action_scope(
+            runtime,
+            label="raising-body",
+            domain_id="d0-http-control",
+            tool="maven",
+            params={"command": "validate", "working_directory": "/workspace/x"},
+            next_action_kind="maven",
+        ):
+            raise RuntimeError("probe body exploded")
+
+    events = d0._control_events(runtime.control_event_path)
+    assert [event["kind"] for event in events][-2:] == ["action_envelope", "tool_result"]
+    assert events[-1]["payload"]["result"]["invocation_status"] == "crashed"
+    assert events[-1]["payload"]["envelope_id"] == events[-2]["payload"]["envelope_id"]
+
+
+def test_live_control_stream_survives_production_strict_recovery(tmp_path):
+    """The engine reads the live stream through this exact recovery path."""
+
+    from sag.agent.replay import recover_active_repair_context_from_path
+
+    runtime = _controller_runtime(tmp_path)
+    with d0._controller_action_scope(
+        runtime,
+        label="recovered",
+        domain_id="d0-http-control",
+        tool="maven",
+        params={"command": "validate", "working_directory": "/workspace/x"},
+        next_action_kind="maven",
+    ):
+        pass
+
+    state = recover_active_repair_context_from_path(runtime.control_event_path)
+    assert state.context is None
 
 
 def test_controller_dispatch_scope_freezes_before_body_and_fails_closed(tmp_path, monkeypatch):
