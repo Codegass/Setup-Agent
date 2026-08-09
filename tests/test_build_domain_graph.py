@@ -21,6 +21,8 @@ single-domain project emits no domain keys at all (byte-compat: the
 import json
 import re
 
+from test_container_io import FakeContainer
+
 from sag.agent.physical_survey import (
     derive_domain_edges,
     edge_id_for,
@@ -30,6 +32,7 @@ from sag.agent.physical_survey import (
     parse_gradle_requires,
     parse_maven_coordinates,
 )
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.project_fact_projection import render_recommended_build_facts
 from sag.project_fact_sheet import (
     project_fact_sheet_metadata,
@@ -37,6 +40,16 @@ from sag.project_fact_sheet import (
 )
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+_ATOMIC_WRITE_PREFIXES = (
+    "mkdir -p -- ",
+    ": > ",
+    "printf '%s' ",
+    "base64 --decode ",
+    "python3 -c ",
+    "rm -f -- ",
+    "mv -f -- ",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +64,9 @@ class FakeOrchestrator:
         self.existing = set(files)
         self.source_dirs = list(source_dirs)
         self.test_dirs = list(test_dirs)
-        self.files = {}  # heredoc writes (the persisted manifest)
+        self.files = {}  # atomic writes (the persisted manifest)
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     @staticmethod
     def _matching(command, candidate_dirs):
@@ -78,6 +93,14 @@ class FakeOrchestrator:
         return {"success": True, "output": "\n".join(hits), "exit_code": 0}
 
     def execute_command(self, command, **kwargs):
+        if "SAG_NAMED_JSON_RECORD_V1" in command and "/.setup_agent/claims" in command:
+            return {
+                "success": True,
+                "output": frame_named_json_record_stream([]),
+                "exit_code": 0,
+            }
+        if command.startswith(_ATOMIC_WRITE_PREFIXES):
+            return self.atomic.execute_command(command, **kwargs)
         if command.startswith("mkdir -p"):
             return {"success": True, "output": "", "exit_code": 0}
         if "<<'SAGEOF'" in command:  # heredoc manifest write

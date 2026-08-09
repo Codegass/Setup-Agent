@@ -207,7 +207,7 @@ def test_provider_error_degrades_to_a_success_shaped_unavailable_result():
     assert telemetry[0]["phase"] == "build"
     # An errored consult still counts as a consult: the run must be able to
     # move on when the advisor is down.
-    assert engine._had_failure_since_consult is False
+    assert engine._advisor_redirect_armed is False
 
 
 # --- (e) the happy path ----------------------------------------------------
@@ -216,7 +216,6 @@ def test_provider_error_degrades_to_a_success_shaped_unavailable_result():
 def test_successful_consult_returns_the_advice_and_records_telemetry():
     client = _ScriptedAdvisorClient(advice="Install the provider first, then retry.")
     engine = _advisor_engine(client=client)
-    engine._had_failure_since_consult = True
     engine._advisor_redirect_armed = True
 
     result = engine.consult_advisor()
@@ -237,9 +236,7 @@ def test_successful_consult_returns_the_advice_and_records_telemetry():
             "outcome": "advice",
         }
     ]
-    # The consult clears the two Task-5 state bits (the plan's
-    # `_advisor_consulted_since_failure` is expressed as this bit being False).
-    assert engine._had_failure_since_consult is False
+    # The consult clears the repeated-action redirect.
     assert engine._advisor_redirect_armed is False
 
     # The hard output cap and the resolved model both reach the provider.

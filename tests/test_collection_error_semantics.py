@@ -20,6 +20,7 @@ import re
 
 import pytest
 
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import _COMPACT_REPORT_PARSER_BODY, PhysicalValidator
 
 PYTEST_REPORT_DIR = "/workspace/.setup_agent/pytest-reports"
@@ -122,6 +123,12 @@ class _PytestReportOrchestrator:
         c = command.strip()
         if "SAG_COMPACT_TEST_REPORT_PARSER" in c:
             return {"exit_code": 1, "output": ""}
+        if "SAG_NAMED_JSON_RECORD_V1" in c:
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream([]),
+            }
         if f"test -d {PYTEST_REPORT_DIR}" in c:
             return {"exit_code": 0, "output": "EXISTS"}
         if "-type d" in c:
@@ -139,14 +146,14 @@ class _PytestReportOrchestrator:
 def _run_compact_parser(project_dir: str, pytest_reports_dir: str) -> dict:
     """Execute the in-container parser body locally (same source string).
 
-    Plan 5 Task B2 added two prepended coordinates (``receipts_dir``,
-    ``primary_root``). These sessions have no invocation receipts, so the
-    parser stays on its legacy global-scan basis.
+    These sessions have no invocation receipts, so the parser stays on its
+    legacy global-scan basis.
     """
     namespace = {
         "project_dir": project_dir,
         "pytest_reports_dir": pytest_reports_dir,
-        "receipts_dir": "/workspace/.setup_agent/invocation_receipts",
+        "receipt_scoped": False,
+        "receipt_claims": {},
         "primary_root": None,
     }
     buffer = io.StringIO()

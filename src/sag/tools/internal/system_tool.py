@@ -93,8 +93,7 @@ class SystemTool(BaseTool):
                         category="validation",
                         error_code="MISSING_VERSION",
                         suggestions=[
-                            "Provide Java version to install (e.g., '17', '21')",
-                            "Example: project(action='provision', java_version='17')",
+                            "Constraint: Java provisioning requires an explicit java_version",
                         ],
                         retryable=True,
                     )
@@ -122,8 +121,8 @@ class SystemTool(BaseTool):
                             error=f"Java version mismatch",
                             error_code="JAVA_VERSION_MISMATCH",
                             suggestions=[
-                                f"Install Java {java_version}: project(action='provision', java_version='{java_version}')",
-                                f"Current version is {verification['current_version']}",
+                                f"Observed active Java major version: {verification['current_version']}",
+                                f"Constraint: requested Java major version is {java_version}",
                             ],
                             metadata=verification,
                         )
@@ -133,7 +132,8 @@ class SystemTool(BaseTool):
                             error="Java not found",
                             error_code="JAVA_NOT_INSTALLED",
                             suggestions=[
-                                f"Install Java {java_version}: project(action='provision', java_version='{java_version}')"
+                                "Observed capability: no active Java executable",
+                                f"Constraint: requested Java major version is {java_version}",
                             ],
                             metadata=verification,
                         )
@@ -149,9 +149,8 @@ class SystemTool(BaseTool):
                 error=error_msg,
                 error_code="SYSTEM_ERROR",
                 suggestions=[
-                    "Check if Docker container is running",
-                    "Verify network connectivity",
-                    "Try updating package lists first",
+                    "Observed category: system provision operation raised an exception",
+                    "Relevant constraints: container availability, network, and package index state",
                 ],
             )
 
@@ -431,9 +430,8 @@ class SystemTool(BaseTool):
                     error=f"Failed to install Java {java_version}",
                     error_code="JAVA_INSTALL_FAILED",
                     suggestions=[
-                        f"Java {java_version} may not be available in the package repository",
-                        "Try a different version (e.g., 11, 17, 21)",
-                        "Check available versions: apt-cache search openjdk | grep jdk",
+                        f"Observed fact: packages for Java {java_version} were not installable",
+                        "Constraint: a compatible JDK package must exist in the configured repositories",
                     ],
                 )
 
@@ -518,9 +516,8 @@ class SystemTool(BaseTool):
                     error="Java binaries not found",
                     error_code="JAVA_BINARIES_NOT_FOUND",
                     suggestions=[
-                        "Check installation with: ls -la /usr/lib/jvm/",
-                        f"Try reinstalling: apt-get install --reinstall openjdk-{java_version}-jdk",
-                        "Check available Java versions: update-alternatives --list java",
+                        "Observed fact: installation completed without discoverable java and javac binaries",
+                        f"Constraint: Java {java_version} must expose both executables before activation",
                     ],
                 )
 
@@ -614,9 +611,9 @@ class SystemTool(BaseTool):
                 error=f"Java {java_version} installed but verification failed",
                 error_code="JAVA_CONFIG_FAILED",
                 suggestions=[
-                    "Java was installed but configuration may be incomplete",
-                    f"Try manually setting: export JAVA_HOME={java_home}",
-                    "Restart the shell or container to apply changes",
+                    "Observed fact: the installed Java runtime failed post-install verification",
+                    f"Observed candidate JAVA_HOME: {java_home}",
+                    "Constraint: java and javac must both execute under the activated environment",
                 ],
             )
 
@@ -790,7 +787,7 @@ class SystemTool(BaseTool):
         return packages[:3] if packages else []
 
     def _analyze_install_error(self, error_output: str) -> Dict[str, Any]:
-        """Analyze installation error output and provide suggestions."""
+        """Classify package-install output without selecting a repair command."""
         suggestions = []
         docs = []
 
@@ -800,35 +797,32 @@ class SystemTool(BaseTool):
         if "package not found" in error_lower or "unable to locate package" in error_lower:
             suggestions.extend(
                 [
-                    "Update package lists with 'apt-get update'",
-                    "Check if package name is spelled correctly",
-                    "Verify the package exists in current repositories",
+                    "Observed category: requested package was not found",
+                    "Relevant constraints: package spelling and configured repository inventory",
                 ]
             )
 
         if "network" in error_lower or "connection" in error_lower:
             suggestions.extend(
                 [
-                    "Check network connectivity",
-                    "Try again after a few minutes",
-                    "Verify DNS resolution is working",
+                    "Observed category: package transport network failure",
+                    "Relevant constraints: container network and DNS availability",
                 ]
             )
 
         if "permission denied" in error_lower or "access denied" in error_lower:
             suggestions.extend(
                 [
-                    "Ensure running with appropriate permissions",
-                    "Check if container has required privileges",
+                    "Observed category: package operation permission failure",
+                    "Constraint: the provisioner requires package-manager privileges",
                 ]
             )
 
         if "disk space" in error_lower or "no space left" in error_lower:
             suggestions.extend(
                 [
-                    "Free up disk space",
-                    "Clean package cache with 'apt-get clean'",
-                    "Remove unused packages with 'apt-get autoremove'",
+                    "Observed category: insufficient disk space",
+                    "Constraint: package installation requires additional writable capacity",
                 ]
             )
 
@@ -836,9 +830,8 @@ class SystemTool(BaseTool):
         if not suggestions:
             suggestions.extend(
                 [
-                    "Try updating package lists first",
-                    "Check container logs for more details",
-                    "Verify the package name and version",
+                    "Observed category: unclassified package installation failure",
+                    "Relevant evidence: raw package-manager output and requested package identities",
                 ]
             )
 

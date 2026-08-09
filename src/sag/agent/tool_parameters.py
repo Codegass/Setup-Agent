@@ -1,10 +1,16 @@
-"""Internal parameter normalization for orchestrated tool execution."""
+"""Representation-preserving parameter normalization for public tool calls.
+
+The normalizer is deliberately not a repair engine.  It may translate a
+retired public spelling into its current spelling, rename an unambiguous field
+alias, coerce a JSON value to the declared schema type, or apply an explicit
+schema default.  It must never choose an action, working directory, module,
+version, command-line flag, retry, or fallback from runtime state.
+"""
 
 from __future__ import annotations
 
 import json
-import re
-import shlex
+from collections.abc import Callable, Mapping
 from typing import Any, Dict, Optional
 
 from loguru import logger as default_logger
@@ -12,145 +18,228 @@ from loguru import logger as default_logger
 from sag.agent.tool_orchestration import ParameterFix, ParameterFixSource
 from sag.tools.base import BaseTool
 
-# Common Maven invocations (incl. compound phases the old MavenTool accepted)
-# mapped onto the consolidated build verbs.
+
 _MAVEN_COMMAND_TO_BUILD_ACTION = {
     "deps": "deps",
     "dependency:resolve": "deps",
     "compile": "compile",
-    "clean compile": "compile",
     "test": "test",
-    "clean test": "test",
     "package": "package",
-    "clean package": "package",
-    "install": "package",
-    "clean install": "package",
-    "verify": "package",
-    "clean verify": "package",
+    "install": "install",
+    # MavenBackend materializes the public test verb as Maven verify, so this
+    # legacy spelling is representation-equivalent to build(action='test').
+    "verify": "test",
 }
+_BUILD_ACTIONS = frozenset({"deps", "compile", "test", "package", "install"})
 
 
-def _map_legacy_maven_params(p: Dict[str, Any]) -> Dict[str, Any]:
-    """maven(command=...|goals=...) -> build(action=...).
+def _string_sequence(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(item) for item in value if item is not None).strip()
+    return str(value or "").strip()
 
-    Mirrors the gradle alias: known lifecycle phases map onto the build verbs;
-    anything else falls back to compile with the raw command as args.
-    Properties ride along as args so they are not silently dropped.
+
+def _map_legacy_maven_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate the retired Maven facade without inventing a lifecycle.
+
+    A caller-supplied current ``action``/``args`` field wins.  Known Maven
+    lifecycle spellings have an exact public-build equivalent.  Unknown or
+    missing lifecycle values remain invalid build actions so schema validation
+    refuses them; the old ``compile + raw args`` fallback was a harness-authored
+    replacement, not normalization.
     """
-    raw_command = p.get("command")
-    raw_goals = p.get("goals")
-    selected = raw_command if str(raw_command or "").strip() else raw_goals
-    if isinstance(selected, (list, tuple)):
-        command = " ".join(str(item) for item in selected if item is not None).strip()
-    else:
-        command = str(selected or "").strip()
-    action = _MAVEN_COMMAND_TO_BUILD_ACTION.get(command.lower())
-    arg_parts = []
-    if not command:
-        # Preserve the invalid/missing state so BuildTool can reject it.  The
-        # previous invented "compile" turned a malformed test request into a
-        # convincing but irrelevant successful compile.
-        action = ""
-    elif action is None:
-        action = "compile"
-        arg_parts.append(command)
-    if p.get("extra_args"):
-        arg_parts.append(str(p["extra_args"]))
-    properties = p.get("properties")
-    if properties:
-        if isinstance(properties, (list, tuple)):
-            arg_parts.extend(str(prop) for prop in properties if prop)
-        else:
-            arg_parts.append(str(properties))
-    return {
-        "action": action,
-        "args": " ".join(arg_parts) or None,
-        "working_directory": p.get("working_directory", "/workspace"),
+
+    raw = dict(params or {})
+    mapped = {
+        key: value
+        for key, value in raw.items()
+        if key not in {"command", "goals", "extra_args", "properties"}
     }
+
+    if "action" not in mapped:
+        selected = raw.get("command") if "command" in raw else raw.get("goals")
+        command = _string_sequence(selected)
+        mapped["action"] = _MAVEN_COMMAND_TO_BUILD_ACTION.get(command.lower(), command)
+
+    if "args" not in mapped:
+        arg_parts: list[str] = []
+        if raw.get("extra_args"):
+            arg_parts.append(str(raw["extra_args"]))
+        properties = raw.get("properties")
+        if isinstance(properties, Mapping):
+            raise ValueError(
+                "legacy Maven properties object has no exact public build args representation"
+            )
+        if isinstance(properties, (list, tuple)):
+            arg_parts.extend(str(item) for item in properties if item)
+        elif properties:
+            arg_parts.append(str(properties))
+        if arg_parts:
+            mapped["args"] = " ".join(arg_parts)
+    return mapped
+
+
+def _map_legacy_gradle_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate an exactly equivalent Gradle facade call or leave it invalid."""
+
+    raw = dict(params or {})
+    mapped = {key: value for key, value in raw.items() if key != "tasks"}
+    if "action" not in mapped:
+        task = _string_sequence(raw.get("tasks"))
+        # Known facade verbs are exact aliases.  Unknown task strings are not
+        # forced through compile; preserving them makes enum validation fail.
+        mapped["action"] = task if task in _BUILD_ACTIONS else task
+    return mapped
+
+
+def _map_web_search_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    raw = dict(params or {})
+    mapped = {key: value for key, value in raw.items() if key != "query"}
+    if "target" not in mapped:
+        query = str(raw.get("query") or "").strip()
+        if not query:
+            raise ValueError("legacy web_search requires query")
+        mapped["target"] = f"web:{query}"
+    return mapped
+
+
+def _map_output_search_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Map only legacy retrieve/grep calls expressible by the Search facade."""
+
+    raw = dict(params or {})
+    action = str(raw.get("action") or "").strip().lower()
+    if action and action not in {"retrieve", "grep"}:
+        raise ValueError(f"legacy output_search action {action!r} has no exact search equivalent")
+    unsupported = {
+        "context_lines",
+        "head_lines",
+        "tail_lines",
+        "task_id",
+        "tool_name",
+        "show_line_numbers",
+        "extreme",
+    }.intersection(raw)
+    if unsupported:
+        raise ValueError(
+            "legacy output_search parameters have no exact search equivalent: "
+            + ", ".join(sorted(unsupported))
+        )
+    mapped = {
+        key: value
+        for key, value in raw.items()
+        if key not in {"action", "ref_id", "grep_pattern", "limit"}
+    }
+    if "target" not in mapped:
+        target = str(raw.get("ref_id") or "").strip()
+        if not target:
+            raise ValueError("legacy output_search requires ref_id")
+        mapped["target"] = target
+    if "pattern" not in mapped and raw.get("grep_pattern") is not None:
+        mapped["pattern"] = raw["grep_pattern"]
+    if "max_results" not in mapped and raw.get("limit") is not None:
+        mapped["max_results"] = raw["limit"]
+    return mapped
+
+
+def _map_project_setup_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve a legacy project-setup call in the Project facade spelling."""
+
+    raw = dict(params or {})
+    mapped = dict(raw)
+    if "repo_url" not in mapped:
+        for alias in ("repository_url", "url", "repo", "repository", "git_url"):
+            if alias in raw:
+                mapped["repo_url"] = raw[alias]
+                break
+    for alias in ("repository_url", "url", "repo", "repository", "git_url"):
+        if alias != "repo_url":
+            mapped.pop(alias, None)
+    if "ref" not in mapped:
+        for alias in ("branch", "tag", "release", "commit", "commit_hash", "version_ref"):
+            if alias in raw:
+                mapped["ref"] = raw[alias]
+                break
+    for alias in ("branch", "tag", "release", "commit", "commit_hash", "version_ref"):
+        mapped.pop(alias, None)
+    return mapped
+
+
+def _map_project_analyzer_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    raw = dict(params or {})
+    action = str(raw.get("action") or "analyze").strip().lower()
+    if action != "analyze":
+        raise ValueError(f"legacy project_analyzer action {action!r} is not analyze")
+    mapped = {key: value for key, value in raw.items() if key != "action"}
+    mapped["action"] = "analyze"
+    if "project_path" not in mapped:
+        for alias in ("working_directory", "path"):
+            if alias in raw:
+                mapped["project_path"] = raw[alias]
+                break
+    mapped.pop("working_directory", None)
+    mapped.pop("path", None)
+    return mapped
+
+
+def _map_system_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    raw = dict(params or {})
+    legacy_action = str(raw.get("action") or "").strip().lower()
+    if legacy_action not in {"install", "install_java", "provision"}:
+        raise ValueError(
+            f"legacy system action {legacy_action or '<missing>'!r} has no exact project equivalent"
+        )
+    if legacy_action == "install" and (
+        not raw.get("packages") or raw.get("java_version") not in (None, "")
+    ):
+        raise ValueError(
+            "legacy system install maps exactly only with packages and without java_version"
+        )
+    if legacy_action == "install_java" and not str(raw.get("java_version") or "").strip():
+        raise ValueError("legacy system install_java requires java_version")
+    mapped = {key: value for key, value in raw.items() if key != "action"}
+    mapped["action"] = "provision"
+    return mapped
+
+
+def _map_env_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    raw = dict(params or {})
+    legacy_action = str(raw.get("action") or "").strip().lower()
+    if legacy_action not in {"register", "env"}:
+        raise ValueError(
+            f"legacy env action {legacy_action or '<missing>'!r} has no exact project equivalent"
+        )
+    if legacy_action == "register" and raw.get("activate") is not True:
+        raise ValueError(
+            "legacy env register maps exactly only when activate=true; "
+            "the public env action is atomic"
+        )
+    mapped = {key: value for key, value in raw.items() if key != "action"}
+    mapped["action"] = "env"
+    return mapped
 
 
 class ToolParameterNormalizer:
-    """Normalize model-supplied tool parameters against tool schemas and runtime state."""
+    """Normalize only static representations, never model intent."""
 
-    # Legacy (pre-stage-1) tool names mapped onto their consolidated successors.
-    # Each entry: legacy name -> (new tool name, params mapper). Applied only
-    # when the legacy name is NOT registered, so direct registrations win.
-    LEGACY_TOOL_ALIASES = {
+    # Applied only when the retired name is not directly registered.  Each
+    # mapper is deterministic from the submitted call alone; none consults
+    # analyzer output, prior executions, repository identity, or filesystem
+    # state.
+    LEGACY_TOOL_ALIASES: Dict[
+        str,
+        tuple[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
+    ] = {
         "maven": ("build", _map_legacy_maven_params),
-        "gradle": (
-            "build",
-            lambda p: (
-                {
-                    "action": p["tasks"],
-                    "working_directory": p.get("working_directory", "/workspace"),
-                }
-                if p.get("tasks") in ("deps", "compile", "test", "package")
-                else {
-                    "action": "compile",
-                    "args": p.get("tasks"),
-                    "working_directory": p.get("working_directory", "/workspace"),
-                }
-            ),
-        ),
-        "web_search": ("search", lambda p: {"target": f"web:{p.get('query', '')}"}),
-        "output_search": (
-            "search",
-            lambda p: {
-                "target": p.get("ref_id", ""),
-                # No pattern maps to no pattern: search retrieves the stored
-                # output. The old default "." silently downgraded a retrieve
-                # intent to a grep of every line (#30).
-                "pattern": p.get("grep_pattern", p.get("pattern", "")),
-            },
-        ),
-        # Facade verb must win over any legacy sub-action key: ProjectTool routes
-        # on `action` and re-derives the delegate's sub-action itself.
-        "project_setup": ("project", lambda p: {**p, "action": "clone"}),
-        "project_analyzer": ("project", lambda p: {**p, "action": "analyze"}),
-        "system": ("project", lambda p: {**p, "action": "provision"}),
-        "env": ("project", lambda p: {**p, "action": "env"}),
+        "gradle": ("build", _map_legacy_gradle_params),
+        "web_search": ("search", _map_web_search_params),
+        "output_search": ("search", _map_output_search_params),
+        # ProjectSetupTool had several verbs.  Preserve the submitted action;
+        # an omitted or unsupported verb must fail instead of becoming clone.
+        "project_setup": ("project", _map_project_setup_params),
+        "project_analyzer": ("project", _map_project_analyzer_params),
+        "system": ("project", _map_system_params),
+        "env": ("project", _map_env_params),
     }
-
-    def resolve_legacy_alias(self, tool_name, params, parameter_fixes=None):
-        """Map a legacy tool name (model drift) to its stage-1 successor."""
-        if tool_name in self.tools or tool_name not in self.LEGACY_TOOL_ALIASES:
-            return tool_name, params
-        raw_params = dict(params or {})
-        new_name, mapper = self.LEGACY_TOOL_ALIASES[tool_name]
-        mapped = {k: v for k, v in mapper(raw_params).items() if v is not None}
-        fixes = parameter_fixes
-        if fixes is not None:
-            self._add_parameter_fix(
-                fixes,
-                field="tool",
-                before=tool_name,
-                after=new_name,
-                reason=f"Mapped legacy tool '{tool_name}' to '{new_name}'",
-                source="schema_alias",
-            )
-            if tool_name == "maven" and "goals" in raw_params:
-                self._add_parameter_fix(
-                    fixes,
-                    field="goals",
-                    before=raw_params.get("goals"),
-                    after=None,
-                    reason=(
-                        "Removed legacy Maven goals alias after canonical command won"
-                        if str(raw_params.get("command") or "").strip()
-                        else "Renamed legacy Maven goals to build action"
-                    ),
-                    source="schema_alias",
-                )
-                if not str(raw_params.get("command") or "").strip():
-                    self._add_parameter_fix(
-                        fixes,
-                        field="action",
-                        before=None,
-                        after=mapped.get("action"),
-                        reason="Mapped legacy Maven goals to canonical build action",
-                        source="schema_alias",
-                    )
-        return new_name, mapped
 
     def __init__(
         self,
@@ -162,13 +251,16 @@ class ToolParameterNormalizer:
         logger: Any = None,
     ) -> None:
         self.tools = tools
+        # Retained as constructor compatibility only.  Reading any of these to
+        # alter params would make a model-owned ActionIntent falsely describe a
+        # controller-selected action.
         self.successful_states = successful_states
         self.repository_url = repository_url
         self.repository_ref = repository_ref
         self.logger = logger or default_logger
 
+    @staticmethod
     def _add_parameter_fix(
-        self,
         fixes: list[ParameterFix],
         *,
         field: str,
@@ -188,104 +280,44 @@ class ToolParameterNormalizer:
                 )
             )
 
-    def _append_maven_fail_at_end_if_needed(self, command: str) -> tuple[str, bool]:
-        """Append Maven fail-at-end only when a shell segment invokes Maven directly."""
-        if not command:
-            return command, False
+    def resolve_legacy_alias(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        parameter_fixes: Optional[list[ParameterFix]] = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Map a retired public spelling to a statically equivalent facade."""
 
-        # Piped or redirected commands are often inspection commands containing "mvn".
-        # Leave those untouched rather than rewriting shell syntax we do not fully parse.
-        if any(operator in command for operator in ("|", ">", "<")):
-            return command, False
+        if tool_name in self.tools or tool_name not in self.LEGACY_TOOL_ALIASES:
+            return tool_name, dict(params or {})
 
-        parts = re.split(r"(\s*(?:&&|;)\s*)", command)
-        changed = False
-        rewritten_parts = []
-
-        for part in parts:
-            if re.fullmatch(r"\s*(?:&&|;)\s*", part):
-                rewritten_parts.append(part)
-                continue
-
-            tokens = self._split_shell_segment(part)
-            if not self._should_append_maven_fail_at_end(tokens):
-                rewritten_parts.append(part)
-                continue
-
-            if "--fail-at-end" in tokens or "-fae" in tokens:
-                rewritten_parts.append(part)
-                continue
-
-            rewritten_parts.append(f"{part.rstrip()} --fail-at-end")
-            changed = True
-
-        return "".join(rewritten_parts), changed
-
-    def _split_shell_segment(self, segment: str) -> list[str]:
-        try:
-            return shlex.split(segment)
-        except ValueError:
-            return []
-
-    def _should_append_maven_fail_at_end(self, tokens: list[str]) -> bool:
-        command_index = self._maven_command_index(tokens)
-        if command_index is None:
-            return False
-
-        args = tokens[command_index + 1 :]
-        if any(arg in {"-v", "--version", "-version"} for arg in args):
-            return False
-
-        lifecycle_phases = {
-            "validate",
-            "initialize",
-            "generate-sources",
-            "process-sources",
-            "generate-resources",
-            "process-resources",
-            "compile",
-            "process-classes",
-            "generate-test-sources",
-            "process-test-sources",
-            "generate-test-resources",
-            "process-test-resources",
-            "test-compile",
-            "process-test-classes",
-            "test",
-            "prepare-package",
-            "package",
-            "pre-integration-test",
-            "integration-test",
-            "post-integration-test",
-            "verify",
-            "install",
-            "deploy",
-            "clean",
-            "site",
-        }
-        return any(arg in lifecycle_phases for arg in args)
-
-    def _maven_command_index(self, tokens: list[str]) -> Optional[int]:
-        if not tokens:
-            return None
-
-        command_index = 0
-        while command_index < len(tokens) and self._is_shell_assignment(tokens[command_index]):
-            command_index += 1
-
-        if command_index >= len(tokens):
-            return None
-
-        executable = tokens[command_index].rsplit("/", 1)[-1]
-        if executable not in {"mvn", "mvnw"}:
-            return None
-        return command_index
-
-    def _is_shell_assignment(self, token: str) -> bool:
-        if "=" not in token:
-            return False
-        name = token.split("=", 1)[0]
-        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
+        raw_params = dict(params or {})
+        new_name, mapper = self.LEGACY_TOOL_ALIASES[tool_name]
+        mapped = mapper(raw_params)
+        fixes = parameter_fixes
+        if fixes is not None:
+            self._add_parameter_fix(
+                fixes,
+                field="tool",
+                before=tool_name,
+                after=new_name,
+                reason=f"Mapped legacy tool '{tool_name}' to '{new_name}'",
+                source="schema_alias",
+            )
+            if tool_name == "maven" and "goals" in raw_params:
+                self._add_parameter_fix(
+                    fixes,
+                    field="goals",
+                    before=raw_params.get("goals"),
+                    after=None,
+                    reason=(
+                        "Removed legacy Maven goals because canonical action or command won"
+                        if "action" in raw_params or "command" in raw_params
+                        else "Renamed legacy Maven goals to build action"
+                    ),
+                    source="schema_alias",
+                )
+        return new_name, mapped
 
     def validate_and_fix(
         self,
@@ -293,7 +325,13 @@ class ToolParameterNormalizer:
         params: Dict[str, Any],
         parameter_fixes: Optional[list[ParameterFix]] = None,
     ) -> Dict[str, Any]:
-        """Validate and fix tool parameters with self-healing capability."""
+        """Return the same action in canonical schema representation.
+
+        Schema-invalid model data raises ``ValueError``.  The orchestrator
+        converts that into a non-dispatched validation result, so no guessed
+        replacement can be minted as ``source=model``.
+        """
+
         fixes = parameter_fixes if parameter_fixes is not None else []
         if tool_name not in self.tools:
             tool_name, params = self.resolve_legacy_alias(
@@ -302,423 +340,300 @@ class ToolParameterNormalizer:
                 parameter_fixes=fixes,
             )
         if tool_name not in self.tools:
-            self.logger.error(f"Unknown tool: {tool_name}")
-            return params
+            raise ValueError(f"unknown tool: {tool_name}")
 
+        raw = dict(params or {})
         tool = self.tools[tool_name]
-
-        # Handle completely empty parameters
-        if not params:
-            params = {}
-
-        # Get the tool's parameter schema
         if hasattr(tool, "get_parameter_schema"):
             schema = tool.get_parameter_schema()
         elif hasattr(tool, "_get_parameters_schema"):
             schema = tool._get_parameters_schema()
         else:
-            # No schema available, apply basic fixes
-            return self._apply_basic_parameter_fixes(tool_name, params, fixes)
+            return raw
+        if not isinstance(schema, Mapping):
+            raise ValueError(f"invalid parameter schema for {tool_name}")
+        return self._normalize_against_schema(raw, dict(schema), tool_name, fixes)
 
-        # Validate and fix parameters
-        validated_params = self._fix_parameters_against_schema(params, schema, tool_name, fixes)
-
-        # Apply additional tool-specific fixes
-        validated_params = self._apply_tool_specific_fixes(tool_name, validated_params, fixes)
-
-        # Check for unexpected parameters and provide warnings
-        expected_params = set(schema.get("properties", {}).keys())
-        actual_params = set(validated_params.keys())
-        unexpected_params = actual_params - expected_params
-
-        if unexpected_params:
-            self.logger.warning(f"🚨 Unexpected parameters for {tool_name}: {unexpected_params}")
-            self.logger.warning(f"Expected parameters: {expected_params}")
-
-            # Only remove parameters that are clearly invalid, keep potentially useful ones
-            params_to_remove = []
-            for param in unexpected_params:
-                param_value = validated_params[param]
-
-                # Keep parameters that might be useful extensions
-                if tool_name == "maven" and param in ["pom_file", "maven_home", "java_home"]:
-                    self.logger.info(
-                        f"🔧 Keeping potentially useful Maven parameter: {param}={param_value}"
-                    )
-                    continue
-                elif tool_name == "bash" and param in ["env", "environment"]:
-                    self.logger.info(
-                        f"🔧 Keeping potentially useful bash parameter: {param}={param_value}"
-                    )
-                    continue
-                elif tool_name == "system" and param in ["sudo", "force"]:
-                    self.logger.info(
-                        f"🔧 Keeping potentially useful system parameter: {param}={param_value}"
-                    )
-                    continue
-                else:
-                    # Remove clearly invalid parameters
-                    params_to_remove.append(param)
-
-            # DISABLED: Auto-removal of invalid parameters to enable proper error feedback
-            # Let tools handle their own parameter validation and provide clear error messages
-            # for param in params_to_remove:
-            #     self.logger.warning(f"🔧 Removing invalid parameter: {param}={validated_params[param]}")
-            #     del validated_params[param]
-
-        # Log parameter fixes if any were made
-        if validated_params != params:
-            self.logger.info(f"🔧 Parameter self-healing applied for {tool_name}")
-            self.logger.debug(f"Original params: {params}")
-            self.logger.debug(f"Fixed params: {validated_params}")
-
-        return validated_params
-
-    def _fix_parameters_against_schema(
+    def _normalize_against_schema(
         self,
         params: Dict[str, Any],
         schema: Dict[str, Any],
         tool_name: str,
-        parameter_fixes: Optional[list[ParameterFix]] = None,
+        fixes: list[ParameterFix],
     ) -> Dict[str, Any]:
-        """Fix parameters against a schema with intelligent defaults."""
-        fixes = parameter_fixes if parameter_fixes is not None else []
-        fixed_params = params.copy()
+        properties = dict(schema.get("properties") or {})
+        required = tuple(schema.get("required") or ())
+        normalized = self._fix_parameter_names(params, properties, tool_name, fixes)
 
-        # Get schema properties
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
+        # Every non-null default explicitly declared by the public schema is
+        # part of the canonical call and is materialized before ActionIntent
+        # freeze. Action-conditional defaults must be expressed by a static
+        # JSON-schema if/then branch; no parameter/tool/state heuristic is
+        # allowed here.
+        default_properties = [properties]
+        for clause in schema.get("allOf") or ():
+            if not isinstance(clause, Mapping):
+                continue
+            condition = clause.get("if")
+            branch = clause.get("then")
+            if not isinstance(condition, Mapping) or not isinstance(branch, Mapping):
+                continue
+            if self._schema_condition_matches(normalized, condition):
+                branch_properties = branch.get("properties")
+                if isinstance(branch_properties, Mapping):
+                    default_properties.append(dict(branch_properties))
 
-        # Normalize the two report aliases observed in weak-model transcripts
-        # before required-field defaults are inserted.  Presence of a
-        # canonical field means the caller chose it, even if its value is
-        # empty; generated defaults must not masquerade as that choice.
-        if tool_name == "report":
-            for old_name, new_name in {
-                "content": "summary",
-                "outcome": "status",
-            }.items():
-                if old_name not in fixed_params or new_name not in properties:
-                    continue
-                old_value = fixed_params.pop(old_name)
-                if new_name in fixed_params:
+        for default_set in default_properties:
+            self._materialize_schema_defaults(normalized, default_set, fixes)
+
+        for name, value in list(normalized.items()):
+            prop = properties.get(name)
+            if not isinstance(prop, Mapping) or value is None:
+                continue
+            expected_type = prop.get("type")
+            if expected_type:
+                converted = self._convert_parameter_type(value, str(expected_type), name)
+                if converted != value:
+                    normalized[name] = converted
                     self._add_parameter_fix(
                         fixes,
-                        field=old_name,
-                        before=old_value,
-                        after=None,
-                        reason=(
-                            f"Removed alias '{old_name}' because "
-                            f"'{new_name}' already had a value"
-                        ),
-                        source="schema_alias",
+                        field=name,
+                        before=value,
+                        after=converted,
+                        reason=f"Converted parameter '{name}' to {expected_type}",
+                        source="safety_fix",
                     )
-                    continue
-                fixed_params[new_name] = old_value
+
+        missing = [
+            name
+            for name in required
+            if name not in normalized
+            or normalized[name] is None
+            or (isinstance(normalized[name], str) and not normalized[name].strip())
+        ]
+        if missing:
+            raise ValueError("missing required parameters: " + ", ".join(missing))
+
+        if not schema.get("additionalProperties"):
+            unexpected = sorted(set(normalized) - set(properties))
+            if unexpected:
+                raise ValueError("unexpected parameters: " + ", ".join(unexpected))
+
+        for name, prop in properties.items():
+            if name not in normalized or not isinstance(prop, Mapping):
+                continue
+            allowed = prop.get("enum")
+            if allowed is not None and normalized[name] not in allowed:
+                raise ValueError(
+                    f"invalid value for {name}: {normalized[name]!r}; "
+                    f"expected one of {list(allowed)!r}"
+                )
+        return normalized
+
+    def _materialize_schema_defaults(
+        self,
+        normalized: Dict[str, Any],
+        properties: Mapping[str, Any],
+        fixes: list[ParameterFix],
+    ) -> None:
+        """Materialize only explicit, non-null schema defaults."""
+
+        for name, prop in properties.items():
+            if name in normalized and normalized[name] is not None:
+                continue
+            if not isinstance(prop, Mapping) or "default" not in prop or prop["default"] is None:
+                continue
+            before = normalized.get(name)
+            normalized[name] = prop["default"]
+            self._add_parameter_fix(
+                fixes,
+                field=name,
+                before=before,
+                after=prop["default"],
+                reason=f"Applied schema default for parameter '{name}'",
+                source="default",
+            )
+
+    @staticmethod
+    def _schema_condition_matches(params: Mapping[str, Any], condition: Mapping[str, Any]) -> bool:
+        """Evaluate the small static if-shape used for schema defaults.
+
+        Unsupported predicates do not match. This deliberately cannot infer a
+        condition from repository or execution state.
+        """
+
+        supported = {"properties", "required"}
+        if set(condition) - supported:
+            return False
+        required = condition.get("required") or ()
+        if not isinstance(required, (list, tuple)) or any(name not in params for name in required):
+            return False
+        predicates = condition.get("properties") or {}
+        if not isinstance(predicates, Mapping):
+            return False
+        for name, predicate in predicates.items():
+            if not isinstance(predicate, Mapping) or name not in params:
+                return False
+            if set(predicate) == {"const"}:
+                if params[name] != predicate["const"]:
+                    return False
+                continue
+            if set(predicate) == {"enum"} and isinstance(predicate["enum"], (list, tuple)):
+                if params[name] not in predicate["enum"]:
+                    return False
+                continue
+            return False
+        return True
+
+    @staticmethod
+    def _convert_parameter_type(value: Any, expected_type: str, param_name: str) -> Any:
+        """Perform only deterministic, representation-equivalent coercions."""
+
+        if expected_type == "string":
+            if isinstance(value, dict):
+                converted = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            elif isinstance(value, list):
+                converted = " ".join(str(item) for item in value)
+            else:
+                converted = str(value)
+            if param_name == "key_results":
+                return " ".join(converted.split())
+            return converted
+
+        if expected_type == "integer":
+            if isinstance(value, bool):
+                raise ValueError(f"parameter '{param_name}' is not an integer")
+            return int(value)
+
+        if expected_type == "number":
+            if isinstance(value, bool):
+                raise ValueError(f"parameter '{param_name}' is not a number")
+            return float(value)
+
+        if expected_type == "boolean":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "1", "yes", "on"}:
+                    return True
+                if lowered in {"false", "0", "no", "off"}:
+                    return False
+            if value in {0, 1}:
+                return bool(value)
+            raise ValueError(f"parameter '{param_name}' is not a boolean")
+
+        if expected_type == "array":
+            if isinstance(value, list):
+                return value
+            if isinstance(value, tuple):
+                return list(value)
+            if isinstance(value, str):
+                text = value.strip()
+                if text.startswith("["):
+                    parsed = json.loads(text)
+                    if not isinstance(parsed, list):
+                        raise ValueError(f"parameter '{param_name}' is not an array")
+                    return parsed
+                return [item.strip() for item in value.split(",") if item.strip()]
+            return [value]
+
+        if expected_type == "object":
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, str):
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed
+            raise ValueError(f"parameter '{param_name}' is not an object")
+        return value
+
+    def _rename_aliases(
+        self,
+        params: Dict[str, Any],
+        properties: Dict[str, Any],
+        mappings: Mapping[str, str],
+        fixes: list[ParameterFix],
+    ) -> Dict[str, Any]:
+        normalized = dict(params)
+        for alias, canonical in mappings.items():
+            if alias not in normalized or canonical not in properties or alias == canonical:
+                continue
+            alias_value = normalized.pop(alias)
+            if canonical in normalized:
                 self._add_parameter_fix(
                     fixes,
-                    field=new_name,
-                    before=None,
-                    after=old_value,
-                    reason=f"Renamed parameter '{old_name}' to '{new_name}'",
+                    field=alias,
+                    before=alias_value,
+                    after=None,
+                    reason=(
+                        f"Removed alias '{alias}' because canonical field "
+                        f"'{canonical}' was supplied"
+                    ),
                     source="schema_alias",
                 )
-
-        # Fix missing required parameters
-        for param_name in required:
-            if param_name not in fixed_params or fixed_params[param_name] is None:
-                before = fixed_params.get(param_name)
-                default_value = self._get_smart_default(
-                    param_name, properties.get(param_name, {}), tool_name
-                )
-                if default_value is not None:
-                    fixed_params[param_name] = default_value
-                    self._add_parameter_fix(
-                        fixes,
-                        field=param_name,
-                        before=before,
-                        after=default_value,
-                        reason=f"Added missing required parameter '{param_name}'",
-                        source="default",
-                    )
-                    self.logger.info(
-                        f"🔧 Added missing required parameter '{param_name}' with default: {default_value}"
-                    )
-
-        # Fix parameter types
-        for param_name, param_value in fixed_params.items():
-            if param_name in properties:
-                prop_schema = properties[param_name]
-                expected_type = prop_schema.get("type")
-
-                # Try to convert to expected type
-                if expected_type and param_value is not None:
-                    converted_value = self._convert_parameter_type(
-                        param_value, expected_type, param_name
-                    )
-                    if converted_value != param_value:
-                        fixed_params[param_name] = converted_value
-                        self._add_parameter_fix(
-                            fixes,
-                            field=param_name,
-                            before=param_value,
-                            after=converted_value,
-                            reason=f"Converted parameter '{param_name}' to {expected_type}",
-                            source="safety_fix",
-                        )
-                        self.logger.info(
-                            f"🔧 Converted parameter '{param_name}' from {type(param_value).__name__} to {expected_type}"
-                        )
-
-        # Handle common parameter naming issues
-        fixed_params = self._fix_parameter_names(fixed_params, properties, tool_name, fixes)
-
-        # Aliases are intentionally mapped after the first schema pass. Run a
-        # second type pass so newly canonical fields (for example report
-        # evidence -> evidence_refs and key_results -> details) satisfy the
-        # destination schema before the normalized action envelope is emitted.
-        for param_name, param_value in fixed_params.items():
-            if param_name not in properties or param_value is None:
                 continue
-            expected_type = properties[param_name].get("type")
-            if not expected_type:
-                continue
-            converted_value = self._convert_parameter_type(param_value, expected_type, param_name)
-            if converted_value != param_value:
-                fixed_params[param_name] = converted_value
-                self._add_parameter_fix(
-                    fixes,
-                    field=param_name,
-                    before=param_value,
-                    after=converted_value,
-                    reason=f"Converted aliased parameter '{param_name}' to {expected_type}",
-                    source="safety_fix",
-                )
-
-        return fixed_params
-
-    def _get_smart_default(
-        self, param_name: str, param_schema: Dict[str, Any], tool_name: str
-    ) -> Any:
-        """Get smart default values for common parameters."""
-        param_type = param_schema.get("type", "string")
-
-        # Check if there's a default in the schema
-        if "default" in param_schema:
-            return param_schema["default"]
-
-        # Smart defaults based on parameter names and tool types
-        smart_defaults = {
-            # Command-related parameters
-            "command": "help" if tool_name == "bash" else None,
-            "cmd": "help",
-            "timeout": 60,
-            # File-related parameters
-            "action": self._get_tool_specific_action_default(tool_name),
-            "path": "/workspace",
-            "file_path": "/workspace",
-            "directory": "/workspace",
-            "working_directory": "/workspace",
-            # Web search parameters
-            "query": "help" if tool_name == "web_search" else None,
-            "max_results": 5,
-            # System parameters
-            "packages": [] if param_type == "array" else None,
-            # Maven parameters
-            "goals": None,
-            "profiles": None,
-            "properties": None,
-            "raw_output": False,
-            # Context management
-            "context_type": "branch",
-            "summary": "Task in progress",
-            # Project setup parameters - DO NOT provide defaults for URLs
-            # These should come from the user's actual repository URL
-            "repository_url": None,
-            "url": None,
-            "repo_url": None,
-            # Generic defaults by type
-            "boolean": False,
-            "integer": 0,
-            "array": [],
-            "object": {},
-        }
-
-        # Try parameter name first
-        if param_name in smart_defaults:
-            return smart_defaults[param_name]
-
-        # Try parameter type
-        if param_type in smart_defaults:
-            return smart_defaults[param_type]
-
-        return None
-
-    def _get_tool_specific_action_default(self, tool_name: str) -> str:
-        """Get tool-specific default action."""
-        tool_action_defaults = {
-            "file_io": "read",
-            "project_setup": "clone",
-            "project": "clone",
-            "manage_context": "get_info",
-            "maven": "compile",
-            "build": "compile",
-            "bash": None,
-        }
-        return tool_action_defaults.get(tool_name, "list")
-
-    def _convert_parameter_type(self, value: Any, expected_type: str, param_name: str) -> Any:
-        """Convert parameter to expected type."""
-        try:
-            if expected_type == "string":
-                # Structured planner values must have one stable string form.
-                # ``str(dict)`` depends on insertion order and uses Python
-                # quoting, which made an actor's semantically identical JSON
-                # string fail the scheduler's exact comparison.
-                if isinstance(value, dict):
-                    converted = json.dumps(
-                        value,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                # Handle list to string conversion properly
-                elif isinstance(value, list):
-                    # If list has one element, return just that element
-                    if len(value) == 1:
-                        converted = str(value[0])
-                    # If multiple elements, join with spaces (common for command-line args)
-                    else:
-                        converted = " ".join(str(v) for v in value)
-                else:
-                    converted = str(value)
-                if param_name == "key_results":
-                    # Function-calling actors sometimes render an equivalent
-                    # list as newline-separated text.  The phase contract is a
-                    # narrative scalar, so canonicalize insignificant spacing
-                    # before the scheduler's strict equality check.
-                    return " ".join(converted.split())
-                return converted
-            elif expected_type == "integer":
-                if isinstance(value, str):
-                    # Try to extract number from string
-                    import re
-
-                    match = re.search(r"\d+", value)
-                    if match:
-                        return int(match.group())
-                return int(value)
-            elif expected_type == "boolean":
-                if isinstance(value, str):
-                    return value.lower() in ["true", "1", "yes", "on"]
-                elif isinstance(value, list):
-                    # Handle list to boolean conversion properly
-                    if len(value) == 0:
-                        return False  # Empty list = False
-                    elif len(value) == 1:
-                        # Single element - convert that element recursively
-                        return self._convert_parameter_type(value[0], "boolean", param_name)
-                    else:
-                        # Multiple elements - true if any are true
-                        return any(
-                            self._convert_parameter_type(v, "boolean", param_name) for v in value
-                        )
-                return bool(value)
-            elif expected_type == "array":
-                if isinstance(value, str):
-                    # Try to parse as JSON array or split by common delimiters
-                    try:
-                        return json.loads(value)
-                    except:
-                        # Split by common delimiters
-                        return [item.strip() for item in value.split(",")]
-                elif not isinstance(value, list):
-                    return [value]
-                return value
-            elif expected_type == "object":
-                if isinstance(value, str):
-                    try:
-                        return json.loads(value)
-                    except:
-                        # CRITICAL FIX: Don't lose the original string value!
-                        # For manage_context entry parameter, wrap string in meaningful object
-                        if param_name == "entry":
-                            return {"content": value}  # Preserve the original string as content
-                        elif "description" in param_name.lower() or "content" in param_name.lower():
-                            return {"description": value}
-                        else:
-                            return {"value": value}  # Fallback: preserve in generic wrapper
-                # Don't wrap lists of dicts unnecessarily
-                if isinstance(value, list) and all(
-                    isinstance(item, dict) for item in value if value
-                ):
-                    return value  # Return list of dicts as-is
-                return value if isinstance(value, dict) else {"value": value}
-        except Exception as e:
-            self.logger.warning(
-                f"Failed to convert parameter '{param_name}' to {expected_type}: {e}"
+            normalized[canonical] = alias_value
+            self._add_parameter_fix(
+                fixes,
+                field=canonical,
+                before=None,
+                after=alias_value,
+                reason=f"Renamed parameter '{alias}' to '{canonical}'",
+                source="schema_alias",
             )
-            return value
-
-        return value
+        return normalized
 
     def _fix_parameter_names(
         self,
         params: Dict[str, Any],
         properties: Dict[str, Any],
         tool_name: str,
-        parameter_fixes: Optional[list[ParameterFix]] = None,
+        fixes: list[ParameterFix],
     ) -> Dict[str, Any]:
-        """Fix common parameter naming issues."""
-        fixes = parameter_fixes if parameter_fixes is not None else []
-        fixed_params = params.copy()
+        """Rename documented-equivalent fields; canonical fields always win."""
 
-        # Common parameter name mappings (removed conflicting mappings)
-        name_mappings = {
-            # Action variations (file_io, context tools)
+        general = {
             "op": "action",
             "operation": "action",
             "method": "action",
             "type": "action",
-            # Query variations (web_search tool)
             "search": "query",
             "q": "query",
             "term": "query",
             "search_term": "query",
             "keywords": "query",
-            # URL variations (project_setup tool)
             "url": "repository_url",
             "repo_url": "repository_url",
             "git_url": "repository_url",
             "repository": "repository_url",
             "repo": "repository_url",
             "git_repo": "repository_url",
-            # Target directory variations (project_setup tool)
             "destination": "target_directory",
             "dest": "target_directory",
             "target_dir": "target_directory",
             "output_dir": "target_directory",
             "clone_dir": "target_directory",
-            # Maven/build specific (non-conflicting)
             "options": "properties",
             "opts": "properties",
             "maven_options": "properties",
             "build_options": "properties",
-            # Context specific
             "context_type": "action",
             "name": "task_id",
             "parameters": "summary",
             "task_name": "task_id",
             "id": "task_id",
-            # Content variations (file_io tool)
             "data": "content",
             "text": "content",
             "body": "content",
             "file_content": "content",
         }
-
-        # Tool-specific mappings for better accuracy
-        tool_specific_mappings = {
+        tool_specific: Dict[str, Dict[str, str]] = {
             "bash": {
                 "cmd": "command",
                 "script": "command",
@@ -728,23 +643,15 @@ class ToolParameterNormalizer:
                 "execute": "command",
                 "bash_command": "command",
                 "shell_command": "command",
-                "path": "working_directory",  # Path should also map to working_directory for bash
+                "path": "working_directory",
             },
             "file_io": {
                 "file": "path",
                 "filename": "path",
                 "filepath": "path",
                 "file_path": "path",
-                "operation": "action",
-                "op": "action",
-                "data": "content",
-                "text": "content",
             },
             "project_setup": {
-                "url": "repository_url",
-                "repo": "repository_url",
-                "destination": "target_directory",
-                "dest": "target_directory",
                 "output": "target_directory",
                 "tag": "ref",
                 "release": "ref",
@@ -752,32 +659,21 @@ class ToolParameterNormalizer:
                 "commit_hash": "ref",
                 "version_ref": "ref",
             },
-            "project": {
-                "path": "project_path",
-            },
             "report": {
+                "content": "summary",
+                "outcome": "status",
                 "evidence": "evidence_refs",
                 "key_results": "details",
             },
             "maven": {
-                # Don't map 'goals' - it's a separate parameter from 'command'
-                "options": "properties",
                 "project_dir": "working_directory",
-                "cmd": "command",  # Common mistake
+                "cmd": "command",
                 "maven_command": "command",
             },
             "manage_context": {
-                "type": "action",
-                "operation": "action",
-                "context_type": "action",
-                "name": "task_id",
-                "id": "task_id",
-                "target": "action",  # Map target to action for switch-like operations
-                "switch": "action",  # Map switch to action
-                "task_name": "task_id",
-                "branch_name": "task_id",
-                # CRITICAL FIX: Map content-related parameters to 'entry' for add_context action
-                "description": "entry",  # Fixed: was incorrectly mapped to 'summary'
+                "target": "action",
+                "switch": "action",
+                "description": "entry",
                 "content": "entry",
                 "data": "entry",
                 "info": "entry",
@@ -785,855 +681,39 @@ class ToolParameterNormalizer:
                 "context": "entry",
                 "observation": "entry",
                 "result": "entry",
-                # For complete_task action, these should map to summary
                 "completion_summary": "summary",
                 "task_summary": "summary",
                 "results": "summary",
             },
         }
 
-        # Weak models commonly serialize a cwd alias even when the tool schema
-        # says ``working_directory``. Normalize this before state defaults are
-        # considered by the orchestrator. If both are present, the documented
-        # canonical field always wins; string length is not a precedence rule.
+        normalized = dict(params)
         if tool_name in {"build", "python", "maven", "gradle", "bash"}:
-            for old_name in (
-                "cwd",
-                "workdir",
-                "working_dir",
-                "work_dir",
-                "dir",
-                "directory",
-            ):
-                if old_name not in fixed_params or "working_directory" not in properties:
-                    continue
-                old_value = fixed_params[old_name]
-                if "working_directory" in fixed_params:
-                    self._add_parameter_fix(
-                        fixes,
-                        field=old_name,
-                        before=old_value,
-                        after=None,
-                        reason=(
-                            f"Removed alias '{old_name}' because "
-                            "'working_directory' already had a value"
-                        ),
-                        source="schema_alias",
-                    )
-                else:
-                    fixed_params["working_directory"] = old_value
-                    self._add_parameter_fix(
-                        fixes,
-                        field="working_directory",
-                        before=None,
-                        after=old_value,
-                        reason=f"Renamed parameter '{old_name}' to 'working_directory'",
-                        source="schema_alias",
-                    )
-                del fixed_params[old_name]
-
-        # Apply tool-specific mappings first (higher priority)
-        if tool_name in tool_specific_mappings:
-            tool_mappings = tool_specific_mappings[tool_name]
-            for old_name, new_name in tool_mappings.items():
-                if (
-                    tool_name == "project"
-                    and old_name == "path"
-                    and fixed_params.get("action") != "analyze"
-                ):
-                    continue
-                if old_name in fixed_params and new_name in properties:
-                    old_value = fixed_params[old_name]
-                    # If target parameter exists but old parameter has a non-default value, use the old value
-                    if new_name in fixed_params:
-                        # Check if the existing value is a default/placeholder value
-                        existing_value = fixed_params[new_name]
-                        if (
-                            existing_value in ["help", "", None]
-                            or str(existing_value).strip() == ""
-                            or (
-                                isinstance(existing_value, str)
-                                and len(old_value) > len(existing_value)
-                            )
-                        ):
-                            fixed_params[new_name] = old_value
-                            self._add_parameter_fix(
-                                fixes,
-                                field=new_name,
-                                before=existing_value,
-                                after=old_value,
-                                reason=f"Renamed parameter '{old_name}' to '{new_name}'",
-                                source="schema_alias",
-                            )
-                            self.logger.info(
-                                f"🔧 Tool-specific rename (override): '{old_name}' → '{new_name}' for {tool_name}"
-                            )
-                        else:
-                            self._add_parameter_fix(
-                                fixes,
-                                field=old_name,
-                                before=old_value,
-                                after=None,
-                                reason=f"Removed alias '{old_name}' because '{new_name}' already had a value",
-                                source="schema_alias",
-                            )
-                            self.logger.debug(
-                                f"🔧 Skipping rename '{old_name}' → '{new_name}' (target has value: {existing_value})"
-                            )
-                    else:
-                        # Target doesn't exist, normal mapping
-                        fixed_params[new_name] = old_value
-                        self._add_parameter_fix(
-                            fixes,
-                            field=new_name,
-                            before=None,
-                            after=old_value,
-                            reason=f"Renamed parameter '{old_name}' to '{new_name}'",
-                            source="schema_alias",
-                        )
-                        self.logger.info(
-                            f"🔧 Tool-specific rename: '{old_name}' → '{new_name}' for {tool_name}"
-                        )
-
-                    # Always delete the old parameter
-                    del fixed_params[old_name]
-
-        # Apply general mappings if target parameter exists in schema
-        mappings_applied = []
-        for old_name, new_name in name_mappings.items():
-            if old_name in fixed_params and new_name in properties and new_name not in fixed_params:
-                # Extract value from nested structure if needed (fix for parameters->summary mapping issue)
-                old_value = fixed_params[old_name]
-                if isinstance(old_value, dict) and len(old_value) == 1 and new_name in old_value:
-                    # Handle case where we have {'summary': {'summary': '...'}} -> extract the inner value
-                    new_value = old_value[new_name]
-                    fixed_params[new_name] = new_value
-                    self.logger.info(
-                        f"🔧 Extracted nested value from '{old_name}' to '{new_name}' for {tool_name}"
-                    )
-                else:
-                    new_value = old_value
-                    fixed_params[new_name] = new_value
-                    self.logger.info(
-                        f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}"
-                    )
-
-                self._add_parameter_fix(
-                    fixes,
-                    field=new_name,
-                    before=None,
-                    after=new_value,
-                    reason=f"Renamed parameter '{old_name}' to '{new_name}'",
-                    source="schema_alias",
-                )
-                del fixed_params[old_name]
-                mappings_applied.append(f"{old_name} → {new_name}")
-
-        # Log all mappings applied for debugging
-        if mappings_applied:
-            self.logger.debug(
-                f"Parameter mappings applied for {tool_name}: {', '.join(mappings_applied)}"
-            )
-
-        return fixed_params
-
-    def _apply_basic_parameter_fixes(
-        self,
-        tool_name: str,
-        params: Dict[str, Any],
-        parameter_fixes: Optional[list[ParameterFix]] = None,
-    ) -> Dict[str, Any]:
-        """Apply basic parameter fixes when schema is not available."""
-        fixes = parameter_fixes if parameter_fixes is not None else []
-        fixed_params = params.copy()
-
-        # Tool-specific basic fixes
-        if tool_name == "maven":
-            if not fixed_params.get("command"):
-                before = fixed_params.get("command")
-                fixed_params["command"] = "compile"
-                self._add_parameter_fix(
-                    fixes,
-                    field="command",
-                    before=before,
-                    after="compile",
-                    reason="Added default Maven command",
-                    source="default",
-                )
-        elif tool_name == "bash":
-            if not fixed_params.get("command"):
-                before = fixed_params.get("command")
-                fixed_params["command"] = "pwd"  # Safe default
-                self._add_parameter_fix(
-                    fixes,
-                    field="command",
-                    before=before,
-                    after="pwd",
-                    reason="Added default bash command",
-                    source="default",
-                )
-        elif tool_name == "file_io":
-            if not fixed_params.get("action"):
-                before = fixed_params.get("action")
-                fixed_params["action"] = "read"
-                self._add_parameter_fix(
-                    fixes,
-                    field="action",
-                    before=before,
-                    after="read",
-                    reason="Added default file_io action",
-                    source="default",
-                )
-            if not fixed_params.get("file_path") and fixed_params.get("action") == "read":
-                before = fixed_params.get("file_path")
-                fixed_params["file_path"] = "/workspace"
-                self._add_parameter_fix(
-                    fixes,
-                    field="file_path",
-                    before=before,
-                    after="/workspace",
-                    reason="Added default file path for read action",
-                    source="default",
-                )
-        elif tool_name == "manage_context":
-            if not fixed_params.get("action"):
-                before = fixed_params.get("action")
-                fixed_params["action"] = "get_info"
-                self._add_parameter_fix(
-                    fixes,
-                    field="action",
-                    before=before,
-                    after="get_info",
-                    reason="Added default manage_context action",
-                    source="default",
-                )
-        elif tool_name == "project_setup":
-            if not fixed_params.get("action"):
-                before = fixed_params.get("action")
-                # If we have a repository URL, default to clone
-                if self.repository_url:
-                    fixed_params["action"] = "clone"
-                    self._add_parameter_fix(
-                        fixes,
-                        field="action",
-                        before=before,
-                        after="clone",
-                        reason="Added default project_setup action",
-                        source="default",
-                    )
-                    repo_before = fixed_params.get("repository_url")
-                    fixed_params["repository_url"] = self.repository_url
-                    self._add_parameter_fix(
-                        fixes,
-                        field="repository_url",
-                        before=repo_before,
-                        after=self.repository_url,
-                        reason="Injected repository URL from orchestrator state",
-                        source="state_injection",
-                    )
-                    if self.repository_ref and not fixed_params.get("ref"):
-                        ref_before = fixed_params.get("ref")
-                        fixed_params["ref"] = self.repository_ref
-                        self._add_parameter_fix(
-                            fixes,
-                            field="ref",
-                            before=ref_before,
-                            after=self.repository_ref,
-                            reason="Injected repository ref from orchestrator state",
-                            source="state_injection",
-                        )
-                else:
-                    fixed_params["action"] = "detect_project_type"
-                    self._add_parameter_fix(
-                        fixes,
-                        field="action",
-                        before=before,
-                        after="detect_project_type",
-                        reason="Added default project_setup action",
-                        source="default",
-                    )
-        return fixed_params
-
-    def _apply_tool_specific_fixes(
-        self,
-        tool_name: str,
-        params: Dict[str, Any],
-        parameter_fixes: Optional[list[ParameterFix]] = None,
-    ) -> Dict[str, Any]:
-        """Apply tool-specific parameter fixes using state memory."""
-        fixes = parameter_fixes if parameter_fixes is not None else []
-        fixed_params = params.copy()
-
-        # The report tool has one verb. Models commonly echo the tool name as
-        # the action; canonicalize that harmless value before execution.
-        if tool_name == "report" and fixed_params.get("action") == "report":
-            fixed_params["action"] = "generate"
-            self._add_parameter_fix(
+            normalized = self._rename_aliases(
+                normalized,
+                properties,
+                {
+                    "cwd": "working_directory",
+                    "workdir": "working_directory",
+                    "working_dir": "working_directory",
+                    "work_dir": "working_directory",
+                    "dir": "working_directory",
+                    "directory": "working_directory",
+                },
                 fixes,
-                field="action",
-                before="report",
-                after="generate",
-                reason="Mapped report action to the report tool's generate verb",
-                source="safety_fix",
             )
 
-        # The clone fixes apply to the stage-1 'project' facade (whose clone
-        # verb passes parameters through to ProjectSetupTool) and to a directly
-        # registered legacy 'project_setup' tool alike.
-        if tool_name in ("project_setup", "project"):
-
-            def _clone_url(params_dict: Dict[str, Any]) -> Optional[str]:
-                return params_dict.get("repository_url") or params_dict.get("repo_url")
-
-            # Auto-inject repository URL if available and action is clone
-            if fixed_params.get("action") == "clone" and not _clone_url(fixed_params):
-                if self.repository_url:
-                    before = fixed_params.get("repository_url")
-                    fixed_params["repository_url"] = self.repository_url
-                    self._add_parameter_fix(
-                        fixes,
-                        field="repository_url",
-                        before=before,
-                        after=self.repository_url,
-                        reason="Injected repository URL from orchestrator state",
-                        source="state_injection",
-                    )
-                    if self.repository_ref and not fixed_params.get("ref"):
-                        ref_before = fixed_params.get("ref")
-                        fixed_params["ref"] = self.repository_ref
-                        self._add_parameter_fix(
-                            fixes,
-                            field="ref",
-                            before=ref_before,
-                            after=self.repository_ref,
-                            reason="Injected repository ref from orchestrator state",
-                            source="state_injection",
-                        )
-                    self.logger.info(f"🔧 Auto-injected repository URL: {self.repository_url}")
-
-            # CRITICAL FIX: Handle target_directory correctly for workspace vs fallback modes
-            if fixed_params.get("action") == "clone":
-                # Check current workspace status
-                is_fallback_mode = self.successful_states.get("workspace_fallback", False)
-                current_workdir = self.successful_states.get("working_directory", "/workspace")
-
-                if is_fallback_mode:
-                    # We're in abnormal fallback mode - need to specify full path
-                    fallback_reason = self.successful_states.get(
-                        "fallback_reason", "Unknown reason"
-                    )
-
-                    self.logger.error(f"🚨 CLONE IN FALLBACK MODE: Using {current_workdir}")
-                    self.logger.error(f"🚨 Reason: {fallback_reason}")
-                    self.logger.error("🚨 This is SUBOPTIMAL - clone should happen in /workspace")
-
-                    # For fallback mode, we need to specify the full path
-                    if not fixed_params.get("target_directory"):
-                        # Extract project name from URL
-                        repo_name = (
-                            (_clone_url(fixed_params) or "").split("/")[-1].replace(".git", "")
-                        )
-                        before = fixed_params.get("target_directory")
-                        if repo_name:
-                            fallback_target = f"{current_workdir}/{repo_name}"
-                            fixed_params["target_directory"] = fallback_target
-                            self._add_parameter_fix(
-                                fixes,
-                                field="target_directory",
-                                before=before,
-                                after=fallback_target,
-                                reason="Injected fallback clone target from current working directory",
-                                source="state_injection",
-                            )
-                            self.logger.error(
-                                f"🚨 Setting fallback clone target: {fallback_target}"
-                            )
-                        else:
-                            # Use fallback directory as-is
-                            fixed_params["target_directory"] = current_workdir
-                            self._add_parameter_fix(
-                                fixes,
-                                field="target_directory",
-                                before=before,
-                                after=current_workdir,
-                                reason="Injected fallback clone target from current working directory",
-                                source="state_injection",
-                            )
-                            self.logger.error(
-                                f"🚨 Using fallback directory directly: {current_workdir}"
-                            )
-                else:
-                    # Normal case - workspace is available
-                    self.logger.info("✅ CLONE IN WORKSPACE: Standard workspace cloning")
-
-                    # CRITICAL FIX: Don't set target_directory to /workspace!
-                    # Let project_setup tool auto-generate the project subdirectory name
-                    if fixed_params.get("target_directory") == "/workspace":
-                        # Remove the incorrect target_directory - let tool auto-generate
-                        before = fixed_params["target_directory"]
-                        del fixed_params["target_directory"]
-                        self._add_parameter_fix(
-                            fixes,
-                            field="target_directory",
-                            before=before,
-                            after=None,
-                            reason="Removed workspace root clone target so project_setup can create a subdirectory",
-                            source="safety_fix",
-                        )
-                        self.logger.info(
-                            "🔧 Removed incorrect target_directory, will auto-generate project subdirectory"
-                        )
-                    elif not fixed_params.get("target_directory"):
-                        # No target_directory specified - this is correct, tool will auto-generate
-                        self.logger.info(
-                            "✅ No target_directory specified - project_setup will create subdirectory"
-                        )
-                    else:
-                        # Explicit target_directory specified
-                        target_dir = fixed_params["target_directory"]
-                        if not target_dir.startswith("/workspace/"):
-                            self.logger.warning(f"⚠️ EXPLICIT NON-WORKSPACE CLONE: {target_dir}")
-                            self.logger.warning("⚠️ This may cause project layout issues")
-                        else:
-                            self.logger.info(f"✅ Workspace subdirectory clone: {target_dir}")
-
-            # Prevent duplicate cloning. The facade has no detect_project_type
-            # verb — its closest equivalent is analyze.
-            cloned_repos = self.successful_states.get("cloned_repos", set())
-            if fixed_params.get("action") == "clone" and _clone_url(fixed_params) in cloned_repos:
-                before = fixed_params.get("action")
-                fallback_action = "analyze" if tool_name == "project" else "detect_project_type"
-                self.logger.warning(
-                    f"🔧 Repository already cloned, changing action to {fallback_action}"
-                )
-                fixed_params["action"] = fallback_action
-                self._add_parameter_fix(
-                    fixes,
-                    field="action",
-                    before=before,
-                    after=fallback_action,
-                    reason="Avoided duplicate clone for already cloned repository",
-                    source="safety_fix",
-                )
-
-        elif tool_name == "maven":
-            # Ensure maven has a valid command
-            if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
-                before = fixed_params.get("command")
-                # Use intelligent default based on current state
-                if self.successful_states.get("maven_success"):
-                    fixed_params["command"] = "test"  # If compile succeeded before, try test
-                else:
-                    fixed_params["command"] = "compile"  # Start with compile
-                self._add_parameter_fix(
-                    fixes,
-                    field="command",
-                    before=before,
-                    after=fixed_params["command"],
-                    reason="Added default Maven command based on successful state",
-                    source="default",
-                )
-
-            # Auto-inject successful working directory for Maven operations
-            if "working_directory" not in fixed_params:
-                if self.successful_states.get("working_directory"):
-                    before = fixed_params.get("working_directory")
-                    fixed_params["working_directory"] = self.successful_states["working_directory"]
-                    self._add_parameter_fix(
-                        fixes,
-                        field="working_directory",
-                        before=before,
-                        after=self.successful_states["working_directory"],
-                        reason="Injected working directory from successful state",
-                        source="state_injection",
-                    )
-                    self.logger.info(
-                        f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}"
-                    )
-                else:
-                    # Try to infer from repository URL
-                    if self.repository_url:
-                        repo_name = self.repository_url.split("/")[-1].replace(".git", "")
-                        inferred_workdir = f"/workspace/{repo_name}"
-                        before = fixed_params.get("working_directory")
-                        fixed_params["working_directory"] = inferred_workdir
-                        self._add_parameter_fix(
-                            fixes,
-                            field="working_directory",
-                            before=before,
-                            after=inferred_workdir,
-                            reason="Inferred working directory from repository URL",
-                            source="state_injection",
-                        )
-                        self.logger.info(
-                            f"🔧 Inferred working directory from repo: /workspace/{repo_name}"
-                        )
-
-            # Convert common typos
-            command = fixed_params.get("command", "")
-            if command in ["test", "tests"]:
-                fixed_params["command"] = "test"
-            elif command in ["build", "compile"]:
-                fixed_params["command"] = "compile"
-            elif command in ["install", "package"]:
-                fixed_params["command"] = "package"
-            self._add_parameter_fix(
+        if tool_name == "project" and normalized.get("action") == "analyze":
+            normalized = self._rename_aliases(
+                normalized,
+                properties,
+                {"path": "project_path"},
                 fixes,
-                field="command",
-                before=command,
-                after=fixed_params.get("command"),
-                reason="Normalized Maven command alias",
-                source="safety_fix",
             )
-
-        elif tool_name == "build":
-            # The consolidated build tool defaults to /workspace, but clones
-            # land in /workspace/<repo> — inject the known-good or inferred
-            # directory exactly like the legacy maven path did.
-            if "working_directory" not in fixed_params:
-                if self.successful_states.get("working_directory"):
-                    before = fixed_params.get("working_directory")
-                    fixed_params["working_directory"] = self.successful_states["working_directory"]
-                    self._add_parameter_fix(
-                        fixes,
-                        field="working_directory",
-                        before=before,
-                        after=self.successful_states["working_directory"],
-                        reason="Injected working directory from successful state",
-                        source="state_injection",
-                    )
-                    self.logger.info(
-                        f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}"
-                    )
-                elif self.repository_url:
-                    repo_name = self.repository_url.split("/")[-1].replace(".git", "")
-                    inferred_workdir = f"/workspace/{repo_name}"
-                    before = fixed_params.get("working_directory")
-                    fixed_params["working_directory"] = inferred_workdir
-                    self._add_parameter_fix(
-                        fixes,
-                        field="working_directory",
-                        before=before,
-                        after=inferred_workdir,
-                        reason="Inferred working directory from repository URL",
-                        source="state_injection",
-                    )
-                    self.logger.info(f"🔧 Inferred working directory from repo: {inferred_workdir}")
-
-        elif tool_name == "bash":
-            # Ensure bash has a command
-            if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
-                before = fixed_params.get("command")
-                fixed_params["command"] = "pwd"
-                self._add_parameter_fix(
-                    fixes,
-                    field="command",
-                    before=before,
-                    after="pwd",
-                    reason="Added default bash command",
-                    source="default",
-                )
-
-            # Auto-inject successful working directory for bash operations
-            if "working_directory" not in fixed_params:
-                before = fixed_params.get("working_directory")
-                if self.successful_states.get("working_directory"):
-                    fixed_params["working_directory"] = self.successful_states["working_directory"]
-                    self._add_parameter_fix(
-                        fixes,
-                        field="working_directory",
-                        before=before,
-                        after=self.successful_states["working_directory"],
-                        reason="Injected working directory from successful state",
-                        source="state_injection",
-                    )
-                    self.logger.info(
-                        f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}"
-                    )
-                else:
-                    fixed_params["working_directory"] = "/workspace"
-                    self._add_parameter_fix(
-                        fixes,
-                        field="working_directory",
-                        before=before,
-                        after="/workspace",
-                        reason="Injected default workspace working directory",
-                        source="state_injection",
-                    )
-
-            command_str = fixed_params.get("command", "")
-            rewritten_command, added_fail_at_end = self._append_maven_fail_at_end_if_needed(
-                command_str
-            )
-            if added_fail_at_end:
-                before = command_str
-                fixed_params["command"] = rewritten_command
-                self._add_parameter_fix(
-                    fixes,
-                    field="command",
-                    before=before,
-                    after=fixed_params["command"],
-                    reason="Appended Maven fail-at-end flag to bash command",
-                    source="safety_fix",
-                )
-                self.logger.info("🔧 Appended --fail-at-end to bash Maven command")
-
-        elif tool_name == "file_io":
-            # Ensure file_io has an action
-            if not fixed_params.get("action"):
-                before = fixed_params.get("action")
-                fixed_params["action"] = "read"
-                self._add_parameter_fix(
-                    fixes,
-                    field="action",
-                    before=before,
-                    after="read",
-                    reason="Added default file_io action",
-                    source="default",
-                )
-
-            # CRITICAL PRIORITY: Use workspace paths when possible, warn about fallbacks
-            current_workdir = self.successful_states.get("working_directory", "/workspace")
-            is_fallback_mode = self.successful_states.get("workspace_fallback", False)
-
-            # If reading but no file path, default to current directory listing
-            if fixed_params.get("action") == "read" and not fixed_params.get("path"):
-                action_before = fixed_params.get("action")
-                path_before = fixed_params.get("path")
-                fixed_params["action"] = "list"
-                fixed_params["path"] = current_workdir
-                self._add_parameter_fix(
-                    fixes,
-                    field="action",
-                    before=action_before,
-                    after="list",
-                    reason="Switched read without path to directory listing",
-                    source="safety_fix",
-                )
-                self._add_parameter_fix(
-                    fixes,
-                    field="path",
-                    before=path_before,
-                    after=current_workdir,
-                    reason="Injected current working directory for file listing",
-                    source="state_injection",
-                )
-
-                if is_fallback_mode:
-                    self.logger.error(
-                        f"🚨 FILE_IO FALLBACK: Listing {current_workdir} (not in workspace)"
-                    )
-                else:
-                    self.logger.info(f"✅ FILE_IO WORKSPACE: Listing {current_workdir}")
-
-            # If path is relative and we have a known working directory, make it absolute
-            elif fixed_params.get("path") and not fixed_params["path"].startswith("/"):
-                relative_path = fixed_params["path"]
-                absolute_path = f"{current_workdir}/{relative_path}"
-                fixed_params["path"] = absolute_path
-                self._add_parameter_fix(
-                    fixes,
-                    field="path",
-                    before=relative_path,
-                    after=absolute_path,
-                    reason="Resolved relative file path against current working directory",
-                    source="safety_fix",
-                )
-
-                if is_fallback_mode:
-                    self.logger.error(
-                        f"🚨 FILE_IO FALLBACK PATH: {relative_path} → {absolute_path} (not in workspace)"
-                    )
-                else:
-                    self.logger.info(
-                        f"✅ FILE_IO WORKSPACE PATH: {relative_path} → {absolute_path}"
-                    )
-
-            # PRIORITY CHECK: If path points to /workspace but we're in fallback mode, this is concerning
-            elif fixed_params.get("path") and fixed_params["path"].startswith("/workspace"):
-                if is_fallback_mode and not current_workdir.startswith("/workspace"):
-                    original_path = fixed_params["path"]
-                    self.logger.error(
-                        f"🚨 FILE_IO MISMATCH: Requesting {original_path} but workspace unavailable"
-                    )
-                    self.logger.error(f"🚨 Current fallback directory: {current_workdir}")
-
-                    # Try to map /workspace/... to current_workdir/...
-                    relative_part = original_path.replace("/workspace", "").lstrip("/")
-                    if relative_part:
-                        adjusted_path = f"{current_workdir}/{relative_part}"
-                        self.logger.error(
-                            f"🚨 ATTEMPTING PATH MAPPING: {original_path} → {adjusted_path}"
-                        )
-                        self.logger.error("🚨 This may fail if files are actually in /workspace")
-                    else:
-                        adjusted_path = current_workdir
-                        self.logger.error(f"🚨 MAPPING WORKSPACE ROOT to fallback: {adjusted_path}")
-
-                    fixed_params["path"] = adjusted_path
-                    self._add_parameter_fix(
-                        fixes,
-                        field="path",
-                        before=original_path,
-                        after=adjusted_path,
-                        reason="Mapped workspace path to fallback working directory",
-                        source="safety_fix",
-                    )
-                else:
-                    # Normal case - workspace path and we're in workspace
-                    if not is_fallback_mode:
-                        self.logger.debug(f"✅ FILE_IO WORKSPACE: Accessing {fixed_params['path']}")
-                    else:
-                        self.logger.info(
-                            f"✅ FILE_IO WORKSPACE: Accessing {fixed_params['path']} (workspace available)"
-                        )
-
-            # If we're in fallback mode, warn about any non-fallback paths
-            elif is_fallback_mode and fixed_params.get("path"):
-                path = fixed_params["path"]
-                if not path.startswith(current_workdir):
-                    self.logger.warning(
-                        f"⚠️ FILE_IO OUTSIDE FALLBACK: Accessing {path} while in fallback mode ({current_workdir})"
-                    )
-                    self.logger.warning("⚠️ This may fail if the path doesn't exist")
-
-        elif tool_name == "manage_context":
-            # Fix common action name errors with comprehensive alias mapping
-            action = fixed_params.get("action", "")
-
-            # Map common variations to correct actions
-            action_aliases = {
-                # Start task aliases
-                "start": "start_task",
-                "begin": "start_task",
-                "create": "start_task",
-                "create_branch": "start_task",
-                "new": "start_task",
-                "new_task": "start_task",
-                # Get info aliases
-                "info": "get_info",
-                "status": "get_info",
-                "current": "get_info",
-                "check": "get_info",
-                # Complete task aliases
-                "complete": "complete_task",
-                "finish": "complete_task",
-                "end": "complete_task",
-                "done": "complete_task",
-                "complete_branch": "complete_task",
-                "switch_to_trunk": "complete_task",
-                "failure": "complete_task",
-                "failed": "complete_task",
-                # Add context aliases
-                "add": "add_context",
-                "record": "add_context",
-                "log": "add_context",
-                # Get context aliases
-                "get": "get_full_context",
-                "show": "get_full_context",
-                "view": "get_full_context",
-                "history": "get_full_context",
-                # Compact context aliases
-                "compress": "compact_context",
-                "compact": "compact_context",
-                "reduce": "compact_context",
-            }
-
-            if action in action_aliases:
-                original_action = action
-                fixed_params["action"] = action_aliases[action]
-                self._add_parameter_fix(
-                    fixes,
-                    field="action",
-                    before=original_action,
-                    after=action_aliases[action],
-                    reason="Normalized manage_context action alias",
-                    source="safety_fix",
-                )
-                self.logger.info(
-                    f"🔧 Converted action '{original_action}' to '{action_aliases[action]}' for manage_context"
-                )
-
-                # Add default summary for completion actions
-                if action_aliases[action] == "complete_task" and not fixed_params.get("summary"):
-                    summary_before = fixed_params.get("summary")
-                    if action in ["failure", "failed"]:
-                        fixed_params["summary"] = (
-                            "Task failed to complete successfully due to encountered issues"
-                        )
-                    else:
-                        fixed_params["summary"] = "Task completed with mixed results"
-                    self._add_parameter_fix(
-                        fixes,
-                        field="summary",
-                        before=summary_before,
-                        after=fixed_params["summary"],
-                        reason="Added default summary for complete_task action",
-                        source="default",
-                    )
-                    self.logger.info("🔧 Added default summary for complete_task action")
-            elif action == "switch_to_trunk":
-                # This is correct, but ensure we have a summary if needed
-                if not fixed_params.get("summary"):
-                    before = fixed_params.get("summary")
-                    fixed_params["summary"] = "Switching back to trunk context"
-                    self._add_parameter_fix(
-                        fixes,
-                        field="summary",
-                        before=before,
-                        after="Switching back to trunk context",
-                        reason="Added default summary for switch_to_trunk action",
-                        source="default",
-                    )
-                    self.logger.info("🔧 Added default summary for switch_to_trunk action")
-
-            # Ensure required parameters for create_branch
-            if fixed_params.get("action") == "create_branch":
-                if not fixed_params.get("task_id"):
-                    # Generate a default task_id if missing
-                    before = fixed_params.get("task_id")
-                    summary = fixed_params.get("summary", "default_task")
-                    task_id = summary.replace(" ", "_").lower()[:20]
-                    fixed_params["task_id"] = task_id
-                    self._add_parameter_fix(
-                        fixes,
-                        field="task_id",
-                        before=before,
-                        after=task_id,
-                        reason="Generated missing task_id from summary",
-                        source="default",
-                    )
-                    self.logger.info(f"🔧 Generated missing task_id: {task_id}")
-
-            # For start_task, ensure we have task_id
-            elif fixed_params.get("action") == "start_task":
-                if not fixed_params.get("task_id"):
-                    # Auto-inject the correct next task ID based on context
-                    before = fixed_params.get("task_id")
-                    fixed_params["task_id"] = "task_1"  # Default to first task
-                    self._add_parameter_fix(
-                        fixes,
-                        field="task_id",
-                        before=before,
-                        after="task_1",
-                        reason="Added default task_id for start_task",
-                        source="default",
-                    )
-                    self.logger.info("🔧 Auto-injected default task_id: task_1 for start_task")
-
-            # For complete_task, ensure we have summary
-            elif fixed_params.get("action") == "complete_task":
-                if not fixed_params.get("summary"):
-                    before = fixed_params.get("summary")
-                    fixed_params["summary"] = "Task completed with mixed results"
-                    self._add_parameter_fix(
-                        fixes,
-                        field="summary",
-                        before=before,
-                        after="Task completed with mixed results",
-                        reason="Added default summary for complete_task action",
-                        source="default",
-                    )
-                    self.logger.info("🔧 Added default summary for complete_task action")
-
-        return fixed_params
+        normalized = self._rename_aliases(
+            normalized,
+            properties,
+            tool_specific.get(tool_name, {}),
+            fixes,
+        )
+        return self._rename_aliases(normalized, properties, general, fixes)

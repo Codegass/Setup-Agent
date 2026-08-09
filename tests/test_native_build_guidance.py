@@ -37,6 +37,13 @@ import re
 import shlex
 from types import SimpleNamespace
 
+from container_evidence_fakes import (
+    ContainerFS,
+    add_published_mutable_json,
+    strict_published_evidence,
+)
+
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.phase_machine import PhaseMachine
 from sag.agent.physical_survey import _smoke_candidates_from_pyproject
 from sag.agent.physical_validator import PhysicalValidator
@@ -44,6 +51,16 @@ from sag.agent.project_fact_projection import render_project_fact_sheet
 from sag.agent.react_engine import ReActEngine
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+_ATOMIC_WRITE_PREFIXES = (
+    "mkdir -p -- ",
+    ": > ",
+    "printf '%s' ",
+    "base64 --decode ",
+    "python3 -c ",
+    "rm -f -- ",
+    "mv -f -- ",
+)
 
 # ---------------------------------------------------------------------------
 # Scripted repo (mirrors tests/test_python_phase_guidance.py::_ScriptedRepo,
@@ -63,9 +80,15 @@ class _ScriptedRepo:
             parts = path.split("/")
             for i in range(2, len(parts)):
                 self.dirs.add("/".join(parts[:i]))
-        self.written = {}  # REQUIREMENTS_PATH heredoc capture
+        self.written = {}  # atomically persisted REQUIREMENTS_PATH capture
+        self.atomic = ContainerFS()
+        self.atomic.files = self.written
 
     def execute_command(self, command, **kwargs):
+        if "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.atomic(command, **kwargs)
+        if command.startswith(_ATOMIC_WRITE_PREFIXES):
+            return self.atomic(command, **kwargs)
         cmd = command.strip()
         # Manifest heredoc write: capture the JSON body.
         if cmd.startswith("cat >") or cmd.startswith("cat > "):
@@ -482,9 +505,11 @@ def test_native_build_intro_has_no_prehoc_native_first_block():
     # dim (e) deleted: no pre-hoc native-first prose.
     for marker in _NATIVE_FIRST_MARKERS:
         assert marker not in intro, f"native-first prose should be gone: {marker!r}"
-    # The python FACTS objective + coordinates remain (physical substrate).
-    assert "build(action='deps')" in intro
-    assert "build(action='compile')" in intro
+    # The Python outcome contract + coordinates remain (physical substrate),
+    # without selecting a setup action before the model reasons from facts.
+    assert "dependency readiness" in intro
+    assert "registered interpreter" in intro
+    assert "build(action=" not in intro
     assert f"Build coordinates: python at {_TVM_ROOT}/python." in intro
 
 
@@ -496,8 +521,9 @@ def test_plain_python_intro_carries_facts_objective_and_coordinates():
     assert "NATIVE core" not in intro
     assert "native library FIRST" not in intro
     assert "=== PROJECT BRIEF v1 ===" not in intro  # dim (c) deleted
-    assert "build(action='deps')" in intro
-    assert "build(action='compile')" in intro
+    assert "dependency readiness" in intro
+    assert "registered interpreter" in intro
+    assert "build(action=" not in intro
     assert f"Build coordinates: python at {_PLAIN_ROOT}." in intro
 
 
@@ -531,6 +557,21 @@ class NativeLadderOrch:
         self.import_ok = import_ok
         self.manifest = manifest if manifest is not None else _native_manifest()
         self.commands = []
+        self.evidence_store = strict_published_evidence(
+            self,
+            run_id="run-pytest",
+            target_sha="a" * 40,
+            run_pin=False,
+        )
+        add_published_mutable_json(
+            self,
+            self.evidence_store,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=self.manifest,
+        )
 
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
@@ -539,6 +580,8 @@ class NativeLadderOrch:
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
 
         c = cmd.strip()
+        if "SAG_NAMED_JSON_RECORD_V1" in c:
+            return self.evidence_store(cmd, workdir=workdir, **kwargs)
         if c in (
             f"cat {REQUIREMENTS_PATH}",
             f"cat -- {REQUIREMENTS_PATH}",
@@ -617,14 +660,16 @@ def test_native_core_not_built_caps_at_partial():
     assert "native core not built" in result["reason"]
 
 
-def test_native_core_built_leaves_ladder_unchanged():
-    """With the native .so present, the native rung is satisfied and the ladder
-    is the ordinary all-green SUCCESS — the native cap adds nothing."""
+def test_native_core_built_satisfies_artifact_rung_but_not_runtime_rungs():
+    """A native artifact is read-only physical evidence; absent producer
+    receipts keep pip/import/compile facts unknown and the ladder partial."""
     orch = NativeLadderOrch(so_present=True)
     result = _validate(orch)
     assert result["success"] is True
-    assert result["build_complete"] is True
-    assert result["evidence_status"] == "success"
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["fingerprint_details"]["native_artifact_ok"] is True
+    assert "no producer receipt" in result["reason"]
     assert "native core not built" not in result["reason"]
 
 
@@ -634,8 +679,9 @@ def test_native_flag_absent_never_adds_native_cap():
     orch = NativeLadderOrch(so_present=False, manifest=_native_manifest(has_native_build=False))
     result = _validate(orch)
     assert result["success"] is True
-    assert result["build_complete"] is True
-    assert result["evidence_status"] == "success"
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "no producer receipt" in result["reason"]
     assert "native core not built" not in result["reason"]
 
 
@@ -733,6 +779,21 @@ class StrictNativeLadderOrch:
         self.workspace_realpath = workspace_realpath
         self.survey_realpath = survey_realpath
         self.commands = []
+        self.evidence_store = strict_published_evidence(
+            self,
+            run_id="run-pytest",
+            target_sha="a" * 40,
+            run_pin=False,
+        )
+        add_published_mutable_json(
+            self,
+            self.evidence_store,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=self.manifest,
+        )
 
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
@@ -741,6 +802,8 @@ class StrictNativeLadderOrch:
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
 
         c = cmd.strip()
+        if "SAG_NAMED_JSON_RECORD_V1" in c:
+            return self.evidence_store(cmd, workdir=workdir, **kwargs)
         if c in (
             f"cat {REQUIREMENTS_PATH}",
             f"cat -- {REQUIREMENTS_PATH}",
@@ -990,13 +1053,13 @@ def test_v8_root_record_artifact_and_package_paths_verify_exact_scope():
     result = _validate_strict_native(orch)
     details = result["evidence"]["fingerprint_details"]
 
-    assert result["build_complete"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
     assert details["distribution_record_ok"] is True
     assert details["distribution_origin_ok"] is True
     assert details["native_artifact_ok"] is True
     assert result["test_entry_ready"] is True
-    compileall = next(command for command in orch.commands if "-m compileall" in command)
-    assert compileall.split("-q ", 1)[1] == "/workspace/tvm/python/tvm"
+    assert not any("-m compileall" in command for command in orch.commands)
 
 
 def test_v8_subdir_install_origin_and_package_paths_use_python_root():
@@ -1039,12 +1102,12 @@ def test_v8_subdir_install_origin_and_package_paths_use_python_root():
 
     result = _validate_strict_native(orch)
 
-    assert result["build_complete"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
     details = result["evidence"]["fingerprint_details"]
     assert details["distribution_origin_ok"] is True
     assert details["native_artifact_ok"] is True
-    compileall = next(command for command in orch.commands if "-m compileall" in command)
-    assert compileall.split("-q ", 1)[1] == "/workspace/tvm/python/src/native_pkg"
+    assert not any("-m compileall" in command for command in orch.commands)
     native_find = next(
         command for command in orch.commands if "'*.so'" in command and "'*.dylib'" in command
     )
@@ -1097,7 +1160,8 @@ def test_v8_unsafe_first_artifact_does_not_hide_later_owned_artifact():
     )
     result = _validate_strict_native(orch)
 
-    assert result["build_complete"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
     assert result["evidence"]["fingerprint_details"]["native_artifact_ok"] is True
     native_find = next(
         command for command in orch.commands if "'*.so'" in command and "'*.dylib'" in command

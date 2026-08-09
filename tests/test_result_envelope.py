@@ -88,7 +88,7 @@ def test_observation_running_handoff_keeps_positive_running_wording():
     assert "✅" not in observation.split("\n")[0]
 
 
-def test_observation_unknown_liveness_instructs_polling_existing_job():
+def test_observation_unknown_liveness_is_owned_by_the_controller():
     result = ToolResult(
         invocation_status="pending",
         operation_outcome="unknown",
@@ -102,7 +102,8 @@ def test_observation_unknown_liveness_instructs_polling_existing_job():
     first_line = observation.splitlines()[0].lower()
 
     assert "liveness is unknown" in first_line
-    assert "poll existing job job:background-build" in first_line
+    assert "controller owns reconciliation" in first_line
+    assert "job:background-build" in first_line
     assert "still running" not in first_line
 
 

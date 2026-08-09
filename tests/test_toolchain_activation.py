@@ -3,15 +3,10 @@
 Both faults are recorded, not imagined.
 
 B1 — polaris, `logs/session_20260727_065557_97847`: Java 21 was provisioned,
-registered and activated (`project(action='env', activate=True)`), and the
-compile that would have run under it was refused three times as
-`RETRY_WITHOUT_DELTA` with the SAME `retry_key` (`5b057768a1d3b320`,
-`runner_dispatched: false`).  The retry identity's toolchain component hashes
-`/workspace/.setup_agent/toolchains.json`; no session in the 23-project
-campaign ever wrote that file, because every real registration lands in
-`env_overlay.json` instead.  Registry and overlay were two disconnected
-stores, so a registration was invisible to the dispatch that was supposed to
-inherit it.
+registered and activated, but no session in the 23-project campaign wrote
+`/workspace/.setup_agent/toolchains.json`; every real registration landed only
+in `env_overlay.json`. Registry and overlay were disconnected, so durable
+runtime inventory and fallback resolution could not observe the registration.
 
 B2 — camel-quarkus, `logs/session_20260727_063915_96714`: the overlay listed
 more than one Maven for one tool and no active candidate, and the phase had no
@@ -22,11 +17,11 @@ rule with which to choose.  The shapes below are that session's real
 import json
 import shlex
 
-from sag.agent.retry_authority import (
-    TOOLCHAIN_REGISTRY_PATH as RETRY_TOOLCHAIN_REGISTRY_PATH,
+from sag.agent.evidence_publications import (
+    ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+    evidence_publication_authority_for,
 )
-from sag.agent.retry_authority import compute_retry_key, toolchain_state_fingerprint
-from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
+from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
 from sag.tools.internal.build_preflight import (
     JAVA_RUNTIME_CONFLICT,
     REQUIREMENTS_PATH,
@@ -67,6 +62,24 @@ class FakeContainer:
         self.java_version_banner = java_version_banner
         self.path_executables = dict(path_executables or {})
         self.commands = []
+        raw_overlay = self.files.pop(DEFAULT_OVERLAY_JSON, None)
+        if raw_overlay is not None:
+            self.publish_overlay(json.loads(raw_overlay))
+
+    def publish_overlay(self, payload):
+        store = EnvOverlayStore(self)
+        normalized = store._normalize_overlay(dict(payload))
+        raw = store._canonical_overlay_json(normalized)
+        self.files[DEFAULT_OVERLAY_JSON] = raw
+        authority = evidence_publication_authority_for(self)
+        prior = authority.latest_head(ENV_OVERLAY_LOGICAL_ARTIFACT_ID)
+        authority.publish_revision(
+            record_kind="env_overlay",
+            record_id=ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+            raw=raw.encode("utf-8"),
+            expected_previous_raw_sha256=(prior.raw_sha256 if prior else "0" * 64),
+        )
 
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=None):
         self.commands.append(command)
@@ -161,31 +174,14 @@ def _polaris_container():
     )
 
 
-def _dispatch_contract():
-    """The retry-relevant view of the polaris compile that was refused."""
-    return {
-        "requested_call": {"tool": "build"},
-        "effective_action": "compile",
-        "expected_argv": "/workspace/polaris/gradlew --continue --build-cache compileJava",
-        "target_sha": "da95233805815b1d6a8576c5b527143193e7d7e5",
-        "config_fingerprint": "2151062651 52941 L0",
-    }
-
-
 # ---------------------------------------------------------------------------
 # B1 — the registered runtime reaches the dispatch
 # ---------------------------------------------------------------------------
 
 
-def test_env_registration_reaches_the_dispatch_toolchain_state():
-    """polaris regression: registry -> overlay -> dispatch carries the runtime."""
+def test_env_registration_reaches_runtime_registry_and_resolution():
+    """polaris regression: registration reaches both execution consumers."""
     container = _polaris_container()
-    contract = _dispatch_contract()
-    before = compute_retry_key(
-        contract,
-        "expectation_unmet",
-        toolchain_state=toolchain_state_fingerprint(container.execute_command),
-    )
 
     result = EnvTool(container).execute(
         action="register",
@@ -194,8 +190,8 @@ def test_env_registration_reaches_the_dispatch_toolchain_state():
         requirement="21",
         env={
             "JAVA_HOME": "/usr/lib/jvm/java-21-openjdk-arm64",
-            "PATH": "/usr/lib/jvm/java-21-openjdk-arm64/bin:/usr/bin:/bin",
         },
+        path_prepend=["/usr/lib/jvm/java-21-openjdk-arm64/bin"],
         activate=True,
     )
 
@@ -206,29 +202,16 @@ def test_env_registration_reaches_the_dispatch_toolchain_state():
     registry = json.loads(container.files[TOOLCHAIN_REGISTRY_PATH])
     assert registry["java"]["java"][0]["path"] == JAVA_21
 
-    after = compute_retry_key(
-        contract,
-        "expectation_unmet",
-        toolchain_state=toolchain_state_fingerprint(container.execute_command),
-    )
-    assert after != before
+    resolved = ToolchainManager(container).resolve(ToolchainSpec(name="java", executable="java"))
+    assert resolved is not None
+    assert resolved.candidate.path == JAVA_21
 
 
-def test_the_registry_the_dispatch_reads_is_the_registry_registration_writes():
-    """One path, stated once on each side, asserted to be the same path.
-
-    The whole B1 fault was two stores that never met. A drift between these
-    two constants would silently recreate it.
-    """
-    assert TOOLCHAIN_REGISTRY_PATH == RETRY_TOOLCHAIN_REGISTRY_PATH
-
-
-def test_identical_re_registration_leaves_the_dispatch_identity_alone():
-    """A repeat of the same registration is not new material progress.
+def test_identical_re_registration_leaves_the_registry_byte_stable():
+    """A repeat of the same registration states no new runtime fact.
 
     camel-quarkus registered the same Maven three times.  The registry records
-    the runtime, not the number of times a model asked for it, so a re-register
-    that states nothing new must not hand the retry law a fresh identity.
+    the runtime, not the number of times a model asked for it.
     """
     container = _polaris_container()
     tool = EnvTool(container)
@@ -280,6 +263,41 @@ def test_registered_java_the_dispatch_does_run_states_no_conflict():
 
     assert outcome.conflicts == ()
     assert outcome.matched is True
+
+
+def test_provisioning_postcondition_rejects_same_major_on_wrong_java_executable(
+    monkeypatch,
+):
+    container = FakeContainer(
+        java_executable=JAVA_17,
+        java_version_banner='openjdk version "17.0.19" 2026-01-20',
+    )
+
+    def provision(_self, _version):
+        return "/usr/lib/jvm/java-21-openjdk-arm64"
+
+    def register(orchestrator, java_home, version):
+        EnvOverlayStore(orchestrator).register(
+            "java",
+            f"{java_home}/bin/java",
+            version=version,
+            env={"JAVA_HOME": java_home},
+            activate=True,
+        )
+        # The shell changed its version banner but still resolves the old
+        # executable: this is the production activation defect, not success.
+        orchestrator.java_version_banner = 'openjdk version "21.0.9" 2026-01-20'
+        return True
+
+    monkeypatch.setattr(JdkPreflight, "_provision", provision)
+    monkeypatch.setattr("sag.tools.internal.build_preflight._register_overlay", register)
+
+    outcome = JdkPreflight(container).run("21", source="runner-observed")
+
+    assert outcome.provisioned is False
+    assert outcome.mismatch is True
+    assert JAVA_RUNTIME_CONFLICT in outcome.conflicts
+    assert "postcondition failed" in outcome.narration
 
 
 def test_version_mismatch_against_the_registered_runtime_is_named():
@@ -603,7 +621,7 @@ def test_a_blocked_registered_candidate_is_never_the_resolution():
             "source": "build_error",
         }
     ]
-    container.files[DEFAULT_OVERLAY_JSON] = json.dumps(overlay)
+    container.publish_overlay(overlay)
 
     resolved = ToolchainManager(container).resolve(
         ToolchainSpec(name="maven", executable="mvn"),

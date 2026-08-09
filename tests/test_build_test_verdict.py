@@ -1650,7 +1650,9 @@ def test_scan_modules_includes_root_in_multi_module():
 # ===========================================================================
 # 4. --fail-at-end backend wiring (compile/package, not just test)
 # ===========================================================================
-def test_compile_and_package_pass_fail_at_end_for_whole_reactor():
+def test_compile_and_package_pass_fail_at_end_for_whole_reactor(
+    exact_build_facade_authority,
+):
     for action in ("compile", "package"):
         maven, gradle = FakeBackendTool(), FakeBackendTool()
         _tool({"pom.xml"}, maven=maven).execute(action=action, working_directory="/w")
@@ -1659,7 +1661,7 @@ def test_compile_and_package_pass_fail_at_end_for_whole_reactor():
         assert gradle.calls[0].get("fail_at_end") is True, action
 
 
-def test_deps_does_not_pass_fail_at_end():
+def test_deps_does_not_pass_fail_at_end(exact_build_facade_authority):
     maven = FakeBackendTool()
     _tool({"pom.xml"}, maven=maven).execute(action="deps", working_directory="/w")
     assert "fail_at_end" not in maven.calls[0]

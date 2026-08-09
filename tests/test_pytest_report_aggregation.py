@@ -29,6 +29,7 @@ import subprocess
 
 import pytest
 
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import PhysicalValidator
 from sag.tools.internal.python_tool import COLLECTED_JSON, PYTEST_REPORT_DIR
 from sag.tools.report_tool import ReportTool
@@ -499,6 +500,12 @@ class CollectedDenominatorOrch:
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
         c = cmd.strip()
+        if "SAG_NAMED_JSON_RECORD_V1" in c:
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream([]),
+            }
         if "SAG_COMPACT_TEST_REPORT_PARSER" in c:
             # Force the shell discovery path (canned commands below).
             return {"exit_code": 1, "success": False, "output": ""}
@@ -519,7 +526,7 @@ class CollectedDenominatorOrch:
         return {"exit_code": 0, "output": ""}
 
 
-def test_collected_json_fallback_populates_test_stats_discovered():
+def test_unpublished_collected_json_does_not_populate_test_stats_discovered():
     orch = CollectedDenominatorOrch(collected=635)
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
@@ -527,9 +534,9 @@ def test_collected_json_fallback_populates_test_stats_discovered():
 
     assert result["has_test_reports"] is True
     assert result["test_stats"] is not None
-    assert result["test_stats"]["discovered"] == 635
-    assert result["static_test_count"] == 635
-    assert any(COLLECTED_JSON in c for c in orch.commands)
+    assert result["test_stats"]["discovered"] is None
+    assert result["static_test_count"] is None
+    assert not any(COLLECTED_JSON in c for c in orch.commands)
 
 
 def test_execution_coverage_gate_consumes_collected_fallback(workspace):
@@ -657,14 +664,7 @@ def test_java_method_denominator_keeps_unique_numerator():
     assert "tests_not_fully_executed" not in snapshot["evidence_result"].get("conflicts", [])
 
 
-def test_collect_only_denominator_outranks_env_summary_on_python():
-    """python denominator priority (bug #7, click live probe): the pytest
-    --collect-only count is ground truth from the actual runner and OVERRIDES
-    an env-summary static count when both exist — static scans can be polluted
-    by the venv the setup plants inside the project dir (click: 32927 static
-    vs 1927 collected capped a 98.7% run at PARTIAL). The static count is kept
-    as evidence and stays the fallback when no collected count exists; java
-    priority order is unchanged (see tests/test_static_scan_exclusions.py)."""
+def test_unpublished_collect_only_mirror_cannot_override_env_summary():
 
     class TrunkOrch(CollectedDenominatorOrch):
         def execute_command(self, cmd, workdir=None, **kwargs):
@@ -688,6 +688,7 @@ def test_collect_only_denominator_outranks_env_summary_on_python():
 
     analysis = validator.validate_project_analysis_status("proj")
 
-    assert analysis["static_test_count"] == 635
-    assert analysis["static_test_count_source"] == "pytest_collect_only"
-    assert analysis["static_test_count_static_scan"] == 700
+    assert analysis["static_test_count"] == 700
+    assert "static_test_count_source" not in analysis
+    assert "static_test_count_static_scan" not in analysis
+    assert not any(COLLECTED_JSON in command for command in orch.commands)

@@ -8,16 +8,23 @@ from pydantic import BaseModel
 import sag.agent.agent as agent_module
 from sag.agent.agent import SetupAgent, _active_setup_run_id
 from sag.agent.control_events import (
+    CONTROL_EVENT_KINDS,
     CONTROL_EVENT_SCHEMA_VERSION,
     ControlEvent,
+    job_stall_transition,
     ControlEventSink,
+    EvidencePublicationPayload,
     RunPin,
     canonical_sha256,
     forced_action_sha256,
     sanitize_config,
 )
 from sag.agent.react_engine import ReActEngine
-from sag.agent.replay import ControlReplayRunner, ReplayValidationError
+from sag.agent.replay import (
+    ControlReplayRunner,
+    ReplayValidationError,
+    _validate_analysis_recovery_audit,
+)
 from sag.config.logger import SessionLogger
 from sag.config.prompt_loader import PromptConfig
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
@@ -26,14 +33,19 @@ from sag.tools.base import ToolResult
 FIXTURES = Path(__file__).parent / "fixtures" / "control_layer"
 
 
-def test_live_run_id_uses_the_unique_session_id(monkeypatch):
+def test_live_run_id_is_a_unique_command_epoch_under_the_log_session(monkeypatch):
     monkeypatch.setattr(
         agent_module,
         "get_session_logger",
         lambda: SimpleNamespace(session_id="20260717_190128_88744"),
     )
 
-    assert _active_setup_run_id(7) == "20260717_190128_88744"
+    first = _active_setup_run_id(7)
+    second = _active_setup_run_id(7)
+
+    assert first.startswith("20260717_190128_88744-7-")
+    assert second.startswith("20260717_190128_88744-7-")
+    assert first != second
 
 
 @pytest.mark.parametrize(
@@ -130,6 +142,55 @@ def test_replay_checks_recorded_loop_recurrence_count(tmp_path):
         ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
 
+def _completion_claim_decision(count):
+    at_cap = count == 3
+    return {
+        "kind": "completion_claim_decision",
+        "payload": {
+            "phase_attempt_id": "test-1",
+            "claim_kind": "done" if count % 2 else "blocked",
+            "judge_disposition": "repair_required",
+            "blocker_id": "test_failed",
+            "mechanical_evidence_digest": "a" * 64,
+            "assessment_fingerprints": ["b" * 64],
+            "open_job_fingerprints": [],
+            "evidence_refs": ["output_paramiko_tests"],
+            "target_fingerprint": "target-1",
+            "config_fingerprint": "config-1",
+            "fact_fingerprint": "c" * 64,
+            "expected_decision": "agent_no_progress" if at_cap else "continue",
+            "expected_recurrence_count": count,
+            "expected_reason_code": (
+                "agent_no_progress" if at_cap else "completion_claim_without_action"
+            ),
+            "expected_close_phase": at_cap,
+        },
+    }
+
+
+def test_replay_reconstructs_done_blocked_no_op_convergence(tmp_path):
+    rows = _paramiko_rows_with_job_events(
+        [_completion_claim_decision(count) for count in (1, 2, 3)]
+    )
+    transcript = tmp_path / "completion-convergence.jsonl"
+    _write_replay_rows(transcript, rows)
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert result.snapshot is not None
+
+
+def test_replay_rejects_a_forged_completion_recurrence_count(tmp_path):
+    events = [_completion_claim_decision(count) for count in (1, 2, 3)]
+    events[1]["payload"]["expected_recurrence_count"] = 3
+    rows = _paramiko_rows_with_job_events(events)
+    transcript = tmp_path / "forged-completion-count.jsonl"
+    _write_replay_rows(transcript, rows)
+
+    with pytest.raises(ReplayValidationError, match="completion-claim decision"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
 def _write_replay_rows(path, rows):
     for sequence, row in enumerate(rows[1:], 1):
         row["sequence"] = sequence
@@ -137,6 +198,768 @@ def _write_replay_rows(path, rows):
         "\n".join(json.dumps(row) for row in rows) + "\n",
         encoding="utf-8",
     )
+
+
+def _paramiko_rows_with_job_events(events):
+    source = [
+        json.loads(line)
+        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    rows = [source[0]]
+    for row in source[1:]:
+        if row.get("kind") == "evidence_close":
+            rows.extend({**event, "source": row["source"]} for event in events)
+        rows.append(row)
+    return rows
+
+
+def _publication_event(
+    *,
+    run_id="replay-paramiko-20260712",
+    record_kind="policy_claim",
+    record_id="claim-replay-a",
+    raw_sha256="a" * 64,
+):
+    payload = {
+        "record_kind": record_kind,
+        "record_id": record_id,
+        "raw_sha256": raw_sha256,
+        "byte_count": 1,
+        "run_id": run_id,
+    }
+    if record_kind in {
+        "job_obligation",
+        "build_requirements",
+        "run_pin",
+        "document_map",
+        "receipt_structure",
+        "stall_cleanup",
+        "report_metrics",
+    }:
+        logical_artifact_id = f"logical-{record_kind}"
+        payload.update(
+            {
+                "record_id": logical_artifact_id,
+                "logical_artifact_id": logical_artifact_id,
+                "revision": 1,
+                "previous_raw_sha256": "0" * 64,
+                "previous_publication_sha256": "0" * 64,
+            }
+        )
+    return {
+        "kind": "evidence_publication",
+        "payload": payload,
+    }
+
+
+def _store_binding_event(*, run_id="replay-paramiko-20260712"):
+    return {
+        "kind": "evidence_store_bound",
+        "payload": {
+            "run_id": run_id,
+            "store_identity": "docker:replay-paramiko-store",
+        },
+    }
+
+
+def _paramiko_rows_with_publications(publications, *, placement="inside_envelope"):
+    rows = [
+        json.loads(line)
+        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    source = rows[1]["source"]
+    # The host stream binds one immutable container store before it can
+    # authorize any mirrored evidence bytes.  Keep the binding before the
+    # action stream so both in-envelope and post-close publications share the
+    # same durable epoch.
+    rows.insert(1, {**_store_binding_event(), "source": source})
+    additions = [{**publication, "source": source} for publication in publications]
+    if placement == "inside_envelope":
+        envelope_index = next(
+            index for index, row in enumerate(rows) if row.get("kind") == "action_envelope"
+        )
+        rows[envelope_index + 1 : envelope_index + 1] = additions
+    elif placement == "after_close":
+        rows.extend(additions)
+    else:
+        raise AssertionError(f"unknown publication placement: {placement}")
+    return rows
+
+
+def test_evidence_publication_is_strict_but_inert_inside_pending_action_pair(tmp_path):
+    transcript = tmp_path / "publication-inside-envelope.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_publications([_publication_event()]),
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert result.snapshot.model_dump(mode="json") == result.expected_snapshot
+    assert result.executed_envelope_count == result.paired_envelope_count == 6
+
+
+def test_evidence_publication_without_a_prior_store_binding_is_rejected(tmp_path):
+    rows = _paramiko_rows_with_publications([_publication_event()])
+    rows = [row for row in rows if row.get("kind") != "evidence_store_bound"]
+    transcript = tmp_path / "publication-without-store-binding.jsonl"
+    _write_replay_rows(transcript, rows)
+
+    with pytest.raises(ReplayValidationError, match="precedes the immutable store binding"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_evidence_store_binding_is_unique_and_matches_the_replay_run(tmp_path):
+    duplicate_rows = _paramiko_rows_with_publications([_publication_event()])
+    duplicate_rows.insert(2, duplicate_rows[1].copy())
+    duplicate = tmp_path / "duplicate-store-binding.jsonl"
+    _write_replay_rows(duplicate, duplicate_rows)
+    with pytest.raises(ReplayValidationError, match="bind exactly once"):
+        ControlReplayRunner.offline(verify_expected=False).run(duplicate)
+
+    foreign_rows = _paramiko_rows_with_publications([_publication_event()])
+    foreign_rows[1]["payload"]["run_id"] = "replay-foreign-run"
+    foreign = tmp_path / "foreign-store-binding.jsonl"
+    _write_replay_rows(foreign, foreign_rows)
+    with pytest.raises(ReplayValidationError, match="binding belongs to a foreign run"):
+        ControlReplayRunner.offline(verify_expected=False).run(foreign)
+
+
+def test_evidence_publication_duplicate_is_idempotent_but_collision_is_rejected(tmp_path):
+    publication = _publication_event()
+    idempotent = tmp_path / "publication-idempotent.jsonl"
+    _write_replay_rows(
+        idempotent,
+        _paramiko_rows_with_publications([publication, publication]),
+    )
+    assert ControlReplayRunner.offline(verify_expected=False).run(idempotent).snapshot
+
+    conflict = tmp_path / "publication-conflict.jsonl"
+    _write_replay_rows(
+        conflict,
+        _paramiko_rows_with_publications([publication, _publication_event(raw_sha256="b" * 64)]),
+    )
+    with pytest.raises(ReplayValidationError, match="conflicting record bytes"):
+        ControlReplayRunner.offline(verify_expected=False).run(conflict)
+
+
+def _next_mutable_publication(first, *, raw_sha256="b" * 64, record_kind=None):
+    prior = EvidencePublicationPayload.model_validate(first["payload"])
+    payload = dict(first["payload"])
+    payload.update(
+        {
+            "record_kind": record_kind or prior.record_kind,
+            "raw_sha256": raw_sha256,
+            "revision": int(prior.revision) + 1,
+            "previous_raw_sha256": prior.raw_sha256,
+            "previous_publication_sha256": canonical_sha256(
+                prior.model_dump(mode="json", exclude_unset=True)
+            ),
+        }
+    )
+    return {"kind": "evidence_publication", "payload": payload}
+
+
+def test_mutable_publication_revision_chain_is_inert_and_strict(tmp_path):
+    first = _publication_event(record_kind="run_pin")
+    second = _next_mutable_publication(first)
+    valid = tmp_path / "publication-revision-chain.jsonl"
+    _write_replay_rows(
+        valid,
+        _paramiko_rows_with_publications([first, second]),
+    )
+    result = ControlReplayRunner.offline(verify_expected=False).run(valid)
+    assert result.snapshot.model_dump(mode="json") == result.expected_snapshot
+
+    forged = tmp_path / "publication-revision-forged.jsonl"
+    second["payload"]["previous_publication_sha256"] = "f" * 64
+    _write_replay_rows(
+        forged,
+        _paramiko_rows_with_publications([first, second]),
+    )
+    with pytest.raises(ReplayValidationError, match="revision chain is discontinuous"):
+        ControlReplayRunner.offline(verify_expected=False).run(forged)
+
+
+def test_mutable_publication_cannot_switch_kind_under_one_logical_head(tmp_path):
+    first = _publication_event(record_kind="run_pin")
+    second = _next_mutable_publication(first, record_kind="report_metrics")
+    transcript = tmp_path / "publication-cross-kind.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_publications([first, second]),
+    )
+
+    with pytest.raises(ReplayValidationError, match="revision chain is discontinuous"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_mutable_tombstone_replays_but_cannot_be_resurrected(tmp_path):
+    first = _publication_event(record_kind="report_metrics")
+    tombstone = _next_mutable_publication(first)
+    tombstone["payload"].update(
+        {
+            "raw_sha256": "0" * 64,
+            "byte_count": 0,
+            "publication_state": "revoked",
+        }
+    )
+    valid = tmp_path / "publication-tombstone.jsonl"
+    _write_replay_rows(
+        valid,
+        _paramiko_rows_with_publications([first, tombstone], placement="after_close"),
+    )
+    assert ControlReplayRunner.offline(verify_expected=False).run(valid).snapshot
+
+    revoked = EvidencePublicationPayload.model_validate(tombstone["payload"])
+    resurrection = {
+        "kind": "evidence_publication",
+        "payload": {
+            **first["payload"],
+            "raw_sha256": "c" * 64,
+            "revision": 3,
+            "previous_raw_sha256": revoked.raw_sha256,
+            "previous_publication_sha256": canonical_sha256(
+                revoked.model_dump(mode="json", exclude_unset=True)
+            ),
+        },
+    }
+    forged = tmp_path / "publication-resurrection.jsonl"
+    _write_replay_rows(
+        forged,
+        _paramiko_rows_with_publications([first, tombstone, resurrection], placement="after_close"),
+    )
+    with pytest.raises(ReplayValidationError, match="revision chain is discontinuous"):
+        ControlReplayRunner.offline(verify_expected=False).run(forged)
+
+
+def test_evidence_publication_rejects_foreign_run(tmp_path):
+    transcript = tmp_path / "publication-foreign-run.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_publications([_publication_event(run_id="replay-foreign-run")]),
+    )
+
+    with pytest.raises(ReplayValidationError, match="foreign run"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+@pytest.mark.parametrize(
+    ("record_kind", "accepted"),
+    [("run_pin", True), ("report_metrics", True), ("policy_claim", False)],
+)
+def test_only_final_host_artifacts_may_publish_after_evidence_close(
+    tmp_path, record_kind, accepted
+):
+    transcript = tmp_path / f"publication-after-close-{record_kind}.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_publications(
+            [_publication_event(record_kind=record_kind)],
+            placement="after_close",
+        ),
+    )
+
+    if accepted:
+        assert ControlReplayRunner.offline(verify_expected=False).run(transcript).snapshot
+    else:
+        with pytest.raises(ReplayValidationError, match="may follow evidence_close"):
+            ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def _terminal_observed(job_id="job-replay-1", exit_code=137):
+    return {
+        "kind": "job_terminal_observed",
+        "payload": {
+            "job_id": job_id,
+            "exit_code": exit_code,
+            "marker_ref": f"/tmp/sag_jobs/{job_id}.exit",
+            "observed_at": "2026-08-08T12:00:00Z",
+            "obligation_ref": f"/workspace/.setup_agent/job_obligations/{job_id}.json",
+        },
+    }
+
+
+def test_ws2_job_lifecycle_control_events_are_strict_and_append_only():
+    assert CONTROL_EVENT_SCHEMA_VERSION == 5
+    assert CONTROL_EVENT_KINDS[-9:] == (
+        "job_terminal_observed",
+        "job_terminal_unpersisted",
+        "job_live_at_close",
+        "job_barrier_integrity_failure",
+        "completion_claim_decision",
+        "job_stall_observed",
+        "repair_context_opened",
+        "evidence_publication",
+        "evidence_store_bound",
+    )
+    event = ControlEvent(
+        sequence=1,
+        **_terminal_observed(),
+    )
+
+    assert event.typed_payload.exit_code == 137
+    with pytest.raises(ValueError):
+        ControlEvent(
+            sequence=1,
+            kind="job_live_at_close",
+            payload={
+                "job_id": "job-replay-1",
+                "obligation_ref": "unpersisted",
+                "log_ref": "/tmp/job.log",
+                "close_reason": "deadline",
+                "unsupported_conclusion": "hung",
+            },
+        )
+
+    for failures in ([], [""]):
+        with pytest.raises(ValueError):
+            ControlEvent(
+                sequence=1,
+                kind="job_barrier_integrity_failure",
+                payload={"failures": failures},
+            )
+
+    with pytest.raises(ValueError, match="sealed evidence"):
+        ControlEvent(
+            sequence=1,
+            kind="job_stall_observed",
+            payload={
+                "job_id": "job-replay-1",
+                "obligation_ref": "/workspace/.setup_agent/job_obligations/job-replay-1.json",
+                "diagnostic_ref": "/workspace/.setup_agent/job_diagnostics/job-replay-1/bundle.json",
+                "diagnostic_fingerprint": "a" * 64,
+                "observation": "unknown",
+                "progress_signals": [],
+                "controller_code": "term_failed",
+                "evidence_sealed": False,
+                "term_sent": True,
+                "kill_sent": False,
+                "group_live": True,
+            },
+        )
+
+
+def test_job_stall_observation_replays_as_physical_fact_without_project_cause(tmp_path):
+    job_id = "job-stalled-1"
+    event = {
+        "kind": "job_stall_observed",
+        "payload": {
+            "job_id": job_id,
+            "obligation_ref": f"/workspace/.setup_agent/job_obligations/{job_id}.json",
+            "diagnostic_ref": f"/workspace/.setup_agent/job_diagnostics/{job_id}/bundle.json",
+            "diagnostic_fingerprint": "b" * 64,
+            "observation": "thread_join_wait",
+            "progress_signals": [],
+            "controller_code": "killed",
+            "evidence_sealed": True,
+            "term_sent": True,
+            "kill_sent": True,
+            "group_live": False,
+        },
+    }
+    transcript = tmp_path / "job-stall-observed.jsonl"
+    _write_replay_rows(transcript, _paramiko_rows_with_job_events([event]))
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert event["payload"]["diagnostic_ref"] in result.snapshot.input_refs
+    assert not any("missing_broker" in conflict.lower() for conflict in result.snapshot.conflicts)
+
+
+def test_stall_loop_projection_does_not_turn_unobservable_into_no_progress():
+    base = {
+        "job_id": "job-stalled-1",
+        "obligation_ref": "/workspace/.setup_agent/job_obligations/job-stalled-1.json",
+        "diagnostic_ref": "/workspace/.setup_agent/job_diagnostics/job-stalled-1/bundle.json",
+        "diagnostic_fingerprint": "c" * 64,
+        "observation": "unknown",
+        "progress_signals": [],
+        "controller_code": "progress_unobservable",
+        "evidence_sealed": False,
+        "term_sent": False,
+        "kill_sent": False,
+        "group_live": True,
+    }
+
+    assert job_stall_transition(base) is None
+    assert job_stall_transition({**base, "evidence_sealed": True}) == "stalled"
+    assert (
+        job_stall_transition(
+            {**base, "controller_code": "progress_observed", "progress_signals": ["cpu_active"]}
+        )
+        == "progress"
+    )
+
+
+def test_barrier_integrity_failure_replays_as_the_live_harness_conflict(tmp_path):
+    transcript = tmp_path / "job-barrier-integrity-failure.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events(
+            [
+                {
+                    "kind": "job_barrier_integrity_failure",
+                    "payload": {
+                        "failures": [
+                            "job-1:exit_marker_malformed",
+                            "job-2:obligation_transport_read_failed",
+                        ]
+                    },
+                }
+            ]
+        ),
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert "job_barrier_integrity_failure" in result.snapshot.conflicts
+    assert "control:job_barrier_integrity_failure" in result.snapshot.input_refs
+
+
+def test_duplicate_barrier_integrity_failure_is_rejected(tmp_path):
+    event = {
+        "kind": "job_barrier_integrity_failure",
+        "payload": {"failures": ["job-1:exit_marker_unreadable"]},
+    }
+    transcript = tmp_path / "duplicate-job-barrier-integrity-failure.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events([event, event]),
+    )
+
+    with pytest.raises(ReplayValidationError, match="duplicate job barrier"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_barrier_integrity_failure_after_evidence_close_is_rejected(tmp_path):
+    rows = [
+        json.loads(line)
+        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    rows.append(
+        {
+            "kind": "job_barrier_integrity_failure",
+            "payload": {"failures": ["job-1:exit_marker_unreadable"]},
+            "source": rows[-1]["source"],
+        }
+    )
+    transcript = tmp_path / "late-job-barrier-integrity-failure.jsonl"
+    _write_replay_rows(transcript, rows)
+
+    with pytest.raises(ReplayValidationError, match="cannot follow evidence_close"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_terminal_observation_cannot_close_before_settlement_resolves(tmp_path):
+    transcript = tmp_path / "terminal-observed.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events([_terminal_observed()]),
+    )
+
+    with pytest.raises(ReplayValidationError, match="unresolved terminal settlement"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_terminal_observation_then_settlement_preserves_the_verdict(tmp_path):
+    job_id = "job-replay-settled"
+    transcript = tmp_path / "terminal-settled.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events(
+            [
+                _terminal_observed(job_id=job_id, exit_code=0),
+                {
+                    "kind": "job_settled",
+                    "payload": {
+                        "job_id": job_id,
+                        "receipt_id": "receipt-job-replay-settled",
+                        "exit_code": 0,
+                    },
+                },
+            ]
+        ),
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert result.snapshot.verdict == "success"
+    assert not any(conflict.startswith("job_terminal_") for conflict in result.snapshot.conflicts)
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        {"receipt_id": "receipt-job-replay-settled", "exit_code": 0},
+        {"receipt_id": "receipt-conflicting", "exit_code": 137},
+    ],
+)
+def test_replay_rejects_any_second_job_settled_event(tmp_path, second):
+    job_id = "job-replay-settled"
+    events = [
+        _terminal_observed(job_id=job_id, exit_code=0),
+        {
+            "kind": "job_settled",
+            "payload": {
+                "job_id": job_id,
+                "receipt_id": "receipt-job-replay-settled",
+                "exit_code": 0,
+            },
+        },
+        {
+            "kind": "job_settled",
+            "payload": {"job_id": job_id, **second},
+        },
+    ]
+    transcript = tmp_path / "duplicate-job-settled.jsonl"
+    _write_replay_rows(transcript, _paramiko_rows_with_job_events(events))
+
+    with pytest.raises(ReplayValidationError, match="duplicate job_settled"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def _analysis_recovery_audit(**overrides):
+    return {
+        "kind": "framework_survey",
+        "attempt": 1,
+        "before_code": "analysis_facts_missing",
+        "survey_status": "created",
+        "after_code": "analysis_green",
+        "resolved": True,
+        **overrides,
+    }
+
+
+def test_analysis_recovery_audit_has_one_strict_replay_shape():
+    audit = _analysis_recovery_audit()
+
+    assert (
+        _validate_analysis_recovery_audit(
+            audit,
+            phase="analyze",
+            control_disposition="terminal_claimable",
+        )
+        == audit
+    )
+
+    with pytest.raises(ReplayValidationError, match="resolved disagrees"):
+        _validate_analysis_recovery_audit(
+            _analysis_recovery_audit(resolved=False),
+            phase="analyze",
+            control_disposition="terminal_claimable",
+        )
+
+    with pytest.raises(ReplayValidationError, match="before_code must be a string"):
+        _validate_analysis_recovery_audit(
+            _analysis_recovery_audit(before_code=["analysis_facts_missing"]),
+            phase="analyze",
+            control_disposition="terminal_claimable",
+        )
+
+
+@pytest.mark.parametrize("placement", ["non_analyze", "observation_only"])
+def test_replay_rejects_misplaced_analysis_recovery_audit(tmp_path, placement):
+    rows = [
+        json.loads(line)
+        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    observation = next(
+        row
+        for row in rows
+        if row.get("kind") == "validator_observation" and row["payload"]["phase"] == "build"
+    )
+    gate = next(
+        row
+        for row in rows
+        if row.get("kind") == "gate_decision" and row["payload"]["phase"] == "build"
+    )
+    observation["payload"]["validated_facts"]["run.analysis_recovery"] = _analysis_recovery_audit()
+    if placement == "non_analyze":
+        gate["payload"]["validated_facts"]["run.analysis_recovery"] = _analysis_recovery_audit()
+        expected = "requires the analyze phase"
+    else:
+        # Prove final-only semantics independently of the phase restriction.
+        observation["payload"]["phase"] = "analyze"
+        expected = "differs from final gate"
+    transcript = tmp_path / f"analysis-recovery-{placement}.jsonl"
+    _write_replay_rows(transcript, rows)
+
+    with pytest.raises(ReplayValidationError, match=expected):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_terminal_unpersisted_replay_rebuilds_the_live_conflict(tmp_path):
+    job_id = "job-replay-unpersisted"
+    observed = _terminal_observed(job_id=job_id, exit_code=0)
+    unpersisted = {
+        "kind": "job_terminal_unpersisted",
+        "payload": {
+            "job_id": job_id,
+            "exit_code": 0,
+            "attempted_receipt_id": "receipt-job-replay-unpersisted",
+            "persistence_code": "transport_publish_failed",
+            "attempt_count": 2,
+            "obligation_ref": (f"/workspace/.setup_agent/job_obligations/{job_id}.json"),
+            "log_ref": f"/tmp/sag_jobs/{job_id}.log",
+        },
+    }
+    transcript = tmp_path / "terminal-unpersisted.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events([observed, unpersisted]),
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert f"job_terminal_unpersisted:{job_id}" in result.snapshot.conflicts
+    assert f"job_unsettled:{job_id}" not in result.snapshot.conflicts
+
+
+def test_live_at_close_replay_rebuilds_the_live_conflict(tmp_path):
+    job_id = "job-replay-live"
+    transcript = tmp_path / "live-at-close.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events(
+            [
+                {
+                    "kind": "job_live_at_close",
+                    "payload": {
+                        "job_id": job_id,
+                        "obligation_ref": (
+                            f"/workspace/.setup_agent/job_obligations/{job_id}.json"
+                        ),
+                        "log_ref": f"/tmp/sag_jobs/{job_id}.log",
+                        "close_reason": "dependents_skipped",
+                    },
+                }
+            ]
+        ),
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert f"job_live_at_close:{job_id}" in result.snapshot.conflicts
+    assert f"job_unsettled:{job_id}" not in result.snapshot.conflicts
+
+
+def test_legacy_job_unsettled_still_replays(tmp_path):
+    job_id = "job-replay-legacy"
+    transcript = tmp_path / "legacy-job-unsettled.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events(
+            [
+                {
+                    "kind": "job_unsettled",
+                    "payload": {
+                        "job_id": job_id,
+                        "evidence_ref": (f"/workspace/.setup_agent/job_obligations/{job_id}.json"),
+                        "obligation": {"tool": "maven"},
+                    },
+                }
+            ]
+        ),
+    )
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert f"job_unsettled:{job_id}" in result.snapshot.conflicts
+
+
+@pytest.mark.parametrize(
+    "events,match",
+    [
+        (
+            [
+                {
+                    "kind": "job_terminal_unpersisted",
+                    "payload": {
+                        "job_id": "job-no-observation",
+                        "exit_code": 1,
+                        "attempted_receipt_id": "receipt-1",
+                        "persistence_code": "transport_write_failed",
+                        "attempt_count": 2,
+                        "obligation_ref": "unpersisted",
+                        "log_ref": "/tmp/job.log",
+                    },
+                }
+            ],
+            "prior terminal observation",
+        ),
+        (
+            [
+                _terminal_observed(job_id="job-legacy-terminal", exit_code=1),
+                {
+                    "kind": "job_unsettled",
+                    "payload": {
+                        "job_id": "job-legacy-terminal",
+                        "evidence_ref": "obligation.json",
+                        "obligation": {},
+                    },
+                },
+            ],
+            "cannot describe a terminal job",
+        ),
+        (
+            [
+                {
+                    "kind": "job_unsettled",
+                    "payload": {
+                        "job_id": "job-legacy-first",
+                        "evidence_ref": "obligation.json",
+                        "obligation": {},
+                    },
+                },
+                _terminal_observed(job_id="job-legacy-first", exit_code=1),
+            ],
+            "cannot precede terminal observation",
+        ),
+        (
+            [
+                {
+                    "kind": "job_live_at_close",
+                    "payload": {
+                        "job_id": "job-contradiction",
+                        "obligation_ref": "obligation.json",
+                        "log_ref": "/tmp/job.log",
+                        "close_reason": "deadline",
+                    },
+                },
+                _terminal_observed(job_id="job-contradiction", exit_code=0),
+            ],
+            "both terminal and live at close",
+        ),
+        (
+            [
+                _terminal_observed(job_id="job-exit-mismatch", exit_code=0),
+                {
+                    "kind": "job_terminal_unpersisted",
+                    "payload": {
+                        "job_id": "job-exit-mismatch",
+                        "exit_code": 137,
+                        "attempted_receipt_id": "receipt-2",
+                        "persistence_code": "transport_write_failed",
+                        "attempt_count": 2,
+                        "obligation_ref": "obligation.json",
+                        "log_ref": "/tmp/job.log",
+                    },
+                },
+            ],
+            "exit code differs",
+        ),
+    ],
+)
+def test_replay_rejects_impossible_job_lifecycle(events, match, tmp_path):
+    transcript = tmp_path / "impossible-job-lifecycle.jsonl"
+    _write_replay_rows(
+        transcript,
+        _paramiko_rows_with_job_events(events),
+    )
+
+    with pytest.raises(ReplayValidationError, match=match):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
 
 def test_extra_historical_scheduler_rows_stay_inert(tmp_path):
@@ -393,7 +1216,7 @@ def test_forced_result_pairs_and_leaves_trailing_historical_rows_inert(tmp_path)
 
 
 def test_forced_action_is_versioned_as_control_schema_v2(tmp_path):
-    assert CONTROL_EVENT_SCHEMA_VERSION == 2
+    assert CONTROL_EVENT_SCHEMA_VERSION == 5
     source = _forced_bigtop_rows()
     source[0]["schema_version"] = 1
     transcript = tmp_path / "forced-action-v1.jsonl"
@@ -405,7 +1228,7 @@ def test_forced_action_is_versioned_as_control_schema_v2(tmp_path):
 
 def test_replay_rejects_unknown_control_schema_version(tmp_path):
     source = _forced_bigtop_rows()
-    source[0]["schema_version"] = 3
+    source[0]["schema_version"] = 4
     transcript = tmp_path / "unknown-control-schema.jsonl"
     _write_replay_rows(transcript, source)
 
@@ -782,6 +1605,9 @@ def test_session_logger_control_sink_appends_host_and_mirror(tmp_path):
 # Plan 2 Task 8: old protocol removed — the live envelope is keyed by the
 # native tool_call id, not by a scheduler plan index.
 def test_live_engine_emits_native_envelope_and_redacted_result(tmp_path):
+    from sag.agent.invocation_contracts import clear_action_context
+
+    clear_action_context()
     sink = ControlEventSink(
         tmp_path / "control_events.jsonl",
         clock=lambda: "2026-07-17T12:00:00Z",
@@ -824,6 +1650,7 @@ def test_live_engine_emits_native_envelope_and_redacted_result(tmp_path):
     assert events[-1].payload["result"]["facts"] == {"compiled_classes": 41}
     assert "secret build output" not in text
     assert "never serialize" not in text
+    clear_action_context()
 
 
 def test_sanitized_config_excludes_secrets_and_api_endpoints():
@@ -839,12 +1666,23 @@ def test_sanitized_config_excludes_secrets_and_api_endpoints():
     assert sanitized == {"nested": {"safe": 3}, "thinking_model": "gpt-5"}
 
 
+class _PinEvidenceStore:
+    def evidence_store_identity(self):
+        return "docker:run-pin-test-store"
+
+    def execute_command(self, _command, **_kwargs):
+        return {"success": True, "exit_code": 0, "output": ""}
+
+
 def test_setup_agent_updates_complete_run_pin_after_clone(tmp_path):
     mirrored = []
     agent = object.__new__(SetupAgent)
     agent._run_pin_host_path = tmp_path / "run-pin.json"
     agent._run_pin_mirror = mirrored.append
+    agent.orchestrator = _PinEvidenceStore()
+    agent.run_id = "run-pytest"
     agent._run_pin_template = {
+        "run_id": "run-pytest",
         "container_image_digest": "sha256:" + "b" * 64,
         "sag_git_sha": "c" * 40,
         "thinking_model": "thinking-model",
@@ -877,6 +1715,8 @@ def _pin_template_agent(tmp_path):
     agent = object.__new__(SetupAgent)
     agent._run_pin_host_path = tmp_path / "run-pin.json"
     agent._run_pin_mirror = None
+    agent.orchestrator = _PinEvidenceStore()
+    agent.run_id = "run-pytest"
     agent.config = PinConfig()
     agent.react_engine = SimpleNamespace(prompts=PromptConfig({"system": "sys"}))
     agent.phase_machine = object()

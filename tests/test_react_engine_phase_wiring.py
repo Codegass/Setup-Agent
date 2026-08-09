@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
-from sag.agent.phase_transitions import PhaseTransitionPolicy, RepairRequest
+from sag.agent.phase_transitions import PhaseTransitionPolicy
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
 from sag.agent.verdict_finalizer import EvidenceCloseReason
@@ -42,6 +42,17 @@ def _engine_with_machine(*, start_phase="provision"):
     engine.finalized_reasons = []
     engine._finalize_evidence = lambda reason: engine.finalized_reasons.append(reason)
     return engine
+
+
+def test_analysis_facts_controller_recovery_spends_one_run_local_survey_attempt():
+    engine = _engine_with_machine(start_phase="analyze")
+    engine._analysis_facts_recovery_attempted = False
+    calls = []
+    engine._ensure_project_facts = lambda: calls.append("survey") or "created"
+
+    assert engine._recover_analysis_facts_once() == "created"
+    assert engine._recover_analysis_facts_once() is None
+    assert calls == ["survey"]
 
 
 def _terminal_step(
@@ -176,51 +187,25 @@ def test_partial_build_with_validated_test_entry_advances_to_test():
     assert engine.finalized_reasons == []
 
 
-def test_repair_signal_reopens_direct_dependency_with_monotonic_attempt():
-    class RedTestValidator:
-        docker_orchestrator = None
-
-        def validate_test_status(self, project_name=None):
-            return {
-                "has_test_reports": True,
-                "evidence_status": "blocked",
-                "total_tests": 1,
-                "error_tests": 1,
-                "test_stats": {"executed": 1, "discovered": 1},
-                "reason": "missing sibling artifact",
-                "evidence_refs": ["log://test-1/tail"],
-            }
-
+def test_retired_repair_signal_cannot_reopen_a_dependency():
+    """WS3 requires the model to emit a new ordinary ActionIntent.  A stale
+    phase-repair envelope cannot mutate the phase machine behind that path."""
     engine = _engine_with_machine(start_phase="test")
-    engine.physical_validator = RedTestValidator()
-    request = RepairRequest(
-        from_phase="test",
-        target_phase="build",
-        source_attempt_id="test-1",
-        reason_code="missing_sibling_artifact",
-        failure_signature="missing_sibling_artifact:module-a",
-        hypothesis="root install will publish the sibling artifact",
-        evidence_refs=("log://test-1/tail",),
-    )
-    engine.run_evidence_state.record_phase_evidence(
-        request.source_attempt_id,
-        request.evidence_refs,
-    )
     step = SimpleNamespace(
         tool_result=SimpleNamespace(
             metadata={
                 "phase_signal": "repair",
-                "repair_request": request.to_metadata(),
+                "repair_request": {"target_phase": "build"},
             }
         )
     )
 
-    engine._handle_phase_signals([step])
+    signal = engine._handle_phase_signals([step])
 
-    assert engine.phase_machine.current_phase == "build"
-    assert engine.phase_machine.current_attempt_id == "build-1"
-    assert engine.phase_machine.records[0].transition == "repair"
-    assert engine.run_evidence_state.repair_records[-1].accepted is True
+    assert signal is None
+    assert engine.phase_machine.current_phase == "test"
+    assert engine.phase_machine.current_attempt_id == "test-1"
+    assert engine.phase_machine.records == ()
 
 
 def test_phase_note_signal_persists_without_advancing():
@@ -478,16 +463,17 @@ def test_no_nudge_off_cycle():
     assert engine._maybe_nudge_phase_done() is False
 
 
-def test_build_objective_does_not_prescribe_deps_first():
-    """vfs round 5: 'build(action='deps') then compile' steered the model into
-    a structural dependency:resolve failure (reactor test-jar deps) that plain
-    compile never hits. The objective prescribes compile; deps only as remedy."""
+def test_build_objective_names_closure_evidence_not_a_selected_call():
+    """A weak model chooses the next ordinary action from facts and schema;
+    the phase objective defines only the evidence needed to close."""
     from sag.agent.react_engine import PHASE_OBJECTIVES
 
     build_obj = PHASE_OBJECTIVES["build"]
-    assert "build(action='compile')" in build_obj
-    assert "deps') then" not in build_obj, "must not prescribe deps-before-compile"
-    assert "deps" in build_obj, "deps should remain available as a remedy"
+    assert "terminal build evidence" in build_obj
+    assert "required surveyed build coordinate" in build_obj
+    assert "current receipt and artifact/coverage evidence" in build_obj
+    assert "build(action=" not in build_obj
+    assert " then " not in build_obj.lower()
 
 
 def test_summary_counts_survive_window_resets():

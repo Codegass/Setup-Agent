@@ -29,10 +29,22 @@ invalid experiment).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    MutablePublicationObservation,
+)
+from sag.tools.internal.build_preflight import validate_build_requirements_v1
+from scripts.collect_control_layer_ab import (
+    AuthorizedCurrentRun,
+    CollectionError,
+    load_authorized_current_run,
+)
 
 # Pre-registered absolute floors (mirror of logs/panel-category3/panel-lock.json;
 # these are the machine-checkable constants the anchors read).
@@ -143,6 +155,7 @@ class ToolInvocation:
 class RunArtifacts:
     """The structured truth of one run, distilled for the anchor predicates."""
 
+    run_id: str
     verdict: str
     build_judgment: str = "unknown"
     build_source: str = "none"
@@ -162,9 +175,7 @@ class RunArtifacts:
     def build_test_invocations(self) -> list[ToolInvocation]:
         """Every build(action='test') invocation from the control record."""
         return [
-            i
-            for i in self.invocations
-            if i.tool == "build" and str(i.action).lower() == "test"
+            i for i in self.invocations if i.tool == "build" and str(i.action).lower() == "test"
         ]
 
     def pytest_invocations(self) -> list[ToolInvocation]:
@@ -205,9 +216,7 @@ def evaluate_bigtop(art: RunArtifacts) -> list[AnchorResult]:
 
     # phantom-green guard: a success verdict with zero compiled classes is a lie.
     if art.verdict == "success" and (art.compiled_classes or 0) == 0:
-        results.append(
-            _fail("phantom_green_guard", "verdict=='success' with compiled_classes==0")
-        )
+        results.append(_fail("phantom_green_guard", "verdict=='success' with compiled_classes==0"))
     else:
         results.append(_ok("phantom_green_guard"))
 
@@ -258,7 +267,9 @@ def _has_successful_data_generators_build(invocations: Sequence[ToolInvocation])
         if i.tool != "build" or not i.success:
             continue
         workdir = str(i.working_directory or "").lower()
-        target = " ".join(str(i.params.get(k) or "") for k in ("module", "target", "command", "args")).lower()
+        target = " ".join(
+            str(i.params.get(k) or "") for k in ("module", "target", "command", "args")
+        ).lower()
         if "data-generators" in workdir or "data_generators" in workdir:
             return True
         if "data-generators" in target or "data_generators" in target:
@@ -383,10 +394,7 @@ def tvm_smoke_liveness(art: RunArtifacts) -> int:
     recorded pytest command) that carries a node-id/-k selection filter. Zero
     pytest invocations => 0 (nothing swept, but also nothing smoked)."""
     return int(
-        any(
-            i.command().strip() and i.has_node_or_k_filter()
-            for i in art.pytest_invocations()
-        )
+        any(i.command().strip() and i.has_node_or_k_filter() for i in art.pytest_invocations())
     )
 
 
@@ -399,9 +407,7 @@ def evaluate_tvm(art: RunArtifacts) -> list[AnchorResult]:
     # absent while pure-python evidence exists); anything green is strictly
     # better outright.
     honest_native_partial = (
-        art.build_judgment == "partial"
-        and art.build_source == "physical"
-        and not art.build_green
+        art.build_judgment == "partial" and art.build_source == "physical" and not art.build_green
     )
     strictly_better = art.verdict in {"partial", "success"} and art.build_green
     if failed_physical or honest_native_partial or strictly_better:
@@ -452,9 +458,7 @@ def evaluate_tvm(art: RunArtifacts) -> list[AnchorResult]:
                 "filtered pytest missing the structured collected_after_deselection field"
             )
         elif collected > TVM_COLLECTED_MAX:
-            violations.append(
-                f"collected_after_deselection {collected} > max {TVM_COLLECTED_MAX}"
-            )
+            violations.append(f"collected_after_deselection {collected} > max {TVM_COLLECTED_MAX}")
     if violations:
         results.append(
             _fail(
@@ -487,7 +491,9 @@ def evaluate_pyyaml(art: RunArtifacts, *, executed_floor: int | None) -> list[An
     # would pass (round-review P2-3).
     if not art.manifest_present:
         results.append(
-            _fail("stamped_manifest_exists", "stamped manifest (build_requirements.json) is missing")
+            _fail(
+                "stamped_manifest_exists", "stamped manifest (build_requirements.json) is missing"
+            )
         )
     elif not art.manifest_stamped:
         results.append(
@@ -502,9 +508,7 @@ def evaluate_pyyaml(art: RunArtifacts, *, executed_floor: int | None) -> list[An
 
     packages = art.manifest_python_packages
     if packages is None:
-        results.append(
-            _fail("manifest_python_packages", "manifest python_packages is missing")
-        )
+        results.append(_fail("manifest_python_packages", "manifest python_packages is missing"))
     elif "yaml" in list(packages):
         # Calibration evidence (pyyaml-cal-r1): the C-extension package _yaml
         # (lib/_yaml/__init__.py) is REAL and discovered beside yaml — exact
@@ -604,12 +608,85 @@ def probe_arm_verdict(*, p_pass: bool, f_pass: bool) -> str:
 # --------------------------------------------------------------------------
 # loader: build RunArtifacts from a sealed session directory
 # --------------------------------------------------------------------------
-def _load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _load_strict_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
+    """Read one duplicate-free JSON object while preserving its exact bytes."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise EvaluationError(f"cannot read structured artifact {path}: {exc}") from exc
+    if not raw or len(raw) > 16 * 1024 * 1024:
+        raise EvaluationError(f"structured artifact {path} has an invalid byte length")
+
+    def strict_object(pairs):
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=strict_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise EvaluationError(f"cannot read strict structured artifact {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise EvaluationError(f"structured artifact {path} is not one JSON object")
+    return payload, raw
 
 
-def _first_existing(*paths: Path) -> Path | None:
-    return next((p for p in paths if p.is_file()), None)
+def load_authorized_build_requirements(
+    session: str | Path,
+    current: AuthorizedCurrentRun,
+) -> dict[str, Any] | None:
+    """Return the exact current manifest, or a host-verified absence.
+
+    The archived container file is only a mirror.  Its bytes become usable
+    when the recovered host publication authority says that they are the one
+    complete current ``build_requirements`` mutable ledger.  A missing mirror
+    is accepted only when the same authority verifies an empty current set
+    (genesis or a tombstone).
+    """
+
+    manifest_path = Path(session) / ".setup_agent" / "build_requirements.json"
+    if not manifest_path.is_file():
+        check = current.authority.verify_latest_record_set("build_requirements", {})
+        if not check.authorized:
+            raise EvaluationError(
+                "build_requirements mirror is missing while the host authority has a current head"
+            )
+        return None
+
+    manifest, raw = _load_strict_json_object(manifest_path)
+    head = current.authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
+    if (
+        head is None
+        or head.publication_state != "present"
+        or head.record_id != BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+        or head.logical_artifact_id != BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+        or head.record_kind not in {"build_requirements", "receipt_structure"}
+    ):
+        raise EvaluationError(
+            "build_requirements mirror has no matching current host publication head"
+        )
+    observation = MutablePublicationObservation(
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        raw_sha256=hashlib.sha256(raw).hexdigest(),
+        byte_count=len(raw),
+        run_id=current.pin.run_id,
+        contract_id=head.contract_id,
+        contract_hash=head.contract_hash,
+    )
+    check = current.authority.verify_latest_record_set(
+        "build_requirements",
+        {BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID: observation},
+    )
+    if not check.authorized:
+        raise EvaluationError("build_requirements mirror is not the exact current host publication")
+    try:
+        return validate_build_requirements_v1(manifest)
+    except (TypeError, ValueError) as exc:
+        raise EvaluationError("build_requirements mirror is not a valid v1 manifest") from exc
 
 
 def _invocation_success(result: Mapping[str, Any]) -> bool:
@@ -622,71 +699,60 @@ def _invocation_success(result: Mapping[str, Any]) -> bool:
 def load_run_artifacts(session_path: str | Path) -> RunArtifacts:
     """Distill one archived session into :class:`RunArtifacts`.
 
-    Reads ONLY sealed structured files: verdict.json, control_events.jsonl, and
-    the stamped manifest build_requirements.json. Rendered/summary artifacts are
-    never opened.
+    Reads only host-authorized archived state.  The host run pin and host
+    control stream recover the run authority; the container verdict and
+    manifest are accepted only as exact current mirrors.  Rendered/summary
+    artifacts and session-root/container fallback files are never consulted.
     """
     session = Path(session_path)
-    verdict_path = _first_existing(
-        session / ".setup_agent" / "verdict.json", session / "verdict.json"
-    )
-    if verdict_path is None:
-        raise EvaluationError(f"verdict.json is missing under {session}")
-    verdict = _load_json(verdict_path)
-    build_evidence = verdict.get("build_evidence") or {}
-    unique = ((verdict.get("test_stats") or {}).get("unique")) or {}
+    try:
+        current = load_authorized_current_run(session)
+    except CollectionError as exc:
+        raise EvaluationError(f"archived run authority is invalid: {exc}") from exc
+    verdict = current.snapshot.model_dump(mode="json")
+    build_evidence = verdict["build_evidence"]
+    unique = verdict["test_stats"]["unique"]
 
-    events_path = _first_existing(
-        session / ".setup_agent" / "control_events.jsonl", session / "control_events.jsonl"
-    )
     invocations: list[ToolInvocation] = []
     project_root: str | None = None
-    if events_path is not None:
-        for line in events_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            event = json.loads(line)
-            if event.get("kind") != "tool_result":
-                continue
-            payload = event.get("payload") or {}
-            params = payload.get("params") or {}
-            result = payload.get("result") or {}
-            metadata = result.get("metadata")
-            if not isinstance(metadata, Mapping):
-                metadata = {}
-            tool = str(payload.get("tool") or "")
-            action = str(params.get("action") or "")
-            # Authoritative project root from the clone/analyze events (the
-            # control record's structured truth — not derived from later test
-            # invocations, round-review P2-4).
-            if project_root is None and tool == "project":
-                if action == "clone" and metadata.get("clone_path"):
-                    project_root = str(metadata["clone_path"])
-                elif action == "analyze":
-                    candidate = params.get("project_path") or metadata.get("project_path")
-                    if candidate:
-                        project_root = str(candidate)
-            invocations.append(
-                ToolInvocation(
-                    tool=tool,
-                    action=action,
-                    working_directory=params.get("working_directory"),
-                    success=_invocation_success(result),
-                    params=params,
-                    result=result,
-                    metadata=metadata,
-                )
+    for event in current.events:
+        if event.kind != "tool_result":
+            continue
+        payload = event.payload
+        params = payload.get("params") or {}
+        result = payload.get("result") or {}
+        metadata = result.get("metadata")
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        tool = str(payload.get("tool") or "")
+        action = str(params.get("action") or "")
+        # Authoritative project root from the clone/analyze events (the
+        # control record's structured truth — not derived from later test
+        # invocations, round-review P2-4).
+        if project_root is None and tool == "project":
+            if action == "clone" and metadata.get("clone_path"):
+                project_root = str(metadata["clone_path"])
+            elif action == "analyze":
+                candidate = params.get("project_path") or metadata.get("project_path")
+                if candidate:
+                    project_root = str(candidate)
+        invocations.append(
+            ToolInvocation(
+                tool=tool,
+                action=action,
+                working_directory=params.get("working_directory"),
+                success=_invocation_success(result),
+                params=params,
+                result=result,
+                metadata=metadata,
             )
+        )
 
-    manifest_path = _first_existing(
-        session / ".setup_agent" / "build_requirements.json",
-        session / "build_requirements.json",
-    )
-    manifest_present = manifest_path is not None
+    manifest = load_authorized_build_requirements(session, current)
+    manifest_present = manifest is not None
     manifest_packages: list[str] | None = None
     manifest_stamped = False
-    if manifest_path is not None:
-        manifest = _load_json(manifest_path)
+    if manifest is not None:
         raw = manifest.get("python_packages")
         if isinstance(raw, list):
             manifest_packages = [str(item) for item in raw]
@@ -702,6 +768,7 @@ def load_run_artifacts(session_path: str | Path) -> RunArtifacts:
             )
 
     return RunArtifacts(
+        run_id=current.pin.run_id,
         verdict=str(verdict.get("verdict") or "unknown"),
         build_judgment=str(build_evidence.get("judgment") or "unknown"),
         build_source=str(build_evidence.get("source") or "none"),

@@ -4,14 +4,15 @@
 Each section reproduces one confirmed P0/P1 finding:
 1. bash version-probe exemption must not swallow compound/piped long builds.
 2. ProjectTool must accept its documented parameters through safe_execute.
-3. Self-healing / state tracking re-keyed to the new tool surface
-   (project/build) instead of the retired legacy names.
-4. Legacy maven alias must map common lifecycle phases onto valid build verbs.
-5. build() without working_directory must heal to the real project directory.
-6. search(target='job:<id>') polling is prescribed, never repetition-blocked,
+3. Parameter normalization may translate spellings but cannot inject runtime
+   state or replace the model's selected action.
+4. Legacy Maven aliases map only exactly equivalent lifecycle phases; lossy
+   clean/plugin translations fail validation.
+5. build() without working_directory uses its public schema default, never a
+   state- or repository-derived path.
+6. legacy search(target='job:<id>') polling remains mechanically safe, while
+   current runs use a controller-owned barrier,
    and detached handoffs carry the promised job ref.
-7. Tool recovery routes build/project failures to the maven/gradle/clone
-   strategies via the facades' delegate tools.
 """
 
 from types import SimpleNamespace
@@ -21,10 +22,8 @@ import pytest
 from sag.agent.react_engine import ReActEngine
 from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.agent.tool_parameters import ToolParameterNormalizer
-from sag.agent.tool_recovery import ToolRecoveryHandler
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
-from sag.tools.build.backends import MavenBackend
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_utils import detached_handoff_tool_result
 from sag.tools.project_tool import ProjectTool
@@ -125,8 +124,7 @@ def test_project_safe_execute_accepts_provision_env_and_analyze_parameters():
 
 
 def test_project_safe_execute_passes_through_params_taught_elsewhere():
-    """target_directory / ref / update_context are taught by prompts and
-    recovery guidance; the facade must not reject them."""
+    """Parameters declared by the public schema/prompts reach the facade."""
     tool, setup, *_ = _project_tool()
     result = tool.safe_execute(
         action="clone",
@@ -158,7 +156,7 @@ def _normalizer(tools, successful_states=None, repository_url=None, repository_r
     )
 
 
-def test_project_clone_injects_repository_url_and_ref_from_state():
+def test_project_clone_does_not_inject_repository_url_or_ref_from_state():
     tool, *_ = _project_tool()
     normalizer = _normalizer(
         {"project": tool},
@@ -169,11 +167,10 @@ def test_project_clone_injects_repository_url_and_ref_from_state():
 
     params = normalizer.validate_and_fix("project", {"action": "clone"}, [])
 
-    assert params["repository_url"] == "https://example.test/repo.git"
-    assert params["ref"] == "rel/commons-cli-1.11.0"
+    assert params == {"action": "clone"}
 
 
-def test_project_clone_duplicate_guard_switches_to_analyze():
+def test_project_clone_duplicate_state_does_not_replace_model_action():
     tool, *_ = _project_tool()
     url = "https://example.test/repo.git"
     normalizer = _normalizer(
@@ -184,10 +181,10 @@ def test_project_clone_duplicate_guard_switches_to_analyze():
 
     params = normalizer.validate_and_fix("project", {"action": "clone", "repo_url": url}, [])
 
-    assert params["action"] == "analyze"
+    assert params == {"action": "clone", "repo_url": url}
 
 
-def test_build_injects_known_working_directory_from_state():
+def test_build_uses_schema_default_not_known_working_directory_state():
     build = BuildTool(None)
     normalizer = _normalizer(
         {"build": build},
@@ -196,10 +193,10 @@ def test_build_injects_known_working_directory_from_state():
 
     params = normalizer.validate_and_fix("build", {"action": "test"}, [])
 
-    assert params["working_directory"] == "/workspace/app"
+    assert params == {"action": "test", "working_directory": "/workspace"}
 
 
-def test_build_infers_working_directory_from_repository_url():
+def test_build_does_not_infer_working_directory_from_repository_url():
     build = BuildTool(None)
     normalizer = _normalizer(
         {"build": build},
@@ -208,7 +205,7 @@ def test_build_infers_working_directory_from_repository_url():
 
     params = normalizer.validate_and_fix("build", {"action": "compile"}, [])
 
-    assert params["working_directory"] == "/workspace/commons-cli"
+    assert params == {"action": "compile", "working_directory": "/workspace"}
 
 
 # --- finding: state tracking keyed to legacy names (react engine) ------------
@@ -271,11 +268,9 @@ def test_update_successful_states_does_not_label_gradle_build_as_maven():
 @pytest.mark.parametrize(
     "command, expected_action",
     [
-        ("clean install", "package"),
-        ("install", "package"),
-        ("verify", "package"),
-        ("clean test", "test"),
-        ("clean compile", "compile"),
+        ("install", "install"),
+        ("verify", "test"),
+        ("compile", "compile"),
         ("test", "test"),
         ("package", "package"),
         ("dependency:resolve", "deps"),
@@ -291,15 +286,21 @@ def test_legacy_maven_alias_maps_lifecycle_phases(command, expected_action):
     assert params["action"] == expected_action
 
 
-def test_legacy_maven_alias_falls_back_to_compile_with_args():
+@pytest.mark.parametrize("command", ["clean compile", "clean test", "clean install", "clean verify"])
+def test_legacy_maven_clean_lifecycle_is_refused_when_clean_cannot_be_preserved(command):
     build = BuildTool(None)
     normalizer = _normalizer({"build": build})
 
-    name, params = normalizer.resolve_legacy_alias("maven", {"command": "org.foo:plugin:goal"})
+    with pytest.raises(ValueError, match="invalid value for action"):
+        normalizer.validate_and_fix("maven", {"command": command})
 
-    assert name == "build"
-    assert params["action"] == "compile"
-    assert params["args"] == "org.foo:plugin:goal"
+
+def test_legacy_maven_unknown_goal_is_refused_instead_of_becoming_compile():
+    build = BuildTool(None)
+    normalizer = _normalizer({"build": build})
+
+    with pytest.raises(ValueError, match="invalid value for action"):
+        normalizer.validate_and_fix("maven", {"command": "org.foo:plugin:goal"})
 
 
 def test_legacy_maven_alias_carries_properties_into_args():
@@ -315,13 +316,27 @@ def test_legacy_maven_alias_carries_properties_into_args():
     assert "-DskipITs=true" in params["args"]
 
 
-def test_maven_failure_suggestions_use_valid_build_actions():
-    from sag.tools.internal.maven_tool import MavenTool
+def test_legacy_maven_canonical_action_wins_over_conflicting_command_alias():
+    build = BuildTool(None)
+    normalizer = _normalizer({"build": build})
 
-    assert MavenTool._suggested_build_action("dependency:resolve") == "deps"
-    assert MavenTool._suggested_build_action("install") == "package"
-    assert MavenTool._suggested_build_action("test") == "test"
-    assert MavenTool._suggested_build_action("org.foo:plugin:goal") == "compile"
+    params = normalizer.validate_and_fix(
+        "maven",
+        {"action": "install", "command": "test", "working_directory": "/workspace/p"},
+    )
+
+    assert params["action"] == "install"
+
+
+def test_legacy_maven_mapping_refuses_structured_properties_instead_of_stringifying():
+    build = BuildTool(None)
+    normalizer = _normalizer({"build": build})
+
+    with pytest.raises(ValueError, match="properties"):
+        normalizer.validate_and_fix(
+            "maven",
+            {"command": "test", "properties": {"skipTests": True}},
+        )
 
 
 # --- finding: build() without working_directory in /workspace/<repo> layout --
@@ -342,17 +357,28 @@ class ProjectLayoutOrchestrator:
         return {"success": True, "output": "missing", "exit_code": 0}
 
 
-def test_build_detection_falls_back_to_project_directory():
+def test_build_detection_does_not_probe_or_dispatch_from_project_name_fallback(
+    exact_build_facade_authority,
+):
     maven = RecorderTool("maven")
-    tool = BuildTool(ProjectLayoutOrchestrator("sample"), maven_tool=maven)
+    orchestrator = ProjectLayoutOrchestrator("sample")
+    tool = BuildTool(orchestrator, maven_tool=maven)
 
     result = tool.execute(action="compile")
 
-    assert result.succeeded, f"outcome={result.operation_outcome.value}: {result.output}"
-    assert maven.calls and maven.calls[0]["working_directory"] == "/workspace/sample"
+    assert result.operation_outcome.value == "unknown"
+    assert result.error_code == "BUILD_SYSTEM_NOT_DETECTED"
+    assert result.metadata == {
+        "runner_dispatched": False,
+        "working_directory": "/workspace",
+    }
+    assert result.facts["working_directory"] == "/workspace"
+    assert maven.calls == []
+    assert orchestrator.commands
+    assert not any("/workspace/sample/" in command for command in orchestrator.commands)
 
 
-# --- finding: search(target='job:<id>') polling repetition-blocked -----------
+# --- legacy job polling remains safe behind the controller barrier ----------
 
 
 def test_search_job_polling_is_exempt_from_repetition_detection():
@@ -391,133 +417,6 @@ def test_detached_handoff_carries_job_ref():
     assert "job:abc123" in result.refs
 
 
-# --- finding: recovery dispatch keyed on retired tool names -------------------
-
-
-def _recovery_handler(tools, **overrides):
-    guidance = overrides.pop("guidance", [])
-    return ToolRecoveryHandler(
-        tools=tools,
-        context_manager=overrides.pop("context_manager", None),
-        successful_states=overrides.pop("successful_states", {}),
-        repository_url=overrides.pop("repository_url", None),
-        repository_ref=overrides.pop("repository_ref", None),
-        add_system_guidance=lambda message, priority=5: guidance.append((message, priority)),
-    )
-
-
-def test_build_failure_routes_to_maven_java_version_recovery():
-    maven = RecorderTool("maven", results=[ToolResult.completed_success(output="build ok")])
-    system = RecorderTool(
-        "system",
-        results=[
-            ToolResult.completed_failure(output="", error="missing"),
-            ToolResult.completed_success(output="installed"),
-        ],
-    )
-    build = BuildTool(None, maven_tool=maven)
-    project = ProjectTool(system_tool=system)
-    handler = _recovery_handler({"build": build, "project": project})
-
-    failed = ToolResult.completed_failure(
-        output="",
-        error="Java 17 is required",
-        error_code="JAVA_VERSION_MISMATCH",
-        facts={"system": "maven", "action": "test"},
-        metadata={"analysis": {"java_version_error": {"required": "17", "current": "11"}}},
-    )
-
-    decision = handler.recover(
-        "build", {"action": "test", "working_directory": "/workspace/app"}, failed
-    )
-
-    assert decision.should_recover is True
-    assert decision.strategy == "maven_java_version"
-    assert system.calls == [
-        {"action": "verify_java", "java_version": "17"},
-        {"action": "install_java", "java_version": "17"},
-    ]
-    assert maven.calls == [
-        {
-            "command": MavenBackend.VERBS["test"],
-            "working_directory": "/workspace/app",
-        }
-    ]
-    assert decision.replacement_result.succeeded is True
-
-
-def test_build_failure_routes_to_gradle_compile_before_test():
-    gradle = RecorderTool("gradle", results=[ToolResult.completed_success(output="compiled")])
-    build = BuildTool(None, gradle_tool=gradle)
-    handler = _recovery_handler({"build": build})
-
-    failed = ToolResult.completed_failure(
-        output="",
-        error="Compilation failure before tests",
-        error_code="BUILD_FAILED",
-        facts={"system": "gradle", "action": "test"},
-    )
-
-    decision = handler.recover(
-        "build", {"action": "test", "working_directory": "/workspace/app"}, failed
-    )
-
-    assert decision.should_recover is True
-    assert decision.strategy == "gradle_compile_before_test"
-    assert gradle.calls == [{"tasks": "compileJava", "working_directory": "/workspace/app"}]
-
-
-def test_build_failure_routes_to_maven_known_working_directory():
-    maven = RecorderTool("maven", results=[ToolResult.completed_success(output="build ok")])
-    build = BuildTool(None, maven_tool=maven)
-    handler = _recovery_handler(
-        {"build": build},
-        successful_states={"working_directory": "/workspace/app"},
-    )
-
-    failed = ToolResult.completed_failure(
-        output="",
-        error="pom.xml not found: no such file",
-        error_code="MISSING_PROJECT",
-        facts={"system": "maven", "action": "test"},
-    )
-
-    decision = handler.recover("build", {"action": "test"}, failed)
-
-    assert decision.should_recover is True
-    assert decision.strategy == "maven_known_working_directory"
-    assert maven.calls == [
-        {
-            "command": MavenBackend.VERBS["test"],
-            "working_directory": "/workspace/app",
-        }
-    ]
-
-
-def test_project_clone_failure_recovers_with_injected_repository_url():
-    setup = RecorderTool("setup", results=[ToolResult.completed_success(output="cloned")])
-    project = ProjectTool(setup_tool=setup)
-    handler = _recovery_handler(
-        {"project": project},
-        repository_url="https://example.com/repo.git",
-        repository_ref="rel/1.2.3",
-    )
-
-    failed = ToolResult.completed_failure(output="", error="repository_url is required")
-
-    decision = handler.recover("project", {"action": "clone"}, failed)
-
-    assert decision.should_recover is True
-    assert decision.strategy == "project_setup_repository_url"
-    assert setup.calls == [
-        {
-            "action": "clone",
-            "repository_url": "https://example.com/repo.git",
-            "ref": "rel/1.2.3",
-        }
-    ]
-
-
 # --- round-4 gate fixes: steer the model to build(), not hand-rolled mvn ----
 # NOTE: test_analyzer_test_task_prescribes_build_tool was deleted with the plan
 # pipeline (Category-3 analyzer diet, dim a): the analyzer no longer generates
@@ -525,14 +424,15 @@ def test_project_clone_failure_recovers_with_injected_repository_url():
 # The bash-nudge regressions below still hold.
 
 
-def test_bash_mvn_failure_suggests_build_tool():
+def test_bash_mvn_failure_reports_boundary_without_selecting_a_call():
     from sag.tools.bash import BashTool
 
     tool = BashTool.__new__(BashTool)
     suggestions = tool._generate_error_suggestions(
         {"error_type": "general"}, "cd /workspace/p && ./bin/mvn -q test", 127
     )
-    assert any("build(action=" in s for s in suggestions), suggestions
+    assert any("public build affordance" in s for s in suggestions), suggestions
+    assert not any("build(action=" in s for s in suggestions), suggestions
 
 
 def test_bash_non_build_failure_has_no_build_nudge():

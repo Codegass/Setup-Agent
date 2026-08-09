@@ -29,12 +29,25 @@ is its own commit. The contract claim is scoped accordingly.
 import json
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
+from test_container_io import FakeContainer
 
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.receipt_structure import promote_structure
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.tools.internal.build_preflight import (
     BUILD_REQUIREMENTS_PATH,
     write_build_requirements,
+)
+
+_ATOMIC_WRITE_PREFIXES = (
+    "mkdir -p -- ",
+    ": > ",
+    "printf '%s' ",
+    "base64 --decode ",
+    "python3 -c ",
+    "rm -f -- ",
+    "mv -f -- ",
 )
 
 MANIFEST = {
@@ -78,8 +91,14 @@ class Transport:
         self.body = body if body is not None else json.dumps(MANIFEST)
         self.files = None  # never offer the in-memory shortcut
         self.writes = []
+        self.atomic = FakeContainer()
 
     def execute_command(self, command, **kwargs):
+        if command.startswith(_ATOMIC_WRITE_PREFIXES):
+            result = self.atomic.execute_command(command, **kwargs)
+            if command.startswith("python3 -c ") and "fcntl.flock" in command:
+                self.writes.append(command)
+            return result
         if self.mode == "failing":
             # The review's live reproduction: the READS fail transiently, the
             # WRITE then succeeds. A fake whose writes also fail would let the
@@ -108,6 +127,9 @@ class Transport:
             return ok()
         return ok()
 
+    def execute_control_command(self, command, **kwargs):
+        return self.execute_command(command, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # the read boundary
@@ -116,24 +138,81 @@ class Transport:
 
 def test_a_not_succeeded_read_raises_instead_of_reporting_absence():
     with pytest.raises(ContainerFileReadError):
-        read_container_text(
-            Transport("failing"), BUILD_REQUIREMENTS_PATH, exact_bytes=True
-        )
+        read_container_text(Transport("failing"), BUILD_REQUIREMENTS_PATH, exact_bytes=True)
 
 
 def test_marker_verified_absence_is_still_none():
     assert (
-        read_container_text(Transport("absent"), BUILD_REQUIREMENTS_PATH, exact_bytes=True)
-        is None
+        read_container_text(Transport("absent"), BUILD_REQUIREMENTS_PATH, exact_bytes=True) is None
     )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "success": False,
+            "exit_code": -1,
+            "dispatch_status": "control_transport_unavailable",
+            "output": "__SAG_FILE_MISSING__",
+        },
+        {
+            "success": False,
+            "exit_code": 44,
+            "dispatch_status": "execution_observation_failed",
+            "output": "garbled",
+        },
+        {
+            "success": False,
+            "exit_code": 44,
+            "output": "__SAG_FILE_BASE64__not-base64!",
+        },
+    ],
+)
+def test_only_the_exact_clean_missing_protocol_proves_absence(result):
+    class ForgedAbsence:
+        files = None
+
+        def execute_control_command(self, _command, **_kwargs):
+            return result
+
+    with pytest.raises(ContainerFileReadError):
+        read_container_text(ForgedAbsence(), BUILD_REQUIREMENTS_PATH, exact_bytes=True)
 
 
 def test_a_healthy_transport_read_returns_the_exact_bytes():
-    content = read_container_text(
-        Transport("present"), BUILD_REQUIREMENTS_PATH, exact_bytes=True
-    )
+    content = read_container_text(Transport("present"), BUILD_REQUIREMENTS_PATH, exact_bytes=True)
 
     assert json.loads(content) == MANIFEST
+
+
+def test_lossless_read_prefers_clean_control_transport_over_poisoned_runtime_path():
+    class PoisonedRuntime:
+        files = None
+
+        def __init__(self):
+            self.normal_calls = 0
+            self.control_calls = 0
+
+        def execute_command(self, _command, **_kwargs):
+            self.normal_calls += 1
+            return ok("__SAG_FILE_BASE64__Zm9yZ2Vk")
+
+        def execute_control_command(self, command, **_kwargs):
+            self.control_calls += 1
+            assert command.startswith("if test -f")
+            import base64 as b64
+
+            payload = b64.b64encode(json.dumps(MANIFEST).encode()).decode()
+            return ok(f"__SAG_FILE_BASE64__{payload}")
+
+    source = PoisonedRuntime()
+
+    content = read_container_text(source, BUILD_REQUIREMENTS_PATH, exact_bytes=True)
+
+    assert json.loads(content) == MANIFEST
+    assert source.control_calls == 1
+    assert source.normal_calls == 0
 
 
 def test_a_compat_double_that_serves_cat_still_works():
@@ -187,9 +266,7 @@ def test_a_failed_probe_never_degrades_to_the_lossy_cat():
             return ok()
 
     with pytest.raises(ContainerFileReadError):
-        read_container_text(
-            ProbeFailsCatWorks(), BUILD_REQUIREMENTS_PATH, exact_bytes=True
-        )
+        read_container_text(ProbeFailsCatWorks(), BUILD_REQUIREMENTS_PATH, exact_bytes=True)
 
 
 def test_the_non_exact_path_keeps_its_none_on_failure_semantics():
@@ -260,16 +337,14 @@ def test_a_failed_read_writes_nothing_and_the_manifest_survives():
     assert surface.writes == []
 
 
-def test_marker_verified_absence_still_creates_the_manifest():
-    """First-ever creation stays legal: absence PROVEN by the transport marker
-    is the one None that may create."""
+def test_marker_verified_absence_cannot_manufacture_a_survey_manifest():
+    """A receipt promotion needs the complete v1 survey identity."""
     surface = Transport("absent")
 
     promoted = promote_structure(surface.execute_command, TERMINAL_RECEIPT)
 
-    assert promoted is True
-    assert len(surface.writes) == 1
-    assert "module_structure" in surface.writes[0]
+    assert promoted is False
+    assert surface.writes == []
 
 
 def test_a_write_refused_on_an_unreadable_manifest_refuses_the_whole_write():
@@ -278,7 +353,13 @@ def test_a_write_refused_on_an_unreadable_manifest_refuses_the_whole_write():
     whether one exists, so the conservative act is to not write at all."""
     surface = Transport("failing")
 
-    written = write_build_requirements(surface, {"build_system": "gradle"})
+    written = write_build_requirements(
+        surface,
+        complete_build_requirements_v1(
+            project_root="/workspace/polaris",
+            build_system="gradle",
+        ),
+    )
 
     assert written is False
     assert surface.writes == []
@@ -287,7 +368,13 @@ def test_a_write_refused_on_an_unreadable_manifest_refuses_the_whole_write():
 def test_a_verified_absent_manifest_is_still_writable():
     surface = Transport("absent")
 
-    written = write_build_requirements(surface, {"build_system": "gradle"})
+    written = write_build_requirements(
+        surface,
+        complete_build_requirements_v1(
+            project_root="/workspace/polaris",
+            build_system="gradle",
+        ),
+    )
 
     assert written is True
     assert len(surface.writes) == 1
@@ -317,9 +404,11 @@ class LedgerSurface:
         self.mode = mode
 
     def execute_command(self, command, **kwargs):
-        if "job_obligations" in command and command.startswith("cat "):
+        if "job_obligations" in command and "SAG_NAMED_JSON_RECORD_V1" in command:
             if self.mode == "empty":
-                return fail("", exit_code=1)  # glob matched nothing: ran, empty
+                # The explicit-boundary loop skips an unmatched glob and exits
+                # successfully: it proved the ledger contains zero records.
+                return ok(frame_named_json_record_stream([]))
             if self.mode == "transport":
                 return {
                     "success": False,
@@ -351,10 +440,12 @@ def test_an_unreadable_ledger_holds_the_gate_cap(monkeypatch):
     confirmed — the cap holds on a stated inability, never lifts on one."""
     from sag.agent import phase_gates
     from sag.agent.phase_gates import (
+        JOB_INTEGRITY_FACT,
         OPEN_OBLIGATIONS_FACT,
+        GateControlDisposition,
+        ValidatorState,
         _inspect_phase,
         _ValidatorObservation,
-        ValidatorState,
     )
 
     monkeypatch.setattr(
@@ -370,7 +461,14 @@ def test_an_unreadable_ledger_holds_the_gate_cap(monkeypatch):
 
     observation = _inspect_phase("build", None, LedgerSurface("transport"), "polaris")
 
-    assert observation.validated_facts[OPEN_OBLIGATIONS_FACT] == [LEDGER_UNREADABLE]
+    # WS2/WS3 no longer disguises a broken controller ledger as an open
+    # project job.  It short-circuits the physical judge with a typed,
+    # controller-owned integrity disposition.
+    assert OPEN_OBLIGATIONS_FACT not in observation.validated_facts
+    assert observation.validated_facts[JOB_INTEGRITY_FACT] == ["ledger_unreadable"]
+    assert observation.state is ValidatorState.UNAVAILABLE
+    assert observation.code == "job_evidence_integrity"
+    assert observation.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
 
 
 def test_a_readable_empty_ledger_states_no_fact(monkeypatch):
@@ -378,9 +476,9 @@ def test_a_readable_empty_ledger_states_no_fact(monkeypatch):
     from sag.agent import phase_gates
     from sag.agent.phase_gates import (
         OPEN_OBLIGATIONS_FACT,
+        ValidatorState,
         _inspect_phase,
         _ValidatorObservation,
-        ValidatorState,
     )
 
     monkeypatch.setattr(
@@ -400,9 +498,8 @@ def test_a_readable_empty_ledger_states_no_fact(monkeypatch):
 
 
 def test_the_unreadable_ledger_refusal_names_the_ledger():
-    from sag.agent.phase_gates import OPEN_OBLIGATIONS_FACT, validate_phase_claim
+    from sag.agent.phase_gates import OPEN_OBLIGATIONS_FACT, ValidatorState, validate_phase_claim
     from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
-    from sag.agent.phase_gates import ValidatorState
 
     gate = validate_phase_claim(
         PhaseClaim(phase="build", signal="done", claimed_outcome=PhaseOutcome.SUCCESS),
@@ -447,6 +544,8 @@ def test_a_failed_receipts_probe_is_unreadable_not_absent():
 
     class Absent:
         def execute_command(self, command, **kwargs):
+            if "SAG_NAMED_JSON_RECORD_V1" in command:
+                return ok(frame_named_json_record_stream([]))
             return {"success": False, "exit_code": 1, "output": ""}
 
     assert _validator_with(Failing())._invocation_receipts_state() == "unreadable"
@@ -521,7 +620,15 @@ def test_a_failed_promotion_is_recovered_by_the_next_terminal_receipt():
     surface = Transport("failing")
     assert promote_structure(surface.execute_command, TERMINAL_RECEIPT) is False
 
-    surface.mode = "absent"  # the transient failure cleared; manifest absent
+    # The transient failure cleared after the survey's complete v1 artifact
+    # landed.  A receipt may enrich that identity, never synthesize it.
+    current = complete_build_requirements_v1(
+        project_root="/workspace/polaris",
+        build_system="gradle",
+    )
+    surface.mode = "present"
+    surface.body = json.dumps(current, sort_keys=True)
+    surface.atomic.files[BUILD_REQUIREMENTS_PATH] = surface.body
     recovered = promote_structure(surface.execute_command, TERMINAL_RECEIPT)
 
     assert recovered is True
@@ -550,8 +657,8 @@ def test_a_control_fact_never_moves_the_epoch_vector():
         EVIDENCE_SEALED_FACT,
         OPEN_OBLIGATIONS_FACT,
         PHYSICAL_STATE_FACT,
-        GateResult,
         ClaimDisposition,
+        GateResult,
         ValidatorState,
     )
     from sag.agent.phase_machine import PhaseOutcome
@@ -620,6 +727,9 @@ class TruncatingSurface:
         if truncate_output and len(output) > 10000:
             output = output[:10000]
         return {"success": True, "exit_code": 0, "output": output}
+
+    # Report hashes are machine evidence, not presentation output.
+    execute_control_command = execute_command
 
 
 def test_the_snapshot_survives_the_presentation_clamp():

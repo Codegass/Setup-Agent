@@ -3,6 +3,12 @@ from dataclasses import asdict, replace
 
 import pytest
 
+from container_evidence_fakes import ContainerFS
+from sag.agent.evidence_publications import (
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
 from sag.agent.evidence_state import (
     EvidenceRole,
 )
@@ -15,7 +21,7 @@ from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.verdict_finalizer import (
     EvidenceCloseReason,
     PhaseRecordSnapshot,
-    VerdictFinalizer,
+    VerdictFinalizer as _VerdictFinalizer,
     read_verdict_snapshot,
 )
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
@@ -46,38 +52,12 @@ class RunEvidenceState(_RunEvidenceState):
 
 class FakeVerdictOrchestrator:
     def __init__(self):
-        self.commands = []
-        self.files = {}
+        self.filesystem = ContainerFS()
+        self.commands = self.filesystem.commands
+        self.files = self.filesystem.files
 
-    def execute_command(self, command):
-        self.commands.append(command)
-
-        if command.startswith("mkdir -p "):
-            return {"success": True, "exit_code": 0, "output": ""}
-
-        if command.startswith("test -f ") and " && cat " in command:
-            path = command.split()[2]
-            if path not in self.files:
-                return {"success": False, "exit_code": 1, "output": ""}
-            return {"success": True, "exit_code": 0, "output": self.files[path]}
-
-        if command.startswith("cat > "):
-            path = command.split()[2]
-            payload = command.split("\n", 1)[1].rsplit("\n", 1)[0]
-            self.files[path] = payload + "\n"
-            return {"success": True, "exit_code": 0, "output": ""}
-
-        if command.startswith("truncate -s -1 "):
-            path = command.split()[-1]
-            self.files[path] = self.files[path][:-1]
-            return {"success": True, "exit_code": 0, "output": ""}
-
-        if command.startswith("mv "):
-            _, source, target = command.split()
-            self.files[target] = self.files.pop(source)
-            return {"success": True, "exit_code": 0, "output": ""}
-
-        return {"success": True, "exit_code": 0, "output": ""}
+    def execute_command(self, command, **kwargs):
+        return self.filesystem(command, **kwargs)
 
 
 class FailingReplacementOrchestrator(FakeVerdictOrchestrator):
@@ -85,11 +65,45 @@ class FailingReplacementOrchestrator(FakeVerdictOrchestrator):
         super().__init__()
         self.fail_replacement = False
 
-    def execute_command(self, command):
-        if command.startswith("mv ") and self.fail_replacement:
+    def execute_command(self, command, **kwargs):
+        if "fcntl.flock" in command and self.fail_replacement:
             self.commands.append(command)
             return {"success": False, "exit_code": 1, "output": "replacement failed"}
-        return super().execute_command(command)
+        return super().execute_command(command, **kwargs)
+
+
+class _MemoryControlSink:
+    path = "/host/verdict-finalizer-test-control-events.jsonl"
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, kind, payload, *, source=None):
+        del source
+        self.events.append((kind, dict(payload)))
+
+
+def bind_verdict_authority(orchestrator, run_id):
+    authority = EvidencePublicationAuthority(run_id=run_id, sink=_MemoryControlSink())
+    token = install_evidence_publication_authority(
+        authority,
+        orchestrator=orchestrator,
+    )
+    reset_evidence_publication_authority(token)
+    return authority
+
+
+class VerdictFinalizer(_VerdictFinalizer):
+    """Bind each legacy unit double to the state run it is exercising."""
+
+    def finalize(self, state, reason):
+        candidate = getattr(self.orchestrator, "_sag_evidence_publication_authority", None)
+        if (
+            not isinstance(candidate, EvidencePublicationAuthority)
+            or candidate.run_id != state.run_id
+        ):
+            bind_verdict_authority(self.orchestrator, state.run_id)
+        return super().finalize(state, reason)
 
 
 def _record_machine_history(state: RunEvidenceState, machine: PhaseMachine) -> None:
@@ -138,7 +152,7 @@ def _tvm_state() -> RunEvidenceState:
     return state
 
 
-def test_finalization_is_byte_identical_and_uses_atomic_rename():
+def test_finalization_is_byte_identical_and_uses_compare_publish_cas():
     orchestrator = FakeVerdictOrchestrator()
     state = _tvm_state()
     finalizer = VerdictFinalizer(orchestrator)
@@ -151,14 +165,11 @@ def test_finalization_is_byte_identical_and_uses_atomic_rename():
     assert first.schema_version == 3
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
-    assert orchestrator.commands[len(commands_after_first) :] == [
-        f"test -f {VERDICT_PATH} && cat {VERDICT_PATH}"
-    ]
-    temp_write_index = next(
-        index for index, command in enumerate(orchestrator.commands) if VERDICT_TMP_PATH in command
+    assert not any(
+        "fcntl.flock" in command for command in orchestrator.commands[len(commands_after_first) :]
     )
-    rename_index = orchestrator.commands.index(f"mv {VERDICT_TMP_PATH} {VERDICT_PATH}")
-    assert temp_write_index < rename_index
+    assert sum("fcntl.flock" in command for command in orchestrator.commands) == 1
+    assert not any(path.startswith(f"{VERDICT_PATH}.candidate.") for path in orchestrator.files)
 
 
 @pytest.mark.parametrize("disk_state", ["missing", "corrupt", "other_run", "stale"])
@@ -218,9 +229,9 @@ def test_sealed_retry_never_accepts_or_caches_an_older_run_snapshot():
     finalizer = VerdictFinalizer(orchestrator)
     orchestrator.fail_replacement = True
 
-    with pytest.raises(OSError, match="atomically rename"):
+    with pytest.raises(OSError, match="compare-and-publish"):
         finalizer.finalize(new_state, EvidenceCloseReason.ABORTED)
-    with pytest.raises(OSError, match="atomically rename"):
+    with pytest.raises(OSError, match="compare-and-publish"):
         finalizer.finalize(new_state, EvidenceCloseReason.ABORTED)
 
     assert new_state.sealed is True

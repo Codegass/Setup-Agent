@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from test_verdict_finalizer import FakeVerdictOrchestrator
+from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authority
 
 import sag.agent.react_engine as react_engine_module
 import sag.tools.base as tool_base_module
@@ -43,7 +43,9 @@ def _engine(*, turn=None, error=None, wall_clock_cap=0):
     engine.max_iterations = 3
     engine.phase_machine = PhaseMachine()
     engine.run_evidence_state = RunEvidenceState(run_id="abort-wiring")
-    engine.verdict_finalizer = VerdictFinalizer(FakeVerdictOrchestrator())
+    verdict_orchestrator = FakeVerdictOrchestrator()
+    bind_verdict_authority(verdict_orchestrator, engine.run_evidence_state.run_id)
+    engine.verdict_finalizer = VerdictFinalizer(verdict_orchestrator)
     engine._report_attempted = False
     engine._report_delivered = False
     engine._report_failed = False

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import shlex
+import threading
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, cast
 
 from loguru import logger
 
@@ -26,6 +28,9 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metric
 # Sentinel for memoizing _build_module_metrics (the result can legitimately be
 # None, so None cannot double as "not computed yet").
 _MODULE_METRICS_UNSET = object()
+_RECEIPT_RECORDS_UNSET = object()
+_OBLIGATION_RECORDS_UNSET = object()
+_REPORT_METRICS_PUBLICATION_LOCK = threading.RLock()
 from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import ADJUDICATED_CONFLICTS, rescue_blocked_build, run_verdict
 
@@ -135,6 +140,22 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
         "collection_error_summary": test_analysis.get("collection_error_summary"),
         "test_histories": test_analysis.get("test_histories", []),
         "metrics_conflicts": test_analysis.get("metrics_conflicts", []),
+        # Metrics-v2 dispositions must survive the parser -> report writer
+        # projection. They remain separate from every claimed count. Absent
+        # facts remain absent so historical report snapshots do not grow null
+        # aliases.
+        **{
+            key: value
+            for key, value in {
+                "receipt_scoped": True if test_analysis.get("receipt_scoped") else None,
+                "auxiliary_test_stats": test_analysis.get("auxiliary_test_stats"),
+                "auxiliary_report_files": (
+                    list(test_analysis.get("auxiliary_report_files") or []) or None
+                ),
+                "stale_test_reports": (list(test_analysis.get("stale_test_reports") or []) or None),
+            }.items()
+            if value is not None
+        },
         # Legacy plural alias (markdown consumers) + the singular key the
         # report_metrics contract actually reads.
         "report_files_count": len(report_files),
@@ -192,6 +213,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         context_manager=None,
         physical_validator=None,
         workflow_mode: str = "legacy",
+        control_event_sink=None,
     ):
         BaseTool.__init__(
             self,
@@ -205,6 +227,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         self.execution_history_callback = execution_history_callback
         self.context_manager = context_manager
         self.physical_validator = physical_validator
+        self.control_event_sink = control_event_sink
         if workflow_mode not in {"setup", "legacy", "run_task"}:
             raise ValueError(f"Unsupported report workflow mode: {workflow_mode}")
         self.workflow_mode = "legacy" if workflow_mode == "run_task" else workflow_mode
@@ -998,9 +1021,9 @@ class ReportTool(BaseTool, UIEventEmitter):
     ) -> Tuple[str, str, str, dict, dict]:
         """Generate a report through the explicit setup or legacy adapter."""
         if self.workflow_mode == "setup":
-            from sag.agent.verdict_finalizer import read_verdict_snapshot
+            from sag.agent.verdict_finalizer import read_live_verdict_snapshot
 
-            snapshot = read_verdict_snapshot(self.docker_orchestrator)
+            snapshot = read_live_verdict_snapshot(self.docker_orchestrator)
             return self._generate_snapshot_report(
                 snapshot,
                 summary=summary,
@@ -1033,6 +1056,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_filename=report_filename,
             project_info=project_info or {},
         )
+        report_metrics = self._assemble_report_metrics_artifact(
+            snapshot=report_snapshot,
+            build_evidence={},
+            test_analysis={},
+            conflicts=list(snapshot.conflicts),
+            evidence_refs=list(snapshot.input_refs),
+            generated_at=timestamp,
+            execution_metrics=execution_metrics,
+        )
+        report_snapshot["metrics_v2"] = report_metrics
         actual_accomplishments: dict[str, Any] = {}
 
         console_report = self._generate_console_report(
@@ -1059,23 +1092,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         if not self._save_markdown_report(markdown_report, timestamp, report_filename):
             raise OSError(f"failed to persist setup report: /workspace/{report_filename}")
 
-        try:
-            from sag.tools.report_metrics import assemble_report_metrics
-
-            evidence_result = report_snapshot.get("evidence_result") or {}
-            self._persist_report_metrics(
-                assemble_report_metrics(
-                    snapshot=report_snapshot,
-                    build_evidence={},
-                    test_analysis={},
-                    conflicts=list(evidence_result.get("conflicts") or []),
-                    evidence_refs=list(evidence_result.get("evidence_refs") or []),
-                    generated_at=timestamp,
-                    execution_metrics=execution_metrics,
-                )
-            )
-        except Exception as exc:  # pragma: no cover - defensive diagnostics
-            logger.warning(f"Skipped report metrics artifact: {exc}")
+        self._persist_report_metrics(report_metrics)
 
         return (
             console_report,
@@ -1153,6 +1170,31 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_snapshot["status"]["modules_not_tested"] = msum.get("modules_not_tested")
             report_snapshot["status"]["modules_test_bearing"] = msum.get("modules_test_bearing")
 
+        physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
+        build_status = physical_validation.get("build_status", {}) or {}
+        build_evidence = build_status.get("evidence", {}) or {}
+        test_analysis = physical_validation.get("test_analysis", {}) or {}
+        report_metrics: dict[str, Any] | None = None
+        if self.docker_orchestrator is not None:
+            report_metrics = self._assemble_report_metrics_artifact(
+                snapshot=report_snapshot,
+                build_evidence=build_evidence,
+                test_analysis=test_analysis,
+                conflicts=list(report_evidence_result.get("conflicts") or []),
+                evidence_refs=list(report_evidence_result.get("evidence_refs") or []),
+                generated_at=timestamp,
+                execution_metrics=execution_metrics,
+            )
+            report_snapshot["metrics_v2"] = report_metrics
+        else:
+            from sag.tools.report_metrics import build_evidence_layer_projection
+
+            report_snapshot["evidence_layer_projection"] = build_evidence_layer_projection(
+                snapshot=report_snapshot,
+                test_analysis=test_analysis,
+                conflicts=list(report_evidence_result.get("conflicts") or []),
+            )
+
         # Generate both console and markdown versions with verified information and metrics
         console_report = self._generate_console_report(
             summary,
@@ -1177,30 +1219,8 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Save markdown report to workspace with consistent filename
         self._save_markdown_report(markdown_report, timestamp, report_filename)
-        try:
-            from sag.tools.report_metrics import assemble_report_metrics
-
-            physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
-            build_status = physical_validation.get("build_status", {}) or {}
-            # Build system / fingerprint details live under build_status["evidence"];
-            # there is no dedicated "build_evidence" key (verified against the
-            # physical validator + report snapshot shapes).
-            build_evidence = build_status.get("evidence", {}) or {}
-            test_analysis = physical_validation.get("test_analysis", {}) or {}
-
-            self._persist_report_metrics(
-                assemble_report_metrics(
-                    snapshot=report_snapshot,
-                    build_evidence=build_evidence,
-                    test_analysis=test_analysis,
-                    conflicts=list(report_evidence_result.get("conflicts") or []),
-                    evidence_refs=list(report_evidence_result.get("evidence_refs") or []),
-                    generated_at=timestamp,
-                    execution_metrics=execution_metrics,
-                )
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(f"Skipped report metrics artifact: {exc}")
+        if report_metrics is not None:
+            self._persist_report_metrics(report_metrics)
 
         try:
             module_metrics = self._build_module_metrics(
@@ -1570,7 +1590,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             {"severity": "INFO", "icon": "INFO", "message": conflict}
             for conflict in snapshot.conflicts
         ]
-        return {
+        report_snapshot = {
             "mode": "setup",
             "status": status,
             "project": {
@@ -1610,6 +1630,13 @@ class ReportTool(BaseTool, UIEventEmitter):
             "raw_diagnostics": raw.model_dump(mode="json"),
             "canonical_snapshot": snapshot.model_dump(mode="json"),
         }
+        from sag.tools.report_metrics import build_evidence_layer_projection
+
+        report_snapshot["evidence_layer_projection"] = build_evidence_layer_projection(
+            snapshot=report_snapshot,
+            conflicts=list(snapshot.conflicts),
+        )
+        return report_snapshot
 
     def _build_legacy_report_snapshot(
         self,
@@ -2225,6 +2252,13 @@ class ReportTool(BaseTool, UIEventEmitter):
         snapshot["status"] = status
 
         condensed_lines = render_condensed_summary(snapshot).split("\n")
+        from sag.tools.report_metrics import format_evidence_layer_lines
+
+        condensed_lines.extend(
+            format_evidence_layer_lines(
+                snapshot.get("metrics_v2") or snapshot.get("evidence_layer_projection")
+            )
+        )
 
         if not actual_accomplishments and not self.physical_validator:
             condensed_lines.append(
@@ -2939,6 +2973,18 @@ class ReportTool(BaseTool, UIEventEmitter):
         evidence_lines = self._render_console_evidence_result(report_snapshot)
         if evidence_lines:
             report_lines.extend(evidence_lines)
+        from sag.tools.report_metrics import format_evidence_layer_lines
+
+        report_lines.extend(
+            ["", "🧾 METRICS-V2 EVIDENCE LAYERS:"]
+            + [
+                f"   • {line}"
+                for line in format_evidence_layer_lines(
+                    (report_snapshot or {}).get("metrics_v2")
+                    or (report_snapshot or {}).get("evidence_layer_projection")
+                )
+            ]
+        )
         report_lines.append("")
 
         # Add project information
@@ -3705,27 +3751,573 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         return section_lines
 
-    def _persist_report_metrics(self, metrics: dict) -> None:
-        """Write the structured metrics artifact for the web read model.
-        Best-effort: never fail report generation on a metrics write error."""
+    def _read_metrics_json(self, path: str) -> dict[str, Any]:
+        """Forensic compatibility reader; never feeds the live KPI writer."""
+
         if not self.docker_orchestrator:
-            return
+            return {}
         try:
-            import json as _json
-            import os as _os
+            result = self.docker_orchestrator.execute_command(f"cat {path} 2>/dev/null")
+            if result.get("exit_code") != 0:
+                return {}
+            parsed = json.loads(str(result.get("output") or ""))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
-            from sag.tools.report_metrics import METRICS_PATH
+    def _read_metrics_json_records(self, directory: str) -> list[dict[str, Any]] | None:
+        """Forensic complete transport view, without host publication trust.
 
-            parent = _os.path.dirname(METRICS_PATH)
-            if parent:
-                self.docker_orchestrator.execute_command(f"mkdir -p {parent}")
+        Historical tests and diagnostics may inspect it.  The live KPI writer
+        uses the publication-backed helpers below so a complete container
+        mirror cannot authorize itself.
+        """
 
-            body = _json.dumps(metrics, indent=2)
-            delimiter = f"EOF_METRICS_{abs(hash(body)) % 10000}"
-            command = f"cat > {METRICS_PATH} << '{delimiter}'\n{body}\n{delimiter}"
-            self.docker_orchestrator.execute_command(command)
+        if not self.docker_orchestrator:
+            return None
+        from sag.agent.evidence_records import (
+            decode_json_record_stream,
+            execute_json_record_stream,
+        )
+
+        try:
+            result = execute_json_record_stream(self.docker_orchestrator, directory)
+        except Exception:
+            return None
+        decoded = decode_json_record_stream(result)
+        if not decoded.complete or decoded.conflict:
+            return None
+        return [dict(record) for record in decoded.records]
+
+    def _read_live_metrics_run_pin(self) -> dict[str, Any]:
+        """Return the exact current host-published run pin, or no pin."""
+
+        if not self.docker_orchestrator:
+            return {}
+        from sag.agent.control_events import RunPin
+        from sag.agent.evidence_publications import RUN_PIN_LOGICAL_ARTIFACT_ID
+        from sag.agent.evidence_records import (
+            EvidencePublicationBinding,
+            read_live_published_mutable_json_object,
+        )
+
+        def validate(payload, expected_id):
+            if expected_id != RUN_PIN_LOGICAL_ARTIFACT_ID:
+                raise ValueError("run pin publication identity is invalid")
+            return RunPin.model_validate(payload).model_dump(mode="json")
+
+        read = read_live_published_mutable_json_object(
+            self.docker_orchestrator,
+            "/workspace/.setup_agent/run-pin.json",
+            record_kind="run_pin",
+            record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            validator=validate,
+            publication_binding=lambda payload: EvidencePublicationBinding(
+                run_id=payload.get("run_id"),
+                logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            ),
+        )
+        if not read.complete or read.conflict is not None or read.payload is None:
+            return {}
+        return dict(read.payload)
+
+    def _read_live_metrics_receipts(self) -> list[dict[str, Any]] | None:
+        """Return the complete current host-published receipt ledger."""
+
+        if not self.docker_orchestrator:
+            return None
+        from sag.agent.evidence_records import (
+            EvidencePublicationBinding,
+            LiveRecordScope,
+            read_live_published_json_records,
+        )
+        from sag.agent.invocation_receipts import (
+            RECEIPT_DIR,
+            receipt_record_scope,
+            validate_receipt_v2,
+        )
+
+        def scope(payload, current_run_id) -> LiveRecordScope:
+            value = receipt_record_scope(payload, current_run_id)
+            if value not in {"current", "foreign", "forensic"}:
+                return "current"
+            return cast(LiveRecordScope, value)
+
+        read = read_live_published_json_records(
+            self.docker_orchestrator,
+            RECEIPT_DIR,
+            record_kind="invocation_receipt",
+            validator=lambda payload, expected_id: validate_receipt_v2(
+                payload,
+                expected_id=expected_id,
+            ),
+            publication_binding=lambda payload: EvidencePublicationBinding(
+                run_id=payload["run_id"],
+                contract_id=payload.get("contract_id"),
+                contract_hash=payload.get("contract_hash"),
+            ),
+            record_scope=scope,
+        )
+        if not read.complete or read.conflict is not None:
+            return None
+        return [dict(record.payload) for record in read.records]
+
+    def _read_live_metrics_obligations(self) -> list[dict[str, Any]] | None:
+        """Return the complete current mutable job ledger."""
+
+        if not self.docker_orchestrator:
+            return None
+        from sag.agent.job_obligations import read_obligations
+
+        records = read_obligations(self.docker_orchestrator)
+        return [dict(record) for record in records] if records is not None else None
+
+    def _metrics_persistence_surface(
+        self,
+        *,
+        receipt_records: object = _RECEIPT_RECORDS_UNSET,
+        obligation_records: object = _OBLIGATION_RECORDS_UNSET,
+        run_id: str | None = None,
+    ) -> dict[str, int | None]:
+        """Count durable receipts and terminal-unpersisted obligations.
+
+        The count is intentionally file/state based.  Console prose and model
+        claims cannot create or settle a receipt.
+        """
+        if not self.docker_orchestrator:
+            return {
+                "receipts_expected": None,
+                "receipts_persisted": None,
+                "terminal_receipts_unpersisted": None,
+            }
+        from sag.agent.job_obligations import (
+            SETTLEMENT_SETTLED,
+            SETTLEMENT_UNPERSISTED,
+        )
+
+        if receipt_records is _RECEIPT_RECORDS_UNSET:
+            receipt_records = self._read_live_metrics_receipts()
+        records = receipt_records if isinstance(receipt_records, list) else None
+        active_run = str(run_id or "").strip()
+        if records is not None and active_run:
+            records = [record for record in records if record.get("run_id") == active_run]
+        if records is None:
+            persisted_ids: set[str] | None = None
+        else:
+            persisted_ids = set()
+            for record in records:
+                receipt_id = str(record.get("receipt_id") or "").strip()
+                if not receipt_id:
+                    persisted_ids = None
+                    break
+                persisted_ids.add(receipt_id)
+
+        if obligation_records is _OBLIGATION_RECORDS_UNSET:
+            obligation_records = self._read_live_metrics_obligations()
+        obligations = obligation_records if isinstance(obligation_records, list) else None
+        if obligations is not None and active_run:
+            obligations = [record for record in obligations if record.get("run_id") == active_run]
+        if obligations is not None and any(
+            not str(record.get("job_id") or "").strip() for record in obligations
+        ):
+            obligations = None
+        if obligations is None:
+            unpersisted: int | None = None
+            expected: int | None = None
+        else:
+            unpersisted = sum(
+                record.get("settlement_state") == SETTLEMENT_UNPERSISTED for record in obligations
+            )
+            if persisted_ids is None:
+                expected = None
+            else:
+                missing_obligations = 0
+                for record in obligations:
+                    receipt_id = str(
+                        record.get("settled_receipt_id") or record.get("attempted_receipt_id") or ""
+                    ).strip()
+                    if (
+                        record.get("settlement_state") != SETTLEMENT_SETTLED
+                        or not receipt_id
+                        or receipt_id not in persisted_ids
+                    ):
+                        missing_obligations += 1
+                expected = len(persisted_ids) + missing_obligations
+        return {
+            "receipts_expected": expected,
+            "receipts_persisted": len(persisted_ids) if persisted_ids is not None else None,
+            "terminal_receipts_unpersisted": unpersisted,
+        }
+
+    def _metrics_control_surface(self) -> dict[str, int | None]:
+        """Project only mechanically countable controller events.
+
+        Completion recurrence comes from the authoritative LoopMemory event;
+        the first rejected claim is not a recurrence, so only counts greater
+        than one contribute.  Cleanup counts registered jobs whose WS9 event
+        records a physical TERM/KILL signal.  The no-midrun-approval value is
+        a frozen startup policy invariant.
+        """
+        if not self.docker_orchestrator:
+            return {
+                "terminal_refusal_recurrences": None,
+                "unsettled_jobs": None,
+                "cleanup_escalations": None,
+                "midrun_human_approvals": 0,
+            }
+        from pathlib import Path
+
+        from sag.agent.control_events import (
+            CONTROL_EVENT_KINDS,
+            CONTROL_EVENT_MAX_RAW_BYTES,
+            ControlEvent,
+        )
+        from sag.agent.evidence_publications import (
+            EVIDENCE_PUBLICATION_MAX_CONTROL_STREAM_BYTES,
+        )
+
+        events: list[dict[str, Any]] | None = None
+        sink_path = getattr(getattr(self, "control_event_sink", None), "path", None)
+        if sink_path is not None:
+            try:
+                source = Path(sink_path)
+                if not source.exists():
+                    events = []
+                elif source.stat().st_size > EVIDENCE_PUBLICATION_MAX_CONTROL_STREAM_BYTES:
+                    events = None
+                else:
+                    raw = source.read_bytes()
+                    if not raw:
+                        events = []
+                    elif not raw.endswith(b"\n"):
+                        events = None
+                    else:
+                        events = []
+                        expected_sequence = 1
+                        for raw_line in raw.splitlines(keepends=True):
+                            if (
+                                raw_line in {b"\n", b"\r\n"}
+                                or not raw_line.endswith(b"\n")
+                                or len(raw_line) > CONTROL_EVENT_MAX_RAW_BYTES
+                            ):
+                                events = None
+                                break
+                            event = ControlEvent.model_validate_json(raw_line)
+                            if event.sequence != expected_sequence:
+                                events = None
+                                break
+                            expected_sequence += 1
+                            events.append(event.model_dump(mode="json"))
+            except (OSError, TypeError, ValueError):
+                events = None
+
+        def occurrences(kinds: tuple[str, ...], *, unique_jobs: bool = False) -> int | None:
+            if events is None or any(kind not in CONTROL_EVENT_KINDS for kind in kinds):
+                return None
+            selected = [event for event in events if event.get("kind") in kinds]
+            if not unique_jobs:
+                return len(selected)
+            job_ids = {
+                str(payload.get("job_id"))
+                for event in selected
+                if isinstance((payload := event.get("payload")), dict)
+                and str(payload.get("job_id") or "").strip()
+            }
+            return len(job_ids)
+
+        def completion_recurrences() -> int | None:
+            if events is None or "completion_claim_decision" not in CONTROL_EVENT_KINDS:
+                return None
+            return sum(
+                1
+                for event in events
+                if event.get("kind") == "completion_claim_decision"
+                and isinstance((payload := event.get("payload")), dict)
+                and payload.get("expected_decision") != "not_counted"
+                and int(payload.get("expected_recurrence_count") or 0) > 1
+            )
+
+        def cleanup_escalations() -> int | None:
+            if events is None or "job_stall_observed" not in CONTROL_EVENT_KINDS:
+                return None
+            return len(
+                {
+                    str(payload.get("job_id"))
+                    for event in events
+                    if event.get("kind") == "job_stall_observed"
+                    and isinstance((payload := event.get("payload")), dict)
+                    and (payload.get("term_sent") is True or payload.get("kill_sent") is True)
+                    and str(payload.get("job_id") or "").strip()
+                }
+            )
+
+        return {
+            "terminal_refusal_recurrences": completion_recurrences(),
+            "unsettled_jobs": occurrences(("job_live_at_close", "job_unsettled"), unique_jobs=True),
+            "cleanup_escalations": cleanup_escalations(),
+            "midrun_human_approvals": 0,
+        }
+
+    def _assemble_report_metrics_artifact(
+        self,
+        *,
+        snapshot: dict[str, Any],
+        build_evidence: dict[str, Any],
+        test_analysis: dict[str, Any],
+        conflicts: list[str],
+        evidence_refs: list[str],
+        generated_at: str,
+        execution_metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        from sag.tools.report_metrics import assemble_report_metrics
+
+        run_pin = self._read_live_metrics_run_pin()
+        # One immutable read feeds both persistence accounting and exact-row
+        # projection. A transient second read used to turn a known non-empty
+        # ledger into ``()`` via ``or ()`` while still reporting its receipt
+        # count as complete.
+        receipt_records = self._read_live_metrics_receipts()
+        obligation_records = self._read_live_metrics_obligations()
+        return assemble_report_metrics(
+            snapshot=snapshot,
+            build_evidence=build_evidence,
+            test_analysis=test_analysis,
+            conflicts=conflicts,
+            evidence_refs=evidence_refs,
+            generated_at=generated_at,
+            execution_metrics=execution_metrics,
+            run_pin=run_pin,
+            persistence=self._metrics_persistence_surface(
+                receipt_records=receipt_records,
+                obligation_records=obligation_records,
+                run_id=run_pin.get("run_id"),
+            ),
+            control=self._metrics_control_surface(),
+            receipt_records=receipt_records,
+        )
+
+    def finalize_metrics_v2(self, snapshot: Any) -> dict[str, Any]:
+        """Rewrite metrics-v2 after the loop, including the report receipt.
+
+        The report tool's in-call artifact is useful to its renderers, but its
+        own invocation receipt and the final control events do not exist until
+        after that call returns. The setup harness invokes this method at the
+        post-loop boundary so the durable artifact is the final accounting
+        surface rather than an off-by-one preview.
+        """
+
+        payload = (
+            snapshot.model_dump(mode="json")
+            if hasattr(snapshot, "model_dump")
+            else dict(snapshot or {})
+        )
+        build = payload.get("build_evidence")
+        build = build if isinstance(build, dict) else {}
+        try:
+            metrics = self._assemble_report_metrics_artifact(
+                snapshot=payload,
+                build_evidence=build,
+                test_analysis={},
+                conflicts=[str(item) for item in payload.get("conflicts") or ()],
+                evidence_refs=[str(item) for item in payload.get("input_refs") or ()],
+                generated_at=str(payload.get("finalized_at") or "unavailable"),
+                execution_metrics=self._collect_execution_metrics(),
+            )
+            if not self._persist_report_metrics(metrics):
+                raise OSError("final metrics-v2 artifact did not persist")
+        except Exception:
+            self._quarantine_report_metrics()
+            raise
+        return metrics
+
+    def _quarantine_report_metrics(self) -> bool:
+        """Revoke the current metrics head and CAS-move its container mirror.
+
+        Revocation is the authority boundary; ``.rejected`` is only retained
+        diagnosis.  Either half failing remains fail-closed: a tombstone with
+        an unexpected live file and a present head with a missing file are
+        both rejected by the strict fixed-path reader.
+        """
+
+        if not self.docker_orchestrator:
+            return False
+        from sag.agent.evidence_publications import (
+            evidence_publication_authority_for,
+            revoke_evidence_artifact,
+        )
+        from sag.runtime.container_io import ContainerFileReadError, read_container_text
+        from sag.tools.report_metrics import (
+            METRICS_PATH,
+            REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+        )
+
+        with _REPORT_METRICS_PUBLICATION_LOCK:
+            authority = evidence_publication_authority_for(self.docker_orchestrator)
+            head = authority.latest_head(REPORT_METRICS_LOGICAL_ARTIFACT_ID)
+            revoked = head is None or head.publication_state == "revoked"
+            if head is not None and head.publication_state == "present":
+                attempt = revoke_evidence_artifact(
+                    self.docker_orchestrator,
+                    record_kind="report_metrics",
+                    record_id=REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                    logical_artifact_id=REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                    expected_previous_raw_sha256=head.raw_sha256,
+                )
+                revoked = attempt.committed
+                if not revoked:
+                    logger.warning("Report metrics host revocation failed: " f"{attempt.status}")
+            try:
+                current = read_container_text(
+                    self.docker_orchestrator,
+                    METRICS_PATH,
+                    exact_bytes=True,
+                )
+            except ContainerFileReadError as exc:
+                logger.warning(f"Report metrics quarantine read failed: {exc}")
+                return False
+            if current is None:
+                return revoked
+            moved = self._compare_quarantine_report_metrics_file(current)
+            if not moved:
+                logger.warning("Report metrics quarantine compare-move failed")
+            return bool(revoked and moved)
+
+    def _compare_quarantine_report_metrics_file(self, expected_content: str) -> bool:
+        """Move only the exact metrics bytes observed by the quarantine read."""
+
+        import hashlib
+
+        from sag.tools.report_metrics import METRICS_PATH
+
+        payload = expected_content.encode("utf-8")
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+        rejected_path = f"{METRICS_PATH}.rejected"
+        lock_path = f"{METRICS_PATH}.update.lock"
+        program = """import fcntl,hashlib,os,sys
+target,rejected,lock_path,expected_bytes,expected_sha=sys.argv[1:6]
+with open(lock_path,"a+b") as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX)
+    try:
+        with open(target,"rb") as source:
+            actual=source.read()
+    except FileNotFoundError:
+        print("SAG_QUARANTINE_ABSENT")
+        raise SystemExit(75)
+    if len(actual) != int(expected_bytes) or hashlib.sha256(actual).hexdigest() != expected_sha:
+        print("SAG_QUARANTINE_CONFLICT")
+        raise SystemExit(75)
+    os.replace(target,rejected)
+"""
+        command = (
+            f"python3 -c {shlex.quote(program)} {shlex.quote(METRICS_PATH)} "
+            f"{shlex.quote(rejected_path)} {shlex.quote(lock_path)} "
+            f"{len(payload)} {expected_sha256}"
+        )
+        try:
+            result = self.docker_orchestrator.execute_command(command)
+        except Exception:
+            return False
+        return bool(
+            isinstance(result, dict)
+            and result.get("exit_code", 0) == 0
+            and result.get("success") is not False
+            and not result.get("dispatch_status")
+        )
+
+    def _persist_report_metrics(self, metrics: dict) -> bool:
+        """CAS-write and host-publish one mutable metrics revision."""
+        if not self.docker_orchestrator:
+            return False
+        try:
+            from sag.agent.evidence_publications import (
+                evidence_publication_authority_for,
+                latest_publication_raw_sha256,
+                publish_evidence_revision,
+                verify_latest_evidence_bytes,
+            )
+            from sag.runtime.container_io import read_container_text
+            from sag.tools.report_metrics import (
+                METRICS_PATH,
+                REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                validate_report_metrics_v2,
+            )
+            from sag.utils.container_io import (
+                WRITE_COMPARE_CONFLICT,
+                compare_publish_container_text_atomic,
+            )
+
+            forward = validate_report_metrics_v2(metrics)
+            body = json.dumps(forward, ensure_ascii=False, indent=2, sort_keys=True)
+            raw = body.encode("utf-8")
+            with _REPORT_METRICS_PUBLICATION_LOCK:
+                for _attempt in range(3):
+                    authority = evidence_publication_authority_for(self.docker_orchestrator)
+                    payload_run_id = (forward.get("run") or {}).get("run_id")
+                    if isinstance(payload_run_id, str) and payload_run_id != getattr(
+                        authority, "run_id", None
+                    ):
+                        raise ValueError(
+                            "report metrics payload belongs to a different host publication run"
+                        )
+                    head = authority.latest_head(REPORT_METRICS_LOGICAL_ARTIFACT_ID)
+                    if head is not None and head.publication_state == "revoked":
+                        raise ValueError("a revoked report metrics artifact cannot be resurrected")
+                    expected_publication = latest_publication_raw_sha256(
+                        self.docker_orchestrator,
+                        REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                    )
+                    current = read_container_text(
+                        self.docker_orchestrator,
+                        METRICS_PATH,
+                        exact_bytes=True,
+                    )
+                    current_is_head = bool(
+                        head is not None
+                        and current is not None
+                        and verify_latest_evidence_bytes(
+                            self.docker_orchestrator,
+                            record_kind="report_metrics",
+                            record_id=REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                            logical_artifact_id=REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                            raw=current.encode("utf-8"),
+                            run_id=(forward.get("run") or {}).get("run_id"),
+                        ).authorized
+                    )
+                    if head is not None and not current_is_head and current != body:
+                        raise ValueError(
+                            "report metrics container bytes are not the current host revision"
+                        )
+                    if current != body:
+                        result = compare_publish_container_text_atomic(
+                            self.docker_orchestrator,
+                            METRICS_PATH,
+                            body,
+                            expected_content=current,
+                            validate_json=True,
+                        )
+                        if not result.persisted:
+                            if result.code == WRITE_COMPARE_CONFLICT:
+                                continue
+                            raise OSError(
+                                f"{result.code}: metrics-v2 transport rejected the artifact"
+                            )
+                    publication = publish_evidence_revision(
+                        self.docker_orchestrator,
+                        record_kind="report_metrics",
+                        record_id=REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                        logical_artifact_id=REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+                        raw=raw,
+                        expected_previous_raw_sha256=expected_publication,
+                    )
+                    if publication.published:
+                        return True
+                    if publication.status == "publication_conflict":
+                        continue
+                    raise OSError(f"{publication.status}: metrics-v2 host publication failed")
+                raise OSError("report metrics compare/publication retry exhausted")
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"Failed to persist report metrics: {exc}")
+            return False
 
     def _reactor_status_from_history(self, test_history: dict) -> dict:
         """Flatten reactor_summary records from test history into {label: status}.
@@ -4289,6 +4881,19 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
         """Render detailed test analysis with all metrics clearly displayed."""
         status = snapshot.get("status", {})
+        from sag.tools.report_metrics import format_evidence_layer_lines
+
+        lines = [
+            "## 🧾 Metrics-v2 Evidence Layers",
+            "",
+            *[
+                f"- {line}"
+                for line in format_evidence_layer_lines(
+                    snapshot.get("metrics_v2") or snapshot.get("evidence_layer_projection")
+                )
+            ],
+            "",
+        ]
 
         # A run whose pytest attempts produced only COLLECTION nodes executed
         # nothing, so the old gate ("skip unless tests_total") deleted the one
@@ -4300,9 +4905,17 @@ class ReportTool(BaseTool, UIEventEmitter):
         collection = self._collection_failure_facts(snapshot)
         attempt = self._latest_test_attempt_facts(snapshot)
         if not status.get("tests_total") and not collection and not attempt:
-            return []
+            return lines
 
-        lines = ["## 🧪 Detailed Test Analysis", ""]
+        lines.extend(
+            [
+                "## 🧪 Snapshot Test Diagnostics",
+                "",
+                "> These aggregates are diagnostic. Metrics-v2 claimed subjects, cases, and "
+                "receipt executions are listed separately above.",
+                "",
+            ]
+        )
         lines.extend(self._render_collection_failure(collection, status))
         lines.extend(self._render_latest_test_attempt(attempt))
 
@@ -4445,8 +5058,8 @@ class ReportTool(BaseTool, UIEventEmitter):
         return lines
 
     def _render_issues_recommendations(self, snapshot: Dict[str, Any]) -> List[str]:
-        """Render issues and recommendations section."""
-        lines = ["## 🚨 Issues & Recommendations", ""]
+        """Render observed issues and grounded setup facts, never a repair plan."""
+        lines = ["## 🚨 Issues & Evidence", ""]
 
         status = snapshot.get("status", {})
         attention_raw = snapshot.get("attention", {}).get("raw", [])
@@ -4518,99 +5131,34 @@ class ReportTool(BaseTool, UIEventEmitter):
                 lines.append(f"- ... (+{len(warnings) - 5} more)")
             lines.append("")
 
-        # Actionable Recommendations
-        lines.extend(["### Actionable Recommendations"])
+        lines.extend(["### Grounded Setup Facts"])
 
-        # Surveyed coordinates outrank generic ecosystem prose (§3.5-adjacent
-        # P2): the TVM report recommended "pip install -e . && pytest" while
-        # the survey manifest carried the real install ladder and a verified
-        # smoke coordinate. Quote what was surveyed; when a survey source is
-        # reachable but recorded nothing, name that gap instead of inventing
-        # commands the run never verified.
+        # A survey may record text that appeared in project-owned build files
+        # or documentation.  Report it as provenance-bearing observed data,
+        # never as the next command the model or user should run.
         surveyed = self._surveyed_setup_facts()
         if surveyed:
-            lines.extend(self._render_surveyed_recommendations(surveyed))
+            lines.extend(self._render_surveyed_observations(surveyed))
             lines.append("")
             return lines
         if self._survey_source_reachable():
             lines.extend(
                 [
-                    "- ⚠️ No surveyed setup coordinates were recorded for this run, so this"
-                    " report has no verified install or test commands to quote.",
-                    "- Run project(action='analyze') to record them before trusting any"
-                    " reproduction steps.",
+                    "- ⚠️ No surveyed setup coordinates were recorded for this run.",
+                    "- Constraint: no reproduction or repair command can be inferred from"
+                    " the available report evidence.",
                 ]
             )
             lines.append("")
             return lines
-
-        # Language-aware advice: a python snapshot must NOT be handed maven
-        # commands. TVM (python-primary, jvm/ Maven binding) got a report
-        # recommending 'mvn clean test -DskipTests=false' — meaningless for a
-        # pytest project. Branch on the snapshot's build system.
-        if self._snapshot_build_system(snapshot) == "python":
-            if exec_rate and exec_rate < 90:
-                lines.append("1. **Increase Test Execution Rate**:")
-                lines.append("   ```bash")
-                lines.append("   pytest -p no:cacheprovider")
-                lines.append("   ```")
-
-            lines.append("2. **Run All Tests**:")
-            lines.append("   ```bash")
-            lines.append("   pip install -e . && pytest")
-            lines.append("   ```")
-
-            if warnings or blockers:
-                lines.append("3. **Check Skipped Reasons**:")
-                lines.append("   ```bash")
-                lines.append('   pytest -rs | grep -i "skip\\|deselect"')
-                lines.append("   ```")
-
-            lines.append("")
-            return lines
-
-        if exec_rate and exec_rate < 90:
-            skipped_modules = status.get("skipped_modules", [])[:3]
-            if skipped_modules:
-                modules_str = ",".join(skipped_modules)
-                lines.append(f"1. **Increase Test Execution Rate**:")
-                lines.append(f"   ```bash")
-                lines.append(f"   mvn test -pl {modules_str}")
-                lines.append(f"   ```")
-
-        lines.append("2. **Run All Tests**:")
-        lines.append("   ```bash")
-        lines.append("   mvn clean test -DskipTests=false")
-        lines.append("   ```")
-
-        if warnings or blockers:
-            lines.append("3. **Check Skipped Reasons**:")
-            lines.append("   ```bash")
-            lines.append('   mvn test -X | grep -i "skip\\|exclude"')
-            lines.append("   ```")
-
+        lines.extend(
+            [
+                "- ⚠️ Survey evidence is unavailable to this report renderer.",
+                "- Constraint: no project command is inferred from ecosystem labels alone.",
+            ]
+        )
         lines.append("")
-
         return lines
-
-    def _snapshot_build_system(self, snapshot: Dict[str, Any]) -> str:
-        """The canonical build-system label for this snapshot, lowercased.
-
-        Prefers the physically-detected build system (physical_evidence, same
-        source the module-metrics scan trusts) and falls back to the reported
-        project build system. 'pip/poetry' normalizes to 'python' so the
-        recommendation branch keys off one label.
-        """
-        for candidate in (
-            (snapshot.get("physical_evidence") or {}).get("build_system"),
-            (snapshot.get("project") or {}).get("build_system"),
-        ):
-            label = str(candidate or "").strip().lower()
-            if label in ("python", "pip/poetry", "pip", "poetry"):
-                return "python"
-            if label in ("maven", "gradle"):
-                return label
-        return ""
 
     # ------------------------------------------------------------------
     # Report-layer honesty (Plan 3 Task 3)
@@ -4782,32 +5330,20 @@ class ReportTool(BaseTool, UIEventEmitter):
         return facts
 
     def _pytest_collected_facts(self) -> Dict[str, Any]:
-        """The last pytest collect pass as python_tool persisted it, {} if none.
+        """Return no live facts from the legacy collect-count sidecar.
 
-        ``pytest_collected.json`` is the runner's own structured record of the
-        latest attempt (scope/collected/selected). Memoized: one read per
-        report, and an unreachable or malformed file is simply no facts.
+        ``pytest_collected.json`` remains a forensic runner artifact, but it is
+        project-writable container state without a host publication or a
+        receipt/contract binding.  Report authority therefore comes only from
+        the sealed/current sources assembled by :meth:`_collection_fact_sources`.
+        Keeping this compatibility hook empty also prevents a later raw file
+        from overriding the attempt the finalizer actually sealed.
         """
         cached = getattr(self, "_pytest_collected_cache", None)
         if cached is not None:
             return cached
-
-        facts: Dict[str, Any] = {}
-        orchestrator = getattr(self, "docker_orchestrator", None)
-        if orchestrator is not None:
-            try:
-                from sag.tools.internal.python_tool import COLLECTED_JSON
-
-                result = orchestrator.execute_command(f"cat {COLLECTED_JSON}")
-                if result.get("success") or result.get("exit_code") == 0:
-                    payload = json.loads(str(result.get("output") or "").strip())
-                    if isinstance(payload, dict):
-                        facts = payload
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug(f"pytest collect record unavailable for the report: {exc}")
-
-        self._pytest_collected_cache = facts
-        return facts
+        self._pytest_collected_cache = {}
+        return self._pytest_collected_cache
 
     def _latest_test_attempt_facts(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """Command/scope/collected/selected of the attempt the report describes."""
@@ -4915,18 +5451,24 @@ class ReportTool(BaseTool, UIEventEmitter):
         )
 
     def _read_survey_manifest(self) -> Dict[str, Any]:
-        """The analyzer's build-requirements manifest; {} when unreachable."""
+        """The current host-authorized survey manifest, or ``{}``."""
         orchestrator = getattr(self, "docker_orchestrator", None)
         if orchestrator is None:
             return {}
         try:
-            from sag.tools.internal.build_preflight import read_build_requirements
+            from sag.tools.internal.build_preflight import read_live_build_requirements
 
-            manifest = read_build_requirements(orchestrator)
+            live = read_live_build_requirements(orchestrator)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"survey manifest unreadable for recommendations: {exc}")
             return {}
-        return manifest if isinstance(manifest, dict) else {}
+        if not live.complete or live.conflict is not None or live.payload is None:
+            logger.debug(
+                "survey manifest unavailable for report facts: "
+                f"{live.conflict or live.detail or 'verified_absent'}"
+            )
+            return {}
+        return dict(live.payload)
 
     def _trunk_build_recommendation(self) -> Dict[str, Any]:
         """The trunk's surveyed build coordinates; {} when unreachable."""
@@ -4943,11 +5485,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         return recommendation if isinstance(recommendation, dict) else {}
 
     def _surveyed_setup_facts(self) -> Dict[str, Any]:
-        """Surveyed coordinates the recommendations may quote; {} when none.
+        """Surveyed coordinates the report may identify as observations.
 
-        Facts only — the install commands, verified smoke coordinates and
-        build/test coordinates the survey actually recorded. Memoized: one
-        manifest read per report.
+        Facts only: text found in project metadata/documents and mechanically
+        discovered roots/candidates.  Their presence does not prove execution
+        or make them a harness recommendation. Memoized: one manifest read per
+        report.
         """
         cached = getattr(self, "_surveyed_facts_cache", None)
         if cached is not None:
@@ -4986,15 +5529,15 @@ class ReportTool(BaseTool, UIEventEmitter):
         self._surveyed_facts_cache = facts
         return facts
 
-    def _render_surveyed_recommendations(self, facts: Dict[str, Any]) -> List[str]:
-        """Render the surveyed facts as the actionable recommendations."""
+    def _render_surveyed_observations(self, facts: Dict[str, Any]) -> List[str]:
+        """Render survey data with factual provenance and no imperative."""
         lines: List[str] = []
         index = 0
 
         install_commands = facts.get("install_commands") or []
         if install_commands:
             index += 1
-            lines.append(f"{index}. **Install with the surveyed commands**:")
+            lines.append(f"{index}. **Install command text recorded by the survey**:")
             lines.append("   ```bash")
             for command in install_commands:
                 lines.append(f"   {command}")
@@ -5003,7 +5546,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         smoke = facts.get("smoke_coordinates") or []
         if smoke:
             index += 1
-            lines.append(f"{index}. **Verified smoke coordinates** (survey-recorded tests):")
+            lines.append(f"{index}. **Survey-discovered smoke candidates**:")
             for coordinate in smoke:
                 lines.append(f"   - `{coordinate}`")
 
@@ -5105,14 +5648,15 @@ class ReportTool(BaseTool, UIEventEmitter):
         if snapshot:
             last_cmd = snapshot.get("last_command", {})
             if last_cmd:
-                tool = last_cmd.get("tool", "maven")
-                command = last_cmd.get("command", "N/A")
-                workdir = last_cmd.get("workdir", "/workspace")
-
-                lines.append(
-                    f"**Build Command:** `{command if 'install' in command or 'compile' in command else 'mvn clean install -DskipTests'}`"
-                )
-                lines.append(f"**Test Command:** `{command if 'test' in command else 'mvn test'}`")
+                tool = str(last_cmd.get("tool") or "").strip()
+                command = str(last_cmd.get("command") or "").strip()
+                workdir = str(last_cmd.get("workdir") or "").strip()
+                if tool:
+                    lines.append(f"**Last Recorded Tool:** `{tool}`")
+                if command:
+                    lines.append(f"**Last Recorded Command:** `{command}`")
+                if workdir:
+                    lines.append(f"**Recorded Working Directory:** `{workdir}`")
 
         # Add runtime metrics
         if execution_metrics:

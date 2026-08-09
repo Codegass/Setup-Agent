@@ -359,7 +359,7 @@ def test_agent_task_launcher_project_name_falls_back_on_non_string_metadata_name
     )
 
 
-def test_agent_task_launcher_project_name_strips_metadata_name():
+def test_agent_task_launcher_ignores_container_project_metadata():
     class SpacedNameMetadataOrchestrator:
         def execute_command(self, command):
             return {"exit_code": 0, "output": '{"project_name": " commons-cli "}'}
@@ -368,5 +368,5 @@ def test_agent_task_launcher_project_name_strips_metadata_name():
 
     assert (
         launcher._read_project_name(SpacedNameMetadataOrchestrator(), fallback="fallback")
-        == "commons-cli"
+        == "fallback"
     )

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -13,11 +14,14 @@ from loguru import logger
 def generate_session_id() -> str:
     """Generate a unique session ID.
 
-    The pid suffix keeps concurrent setups (for example, batch launches from
-    the Web UI that start in the same second) in separate session directories.
+    A random nonce separates consecutive sessions in one long-lived process;
+    the pid suffix separates concurrent processes and remains useful in logs.
+    Both are needed because the Workbench can force a new session logger
+    without restarting Python.
     """
 
-    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{timestamp}_{uuid.uuid4().hex[:12]}_{os.getpid()}"
 
 
 class SessionLogger:

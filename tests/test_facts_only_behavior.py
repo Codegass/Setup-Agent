@@ -13,18 +13,20 @@ advice and open only to survey FACTS:
   (d) objectives wording: facts wording, no "Recommended Build/Tests"
   (e) pre-hoc python guidance: closed; the REACTIVE smoke steer stays
 
-The corrective-loop allowlist (island checklist, loop redirect, native smoke
-steer) and the shared mechanical machinery (workdir default, manifest reads)
-are retained — this file asserts they still behave.
+The corrective-loop allowlist (island checklist and native smoke steer) and
+the shared mechanical machinery (workdir default, manifest reads) are retained;
+the deleted manifest-goal redirect is no longer allowed to choose model calls.
 """
 
 import json
 from types import SimpleNamespace
 
 import pytest
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 from test_framework_survey import SurveyOrch
 
 from sag.agent.project_fact_projection import render_project_fact_sheet
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.tool_orchestration import format_tool_result
 from sag.config.prescriptions import (
     PRESCRIPTION_FLAG_NAMES,
@@ -145,7 +147,7 @@ def test_analyzer_failure_is_typed_and_only_engine_projects_explanatory_prose():
 
     observation = format_tool_result("project", result)
     assert "The project survey action is invalid." in observation
-    assert "Use project(action='analyze')." in observation
+    assert "project(action=" not in observation
     assert '"schema":"sag.project-analysis-error"' not in observation
 
 
@@ -464,10 +466,12 @@ def test_objectives_carry_no_recommendation_wording():
     for text in (build, analyze, test, python_test):
         assert "Recommended Build" not in text
         assert "Recommended Tests" not in text
-    # The surviving semantics are intact: honest blocking and the bash ban.
+    # Closure semantics remain, while neutral call syntax stays in tool schema.
     assert "compile target" in build
-    assert "Never run mvn/gradle via bash" in build
-    assert "pytest" in python_test  # ecosystem override still selected
+    assert "registered toolchain" in build
+    assert "terminal Python runner evidence" in python_test
+    assert "build(action=" not in build
+    assert "build(action=" not in python_test
 
 
 def test_kickoff_tasks_carry_no_recommendation_wording():
@@ -477,8 +481,9 @@ def test_kickoff_tasks_carry_no_recommendation_wording():
     for name in ("analyze", "build", "test"):
         assert "Recommended Build" not in tasks[name]
         assert "Recommended Tests" not in tasks[name]
-    # The kickoff softening survives the facts wording.
-    assert "not a Python/other-ecosystem project" in tasks["build"]
+    assert "terminal build evidence" in tasks["build"]
+    assert "required surveyed build coordinate" in tasks["build"]
+    assert "build(action=" not in tasks["build"]
 
 
 def test_python_objectives_carry_no_recommendation_wording():
@@ -549,36 +554,224 @@ def test_analysis_validity_is_facts_based():
     assert tool._is_analysis_valid(analysis) is True
 
 
-def test_loop_redirect_reads_island_goals_from_the_shared_manifest():
-    """The redirect reads island goals from the shared manifest (not the
-    stripped trunk rec), so the coordinates carry the recommended goal per
-    island."""
-    import json
+def test_loop_redirect_projects_manifest_coordinates_but_not_goals():
+    """The allowlisted corrective line is factual navigation only."""
+    from types import SimpleNamespace
 
-    from test_python_phase_guidance import _engine_at, _python_env
-
+    from sag.agent.react_engine import ReActEngine
     from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
-    manifest = {
-        "build_islands": [
-            {"root": "/workspace/p/a", "system": "maven", "goal": "install"},
-            {"root": "/workspace/p/b", "system": "gradle", "goal": "publishToMavenLocal"},
-        ]
+    engine = ReActEngine.__new__(ReActEngine)
+    orchestrator = SurveyOrch()
+    orchestrator.files[REQUIREMENTS_PATH] = json.dumps(
+        {
+            "build_islands": [
+                {
+                    "system": "gradle",
+                    "root": "/workspace/demo/island-a",
+                    "goal": "publishToMavenLocal",
+                },
+                {
+                    "system": "maven",
+                    "root": "/workspace/demo/island-b",
+                    "goal": "install",
+                },
+            ]
+        }
+    )
+    orchestrator.publish_existing_manifest()
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orchestrator)
+    engine.run_evidence_state = SimpleNamespace(tool_observations=())
+
+    line = engine._untried_island_coordinates()
+
+    assert "gradle at /workspace/demo/island-a" in line
+    assert "maven at /workspace/demo/island-b" in line
+    assert "publishToMavenLocal" not in line
+    assert "install" not in line
+    assert "build(action=" not in line
+
+
+class _ReceiptBoundLoopOrch:
+    def __init__(self, manifest, receipts=(), run_pin=None):
+        from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="current-run",
+            target_sha="a" * 40,
+            receipts=tuple(receipts),
+            run_pin=run_pin,
+        )
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=manifest,
+        )
+        self.files = self.evidence.files
+
+    def read_file(self, path):
+        content = self.files.get(path)
+        if content is None:
+            return None
+        return {"success": True, "exit_code": 0, "content": content}
+
+    def execute_command(self, command, **_kwargs):
+        return self.evidence(command)
+
+
+def _receipt_loop_line(
+    *,
+    receipt=None,
+    metadata_receipt_id=None,
+    params=None,
+    metadata_extra=None,
+    run_pin=None,
+):
+    from sag.agent.evidence_state import RunEvidenceState, StateScope
+    from sag.agent.react_engine import ReActEngine
+
+    islands = [
+        {"system": "maven", "root": "/workspace/demo/a"},
+        {"system": "gradle", "root": "/workspace/demo/b"},
+    ]
+    orch = _ReceiptBoundLoopOrch(
+        {"build_islands": islands},
+        [receipt] if receipt else [],
+        run_pin=run_pin,
+    )
+    state = RunEvidenceState(run_id="current-run")
+    if metadata_receipt_id is not None:
+        metadata = {"receipt_id": metadata_receipt_id}
+        metadata.update(metadata_extra or {})
+        state.ingest_tool_result(
+            StateScope.ARTIFACTS,
+            "build",
+            ToolResult.completed_failure(
+                output="runner failed",
+                error="compile failed",
+                metadata=metadata,
+            ),
+            params=params or {"action": "compile"},
+            source_phase="build",
+            source_attempt_id="build-1",
+            execution_id="exec-1",
+        )
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orch)
+    engine.run_evidence_state = state
+    return engine._untried_island_coordinates()
+
+
+def _build_receipt(**overrides):
+    receipt = {
+        "schema_version": 2,
+        "receipt_id": "receipt-a",
+        "run_id": "current-run",
+        "tool": "maven",
+        "requested_action": "compile",
+        "effective_action": "compile",
+        "argv": "mvn compile",
+        "working_directory": "/workspace/demo/wrong-param",
+        "actual_cwd": "/workspace/demo/a",
+        "target_sha": "a" * 40,
+        "domain_id": "/workspace/demo/a",
+        "exit_code": 1,
+        "outcome": "failed",
+        "report_delta": {},
     }
+    receipt.update(overrides)
+    return receipt
 
-    class ManifestOrch:
-        def execute_command(self, command, **kwargs):
-            if command in (
-                f"cat {REQUIREMENTS_PATH}",
-                f"cat -- {REQUIREMENTS_PATH}",
-            ):
-                return {"success": True, "exit_code": 0, "output": json.dumps(manifest)}
-            return {"success": True, "exit_code": 0, "output": ""}
 
-    engine = _engine_at(2, _python_env())
-    engine.physical_validator = SimpleNamespace(docker_orchestrator=ManifestOrch())
-    line = engine._untried_island_targets()
-    assert "'install'" in line and "'publishToMavenLocal'" in line
+def test_bare_failed_build_uses_current_durable_receipt_actual_cwd_as_tried():
+    line = _receipt_loop_line(
+        receipt=_build_receipt(),
+        metadata_receipt_id="receipt-a",
+        params={"action": "compile"},
+    )
+
+    assert "maven at /workspace/demo/a" not in line
+    assert "gradle at /workspace/demo/b" in line
+
+
+@pytest.mark.parametrize(
+    ("receipt", "receipt_id"),
+    [
+        (_build_receipt(run_id="foreign-run"), "receipt-a"),
+        (None, "receipt-missing"),
+        (
+            _build_receipt(
+                requested_action="deps",
+                effective_action="dependency:resolve",
+                argv="mvn dependency:resolve",
+                exit_code=0,
+                outcome="completed",
+            ),
+            "receipt-a",
+        ),
+        (_build_receipt(target_sha="b" * 40), "receipt-a"),
+        (_build_receipt(domain_id="/workspace/foreign-domain"), "receipt-a"),
+    ],
+)
+def test_foreign_missing_and_dependencies_only_receipts_do_not_mark_island_tried(
+    receipt, receipt_id
+):
+    line = _receipt_loop_line(
+        receipt=receipt,
+        metadata_receipt_id=receipt_id,
+        params={"action": "compile", "working_directory": "/workspace/demo/a"},
+    )
+
+    assert "maven at /workspace/demo/a" in line
+    assert "gradle at /workspace/demo/b" in line
+
+
+def test_raw_working_directory_without_a_durable_receipt_has_zero_try_authority():
+    line = _receipt_loop_line(
+        metadata_receipt_id=None,
+        params={"action": "compile", "working_directory": "/workspace/demo/a"},
+    )
+
+    assert "maven at /workspace/demo/a" in line
+    assert "gradle at /workspace/demo/b" in line
+
+
+def test_self_reported_runner_dispatch_without_receipt_has_zero_try_authority():
+    line = _receipt_loop_line(
+        metadata_receipt_id="receipt-missing",
+        metadata_extra={"runner_dispatched": True, "command": "mvn compile"},
+        params={"action": "compile", "working_directory": "/workspace/demo/a"},
+    )
+
+    assert "maven at /workspace/demo/a" in line
+    assert "gradle at /workspace/demo/b" in line
+
+
+@pytest.mark.parametrize(
+    ("run_pin", "status"),
+    [
+        ("{not-json", "run_pin_unreadable"),
+        (
+            {"run_id": "other-run", "target_repo_sha": "a" * 40},
+            "run_pin_unreadable",
+        ),
+    ],
+)
+def test_unreadable_or_mismatched_run_pin_keeps_all_islands_explicitly_untried(run_pin, status):
+    line = _receipt_loop_line(
+        receipt=_build_receipt(),
+        metadata_receipt_id="receipt-a",
+        run_pin=run_pin,
+    )
+
+    assert f"Current receipt binding: unknown ({status})" in line
+    assert "maven at /workspace/demo/a" in line
+    assert "gradle at /workspace/demo/b" in line
 
 
 def test_island_checklist_renders_coordinates_not_none():
@@ -630,7 +823,8 @@ def test_initial_prompt_describes_analyze_as_survey_not_plan():
     prompt = _initial_prompt_with_project_tool()
     assert "analyze (detect build system, plan)" not in prompt
     assert "plan)" not in prompt
-    assert "survey the project; persist build facts" in prompt
+    assert "analyze: Fact-sheet refresh capability" in prompt
+    assert "engine mechanically supplies the initial survey" in prompt
 
 
 # ---- historical collector harness: mask naming/parsing still intact ---------

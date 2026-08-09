@@ -38,6 +38,7 @@ is the phase gate's business, not the runner's.
 import hashlib
 import itertools
 import json
+import posixpath
 import re
 import shlex
 import threading
@@ -46,9 +47,32 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
-from sag.agent.invocation_receipts import RECEIPT_DIR
+from sag.agent.control_ownership import BlockerOwner, blocker_owner_for_assessment
+from sag.agent.evidence_records import (
+    EvidencePublicationBinding,
+    PublishedNamedJsonRecordStreamRead,
+    read_live_published_json_records,
+)
+from sag.agent.invocation_contracts import (
+    ARGV_EXECUTION_BINDING,
+    PYTHON_FACADE_EXECUTION_BINDING,
+    compliance_class,
+    live_contract_valid,
+    python_operation_for_public_action,
+    read_frozen_contract,
+)
+from sag.agent.invocation_receipts import (
+    RECEIPT_DIR,
+    read_producer_observations,
+    receipt_record_scope,
+    validate_receipt_v2,
+)
+from sag.utils.container_io import (
+    WRITE_COMPARE_CONFLICT,
+    compare_publish_container_text_atomic,
+)
 
-ASSESSMENT_SCHEMA_VERSION = 1
+ASSESSMENT_SCHEMA_VERSION = 2
 ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 # Heredoc delimiter for the atomic write. The body is single-line JSON, so no
 # assessment content can ever collide with it.
@@ -57,10 +81,32 @@ DETAIL_MAX_CHARS = 200
 SUBJECT_SLUG_MAX_CHARS = 48
 CODE_SLUG_MAX_CHARS = 40
 
+# Structured prerequisite riders.  They describe what the runner/testcase
+# physically reported; they do not authorize an install, a service start, or
+# any other action.  Candidate extraction walks the complete output but keeps
+# only a bounded number of bounded lines, so a large build log cannot turn the
+# assessor into an unbounded prompt/parser surface.
+PREREQUISITE_EXECUTABLE_MISSING = "prerequisite_executable_missing"
+PREREQUISITE_SERVICE_UNAVAILABLE = "prerequisite_service_unavailable"
+PREREQUISITE_OUTPUT_CANDIDATE_CAP = 64
+PREREQUISITE_OUTPUT_LINE_MAX_CHARS = 2_000
+PREREQUISITE_FINDING_CAP = 16
+PREREQUISITE_FIELD_MAX_CHARS = 500
+ASSESSMENT_MAX_CANONICAL_BYTES = 1 << 20
+ASSESSMENT_SEQUENCE_MAX_ITEMS = 64
+_ASSESSMENT_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
+
 # The typed stages a control assessment may name (spec §C4). A stage outside
 # this set is a programming error, not a fact about the run, so it is refused
 # rather than persisted.
-CONTROL_STAGES = ("precondition", "materialization", "envelope", "dispatch")
+CONTROL_STAGES = (
+    "precondition",
+    "materialization",
+    "envelope",
+    "dispatch",
+    "postcondition",
+    "gate",
+)
 
 # --- the §C5 receipt taxonomy ----------------------------------------------
 # Codes whose CAUSE lies outside the project: nothing was learned about the
@@ -84,6 +130,12 @@ EXPECTATION_MET = "expectation_met"
 # It honoured the contract and did not. An honest failure — a compiler error is
 # a real fact about the run, but it falsifies no claim on its own.
 EXPECTATION_UNMET = "expectation_unmet"
+# A valid, honored contract whose operation-specific positive predicate is
+# absent. This is neither green nor proof the project is wrong.
+EXPECTATION_UNOBSERVED = "expectation_unobserved"
+# Current evidence could not be tied to one live v2 commitment. The harness,
+# not the project/model, owns this integrity defect.
+CONTRACT_BINDING_UNKNOWN = "contract_binding_unknown"
 # `falsifier_<predicate_id>` is the ONLY contradicting shape (spec §C5).
 FALSIFIER_PREFIX = "falsifier_"
 # `capability_absent_<name>` rides alongside the primary verdict.
@@ -114,9 +166,11 @@ BLOCKED_CLASS_ERROR_CODES = {
 # only one side states is UNKNOWN, never a mismatch.
 FINGERPRINT_KEYS = (
     "target_sha",
+    "survey_fingerprint",
     "config_fingerprint",
     "document_map_fingerprint",
-    "survey_fingerprint",
+    "domain_id",
+    "fact_epoch",
 )
 # The named capabilities a skip reason can reveal as absent. PATTERNS, not
 # project names: the table is data, an ecosystem adds a row, and the assessor
@@ -124,6 +178,56 @@ FINGERPRINT_KEYS = (
 CAPABILITY_PATTERNS = (
     {"name": "llvm", "pattern": "need llvm|LLVM"},
     {"name": "cuda", "pattern": "CUDA"},
+)
+
+_COMMAND_NOT_FOUND_RE = re.compile(
+    r"(?<![\w./+-])(?P<name>[A-Za-z_][A-Za-z0-9_.+/-]{0,127})" r"\s*:\s*command\s+not\s+found\b",
+    re.IGNORECASE,
+)
+_SHELL_NOT_FOUND_RE = re.compile(
+    r"\b(?:ba|z|da|k)?sh:\s*(?:(?:line\s+)?\d+:\s*)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_.+/-]{0,127})\s*:\s*not\s+found\b",
+    re.IGNORECASE,
+)
+_NO_SUCH_EXECUTABLE_AFTER_RE = re.compile(
+    r"\bno\s+such\s+executable\b\s*(?::|=|\bfor\b)\s*"
+    r"[`'\"]?(?P<name>[A-Za-z_./][A-Za-z0-9_.+/-]{0,127})",
+    re.IGNORECASE,
+)
+_NO_SUCH_EXECUTABLE_BEFORE_RE = re.compile(
+    r"(?<![\w./+-])(?P<name>[A-Za-z_][A-Za-z0-9_.+/-]{0,127})" r"\s*:\s*no\s+such\s+executable\b",
+    re.IGNORECASE,
+)
+_CANNOT_RUN_PROGRAM_RE = re.compile(
+    r"\bcannot\s+run\s+program\s+[`'\"]"
+    r"(?P<name>[^`'\"\s]{1,128})[`'\"]"
+    r"[^\r\n]{0,240}\bno\s+such\s+file\s+or\s+directory\b",
+    re.IGNORECASE,
+)
+_ENDPOINT_RE = re.compile(
+    r"(?<![\w.-])(?P<host>\[[0-9A-Fa-f:]+\]|localhost|"
+    r"(?:\d{1,3}\.){3}\d{1,3}|"
+    r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)"
+    r":(?P<port>\d{1,5})(?!\d)",
+    re.IGNORECASE,
+)
+_CONNECTION_REFUSED_RE = re.compile(
+    r"\bconnection\s+(?:was\s+)?refused\b|\bconnectionrefusederror\b|" r"\beconnrefused\b",
+    re.IGNORECASE,
+)
+_SERVICE_HINT_PATTERNS = (
+    re.compile(
+        r"\bservice(?:_hint)?\s*[:=]\s*[`'\"]?" r"(?P<hint>[A-Za-z][A-Za-z0-9_.+-]{0,63})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<hint>[A-Za-z][A-Za-z0-9_.+-]{0,63})\s+service\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<hint>[A-Za-z][A-Za-z0-9+.-]{0,31})://",
+        re.IGNORECASE,
+    ),
 )
 
 _SEQUENCE = itertools.count(1)
@@ -166,6 +270,12 @@ class ReceiptAssessment:
     detail: str = ""
     fingerprints: Optional[Mapping[str, str]] = None
     created_event: Optional[str] = None
+    blocker_owner: BlockerOwner | str | None = None
+    name: Optional[str] = None
+    endpoint: Optional[str] = None
+    service_hint: Optional[str] = None
+    scope: Optional[str] = None
+    evidence_ref: Optional[str] = None
 
     @property
     def subject_id(self) -> str:
@@ -173,7 +283,24 @@ class ReceiptAssessment:
 
     @property
     def assessment_id(self) -> str:
-        return assessment_id(self.subject_id, str(self.typed_code or "").strip())
+        code = str(self.typed_code or "").strip()
+        # One receipt can report more than one missing executable or endpoint.
+        # Keep the payload's general typed code while deriving identity from
+        # normalized structured facts.  Detail/stacktrace text and evidence
+        # reference are deliberately absent from the identity.
+        if code == PREREQUISITE_EXECUTABLE_MISSING:
+            code = "\x00".join((code, _normalize_executable(self.name), _bounded_field(self.scope)))
+        elif code == PREREQUISITE_SERVICE_UNAVAILABLE:
+            code = "\x00".join(
+                (code, _normalize_endpoint(self.endpoint), _bounded_field(self.scope))
+            )
+        return assessment_id(self.subject_id, code)
+
+    @property
+    def owner(self) -> BlockerOwner:
+        if self.blocker_owner is not None:
+            return BlockerOwner(self.blocker_owner)
+        return blocker_owner_for_assessment(self.typed_code)
 
     def payload(self) -> Dict[str, Any]:
         body: Dict[str, Any] = {
@@ -181,6 +308,7 @@ class ReceiptAssessment:
             "assessment_id": self.assessment_id,
             "receipt_id": self.subject_id,
             "typed_code": str(self.typed_code or "").strip(),
+            "blocker_owner": self.owner.value,
         }
         detail = _bounded(self.detail)
         if detail:
@@ -192,6 +320,27 @@ class ReceiptAssessment:
         created_event = str(self.created_event or "").strip()
         if created_event:
             body["created_event"] = created_event
+        code = str(self.typed_code or "").strip()
+        name = (
+            _normalize_executable(self.name)
+            if code == PREREQUISITE_EXECUTABLE_MISSING
+            else self.name
+        )
+        endpoint = (
+            _normalize_endpoint(self.endpoint)
+            if code == PREREQUISITE_SERVICE_UNAVAILABLE
+            else self.endpoint
+        )
+        for key, value in (
+            ("name", name),
+            ("endpoint", endpoint),
+            ("service_hint", self.service_hint),
+            ("scope", self.scope),
+            ("evidence_ref", self.evidence_ref),
+        ):
+            bounded = _bounded_field(value)
+            if bounded:
+                body[key] = bounded
         return body
 
 
@@ -207,6 +356,9 @@ class ControlAssessment:
     stage: str
     typed_code: str
     detail: str = ""
+    blocker_owner: BlockerOwner | str | None = None
+    observed_facts: Optional[Mapping[str, Any]] = None
+    evidence_refs: Tuple[str, ...] = ()
 
     @property
     def subject_id(self) -> str:
@@ -216,6 +368,12 @@ class ControlAssessment:
     def assessment_id(self) -> str:
         return assessment_id(self.subject_id, str(self.typed_code or "").strip())
 
+    @property
+    def owner(self) -> BlockerOwner:
+        if self.blocker_owner is not None:
+            return BlockerOwner(self.blocker_owner)
+        return blocker_owner_for_assessment(self.typed_code)
+
     def payload(self) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "schema_version": ASSESSMENT_SCHEMA_VERSION,
@@ -223,11 +381,183 @@ class ControlAssessment:
             "event_or_intent_id": self.subject_id,
             "stage": str(self.stage or "").strip(),
             "typed_code": str(self.typed_code or "").strip(),
+            "blocker_owner": self.owner.value,
         }
         detail = _bounded(self.detail)
         if detail:
             body["detail"] = detail
+        if self.observed_facts:
+            body["observed_facts"] = dict(self.observed_facts)
+        refs = tuple(
+            dict.fromkeys(str(ref).strip() for ref in self.evidence_refs if str(ref).strip())
+        )
+        if refs:
+            body["evidence_refs"] = list(refs)
         return body
+
+
+def validate_assessment_v2(
+    payload: Mapping[str, Any],
+    *,
+    expected_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return one exact persisted assessment union or fail closed.
+
+    Host publication proves where bytes came from; this validator proves what
+    those bytes mean. Receipt and control assessments have disjoint subject
+    fields and exact key sets. Their deterministic identity is recomputed, and
+    reconstructing the corresponding dataclass enforces every normalization
+    rule used by the writer. Ownership is a closed enum but remains an input to
+    reconstruction: gate authority and prerequisite UNKNOWN are intentionally
+    more precise than the generic code fallback.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("assessment must be an object")
+    body = dict(payload)
+    if type(body.get("schema_version")) is not int or body.get("schema_version") != (
+        ASSESSMENT_SCHEMA_VERSION
+    ):
+        raise ValueError("assessment schema_version is not live v2")
+
+    identifier = body.get("assessment_id")
+    if not isinstance(identifier, str) or _ASSESSMENT_SAFE_ID.fullmatch(identifier) is None:
+        raise ValueError("assessment_id is invalid")
+    if expected_id is not None:
+        if (
+            not isinstance(expected_id, str)
+            or _ASSESSMENT_SAFE_ID.fullmatch(expected_id) is None
+            or identifier != expected_id
+        ):
+            raise ValueError("assessment id does not match filename")
+
+    is_receipt = "receipt_id" in body
+    is_control = "event_or_intent_id" in body
+    if is_receipt == is_control:
+        raise ValueError("assessment must name exactly one persisted union subject")
+
+    common_required = {
+        "schema_version",
+        "assessment_id",
+        "typed_code",
+        "blocker_owner",
+    }
+    receipt_optional = {
+        "detail",
+        "fingerprints",
+        "created_event",
+        "name",
+        "endpoint",
+        "service_hint",
+        "scope",
+        "evidence_ref",
+    }
+    control_optional = {"detail", "observed_facts", "evidence_refs"}
+    required = common_required | ({"receipt_id"} if is_receipt else {"event_or_intent_id", "stage"})
+    allowed = required | (receipt_optional if is_receipt else control_optional)
+    if set(body) != set(body) & allowed or not required <= set(body):
+        raise ValueError(
+            "assessment fields are not exact: "
+            f"unknown={sorted(set(body) - allowed)} missing={sorted(required - set(body))}"
+        )
+
+    typed_code = body.get("typed_code")
+    if not isinstance(typed_code, str) or _ASSESSMENT_SAFE_ID.fullmatch(typed_code) is None:
+        raise ValueError("assessment typed_code is invalid")
+    subject_key = "receipt_id" if is_receipt else "event_or_intent_id"
+    subject = body.get(subject_key)
+    if not isinstance(subject, str) or _ASSESSMENT_SAFE_ID.fullmatch(subject) is None:
+        raise ValueError(f"assessment {subject_key} is invalid")
+
+    try:
+        owner = BlockerOwner(body.get("blocker_owner"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("assessment blocker_owner is invalid") from exc
+
+    if "detail" in body and (
+        not isinstance(body.get("detail"), str)
+        or body.get("detail") != _bounded(body.get("detail"))
+    ):
+        raise ValueError("assessment detail is not canonical and bounded")
+
+    if is_receipt:
+        fingerprints = body.get("fingerprints")
+        if fingerprints is not None:
+            if (
+                not isinstance(fingerprints, Mapping)
+                or not fingerprints
+                or len(fingerprints) > ASSESSMENT_SEQUENCE_MAX_ITEMS
+                or any(
+                    not isinstance(key, str)
+                    or not key
+                    or key != key.strip()
+                    or not isinstance(value, str)
+                    or not value
+                    or value != value.strip()
+                    for key, value in fingerprints.items()
+                )
+            ):
+                raise ValueError("assessment fingerprints are invalid")
+        candidate = ReceiptAssessment(
+            receipt_id=subject,
+            typed_code=typed_code,
+            detail=body.get("detail", ""),
+            fingerprints=dict(fingerprints) if isinstance(fingerprints, Mapping) else None,
+            created_event=body.get("created_event"),
+            blocker_owner=owner,
+            name=body.get("name"),
+            endpoint=body.get("endpoint"),
+            service_hint=body.get("service_hint"),
+            scope=body.get("scope"),
+            evidence_ref=body.get("evidence_ref"),
+        )
+    else:
+        stage = body.get("stage")
+        if not isinstance(stage, str) or stage not in CONTROL_STAGES:
+            raise ValueError("control assessment stage is invalid")
+        observed_facts = body.get("observed_facts")
+        if observed_facts is not None and (
+            not isinstance(observed_facts, Mapping) or not observed_facts
+        ):
+            raise ValueError("control assessment observed_facts are invalid")
+        raw_refs = body.get("evidence_refs")
+        if raw_refs is not None:
+            if (
+                not isinstance(raw_refs, list)
+                or not raw_refs
+                or len(raw_refs) > ASSESSMENT_SEQUENCE_MAX_ITEMS
+                or any(
+                    not isinstance(ref, str) or not ref or ref != ref.strip() for ref in raw_refs
+                )
+                or len(set(raw_refs)) != len(raw_refs)
+            ):
+                raise ValueError("control assessment evidence_refs are invalid")
+        candidate = ControlAssessment(
+            event_or_intent_id=subject,
+            stage=stage,
+            typed_code=typed_code,
+            detail=body.get("detail", ""),
+            blocker_owner=owner,
+            observed_facts=(dict(observed_facts) if isinstance(observed_facts, Mapping) else None),
+            evidence_refs=tuple(raw_refs or ()),
+        )
+
+    reconstructed = candidate.payload()
+    if reconstructed != body:
+        raise ValueError("assessment payload differs from its canonical persisted union")
+    try:
+        encoded = json.dumps(
+            body,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("assessment is not canonical JSON data") from exc
+    if len(encoded) > ASSESSMENT_MAX_CANONICAL_BYTES:
+        raise ValueError("assessment exceeds its canonical byte limit")
+    return body
 
 
 def write_assessment(execute, assessment) -> bool:
@@ -239,43 +569,71 @@ def write_assessment(execute, assessment) -> bool:
     collision is a defect to see, not to resolve silently), and the write
     itself is temp-file + `mv` so no reader ever sees half an assessment.
     """
-    subject = assessment.subject_id
-    code = str(getattr(assessment, "typed_code", "") or "").strip()
-    if not subject or not code:
-        return False
-    payload = assessment.payload()
-    if isinstance(assessment, ControlAssessment) and payload["stage"] not in CONTROL_STAGES:
-        logger.debug(f"control assessment for {subject} names no typed stage; not persisted")
-        return False
-    identifier = payload["assessment_id"]
     try:
-        body = json.dumps(payload, sort_keys=True)
-    except (TypeError, ValueError) as exc:
-        logger.debug(f"evidence assessment {identifier} is not serializable: {exc}")
+        payload = validate_assessment_v2(assessment.payload())
+        identifier = payload["assessment_id"]
+        body = json.dumps(payload, allow_nan=False, sort_keys=True)
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.debug(f"evidence assessment is invalid: {exc}")
         return False
     final = f"{ASSESSMENT_DIR}/{identifier}.json"
-    existing = _read_existing(execute, final)
-    if existing is not None:
-        if existing == payload:
-            return True
+    existing_raw = _read_existing_raw(execute, final)
+    if existing_raw is not None:
+        if existing_raw == body:
+            return _publish_assessment_bytes(
+                execute,
+                identifier,
+                body.encode("utf-8"),
+            )
         logger.warning(
             f"evidence assessment {identifier} already records a different body; "
             "assessments are append-only and this write was refused"
         )
         return False
-    temp = f"{final}.tmp"
-    command = (
-        f"mkdir -p {shlex.quote(ASSESSMENT_DIR)} && "
-        f"cat > {shlex.quote(temp)} <<'{ASSESSMENT_HEREDOC}' && "
-        f"mv -f {shlex.quote(temp)} {shlex.quote(final)}\n"
-        f"{body}\n{ASSESSMENT_HEREDOC}"
-    )
     try:
-        result = execute(command) or {}
+        result = compare_publish_container_text_atomic(
+            execute,
+            final,
+            body,
+            expected_content=None,
+            validate_json=True,
+        )
     except Exception as exc:
         logger.debug(f"evidence assessment {identifier} not persisted: {exc}")
         return False
-    return _succeeded(result)
+    if result.code == WRITE_COMPARE_CONFLICT:
+        # An identical concurrent writer may have won after our absence read.
+        # Only exact canonical bytes are replay success; a semantic parse is
+        # insufficient because host publication seals the raw artifact.
+        if _read_existing_raw(execute, final) == body:
+            return _publish_assessment_bytes(execute, identifier, body.encode("utf-8"))
+        logger.warning(
+            f"evidence assessment {identifier} lost an absent-write race to "
+            "different bytes; the collision was refused"
+        )
+        return False
+    if not result.persisted:
+        logger.debug(f"evidence assessment {identifier} not persisted: {result.code}")
+        return False
+    return _publish_assessment_bytes(execute, identifier, body.encode("utf-8"))
+
+
+def _publish_assessment_bytes(execute: Any, identifier: str, raw: bytes) -> bool:
+    from sag.agent.evidence_publications import publish_evidence_bytes
+
+    publication = publish_evidence_bytes(
+        execute,
+        record_kind="receipt_assessment",
+        record_id=identifier,
+        raw=raw,
+    )
+    if publication.published:
+        return True
+    logger.warning(
+        f"evidence assessment {identifier} reached the container but host publication "
+        f"failed: {publication.status}"
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +645,12 @@ def ensure_receipt_assessed(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     receipt_id: Any,
 ) -> bool:
-    """Backstop: assess a dispatched receipt no facade path assessed.
+    """Backstop: assess a valid dispatched receipt no facade path assessed.
 
-    Live p6v-bigtop-r3: the tool-recovery delegate freezes its own fallback
-    contract, but only the build facade ran the assessor — the recovery
-    dispatch's receipt had a contract and no verdict. This runs at the engine
-    observation seam for exactly that gap; the write is idempotent, so a
-    facade-assessed receipt is a no-op. Never raises.
+    Detached/external facade dispatches may reach the engine observation seam
+    before an assessment is present. The write is idempotent, so a receipt the
+    facade already assessed is a no-op. This function never mints a contract
+    and never raises.
     """
     identifier = str(receipt_id or "").strip()
     if not identifier:
@@ -309,8 +666,6 @@ def ensure_receipt_assessed(
         contract_id = str(receipt.get("contract_id") or "").strip()
         if not contract_id:
             return False
-        from sag.agent.retry_authority import read_frozen_contract
-
         contract = read_frozen_contract(execute, contract_id)
         if not isinstance(contract, Mapping):
             return False
@@ -329,6 +684,228 @@ def _list_assessment_files(
     except Exception:
         return []
     return [line.strip() for line in (result.get("output") or "").splitlines() if line.strip()]
+
+
+def read_live_assessment_ledger(orchestrator: Any) -> PublishedNamedJsonRecordStreamRead:
+    """Read the complete live assessment ledger or return a typed conflict.
+
+    Assessments are immutable authority records.  A source file becomes live
+    only when its exact basename, canonical v2 union payload, raw bytes and the
+    complete immutable ID set all match the host publication ledger.
+    """
+
+    return read_live_published_json_records(
+        orchestrator,
+        ASSESSMENT_DIR,
+        record_kind="receipt_assessment",
+        validator=lambda payload, expected_id: validate_assessment_v2(
+            payload,
+            expected_id=expected_id,
+        ),
+    )
+
+
+def read_assessments(orchestrator: Any) -> List[Dict[str, Any]]:
+    """Project the complete strict live assessment ledger as payloads.
+
+    The historical forgiving directory parser is intentionally not used at a
+    live authority seam.  An unpublished, malformed, tampered, truncated or
+    deletion-incomplete ledger projects no positive assessments.
+    """
+
+    ledger = read_live_assessment_ledger(orchestrator)
+    if not ledger.complete or ledger.conflict is not None:
+        logger.debug(
+            "live assessment ledger unavailable: "
+            f"{ledger.conflict or ledger.detail or 'incomplete'}"
+        )
+        return []
+    return [dict(record.payload) for record in ledger.records]
+
+
+def contract_receipt_binding_problem(
+    contract: Optional[Mapping[str, Any]],
+    receipt: Optional[Mapping[str, Any]],
+) -> str:
+    """A typed current-authority defect, or empty when the chain is exact."""
+
+    if not live_contract_valid(contract):
+        return "receipt is not bound to a live schema-v2 invocation contract"
+    assert isinstance(contract, Mapping)
+    if not isinstance(receipt, Mapping):
+        return "receipt body is unavailable"
+    for key in ("contract_id", "contract_hash", "run_id", "execution_binding"):
+        if _text(receipt.get(key)) != _text(contract.get(key)):
+            return f"receipt {key} differs from its invocation contract"
+    for key in (
+        "target_sha",
+        "survey_fingerprint",
+        "config_fingerprint",
+        "document_map_fingerprint",
+        "domain_id",
+        "fact_epoch",
+    ):
+        if (key in contract) != (key in receipt) or (
+            key in contract and _text(contract.get(key)) != _text(receipt.get(key))
+        ):
+            return f"receipt {key} pin differs from its invocation contract"
+    if _text(receipt.get("tool")).lower() != _text(contract.get("effective_tool")).lower():
+        return "receipt executor differs from its invocation contract"
+    if _text(receipt.get("effective_action")) != _text(contract.get("effective_action")):
+        return "receipt effective action differs from its invocation contract"
+    expected_cwd = posixpath.normpath(_text(contract.get("expected_cwd")))
+    for key in ("working_directory", "actual_cwd"):
+        value = _text(receipt.get(key))
+        if not value or posixpath.normpath(value) != expected_cwd:
+            return f"receipt {key} differs from its invocation contract"
+
+    binding = _text(contract.get("execution_binding"))
+    if binding == ARGV_EXECUTION_BINDING:
+        recomputed = compliance_class(contract.get("expected_argv"), receipt.get("argv"))
+        if recomputed is None or _text(receipt.get("compliance")) != recomputed:
+            return "receipt argv compliance is absent or was not mechanically recomputed"
+    elif binding == PYTHON_FACADE_EXECUTION_BINDING:
+        if "compliance" in receipt:
+            return "python semantic receipt must not claim argv compliance"
+        requested = contract.get("requested_call")
+        params = requested.get("params") if isinstance(requested, Mapping) else None
+        if (
+            not isinstance(params, Mapping)
+            or python_operation_for_public_action(params.get("action"))
+            != _text(receipt.get("effective_action"))
+            or _text(receipt.get("requested_action")) != _text(receipt.get("effective_action"))
+        ):
+            return "python receipt operation differs from its public action binding"
+    else:  # live_contract_valid already rejects this; retain a total function.
+        return "receipt execution binding is unknown"
+    return ""
+
+
+def _current_contract_binding_problem(
+    contract: Mapping[str, Any],
+    current: Optional[Mapping[str, Any]],
+) -> str:
+    """Return the missing current project pin that makes authority unknowable.
+
+    A model/project dispatch is live authority only when the harness can bind
+    the frozen decision to the *current* target, survey, document map, domain,
+    and fact epoch.  Missing is not stale: it is an evidence-integrity hole.
+    The sole carve-out is the explicitly controller-owned bash lane used for
+    harness/D0 mechanics, which has no surveyed project tuple by design.
+    """
+
+    if (
+        _text(contract.get("intent_source")) == "controller"
+        and _text(contract.get("effective_tool")) == "bash"
+    ):
+        return ""
+    requested = contract.get("requested_call")
+    if not isinstance(requested, Mapping) or _text(requested.get("tool")) != "build":
+        return ""
+    for key in FINGERPRINT_KEYS:
+        if key not in contract:
+            return f"invocation contract has no current-authority {key} pin"
+        if not isinstance(current, Mapping) or key not in current:
+            return f"current {key} pin is unavailable"
+        if not _text(current.get(key)):
+            return f"current {key} pin is unavailable"
+    return ""
+
+
+def _delta_nonempty(value: Any) -> bool:
+    return isinstance(value, Mapping) and any(value.get(key) for key in ("new", "changed"))
+
+
+def _python_semantic_result(
+    contract: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    current_fingerprints: Optional[Mapping[str, Any]],
+) -> str:
+    operation = _text(contract.get("effective_action"))
+    if operation in {"setup_env", "build", "compile"}:
+        observations = read_producer_observations(receipt)
+        if not observations or observations.get("operation") != operation:
+            return "unobserved"
+        if operation == "setup_env":
+            setup = observations.get("setup") or {}
+            if setup.get("install_outcome") != "success":
+                return "unobserved"
+            pip_check = setup.get("pip_check")
+            imports = setup.get("imports")
+            if not isinstance(pip_check, Mapping) or pip_check.get("status") != "clean":
+                return "unobserved"
+            if (
+                not isinstance(imports, Mapping)
+                or imports.get("status") != "complete"
+                or imports.get("failed_count") != 0
+            ):
+                return "unobserved"
+            current_targets = (current_fingerprints or {}).get("python_import_targets")
+            current_targets_sha256 = _text(
+                (current_fingerprints or {}).get("python_import_targets_sha256")
+            )
+            if (
+                not isinstance(current_targets, list)
+                or not current_targets
+                or imports.get("targets") != current_targets
+                or _text(imports.get("targets_sha256")) != current_targets_sha256
+            ):
+                return "unobserved"
+            return "met"
+        if operation == "build":
+            build = observations.get("build") or {}
+            return (
+                "met"
+                if build.get("artifact_status") == "produced" and build.get("artifacts")
+                else "unobserved"
+            )
+        compile_observation = observations.get("compile") or {}
+        return "met" if compile_observation.get("status") == "valid" else "unobserved"
+
+    if operation in {"test", "native"}:
+        # The current receipt records useful diagnostics, but it does not yet
+        # freeze the effective selector for tests or the full resolver /
+        # definitions / rebuild-trace tuple for native repair.  Promoting
+        # either shape would let a hidden scope rewrite or a loose feature
+        # probe masquerade as the contracted semantic operation.  A future
+        # typed schema may add those bindings explicitly; v1 stays fail-closed.
+        return "unobserved"
+    return "unobserved"
+
+
+def _operation_semantic_result(
+    contract: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    current_fingerprints: Optional[Mapping[str, Any]],
+) -> str:
+    binding = _text(contract.get("execution_binding"))
+    if binding == PYTHON_FACADE_EXECUTION_BINDING:
+        return _python_semantic_result(contract, receipt, current_fingerprints)
+    if binding != ARGV_EXECUTION_BINDING:
+        return "unobserved"
+    promised = _expected_observations(contract)
+    if not promised:
+        # Exact argv + terminal zero is itself the explicit predicate for a
+        # dependency-resolution command that promised no artifact/report.
+        return "met"
+    if any(
+        observation == "report_delta" and _delta_nonempty(receipt.get("report_delta"))
+        for observation in promised
+    ):
+        return "met"
+    if any(
+        observation == "artifact_or_report_delta"
+        and (
+            _delta_nonempty(receipt.get("report_delta"))
+            or _delta_nonempty(receipt.get("artifact_delta"))
+            or bool(receipt.get("module_outcomes"))
+            or bool(receipt.get("producer_observations"))
+        )
+        for observation in promised
+    ):
+        return "met"
+    predicate = _falsified_predicate(contract, receipt)
+    return f"falsifier:{predicate}" if predicate else "unobserved"
 
 
 def assess_receipt(
@@ -376,6 +953,15 @@ def assess_receipt(
             fingerprints=pins or None,
         )
 
+    binding_problem = contract_receipt_binding_problem(contract, receipt)
+    if binding_problem:
+        return verdict(CONTRACT_BINDING_UNKNOWN, binding_problem)
+
+    assert isinstance(contract, Mapping)
+    current_problem = _current_contract_binding_problem(contract, current_fingerprints)
+    if current_problem:
+        return verdict(CONTRACT_BINDING_UNKNOWN, current_problem)
+
     blocked = _blocked_class(receipt, dispatch_status, error_code)
     if blocked is not None:
         return verdict(*blocked)
@@ -396,20 +982,25 @@ def assess_receipt(
             f"frozen {_text((contract or {}).get('expected_argv'))!r}",
         )
 
-    promised = _expected_observations(contract)
-    stated = ", ".join(promised) if promised else "no stated observation"
-    if compliance in COMPLIANT_CLASSES:
-        predicate = _falsified_predicate(contract, receipt)
-        if predicate:
-            return verdict(
-                f"{FALSIFIER_PREFIX}{predicate}",
-                f"exit 0 produced none of the expected {stated}",
-            )
-
     exit_code = _exit_code(receipt)
-    if exit_code == 0:
-        return verdict(EXPECTATION_MET, f"exit 0; nothing contradicts the expected {stated}")
-    return verdict(EXPECTATION_UNMET, f"exit {exit_code} against the expected {stated}")
+    promised = _expected_observations(contract)
+    stated = ", ".join(promised) if promised else "the contracted operation"
+    if exit_code != 0:
+        return verdict(EXPECTATION_UNMET, f"exit {exit_code} against the expected {stated}")
+
+    semantic = _operation_semantic_result(contract, receipt, current_fingerprints)
+    if semantic == "met":
+        return verdict(EXPECTATION_MET, f"typed evidence satisfied {stated}")
+    if semantic.startswith("falsifier:"):
+        predicate = semantic.split(":", 1)[1]
+        return verdict(
+            f"{FALSIFIER_PREFIX}{predicate}",
+            f"exit 0 produced none of the expected {stated}",
+        )
+    return verdict(
+        EXPECTATION_UNOBSERVED,
+        f"exit 0 did not carry the typed positive evidence required for {stated}",
+    )
 
 
 def capability_absences(receipt: Optional[Mapping[str, Any]]) -> List[ReceiptAssessment]:
@@ -450,6 +1041,221 @@ def capability_absences(receipt: Optional[Mapping[str, Any]]) -> List[ReceiptAss
     return absences
 
 
+def prerequisite_assessments(
+    receipt: Optional[Mapping[str, Any]],
+    output: Optional[str] = None,
+    *,
+    evidence_ref: Optional[str] = None,
+) -> List[ReceiptAssessment]:
+    """Mechanical missing-executable/service riders for one receipt.
+
+    Sources are deliberately limited to FAILED/ERROR testcase reasons already
+    bound to the receipt and candidate lines from the complete runner output.
+    Project names, ports, and ecosystem defaults never supply a service name.
+    The observations carry ``blocker_owner=unknown``: seeing a prerequisite
+    boundary is not authority to install a package or start a service.
+
+    The primary receipt assessment is not read or changed here.  In particular,
+    an ``expectation_unmet`` remains red when either rider is also present.
+    """
+    identifier = _text((receipt or {}).get("receipt_id"))
+    if not identifier:
+        return []
+    scope = _prerequisite_scope(receipt)
+    output_ref = _text(evidence_ref) or _text((receipt or {}).get("output_ref")) or identifier
+    fragments: List[Tuple[str, str, str]] = [
+        (f"testcase {node_id}" if node_id else "failed testcase", reason, identifier)
+        for node_id, reason in _failure_reasons(receipt)[:PREREQUISITE_OUTPUT_CANDIDATE_CAP]
+    ]
+    fragments.extend(
+        ("runner output", line, output_ref) for line in _prerequisite_output_candidates(output)
+    )
+
+    executable_hits: List[Tuple[str, str, str, str]] = []
+    service_hits: List[Tuple[str, str, str, str, str]] = []
+    seen_executables = set()
+    endpoint_positions: Dict[Tuple[str, str], int] = {}
+    for source, fragment, source_ref in fragments:
+        for name in _missing_executables(fragment):
+            identity = (name, scope)
+            if identity in seen_executables:
+                continue
+            seen_executables.add(identity)
+            executable_hits.append((name, scope, source_ref, source))
+        for endpoint, service_hint in _unavailable_services(fragment):
+            identity = (endpoint, scope)
+            existing_position = endpoint_positions.get(identity)
+            if existing_position is not None:
+                existing = service_hits[existing_position]
+                # The receipt reason may name only the endpoint while its
+                # complete output explicitly labels the service. Prefer the
+                # stronger original evidence without inventing a hint.
+                if not existing[1] and service_hint:
+                    service_hits[existing_position] = (
+                        endpoint,
+                        service_hint,
+                        scope,
+                        source_ref,
+                        source,
+                    )
+                continue
+            endpoint_positions[identity] = len(service_hits)
+            service_hits.append((endpoint, service_hint, scope, source_ref, source))
+
+    findings: List[ReceiptAssessment] = []
+    for name, hit_scope, source_ref, source in executable_hits[:PREREQUISITE_FINDING_CAP]:
+        findings.append(
+            ReceiptAssessment(
+                receipt_id=identifier,
+                typed_code=PREREQUISITE_EXECUTABLE_MISSING,
+                blocker_owner=BlockerOwner.UNKNOWN,
+                name=name,
+                scope=hit_scope,
+                evidence_ref=source_ref,
+                detail=f"{source} reported missing executable {name}",
+            )
+        )
+    remaining = max(0, PREREQUISITE_FINDING_CAP - len(findings))
+    for endpoint, hint, hit_scope, source_ref, source in service_hits[:remaining]:
+        findings.append(
+            ReceiptAssessment(
+                receipt_id=identifier,
+                typed_code=PREREQUISITE_SERVICE_UNAVAILABLE,
+                blocker_owner=BlockerOwner.UNKNOWN,
+                endpoint=endpoint,
+                service_hint=hint or None,
+                scope=hit_scope,
+                evidence_ref=source_ref,
+                detail=f"{source} reported connection refused at {endpoint}",
+            )
+        )
+    return findings
+
+
+def _prerequisite_scope(receipt: Optional[Mapping[str, Any]]) -> str:
+    """The narrowest scope the receipt itself stated, never a project guess."""
+    for key in ("domain_id", "actual_cwd", "working_directory"):
+        value = _bounded_field((receipt or {}).get(key))
+        if value:
+            return value
+    return "unknown"
+
+
+def _prerequisite_output_candidates(output: Optional[str]) -> List[str]:
+    """Bounded candidate windows sampled from the complete runner output.
+
+    Keep the first and last halves when more than the cap match.  This covers
+    setup failures near the start and terminal diagnostics near the end while
+    bounding every downstream regex and persisted detail.
+    """
+    text = str(output or "")
+    if not text:
+        return []
+    half = max(1, PREREQUISITE_OUTPUT_CANDIDATE_CAP // 2)
+    first: List[str] = []
+    last: List[str] = []
+    triggers = (
+        "command not found",
+        ": not found",
+        "no such executable",
+        "cannot run program",
+        "connection refused",
+        "connectionrefusederror",
+        "econnrefused",
+    )
+    for raw_line in text.splitlines():
+        lowered = raw_line.lower()
+        positions = [lowered.find(trigger) for trigger in triggers]
+        positions = [position for position in positions if position >= 0]
+        if not positions:
+            continue
+        anchor = min(positions)
+        half_line = PREREQUISITE_OUTPUT_LINE_MAX_CHARS // 2
+        start = max(0, anchor - half_line)
+        line = raw_line[start : start + PREREQUISITE_OUTPUT_LINE_MAX_CHARS]
+        if len(first) < half:
+            first.append(line)
+            continue
+        last.append(line)
+        if len(last) > PREREQUISITE_OUTPUT_CANDIDATE_CAP - half:
+            last.pop(0)
+    return first + last
+
+
+def _missing_executables(text: str) -> List[str]:
+    """Normalized executable tokens explicitly named by one evidence line."""
+    names: List[str] = []
+    for pattern in (
+        _COMMAND_NOT_FOUND_RE,
+        _SHELL_NOT_FOUND_RE,
+        _NO_SUCH_EXECUTABLE_AFTER_RE,
+        _NO_SUCH_EXECUTABLE_BEFORE_RE,
+        _CANNOT_RUN_PROGRAM_RE,
+    ):
+        for match in pattern.finditer(text):
+            name = _normalize_executable(match.group("name"))
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _normalize_executable(value: Any) -> str:
+    candidate = _text(value).strip("`'\".,;:()[]{}")
+    candidate = candidate.rsplit("/", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.+-]{0,127}", candidate):
+        return ""
+    # ``RuntimeError: No such executable: ccm`` contains the same punctuation
+    # as the before-form, but the exception class is a label, not a command.
+    if candidate.lower().endswith(("error", "exception")):
+        return ""
+    return candidate
+
+
+def _unavailable_services(text: str) -> List[Tuple[str, str]]:
+    """Endpoints on an explicit refusal line, plus only evidence-stated hints."""
+    if not _CONNECTION_REFUSED_RE.search(text):
+        return []
+    service_hint = _service_hint(text)
+    observations: List[Tuple[str, str]] = []
+    for match in _ENDPOINT_RE.finditer(text):
+        endpoint = _normalize_endpoint(match.group(0))
+        if endpoint and (endpoint, service_hint) not in observations:
+            observations.append((endpoint, service_hint))
+    return observations
+
+
+def _normalize_endpoint(value: Any) -> str:
+    candidate = _text(value)
+    match = _ENDPOINT_RE.fullmatch(candidate)
+    if not match:
+        return ""
+    host = match.group("host").lower()
+    try:
+        port = int(match.group("port"))
+    except (TypeError, ValueError):
+        return ""
+    if not 0 < port <= 65_535:
+        return ""
+    plain_host = host.strip("[]")
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", plain_host):
+        if any(int(part) > 255 for part in plain_host.split(".")):
+            return ""
+    return f"{host}:{port}"
+
+
+def _service_hint(text: str) -> str:
+    """An explicit service label or URI scheme from the same evidence line."""
+    stopwords = {"a", "local", "remote", "target", "the", "this", "upstream"}
+    for pattern in _SERVICE_HINT_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        hint = _text(match.group("hint")).lower()
+        if hint and hint not in stopwords and hint not in ("http", "https", "tcp"):
+            return hint
+    return ""
+
+
 def read_receipt(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     receipt_id: Any,
@@ -460,13 +1266,40 @@ def read_receipt(
     happened to keep in memory: an assessment of a receipt nobody can read
     would be a verdict about nothing.
     """
-    identifier = _text(receipt_id)
-    if not identifier:
+    if not isinstance(receipt_id, str):
         return None
-    payload = _read_existing(execute, f"{RECEIPT_DIR}/{identifier}.json")
-    if not isinstance(payload, dict) or "unparseable" in payload:
+    identifier = receipt_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", identifier):
         return None
-    return payload
+
+    def binding(payload: Mapping[str, Any]) -> EvidencePublicationBinding:
+        return EvidencePublicationBinding(
+            run_id=str(payload["run_id"]),
+            contract_id=payload.get("contract_id"),
+            contract_hash=payload.get("contract_hash"),
+        )
+
+    read = read_live_published_json_records(
+        execute,
+        RECEIPT_DIR,
+        record_kind="invocation_receipt",
+        validator=lambda payload, expected_id: validate_receipt_v2(
+            payload,
+            expected_id=expected_id,
+        ),
+        publication_binding=binding,
+        record_scope=receipt_record_scope,
+    )
+    if not read.complete or read.conflict is not None:
+        logger.debug(
+            f"invocation receipt ledger unavailable for {identifier}: "
+            f"{read.conflict or read.detail}"
+        )
+        return None
+    for record in read.records:
+        if record.source.record_id == identifier:
+            return dict(record.payload)
+    return None
 
 
 def assess_dispatch(
@@ -478,17 +1311,20 @@ def assess_dispatch(
     dispatch_status: Optional[str] = None,
     error_code: Optional[str] = None,
     output: Optional[str] = None,
+    evidence_ref: Optional[str] = None,
 ) -> List[ReceiptAssessment]:
     """Assess ONE dispatch and persist every verdict; return the ones that landed.
 
-    The primary verdict first, then any capability absence. Persistence is
-    idempotent (`write_assessment`), so re-assessing the same receipt — a
-    replay, a second pass over the same execution trace — writes nothing new.
+    The primary verdict first, then any structured prerequisite and other
+    riders. Persistence is idempotent (`write_assessment`), so re-assessing the
+    same receipt — a replay, a second pass over the same execution trace —
+    writes nothing new.
 
     `output` is the dispatch's complete runner output when the caller still
     holds it. The receipt keeps only a hash of that text, so a fault the build
     stated in prose — a java version mismatch, say — is readable here and
-    nowhere else.
+    nowhere else. `evidence_ref`, when supplied, is the durable reference for
+    that complete text; otherwise prerequisite riders cite their receipt.
     """
     if not _text((receipt or {}).get("receipt_id")):
         return []
@@ -501,6 +1337,7 @@ def assess_dispatch(
             error_code=error_code,
         )
     ]
+    assessments.extend(prerequisite_assessments(receipt, output, evidence_ref=evidence_ref))
     assessments.extend(capability_absences(receipt))
     assessments.extend(dependency_incompatibilities(receipt))
     assessments.extend(java_version_mismatch(receipt, output))
@@ -575,6 +1412,12 @@ DEPENDENCY_PREFIX = "dependency_incompatible_"
 # Each row needs BOTH majors. A pattern that finds only one is not a mismatch —
 # guessing the other half is how a harness invents a requirement.
 JAVA_MISMATCH_PATTERNS = (
+    {
+        # Maven Enforcer's current wording puts both physical facts on one
+        # line: "Required Java version 17 is not met by current version 11".
+        "required": r"Required\s+Java\s+version\s+(\d+)",
+        "detected": r"current\s+version\s+(\d+)",
+    },
     {
         # Gradle: "... requires Java 21.\n Detected Java version: 17"
         "required": r"requires\s+Java\s+(?:version\s+)?(\d+)",
@@ -783,25 +1626,22 @@ def _exit_code(receipt: Optional[Mapping[str, Any]]) -> Optional[int]:
     return value
 
 
-def _read_existing(execute, path: str) -> Optional[Dict[str, Any]]:
-    """The assessment already at `path`, or None when there is none to honour.
+def _read_existing_raw(execute, path: str) -> Optional[str]:
+    """Exact existing assessment bytes as text, or None when not observed.
 
-    An unparseable file is reported as a body that matches nothing, so the
-    caller refuses instead of overwriting bytes it cannot account for.
+    Callers compare this byte-for-byte with their canonical body. Parsing here
+    would let pretty JSON or duplicate keys masquerade as an idempotent replay
+    and acquire host publication authority they never had.
     """
     try:
         result = execute(f"cat {shlex.quote(path)}") or {}
     except Exception as exc:
         logger.debug(f"evidence assessment {path} unreadable: {exc}")
         return None
-    content = str(result.get("output") or "").strip()
-    if not _succeeded(result) or not content:
+    content = str(result.get("output") or "")
+    if not _succeeded(result) or not content.strip():
         return None
-    try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
-        return {"unparseable": path}
-    return payload if isinstance(payload, dict) else {"unparseable": path}
+    return content
 
 
 def _succeeded(result: Mapping[str, Any]) -> bool:
@@ -814,6 +1654,10 @@ def _succeeded(result: Mapping[str, Any]) -> bool:
 
 def _bounded(detail: Any) -> str:
     return " ".join(str(detail or "").split())[:DETAIL_MAX_CHARS]
+
+
+def _bounded_field(value: Any) -> str:
+    return " ".join(str(value or "").split())[:PREREQUISITE_FIELD_MAX_CHARS]
 
 
 def _text(value: Any) -> str:

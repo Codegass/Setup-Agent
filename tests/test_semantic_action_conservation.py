@@ -19,13 +19,48 @@ SEMANTIC mutation is narrated before the model reasons about the result.
 import json
 import shlex
 
+import pytest
+from test_container_io import FakeContainer
+
+from sag.agent.control_events import canonical_json
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    evidence_publication_authority_for,
+)
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.tools.base import ToolResult
 from sag.tools.build.backends import GradleBackend, MavenBackend
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.gradle_tool import GradleTool
 
+pytestmark = pytest.mark.usefixtures(
+    "facade_contract_authority",
+    "exact_build_facade_authority",
+    "exact_internal_runner_authority",
+)
+
 ISLAND = "/workspace/bigtop/bigpetstore-spark"
+
+
+def _published_manifest_stream(source, raw):
+    authority = evidence_publication_authority_for(source)
+    if authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID) is None:
+        authority.publish_revision(
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            raw=raw.encode("utf-8"),
+            expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+        )
+    return {
+        "success": True,
+        "exit_code": 0,
+        "output": frame_named_json_record_stream(
+            [("build_requirements.json", raw)]
+        ),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -41,6 +76,8 @@ class ProbeOrchestrator:
         self.markers = set(markers)
         self.project_name = project_name
         self.commands = []
+        raw_manifest = self.files.get(REQUIREMENTS_PATH)
+        self.manifest_raw = raw_manifest if raw_manifest is not None else canonical_json({})
 
     def read_file(self, path):
         if path in self.files:
@@ -54,6 +91,8 @@ class ProbeOrchestrator:
 
     def execute_command(self, command, workdir=None, timeout=None, **_):
         self.commands.append(command)
+        if "SAG_NAMED_JSON_RECORD_V1" in command and REQUIREMENTS_PATH in command:
+            return _published_manifest_stream(self, self.manifest_raw)
         if command.startswith("for d in ") and "test -d" in command:
             return self._dir_probe(command)
         if command.startswith("cat "):
@@ -95,9 +134,12 @@ class GradleLogOrchestrator:
         self.monitored = {"output": output, "exit_code": exit_code}
         self.project_name = None
         self.commands = []
+        self.manifest_raw = canonical_json({})
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append(command)
+        if "SAG_NAMED_JSON_RECORD_V1" in command and REQUIREMENTS_PATH in command:
+            return _published_manifest_stream(self, self.manifest_raw)
         if command in ("which gradle", "command -v gradle"):
             return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
         if command.startswith("test -x /usr/bin/gradle"):
@@ -511,9 +553,7 @@ def _detect_exclusions(history: str) -> list[str]:
 
 def test_packaging_skip_flags_are_not_test_exclusions():
     """P0-C: install/package legitimately carry -DskipTests / -x test."""
-    exclusions = _detect_exclusions(
-        "mvn install -DskipTests\ngradle publishToMavenLocal -x test\n"
-    )
+    exclusions = _detect_exclusions("mvn install -DskipTests\ngradle publishToMavenLocal -x test\n")
     assert "ALL_TESTS_SKIPPED" not in exclusions
     assert "GRADLE_TESTS_EXCLUDED" not in exclusions
 
@@ -537,6 +577,7 @@ class SelfProbingGradleOrchestrator(GradleLogOrchestrator):
         self.probe_languages = probe_languages
         self.receipts = {}
         self.assessments = {}
+        self.atomic = FakeContainer()
 
     def _write(self, command, store, pattern):
         import re as _re
@@ -555,6 +596,32 @@ class SelfProbingGradleOrchestrator(GradleLogOrchestrator):
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append(command)
+        tokens = (
+            shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
+        )
+        atomic_command = (
+            tokens[:3] == ["mkdir", "-p", "--"]
+            or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+            or tokens[:2] == ["base64", "--decode"]
+            or tokens[:3] == ["mv", "-f", "--"]
+            or (
+                tokens[:2] == ["python3", "-c"]
+                and (
+                    "hashlib.sha256" in tokens[2]
+                    or "json.load" in tokens[2]
+                    or "fcntl.flock" in tokens[2]
+                )
+            )
+        )
+        if atomic_command:
+            result = self.atomic.execute_command(command)
+            if tokens[:3] == ["mv", "-f", "--"]:
+                identifier = tokens[4].rsplit("/", 1)[-1].removesuffix(".json")
+                if "invocation_receipts" in tokens[4]:
+                    self.receipts[identifier] = self.atomic.files[tokens[4]]
+                elif "evidence_assessments" in tokens[4]:
+                    self.assessments[identifier] = self.atomic.files[tokens[4]]
+            return result
         if "for lang in scala kotlin groovy" in command:
             return {"success": True, "output": self.probe_languages, "exit_code": 0}
         if command.startswith("cat ") and "invocation_receipts" in command:

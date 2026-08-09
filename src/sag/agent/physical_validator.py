@@ -24,6 +24,7 @@ Example Usage:
         print("Project built and tested successfully!")
 """
 
+import hashlib
 import json
 import os
 import posixpath
@@ -32,11 +33,16 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from sag.agent.evidence_records import (
+    EvidencePublicationBinding,
+    json_record_stream_succeeded,
+    read_live_published_json_records,
+)
 from sag.agent.receipt_structure import dispatch_terminated as _dispatch_terminated
 from sag.agent.receipt_structure import module_key as _receipt_module_key
 from sag.config.settings import (
@@ -46,7 +52,9 @@ from sag.config.settings import (
 )
 from sag.runtime.container_io import (
     ContainerFileReadError,
-    command_did_not_run as _command_did_not_run,
+)
+from sag.runtime.container_io import command_did_not_run as _command_did_not_run
+from sag.runtime.container_io import (
     read_container_text,
 )
 from sag.testcases.catalog import (
@@ -55,11 +63,6 @@ from sag.testcases.catalog import (
     TestCaseDescriptor,
     build_java_test_catalog,
     normalize_testcase_identifier,
-)
-from sag.testcases.compileall_metrics import (
-    COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
-    compileall_metrics_command,
-    parse_compileall_metrics,
 )
 from sag.testcases.results import (
     CanonicalTestIdentity,
@@ -270,6 +273,9 @@ _DENOMINATOR_REFUSALS = {
     "build_receipt_not_terminal": (
         "a dispatch that did not end on its own stated the modules it had reached"
     ),
+    "build_receipt_scope_unavailable": (
+        "the current run, target checkout, and project root pins could not be bound"
+    ),
     "build_receipts_unreadable": "this run's invocation receipts could not be read",
     "module_scan_unreadable": "the module scan could not read the tree",
 }
@@ -282,8 +288,11 @@ _RECEIPTS_UNREADABLE = "unreadable"
 
 
 # In-container test-report parser (executed via `python3 - <<'PY'`). The four
-# header assignments (project_dir, pytest_reports_dir, receipts_dir,
-# primary_root) are prepended by _parse_test_reports_compact_in_container.
+# header assignments (project_dir, pytest_reports_dir, receipt_scoped,
+# receipt_claims, primary_root) are prepended by
+# _parse_test_reports_compact_in_container. Receipt facts have already crossed
+# the strict host-publication boundary; the embedded parser never reopens a
+# container evidence ledger on its own.
 # Kept as a plain module string so the embedded script needs no f-string brace
 # escaping.
 #
@@ -480,169 +489,6 @@ def content_sha256(path):
         return None
 
 
-def receipt_schema_error(payload):
-    """Receipt conformance. A receipt we cannot read is never "no evidence".
-
-    Version-gated (Plan 6 Stage 0, spec §C4): v1 and v2 are both read, because
-    v2 only ADDS keys and keeps every v1 key's name and shape. An absent
-    ``schema_version`` is v1. An unknown FUTURE version is CORRUPT here rather
-    than merely skipped: this reader decides the provenance of the primary test
-    count, where Plan 5's law is that unattributable evidence closes nothing.
-    """
-    if not isinstance(payload, dict):
-        return "receipt is not a JSON object"
-    version = payload.get("schema_version", 1)
-    if isinstance(version, bool) or version not in (1, 2):
-        return "unsupported schema_version " + repr(payload.get("schema_version"))
-    for key in ("receipt_id", "working_directory"):
-        value = payload.get(key)
-        if not isinstance(value, str) or not value.strip():
-            return "missing " + key
-    if not payload["working_directory"].startswith("/"):
-        return "working_directory is not an absolute path"
-    delta = payload.get("report_delta")
-    if delta is None:
-        return None
-    if not isinstance(delta, dict):
-        return "report_delta is not an object"
-    for bucket in ("new", "changed", "cached"):
-        entries = delta.get(bucket)
-        if entries is None:
-            continue
-        if not isinstance(entries, list):
-            return "report_delta." + bucket + " is not a list"
-        for entry in entries:
-            if not isinstance(entry, dict):
-                return "report_delta." + bucket + " entry is not an object"
-            if not isinstance(entry.get("path"), str) or not entry["path"]:
-                return "report_delta." + bucket + " entry has no path"
-            if not isinstance(entry.get("sha256"), str) or not entry["sha256"]:
-                return "report_delta." + bucket + " entry has no sha256"
-    return None
-
-
-def assessment_schema_error(payload):
-    """ReceiptAssessment conformance (Plan 6 Stage 0, spec §C4).
-
-    The append-only typed interpretation of one receipt:
-    ``{assessment_id, receipt_id, typed_code, detail}``. A record we cannot
-    read is a hole in the evidence chain exactly like an unreadable receipt —
-    it may be the very verdict that condemns an exit-0 invocation.
-    """
-    if not isinstance(payload, dict):
-        return "assessment is not a JSON object"
-    version = payload.get("schema_version", 1)
-    if isinstance(version, bool) or version not in (1, 2):
-        return "unsupported schema_version " + repr(payload.get("schema_version"))
-    # Live p6v-cli-r1: the directory holds BOTH record shapes (spec §C4).
-    # A ControlAssessment interprets a pre-dispatch/dispatch event, carries
-    # `event_or_intent_id` and no receipt_id — it is a different record, not
-    # a corrupt ReceiptAssessment, and it can never condemn a receipt.
-    if "receipt_id" not in payload and isinstance(payload.get("event_or_intent_id"), str):
-        for key in ("assessment_id", "typed_code"):
-            value = payload.get(key)
-            if not isinstance(value, str) or not value.strip():
-                return "missing " + key
-        return None
-    for key in ("assessment_id", "receipt_id", "typed_code"):
-        value = payload.get(key)
-        if not isinstance(value, str) or not value.strip():
-            return "missing " + key
-    return None
-
-
-def read_evidence_assessments():
-    """Corrupt-assessment messages for the evidence-assessment directory.
-
-    The directory is the documented sibling of the receipt directory, so no new
-    prepended coordinate is needed. Only ``*.json`` is read: an atomic writer's
-    ``<id>.json.tmp`` temp file is a partially written record, which is ABSENT
-    rather than corrupt.
-    """
-    assessments_root = Path(receipts_dir).parent / "evidence_assessments"
-    if not assessments_root.is_dir():
-        return []
-    try:
-        assessment_files = sorted(
-            str(path) for path in assessments_root.iterdir() if path.name.endswith(".json")
-        )
-    except Exception as exc:
-        return [str(assessments_root) + ": assessment directory unreadable (" + str(exc) + ")"]
-    corrupt = []
-    for assessment_file in assessment_files:
-        try:
-            payload = json.loads(Path(assessment_file).read_text())
-        except Exception as exc:
-            corrupt.append(assessment_file + ": assessment unreadable (" + str(exc) + ")")
-            continue
-        reason = assessment_schema_error(payload)
-        if reason:
-            corrupt.append(assessment_file + ": " + reason)
-    return corrupt
-
-
-def read_invocation_receipts():
-    """Return (scoped, claims, corrupt) for the invocation-receipt directory.
-
-    ``claims`` maps a claimed report path to every sha256 the primary
-    coordinate's receipts recorded for it, so a retry that overwrites the same
-    path in place verifies through its newest receipt instead of colliding
-    with the superseded one.
-
-    ``corrupt`` also carries unreadable evidence assessments (Plan 6 Stage 0):
-    persistence failure of a receipt OR an assessment is one evidence-closure
-    failure with one mechanism and one message naming the file.
-    """
-    receipts_root = Path(receipts_dir)
-    if not receipts_root.is_dir():
-        return False, {}, []
-    try:
-        receipt_files = sorted(
-            str(path) for path in receipts_root.iterdir() if path.name.endswith(".json")
-        )
-    except Exception as exc:
-        return True, {}, [receipts_dir + ": receipt directory unreadable (" + str(exc) + ")"]
-    if not receipt_files:
-        return False, {}, []
-    claims = {}
-    corrupt = read_evidence_assessments()
-    primary_prefix = (primary_root or "").rstrip("/")
-    for receipt_file in receipt_files:
-        try:
-            payload = json.loads(Path(receipt_file).read_text())
-        except Exception as exc:
-            corrupt.append(receipt_file + ": unreadable (" + str(exc) + ")")
-            continue
-        reason = receipt_schema_error(payload)
-        if reason:
-            corrupt.append(receipt_file + ": " + reason)
-            continue
-        working_directory = payload["working_directory"].rstrip("/") or "/"
-        # The primary coordinate NARROWS the claim set; it does not authorize
-        # it. Live p7b-camel: the coordinate could not be resolved, scoping
-        # fell back to a whole-tree scan, and 17,798 tests entered the main
-        # count with no receipt behind any of them — the same unscoped number
-        # this machinery exists to remove. Once a receipt exists we know what
-        # our own dispatches produced; not knowing which subset is primary is
-        # a reason to count all of them, never a reason to count everything on
-        # disk.
-        if primary_prefix and (
-            working_directory != primary_prefix
-            and not working_directory.startswith(primary_prefix + "/")
-        ):
-            continue
-        delta = payload.get("report_delta") or {}
-        # `cached` joins the claim set: the build system vouched that those
-        # reports ARE this build's result for their task, which is a stronger
-        # statement than a file existing (live kafka: --build-cache served most
-        # test tasks FROM-CACHE, so 4,686 passing tests could be claimed by
-        # nothing and the main count read 546 of 5,232 observed).
-        for bucket in ("new", "changed", "cached"):
-            for entry in delta.get(bucket) or []:
-                claims.setdefault(entry["path"], set()).add(entry["sha256"].strip().lower())
-    return True, claims, corrupt
-
-
 root = Path(project_dir)
 # pytest --junitxml reports live OUTSIDE the project dir; scan that root too.
 pytest_reports = Path(pytest_reports_dir)
@@ -654,14 +500,9 @@ scanned_files = sorted(
 # "which modules produced any reports at all", not "which are primary".
 report_dirs = sorted({str(Path(path).parent) for path in scanned_files})
 
-receipt_scoped, receipt_claims, corrupt_receipts = read_invocation_receipts()
 auxiliary_files = []
 stale_files = []
-if corrupt_receipts:
-    # Fail closed: unreadable receipts mean the provenance of every scanned
-    # report is unknown, so nothing may be counted.
-    report_files = []
-elif receipt_scoped:
+if receipt_scoped:
     verified = set()
     unverified = set()
     for claimed_path, claimed_hashes in receipt_claims.items():
@@ -961,12 +802,6 @@ if auxiliary_files:
     result["auxiliary_report_files"] = auxiliary_files[:200]
 if stale_files:
     result["stale_test_reports"] = stale_files[:200]
-if corrupt_receipts:
-    result = {
-        "valid": False,
-        "receipt_error": "; ".join(corrupt_receipts[:5]),
-        "receipt_error_files": corrupt_receipts[:20],
-    }
 print(json.dumps(result, separators=(",", ":")))
 '''
 
@@ -1189,6 +1024,7 @@ class PhysicalValidator:
         build_coverage_threshold: float = DEFAULT_BUILD_COVERAGE_THRESHOLD,
         test_execution_threshold: float = DEFAULT_TEST_EXECUTION_THRESHOLD,
         command_tracker=None,
+        receipt_run_id: Optional[str] = None,
     ):
         """
         Initialize physical validator.
@@ -1208,6 +1044,9 @@ class PhysicalValidator:
                 and the build's wall-clock duration. validate_build_status reads
                 the last recorded build off it to surface build_time/build_command
                 in its evidence. May be attached after construction.
+            receipt_run_id: Explicit current-run receipt epoch for isolated
+                validation/tests. Production normally inherits the active
+                invocation-receipt context established by SetupAgent.
         """
         self.docker_orchestrator = docker_orchestrator
         self.project_path = project_path
@@ -1216,6 +1055,7 @@ class PhysicalValidator:
         self.build_coverage_threshold = build_coverage_threshold
         self.test_execution_threshold = test_execution_threshold
         self.command_tracker = command_tracker
+        self.receipt_run_id = str(receipt_run_id or "").strip() or None
 
         # Cache for validation results with TTL
         self.validation_cache = {}
@@ -1662,109 +1502,6 @@ class PhysicalValidator:
             logger.error(f"Failed to validate missing classes: {e}")
             return []
 
-    def replay_last_build_command(self, command: str, working_dir: str = None) -> bool:
-        """
-        Re-run a build command and check exit code.
-        Don't rely on logs - check actual result.
-
-        Args:
-            command: The build command to execute
-            working_dir: Working directory (defaults to project path)
-
-        Returns:
-            True if build succeeds, False otherwise
-        """
-        if not self.docker_orchestrator:
-            return False
-
-        working_dir = working_dir or self.project_path
-
-        logger.info(f"Replaying build command for validation: {command[:100]}...")
-
-        try:
-            # Execute the command
-            full_command = f"cd {working_dir} && {command}"
-            result = self.docker_orchestrator.execute_command(
-                full_command, timeout=300
-            )  # 5 min timeout
-
-            exit_code = result.get("exit_code", 1)
-            output = result.get("output", "")
-
-            # Check for explicit build success markers
-            if "mvn" in command or "maven" in command.lower():
-                build_success = "BUILD SUCCESS" in output and "BUILD FAILURE" not in output
-            elif "gradle" in command:
-                build_success = "BUILD SUCCESSFUL" in output and "BUILD FAILED" not in output
-            else:
-                # For other build systems, rely on exit code
-                build_success = exit_code == 0
-
-            logger.info(f"Build replay result: exit_code={exit_code}, success={build_success}")
-
-            return build_success
-
-        except Exception as e:
-            logger.error(f"Failed to replay build command: {e}")
-            return False
-
-    def replay_all_test_commands(
-        self, commands: List[str], working_dir: str = None
-    ) -> Dict[str, any]:
-        """
-        Re-run all test commands to get accurate counts.
-
-        Args:
-            commands: List of test commands to execute
-            working_dir: Working directory (defaults to project path)
-
-        Returns:
-            Dictionary with aggregated test results
-        """
-        if not self.docker_orchestrator:
-            return {"total": 0, "passed": 0, "failed": 0, "skipped": 0, "error": "No orchestrator"}
-
-        working_dir = working_dir or self.project_path
-
-        total_stats = {"total": 0, "passed": 0, "failed": 0, "skipped": 0}
-        command_results = []
-
-        for command in commands:
-            logger.info(f"Replaying test command: {command[:100]}...")
-
-            try:
-                full_command = f"cd {working_dir} && {command}"
-                result = self.docker_orchestrator.execute_command(
-                    full_command, timeout=600
-                )  # 10 min timeout
-
-                output = result.get("output", "")
-                exit_code = result.get("exit_code", 1)
-
-                # Extract test statistics from output
-                stats = self._extract_test_statistics(command, output)
-
-                # Aggregate statistics
-                total_stats["total"] += stats["total"]
-                total_stats["passed"] += stats["passed"]
-                total_stats["failed"] += stats["failed"]
-                total_stats["skipped"] += stats["skipped"]
-
-                command_results.append({"command": command, "exit_code": exit_code, "stats": stats})
-
-            except Exception as e:
-                logger.error(f"Failed to replay test command: {e}")
-                command_results.append({"command": command, "error": str(e)})
-
-        return {
-            "total": total_stats["total"],
-            "passed": total_stats["passed"],
-            "failed": total_stats["failed"],
-            "skipped": total_stats["skipped"],
-            "command_count": len(commands),
-            "command_results": command_results,
-        }
-
     def _extract_test_statistics(self, command: str, output: str) -> Dict[str, int]:
         """
         Extract test statistics from command output.
@@ -1869,16 +1606,27 @@ class PhysicalValidator:
             "parsing_errors": [],
         }
 
-        # Receipt scoping (Plan 5 Task B2). The primary coordinate is only
-        # resolved when receipts actually exist, so a receipt-free run keeps
-        # its command sequence — and its numbers — unchanged.
-        receipts_present = self._invocation_receipts_present()
+        # Receipt scoping crosses the host-publication boundary exactly once.
+        # A malformed, unpublished, deleted or rolled-back ledger is not the
+        # fact "no receipts" and therefore cannot restore a legacy global
+        # scan. The compact parser receives only this verified snapshot.
+        receipt_records = self._read_live_invocation_receipts()
+        if receipt_records is None:
+            return self._receipt_evidence_failure(
+                test_result,
+                cache_key,
+                "invocation receipt ledger is not host-authorized and complete",
+                [],
+            )
+        receipts_present = bool(receipt_records)
         primary_root = self._primary_test_coordinate_root() if receipts_present else None
         coordinate_unresolved = receipts_present and not primary_root
 
         try:
             compact_result = self._parse_test_reports_compact_in_container(
-                project_dir, primary_root=primary_root
+                project_dir,
+                primary_root=primary_root,
+                receipt_records=receipt_records,
             )
             if compact_result and compact_result.get("receipt_error"):
                 return self._receipt_evidence_failure(
@@ -2250,14 +1998,113 @@ class PhysicalValidator:
 
     # --- invocation receipts (Plan 5 Task B2) ------------------------------
     def _invocation_receipts_dir(self) -> str:
-        """The schema-v1 receipt directory for this workspace."""
+        """The invocation receipt directory for this workspace."""
         return f"{self.project_path.rstrip('/')}/{INVOCATION_RECEIPTS_DIRNAME}"
 
-    def _attempted_module_evidence(self) -> "_AttemptedModules":
+    def _evidence_assessments_dir(self) -> str:
+        """The assessment sibling of this workspace's receipt directory."""
+
+        return posixpath.join(
+            posixpath.dirname(self._invocation_receipts_dir()),
+            "evidence_assessments",
+        )
+
+    def _read_live_invocation_receipts(self) -> Optional[List[Dict[str, Any]]]:
+        """Return one complete host-published current receipt snapshot.
+
+        ``[]`` is a host-verified empty current set. ``None`` means the named
+        stream, strict v2 schema/filename binding, exact bytes, contract tuple
+        or immutable expected-id set failed. Historical v1 and fully verified
+        foreign-run v2 records remain forensic and never enter this snapshot.
+        """
+
+        if not self.docker_orchestrator:
+            return []
+        from sag.agent.invocation_receipts import (
+            receipt_record_scope,
+            validate_receipt_v2,
+        )
+
+        read = read_live_published_json_records(
+            self.docker_orchestrator,
+            self._invocation_receipts_dir(),
+            record_kind="invocation_receipt",
+            validator=lambda payload, expected_id: validate_receipt_v2(
+                payload,
+                expected_id=expected_id,
+            ),
+            publication_binding=lambda payload: EvidencePublicationBinding(
+                run_id=payload["run_id"],
+                contract_id=payload.get("contract_id"),
+                contract_hash=payload.get("contract_hash"),
+            ),
+            record_scope=receipt_record_scope,
+        )
+        if not read.complete or read.conflict is not None:
+            logger.debug(
+                "physical receipt ledger unavailable: "
+                f"{read.conflict or read.detail or 'incomplete'}"
+            )
+            return None
+        return [dict(record.payload) for record in read.records]
+
+    def _read_live_evidence_assessments(self) -> Optional[List[Dict[str, Any]]]:
+        """Return the complete strict host-published assessment union."""
+
+        if not self.docker_orchestrator:
+            return []
+        from sag.agent.evidence_assessments import validate_assessment_v2
+
+        read = read_live_published_json_records(
+            self.docker_orchestrator,
+            self._evidence_assessments_dir(),
+            record_kind="receipt_assessment",
+            validator=lambda payload, expected_id: validate_assessment_v2(
+                payload,
+                expected_id=expected_id,
+            ),
+        )
+        if not read.complete or read.conflict is not None:
+            logger.debug(
+                "physical assessment ledger unavailable: "
+                f"{read.conflict or read.detail or 'incomplete'}"
+            )
+            return None
+        return [dict(record.payload) for record in read.records]
+
+    @staticmethod
+    def _verified_report_claims(
+        receipt_records: List[Mapping[str, Any]],
+        primary_root: Optional[str],
+    ) -> Dict[str, List[str]]:
+        """Project a verified receipt snapshot to report path/hash claims."""
+
+        claims: Dict[str, set[str]] = {}
+        primary_prefix = str(primary_root or "").rstrip("/")
+        for payload in receipt_records:
+            working_directory = str(payload.get("working_directory") or "").rstrip("/") or "/"
+            if primary_prefix and (
+                working_directory != primary_prefix
+                and not working_directory.startswith(primary_prefix + "/")
+            ):
+                continue
+            delta = payload.get("report_delta") or {}
+            for bucket in ("new", "changed", "cached"):
+                for entry in delta.get(bucket) or ():
+                    claims.setdefault(str(entry["path"]), set()).add(
+                        str(entry["sha256"]).strip().lower()
+                    )
+        return {path: sorted(digests) for path, digests in sorted(claims.items())}
+
+    def _attempted_module_evidence(
+        self,
+        project_dir: Optional[str] = None,
+    ) -> "_AttemptedModules":
         """Modules THIS run's dispatches attempted, and whether we may narrow.
 
-        Read from the receipts' `module_outcomes` — Maven's reactor summary, the
-        modules whose tasks Gradle ran. This is the coverage SCOPE: counting
+        Read from current-run, target/domain-bound production build receipts'
+        `module_outcomes` — Maven's reactor summary, the modules whose tasks
+        Gradle ran. This is the coverage SCOPE: counting
         `src/main/java` across the whole tree measures modules a scoped build
         (`-pl`), an early-stopping reactor or a disabled profile never tried, and
         calls them missing.
@@ -2290,34 +2137,41 @@ class PhysicalValidator:
         single-module build (Maven prints no reactor summary for one module) and
         of a receipt-free run: nothing to narrow on, and nothing to cap.
         """
-        receipts = self._invocation_receipts_state()
-        if receipts == _RECEIPTS_UNREADABLE:
+        receipt_records = self._read_live_invocation_receipts()
+        if receipt_records is None:
             return _AttemptedModules((), False, "build_receipts_unreadable")
-        if receipts != _RECEIPTS_PRESENT:
+        if not receipt_records:
             return _AttemptedModules((), True, None)
-        try:
-            probe = self.docker_orchestrator.execute_command(
-                f"cat {shlex.quote(self._invocation_receipts_dir())}/*.json 2>/dev/null"
-            )
-        except Exception as exc:
-            logger.debug(f"attempted-module read failed: {exc}")
-            return _AttemptedModules((), False, "build_receipts_unreadable")
-        if _command_did_not_run(probe):
-            logger.debug("attempted-module read did not run")
-            return _AttemptedModules((), False, "build_receipts_unreadable")
+        from sag.agent.attempt_policy import (
+            current_run_production_build_receipt,
+            resolve_current_build_receipt_scope,
+        )
+        from sag.agent.invocation_receipts import active_receipt_run_id
+
+        current_run_id = self.receipt_run_id or active_receipt_run_id()
+        project_scope = project_dir or self.project_path
+        scope = resolve_current_build_receipt_scope(
+            self.docker_orchestrator,
+            run_id=current_run_id,
+            workspace_root=self.project_path,
+            project_root=project_scope,
+        )
+        if not scope.available:
+            logger.debug(f"attempted-module receipt scope unavailable: {scope.status}")
+            return _AttemptedModules((), False, "build_receipt_scope_unavailable")
         modules: List[str] = []
-        unreadable = False
         unproven = False
-        for line in ((probe or {}).get("output") or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                payload = json.loads(line)
-            except ValueError:
-                # A half-written or clipped receipt line. It is a receipt, and we
-                # cannot say what it claimed.
-                unreadable = True
+        for payload in receipt_records:
+            receipt_id = str(payload.get("receipt_id") or "").strip()
+            if not current_run_production_build_receipt(
+                payload,
+                receipt_id=receipt_id,
+                run_id=current_run_id,
+                target_sha=scope.target_sha or "",
+                project_root=scope.project_root or "",
+            ):
+                # A durable receipt from another run, checkout, or domain is
+                # historical evidence.  It cannot narrow THIS run's coverage.
                 continue
             stated = False
             for entry in payload.get("module_outcomes") or ():
@@ -2333,11 +2187,7 @@ class PhysicalValidator:
             # denominator's.
             if stated and not _dispatch_terminated(payload):
                 unproven = True
-        cap = (
-            "build_receipts_unreadable"
-            if unreadable
-            else "build_receipt_not_terminal" if unproven else None
-        )
+        cap = "build_receipt_not_terminal" if unproven else None
         return _AttemptedModules(tuple(modules), cap is None, cap)
 
     def _receipt_structure(self) -> Dict[str, Any]:
@@ -2349,14 +2199,25 @@ class PhysicalValidator:
         phase whose own dispatches stated nothing.
         """
         if not self.docker_orchestrator:
+            self._receipt_structure_conflict = "build_requirements_unavailable"
             return {}
         try:
             from sag.agent.receipt_structure import read_module_structure
-            from sag.tools.internal.build_preflight import read_build_requirements
+            from sag.tools.internal.build_preflight import read_live_build_requirements
 
-            return read_module_structure(read_build_requirements(self.docker_orchestrator)) or {}
+            manifest_read = read_live_build_requirements(self.docker_orchestrator)
+            if (
+                not manifest_read.complete
+                or manifest_read.conflict is not None
+                or manifest_read.payload is None
+            ):
+                self._receipt_structure_conflict = "build_requirements_unavailable"
+                return {}
+            self._receipt_structure_conflict = None
+            return read_module_structure(dict(manifest_read.payload)) or {}
         except Exception as exc:
             logger.debug(f"receipt-proven structure unavailable: {exc}")
+            self._receipt_structure_conflict = "build_requirements_unavailable"
             return {}
 
     def _module_scan_result(self, project_name: str) -> Optional[Dict[str, Any]]:
@@ -2451,32 +2312,12 @@ class PhysicalValidator:
         return _ExpectationScope(scoped, untried, None, tuple(attempted))
 
     def _invocation_receipts_state(self) -> str:
-        """One cheap probe, THREE answers; a receipt-free run pays nothing more.
+        """Three answers from the strict current host-publication snapshot."""
 
-        A probe that threw is not the fact "this run wrote no receipts" — it is
-        "we do not know", and the denominator reader must be able to tell them
-        apart (spec §2 P4: failing to read evidence may not improve a verdict).
-        Every caller that only needs presence keeps its two-answer view below.
-        """
-        if not self.docker_orchestrator:
-            return _RECEIPTS_ABSENT
-        try:
-            probe = self.docker_orchestrator.execute_command(
-                f"test -d {shlex.quote(self._invocation_receipts_dir())} && echo EXISTS"
-            )
-        except Exception as exc:
-            logger.debug(f"Invocation-receipt probe failed: {exc}")
+        records = self._read_live_invocation_receipts()
+        if records is None:
             return _RECEIPTS_UNREADABLE
-        if _command_did_not_run(probe):
-            # §6.8 fence 2: the failure dict, not an exception, is how a
-            # transient docker failure arrives — the except above only sees
-            # the pre-command container checks. "Could not look" is not
-            # "looked and the directory is absent".
-            logger.debug("Invocation-receipt probe did not run")
-            return _RECEIPTS_UNREADABLE
-        if "EXISTS" in ((probe or {}).get("output") or ""):
-            return _RECEIPTS_PRESENT
-        return _RECEIPTS_ABSENT
+        return _RECEIPTS_PRESENT if records else _RECEIPTS_ABSENT
 
     def _invocation_receipts_present(self) -> bool:
         """Presence, byte-identically to before: only a probe that SAW the
@@ -2527,7 +2368,10 @@ class PhysicalValidator:
         return test_result
 
     def _parse_test_reports_compact_in_container(
-        self, project_dir: str, primary_root: Optional[str] = None
+        self,
+        project_dir: str,
+        primary_root: Optional[str] = None,
+        receipt_records: Optional[List[Mapping[str, Any]]] = None,
     ) -> Optional[Dict[str, any]]:
         """Parse Maven/Gradle test XML inside the container and return compact JSON.
 
@@ -2546,12 +2390,32 @@ class PhysicalValidator:
         """
         from sag.tools.internal.python_tool import PYTEST_REPORT_DIR
 
+        records = (
+            self._read_live_invocation_receipts()
+            if receipt_records is None
+            else [dict(record) for record in receipt_records]
+        )
+        if records is None:
+            return {
+                "valid": False,
+                "receipt_error": "invocation receipt ledger is not host-authorized and complete",
+                "receipt_error_files": [],
+            }
+        assessments = self._read_live_evidence_assessments()
+        if assessments is None:
+            return {
+                "valid": False,
+                "receipt_error": "evidence assessment ledger is not host-authorized and complete",
+                "receipt_error_files": [],
+            }
+        receipt_claims = self._verified_report_claims(records, primary_root)
         command = (
             "python3 - <<'PY'\n"
             "# SAG_COMPACT_TEST_REPORT_PARSER\n"
             f"project_dir = {json.dumps(project_dir)}\n"
             f"pytest_reports_dir = {json.dumps(PYTEST_REPORT_DIR)}\n"
-            f"receipts_dir = {json.dumps(self._invocation_receipts_dir())}\n"
+            f"receipt_scoped = {bool(records)!r}\n"
+            f"receipt_claims = {json.dumps(receipt_claims, sort_keys=True)}\n"
             f"primary_root = {json.dumps(primary_root) if primary_root else 'None'}\n"
             f"{_COMPACT_REPORT_PARSER_BODY}\n"
             "PY"
@@ -3257,10 +3121,10 @@ class PhysicalValidator:
                 if cache["subprojects"]:
                     logger.info(f"   Multi-project build with subprojects: {cache['subprojects']}")
         elif build_system == "python":
-            # Python evidence ladder (spec 2026-07-07 Component 4): venv ->
-            # pip check -> package imports -> compileall coverage -> declared
-            # C-extension .so artifacts. The ladder result IS the fingerprint
-            # evidence for a python build (there are no .class/JAR analogs).
+            # Python physical evidence is strictly observational.  Runtime
+            # checks (pip/import/compile) belong to ordinary producer
+            # invocations and their durable receipts; the judge never runs a
+            # project interpreter or manufactures bytecode while deciding.
             python_build = self._verify_python_build(project_dir)
             evidence["has_build_fingerprints"] = python_build["venv_exists"]
             evidence["fingerprint_details"] = {
@@ -3270,6 +3134,7 @@ class PhysicalValidator:
                     "pip_check_clean",
                     "distribution_record_ok",
                     "distribution_origin_ok",
+                    "install_outcome",
                     "imports_ok",
                     "import_failures",
                     "compileall_coverage",
@@ -3277,6 +3142,18 @@ class PhysicalValidator:
                     "compileall_source_count",
                     "compileall_compiled_source_count",
                     "compileall_foreign_pyc_count",
+                    "compileall_cache_tag",
+                    "compileall_source_basis_sha256",
+                    "compileall_pyc_basis_sha256",
+                    "compileall_source_basis_entry_count",
+                    "compileall_pyc_basis_entry_count",
+                    "compileall_missing_sources",
+                    "compileall_foreign_pycs",
+                    "wheel_artifact_status",
+                    "wheel_artifacts",
+                    "wheel_artifacts_verified",
+                    "producer_receipt_status",
+                    "producer_receipt_ids",
                     "ext_modules_ok",
                     "native_artifact_ok",
                 )
@@ -3350,7 +3227,7 @@ class PhysicalValidator:
         # whether the harness will narrow on that claim. A receipt it will not
         # narrow on still contributes its modules (they were attempted) and caps
         # the verdict; it never shrinks the denominator.
-        attempted = self._attempted_module_evidence()
+        attempted = self._attempted_module_evidence(project_dir)
         attempted_modules = attempted.modules or None
         # Plan 8 §3.6, and only as far as it may honestly go: the persisted
         # receipt-proven structure NAMES the receipt behind a denominator; it is
@@ -3379,6 +3256,14 @@ class PhysicalValidator:
         # the harness will stand behind in both directions, and a refusal that
         # left no trace is how the p7d polaris sentence graded green.
         denominator_refusals: List[str] = []
+        receipt_structure_conflict = getattr(self, "_receipt_structure_conflict", None)
+        if receipt_structure_conflict:
+            denominator_refusals.append(receipt_structure_conflict)
+            evidence.setdefault("conflicts", []).append(receipt_structure_conflict)
+            evidence["warnings"].append(
+                "Host-published build requirements are unavailable; receipt-proven "
+                "module structure cannot authorize a complete denominator"
+            )
         if scope_conflict:
             denominator_refusals.append(scope_conflict)
             evidence.setdefault("conflicts", []).append(scope_conflict)
@@ -3451,10 +3336,9 @@ class PhysicalValidator:
         )
 
         if build_system == "python" and python_build is not None:
-            # Tri-state mapping (spec 2026-07-07 Component 4): no venv or a
-            # failed import -> BLOCKED; imports ok but pip-check breakage /
-            # sub-threshold compileall coverage / missing declared C-extension
-            # -> PARTIAL with the failed rung named; every rung green -> SUCCESS.
+            # A missing venv or exact installed-distribution ownership can be
+            # rejected from filesystem facts. Runtime rungs without producer
+            # receipts remain unknown and therefore cap the build at PARTIAL.
             success = python_build["success"]
             complete = python_build["complete"]
             reason = python_build["reason"]
@@ -3767,14 +3651,21 @@ class PhysicalValidator:
         """
         conflicts: List[str] = []
         try:
+            from sag.runtime.env_overlay import EnvOverlayStore
             from sag.tools.internal.build_preflight import (
                 active_java_major,
-                active_python_version,
-                read_build_requirements,
+                read_live_build_requirements,
             )
             from sag.tools.internal.python_env import resolve_python_version
 
-            manifest = read_build_requirements(self.docker_orchestrator) or {}
+            manifest_read = read_live_build_requirements(self.docker_orchestrator)
+            if (
+                not manifest_read.complete
+                or manifest_read.conflict is not None
+                or manifest_read.payload is None
+            ):
+                return ["build_requirements_unavailable"]
+            manifest = dict(manifest_read.payload)
 
             required_jdk = manifest.get("java_version")
             if required_jdk:
@@ -3784,7 +3675,13 @@ class PhysicalValidator:
 
             required_python = manifest.get("python_version")
             if required_python:
-                active_py = active_python_version(self.docker_orchestrator)
+                # Reading the registered overlay is judge-safe. Executing
+                # ``python3 --version`` is not: PATH may resolve a project venv,
+                # and a physical judge must never launch project-owned code.
+                candidate = (
+                    EnvOverlayStore(self.docker_orchestrator).active_candidate("python") or {}
+                )
+                active_py = str(candidate.get("version") or "").strip() or None
                 constraint = manifest.get("python_constraint")
                 constraint_satisfied = bool(
                     active_py
@@ -3795,68 +3692,756 @@ class PhysicalValidator:
                     conflicts.append("python_version_mismatch")
         except Exception as exc:
             logger.debug(f"env conflict check skipped: {exc}")
+            conflicts.append("build_requirements_unavailable")
         return conflicts
 
-    def _verify_python_build(self, project_dir: str) -> Dict[str, any]:
-        """Python evidence ladder (spec 2026-07-07 Component 4).
+    @staticmethod
+    def _empty_python_build_result(
+        *,
+        test_entry_ready: Optional[bool] = None,
+        reason: str = "",
+        conflicts: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "venv_exists": False,
+            "pip_check_clean": None,
+            "distribution_record_ok": None,
+            "distribution_origin_ok": None,
+            "install_outcome": None,
+            "imports_ok": None,
+            "import_failures": [],
+            "compileall_coverage": None,
+            "compileall_metric_status": "unavailable",
+            "compileall_source_count": 0,
+            "compileall_compiled_source_count": 0,
+            "compileall_foreign_pyc_count": 0,
+            "compileall_cache_tag": None,
+            "compileall_source_basis_sha256": None,
+            "compileall_pyc_basis_sha256": None,
+            "compileall_source_basis_entry_count": 0,
+            "compileall_pyc_basis_entry_count": 0,
+            "compileall_missing_sources": [],
+            "compileall_foreign_pycs": [],
+            "wheel_artifact_status": None,
+            "wheel_artifacts": [],
+            "wheel_artifacts_verified": None,
+            "producer_receipt_status": "absent",
+            "producer_receipt_ids": {},
+            "metrics_conflicts": list(conflicts or ()),
+            "ext_modules_ok": None,
+            "native_artifact_ok": None,
+            "test_entry_ready": test_entry_ready,
+            "test_entry_candidate": None,
+            "success": False,
+            "complete": False,
+            "reason": reason,
+            "warnings": [reason] if reason else [],
+        }
 
-        Rungs, in order: venv exists -> `python -m pip check` clean -> every
-        manifest package imports -> `compileall` source-weighted coverage
-        (tests/docs/examples excluded, the analog of the Java class-coverage
-        ratio) -> declared C-extensions have built `.so` artifacts. A missing
-        venv or a failed import is BLOCKED (success=False) — EXCEPT when the
-        only failing names are underscore-prefixed accessory modules (_yaml,
-        _cffi_backend, ...) next to at least one green non-underscore
-        import: wheels list optional C-extension modules statically in
-        top_level.txt whether or not the extension was built (pyyaml bug
-        #14), so those failures are C-extension-rung evidence — PARTIAL
-        ("optional extension module(s) not importable: ..."), never a false
-        red on a usable environment; pip-check
-        breakage, coverage below build_coverage_threshold, or a missing
-        declared extension is PARTIAL (success=True, complete=False) with the
-        failed rung named; a pip-check that cannot run because pip itself is
-        missing from the venv (bug #12: plain uv venvs ship no pip) is
-        UNVERIFIABLE (pip_check_clean=None) — a visible skip warning plus the
-        bug-#9 cap at PARTIAL, never phantom breakage and never silent green;
-        every rung green is SUCCESS. Unknown rungs (no declared packages, no
-        countable sources) stay None — never invented evidence — and an
-        unknown IMPORTS rung caps the build at PARTIAL (pyyaml live probe
-        bug #9): imports are the strongest evidence, so "never probed" must
-        not read as green on a testless project.
+    @staticmethod
+    def _normalized_python_evidence_root(value: Any) -> Optional[str]:
+        """An absolute, newline-free POSIX path suitable for receipt binding."""
 
-        Imports rung fallback (pyyaml re-probe bug #6): package_dir layouts
-        (``package_dir={'': 'lib'}``) can defeat static discovery, leaving the
-        manifest's python_packages empty. The imports check is the STRONGEST
-        evidence rung, so before skipping it the import targets are derived
-        from the venv itself — but ONLY from the PROJECT's own installed
-        record: the dist-info whose direct_url.json points back at the
-        project dir, else a name-matched dist-info/egg-info (see
-        _installed_top_level_packages). Third-party dependency records in the
-        same site-packages are never project evidence. Only when the
-        project's own record yields nothing does the rung stay None, and then
-        the skip is a VISIBLE warning in the evidence, never a silent hole in
-        the report.
+        raw = str(value or "").strip()
+        if not raw.startswith("/") or "\x00" in raw or "\n" in raw:
+            return None
+        return posixpath.normpath(raw)
 
-        Installed-record gate (apache/libcloud false-BLOCKED bug #8): the
-        project's own installed top-level names gate the import targets
-        ALWAYS, not only when the manifest is empty. Discovery's flat-layout
-        probe happily lists repo-support dirs (contrib/, demos/,
-        integration/, pylint_plugins/ — each carries an __init__.py) that
-        were never installed, and one such junk name used to fail the whole
-        rung. Whenever the project's record is non-empty, the FULL installed
-        set is the import target list — never a manifest-narrowed subset:
-        discovery's flat-layout ranking can drop genuine installed siblings
-        (mercurial shape: mercurial/ + hgext/ + hgdemandimport/ all
-        installed, only the name-match kept in the manifest), and probing
-        manifest ∩ installed would let a broken sibling import pass
-        silently. Junk manifest names surface as a "discovered but not
-        installed" warning instead of a false BLOCKED. Only when NOTHING of
-        the project is installed do the manifest packages keep today's
-        semantics — their import failure is then real evidence.
+    @staticmethod
+    def _python_producer_authority(
+        receipt: Mapping[str, Any], observations: Mapping[str, Any]
+    ) -> str:
+        """Classify what a producer observation may prove.
+
+        The runner outcome outranks the observation attached to its receipt. A
+        failed/non-terminal runner may preserve an explicit negative fact (for
+        example ``pip_check=broken``), but it may never launder a positive
+        postcondition.  A clean terminal runner can support either direction.
         """
-        from sag.tools.internal.build_preflight import read_build_requirements
 
-        manifest = read_build_requirements(self.docker_orchestrator) or {}
+        if not _dispatch_terminated(receipt):
+            return "unknown"
+        operation = str(observations.get("operation") or "")
+        detail = observations.get("setup" if operation == "setup_env" else operation)
+        explicit_negative = False
+        if isinstance(detail, Mapping):
+            if operation == "setup_env":
+                pip_check = detail.get("pip_check")
+                imports = detail.get("imports")
+                explicit_negative = bool(
+                    detail.get("install_outcome") == "failed"
+                    or (isinstance(pip_check, Mapping) and pip_check.get("status") == "broken")
+                    or (
+                        isinstance(imports, Mapping)
+                        and imports.get("status") == "complete"
+                        and int(imports.get("failed_count") or 0) > 0
+                    )
+                )
+            elif operation == "compile":
+                explicit_negative = detail.get("status") == "invalid"
+
+        if explicit_negative:
+            return "negative"
+        project_steps = observations.get("recorded_project_steps")
+        steps_green = (
+            isinstance(project_steps, list)
+            and bool(project_steps)
+            and all(
+                isinstance(step, Mapping) and step.get("outcome") == "completed"
+                for step in project_steps
+            )
+        )
+        if receipt.get("outcome") == "completed" and receipt.get("exit_code") == 0 and steps_green:
+            return "positive"
+        return "unknown"
+
+    @staticmethod
+    def _python_optional_pin(record: Mapping[str, Any], key: str) -> Optional[str]:
+        if key not in record:
+            return None
+        value = record.get(key)
+        if not isinstance(value, str):
+            return ""
+        return value.strip() or ""
+
+    def _python_producer_contract_valid(
+        self,
+        receipt: Mapping[str, Any],
+        *,
+        operation: str,
+        project_root: str,
+        target_sha: str,
+        survey_fingerprint: Optional[str],
+        config_fingerprint: Optional[str],
+        document_map_fingerprint: Optional[str],
+        domain_id: Optional[str],
+        fact_epoch: Optional[int],
+    ) -> bool:
+        """Bind a Python aggregate receipt to its frozen facade commitment.
+
+        Python producer actions are dynamic, multi-command operations.  Their
+        facade contract deliberately has no guessed argv.  That exact shape is
+        a semantic contract only when the frozen public ``build`` call maps
+        mechanically to the receipt operation and both sides explicitly omit
+        argv compliance. Schema-v2 Python authority has no argv fallback; a
+        future representation requires a new explicit binding version.
+        """
+
+        from sag.agent.evidence_assessments import contract_receipt_binding_problem
+        from sag.agent.invocation_contracts import (
+            PYTHON_FACADE_EXECUTION_BINDING,
+            python_operation_for_public_action,
+            read_frozen_contract,
+        )
+
+        contract_id = receipt.get("contract_id")
+        receipt_hash = receipt.get("contract_hash")
+        if not isinstance(contract_id, str) or not isinstance(receipt_hash, str):
+            return False
+        contract = read_frozen_contract(
+            self.docker_orchestrator.execute_command,
+            contract_id,
+        )
+        if not isinstance(contract, Mapping):
+            return False
+        if (
+            contract_receipt_binding_problem(contract, receipt)
+            or contract.get("execution_binding") != PYTHON_FACADE_EXECUTION_BINDING
+            or "expected_argv" in contract
+            or "compliance" in receipt
+        ):
+            return False
+
+        normalized_root = self._normalized_python_evidence_root(project_root)
+        expected_cwd = self._normalized_python_evidence_root(contract.get("expected_cwd"))
+        working_cwd = self._normalized_python_evidence_root(receipt.get("working_directory"))
+        actual_cwd = self._normalized_python_evidence_root(receipt.get("actual_cwd"))
+        if not normalized_root or not (
+            expected_cwd == working_cwd == actual_cwd == normalized_root
+        ):
+            return False
+        if (
+            str(contract.get("effective_action") or "").strip() != operation
+            or str(receipt.get("requested_action") or "").strip() != operation
+            or str(receipt.get("effective_action") or "").strip() != operation
+        ):
+            return False
+
+        # Pins are absent-preserving. Two absent optional facts are equal;
+        # an empty or one-sided key is a partial tuple and therefore invalid.
+        current_target = str(target_sha or "").strip().lower()
+        if not current_target:
+            return False
+        for record in (contract, receipt):
+            recorded_target = self._python_optional_pin(record, "target_sha")
+            if not isinstance(recorded_target, str) or recorded_target.lower() != current_target:
+                return False
+        for key, current_value in (
+            ("survey_fingerprint", survey_fingerprint),
+            ("config_fingerprint", config_fingerprint),
+            ("document_map_fingerprint", document_map_fingerprint),
+        ):
+            current = str(current_value).strip() if current_value is not None else None
+            for record in (contract, receipt):
+                recorded = self._python_optional_pin(record, key)
+                if current is None:
+                    if recorded is not None:
+                        return False
+                elif recorded != current:
+                    return False
+        normalized_domain = self._normalized_python_evidence_root(domain_id) if domain_id else None
+        for record in (contract, receipt):
+            recorded_raw = self._python_optional_pin(record, "domain_id")
+            recorded = (
+                self._normalized_python_evidence_root(recorded_raw)
+                if recorded_raw not in (None, "")
+                else recorded_raw
+            )
+            if normalized_domain is None:
+                if recorded is not None:
+                    return False
+            elif recorded != normalized_domain:
+                return False
+        for record in (contract, receipt):
+            if fact_epoch is None:
+                if "fact_epoch" in record:
+                    return False
+            elif record.get("fact_epoch") != fact_epoch:
+                return False
+
+        requested = contract.get("requested_call")
+        if not isinstance(requested, Mapping) or requested.get("tool") != "build":
+            return False
+        params = requested.get("params")
+        if not isinstance(params, Mapping):
+            return False
+        requested_root = self._normalized_python_evidence_root(params.get("working_directory"))
+        if (
+            python_operation_for_public_action(params.get("action")) != operation
+            or requested_root != normalized_root
+        ):
+            return False
+        if operation in {"build", "compile"} and params.get("args") not in (None, ""):
+            return False
+        # Non-empty Python dependency targets are deliberately disabled until
+        # the facade and judge share one typed PolicyClaim verifier. An opaque
+        # supporting id is not install authority, and the ordinary empty-args
+        # deps action still installs the project's declared dependency set.
+        if operation == "setup_env" and str(params.get("args") or "").strip():
+            return False
+        return True
+
+    def _read_python_producer_receipts(
+        self,
+        project_root: str,
+        manifest: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Read hash-verified Python producer observations for this checkout.
+
+        Receipt files are the durable authority. ToolResult prose, a raw
+        ``runner_dispatched`` bit, old-run files, other checkouts, and sibling
+        domains are inert. A malformed current stream is uncertainty for the
+        entire read: accepting an older valid line beside a clipped newer one
+        would refine unknown evidence upward.
+        """
+
+        empty: Dict[str, Any] = {
+            "status": "absent",
+            "operations": {},
+            "conflicts": [],
+            "warnings": [],
+        }
+        receipt_records = self._read_live_invocation_receipts()
+        if receipt_records == []:
+            return empty
+        if receipt_records is None:
+            return {
+                **empty,
+                "status": "unreadable",
+                "conflicts": ["python_producer_receipts_unreadable"],
+                "warnings": ["Python producer receipt stream could not be read"],
+            }
+
+        from sag.agent.attempt_policy import (
+            current_run_durable_receipt,
+            resolve_current_build_receipt_scope,
+        )
+        from sag.agent.invocation_receipts import (
+            RECEIPT_SCHEMA_VERSION,
+            active_receipt_run_id,
+            nearest_domain_fact_epoch,
+            nearest_domain_root,
+            producer_observations_sha256,
+            producer_sequence_from_receipt_id,
+            python_import_targets,
+            read_producer_observations,
+        )
+
+        current_run_id = self.receipt_run_id or active_receipt_run_id()
+        normalized_root = self._normalized_python_evidence_root(project_root)
+        scope = resolve_current_build_receipt_scope(
+            self.docker_orchestrator,
+            run_id=current_run_id,
+            workspace_root=self.project_path,
+            project_root=normalized_root,
+        )
+        if normalized_root is None or not scope.available:
+            return {
+                **empty,
+                "status": "scope_unavailable",
+                "conflicts": ["python_producer_receipt_scope_unavailable"],
+                "warnings": [
+                    "Python producer receipts could not be bound to the current run, "
+                    "checkout, and project root"
+                ],
+            }
+        records: List[Mapping[str, Any]] = list(receipt_records)
+
+        survey = manifest.get("survey") if isinstance(manifest, Mapping) else None
+        manifest_target = None
+        if isinstance(survey, Mapping):
+            manifest_target = str(survey.get("target_sha") or "").strip().lower() or None
+        if manifest_target is None and isinstance(manifest, Mapping):
+            manifest_target = str(manifest.get("target_sha") or "").strip().lower() or None
+        if manifest_target != str(scope.target_sha or "").strip().lower():
+            return {
+                **empty,
+                "status": "invalid",
+                "conflicts": ["python_producer_receipt_invalid"],
+                "warnings": ["Python producer manifest target disagrees with the run pin"],
+            }
+        manifest_config = None
+        if isinstance(survey, Mapping) and "config_fingerprint" in survey:
+            value = survey.get("config_fingerprint")
+            manifest_config = str(value).strip() if isinstance(value, str) and value.strip() else ""
+        elif isinstance(manifest, Mapping) and "config_fingerprint" in manifest:
+            value = manifest.get("config_fingerprint")
+            manifest_config = str(value).strip() if isinstance(value, str) and value.strip() else ""
+        if manifest_config == "":
+            return {
+                **empty,
+                "status": "invalid",
+                "conflicts": ["python_producer_receipt_invalid"],
+                "warnings": ["Python producer manifest config fingerprint is partial"],
+            }
+        manifest_survey = None
+        if isinstance(survey, Mapping) and "survey_fingerprint" in survey:
+            value = survey.get("survey_fingerprint")
+            manifest_survey = str(value).strip() if isinstance(value, str) and value.strip() else ""
+        elif isinstance(manifest, Mapping) and "survey_fingerprint" in manifest:
+            value = manifest.get("survey_fingerprint")
+            manifest_survey = str(value).strip() if isinstance(value, str) and value.strip() else ""
+        manifest_document_map = None
+        if isinstance(survey, Mapping) and "document_map_fingerprint" in survey:
+            value = survey.get("document_map_fingerprint")
+            manifest_document_map = (
+                str(value).strip() if isinstance(value, str) and value.strip() else ""
+            )
+        elif isinstance(manifest, Mapping) and "document_map_fingerprint" in manifest:
+            value = manifest.get("document_map_fingerprint")
+            manifest_document_map = (
+                str(value).strip() if isinstance(value, str) and value.strip() else ""
+            )
+        if manifest_survey == "" or manifest_document_map == "":
+            return {
+                **empty,
+                "status": "invalid",
+                "conflicts": ["python_producer_receipt_invalid"],
+                "warnings": ["Python producer manifest fingerprint tuple is partial"],
+            }
+        manifest_domain = nearest_domain_root(manifest, normalized_root)
+        manifest_fact_epoch = nearest_domain_fact_epoch(manifest, normalized_root)
+        manifest_import_targets = python_import_targets(manifest)
+
+        candidates: Dict[str, List[Tuple[Mapping[str, Any], Mapping[str, Any]]]] = {
+            "setup_env": [],
+            "build": [],
+            "compile": [],
+        }
+        seen_sequences: Dict[int, str] = {}
+        for receipt in records:
+            receipt_id = str(receipt.get("receipt_id") or "").strip()
+            if not current_run_durable_receipt(
+                receipt,
+                receipt_id=receipt_id,
+                run_id=current_run_id,
+                target_sha=scope.target_sha or "",
+                project_root=normalized_root,
+            ):
+                continue
+            if str(receipt.get("tool") or "").strip().lower() != "python":
+                continue
+            operation = str(
+                receipt.get("effective_action") or receipt.get("requested_action") or ""
+            ).strip()
+            if operation not in candidates:
+                continue
+            if type(receipt.get("schema_version")) is not int or (
+                receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
+            ):
+                return {
+                    **empty,
+                    "status": "invalid",
+                    "conflicts": ["python_producer_receipt_invalid"],
+                    "warnings": [f"Python producer receipt {receipt_id} has unsupported schema"],
+                }
+            actual_cwd = self._normalized_python_evidence_root(receipt.get("actual_cwd"))
+            raw_domain_id = str(receipt.get("domain_id") or "").strip()
+            domain_id = (
+                self._normalized_python_evidence_root(raw_domain_id) if raw_domain_id else None
+            )
+            # Python operations are rooted actions. Containment alone would let
+            # a sibling/nested domain's receipt grade this root. A single-domain
+            # survey intentionally omits ``build_domains`` and therefore writes
+            # no domain_id; exact actual_cwd still binds that compatibility case.
+            if actual_cwd != normalized_root or (raw_domain_id and domain_id != normalized_root):
+                continue
+            sequence = receipt.get("producer_sequence")
+            derived_sequence = producer_sequence_from_receipt_id(receipt_id)
+            if (
+                type(sequence) is not int
+                or sequence <= 0
+                or derived_sequence is None
+                or sequence != derived_sequence
+            ):
+                return {
+                    **empty,
+                    "status": "invalid",
+                    "conflicts": ["python_producer_receipt_invalid"],
+                    "warnings": [f"Python producer receipt {receipt_id} has no bound sequence"],
+                }
+            previous_id = seen_sequences.setdefault(sequence, receipt_id)
+            if previous_id != receipt_id:
+                return {
+                    **empty,
+                    "status": "invalid",
+                    "conflicts": ["python_producer_sequence_conflict"],
+                    "warnings": [f"Python producer sequence {sequence} names multiple receipts"],
+                }
+            if not self._python_producer_contract_valid(
+                receipt,
+                operation=operation,
+                project_root=normalized_root,
+                target_sha=scope.target_sha or "",
+                survey_fingerprint=manifest_survey,
+                config_fingerprint=manifest_config,
+                document_map_fingerprint=manifest_document_map,
+                domain_id=manifest_domain,
+                fact_epoch=manifest_fact_epoch,
+            ):
+                return {
+                    **empty,
+                    "status": "invalid",
+                    "conflicts": ["python_producer_receipt_invalid"],
+                    "warnings": [
+                        f"Python producer receipt {receipt_id} has invalid contract authority"
+                    ],
+                }
+            observations = read_producer_observations(receipt)
+            if observations is None:
+                return {
+                    **empty,
+                    "status": "invalid",
+                    "conflicts": ["python_producer_receipt_invalid"],
+                    "warnings": [
+                        f"Python producer receipt {receipt_id} failed schema/hash validation"
+                    ],
+                }
+            if observations.get("operation") != operation:
+                return {
+                    **empty,
+                    "status": "invalid",
+                    "conflicts": ["python_producer_receipt_invalid"],
+                    "warnings": [
+                        f"Python producer receipt {receipt_id} action/observation disagrees"
+                    ],
+                }
+            candidates[operation].append((receipt, observations))
+
+        selected: Dict[str, Dict[str, Any]] = {}
+        warnings: List[str] = []
+        for operation, options in candidates.items():
+            if not options:
+                continue
+            receipt, observations = max(options, key=lambda item: item[0]["producer_sequence"])
+            authority = self._python_producer_authority(receipt, observations)
+            if operation == "setup_env" and authority == "positive":
+                setup = observations.get("setup")
+                imports = setup.get("imports") if isinstance(setup, Mapping) else None
+                expected_target_hash = (
+                    producer_observations_sha256(manifest_import_targets)
+                    if manifest_import_targets
+                    else ""
+                )
+                if (
+                    not manifest_import_targets
+                    or not isinstance(imports, Mapping)
+                    or imports.get("status") != "complete"
+                    or imports.get("targets") != manifest_import_targets
+                    or str(imports.get("targets_sha256") or "") != expected_target_hash
+                ):
+                    authority = "unknown"
+                    warnings.append(
+                        "Python setup producer receipt cannot support positive facts: "
+                        "its import target set is not the current mechanical manifest set"
+                    )
+            selected[operation] = {
+                "receipt": receipt,
+                "observations": observations,
+                "authority": authority,
+            }
+            if authority == "unknown":
+                warnings.append(
+                    f"Python {operation} producer receipt cannot support positive facts: "
+                    "its runner did not complete successfully"
+                )
+        return {
+            "status": "available",
+            "operations": selected,
+            "conflicts": [],
+            "warnings": warnings,
+        }
+
+    def _execute_python_readonly_probe(self, command: str) -> Optional[str]:
+        """Execute a read-only filesystem probe without output truncation."""
+
+        try:
+            try:
+                result = self.docker_orchestrator.execute_command(
+                    command,
+                    workdir=None,
+                    timeout=120,
+                    truncate_output=False,
+                )
+            except TypeError as exc:
+                detail = str(exc)
+                if not any(name in detail for name in ("truncate_output", "workdir", "timeout")):
+                    raise
+                result = self.docker_orchestrator.execute_command(command)
+        except Exception as exc:
+            logger.debug(f"Python read-only evidence probe failed: {exc}")
+            return None
+        if _command_did_not_run(result) or not json_record_stream_succeeded(result):
+            return None
+        return str((result or {}).get("output") or "")
+
+    def _verify_python_wheel_delta(
+        self, project_root: str, observation: Mapping[str, Any]
+    ) -> Tuple[Optional[bool], List[Dict[str, Any]]]:
+        """Re-hash a receipt's bounded wheel delta without executing Python."""
+
+        status = observation.get("artifact_status")
+        artifacts = observation.get("artifacts") or []
+        if status != "produced":
+            return (False if status in {"missing", "stale_only"} else None), []
+        verified: List[Dict[str, Any]] = []
+        normalized_root = posixpath.normpath(project_root)
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                return None, []
+            relative = str(artifact.get("path") or "")
+            candidate = posixpath.normpath(posixpath.join(normalized_root, relative))
+            if not candidate.startswith(normalized_root.rstrip("/") + "/"):
+                return None, []
+            digest_output = self._execute_python_readonly_probe(
+                f"sha256sum -- {shlex.quote(candidate)}"
+            )
+            size_output = self._execute_python_readonly_probe(f"wc -c < {shlex.quote(candidate)}")
+            if digest_output is None or size_output is None:
+                return None, []
+            digest_line = digest_output.strip().splitlines()
+            if len(digest_line) != 1 or not re.fullmatch(r"[0-9a-fA-F]{64}  .+", digest_line[0]):
+                return None, []
+            try:
+                observed_size = int(size_output.strip())
+            except (TypeError, ValueError):
+                return None, []
+            if (
+                digest_line[0][:64].lower() != artifact.get("sha256")
+                or posixpath.normpath(digest_line[0][66:]) != candidate
+                or observed_size != artifact.get("size_bytes")
+            ):
+                return False, []
+            verified.append(dict(artifact))
+        return True, verified
+
+    def _verify_python_compile_basis(
+        self, project_root: str, observation: Mapping[str, Any]
+    ) -> str:
+        """Reproduce source/PYC basis hashes from read-only filesystem facts.
+
+        ``verified`` means every count, basis hash, sample, and conflict still
+        matches the immutable observation. ``changed`` means the current tree
+        differs. ``unreadable`` means the basis could not be reproduced and
+        therefore remains unknown.
+        """
+
+        if observation.get("status") not in {"valid", "invalid"}:
+            return "unreadable"
+        normalized_root = posixpath.normpath(project_root)
+        roots: List[str] = []
+        for relative in observation.get("roots") or ():
+            candidate = posixpath.normpath(posixpath.join(normalized_root, str(relative)))
+            if candidate != normalized_root and not candidate.startswith(
+                normalized_root.rstrip("/") + "/"
+            ):
+                return "unreadable"
+            roots.append(candidate)
+        if not roots:
+            return "unreadable"
+        quoted_roots = " ".join(shlex.quote(root) for root in roots)
+        directories = self._execute_python_readonly_probe(
+            "test " + " -a ".join(f"-d {shlex.quote(root)}" for root in roots)
+        )
+        if directories is None:
+            return "unreadable"
+        links = self._execute_python_readonly_probe(f"find -P {quoted_roots} -type l -print -quit")
+        if links is None or links.strip():
+            # The producer resolves symlinks. Reconstructing that graph in a
+            # shell parser is not exact, so preserve unknown instead.
+            return "unreadable"
+        listing = self._execute_python_readonly_probe(
+            f"find -P {quoted_roots} -mindepth 1 "
+            "\\( -type d \\( -name '.*' -o -name tests -o -name docs -o -name examples "
+            "\\) -prune \\) -o "
+            "\\( -type f ! -name '.*' \\( -name '*.py' -o -name '*.pyc' \\) "
+            "-exec sha256sum -- {} + \\)"
+        )
+        if listing is None:
+            return "unreadable"
+        files: Dict[str, str] = {}
+        for line in listing.splitlines():
+            if not re.fullmatch(r"[0-9a-fA-F]{64}  /[^\x00\n]+", line):
+                return "unreadable"
+            digest = line[:64].lower()
+            path = posixpath.normpath(line[66:])
+            if not any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots):
+                return "unreadable"
+            previous = files.setdefault(path, digest)
+            if previous != digest:
+                return "unreadable"
+
+        sources = {path: digest for path, digest in files.items() if path.endswith(".py")}
+        pycs = {path: digest for path, digest in files.items() if path.endswith(".pyc")}
+        cache_tag = str(observation.get("cache_tag") or "")
+        expected = {
+            posixpath.join(
+                posixpath.dirname(source),
+                "__pycache__",
+                f"{posixpath.basename(source)[:-3]}.{cache_tag}.pyc",
+            ): source
+            for source in sources
+        }
+        mapped: Dict[str, str] = {}
+        for pyc in pycs:
+            source = expected.get(pyc)
+            if source is None and posixpath.basename(posixpath.dirname(pyc)) == "__pycache__":
+                marker = f".{cache_tag}"
+                filename = posixpath.basename(pyc)
+                marker_index = filename.rfind(marker)
+                if marker_index > 0 and filename.endswith(".pyc"):
+                    candidate = posixpath.join(
+                        posixpath.dirname(posixpath.dirname(pyc)),
+                        f"{filename[:marker_index]}.py",
+                    )
+                    if candidate in sources:
+                        source = candidate
+            if source is not None:
+                mapped[pyc] = source
+        compiled_pairs = {
+            expected_pyc: source
+            for expected_pyc, source in expected.items()
+            if expected_pyc in pycs
+        }
+        compiled_pairs.update(mapped)
+        compiled_sources = set(compiled_pairs.values())
+        missing_sources = sorted(set(sources) - compiled_sources)
+        foreign_pycs = sorted(set(pycs) - set(mapped))
+        source_basis = [{"path": path, "sha256": sources[path]} for path in sorted(sources)]
+        pyc_basis = [
+            {"path": path, "sha256": pycs[path], "source": compiled_pairs[path]}
+            for path in sorted(compiled_pairs)
+        ]
+        status = "invalid" if foreign_pycs else ("valid" if sources else "unavailable")
+        coverage = len(compiled_sources) / len(sources) if sources and not foreign_pycs else None
+        conflicts = ["metrics_conflict"] if foreign_pycs else []
+        current = {
+            "status": status,
+            "source_count": len(sources),
+            "compiled_source_count": len(compiled_sources),
+            "missing_source_count": len(missing_sources),
+            "foreign_pyc_count": len(foreign_pycs),
+            "coverage": coverage,
+            "source_basis_sha256": hashlib.sha256(
+                json.dumps(
+                    source_basis,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "pyc_basis_sha256": hashlib.sha256(
+                json.dumps(
+                    pyc_basis,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "source_basis_entry_count": len(source_basis),
+            "pyc_basis_entry_count": len(pyc_basis),
+            "missing_sources": [
+                posixpath.relpath(path, normalized_root) for path in missing_sources[:20]
+            ],
+            "foreign_pycs": [
+                posixpath.relpath(path, normalized_root) for path in foreign_pycs[:20]
+            ],
+            "conflicts": conflicts,
+        }
+        comparable_keys = tuple(current)
+        for key in comparable_keys:
+            expected_value = observation.get(key)
+            current_value = current[key]
+            if key == "coverage" and expected_value is not None and current_value is not None:
+                if abs(float(expected_value) - float(current_value)) <= 1e-12:
+                    continue
+            if expected_value != current_value:
+                return "changed"
+        return "verified"
+
+    def _verify_python_build(self, project_dir: str) -> Dict[str, any]:
+        """Read-only Python build evidence.
+
+        The survey and filesystem may prove a venv, exact installed
+        distribution ownership, declared extension artifacts, and native
+        artifacts. Dependency integrity, importability, and bytecode
+        compilation come only from a current run/target/root-bound producer
+        receipt whose typed observation still matches a read-only filesystem
+        basis. Missing, stale, malformed, or unrepeatable observations remain
+        explicitly unknown.
+
+        In particular this method never executes a venv/project-owned binary,
+        imports project code, runs ``pip check``, or writes/counts ``.pyc`` it
+        created itself.
+        """
+        from sag.tools.internal.build_preflight import read_live_build_requirements
+
+        manifest_read = read_live_build_requirements(self.docker_orchestrator)
+        if (
+            not manifest_read.complete
+            or manifest_read.conflict is not None
+            or manifest_read.payload is None
+        ):
+            return self._empty_python_build_result(
+                reason=(
+                    "Host-published build requirements are unavailable; Python "
+                    "build evidence is unobserved"
+                ),
+                conflicts=["build_requirements_unavailable"],
+            )
+        manifest = dict(manifest_read.payload)
         venv = manifest.get("python_venv") or f"{project_dir.rstrip('/')}/.venv"
         packages = manifest.get("python_packages") or []
         survey = manifest.get("survey")
@@ -3883,36 +4468,11 @@ class PhysicalValidator:
             normalized_install_root.startswith(f"{normalized_survey_root}/")
         )
         package_paths = (manifest.get("python_package_paths") or []) if strict_distribution else []
-        result: Dict[str, any] = {
-            "venv_exists": False,
-            "pip_check_clean": None,
-            "distribution_record_ok": None,
-            "distribution_origin_ok": None,
-            "imports_ok": None,
-            "import_failures": [],
-            "compileall_coverage": None,
-            "compileall_metric_status": "unavailable",
-            "compileall_source_count": 0,
-            "compileall_compiled_source_count": 0,
-            "compileall_foreign_pyc_count": 0,
-            "metrics_conflicts": [],
-            "ext_modules_ok": None,
-            # Native core (root CMakeLists.txt, live TVM): whether a build native
-            # artifact (.so/.dylib) is present. None until probed / not
-            # applicable; False caps the build at PARTIAL "native core not built".
-            "native_artifact_ok": None,
-            # A venv alone never makes a native project test-ready. Facts-v8
-            # may expose a re-verified smoke coordinate that PythonTool will
-            # collect and bound before executing.
-            "test_entry_ready": (
+        result: Dict[str, Any] = self._empty_python_build_result(
+            test_entry_ready=(
                 False if strict_distribution and manifest.get("has_native_build") else None
-            ),
-            "test_entry_candidate": None,
-            "success": False,
-            "complete": False,
-            "reason": "",
-            "warnings": [],
-        }
+            )
+        )
 
         venv_probe = self._execute_command_with_logging(f"test -d {venv}", "checking python venv")
         result["venv_exists"] = venv_probe["success"]
@@ -3949,27 +4509,6 @@ class PhysicalValidator:
             result["test_entry_candidate"] = smoke_candidate
             result["test_entry_ready"] = smoke_candidate is not None
 
-        # Module form ('{venv}/bin/python -m pip check'), never the
-        # '{venv}/bin/pip' binary a plain `uv venv` does not ship (bug #12).
-        pip_check = self._execute_command_with_logging(
-            f"{venv}/bin/python -m pip check", "pip dependency check"
-        )
-        pip_check_output = pip_check.get("output") or ""
-        if pip_check["success"]:
-            result["pip_check_clean"] = True
-        elif (
-            "No module named pip" in pip_check_output
-            or "no such file or directory" in pip_check_output.lower()
-        ):
-            # A MISSING pip (or venv python) is UNVERIFIABLE evidence, never
-            # dependency breakage (bug #12): the rung stays None with a
-            # visible skip warning, and — bug-#9 semantics — an unknown rung
-            # caps the build at PARTIAL below, never silent green.
-            result["pip_check_clean"] = None
-            result["warnings"].append("pip check rung skipped: pip not present in venv")
-        else:
-            result["pip_check_clean"] = False
-
         # Facts-v8 names the distribution observed by the survey. That exact
         # record is the only record allowed to prove the root project was
         # installed. In particular, a local provider such as apache-tvm-ffi
@@ -4005,9 +4544,9 @@ class PhysicalValidator:
             # ladder for surveys that predate an exact distribution fact.
             installed = self._installed_top_level_packages(venv, project_dir)
 
-        # The PROJECT's own installed top_level.txt record gates the import
-        # targets ALWAYS (bug #8, see docstring); still honest — read from
-        # disk, never invented, never a dependency's record.
+        # Installed top-level records remain useful ownership facts. They name
+        # what the exact project distribution says it installed, but are never
+        # treated as proof that importing those names succeeds.
         if packages and installed:
             junk = sorted(name for name in packages if name not in installed)
             if junk:
@@ -4017,92 +4556,186 @@ class PhysicalValidator:
                     + " — skipped by the imports rung (not in the project's "
                     "installed record)"
                 )
-            # The FULL installed set, never manifest ∩ installed: discovery's
-            # flat-layout ranking can narrow the manifest below the installed
-            # record, and a broken installed sibling must still BLOCK.
             if not strict_distribution:
                 packages = installed
         elif not packages:
             # Empty manifest (package_dir layouts, bug #6): the installed
             # record is the fallback source of import targets.
             packages = installed
-        # else: nothing of the project installed — keep the manifest packages
-        # and today's semantics (their import failure is real evidence).
-        if not packages:
-            result["warnings"].append("imports rung skipped: no importable package detected")
 
-        optional_ext_failures: List[str] = []
-        if packages:
-            failures = []
-            imported = []
-            for package in packages:
-                import_probe = self._execute_command_with_logging(
-                    f'{venv}/bin/python -c "import {package}"', f"import {package}"
-                )
-                if import_probe["success"]:
-                    imported.append(package)
-                else:
-                    failures.append(package)
-            # Severity partition (pyyaml optional-libyaml bug #14):
-            # underscore-prefixed top-level names (_yaml, _cffi_backend, ...)
-            # are accessory C-extension modules — the wheel's top_level.txt
-            # lists them statically whether or not the OPTIONAL extension was
-            # built, so their import failure is C-extension-rung evidence
-            # (PARTIAL, see below), never a blocker — PROVIDED at least one
-            # real (non-underscore) package imported: a 1287/1287-green
-            # pyyaml suite proved the env usable while `import _yaml` alone
-            # said BLOCKED. Any non-underscore failure keeps blocking (the
-            # libcloud broken-sibling case), and underscore failures with NO
-            # green non-underscore import verified nothing usable — those
-            # also keep blocking.
-            blocking = [name for name in failures if not name.startswith("_")]
-            if failures and not blocking and any(not name.startswith("_") for name in imported):
-                optional_ext_failures = failures
-                failures = []
-            result["imports_ok"] = not failures
-            result["import_failures"] = failures
-            if failures:
-                result["reason"] = (
-                    f"Top-level package import failed: {', '.join(failures)} — "
-                    f"the installed environment is not usable"
-                )
-                return result
+        producer_view = self._read_python_producer_receipts(install_root, manifest)
+        result["producer_receipt_status"] = producer_view["status"]
+        result["metrics_conflicts"].extend(producer_view.get("conflicts") or ())
+        result["warnings"].extend(producer_view.get("warnings") or ())
+        producer_operations = producer_view.get("operations") or {}
+        result["producer_receipt_ids"] = {
+            operation: str(entry["receipt"].get("receipt_id") or "")
+            for operation, entry in producer_operations.items()
+            if isinstance(entry, Mapping) and isinstance(entry.get("receipt"), Mapping)
+        }
 
-        package_dirs = self._python_package_dirs(
-            install_root if strict_distribution else project_dir,
-            packages,
-            package_paths=package_paths,
-        )
-        self._execute_command_with_logging(
-            f"{venv}/bin/python -m compileall -q "
-            + " ".join(shlex.quote(path) for path in package_dirs),
-            "compileall",
-        )
-        metric_result = self._execute_command_with_logging(
-            compileall_metrics_command(f"{venv}/bin/python", package_dirs),
-            "compileall metrics",
-        )
-        try:
-            if not metric_result["success"]:
-                raise ValueError("scanner command failed")
-            compile_metric = parse_compileall_metrics(metric_result.get("output") or "")
-        except (TypeError, ValueError) as exc:
-            compile_metric = None
-            result["metrics_conflicts"].append(COMPILEALL_METRICS_UNAVAILABLE_CONFLICT)
-            result["warnings"].append(f"compileall metrics unavailable: {exc}")
-
-        if compile_metric is not None:
-            result["compileall_metric_status"] = compile_metric.status
-            result["compileall_source_count"] = compile_metric.source_count
-            result["compileall_compiled_source_count"] = compile_metric.compiled_source_count
-            result["compileall_foreign_pyc_count"] = compile_metric.foreign_pyc_count
-            result["compileall_coverage"] = compile_metric.coverage
-            result["metrics_conflicts"].extend(compile_metric.conflicts)
-            if compile_metric.status == "invalid":
+        setup_authoritative = False
+        setup_failed = False
+        setup_entry = producer_operations.get("setup_env")
+        if isinstance(setup_entry, Mapping):
+            setup_observations = setup_entry.get("observations") or {}
+            setup = setup_observations.get("setup")
+            authority = setup_entry.get("authority")
+            if isinstance(setup, Mapping) and posixpath.normpath(
+                str(setup.get("venv") or "")
+            ) == posixpath.normpath(venv):
+                if authority == "positive" and setup.get("install_outcome") == "success":
+                    setup_authoritative = True
+                    result["install_outcome"] = "success"
+                    pip_check = setup.get("pip_check")
+                    if isinstance(pip_check, Mapping):
+                        result["pip_check_clean"] = pip_check.get("status") == "clean"
+                    imports = setup.get("imports")
+                    if isinstance(imports, Mapping) and imports.get("status") == "complete":
+                        result["imports_ok"] = int(imports.get("failed_count") or 0) == 0
+                        result["import_failures"] = [
+                            str(failure.get("target") or "")
+                            for failure in imports.get("failures") or ()
+                            if isinstance(failure, Mapping) and failure.get("target")
+                        ]
+                    elif isinstance(imports, Mapping):
+                        result["warnings"].append(
+                            "package importability unknown: producer receipt records "
+                            f"{imports.get('reason_code') or 'unavailable'}"
+                        )
+                elif authority == "negative":
+                    if setup.get("install_outcome") == "failed":
+                        result["install_outcome"] = "failed"
+                        setup_failed = True
+                    pip_check = setup.get("pip_check")
+                    if isinstance(pip_check, Mapping) and pip_check.get("status") == "broken":
+                        result["pip_check_clean"] = False
+                        setup_failed = True
+                    imports = setup.get("imports")
+                    if (
+                        isinstance(imports, Mapping)
+                        and imports.get("status") == "complete"
+                        and int(imports.get("failed_count") or 0) > 0
+                    ):
+                        result["imports_ok"] = False
+                        result["import_failures"] = [
+                            str(failure.get("target") or "")
+                            for failure in imports.get("failures") or ()
+                            if isinstance(failure, Mapping) and failure.get("target")
+                        ]
+                        setup_failed = True
+            else:
+                result["metrics_conflicts"].append("python_setup_receipt_venv_mismatch")
                 result["warnings"].append(
-                    "compileall metric invalid: "
-                    f"{compile_metric.foreign_pyc_count} foreign pyc file(s)"
+                    "Python setup producer receipt names a different virtual environment"
                 )
+
+        package_note = ", ".join(packages[:5]) if packages else "no project-owned names recorded"
+        if result["pip_check_clean"] is None:
+            result["warnings"].append(
+                "pip dependency integrity unknown: no producer receipt; "
+                "physical judge did not execute pip"
+            )
+        if result["imports_ok"] is None:
+            result["warnings"].append(
+                "package importability unknown: no producer receipt; physical judge did not import "
+                + package_note
+            )
+
+        compile_entry = producer_operations.get("compile")
+        if isinstance(compile_entry, Mapping):
+            compile_observations = compile_entry.get("observations") or {}
+            compile_observation = compile_observations.get("compile")
+            authority = compile_entry.get("authority")
+            if isinstance(compile_observation, Mapping):
+                metric_status = compile_observation.get("status")
+                can_consume = (authority == "positive" and metric_status == "valid") or (
+                    authority == "negative" and metric_status == "invalid"
+                )
+                if can_consume:
+                    basis_status = self._verify_python_compile_basis(
+                        install_root, compile_observation
+                    )
+                    if basis_status == "verified":
+                        result["compileall_metric_status"] = metric_status
+                        result["compileall_coverage"] = compile_observation.get("coverage")
+                        result["compileall_source_count"] = compile_observation["source_count"]
+                        result["compileall_compiled_source_count"] = compile_observation[
+                            "compiled_source_count"
+                        ]
+                        result["compileall_foreign_pyc_count"] = compile_observation[
+                            "foreign_pyc_count"
+                        ]
+                        result["compileall_cache_tag"] = compile_observation["cache_tag"]
+                        result["compileall_source_basis_sha256"] = compile_observation[
+                            "source_basis_sha256"
+                        ]
+                        result["compileall_pyc_basis_sha256"] = compile_observation[
+                            "pyc_basis_sha256"
+                        ]
+                        result["compileall_source_basis_entry_count"] = compile_observation[
+                            "source_basis_entry_count"
+                        ]
+                        result["compileall_pyc_basis_entry_count"] = compile_observation[
+                            "pyc_basis_entry_count"
+                        ]
+                        result["compileall_missing_sources"] = list(
+                            compile_observation.get("missing_sources") or ()
+                        )
+                        result["compileall_foreign_pycs"] = list(
+                            compile_observation.get("foreign_pycs") or ()
+                        )
+                        result["metrics_conflicts"].extend(
+                            compile_observation.get("conflicts") or ()
+                        )
+                    else:
+                        conflict = (
+                            "python_compile_basis_changed"
+                            if basis_status == "changed"
+                            else "python_compile_basis_unreadable"
+                        )
+                        result["metrics_conflicts"].append(conflict)
+                        result["warnings"].append(
+                            "bytecode compilation unknown: current filesystem basis "
+                            + (
+                                "changed after the receipt"
+                                if basis_status == "changed"
+                                else "could not be read"
+                            )
+                        )
+                elif metric_status == "unavailable":
+                    result["warnings"].append(
+                        "bytecode compilation unknown: producer receipt records "
+                        f"{compile_observation.get('reason_code') or 'unavailable'}"
+                    )
+        if result["compileall_metric_status"] == "unavailable" and not any(
+            warning.startswith("bytecode compilation unknown:") for warning in result["warnings"]
+        ):
+            result["warnings"].append(
+                "bytecode compilation unknown: no producer receipt; "
+                "physical judge did not run compileall"
+            )
+
+        build_entry = producer_operations.get("build")
+        if isinstance(build_entry, Mapping):
+            build_observations = build_entry.get("observations") or {}
+            build_observation = build_observations.get("build")
+            authority = build_entry.get("authority")
+            if isinstance(build_observation, Mapping) and authority in {"positive", "negative"}:
+                result["wheel_artifact_status"] = build_observation.get("artifact_status")
+                verified, artifacts = self._verify_python_wheel_delta(
+                    install_root, build_observation
+                )
+                result["wheel_artifacts_verified"] = verified
+                result["wheel_artifacts"] = artifacts
+                if verified is False and build_observation.get("artifact_status") == "produced":
+                    result["warnings"].append(
+                        "wheel artifact delta changed after its producer receipt"
+                    )
+                elif verified is None and build_observation.get("artifact_status") == "produced":
+                    result["warnings"].append(
+                        "wheel artifact delta could not be re-read from the filesystem"
+                    )
 
         so_missing = False
         if manifest.get("has_c_extensions"):
@@ -4172,36 +4805,30 @@ class PhysicalValidator:
             if strict_distribution and result["native_artifact_ok"]:
                 result["test_entry_ready"] = True
 
-        if optional_ext_failures:
-            # Bug #14: an unimportable optional extension module is
-            # C-extension-rung evidence — the rung goes red even when a .so
-            # artifact exists on disk (the module still did not import).
-            result["ext_modules_ok"] = False
-
         partial_reasons = []
-        if result["pip_check_clean"] is False:
-            partial_reasons.append("pip check reported dependency breakage")
-        elif result["pip_check_clean"] is None:
-            # UNVERIFIABLE rung (bug #12) — honest PARTIAL, never a phantom
-            # breakage and never a silent green.
-            partial_reasons.append("pip check unverified")
+        if result["pip_check_clean"] is None:
+            partial_reasons.append("pip dependency integrity unknown: no producer receipt")
+        elif result["pip_check_clean"] is False:
+            partial_reasons.append("pip dependency check reported broken requirements")
         if result["imports_ok"] is None:
-            # pyyaml live probe bug #9: an UNKNOWN imports rung is not green.
-            # venv + compileall are real evidence (success stays True), but
-            # the strongest rung was never probed — cap at PARTIAL, never a
-            # silent SUCCESS on a project whose install was never verified.
-            partial_reasons.append("imports unverified: no importable package detected")
-        coverage = result["compileall_coverage"]
-        metric_status = result["compileall_metric_status"]
-        threshold = self.build_coverage_threshold
-        if metric_status == "invalid":
-            partial_reasons.append("compileall metric invalid: source/PYC basis mismatch")
-        elif COMPILEALL_METRICS_UNAVAILABLE_CONFLICT in result["metrics_conflicts"]:
-            partial_reasons.append("compileall metrics unavailable")
-        elif coverage is not None and coverage < threshold:
+            partial_reasons.append("package importability unknown: no producer receipt")
+        elif result["imports_ok"] is False:
             partial_reasons.append(
-                f"compileall coverage {coverage * 100:.0f}% below the "
-                f"{threshold * 100:.0f}% threshold"
+                "project package import failed"
+                + (
+                    f": {', '.join(result['import_failures'][:5])}"
+                    if result["import_failures"]
+                    else ""
+                )
+            )
+        if result["compileall_metric_status"] == "unavailable":
+            partial_reasons.append("bytecode compilation unknown: no producer receipt")
+        elif result["compileall_metric_status"] == "invalid":
+            partial_reasons.append("bytecode compilation basis is invalid")
+        elif (result["compileall_coverage"] or 0) < 1.0:
+            partial_reasons.append(
+                f"bytecode compilation covered {(result['compileall_coverage'] or 0) * 100:.0f}% "
+                "of current sources"
             )
         if so_missing:
             partial_reasons.append("declared C-extensions have no built .so artifact")
@@ -4210,30 +4837,27 @@ class PhysicalValidator:
             # PARTIAL, never a block — the python package will not fully import,
             # but pure-python parts and tests may still run.
             partial_reasons.append("native core not built")
-        if optional_ext_failures:
-            partial_reasons.append(
-                "optional extension module(s) not importable: " + ", ".join(optional_ext_failures)
-            )
+        if setup_failed:
+            result["success"] = False
+            result["reason"] = "; ".join(partial_reasons) or "Python setup producer failed"
+            return result
 
+        runtime_complete = bool(
+            setup_authoritative
+            and result["pip_check_clean"] is True
+            and result["imports_ok"] is True
+            and result["compileall_metric_status"] == "valid"
+            and result["compileall_coverage"] == 1.0
+            and result["compileall_foreign_pyc_count"] == 0
+        )
         result["success"] = True
-        if partial_reasons:
-            result["reason"] = "; ".join(partial_reasons)
-        else:
-            result["complete"] = True
-            coverage_note = (
-                f"compileall coverage {coverage * 100:.0f}%"
-                if coverage is not None
-                else "compileall coverage not measurable"
-            )
-            imported = (
-                f"{len(packages)} package(s) import"
-                if packages
-                else "no declared packages to import"
-            )
-            result["reason"] = (
-                f"Python build verified: venv present, pip check clean, "
-                f"{imported}, {coverage_note}"
-            )
+        result["complete"] = runtime_complete and not so_missing and not native_missing
+        result["reason"] = (
+            "Current Python producer receipts and filesystem basis verify setup, "
+            "imports, and bytecode compilation"
+            if result["complete"]
+            else "; ".join(partial_reasons)
+        )
         return result
 
     def _strict_installed_distribution(
@@ -4816,10 +5440,8 @@ class PhysicalValidator:
                 f"📊 Found {result['total_tests']} tests executed, but some modules were skipped"
             )
             logger.info(
-                "💡 RECOMMENDED: Use build(action='test') at project root to test ALL modules"
-            )
-            logger.info(
-                "💡 Alternative: Run bash(command='cd /workspace/PROJECT && mvn test --fail-at-end')"
+                "Observed constraint: module test coverage is incomplete; "
+                "the validator does not select a repair command"
             )
 
         return result
@@ -4930,17 +5552,12 @@ class PhysicalValidator:
     def _apply_python_collected_denominator(
         self, result: Dict[str, any], project_name: Optional[str]
     ) -> Dict[str, any]:
-        """static_test_count from python_tool's collect-only denominator.
+        """Use the current published Python test receipt as denominator.
 
-        build_system == python: the COLLECTED_JSON count (written by
-        python_tool's `pytest --collect-only` pass at test time — ground truth
-        from the actual runner) takes PRIORITY over any static heuristic the
-        env summary carries. Static scans sweep the project dir, and the setup
-        plants the venv INSIDE it (live 2026-07-10 click run: site-packages
-        pushed the static count to 32927 while pytest collected 1927, capping
-        a 98.7% run at PARTIAL). The static count remains the fallback when no
-        collected count exists. Maven/Gradle: _python_collected_count is None,
-        so the env-summary priority order is unchanged.
+        The historical ``pytest_collected.json`` mirror is container-writable
+        and cannot decide a live verdict. A complete typed testcase envelope
+        on a current run/checkout/root-bound InvocationReceipt may replace the
+        static scan; otherwise the denominator stays unknown/falls back.
         """
         collected = self._python_collected_count(project_name)
         if collected is None:
@@ -4951,17 +5568,17 @@ class PhysicalValidator:
             result["static_test_count_static_scan"] = result["static_test_count"]
             logger.info(
                 f"✅ python denominator priority: {collected} tests from pytest "
-                f"--collect-only override the static scan count "
+                f"receipt rows override the static scan count "
                 f"{result['static_test_count']}"
             )
         else:
             logger.info(
                 f"✅ static_test_count: {collected} tests from "
-                f"pytest --collect-only (COLLECTED_JSON)"
+                f"a host-published Python test receipt"
             )
         result["has_static_test_count"] = True
         result["static_test_count"] = collected
-        result["static_test_count_source"] = "pytest_collect_only"
+        result["static_test_count_source"] = "published_testcase_receipt"
         if result.get("analyzed") and result.get("analysis_status_code") == (
             "analysis_static_count_missing"
         ):
@@ -4970,31 +5587,91 @@ class PhysicalValidator:
         return result
 
     def _python_collected_count(self, project_name: Optional[str]) -> Optional[int]:
-        """python_tool's `pytest --collect-only` denominator, python-only.
+        """Conservative denominator from current published Python test rows.
 
-        Returns the collected-test count from COLLECTED_JSON when the build
-        system is python; None otherwise (maven/gradle semantics untouched).
-        Shared by validate_project_analysis_status AND validate_test_status so
-        the two denominators can never diverge again (live 2026-07-10:
-        test_stats.discovered was None while the analysis fallback had 635).
+        Multiple current attempts contribute their maximum complete row set;
+        a later filtered retry cannot shrink an earlier full-suite denominator.
+        Missing, malformed, unpublished, stale, or scope-unbound receipts are
+        unknown. The raw ``pytest_collected.json`` mirror is never read here.
         """
         try:
-            from sag.tools.internal.python_tool import COLLECTED_JSON
+            from sag.agent.attempt_policy import (
+                current_run_durable_receipt,
+                resolve_current_build_receipt_scope,
+            )
+            from sag.agent.invocation_receipts import (
+                active_receipt_run_id,
+                nearest_domain_fact_epoch,
+                nearest_domain_root,
+                survey_pins,
+            )
+            from sag.tools.internal.build_preflight import read_live_build_requirements
 
             project_dir = (
                 f"{self.project_path}/{project_name}" if project_name else self.project_path
             )
             if self._detect_build_system(project_dir) != "python":
                 return None
-            read = self._execute_command_with_logging(
-                f"cat {COLLECTED_JSON}", "reading pytest collect-only denominator"
-            )
-            if not read["success"] or not (read.get("output") or "").strip():
+            manifest_read = read_live_build_requirements(self.docker_orchestrator)
+            if (
+                not manifest_read.complete
+                or manifest_read.conflict is not None
+                or manifest_read.payload is None
+            ):
                 return None
-            collected = json.loads(read["output"]).get("collected")
-            return collected if isinstance(collected, int) else None
+            manifest = dict(manifest_read.payload)
+            records = self._read_live_invocation_receipts()
+            if not records:
+                return None
+            run_id = self.receipt_run_id or active_receipt_run_id()
+            scope = resolve_current_build_receipt_scope(
+                self.docker_orchestrator,
+                run_id=run_id,
+                workspace_root=self.project_path,
+                project_root=project_dir,
+            )
+            if not scope.available:
+                return None
+            pins = survey_pins(manifest)
+            domain_id = nearest_domain_root(manifest, project_dir)
+            fact_epoch = nearest_domain_fact_epoch(manifest, project_dir)
+            counts: List[int] = []
+            for receipt in records:
+                receipt_id = str(receipt.get("receipt_id") or "")
+                if (
+                    receipt.get("tool") != "python"
+                    or receipt.get("effective_action") != "test"
+                    or not _dispatch_terminated(receipt)
+                    or not current_run_durable_receipt(
+                        receipt,
+                        receipt_id=receipt_id,
+                        run_id=run_id,
+                        target_sha=scope.target_sha or "",
+                        project_root=scope.project_root or project_dir,
+                    )
+                    or not self._python_producer_contract_valid(
+                        receipt,
+                        operation="test",
+                        project_root=project_dir,
+                        target_sha=scope.target_sha or "",
+                        survey_fingerprint=pins.get("survey_fingerprint"),
+                        config_fingerprint=pins.get("config_fingerprint"),
+                        document_map_fingerprint=pins.get("document_map_fingerprint"),
+                        domain_id=domain_id,
+                        fact_epoch=fact_epoch,
+                    )
+                ):
+                    continue
+                envelope = receipt.get("testcase_execution_rows")
+                if not isinstance(envelope, Mapping) or envelope.get("status") != "complete":
+                    continue
+                rows = envelope.get("rows")
+                if not isinstance(rows, list) or not rows:
+                    continue
+                counts.append(len(rows))
+            return max(counts) if counts else None
         except Exception as exc:
-            logger.debug(f"pytest collected fallback skipped: {exc}")
+            logger.debug(f"published Python denominator unavailable: {exc}")
             return None
 
     def parse_test_reports_with_catalog(
@@ -6615,8 +7292,10 @@ class PhysicalValidator:
         # exist. Live ignite: `ignite-checkstyle-${revision}.jar` was reported
         # missing on every run, a permanent shortfall no build could close.
         # An expectation we cannot state is not an expectation.
-        if artifact_id and version and not _carries_unresolved_property(
-            f"{artifact_id}{version}{packaging}"
+        if (
+            artifact_id
+            and version
+            and not _carries_unresolved_property(f"{artifact_id}{version}{packaging}")
         ):
             expected_path = f"{project_dir}/target/{artifact_id}-{version}.{packaging}"
             expected.append(
@@ -6918,74 +7597,3 @@ class PhysicalValidator:
         result["valid"] = class_count > 0 or jar_count > 0
 
         return result
-
-    def validate_project_completely(
-        self, project_name: str, command_tracker=None
-    ) -> Dict[str, any]:
-        """
-        Complete fact-based validation of a project.
-
-        Args:
-            project_name: Name of the project
-            command_tracker: CommandTracker instance with recorded commands
-
-        Returns:
-            Complete validation report
-        """
-        logger.info(f"Starting complete validation for project: {project_name}")
-
-        validation_report = {
-            "project": project_name,
-            "timestamp": datetime.now().isoformat(),
-            "build_validation": {},
-            "test_validation": {},
-            "artifact_validation": {},
-            "overall_status": "unknown",
-        }
-
-        # 1. Validate build artifacts
-        validation_report["artifact_validation"] = self.validate_build_artifacts(project_name)
-
-        # 2. Replay build command if tracker available
-        if command_tracker:
-            last_build = command_tracker.get_last_build_command()
-            if last_build:
-                build_success = self.replay_last_build_command(
-                    last_build["command"], last_build.get("working_dir")
-                )
-                validation_report["build_validation"] = {
-                    "command": last_build["command"],
-                    "replay_success": build_success,
-                    "original_result": last_build.get("build_success"),
-                }
-
-        # 3. Replay test commands if build succeeded
-        if validation_report["build_validation"].get("replay_success", False):
-            if command_tracker:
-                test_commands = [cmd["command"] for cmd in command_tracker.get_all_test_commands()]
-                if test_commands:
-                    validation_report["test_validation"] = self.replay_all_test_commands(
-                        test_commands
-                    )
-        else:
-            validation_report["test_validation"] = {
-                "skipped": True,
-                "reason": "Build failed, cannot run tests",
-            }
-
-        # 4. Determine overall status based on facts
-        if validation_report["artifact_validation"]["valid"] and validation_report[
-            "build_validation"
-        ].get("replay_success", False):
-            if validation_report["test_validation"].get("failed", 0) == 0:
-                validation_report["overall_status"] = "SUCCESS"
-            else:
-                validation_report["overall_status"] = "PARTIAL"
-        else:
-            validation_report["overall_status"] = "FAILED"
-
-        logger.info(
-            f"Validation complete for {project_name}: {validation_report['overall_status']}"
-        )
-
-        return validation_report

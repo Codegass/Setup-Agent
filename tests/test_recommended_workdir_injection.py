@@ -1,9 +1,8 @@
-"""build() working_directory defaults to the analyzer's recommended reactor root.
+"""Tool parameters preserve the model's selected working directory.
 
-Regression guard for the wiring gap: the analyzer computes build_root/test_root but
-it was only surfaced as advisory prose, so a model that omitted working_directory
-fell back to a blind /workspace and under-scoped the reactor. The orchestrator now
-injects the recommended root when (and only when) the model omits one.
+Analyzer recommendations and mutable orchestration state are observations, not
+authority to rewrite an omitted model parameter.  The normalizer may translate a
+submitted cwd alias to the canonical field, but it must not invent a cwd.
 """
 
 import pytest
@@ -70,16 +69,30 @@ def _workdir(execution):
     return execution.executed_params["working_directory"]
 
 
-def test_build_defaults_to_recommended_build_root():
-    orch = _orchestrator(_REC)
-    execution = orch.execute(ToolCall(name="build", raw_params={"action": "compile"}))
-    assert _workdir(execution) == "/workspace/proj"
+def _assert_omitted_workdir_is_not_injected(execution, raw_params):
+    assert execution.call.raw_params == raw_params
+    assert execution.call.validated_params == raw_params
+    assert execution.executed_params == raw_params
+    assert execution.result.metadata["working_directory"] == ""
+    assert not any(fix.field == "working_directory" for fix in execution.parameter_fixes)
 
 
-def test_test_defaults_to_recommended_test_root():
+def test_compile_omitting_workdir_is_not_rewritten_from_analyzer_recommendation():
     orch = _orchestrator(_REC)
-    execution = orch.execute(ToolCall(name="build", raw_params={"action": "test"}))
-    assert _workdir(execution) == "/workspace/proj/tests-module"
+    raw_params = {"action": "compile"}
+
+    execution = orch.execute(ToolCall(name="build", raw_params=raw_params))
+
+    _assert_omitted_workdir_is_not_injected(execution, raw_params)
+
+
+def test_test_omitting_workdir_is_not_rewritten_from_analyzer_recommendation():
+    orch = _orchestrator(_REC)
+    raw_params = {"action": "test"}
+
+    execution = orch.execute(ToolCall(name="build", raw_params=raw_params))
+
+    _assert_omitted_workdir_is_not_injected(execution, raw_params)
 
 
 def test_explicit_working_directory_is_respected():
@@ -96,7 +109,7 @@ def test_explicit_working_directory_is_respected():
     "alias",
     ["cwd", "workdir", "working_dir", "work_dir", "dir", "directory"],
 )
-def test_build_workdir_alias_is_normalized_before_recommendation_injection(alias):
+def test_build_workdir_alias_is_normalized_without_analyzer_injection(alias):
     orch = _orchestrator(_REC)
 
     execution = orch.execute(
@@ -148,7 +161,10 @@ def test_canonical_build_workdir_wins_over_conflicting_alias():
     )
 
 
-def test_no_recommendation_falls_back_to_state_default():
+def test_omitted_workdir_is_not_injected_from_orchestration_state():
     orch = _orchestrator(None)
-    execution = orch.execute(ToolCall(name="build", raw_params={"action": "compile"}))
-    assert _workdir(execution) == "/workspace"
+    raw_params = {"action": "compile"}
+
+    execution = orch.execute(ToolCall(name="build", raw_params=raw_params))
+
+    _assert_omitted_workdir_is_not_injected(execution, raw_params)

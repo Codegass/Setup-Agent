@@ -23,11 +23,21 @@ statically. Pre-flight owns stated-requirement recovery and owns it well.
 
 import base64
 import json
+import shlex
+
+from build_requirements_fakes import (
+    complete_build_requirements_v1,
+    complete_python_build_requirements_v1,
+)
+from test_container_io import FakeContainer
 
 from sag.agent.invocation_receipts import build_receipt, record_invocation
+from sag.agent.control_events import canonical_json
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.receipt_structure import (
     STRUCTURE_KEY,
+    STRUCTURE_SCHEMA_VERSION,
     module_key,
     promote_structure,
     read_module_structure,
@@ -44,26 +54,64 @@ CAMEL_OUTCOMES = [
     {"module": "Apache Camel :: FTP", "status": "SKIPPED"},
 ]
 
-# The survey's guess for polaris, verbatim in shape.
-BLIND_SURVEY = {
+# The pre-v1 survey shape remains only for an explicit forensic reader test.
+LEGACY_BLIND_SURVEY = {
     "root_shape": "single_module",
     "build_islands": [],
     "java_version": "17",
 }
+BLIND_SURVEY = complete_build_requirements_v1(
+    project_root="/workspace/project",
+    java_version="17",
+)
+TARGET_A = "a" * 40
+TARGET_B = "b" * 40
+CONFIG_A = "cfg-a"
+CONFIG_B = "cfg-b"
+
+
+def pinned_survey(*, target_sha=TARGET_A, config_fingerprint=CONFIG_A):
+    return complete_build_requirements_v1(
+        project_root="/workspace/project",
+        target_sha=target_sha,
+        config_fingerprint=config_fingerprint,
+        java_version="17",
+    )
 
 
 class ManifestOrchestrator:
     """A container holding one build-requirements file."""
 
     def __init__(self, manifest=None):
+        self._container = FakeContainer()
         self.manifest = json.dumps(manifest, sort_keys=True) if manifest is not None else None
         self.commands = []
         self.calls = []
+
+    @property
+    def manifest(self):
+        return self._container.files.get(BUILD_REQUIREMENTS_PATH)
+
+    @manifest.setter
+    def manifest(self, value):
+        if value is None:
+            self._container.files.pop(BUILD_REQUIREMENTS_PATH, None)
+        else:
+            self._container.files[BUILD_REQUIREMENTS_PATH] = value
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         self.calls.append((command, kwargs))
         text = command.strip()
+        if "SAG_NAMED_JSON_RECORD_V1" in text and BUILD_REQUIREMENTS_PATH in text:
+            records = (
+                [("build-requirements.json", self.manifest)] if self.manifest is not None else []
+            )
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
         if text.startswith("if test -f") and BUILD_REQUIREMENTS_PATH in text:
             # §3.9 absence protocol: absence is STATED (marker / exit 44),
             # never implied by an ordinary failure — a plain failed read on
@@ -81,10 +129,23 @@ class ManifestOrchestrator:
             marker = "SAG_STRUCTURE_EOF" if "SAG_STRUCTURE_EOF" in text else "SAGEOF"
             self.manifest = text.split("\n", 1)[1].rsplit(f"\n{marker}", 1)[0]
             return {"success": True, "exit_code": 0, "output": ""}
-        return {"success": True, "exit_code": 0, "output": ""}
+        return self._container.execute_command(command, **kwargs)
 
     def stored(self):
         return json.loads(self.manifest) if self.manifest else {}
+
+
+def _manifest_publish_commands(orch):
+    commands = []
+    for command in orch.commands:
+        tokens = shlex.split(command)
+        if (
+            tokens[:2] == ["python3", "-c"]
+            and "fcntl.flock" in tokens[2]
+            and tokens[3:4] == [BUILD_REQUIREMENTS_PATH]
+        ):
+            commands.append(command)
+    return commands
 
 
 def _receipt(
@@ -94,6 +155,8 @@ def _receipt(
     outcomes=CAMEL_OUTCOMES,
     lifecycle_state=None,
     termination_reason=None,
+    target_sha=None,
+    config_fingerprint=None,
 ):
     receipt = {"receipt_id": receipt_id, "module_outcomes": list(outcomes)}
     if exit_code is not None:
@@ -102,6 +165,10 @@ def _receipt(
         receipt["lifecycle_state"] = lifecycle_state
     if termination_reason is not None:
         receipt["termination_reason"] = termination_reason
+    if target_sha is not None:
+        receipt["target_sha"] = target_sha
+    if config_fingerprint is not None:
+        receipt["config_fingerprint"] = config_fingerprint
     return receipt
 
 
@@ -278,10 +345,10 @@ def test_the_same_receipt_twice_is_a_no_op():
     """Same-body-no-op, the convention every evidence writer here follows."""
     orch = ManifestOrchestrator(BLIND_SURVEY)
     promote_structure(orch.execute_command, _receipt())
-    writes = len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c])
+    writes = len(_manifest_publish_commands(orch))
 
     assert promote_structure(orch.execute_command, _receipt()) is False
-    assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
+    assert len(_manifest_publish_commands(orch)) == writes
 
 
 def test_a_newer_terminal_receipt_may_widen_the_structure():
@@ -310,7 +377,7 @@ def test_a_scoped_receipt_may_not_narrow_a_wider_proven_structure():
     project, so a subset proves nothing new and the wider statement stands."""
     orch = ManifestOrchestrator(BLIND_SURVEY)
     promote_structure(orch.execute_command, _receipt())
-    writes = len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c])
+    writes = len(_manifest_publish_commands(orch))
 
     scoped = promote_structure(
         orch.execute_command,
@@ -321,7 +388,7 @@ def test_a_scoped_receipt_may_not_narrow_a_wider_proven_structure():
     )
 
     assert scoped is False
-    assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
+    assert len(_manifest_publish_commands(orch)) == writes
     assert orch.stored()[STRUCTURE_KEY]["provenance"] == "inv-maven-1-0001"
     assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
 
@@ -341,7 +408,7 @@ def test_a_disjoint_receipt_may_not_replace_a_wider_proven_structure():
     """
     orch = ManifestOrchestrator(BLIND_SURVEY)
     promote_structure(orch.execute_command, _receipt())
-    writes = len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c])
+    writes = len(_manifest_publish_commands(orch))
 
     disjoint = promote_structure(
         orch.execute_command,
@@ -362,7 +429,7 @@ def test_a_disjoint_receipt_may_not_replace_a_wider_proven_structure():
     )
 
     assert (disjoint, overlapping) == (False, False)
-    assert len([c for c in orch.commands if "SAG_STRUCTURE_EOF" in c]) == writes
+    assert len(_manifest_publish_commands(orch)) == writes
     assert orch.stored()[STRUCTURE_KEY]["provenance"] == "inv-maven-1-0001"
     assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
 
@@ -394,7 +461,17 @@ def test_a_manifest_that_could_not_be_read_whole_is_never_rewritten():
 
     assert promote_structure(orch.execute_command, _receipt()) is False
     assert orch.manifest == mangled
-    assert [c for c in orch.commands if "SAG_STRUCTURE_EOF" in c] == []
+    assert _manifest_publish_commands(orch) == []
+
+
+def test_promotion_revalidates_the_whole_v1_body_before_writing():
+    poisoned = {**BLIND_SURVEY, "repository_authored_extra": {"command": "rm -rf /"}}
+    orch = ManifestOrchestrator(poisoned)
+
+    assert promote_structure(orch.execute_command, _receipt()) is False
+
+    assert orch.stored() == poisoned
+    assert _manifest_publish_commands(orch) == []
 
 
 def test_the_manifest_is_read_through_the_lossless_path():
@@ -410,18 +487,36 @@ def test_the_manifest_is_read_through_the_lossless_path():
     reads = [
         kwargs
         for command, kwargs in orch.calls
-        if BUILD_REQUIREMENTS_PATH in command and "SAG_STRUCTURE_EOF" not in command
+        if command.strip().startswith("if test -f") and BUILD_REQUIREMENTS_PATH in command
     ]
     assert reads
     assert all(kwargs.get("truncate_output") is False for kwargs in reads)
 
 
-def test_a_container_with_no_manifest_yet_gets_one():
-    """Creating is not clobbering: absent and unreadable are different facts."""
+def test_a_container_with_no_v1_manifest_cannot_receive_derived_structure():
+    """A receipt cannot manufacture the survey identity it must bind to."""
     orch = ManifestOrchestrator()
 
+    assert promote_structure(orch.execute_command, _receipt()) is False
+    assert orch.stored() == {}
+
+
+def test_structure_promotion_streams_a_large_manifest_with_bounded_commands():
+    dependencies = [f"dep-{index}-" + "x" * 220 for index in range(400)]
+    large_survey = complete_python_build_requirements_v1(
+        project_root="/workspace/project",
+        dependencies=dependencies,
+    )
+    orch = ManifestOrchestrator(large_survey)
+
     assert promote_structure(orch.execute_command, _receipt()) is True
-    assert orch.stored()[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
+
+    stored = orch.stored()
+    assert stored["python_declared_dependencies"] == dependencies
+    assert stored[STRUCTURE_KEY]["keys"] == ["core", "jms", "ftp"]
+    assert any(command.startswith("printf '%s'") for command in orch.commands)
+    assert max(map(len, orch.commands)) <= 60_200
+    assert not any(path.endswith(".tmp") for path in orch._container.files)
 
 
 def test_a_survey_rerun_may_never_demote_a_receipt_proven_structure():
@@ -435,11 +530,181 @@ def test_a_survey_rerun_may_never_demote_a_receipt_proven_structure():
     assert read_module_structure(orch.stored())["provenance"] == "inv-maven-1-0001"
 
 
+def test_a_same_target_and_config_survey_preserves_the_receipt_structure():
+    survey = pinned_survey()
+    orch = ManifestOrchestrator(survey)
+    receipt = _receipt(target_sha=TARGET_A, config_fingerprint=CONFIG_A)
+    assert promote_structure(orch.execute_command, receipt) is True
+
+    assert write_build_requirements(orch, pinned_survey()) is True
+
+    structure = read_module_structure(orch.stored())
+    assert structure["target_sha"] == TARGET_A
+    assert structure["config_fingerprint"] == CONFIG_A
+
+
+def test_a_new_checkout_does_not_inherit_the_previous_targets_structure():
+    orch = ManifestOrchestrator(pinned_survey())
+    assert (
+        promote_structure(
+            orch.execute_command,
+            _receipt(target_sha=TARGET_A, config_fingerprint=CONFIG_A),
+        )
+        is True
+    )
+
+    assert write_build_requirements(orch, pinned_survey(target_sha=TARGET_B)) is True
+
+    assert read_module_structure(orch.stored()) == {}
+
+
+def test_a_changed_config_does_not_inherit_the_previous_structure():
+    orch = ManifestOrchestrator(pinned_survey())
+    assert (
+        promote_structure(
+            orch.execute_command,
+            _receipt(target_sha=TARGET_A, config_fingerprint=CONFIG_A),
+        )
+        is True
+    )
+
+    assert write_build_requirements(orch, pinned_survey(config_fingerprint=CONFIG_B)) is True
+
+    assert read_module_structure(orch.stored()) == {}
+
+
+def test_a_foreign_receipt_cannot_promote_structure_into_the_current_manifest():
+    survey = pinned_survey()
+    orch = ManifestOrchestrator(survey)
+
+    promoted = promote_structure(
+        orch.execute_command,
+        _receipt(target_sha=TARGET_B, config_fingerprint=CONFIG_A),
+    )
+
+    assert promoted is False
+    assert orch.stored() == survey
+
+
+def test_stale_narrow_promotion_cannot_overwrite_a_concurrent_wide_winner():
+    class ConcurrentWideWinner(ManifestOrchestrator):
+        def __init__(self):
+            super().__init__(BLIND_SURVEY)
+            self.injected = False
+
+        def execute_command(self, command, **kwargs):
+            tokens = shlex.split(command)
+            if (
+                not self.injected
+                and tokens[:2] == ["python3", "-c"]
+                and "fcntl.flock" in tokens[2]
+                and tokens[3:4] == [BUILD_REQUIREMENTS_PATH]
+            ):
+                winner = dict(BLIND_SURVEY)
+                winner[STRUCTURE_KEY] = structure_from_receipt(_receipt())
+                self.manifest = json.dumps(winner, indent=2, sort_keys=True)
+                self.injected = True
+            return super().execute_command(command, **kwargs)
+
+    orch = ConcurrentWideWinner()
+    narrow = _receipt(
+        receipt_id="inv-maven-narrow-0002",
+        outcomes=[{"module": "Apache Camel :: Core", "status": "SUCCESS"}],
+    )
+
+    assert promote_structure(orch.execute_command, narrow) is False
+    assert read_module_structure(orch.stored())["keys"] == ["core", "jms", "ftp"]
+    assert read_module_structure(orch.stored())["provenance"] == "inv-maven-1-0001"
+
+
+def test_survey_writer_does_not_launder_an_unpublished_concurrent_promotion():
+    class ConcurrentPromotion(ManifestOrchestrator):
+        def __init__(self):
+            super().__init__(pinned_survey())
+            self.injected = False
+
+        def execute_command(self, command, **kwargs):
+            tokens = shlex.split(command)
+            if (
+                not self.injected
+                and tokens[:2] == ["python3", "-c"]
+                and "fcntl.flock" in tokens[2]
+                and tokens[3:4] == [BUILD_REQUIREMENTS_PATH]
+            ):
+                winner = pinned_survey()
+                winner[STRUCTURE_KEY] = structure_from_receipt(
+                    _receipt(target_sha=TARGET_A, config_fingerprint=CONFIG_A)
+                )
+                self.manifest = json.dumps(winner, indent=2, sort_keys=True)
+                self.injected = True
+            return super().execute_command(command, **kwargs)
+
+    orch = ConcurrentPromotion()
+
+    assert write_build_requirements(orch, pinned_survey()) is True
+    assert read_module_structure(orch.stored()) == {}
+
+
 def test_a_manifest_written_before_this_design_proves_no_structure():
     """Additive: an older manifest carries no key and every reader degrades to
     the survey's proposal, which is exactly today's behaviour."""
     assert read_module_structure(BLIND_SURVEY) == {}
     assert read_module_structure(None) == {}
+
+
+def test_structure_reader_rejects_future_and_malformed_schema_versions():
+    base = {
+        "provenance": "inv-maven-1-0001",
+        "modules": ["core"],
+        "keys": ["core"],
+    }
+
+    for version in (True, "2", 0, 3):
+        manifest = {STRUCTURE_KEY: {**base, "schema_version": version}}
+        assert read_module_structure(manifest) == {}
+
+
+def test_structure_reader_requires_exact_two_direction_survey_identity():
+    exact = {
+        "schema_version": STRUCTURE_SCHEMA_VERSION,
+        "provenance": "inv-maven-1-0001",
+        "modules": ["core"],
+        "keys": ["core"],
+        "target_sha": TARGET_A,
+        "config_fingerprint": CONFIG_A,
+    }
+
+    assert read_module_structure({**pinned_survey(), STRUCTURE_KEY: exact}) == exact
+    assert (
+        read_module_structure(
+            {
+                **pinned_survey(),
+                STRUCTURE_KEY: {key: value for key, value in exact.items() if key != "target_sha"},
+            }
+        )
+        == {}
+    )
+    assert (
+        read_module_structure(
+            {
+                **pinned_survey(target_sha=TARGET_B),
+                STRUCTURE_KEY: exact,
+            }
+        )
+        == {}
+    )
+
+
+def test_legacy_structure_is_read_only_beside_an_equally_unpinned_survey():
+    legacy = {
+        "schema_version": 1,
+        "provenance": "inv-maven-1-0001",
+        "modules": ["core"],
+        "keys": ["core"],
+    }
+
+    assert read_module_structure({**LEGACY_BLIND_SURVEY, STRUCTURE_KEY: legacy}) == legacy
+    assert read_module_structure({**pinned_survey(), STRUCTURE_KEY: legacy}) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +714,7 @@ def test_recording_a_receipt_promotes_the_structure_it_just_stated():
     """No second bookkeeping system: the structure lands where the receipt
     lands, so a settled receipt (§3.2) promotes exactly like a synchronous one."""
     orch = ManifestOrchestrator(BLIND_SURVEY)
+    assert write_build_requirements(orch, BLIND_SURVEY) is True
 
     record_invocation(
         orch.execute_command,
@@ -493,8 +759,16 @@ def test_the_denominator_stands_on_the_proven_structure_when_this_phase_stated_n
     """A structure proved in the build phase is still proved in the test phase.
     Without this the denominator falls back to the survey guess the moment the
     current phase's dispatches are receipt-free."""
-    orch = ManifestOrchestrator(BLIND_SURVEY)
-    promote_structure(orch.execute_command, _receipt())
+    orch = ManifestOrchestrator()
+    proven = structure_from_receipt(_receipt())
+    assert proven is not None
+    assert (
+        write_build_requirements(
+            orch,
+            {**BLIND_SURVEY, STRUCTURE_KEY: proven},
+        )
+        is True
+    )
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
     structure = validator._receipt_structure()

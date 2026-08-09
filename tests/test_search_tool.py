@@ -8,6 +8,8 @@ internals (stage-1 consolidates the surface, not the implementations).
 
 from types import SimpleNamespace
 
+from sag.agent.evidence_records import frame_json_record_stream, json_record_stream_command
+from sag.agent.job_obligations import OBLIGATION_DIR
 from sag.tools.base import ToolResult
 from sag.tools.search_tool import SearchTool
 
@@ -82,7 +84,34 @@ def test_job_target_polls_original_operation():
     assert result.succeeded is True
     assert result.poll_ref == "job:abc"
     assert "BUILD SUCCESSFUL" in result.output
-    assert orch.commands == []
+    assert orch.commands == [json_record_stream_command(OBLIGATION_DIR)]
+
+
+def test_terminal_job_poll_uses_the_runner_recorded_by_its_obligation():
+    obligation = (
+        '{"job_id":"abc","tool":"gradle","process_state":"terminal",'
+        '"settlement_state":"settled","settled_receipt_id":"receipt-1"}'
+    )
+    tail = "BUILD SUCCESSFUL\nCMake Error: optional native diagnostic"
+    orch = FakeOrchestrator(
+        responses={
+            "sag_jobs/abc.log": {
+                "success": True,
+                "output": tail,
+                "exit_code": 0,
+            },
+            "job_obligations/*.json": {
+                "success": True,
+                "output": frame_json_record_stream([obligation]),
+                "exit_code": 0,
+            },
+        }
+    )
+
+    result = SearchTool(orch).execute(target="job:abc")
+
+    assert result.succeeded is True
+    assert result.metadata["runner"] == "gradle"
 
 
 def test_ref_target_delegates_to_output_search():

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import sag.agent.react_engine as react_engine_module
+from sag.agent.action_intents import ActionIntent, action_fingerprint, canonical_params
 from sag.agent.native_messages import render_messages
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
@@ -29,6 +31,7 @@ def _call(index, name="bash", args=None):
 
 def _scripted_result(metadata):
     """A plain stand-in for ToolResult carrying only what the ACTION path reads."""
+    metadata = dict(metadata or {})
     return SimpleNamespace(
         succeeded=True,
         error_code=None,
@@ -37,8 +40,16 @@ def _scripted_result(metadata):
         output_ref=None,
         evidence_refs=[],
         refs=[],
-        metadata=dict(metadata or {}),
-        invocation_status=SimpleNamespace(value="completed"),
+        metadata=metadata,
+        poll_ref=metadata.pop("poll_ref", None),
+        invocation_status=SimpleNamespace(
+            value=(
+                "pending"
+                if metadata.get("dispatch_status")
+                in {"running_detached", "liveness_unknown_detached"}
+                else "completed"
+            )
+        ),
         operation_outcome=SimpleNamespace(value="succeeded"),
         evidence_status=SimpleNamespace(value="present"),
         evidence_assessment=SimpleNamespace(value="supported"),
@@ -85,13 +96,17 @@ def native_engine():
         # decline to refuse, so calls reach the scripted executor.
         engine.run_evidence_state = None
         engine.phase_machine = None
+        engine.successful_states = {}
         engine.loop_memory = None
         engine.output_storage = None
         engine.executed_calls = []
+        engine.emitted_action_intents = []
         engine.emitted_tool_results = []
         engine.closed_for_loop = []
 
         def fake_execute_tool_call(call):
+            if call.name:
+                call.action_intent = engine._mint_model_action_intent(call, call.raw_params)
             engine.executed_calls.append(call)
             return SimpleNamespace(
                 call=call,
@@ -100,7 +115,7 @@ def native_engine():
                 raw_params=call.raw_params,
                 validated_params=dict(call.raw_params),
                 observation_text=f"[{call.name or 'unnamed'}] observed",
-                attempted_execution=True,
+                attempted_execution=bool(call.name),
                 metadata={},
                 actual_executions=[],
             )
@@ -124,7 +139,31 @@ def native_engine():
             "execution-1",
             [],
         )
-        engine._emit_control_action_envelope = lambda tool, params: None
+
+        def fake_emit_control_action_envelope(tool, params, *, intent):
+            validated = ActionIntent.model_validate(
+                intent.model_dump(mode="python", round_trip=True)
+            )
+            expected_params = canonical_params(params)
+            assert validated.source == "model"
+            assert validated.intent_id
+            assert validated.tool == tool
+            assert validated.domain_id == engine._action_domain_id(params)
+            assert validated.canonical_params == expected_params
+            assert validated.action_fingerprint == action_fingerprint(
+                domain_id=validated.domain_id,
+                tool=tool,
+                params=expected_params,
+            )
+            assert (
+                validated.trigger_assessment_id,
+                validated.repair_context_id,
+                validated.repair_context_sha256,
+            ) == (None, None, None)
+            engine.emitted_action_intents.append(validated)
+            return None
+
+        engine._emit_control_action_envelope = fake_emit_control_action_envelope
         engine._emit_control_tool_result = lambda **kwargs: engine.emitted_tool_results.append(
             kwargs
         )
@@ -169,6 +208,121 @@ def test_loop_force_break_cancels_the_rest_of_the_batch(native_engine):
     assert [o.tool_call_id for o in observations] == ["call_1", "call_2", "call_3"]
     assert engine.closed_for_loop == ["build"]
     assert [call.name for call in engine.executed_calls] == ["build"]
+
+
+def test_detached_job_barrier_cancels_later_calls_in_the_same_model_turn(native_engine):
+    engine = native_engine(
+        results={
+            "build": {
+                "dispatch_status": "running_detached",
+                "job_id": "job-123",
+                "job_obligation_persisted": False,
+                "job_obligation_persistence_code": "transport_write_failed",
+                "exit_code_path": "/tmp/sag_jobs/job-123.log.exit",
+                "log_path": "/tmp/sag_jobs/job-123.log",
+            }
+        }
+    )
+
+    engine._execute_native_calls(_turn(_call(1, "build"), _call(2, "phase"), _call(3, "bash")))
+
+    observations = _observations(engine)
+    assert [call.name for call in engine.executed_calls] == ["build"]
+    assert [item.tool_call_id for item in observations] == [
+        "call_1",
+        "call_2",
+        "call_3",
+    ]
+    assert all("controller job barrier active" in item.content for item in observations[1:])
+    assert "job-123" in engine._ephemeral_job_handles()
+
+
+def test_persisted_detached_job_immediately_cancels_later_same_turn_calls(native_engine):
+    engine = native_engine(
+        results={
+            "build": {
+                "dispatch_status": "running_detached",
+                "job_id": "job-persisted-123",
+                "job_obligation_persisted": True,
+                "job_obligation_persistence_code": "persisted",
+                "exit_code_path": "/tmp/sag_jobs/job-persisted-123.log.exit",
+                "log_path": "/tmp/sag_jobs/job-persisted-123.log",
+            }
+        }
+    )
+
+    engine._execute_native_calls(_turn(_call(1, "build"), _call(2, "phase"), _call(3)))
+
+    observations = _observations(engine)
+    assert [call.name for call in engine.executed_calls] == ["build"]
+    assert [item.tool_call_id for item in observations] == ["call_1", "call_2", "call_3"]
+    assert all("controller job barrier active" in item.content for item in observations[1:])
+    assert engine._ephemeral_job_handles() == {}
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "dispatch_status": "running_detached",
+            "job_id": "job-missing-persistence",
+            "exit_code_path": "/tmp/sag_jobs/job-missing-persistence.log.exit",
+        },
+        {
+            "dispatch_status": "running_detached",
+            "job_obligation_persisted": True,
+            "exit_code_path": "/tmp/sag_jobs/job-missing-id.log.exit",
+        },
+        {
+            "dispatch_status": "liveness_unknown_detached",
+            "job_id": "job-missing-marker",
+            "job_obligation_persisted": False,
+        },
+    ],
+)
+def test_malformed_detached_result_is_a_same_turn_fatal_barrier(native_engine, metadata):
+    engine = native_engine(results={"build": metadata})
+
+    engine._execute_native_calls(_turn(_call(1, "build"), _call(2, "phase"), _call(3)))
+
+    observations = _observations(engine)
+    assert [call.name for call in engine.executed_calls] == ["build"]
+    assert [item.tool_call_id for item in observations] == ["call_1", "call_2", "call_3"]
+    assert all("controller job barrier active" in item.content for item in observations[1:])
+    assert engine._fatal_harness_control_failure.startswith("detached_result_")
+    assert engine._ephemeral_job_handles() == {}
+
+
+def test_running_search_poll_uses_the_existing_obligation_witness(native_engine, monkeypatch):
+    job_id = "job-existing-poll"
+    engine = native_engine(
+        results={
+            "search": {
+                "dispatch_status": "running_detached",
+                "job_id": job_id,
+                "poll_ref": f"job:{job_id}",
+                "log_path": f"/tmp/sag_jobs/{job_id}.log",
+            }
+        }
+    )
+    engine.orchestrator = object()
+    engine._sweep_job_obligations = lambda: None
+    monkeypatch.setattr(
+        react_engine_module,
+        "read_obligations",
+        lambda _orchestrator: [
+            {
+                "job_id": job_id,
+                "process_state": "running",
+                "settlement_state": "none",
+            }
+        ],
+    )
+
+    engine._execute_native_calls(_turn(_call(1, "search"), _call(2, "phase")))
+
+    assert [call.name for call in engine.executed_calls] == ["search"]
+    assert not getattr(engine, "_fatal_harness_control_failure", "")
 
 
 def test_unnamed_tool_call_is_delivered_not_dropped(native_engine):

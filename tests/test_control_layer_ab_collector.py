@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from sag.agent.control_events import action_envelope_sha256
+from sag.agent.control_events import ControlEventSink, action_envelope_sha256
+from sag.agent.evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+)
+from sag.agent.verdict_finalizer import validate_verdict_snapshot_v3
 from scripts.collect_control_layer_ab import (
     CASSANDRA_CLASS_RANGE,
     CASSANDRA_RAW_EXECUTION_RANGE,
@@ -17,6 +24,7 @@ from scripts.collect_control_layer_ab import (
 )
 
 PIN = {
+    "run_id": "collector-fixture-run",
     "target_repo_sha": "a" * 40,
     "container_image_digest": "sha256:" + "b" * 64,
     "sag_git_sha": "c" * 40,
@@ -32,6 +40,47 @@ PIN = {
     "dependency_cache_state": "warm",
     "host_arch": "arm64",
 }
+
+
+def _publish_current_session(session: Path) -> ControlEventSink:
+    """Install the same host roots a real current run archives."""
+
+    setup = session / ".setup_agent"
+    host_pin = session / "run-pin.json"
+    container_pin = setup / "run-pin.json"
+    host_pin.write_bytes(container_pin.read_bytes())
+
+    verdict_path = setup / "verdict.json"
+    snapshot = validate_verdict_snapshot_v3(json.loads(verdict_path.read_text(encoding="utf-8")))
+    verdict_raw = snapshot.model_dump_json().encode("utf-8")
+    verdict_path.write_bytes(verdict_raw)
+
+    host_events = session / "control_events.jsonl"
+    mirror_events = setup / "control_events.jsonl"
+    host_events.unlink(missing_ok=True)
+    mirror_events.unlink(missing_ok=True)
+
+    def mirror(line: str) -> None:
+        with mirror_events.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    sink = ControlEventSink(host_events, mirror=mirror)
+    authority = EvidencePublicationAuthority.for_live_run(run_id=PIN["run_id"], sink=sink)
+    authority.publish_revision(
+        record_kind="run_pin",
+        record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        raw=container_pin.read_bytes(),
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
+    authority.publish_revision(
+        record_kind="verdict",
+        record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        raw=verdict_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
+    return sink
 
 
 def test_panel_records_cassandra_canonical_and_raw_bases():
@@ -54,7 +103,12 @@ def test_panel_records_cassandra_canonical_and_raw_bases():
     ) == CASSANDRA_RAW_EXECUTION_RANGE
 
 
-def _session(tmp_path: Path, *, excluding: str | None = None) -> Path:
+def _session(
+    tmp_path: Path,
+    *,
+    excluding: str | None = None,
+    compiled_classes: int | None = None,
+) -> Path:
     session = tmp_path / "session_one"
     setup = session / ".setup_agent"
     setup.mkdir(parents=True)
@@ -64,7 +118,7 @@ def _session(tmp_path: Path, *, excluding: str | None = None) -> Path:
         json.dumps(
             {
                 "schema_version": 3,
-                "run_id": "run-1",
+                "run_id": PIN["run_id"],
                 "finalized_at": "2026-07-17T12:00:00Z",
                 "verdict": "success",
                 "build_evidence": {
@@ -100,14 +154,16 @@ def _session(tmp_path: Path, *, excluding: str | None = None) -> Path:
         ),
         encoding="utf-8",
     )
-    (setup / "control_events.jsonl").write_text(
-        '{"sequence":1,"kind":"evidence_close","payload":{"reason":"test_terminated"}}\n',
-        encoding="utf-8",
-    )
     (session / "token_usage.csv").write_text(
         "model_type,total_tokens\nthinking,100\naction,50\nthinking,80\n",
         encoding="utf-8",
     )
+    if compiled_classes is not None:
+        verdict_path = setup / "verdict.json"
+        payload = json.loads(verdict_path.read_text(encoding="utf-8"))
+        payload["build_evidence"]["compiled_classes"] = compiled_classes
+        verdict_path.write_text(json.dumps(payload), encoding="utf-8")
+    _publish_current_session(session)
     return session
 
 
@@ -123,15 +179,40 @@ def test_collector_ignores_numbers_in_markdown(tmp_path):
 
 
 def test_v3_collector_reads_compiled_classes_from_the_snapshot(tmp_path):
-    session = _session(tmp_path)
-    verdict_path = session / ".setup_agent" / "verdict.json"
-    payload = json.loads(verdict_path.read_text(encoding="utf-8"))
-    payload["build_evidence"]["compiled_classes"] = 8916
-    verdict_path.write_text(json.dumps(payload), encoding="utf-8")
+    session = _session(tmp_path, compiled_classes=8916)
 
     record = ABCollector().collect(session)
 
     assert record.metrics.compiled_classes == 8916
+
+
+def test_collector_rejects_a_container_control_mirror_without_the_host_stream(tmp_path):
+    session = _session(tmp_path)
+    (session / "control_events.jsonl").unlink()
+
+    with pytest.raises(CollectionError, match="host control event stream"):
+        ABCollector().collect(session)
+
+
+def test_collector_rejects_an_exact_schema_valid_unpublished_verdict_replacement(tmp_path):
+    session = _session(tmp_path)
+    path = session / ".setup_agent" / "verdict.json"
+    snapshot = validate_verdict_snapshot_v3(json.loads(path.read_text(encoding="utf-8")))
+    replaced = snapshot.model_copy(update={"finalized_at": "2026-07-17T12:00:01Z"})
+    path.write_text(replaced.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(CollectionError, match="current host publication"):
+        ABCollector().collect(session)
+
+
+def test_collector_rejects_a_verdict_from_another_run_even_when_schema_valid(tmp_path):
+    session = _session(tmp_path)
+    path = session / ".setup_agent" / "verdict.json"
+    snapshot = validate_verdict_snapshot_v3(json.loads(path.read_text(encoding="utf-8")))
+    path.write_text(snapshot.model_copy(update={"run_id": "foreign-run"}).model_dump_json())
+
+    with pytest.raises(CollectionError, match="run_id disagrees"):
+        ABCollector().collect(session)
 
 
 def test_collector_rejects_incomplete_pin(tmp_path):
@@ -166,7 +247,10 @@ def test_collector_uses_legacy_structured_adapter_without_markdown(tmp_path):
     )
     (session / "setup-report.md").write_text("777777 passed", encoding="utf-8")
 
-    record = ABCollector().collect(session)
+    with pytest.raises(CollectionError, match="host-authorized verdict_v3"):
+        ABCollector().collect(session)
+
+    record = ABCollector(allow_legacy_forensic=True).collect(session)
 
     assert record.source_schema == "legacy_structured"
     assert record.metrics.unique_total == 328
@@ -204,7 +288,7 @@ def test_legacy_adapter_reads_the_recorded_report_action_when_snapshot_is_absent
         encoding="utf-8",
     )
 
-    record = ABCollector().collect(session)
+    record = ABCollector(allow_legacy_forensic=True).collect(session)
 
     assert record.source_schema == "legacy_structured"
     assert record.metrics.verdict == "success"
@@ -264,7 +348,7 @@ def test_legacy_adapter_prefers_structured_physical_report_metrics(tmp_path):
         encoding="utf-8",
     )
 
-    record = ABCollector().collect(session)
+    record = ABCollector(allow_legacy_forensic=True).collect(session)
 
     assert record.metrics.compiled_classes == 8916
     assert record.metrics.unique_total == 2896
@@ -274,9 +358,7 @@ def test_legacy_adapter_prefers_structured_physical_report_metrics(tmp_path):
     assert record.metrics.conflicts == ("test_errors_detected",)
     # Path relativized at generation time (item 5): the record leaks no absolute
     # host worktree path, but still names the artifact by its tail.
-    assert any(
-        entry.endswith("report_metrics.json") for entry in record.structured_inputs
-    )
+    assert any(entry.endswith("report_metrics.json") for entry in record.structured_inputs)
     for entry in record.structured_inputs:
         assert not entry.startswith("/"), entry
 
@@ -291,7 +373,7 @@ def _valid_session_at(base: Path, session_name: str = "session_20260719_x") -> P
         json.dumps(
             {
                 "schema_version": 3,
-                "run_id": "run-1",
+                "run_id": PIN["run_id"],
                 "finalized_at": "2026-07-19T12:00:00Z",
                 "verdict": "success",
                 "build_evidence": {
@@ -316,13 +398,10 @@ def _valid_session_at(base: Path, session_name: str = "session_20260719_x") -> P
         ),
         encoding="utf-8",
     )
-    (setup / "control_events.jsonl").write_text(
-        '{"sequence":1,"kind":"evidence_close","payload":{"reason":"test_terminated"}}\n',
-        encoding="utf-8",
-    )
     (session / "token_usage.csv").write_text(
         "model_type,total_tokens\nthinking,100\naction,50\n", encoding="utf-8"
     )
+    _publish_current_session(session)
     return session
 
 
@@ -414,10 +493,7 @@ def test_collector_flags_an_action_envelope_without_a_tool_result(tmp_path):
             ),
         },
     }
-    (session / ".setup_agent" / "control_events.jsonl").write_text(
-        json.dumps(envelope) + "\n",
-        encoding="utf-8",
-    )
+    ControlEventSink(session / "control_events.jsonl").emit("action_envelope", envelope["payload"])
 
     record = ABCollector().collect(session)
 
@@ -428,6 +504,7 @@ def test_collector_flags_an_action_envelope_without_a_tool_result(tmp_path):
 
 def test_legacy_external_run_pin_is_complete_and_sanitized():
     pin = build_legacy_run_pin(
+        run_id="legacy-fixture-run",
         target_repo_sha="a" * 40,
         container_image_digest="sha256:" + "b" * 64,
         sag_git_sha="c" * 40,
@@ -530,7 +607,7 @@ def test_campaign_append_allows_two_runs_differing_only_in_run_order_index(tmp_p
     campaign.append("paramiko", "ws7", second_record)
 
     payload = json.loads(Path(first).read_text(encoding="utf-8"))
-    assert [r["run_id"] for r in payload["runs"]] == ["run-1", "run-2"]
+    assert [r["run_id"] for r in payload["runs"]] == [PIN["run_id"], "run-2"]
     # The differing index stays recorded verbatim on each pin (not normalized).
     indices = [r["pin"]["run_order_index"] for r in payload["runs"]]
     assert indices == [PIN["run_order_index"], PIN["run_order_index"] + 3]
@@ -713,17 +790,14 @@ def test_current_run_pin_requires_exact_host_container_mirrors(tmp_path):
     assert pin.model_dump(mode="json") == {**PIN, "advisor": None}
     assert pin.run_order_index == 7
     (setup / "run-pin.json").write_text(canonical + "\n", encoding="utf-8")
-    assert (
-        _validate_current_run_pin(
-            session,
-            target_repo_sha=PIN["target_repo_sha"],
-            sag_git_sha=PIN["sag_git_sha"],
-            random_seed=PIN["random_seed_or_null"],
-            dependency_cache_state=PIN["dependency_cache_state"],
-            host_arch=PIN["host_arch"],
-        ).model_dump(mode="json")
-        == {**PIN, "advisor": None}
-    )
+    assert _validate_current_run_pin(
+        session,
+        target_repo_sha=PIN["target_repo_sha"],
+        sag_git_sha=PIN["sag_git_sha"],
+        random_seed=PIN["random_seed_or_null"],
+        dependency_cache_state=PIN["dependency_cache_state"],
+        host_arch=PIN["host_arch"],
+    ).model_dump(mode="json") == {**PIN, "advisor": None}
     drifted = {**PIN, "random_seed_or_null": 99}
     (setup / "run-pin.json").write_text(
         json.dumps(drifted, sort_keys=True, separators=(",", ":")),

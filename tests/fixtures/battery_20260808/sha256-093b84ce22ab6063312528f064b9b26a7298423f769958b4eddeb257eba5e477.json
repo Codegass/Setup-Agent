@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "seeded_report_delta",
+  "generator_version": "sha256-path-v1",
+  "seed": "lucene-9983b7ce-inv-gradle-1-0002",
+  "entry_count": 1683,
+  "path_root": "/workspace/lucene/lucene",
+  "modules": [
+    "analysis.tests",
+    "core",
+    "codecs",
+    "test-framework"
+  ],
+  "terminal": {
+    "receipt_id": "inv-gradle-1-0002",
+    "lifecycle_state": "finished",
+    "outcome": "completed",
+    "exit_code": 0
+  },
+  "source_shape": {
+    "changed_count": 0,
+    "new_count": 1683,
+    "first_source_path": "/workspace/lucene/lucene/analysis.tests/build/test-results/test/TEST-org.apache.lucene.analysis.tests.TestAllAnalyzersHaveFactories.xml",
+    "last_source_path": "/workspace/lucene/lucene/test-framework/build/test-results/test/TEST-org.apache.lucene.tests.util.TestWorstCaseTestBehavior.xml"
+  }
+}

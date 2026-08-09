@@ -5,7 +5,11 @@ split; the ladder existed but sat AFTER an early return)."""
 
 from types import SimpleNamespace
 
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+
 import sag.tools.internal.project_setup_tool as pst
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_setup_tool import ProjectSetupTool
 
 VENV = "/workspace/tvm/.venv"
@@ -20,13 +24,26 @@ ENSUREPIP_ERROR = (
 class CloneVenvOrch:
     """TVM shape: plain venv creation fails; apt rung restores pip."""
 
-    def __init__(self, apt_ok=True):
+    def __init__(self, apt_ok=True, *, publish_manifest=True):
         self.apt_ok = apt_ok
         self.apt_installed = False
         self.commands = []
+        self.evidence = ContainerFS()
+        if publish_manifest:
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload={},
+            )
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command)
         if "test -x" in command and ".venv/bin/python" in command:
             return {"success": True, "exit_code": 0, "output": "MISSING"}
         if command == f"python3 -m venv {VENV}":
@@ -59,7 +76,6 @@ def _tool(orch, monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(pst, "read_build_requirements", lambda orchestrator: {})
     tool = ProjectSetupTool.__new__(ProjectSetupTool)
     tool.orchestrator = orch
     return tool
@@ -80,3 +96,15 @@ def test_exhausted_ladder_still_fails_honestly(monkeypatch):
 
     assert result["success"] is False
     assert "repair ladder exhausted" in result["error"]
+
+
+def test_setup_provisioning_rejects_unpublished_requirements_before_any_probe(monkeypatch):
+    orch = CloneVenvOrch(publish_manifest=False)
+
+    result = _tool(orch, monkeypatch)._install_python_dependencies("/workspace/tvm")
+
+    assert result["success"] is False
+    assert result["error_code"] == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert result["blocker_owner"] == "harness"
+    assert not any("python3 --version" in command for command in orch.commands)
+    assert not any("python3 -m venv" in command for command in orch.commands)

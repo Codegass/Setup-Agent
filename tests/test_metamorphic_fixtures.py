@@ -31,8 +31,14 @@ sides cannot drift: editing the anchor fixture edits both.
 
 import json
 import re
+from contextlib import contextmanager
 
 import pytest
+from container_evidence_fakes import (
+    ScriptedOrchestrator,
+    add_published_mutable_json,
+    canonical_json,
+)
 from test_build_domain_graph import (
     BIG,
     BIGTOP_FILES,
@@ -46,16 +52,35 @@ from test_build_domain_graph import (
 )
 from test_domain_facts_projection import (
     DG_CONSTRAINT_ID,
+    DOC_MAP_PATH,
     PRESCRIPTION_MARKERS,
     SPARK_DEPENDENCY_ID,
+    STAGE_A_CLAIMS,
+    STAGE_A_DOCUMENT_MAP,
     STAGE_A_FILES,
     TF_LIFECYCLE_ID,
     StageAOrch,
-    _analyze_bigtop_stage_a,
+    _analyze_bigtop_stage_a as _analyze_anchor_stage_a,
 )
-from test_invocation_contracts import RecordingOrchestrator
 
-from sag.agent.invocation_contracts import compliance_class, freeze_contract
+from sag.agent.action_intents import action_fingerprint
+from sag.agent.claim_records import PolicyClaim, validate_claim_v1
+from sag.agent.document_map import DocumentMapEntry, document_map_payload, entry_id
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    publish_evidence_bytes,
+    reset_evidence_publication_authority,
+)
+from sag.agent.invocation_contracts import (
+    ARGV_EXECUTION_BINDING,
+    CONTRACT_DIR,
+    compliance_class,
+    freeze_contract,
+)
+from sag.agent.physical_survey import POLICY_CLAIMS_DIR
 from sag.agent.project_fact_projection import render_recommended_build_facts
 from sag.project_fact_sheet import project_fact_sheet_metadata
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
@@ -71,7 +96,7 @@ from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 # --------------------------------------------------------------------------- #
 ORCHARD = "/workspace/orchard"
 
-VOCABULARY = (
+BASE_VOCABULARY = (
     ("<workspace-root>", BIG, ORCHARD),
     ("<group>", "org.apache.bigtop", "org.example.orchard"),
     ("<framework-module>", "bigtop-test-framework", "orchard-test-framework"),
@@ -84,14 +109,9 @@ VOCABULARY = (
     ("<producer-version>", "3.7.0-SNAPSHOT", "9.1.0-SNAPSHOT"),
     ("<spark-version>", "3.6.0-SNAPSHOT", "9.0.0-SNAPSHOT"),
     ("<queue-version>", "3.5.0-SNAPSHOT", "8.9.0-SNAPSHOT"),
-    ("<lifecycle-claim>", TF_LIFECYCLE_ID, "lifecycle-777777777777"),
-    ("<constraint-claim>", DG_CONSTRAINT_ID, "tool_constraint-888888888888"),
-    ("<dependency-claim>", SPARK_DEPENDENCY_ID, "dependency-999999999999"),
 )
 
-RENAMES = {original: renamed for _placeholder, original, renamed in VOCABULARY}
-BIGTOP_TOKENS = {original: placeholder for placeholder, original, _renamed in VOCABULARY}
-ORCHARD_TOKENS = {renamed: placeholder for placeholder, _original, renamed in VOCABULARY}
+BASE_RENAMES = {original: renamed for _placeholder, original, renamed in BASE_VOCABULARY}
 
 # Content-derived identifiers. They are SUPPOSED to differ between the two
 # runs; what must not differ is which record each one belongs to.
@@ -111,8 +131,44 @@ def _substitute(text, table):
     return text
 
 
+def _rename_names(value):
+    """Rename project material before content-derived claim ids exist."""
+
+    return _substitute(value, BASE_RENAMES)
+
+
+_ORCHARD_ENTRY_IDS = {
+    item.entry_id: entry_id(_rename_names(item.path)) for item in STAGE_A_DOCUMENT_MAP["entries"]
+}
+
+
+def _renamed_policy_claim(claim):
+    """Re-mint a canonical claim from the consistently renamed source."""
+
+    payload = json.loads(_rename_names(json.dumps(claim.model_dump(mode="json"))))
+    payload["source_ref"]["entry_id"] = _ORCHARD_ENTRY_IDS[claim.source_ref.entry_id]
+    return PolicyClaim.model_validate(payload)
+
+
+ORCHARD_CLAIMS = tuple(_renamed_policy_claim(claim) for claim in STAGE_A_CLAIMS)
+CLAIM_VOCABULARY = tuple(
+    (placeholder, original_id, orchard_claim.claim_id)
+    for placeholder, original_id, orchard_claim in zip(
+        ("<lifecycle-claim>", "<constraint-claim>", "<dependency-claim>"),
+        (TF_LIFECYCLE_ID, DG_CONSTRAINT_ID, SPARK_DEPENDENCY_ID),
+        ORCHARD_CLAIMS,
+        strict=True,
+    )
+)
+VOCABULARY = BASE_VOCABULARY + CLAIM_VOCABULARY
+RENAMES = {original: renamed for _placeholder, original, renamed in VOCABULARY}
+BIGTOP_TOKENS = {original: placeholder for placeholder, original, _renamed in VOCABULARY}
+ORCHARD_TOKENS = {renamed: placeholder for placeholder, _original, renamed in VOCABULARY}
+
+
 def rename(value):
     """The bigtop fixture, spelled as the orchard project."""
+
     return _substitute(value, RENAMES)
 
 
@@ -122,7 +178,26 @@ def rename(value):
 ORCHARD_FILES = {rename(path): rename(body) for path, body in BIGTOP_FILES.items()}
 ORCHARD_SOURCE_DIRS = [rename(path) for path in BIGTOP_SOURCE_DIRS]
 ORCHARD_TEST_DIRS = [rename(path) for path in BIGTOP_TEST_DIRS]
-ORCHARD_STAGE_A_FILES = {rename(path): rename(body) for path, body in STAGE_A_FILES.items()}
+ORCHARD_STAGE_A_FILES = {
+    f"{POLICY_CLAIMS_DIR}/{claim.claim_id}.json": canonical_json(claim.payload())
+    for claim in ORCHARD_CLAIMS
+}
+ORCHARD_DOCUMENT_MAP = {
+    "entries": sorted(
+        [
+            DocumentMapEntry(
+                entry_id=_ORCHARD_ENTRY_IDS[item.entry_id],
+                path=rename(item.path),
+                realpath=rename(item.realpath),
+                source_hash=item.source_hash,
+                kind=item.kind,
+            )
+            for item in STAGE_A_DOCUMENT_MAP["entries"]
+        ],
+        key=lambda item: item.path,
+    ),
+    "partial_map": json.loads(rename(json.dumps(STAGE_A_DOCUMENT_MAP["partial_map"]))),
+}
 
 ORCHARD_TF = rename(TF)
 ORCHARD_DG = rename(DG)
@@ -134,20 +209,82 @@ def _analyze_orchard():
     return _analyze(ORCHARD, ORCHARD_FILES, ORCHARD_SOURCE_DIRS, ORCHARD_TEST_DIRS)
 
 
+class _MemoryControlSink:
+    """Host-owned event sink for one isolated metamorphic evidence run."""
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, kind, payload, *, source=None):
+        del source
+        self.events.append((str(kind), dict(payload)))
+
+
+@contextmanager
+def _isolated_publication_authority():
+    """Keep each fixture's container store inside one evidence authority."""
+
+    authority = EvidencePublicationAuthority(run_id="run-pytest", sink=_MemoryControlSink())
+    token = install_evidence_publication_authority(authority)
+    try:
+        yield authority
+    finally:
+        reset_evidence_publication_authority(token)
+
+
+def _analyze_bigtop_stage_a(stage_a_files=STAGE_A_FILES):
+    with _isolated_publication_authority():
+        return _analyze_anchor_stage_a(stage_a_files)
+
+
 def _analyze_orchard_stage_a(stage_a_files=ORCHARD_STAGE_A_FILES):
     """The orchard twin of `_analyze_bigtop_stage_a` — same calls, same order."""
-    orch = StageAOrch(
-        ORCHARD_FILES,
-        source_dirs=ORCHARD_SOURCE_DIRS,
-        test_dirs=ORCHARD_TEST_DIRS,
-        stage_a_files=stage_a_files,
-    )
-    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
-    analysis = {"build_system": "maven", "maven_modules": []}
-    analysis["build_recommendation"] = analyzer._recommend_build_approach(ORCHARD, analysis)
-    analyzer._recommend_test_approach(ORCHARD, analysis["build_recommendation"])
-    analyzer._persist_build_requirements(ORCHARD, analysis)
-    return orch, analysis, json.loads(orch.files[REQUIREMENTS_PATH])
+
+    with _isolated_publication_authority():
+        orch = StageAOrch(
+            ORCHARD_FILES,
+            source_dirs=ORCHARD_SOURCE_DIRS,
+            test_dirs=ORCHARD_TEST_DIRS,
+            stage_a_files=stage_a_files,
+        )
+        for path, raw in sorted(orch.stage_a.items()):
+            if not path.startswith(f"{POLICY_CLAIMS_DIR}/") or not path.endswith(".json"):
+                continue
+            record_id = path.rsplit("/", 1)[-1][:-5]
+            validate_claim_v1(json.loads(raw), expected_id=record_id)
+            assert publish_evidence_bytes(
+                orch,
+                record_kind="policy_claim",
+                record_id=record_id,
+                raw=raw.encode("utf-8"),
+            ).published
+        current_document_map = (
+            ORCHARD_DOCUMENT_MAP if stage_a_files else {"entries": [], "partial_map": []}
+        )
+        add_published_mutable_json(
+            orch,
+            orch.atomic,
+            path=DOC_MAP_PATH,
+            record_kind="document_map",
+            record_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+            payload=document_map_payload(current_document_map),
+        )
+        analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+        analysis = {"build_system": "maven", "maven_modules": []}
+        analysis["build_recommendation"] = analyzer._recommend_build_approach(ORCHARD, analysis)
+        analyzer._recommend_test_approach(ORCHARD, analysis["build_recommendation"])
+        analysis["_current_policy_claim_ids"] = sorted(
+            path.rsplit("/", 1)[-1][:-5]
+            for path in orch.stage_a
+            if path.startswith(f"{POLICY_CLAIMS_DIR}/") and path.endswith(".json")
+        )
+        analyzer._persist_build_requirements(
+            ORCHARD,
+            analysis,
+            document_map=current_document_map,
+        )
+        return orch, analysis, json.loads(orch.files[REQUIREMENTS_PATH])
 
 
 # --------------------------------------------------------------------------- #
@@ -391,20 +528,48 @@ ORCHARD_ARGV = rename(BIGTOP_ARGV)
 
 
 def _freeze(root, argv, requirements):
-    orchestrator = RecordingOrchestrator()
-    contract = freeze_contract(
-        orchestrator.execute_command,
-        envelope_id="envelope-000012",
-        tool="build",
-        params={"action": "test", "working_directory": root},
-        effective_action="verify",
-        expected_cwd=root,
-        expected_argv=argv,
-        intent_source="model",
-        requirements=requirements,
-    )
-    assert contract is not None
-    return contract
+    with _isolated_publication_authority() as authority:
+        orchestrator = ScriptedOrchestrator()
+        add_published_mutable_json(
+            orchestrator,
+            orchestrator.filesystem,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=requirements,
+        )
+        params = {"action": "test", "working_directory": root}
+        domain_id = f"metamorphic:{root}"
+        contract = freeze_contract(
+            orchestrator.execute_command,
+            run_id="run-pytest",
+            envelope_id="envelope-000012",
+            tool="build",
+            params=params,
+            effective_tool="maven",
+            effective_action="verify",
+            expected_cwd=root,
+            expected_argv=argv,
+            execution_binding=ARGV_EXECUTION_BINDING,
+            intent_source="model",
+            intent_id="intent-metamorphic-contract",
+            intent_domain_id=domain_id,
+            intent_exact_params=params,
+            action_fingerprint=action_fingerprint(
+                domain_id=domain_id,
+                tool="build",
+                params=params,
+            ),
+            requirements=requirements,
+        )
+        assert contract is not None
+        contract_path = f"{CONTRACT_DIR}/{contract['contract_id']}.json"
+        assert orchestrator.filesystem.files[contract_path] == canonical_json(contract)
+        assert contract["contract_id"] in authority.expected_immutable_record_ids(
+            "invocation_contract"
+        )
+        return contract
 
 
 def _frozen_pair():
@@ -439,10 +604,11 @@ def test_freezing_a_renamed_dispatch_yields_an_isomorphic_contract_body():
         # Normalized WITH the manifest so `domain_id`/`blocking_conflict_ids`
         # resolve to the records that define them.
         body = normalized({"contract": contract, "manifest": manifest}, tokens)["contract"]
-        # `contract_id`/`contract_hash` digest the renamed material, so they are
-        # REQUIRED to differ — asserted separately below.
+        # These three digests bind the renamed material, so they are REQUIRED
+        # to differ — asserted separately below.
         body["contract_id"] = "<contract-id>"
         body["contract_hash"] = "<contract-hash>"
+        body["action_fingerprint"] = "<action-fingerprint>"
         return body
 
     assert canonical(contract_a, manifest_a, BIGTOP_TOKENS) == canonical(
@@ -450,6 +616,7 @@ def test_freezing_a_renamed_dispatch_yields_an_isomorphic_contract_body():
     )
     assert contract_a["contract_id"] != contract_b["contract_id"]
     assert contract_a["contract_hash"] != contract_b["contract_hash"]
+    assert contract_a["action_fingerprint"] != contract_b["action_fingerprint"]
     # The reference really was resolved, not left opaque and equal by accident.
     assert contract_a["blocking_conflict_ids"] != contract_b["blocking_conflict_ids"]
     assert contract_a["domain_id"] != contract_b["domain_id"]

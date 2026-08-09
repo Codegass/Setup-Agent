@@ -20,6 +20,7 @@ from sag.config import create_verbose_logger
 from sag.tools.base import BaseTool
 
 from .react_types import ReactModelCapabilities, ReactModelMode
+from .repair_contexts import repair_context_reference_set
 
 
 @dataclass(frozen=True)
@@ -57,12 +58,14 @@ class ReactLLMClient:
         token_tracker: Any,
         logger=logger,
         trace_context: Optional[Callable[[], dict[str, Any]]] = None,
+        repair_context_provider: Optional[Callable[[], Any]] = None,
     ):
         self.config = config
         self.tools = tools
         self.token_tracker = token_tracker
         self.logger = logger
         self.trace_context = trace_context
+        self.repair_context_provider = repair_context_provider
         self._capability_cache: dict[ReactModelMode, ReactModelCapabilities] = {}
 
     def setup(self) -> None:
@@ -135,6 +138,7 @@ class ReactLLMClient:
 
         for tool in self.tools.values():
             schema = tool.get_parameter_schema()
+            schema = self._repair_aware_schema(tool.name, schema)
 
             if capabilities.tool_call_format == "anthropic":
                 tool_def = {
@@ -155,6 +159,103 @@ class ReactLLMClient:
             tools_schema.append(tool_def)
 
         return tools_schema
+
+    def _repair_aware_schema(self, tool_name: str, schema: Any) -> dict[str, Any]:
+        """Require model-authored repair semantics only on admissible tools.
+
+        The repair context supplies neutral affordances, never a command.  The
+        outer tool call remains the ActionIntent's executable body; this
+        nested object records the model's own hypothesis and stop rule and is
+        stripped before the public tool validates its parameters.
+        """
+
+        base = dict(schema or {})
+        provider = self.repair_context_provider
+        context = provider() if callable(provider) else None
+        if context is None:
+            return base
+        normalized_tool = str(tool_name or "").strip()
+        matching = tuple(
+            affordance
+            for affordance in getattr(context, "allowed_tool_affordances", ())
+            if str(getattr(affordance, "tool", "") or "").strip() == normalized_tool
+        )
+        if len(matching) != 1:
+            return base
+        affordance = matching[0]
+        allowed_refs = sorted(repair_context_reference_set(context, affordance=affordance))
+        observation_types = list(getattr(context, "admissible_observation_types", ()) or ())
+        action_kinds = list(getattr(affordance, "action_kinds", ()) or ())
+        if getattr(affordance, "action_parameter", None) is None:
+            action_kinds = [normalized_tool]
+        # Keep per-tool schemas small for weak models. The bounded neutral
+        # guidance still lists the complete context when a collection is too
+        # large to repeat inside every admissible tool definition.
+        schema_refs = allowed_refs if len(allowed_refs) <= 16 else []
+        schema_observations = observation_types if len(observation_types) <= 16 else []
+        schema_action_kinds = action_kinds if len(action_kinds) <= 16 else []
+        properties = dict(base.get("properties") or {})
+        properties["repair_intent"] = {
+            "type": "object",
+            "description": (
+                "Your reasoning for this evidence-triggered action. The outer tool call is "
+                "the executable action; this object contains no command or argv."
+            ),
+            "properties": {
+                "blocking_fact_refs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "maxLength": 256,
+                        **({"enum": schema_refs} if schema_refs else {}),
+                    },
+                    "minItems": 1,
+                    "maxItems": 64,
+                },
+                "repair_hypothesis": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                },
+                "next_action_kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    **({"enum": schema_action_kinds} if schema_action_kinds else {}),
+                },
+                "expected_observation": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "maxLength": 256,
+                        **(
+                            {"enum": schema_observations}
+                            if schema_observations
+                            else {}
+                        ),
+                    },
+                    "minItems": 1,
+                    "maxItems": 64,
+                },
+                "stop_condition": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                },
+            },
+            "required": [
+                "blocking_fact_refs",
+                "repair_hypothesis",
+                "next_action_kind",
+                "expected_observation",
+                "stop_condition",
+            ],
+            "additionalProperties": False,
+        }
+        required = list(base.get("required") or ())
+        if "repair_intent" not in required:
+            required.append("repair_intent")
+        return {**base, "properties": properties, "required": required}
 
     def get_native_turn(
         self,

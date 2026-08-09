@@ -28,7 +28,7 @@ class FakeBashOrchestrator:
                 "timeout": timeout,
             }
         )
-        if "test -d /workspace" in command:
+        if "test -d /workspace" in command or "test -d -- /workspace" in command:
             return {
                 "success": True,
                 "output": "EXISTS",
@@ -212,6 +212,68 @@ def test_bash_tool_timeout_termination_reports_requested_timeout():
     assert "2 minutes" in result.error
     assert result.metadata["timeout"] == 120
     assert result.metadata["termination_reason"] == "absolute_timeout"
+
+
+def test_bash_build_command_preserves_submitted_command_and_cwd_despite_project_name():
+    orchestrator = FakeBashOrchestrator()
+    orchestrator.project_name = "must-not-be-injected"
+    tool = BashTool(orchestrator)
+
+    result = tool.execute(
+        command="mvn verify",
+        working_directory="/workspace",
+        timeout=120,
+    )
+
+    assert result.succeeded is True
+    assert orchestrator.monitoring_calls
+    dispatched = orchestrator.monitoring_calls[-1]
+    assert dispatched["command"] == "mvn verify"
+    assert dispatched["workdir"] == "/workspace"
+    assert "must-not-be-injected" not in dispatched["command"]
+    assert result.metadata["execution"]["command"] == "mvn verify"
+    assert result.metadata["execution"]["cwd"] == "/workspace"
+
+
+def test_bash_missing_cwd_refuses_without_mkdir_or_fallback_dispatch():
+    class MissingCwdOrchestrator(FakeBashOrchestrator):
+        def execute_command(self, command, **kwargs):
+            self.command_calls.append({"command": command, **kwargs})
+            return {
+                "success": False,
+                "output": "",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "",
+            }
+
+    orchestrator = MissingCwdOrchestrator()
+    tool = BashTool(orchestrator)
+
+    result = tool.execute(
+        command="echo should-not-run",
+        working_directory="/workspace/missing",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "WORKING_DIRECTORY_UNAVAILABLE"
+    assert result.metadata["execution"] == {
+        "command": "echo should-not-run",
+        "cwd": "/workspace/missing",
+        "executed": False,
+        "exit_code": None,
+        "timed_out": False,
+        "duration": 0,
+    }
+    assert len(orchestrator.command_calls) == 1
+    assert orchestrator.command_calls[0]["command"] == "test -d -- /workspace/missing"
+    assert not orchestrator.monitoring_calls
+    assert all("mkdir" not in call["command"] for call in orchestrator.command_calls)
+    assert all(
+        fallback not in call["command"]
+        for call in orchestrator.command_calls
+        for fallback in ("/root", "/tmp")
+    )
 
 
 def test_bash_tool_monitoring_error_is_not_marked_as_timeout():

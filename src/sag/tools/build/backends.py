@@ -10,6 +10,11 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sag.agent.invocation_contracts import (
+    ARGV_EXECUTION_BINDING,
+    PYTHON_FACADE_EXECUTION_BINDING,
+    PYTHON_PUBLIC_ACTION_TO_OPERATION,
+)
 from sag.runtime.container_io import read_container_text
 from sag.tools.base import ActualToolExecution, OutputPersistenceError, ToolResult
 
@@ -130,6 +135,7 @@ def native_cmake_args(definitions: Mapping[str, str]) -> str:
 
 
 class MavenBackend:
+    EXECUTION_BINDING = ARGV_EXECUTION_BINDING
     VERBS = {
         "deps": "dependency:resolve",
         "compile": "compile",
@@ -272,20 +278,8 @@ class MavenBackend:
 
 
 class PythonBackend:
-    VERBS = {
-        "deps": "setup_env",
-        "compile": "compile",
-        "test": "test",
-        # Both packaging verbs map to the wheel build: Python has no local-repo
-        # install step to mirror Maven's, and the wheel is extra evidence only
-        # (spec settled decision: never required for a green verdict).
-        "package": "build",
-        "install": "build",
-        # Spec §C8: the typed native affordance is python-system machinery —
-        # it re-materializes THIS project's own editable install under a
-        # validated CMAKE_ARGS overlay. No JVM backend exposes it.
-        "native": "native",
-    }
+    EXECUTION_BINDING = PYTHON_FACADE_EXECUTION_BINDING
+    VERBS = PYTHON_PUBLIC_ACTION_TO_OPERATION
 
     def __init__(self, python_tool):
         self.python_tool = python_tool
@@ -330,9 +324,9 @@ class PythonBackend:
             "operation": self.VERBS[verb],
             "working_directory": working_directory,
         }
-        if args:
+        if args is not None:
             kwargs["args"] = args
-        if timeout:
+        if timeout is not None:
             kwargs["timeout"] = timeout
         if verb == "native":
             bundle = dict(native or {})
@@ -371,11 +365,12 @@ class PythonBackend:
 
 
 class GradleBackend:
+    EXECUTION_BINDING = ARGV_EXECUTION_BINDING
     # compileJava is the JVM BASELINE of the compile verb, never its whole
     # answer: GradleBackend.execute runs the union of the compile tasks the
     # project's own source directories require (see _compile_tasks). The key
-    # stays for callers that translate a verb without a container to probe
-    # (tool_recovery's delegate path).
+    # stays for callers that translate a verb without a container probe, such
+    # as schema/introspection tests.
     VERBS = {
         "deps": "dependencies",
         "compile": "compileJava",

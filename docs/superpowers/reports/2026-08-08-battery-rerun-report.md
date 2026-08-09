@@ -1,5 +1,14 @@
 # 23-Project Battery Rerun — fixed harness vs the 7/27 campaign
 
+> **Superseded for engineering decisions (2026-08-08).** A subsequent
+> log/control/receipt audit found that this first read mixed metric grains and
+> misattributed several harness failures to model course variance. The audited
+> verdict split is 2 success / 16 partial / 5 failed, and the causal correction
+> is in `2026-08-08-sag-performance-attribution-audit.md`. In particular, do
+> not use the model-course, flaky-HTTP, missing-broker/YARN, or three-lane
+> Polaris explanations below as current conclusions; they are retained only as
+> the historical first interpretation.
+
 **Date:** 2026-08-08
 **Code:** main @ `eeb4ee0` (Plans 6–8 + p9 stall window + #30, all merged).
 **Setup:** the campaign's own 23 Java projects at the campaign-pinned refs,

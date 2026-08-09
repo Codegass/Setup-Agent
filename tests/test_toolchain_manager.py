@@ -1,7 +1,15 @@
 import json
 import shlex
 
-from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
+import pytest
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+    evidence_publication_authority_for,
+)
+from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.toolchain_manager import (
     ToolchainManager,
@@ -27,6 +35,35 @@ class FakeToolchainOrchestrator:
         self.files = {}
         self.commands = []
         self.reads = []
+        self.requirements_store = None
+
+    def publish_overlay(self, payload):
+        store = EnvOverlayStore(self)
+        normalized = store._normalize_overlay(dict(payload))
+        raw = store._canonical_overlay_json(normalized)
+        self.files[DEFAULT_OVERLAY_JSON] = raw
+        authority = evidence_publication_authority_for(self)
+        prior = authority.latest_head(ENV_OVERLAY_LOGICAL_ARTIFACT_ID)
+        authority.publish_revision(
+            record_kind="env_overlay",
+            record_id=ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+            raw=raw.encode("utf-8"),
+            expected_previous_raw_sha256=(prior.raw_sha256 if prior else "0" * 64),
+        )
+
+    def publish_manifest(self, payload):
+        self.requirements_store = ContainerFS()
+        add_published_mutable_json(
+            self,
+            self.requirements_store,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=payload,
+        )
+        self.files[REQUIREMENTS_PATH] = json.dumps(payload)
 
     def read_file(self, path):
         self.reads.append(path)
@@ -42,6 +79,11 @@ class FakeToolchainOrchestrator:
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
+
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            if self.requirements_store is not None:
+                return self.requirements_store(command)
+            return {"success": True, "output": "", "exit_code": 0}
 
         if command.startswith("realpath -e -- "):
             path = shlex.split(command)[3]
@@ -121,9 +163,7 @@ def test_nested_gradle_island_prefers_checkout_ancestor_wrapper():
         },
         regular_files={wrapper},
     )
-    orchestrator.files[REQUIREMENTS_PATH] = json.dumps(
-        {"survey": {"project_path": root}}
-    )
+    orchestrator.publish_manifest({"survey": {"project_path": root}})
 
     resolved = ToolchainManager(orchestrator).resolve(
         ToolchainSpec(name="gradle", executable="gradle"),
@@ -135,16 +175,14 @@ def test_nested_gradle_island_prefers_checkout_ancestor_wrapper():
     assert resolved.candidate.source == "wrapper"
 
 
-def test_gradle_wrapper_discovery_rejects_escape_and_stops_at_survey_root():
-    root = "/workspace/repo"
-    island = f"{root}/island"
-    system_gradle = "/usr/bin/gradle"
-    cases = (
+@pytest.mark.parametrize(
+    "case",
+    (
         # The working directory itself resolves outside the surveyed checkout.
         {
             "realpaths": {
-                root: root,
-                island: "/outside/island",
+                "/workspace/repo": "/workspace/repo",
+                "/workspace/repo/island": "/outside/island",
                 "/outside/island": "/outside/island",
             },
             "wrappers": {"/outside/gradlew"},
@@ -152,46 +190,47 @@ def test_gradle_wrapper_discovery_rejects_escape_and_stops_at_survey_root():
         # The wrapper is a symlink whose target escapes the checkout.
         {
             "realpaths": {
-                root: root,
-                island: island,
-                f"{root}/gradlew": "/outside/gradlew",
+                "/workspace/repo": "/workspace/repo",
+                "/workspace/repo/island": "/workspace/repo/island",
+                "/workspace/repo/gradlew": "/outside/gradlew",
             },
-            "wrappers": {f"{root}/gradlew"},
+            "wrappers": {"/workspace/repo/gradlew"},
         },
         # A wrapper above the surveyed checkout must never be considered.
         {
             "realpaths": {
-                root: root,
-                island: island,
+                "/workspace/repo": "/workspace/repo",
+                "/workspace/repo/island": "/workspace/repo/island",
                 "/workspace/gradlew": "/workspace/gradlew",
             },
             "wrappers": {"/workspace/gradlew"},
         },
+    ),
+)
+def test_gradle_wrapper_discovery_rejects_escape_and_stops_at_survey_root(case):
+    root = "/workspace/repo"
+    island = f"{root}/island"
+    system_gradle = "/usr/bin/gradle"
+    executables = {
+        system_gradle: "Gradle 8.5",
+        **{path: "Gradle 8.7" for path in case["wrappers"]},
+    }
+    orchestrator = FakeToolchainOrchestrator(
+        executables,
+        path_executable=system_gradle,
+        realpaths=case["realpaths"],
+        regular_files=case["wrappers"],
+    )
+    orchestrator.publish_manifest({"survey": {"project_path": root}})
+
+    resolved = ToolchainManager(orchestrator).resolve(
+        ToolchainSpec(name="gradle", executable="gradle"),
+        working_directory=island,
     )
 
-    for case in cases:
-        executables = {
-            system_gradle: "Gradle 8.5",
-            **{path: "Gradle 8.7" for path in case["wrappers"]},
-        }
-        orchestrator = FakeToolchainOrchestrator(
-            executables,
-            path_executable=system_gradle,
-            realpaths=case["realpaths"],
-            regular_files=case["wrappers"],
-        )
-        orchestrator.files[REQUIREMENTS_PATH] = json.dumps(
-            {"survey": {"project_path": root}}
-        )
-
-        resolved = ToolchainManager(orchestrator).resolve(
-            ToolchainSpec(name="gradle", executable="gradle"),
-            working_directory=island,
-        )
-
-        assert resolved is not None
-        assert resolved.candidate.path == system_gradle
-        assert resolved.candidate.source == "system"
+    assert resolved is not None
+    assert resolved.candidate.path == system_gradle
+    assert resolved.candidate.source == "system"
 
 
 def test_resolve_exact_requirement_does_not_upgrade_to_newer_version():
@@ -292,7 +331,7 @@ def test_bare_resolution_inherits_observed_overlay_requirement():
         },
         path_executable="/usr/bin/mvn",
     )
-    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+    orchestrator.publish_overlay(
         {
             "version": 1,
             "tools": {
@@ -326,7 +365,7 @@ def test_bare_resolution_intersects_same_root_history_without_polluting_sibling(
             "/opt/apache-maven-3.9.9/bin/mvn": "Apache Maven 3.9.9",
         }
     )
-    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+    orchestrator.publish_overlay(
         {
             "version": 1,
             "tools": {
@@ -373,7 +412,7 @@ def test_parent_reactor_inherits_constraint_observed_in_child_module():
             "/opt/apache-maven-3.9.9/bin/mvn": "Apache Maven 3.9.9",
         }
     )
-    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+    orchestrator.publish_overlay(
         {
             "version": 1,
             "tools": {
@@ -434,7 +473,7 @@ def test_env_overlay_candidate_wins_over_system_path():
         },
         path_executable="/usr/bin/mvn",
     )
-    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+    orchestrator.publish_overlay(
         {
             "version": 1,
             "tools": {
@@ -479,7 +518,7 @@ def test_env_overlay_blocker_excludes_exact_path_only():
         },
         path_executable="/usr/bin/mvn",
     )
-    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+    orchestrator.publish_overlay(
         {
             "version": 1,
             "tools": {
@@ -526,7 +565,7 @@ def test_env_overlay_resolution_reads_overlay_json_once_for_multiple_candidates(
         },
         path_executable="/usr/bin/mvn",
     )
-    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+    orchestrator.publish_overlay(
         {
             "version": 1,
             "tools": {
@@ -567,26 +606,40 @@ def test_env_overlay_resolution_reads_overlay_json_once_for_multiple_candidates(
     assert orchestrator.read_count(DEFAULT_OVERLAY_JSON) <= 1
 
 
-def test_registered_candidate_persists_and_is_loaded_for_resolution():
+def test_registered_candidate_persists_but_is_not_live_resolution_authority():
     orchestrator = FakeToolchainOrchestrator(
-        {"/opt/apache-maven-3.9.6/bin/mvn": "Apache Maven 3.9.6"}
+        {"/private/toolchains/mvn": "Apache Maven 3.9.6"}
     )
     manager = ToolchainManager(orchestrator)
     manager.register(
         ToolExecutableCandidate(
             name="maven",
             executable="mvn",
-            path="/opt/apache-maven-3.9.6/bin/mvn",
+            path="/private/toolchains/mvn",
             version="3.9.6",
             source="registered",
         )
     )
 
     stored = json.loads(orchestrator.files["/workspace/.setup_agent/toolchains.json"])
-    assert stored["maven"]["mvn"][0]["path"] == "/opt/apache-maven-3.9.6/bin/mvn"
+    assert stored["maven"]["mvn"][0]["path"] == "/private/toolchains/mvn"
 
     reloaded = ToolchainManager(orchestrator)
+    reads_before = len(
+        [
+            command
+            for command in orchestrator.commands
+            if command[0].startswith("cat /workspace/.setup_agent/toolchains.json")
+        ]
+    )
     resolved = reloaded.resolve(ToolchainSpec(name="maven", executable="mvn"))
 
-    assert resolved is not None
-    assert resolved.candidate.path == "/opt/apache-maven-3.9.6/bin/mvn"
+    assert resolved is None
+    reads_after = len(
+        [
+            command
+            for command in orchestrator.commands
+            if command[0].startswith("cat /workspace/.setup_agent/toolchains.json")
+        ]
+    )
+    assert reads_after == reads_before

@@ -18,6 +18,22 @@ import hashlib
 import json
 import os
 import sys
+from pathlib import Path
+from typing import Iterable, Mapping
+
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from scripts.collect_control_layer_ab import (  # noqa: E402
+    AuthorizedCurrentRun,
+    CollectionError,
+    load_authorized_current_run,
+)
+from scripts.panel_category3_evaluator import (  # noqa: E402
+    EvaluationError,
+    load_authorized_build_requirements,
+)
 
 SMOKE_PATH = "tests/python/all-platform-minimal-test"
 
@@ -57,6 +73,10 @@ CONTRACT_HASH_EXPORTS = (
 ENVELOPE_KINDS = ("action_envelope", "forced_action")
 
 
+class VerificationError(RuntimeError):
+    """The archived session cannot be used as acceptance evidence."""
+
+
 def contract_hash_of(payload: dict) -> str:
     """The contract's own content hash, recomputed — never reimplemented here.
 
@@ -80,7 +100,9 @@ def contract_hash_of(payload: dict) -> str:
     return canonical_sha256(body)
 
 
-def _events(session: str):
+def _forensic_events(session: str):
+    """Read the legacy container stream only under explicit forensic mode."""
+
     path = os.path.join(session, ".setup_agent", "control_events.jsonl")
     with open(path) as handle:
         for line in handle:
@@ -89,16 +111,16 @@ def _events(session: str):
                 yield json.loads(line)
 
 
-def _tool_results(session: str):
-    for event in _events(session):
+def _tool_results(events: Iterable[Mapping]):
+    for event in events:
         if event.get("kind") == "tool_result":
             yield event["payload"]
 
 
-def _pytest_attempts(session: str):
+def _pytest_attempts(events: Iterable[Mapping]):
     """Tool results carrying collection metadata — the honest pytest signature."""
-    for payload in _tool_results(session):
-        meta = ((payload.get("result") or {}).get("metadata") or {})
+    for payload in _tool_results(events):
+        meta = (payload.get("result") or {}).get("metadata") or {}
         if "collection_scope" in meta:
             yield payload, meta
 
@@ -161,7 +183,7 @@ def _receipts(session: str):
             yield path, payload
 
 
-def _recorded_receipt_hashes(session: str) -> dict:
+def _recorded_receipt_hashes(events: Iterable[Mapping]) -> dict:
     """receipt_id -> the LAST content hash the session's own events recorded.
 
     Plan 5 receipts carry no hash in their ToolResult metadata, so this is
@@ -169,7 +191,7 @@ def _recorded_receipt_hashes(session: str) -> dict:
     that is the state the run itself last vouched for.
     """
     hashes: dict[str, str] = {}
-    for payload in _tool_results(session):
+    for payload in _tool_results(events):
         meta = (payload.get("result") or {}).get("metadata") or {}
         receipt_id = str(meta.get("receipt_id") or "").strip()
         if not receipt_id:
@@ -192,10 +214,28 @@ def _all_skipped(meta: dict) -> bool:
 
 
 class Verifier:
-    def __init__(self, session: str) -> None:
+    def __init__(self, session: str, *, forensic: bool = False) -> None:
         self.session = session
+        self.forensic = forensic
         self.failures: list[str] = []
         self.passes: list[str] = []
+        self._current: AuthorizedCurrentRun | None = None
+        if forensic:
+            # Legacy recordings remain inspectable, but this opt-in path is
+            # intentionally unavailable from the acceptance CLI and can never
+            # produce campaign authority.
+            self._event_rows = tuple(_forensic_events(session))
+        else:
+            try:
+                self._current = load_authorized_current_run(session)
+            except CollectionError as exc:
+                raise VerificationError(f"archived run authority is invalid: {exc}") from exc
+            self._event_rows = tuple(
+                event.model_dump(mode="json", exclude_unset=True) for event in self._current.events
+            )
+
+    def _events(self) -> tuple[Mapping, ...]:
+        return self._event_rows
 
     def check(self, name: str, ok: bool, detail: str = "") -> None:
         if ok:
@@ -211,7 +251,7 @@ class Verifier:
         envelopes: dict[str, dict] = {}
         results: list[str] = []
         hash_bad = 0
-        for event in _events(self.session):
+        for event in self._events():
             kind, payload = event.get("kind"), event.get("payload", {})
             if kind == "forced_action":
                 # Harness-forced attempts pair forced_action <-> tool_result
@@ -232,12 +272,19 @@ class Verifier:
         unanswered = set(envelopes) - set(results)
         orphans = [r for r in results if r not in envelopes]
         double = len(results) != len(set(results))
-        self.check("pairing.exact", not unanswered and not orphans and not double,
-                   f"unanswered={sorted(unanswered)} orphans={orphans} double={double}")
+        self.check(
+            "pairing.exact",
+            not unanswered and not orphans and not double,
+            f"unanswered={sorted(unanswered)} orphans={orphans} double={double}",
+        )
         self.check("envelope.hashes", hash_bad == 0, f"{hash_bad} bad")
-        self.check("no.scheduler.events",
-                   all(e.get("kind") not in ("scheduler_decision", "planner_response")
-                       for e in _events(self.session)))
+        self.check(
+            "no.scheduler.events",
+            all(
+                e.get("kind") not in ("scheduler_decision", "planner_response")
+                for e in self._events()
+            ),
+        )
 
     def assert_receipts_immutable(self) -> None:
         """A finalized receipt is never rewritten (Plan 6 Stage 0, spec §C4).
@@ -258,7 +305,7 @@ class Verifier:
         files = _receipt_files(self.session)
         if not files:
             return
-        recorded = _recorded_receipt_hashes(self.session)
+        recorded = _recorded_receipt_hashes(self._events())
         problems: list[str] = []
         for path in files:
             receipt_id = os.path.basename(path)[: -len(".json")]
@@ -342,7 +389,7 @@ class Verifier:
 
         envelope_ids = {
             str(event.get("payload", {}).get("envelope_id") or "")
-            for event in _events(self.session)
+            for event in self._events()
             if event.get("kind") in ENVELOPE_KINDS
         }
         for path, contract_id, receipt in bound:
@@ -471,15 +518,26 @@ class Verifier:
         self.check("survey.document_map", not problems, "; ".join(problems))
 
     def _verdict(self) -> dict:
+        if self._current is not None:
+            return self._current.snapshot.model_dump(mode="json")
+        # Explicit forensic mode may inspect a legacy raw snapshot, but the CLI
+        # has no route to this branch and it cannot grade a campaign run.
         with open(os.path.join(self.session, ".setup_agent", "verdict.json")) as handle:
             return json.load(handle)
 
-    def _receipt(self):
-        path = os.path.join(self.session, ".setup_agent", "native_smoke_receipt.json")
+    def _build_requirements(self) -> dict:
+        if self._current is not None:
+            try:
+                payload = load_authorized_build_requirements(self.session, self._current)
+            except EvaluationError as exc:
+                raise VerificationError(str(exc)) from exc
+            return payload or {}
+        path = os.path.join(self.session, ".setup_agent", "build_requirements.json")
         if not os.path.exists(path):
-            return None
+            return {}
         with open(path) as handle:
-            return json.load(handle)
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
 
     def _report_text(self) -> str:
         reports = sorted(glob.glob(os.path.join(self.session, "setup-report-*.md")))
@@ -491,7 +549,7 @@ class Verifier:
     # -- tvm profile -------------------------------------------------------
 
     def assert_tvm(self) -> None:
-        attempts = list(_pytest_attempts(self.session))
+        attempts = list(_pytest_attempts(self._events()))
         self.check("tvm.pytest.attempted", bool(attempts), "no pytest attempt found")
 
         receipt_minted = False
@@ -500,12 +558,14 @@ class Verifier:
             command = str(meta.get("command") or meta.get("collection_command") or "")
             if not receipt_minted:
                 self.check(
-                    f"tvm.attempt{index}.scope.filtered", scope == "filtered",
+                    f"tvm.attempt{index}.scope.filtered",
+                    scope == "filtered",
                     f"scope={scope!r} command={command[:120]!r} (full collect without receipt)",
                 )
             if scope == "filtered":
                 self.check(
-                    f"tvm.attempt{index}.command.smoke_path", SMOKE_PATH in command,
+                    f"tvm.attempt{index}.command.smoke_path",
+                    SMOKE_PATH in command,
                     f"command={command[:160]!r}",
                 )
                 selected = meta.get("collected_after_deselection")
@@ -546,16 +606,6 @@ class Verifier:
                 passed = _junit_passed(meta)
                 if isinstance(passed, int) and passed >= 1:
                     receipt_minted = True
-
-        receipt = self._receipt()
-        if receipt is not None:
-            passed = (receipt.get("stats") or {}).get("passed")
-            self.check(
-                "tvm.receipt.positive_evidence",
-                isinstance(passed, int) and passed >= 1,
-                f"native_smoke_receipt.json stats.passed={passed!r} "
-                f"(stats={receipt.get('stats')!r})",
-            )
 
         verdict = self._verdict()
         stats = verdict.get("test_stats") or {}
@@ -618,11 +668,7 @@ class Verifier:
             verdict.get("verdict") == "partial",
             f"verdict={verdict.get('verdict')!r}",
         )
-        requirements_path = os.path.join(self.session, ".setup_agent", "build_requirements.json")
-        edges = []
-        if os.path.exists(requirements_path):
-            with open(requirements_path) as handle:
-                edges = json.load(handle).get("domain_edges") or []
+        edges = self._build_requirements().get("domain_edges") or []
         named = [e for e in edges if "bigpetstore-data-generator" in str(e.get("detail") or "")]
         self.check(
             "bigtop.edges.data_generator_linked",
@@ -640,8 +686,11 @@ class Verifier:
             and int(unique.get("errors", 0)) == 0
         )
         self.check("cli.canary.921_0_0", ok, f"unique={unique}")
-        self.check("cli.verdict.success", verdict.get("verdict") == "success",
-                   f"verdict={verdict.get('verdict')!r}")
+        self.check(
+            "cli.verdict.success",
+            verdict.get("verdict") == "success",
+            f"verdict={verdict.get('verdict')!r}",
+        )
 
 
 def main() -> int:
@@ -650,13 +699,19 @@ def main() -> int:
     parser.add_argument("--profile", choices=["tvm", "bigtop", "cli"], required=True)
     options = parser.parse_args()
 
-    verifier = Verifier(options.session)
-    verifier.assert_pairing_and_hashes()
-    verifier.assert_receipts_immutable()
-    verifier.assert_contract_chain()
-    verifier.assert_evidence_assessments()
-    verifier.assert_document_map()
-    getattr(verifier, f"assert_{options.profile}")()
+    try:
+        verifier = Verifier(options.session)
+        verifier.assert_pairing_and_hashes()
+        verifier.assert_receipts_immutable()
+        verifier.assert_contract_chain()
+        verifier.assert_evidence_assessments()
+        verifier.assert_document_map()
+        getattr(verifier, f"assert_{options.profile}")()
+    except VerificationError as exc:
+        print(f"== {options.profile} :: {options.session}")
+        print(f"  FAIL archive.authority: {exc}")
+        print("  => 0 passed, 1 failed")
+        return 1
 
     print(f"== {options.profile} :: {options.session}")
     for name in verifier.passes:

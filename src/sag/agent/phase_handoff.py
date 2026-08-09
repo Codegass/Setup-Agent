@@ -180,7 +180,6 @@ class HandoffProjection(BaseModel):
     attempts: tuple[HandoffAttempt, ...] = ()
     repair_routes: tuple[HandoffRepairRoute, ...] = ()
     last_failures: tuple[HandoffFailure, ...] = ()
-    next_hypothesis: str | None = None
     omitted_fact_count: int = 0
     omitted_blocker_count: int = 0
     omitted_attempt_count: int = 0
@@ -274,8 +273,6 @@ class HandoffProjection(BaseModel):
                     f"signature={repair.failure_signature}"
                 )
 
-        if self.next_hypothesis:
-            lines.append(f"NEXT HYPOTHESIS: {_short_json(self.next_hypothesis, 300)}")
         lines.append("[END UNTRUSTED TOOL/PROJECT EVIDENCE]")
         if self.has_omissions:
             lines.append(
@@ -543,10 +540,6 @@ class PhaseHandoff:
         facts = self._facts(target_phase)
         blockers = self._blockers(facts)
         repairs = self._repairs()
-        next_hypothesis = next(
-            (repair.hypothesis for repair in repairs if repair.accepted and repair.evidence_refs),
-            None,
-        )
         return HandoffProjection(
             run_id=self._state.run_id,
             target_phase=target_phase,
@@ -555,7 +548,6 @@ class PhaseHandoff:
             attempts=tuple(self._attempts()),
             repair_routes=tuple(repairs),
             last_failures=tuple(self._failures()),
-            next_hypothesis=next_hypothesis,
             full_state_ref=self.full_state_ref,
         )
 
@@ -593,7 +585,6 @@ class PhaseHandoff:
         selected = HandoffProjection(
             run_id=complete.run_id,
             target_phase=complete.target_phase,
-            next_hypothesis=complete.next_hypothesis,
             full_state_ref=complete.full_state_ref,
         )
         selected = self._with_omission_counts(selected, totals=totals)

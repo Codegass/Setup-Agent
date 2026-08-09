@@ -5,6 +5,8 @@ import os
 import platform
 import re
 import subprocess
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -23,10 +25,22 @@ from .context_manager import ContextManager
 from .control_events import (
     ControlEventSink,
     RunPin,
+    canonical_json,
     canonical_sha256,
     sanitize_config,
 )
 from .evidence_state import RunEvidenceState
+from .evidence_publications import (
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    EvidencePublicationRecoveryError,
+    evidence_publication_authority_for,
+    install_evidence_publication_authority,
+    latest_publication_raw_sha256,
+    publish_evidence_revision,
+    unavailable_evidence_publication_authority,
+    verify_latest_evidence_bytes,
+)
 from .react_engine import ReActEngine
 from .verdict_finalizer import (
     EvidenceCloseReason,
@@ -35,17 +49,23 @@ from .verdict_finalizer import (
     RunTerminationStatus,
     RunVerdictSnapshot,
     VerdictFinalizer,
-    read_verdict_snapshot,
+    read_live_verdict_snapshot,
 )
 
 
 def _active_setup_run_id(command_logger_id: object) -> str:
+    """Mint one command-scoped evidence epoch while preserving its log session."""
+
     session_logger = get_session_logger()
     session_id = str(getattr(session_logger, "session_id", "") or "").strip()
-    if session_id:
-        return session_id
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"setup-{timestamp}-{os.getpid()}-{command_logger_id or 'no-command-log'}"
+    if not session_id:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        session_id = f"setup-{timestamp}-{os.getpid()}"
+    command_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(command_logger_id or "no-command-log")).strip(
+        "-"
+    )[:48]
+    nonce = uuid.uuid4().hex[:12]
+    return f"{session_id}-{command_id or 'no-command-log'}-{nonce}"
 
 
 class SetupAgent:
@@ -80,12 +100,19 @@ class SetupAgent:
         self.run_termination = None
         self.workflow_mode = "idle"
         self.control_event_sink = None
+        self.evidence_publication_authority = unavailable_evidence_publication_authority(
+            "host control-event sink is not initialized"
+        )
         self._run_pin_template = None
         self._run_pin_host_path = None
         self._run_pin_mirror = None
+        self._run_pin_write_lock = threading.RLock()
         # Remembered so the post-loop pin rewrite (which carries the advisor
         # telemetry) does not drop the SHA the clone already observed.
         self._observed_target_repo_sha = None
+        # Assigned at command entry and copied into every receipt, exact row,
+        # run pin, and metrics artifact produced by that command.
+        self.run_id = None
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
@@ -126,7 +153,19 @@ class SetupAgent:
         the engine-owned phase machine + `phase` tool; legacy continuation and
         "run_task" keep the free-form surface with `manage_context` (spec §8.2).
         """
+        from sag.agent.invocation_receipts import set_active_receipt_run_id
+
+        if not getattr(self, "run_id", None):
+            state_run_id = str(
+                getattr(getattr(self, "run_evidence_state", None), "run_id", "") or ""
+            ).strip()
+            self.run_id = state_run_id or _active_setup_run_id(id(self))
+        set_active_receipt_run_id(self.run_id)
         if self.context_manager is not None:
+            # A long-lived SetupAgent can start a new command/run while keeping
+            # its tools. Publication authority is run-scoped even when those
+            # tool objects are reused.
+            self._initialize_control_recording()
             return  # Already initialized
 
         # Initialize ErrorLogger with container workspace path
@@ -189,11 +228,23 @@ class SetupAgent:
     def _initialize_control_recording(self) -> None:
         session_logger = get_session_logger()
         if session_logger is None:
+            authority = unavailable_evidence_publication_authority(
+                "session has no host control-event sink",
+                run_id=str(getattr(self, "run_id", "") or "").strip() or None,
+            )
+            self.evidence_publication_authority = authority
+            install_evidence_publication_authority(
+                authority,
+                orchestrator=getattr(self, "orchestrator", None),
+            )
             return
         from sag.utils.container_io import write_container_text
 
         container_dir = "/workspace/.setup_agent"
-        self.orchestrator.execute_command(f"mkdir -p {container_dir}")
+        control_execute = getattr(self.orchestrator, "execute_control_command", None)
+        if not callable(control_execute):
+            control_execute = self.orchestrator.execute_command
+        control_execute(f"mkdir -p {container_dir}")
 
         def mirror_event(line: str) -> None:
             if not write_container_text(
@@ -215,6 +266,26 @@ class SetupAgent:
         self.control_event_sink = session_logger.get_control_event_sink(mirror=mirror_event)
         self._run_pin_host_path = session_logger.run_pin_path
         self._run_pin_mirror = mirror_pin
+        run_id = str(getattr(self, "run_id", "") or "").strip()
+        if not run_id:
+            authority = unavailable_evidence_publication_authority("current command has no run id")
+        else:
+            try:
+                authority = EvidencePublicationAuthority.for_live_run(
+                    run_id=run_id,
+                    sink=self.control_event_sink,
+                )
+            except (EvidencePublicationRecoveryError, TypeError, ValueError) as exc:
+                authority = unavailable_evidence_publication_authority(
+                    "host publication stream failed strict recovery",
+                    run_id=run_id,
+                )
+                self.agent_logger.error(f"Evidence publication authority unavailable: {exc}")
+        self.evidence_publication_authority = authority
+        install_evidence_publication_authority(
+            authority,
+            orchestrator=getattr(self, "orchestrator", None),
+        )
 
     @staticmethod
     def _resolve_sag_git_sha() -> str | None:
@@ -249,6 +320,8 @@ class SetupAgent:
     def _initialize_run_pin_template(self) -> None:
         if self._run_pin_host_path is None or self.react_engine is None:
             return
+        if not getattr(self, "run_id", None):
+            self.run_id = _active_setup_run_id(id(self))
         sag_git_sha = self._resolve_sag_git_sha()
         image_digest = self._resolve_container_image_digest()
         if sag_git_sha is None or image_digest is None:
@@ -270,6 +343,7 @@ class SetupAgent:
             self.react_engine.prompts,
         )
         self._run_pin_template = {
+            "run_id": self.run_id,
             "container_image_digest": image_digest,
             "sag_git_sha": sag_git_sha,
             "thinking_model": self.config.thinking_model,
@@ -310,25 +384,91 @@ class SetupAgent:
         telemetry = getattr(engine, "advisor_telemetry", None)
         return telemetry if isinstance(telemetry, dict) else None
 
-    def _write_run_pin(self, *, target_repo_sha: str | None) -> None:
+    def _write_run_pin(self, *, target_repo_sha: str | None) -> bool:
+        lock = getattr(self, "_run_pin_write_lock", None)
+        if lock is None:
+            # Narrow compatibility for tests that construct SetupAgent with
+            # object.__new__; production initializes this before any writer.
+            lock = threading.RLock()
+            self._run_pin_write_lock = lock
+        with lock:
+            return self._write_run_pin_locked(target_repo_sha=target_repo_sha)
+
+    def _write_run_pin_locked(self, *, target_repo_sha: str | None) -> bool:
         template = getattr(self, "_run_pin_template", None)
         host_path = getattr(self, "_run_pin_host_path", None)
         if template is None or host_path is None:
             self.agent_logger.warning("Run pin write attempted before provenance was ready")
-            return
+            return False
         try:
+            logical_artifact_id = RUN_PIN_LOGICAL_ARTIFACT_ID
+            expected_publication = latest_publication_raw_sha256(
+                getattr(self, "orchestrator", None), logical_artifact_id
+            )
             pin = RunPin(
                 target_repo_sha=target_repo_sha,
                 advisor=self._advisor_telemetry(),
                 **template,
             )
+            raw = canonical_json(pin).encode("utf-8")
+            authority = evidence_publication_authority_for(getattr(self, "orchestrator", None))
+            head = authority.latest_head(logical_artifact_id)
+            target = Path(host_path)
+            current = target.read_bytes() if target.exists() else None
+            if head is not None:
+                if head.publication_state == "revoked":
+                    self.agent_logger.warning("Refusing to resurrect a revoked run pin")
+                    return False
+                current_is_host_head = bool(
+                    current is not None
+                    and verify_latest_evidence_bytes(
+                        getattr(self, "orchestrator", None),
+                        record_kind="run_pin",
+                        record_id=logical_artifact_id,
+                        logical_artifact_id=logical_artifact_id,
+                        raw=current,
+                    ).authorized
+                )
+                if not current_is_host_head:
+                    # Complete only an exact interrupted host write. Any other
+                    # mismatch is host-file tampering and must not become a
+                    # new trusted revision.
+                    if current == raw:
+                        publication = publish_evidence_revision(
+                            getattr(self, "orchestrator", None),
+                            record_kind="run_pin",
+                            record_id=logical_artifact_id,
+                            logical_artifact_id=logical_artifact_id,
+                            raw=raw,
+                            expected_previous_raw_sha256=expected_publication,
+                        )
+                        return publication.published
+                    self.agent_logger.warning(
+                        "Refusing to rewrite a run pin that is not the current host revision"
+                    )
+                    return False
             ControlEventSink.write_run_pin(
                 host_path,
                 pin,
                 mirror=getattr(self, "_run_pin_mirror", None),
             )
+            publication = publish_evidence_revision(
+                getattr(self, "orchestrator", None),
+                record_kind="run_pin",
+                record_id=logical_artifact_id,
+                logical_artifact_id=logical_artifact_id,
+                raw=raw,
+                expected_previous_raw_sha256=expected_publication,
+            )
+            if not publication.published:
+                self.agent_logger.warning(
+                    "Run pin reached the host but publication failed: " f"{publication.status}"
+                )
+                return False
+            return True
         except Exception as exc:
             self.agent_logger.warning(f"Could not persist run pin: {exc}")
+            return False
 
     def _record_target_repo_sha(self, target_repo_sha: str) -> None:
         # Rewrite the pin with the observed SHA (the startup write left it
@@ -405,6 +545,7 @@ class SetupAgent:
             test_pass_threshold=self.config.test_pass_threshold,
             build_coverage_threshold=self.config.build_coverage_threshold,
             test_execution_threshold=self.config.test_execution_threshold,
+            receipt_run_id=getattr(self, "run_id", None),
         )
         # Attach the shared tracker so validate_build_status can surface the
         # timed build duration + command in its evidence dict.
@@ -452,6 +593,15 @@ class SetupAgent:
         else:
             lifecycle_tool = ContextTool(self.context_manager)
 
+        report_tool = ReportTool(
+            self.orchestrator,
+            execution_history_callback=self._get_execution_history,
+            context_manager=self.context_manager,
+            physical_validator=self.physical_validator,
+            workflow_mode=workflow_mode,
+            control_event_sink=self.control_event_sink,
+        )
+        self.report_tool = report_tool
         tools = [
             BashTool(self.orchestrator, config=bash_config),
             FileIOTool(self.orchestrator),
@@ -475,13 +625,7 @@ class SetupAgent:
                 web_search=WebSearchTool(),
                 command_tracker=self.command_tracker,
             ),
-            ReportTool(
-                self.orchestrator,
-                execution_history_callback=self._get_execution_history,
-                context_manager=self.context_manager,
-                physical_validator=self.physical_validator,
-                workflow_mode=workflow_mode,
-            ),
+            report_tool,
             # ALWAYS registered, in every mode: `advisor_mode="off"` is answered
             # by the engine's consult, so the ablation switch changes behavior
             # without changing the tool surface the model sees (spec §3.7.6).
@@ -603,6 +747,7 @@ class SetupAgent:
 
         # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
+        self.run_id = _active_setup_run_id(cmd_logger_id)
         cmd_logger.info(f"Starting project setup: {project_name} (docker_label={docker_label})")
 
         try:
@@ -646,7 +791,7 @@ class SetupAgent:
             from sag.agent.phase_machine import PhaseMachine
 
             self.phase_machine = PhaseMachine()
-            self.run_evidence_state = RunEvidenceState(run_id=_active_setup_run_id(cmd_logger_id))
+            self.run_evidence_state = RunEvidenceState(run_id=self.run_id)
             self.verdict_finalizer = VerdictFinalizer(
                 self.orchestrator,
                 test_pass_threshold=self.config.test_pass_threshold,
@@ -675,8 +820,8 @@ class SetupAgent:
             # Step 2: Initialize trunk context mirroring the engine-owned phase
             # plan. Trunk tasks use phase_<name> ids so phase history persists
             # exactly like task history (phase_<name>.json — the webui keeps
-            # rendering); descriptions are the one-line phase objectives
-            # (TOOLS, never raw commands).
+            # rendering); descriptions are outcome/evidence contracts. Public
+            # call syntax remains owned by the generated tool schemas.
             from sag.agent.phase_machine import PHASE_NAMES
             from sag.agent.react_engine import kickoff_phase_objectives
 
@@ -748,7 +893,15 @@ class SetupAgent:
 
             # Step 5: Render the immutable setup result. Delivery remains a
             # separate flow fact and never changes the verdict.
-            snapshot = read_verdict_snapshot(self.orchestrator)
+            snapshot = read_live_verdict_snapshot(self.orchestrator)
+            try:
+                self.report_tool.finalize_metrics_v2(snapshot)
+            except Exception as exc:
+                # The metrics writer is deliberately fail-closed (for example,
+                # success + degraded receipt transport is rejected). The
+                # immutable verdict remains the judge's fact; CLI/web fall back
+                # to an explicitly non-campaign display projection.
+                self.agent_logger.error(f"Final metrics-v2 artifact rejected: {exc}")
             if self.config.ui_mode:
                 if snapshot.verdict == "success":
                     self._emit(
@@ -820,6 +973,7 @@ class SetupAgent:
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
         """Continue working on an existing project."""
         self.workflow_mode = "continue"
+        self.run_id = _active_setup_run_id(f"continue-{id(self)}")
 
         self.console.print(
             Panel.fit(
@@ -889,6 +1043,7 @@ class SetupAgent:
 
         # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
+        self.run_id = _active_setup_run_id(cmd_logger_id)
         cmd_logger.info(f"Starting task execution: {task_description}")
 
         try:
@@ -1177,7 +1332,8 @@ Do not generate a final setup report unless the TASK explicitly asks for one.
             ref_instruction = f"""
 
 Repository version handle: {project_ref}
-When cloning, pass ref="{project_ref}" to project_setup. Do not set up the default branch if this ref cannot be checked out.
+The checkout evidence must resolve exactly this ref. A default-branch checkout is not an
+acceptable substitute when this ref cannot be resolved.
 """
 
         setup_prompt = f"""
@@ -1188,28 +1344,24 @@ My goal: {goal}
 
 PHASED SETUP RUN — the engine drives a fixed phase plan:
 provision → analyze → build → test → report.
-I never reorder or skip phases; the engine routes from prerequisites. I may only propose a
-bounded repair to the direct build/analyze dependency named by the phase tool contract.
+I never reorder or skip phases; the engine routes from prerequisites. When a terminal claim is
+rejected, the judge gives me facts and constraints; I choose the next ordinary tool action.
 
 How I work:
-1. Work freely inside the current phase with the available tools:
-   - project(action='clone'/'provision'/'analyze'/'env') for repository and toolchain work
-   - build(action='deps'/'compile'/'test'/'package') for builds and tests — it auto-selects
-     maven/gradle and resolves the registered toolchain
-   - search(target=...) to inspect stored outputs, files, and background job logs
-   - bash and file_io for everything else
+1. Read the current phase facts, coordinates, constraints, and unresolved evidence; then choose
+   one ordinary action from the available tool schemas. Tool results determine the next choice.
 2. When the phase objective is met, claim it with
    phase(action='done', outcome='success|partial|failed|unknown', key_results=...,
    evidence=[refs]) — the claim is checked against physical evidence.
 3. If the phase truly cannot finish here, record it honestly with
    phase(action='blocked', outcome='failed|partial|unknown', reason=..., evidence=[refs]) —
    validator evidence controls the recorded outcome and engine routing.
-4. If new downstream evidence invalidates a direct prerequisite, propose one bounded repair:
-   phase(action='repair', target_phase='build|analyze', reason_code=...,
-   failure_signature=..., hypothesis=..., evidence=[current_attempt_refs]).
+4. If a terminal claim is rejected with a RepairContext, revise my hypothesis and issue one
+   ordinary project action using the repair_intent fields exposed on admissible tool schemas.
+   The harness supplies facts and policy bounds, never the project command.
 5. phase(action='note', text=...) records working notes worth keeping.
 
-The final phase generates the setup report with the report tool.
+The final phase closes only after a durable report artifact reflects the sealed evidence.
 The repository URL is already provided: {project_url}
 START by working toward the current phase objective shown in my context.
 """
@@ -1585,22 +1737,27 @@ START by working toward the current phase objective shown in my context.
             return False
 
     def _get_project_name_for_validation(self) -> Optional[str]:
-        """Resolve the real workspace project directory for final validation."""
+        """Resolve validation scope without trusting container metadata.
 
-        project_name = self._read_project_name_from_metadata()
-        if project_name:
-            return project_name
+        ``project_meta.json`` is a useful forensic/display mirror, but project
+        code can rewrite it. The task entrypoint already owns the actual
+        project name; prefer that controller value over the Docker label.
+        """
 
-        project_name = getattr(self.orchestrator, "project_name", None) or getattr(
-            self, "project_name", None
-        )
+        project_name = getattr(self, "project_name", None)
         if not project_name and hasattr(self.context_manager, "project_name"):
             project_name = self.context_manager.project_name
+        if not project_name:
+            project_name = getattr(self.orchestrator, "project_name", None)
 
         return project_name
 
     def _read_project_name_from_metadata(self) -> Optional[str]:
-        """Read actual repo directory from project metadata when --name used a custom label."""
+        """Forensically read the legacy project metadata mirror.
+
+        Live validation never calls this method: container-authored bytes do
+        not have authority to redirect the final validator.
+        """
 
         try:
             result = self.orchestrator.execute_command(
@@ -1635,6 +1792,12 @@ START by working toward the current phase objective shown in my context.
         self, termination: RunTermination, snapshot: RunVerdictSnapshot
     ) -> None:
         """Render setup completion from one sealed snapshot and flow termination."""
+        from sag.tools.report_metrics import (
+            build_evidence_layer_projection,
+            format_evidence_layer_lines,
+            read_live_report_metrics,
+        )
+
         exec_summary = self.react_engine.get_execution_summary()
         context_info = self.context_manager.get_current_context_info()
         verdict_style = {
@@ -1644,18 +1807,24 @@ START by working toward the current phase objective shown in my context.
             "unknown": ("bold yellow", "yellow"),
         }
         text_style, border_style = verdict_style[snapshot.verdict]
-        tests = snapshot.test_stats
-        flaky = f" ({tests.flaky_count} flaky)" if tests.flaky_count else ""
+        metrics_v2 = None
+        try:
+            read = read_live_report_metrics(self.orchestrator)
+            metrics_v2 = read.payload if read.complete and read.conflict is None else None
+        except (AttributeError, TypeError, ValueError):
+            pass
+        if metrics_v2 is None:
+            metrics_v2 = build_evidence_layer_projection(
+                snapshot=snapshot.model_dump(mode="json"),
+                conflicts=list(snapshot.conflicts),
+            )
         summary_lines = [
             f"[{text_style}]{snapshot.verdict.upper()}[/{text_style}]",
             "",
             "[bold]Canonical Result:[/bold]",
             f"• Verdict: {snapshot.verdict}",
-            f"• {tests.passed} / {tests.executed} unique tests passed{flaky}",
-            f"• Failures: {tests.failed}; errors: {tests.errors}; skipped: {tests.skipped}",
+            *[f"• {line}" for line in format_evidence_layer_lines(metrics_v2)],
         ]
-        if tests.raw.executed != tests.executed:
-            summary_lines.append(f"• Raw executions (diagnostic): {tests.raw.executed}")
         summary_lines.extend(
             [
                 f"• Report delivery: {termination.report_delivery_status.value}",

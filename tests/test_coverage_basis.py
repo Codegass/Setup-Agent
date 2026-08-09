@@ -36,8 +36,12 @@ names which one it used.
 
 import json
 
+import pytest
+from container_evidence_fakes import strict_published_evidence
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
 
+from sag.agent.evidence_records import frame_json_record_stream
+from sag.agent.invocation_receipts import RECEIPT_DIR
 from sag.agent.module_coverage import ModuleBasis, module_basis
 from sag.agent.physical_validator import (
     INVOCATION_RECEIPTS_DIRNAME,
@@ -57,6 +61,30 @@ POLARIS_MODULES = [
     "polaris-catalog-service",
     *[f"plugins/plugin-{n}" for n in range(19)],
 ]
+
+_CURRENT_RECEIPT_RUN = "coverage-current-run"
+_CURRENT_TARGET_SHA = "a" * 40
+
+
+def _current_build_receipt(receipt, *, root="/workspace/proj"):
+    """Fill the durable binding fields production receipts always carry."""
+
+    receipt_id = str(receipt.get("receipt_id") or "")
+    tool = "gradle" if "gradle" in receipt_id else "maven"
+    payload = {
+        "schema_version": 2,
+        "run_id": _CURRENT_RECEIPT_RUN,
+        "tool": tool,
+        "requested_action": "compile",
+        "effective_action": "compile",
+        "working_directory": root,
+        "actual_cwd": root,
+        "target_sha": _CURRENT_TARGET_SHA,
+        "domain_id": root,
+        "outcome": "completed" if receipt.get("exit_code") == 0 else "failed",
+    }
+    payload.update(receipt)
+    return payload
 
 
 def _polaris_scan(built=("build-logic",)):
@@ -109,7 +137,10 @@ def _polaris_validator(
         files.add("/workspace/polaris/build/libs/polaris-1.0.jar")
     orch = _orchestrator(files, receipts, degrade)
     validator = PhysicalValidator(
-        docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
+        docker_orchestrator=orch,
+        project_path="/workspace",
+        build_coverage_threshold=1.0,
+        receipt_run_id=_CURRENT_RECEIPT_RUN,
     )
     validator._detect_build_system = lambda *_a, **_k: "gradle"
     validator._check_build_artifacts_complete = lambda _d: {
@@ -129,7 +160,7 @@ def _polaris_validator(
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
     if receipts is None:
-        validator._attempted_module_evidence = lambda: _AttemptedModules(
+        validator._attempted_module_evidence = lambda *_a, **_k: _AttemptedModules(
             tuple(attempted or ()), True, None
         )
     validator._receipt_structure = lambda: structure or {}
@@ -161,7 +192,10 @@ def _maven_reactor_validator(
     files |= {"/workspace/proj/pom.xml", "/workspace/proj/m0/target/app.jar"}
     orch = _orchestrator(files, receipts, degrade)
     validator = PhysicalValidator(
-        docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
+        docker_orchestrator=orch,
+        project_path="/workspace",
+        build_coverage_threshold=1.0,
+        receipt_run_id=_CURRENT_RECEIPT_RUN,
     )
     validator._detect_build_system = lambda *_a, **_k: "maven"
     validator._check_build_artifacts_complete = lambda _d: {
@@ -182,7 +216,7 @@ def _maven_reactor_validator(
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
     if receipts is None:
-        validator._attempted_module_evidence = lambda: _AttemptedModules(
+        validator._attempted_module_evidence = lambda *_a, **_k: _AttemptedModules(
             tuple(attempted or ()), True, None
         )
     validator._receipt_structure = lambda: structure or {}
@@ -205,7 +239,10 @@ def _met_expectation_validator(
     files |= {"/workspace/proj/pom.xml", "/workspace/proj/m0/target/app.jar"}
     orch = _orchestrator(files, receipts, degrade)
     validator = PhysicalValidator(
-        docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=1.0
+        docker_orchestrator=orch,
+        project_path="/workspace",
+        build_coverage_threshold=1.0,
+        receipt_run_id=_CURRENT_RECEIPT_RUN,
     )
     validator._detect_build_system = lambda *_a, **_k: "maven"
     validator._check_build_artifacts_complete = lambda _d: {
@@ -225,7 +262,7 @@ def _met_expectation_validator(
     ]
     validator._module_scan_result = lambda *_a, **_k: scan
     if receipts is None:
-        validator._attempted_module_evidence = lambda: _AttemptedModules(
+        validator._attempted_module_evidence = lambda *_a, **_k: _AttemptedModules(
             tuple(attempted or ()), True, None
         )
     validator._receipt_structure = lambda: structure or {}
@@ -233,15 +270,27 @@ def _met_expectation_validator(
 
 
 class ReceiptOrchestrator:
-    """A container holding invocation receipts, one JSON object per line —
-    which is what `cat <receipts dir>/*.json` returns for the schema-v1 files."""
+    """A container holding atomic invocation receipts.
 
-    def __init__(self, receipts, *, present=True):
+    Production reads each file separately and inserts an explicit newline;
+    atomic writers intentionally do not append one to the stored bytes.
+    """
+
+    def __init__(self, receipts, *, present=True, run_pin=None):
         self.receipts = list(receipts)
         self.present = present
+        self.evidence = strict_published_evidence(
+            self,
+            run_id=_CURRENT_RECEIPT_RUN,
+            target_sha=_CURRENT_TARGET_SHA,
+            receipts=self.receipts,
+            run_pin=run_pin,
+        )
 
     def execute_command(self, command, **_kwargs):
         text = command.strip()
+        if "run-pin.json" in text:
+            return self.evidence(command)
         if INVOCATION_RECEIPTS_DIRNAME not in text:
             return {"success": True, "exit_code": 0, "output": ""}
         if text.startswith("test -d"):
@@ -250,10 +299,7 @@ class ReceiptOrchestrator:
                 "exit_code": 0 if self.present else 1,
                 "output": "EXISTS" if self.present else "",
             }
-        if text.startswith("cat "):
-            body = "\n".join(json.dumps(receipt) for receipt in self.receipts)
-            return {"success": True, "exit_code": 0, "output": body}
-        return {"success": True, "exit_code": 0, "output": ""}
+        return self.evidence(command)
 
 
 class ReceiptFilesystem(FakeBuildOrchestrator):
@@ -271,29 +317,40 @@ class ReceiptFilesystem(FakeBuildOrchestrator):
         self, files=(), *, receipts=(), corrupt=(), cat_raises=False, present_raises=False
     ):
         super().__init__(files=files)
-        self.receipt_bodies = []
-        for index, receipt in enumerate(receipts):
-            body = json.dumps(receipt)
-            if index in corrupt:
-                body = body[: max(len(body) // 2, 1)]
-            self.receipt_bodies.append(body)
+        self.evidence = strict_published_evidence(
+            self,
+            run_id=_CURRENT_RECEIPT_RUN,
+            target_sha=_CURRENT_TARGET_SHA,
+            receipts=tuple(receipts),
+        )
+        self.receipt_paths = sorted(
+            path for path in self.evidence.files if path.startswith(f"{RECEIPT_DIR}/")
+        )
+        for index in corrupt:
+            if index >= len(self.receipt_paths):
+                continue
+            path = self.receipt_paths[index]
+            body = self.evidence.files[path]
+            self.evidence.files[path] = body[: max(len(body) // 2, 1)]
         self.cat_raises = cat_raises
         self.present_raises = present_raises
 
     def execute_command(self, command, **_kwargs):
         text = command.strip()
+        if "run-pin.json" in text:
+            return self.evidence(command)
         if INVOCATION_RECEIPTS_DIRNAME in text:
             if text.startswith("test -d"):
                 if self.present_raises:
                     raise RuntimeError("container flake on the receipt-directory probe")
                 return {
                     "exit_code": 0,
-                    "output": "EXISTS" if self.receipt_bodies else "",
+                    "output": "EXISTS" if self.receipt_paths else "",
                 }
-            if text.startswith("cat "):
+            if "SAG_JSON_RECORD_V1" in text:
                 if self.cat_raises:
                     raise RuntimeError("container flake reading the receipts")
-                return {"exit_code": 0, "output": "\n".join(self.receipt_bodies)}
+                return self.evidence(command)
         return super().execute_command(command)
 
 
@@ -371,7 +428,7 @@ def test_no_basis_with_nothing_compiled_is_blocked_not_partial():
 
 
 def test_a_derived_and_met_jar_expectation_is_a_basis_and_stays_a_full_success():
-    """"No basis" means NO expectation of any kind could be derived.
+    """ "No basis" means NO expectation of any kind could be derived.
 
     A Kotlin/Scala/Groovy module keeps its sources in `src/main/kotlin`, so the
     parsers emit only the JAR expectation (the `classes` entry is appended
@@ -477,19 +534,25 @@ def test_a_derived_basis_keeps_todays_thresholds_and_messages():
 # ---------------------------------------------------------------------------
 def _receipt_validator(receipts):
     return PhysicalValidator(
-        docker_orchestrator=ReceiptOrchestrator(receipts), project_path="/workspace"
+        docker_orchestrator=ReceiptOrchestrator(receipts),
+        project_path="/workspace",
+        receipt_run_id=_CURRENT_RECEIPT_RUN,
     )
 
 
 def _killed_receipt():
     """The OOM case: `collect_detached_result` synthesized exit 1 and recorded
     `lifecycle_state: vanished`, and Gradle had printed 40 of 300 modules."""
-    return {
-        "receipt_id": "inv-gradle-1-0007",
-        "exit_code": 1,
-        "lifecycle_state": "vanished",
-        "module_outcomes": [{"module": f"m{index}", "status": "SUCCESS"} for index in range(40)],
-    }
+    return _current_build_receipt(
+        {
+            "receipt_id": "inv-gradle-1-0007",
+            "exit_code": 1,
+            "lifecycle_state": "vanished",
+            "module_outcomes": [
+                {"module": f"m{index}", "status": "SUCCESS"} for index in range(40)
+            ],
+        }
+    )
 
 
 def test_a_crashed_dispatchs_truncated_module_list_is_not_a_denominator():
@@ -534,17 +597,21 @@ def test_a_terminal_receipt_still_sets_the_denominator():
     rather than being dropped: the union is what this run attempted, and the
     narrowing waits for evidence the harness will stand behind.
     """
-    finished = {
-        "receipt_id": "inv-maven-1-0001",
-        "exit_code": 1,
-        "lifecycle_state": "finished",
-        "module_outcomes": [{"module": "core", "status": "SUCCESS"}],
-    }
-    synchronous = {
-        "receipt_id": "inv-maven-1-0002",
-        "exit_code": 0,
-        "module_outcomes": [{"module": "jms", "status": "SUCCESS"}],
-    }
+    finished = _current_build_receipt(
+        {
+            "receipt_id": "inv-maven-1-0001",
+            "exit_code": 1,
+            "lifecycle_state": "finished",
+            "module_outcomes": [{"module": "core", "status": "SUCCESS"}],
+        }
+    )
+    synchronous = _current_build_receipt(
+        {
+            "receipt_id": "inv-maven-1-0002",
+            "exit_code": 0,
+            "module_outcomes": [{"module": "jms", "status": "SUCCESS"}],
+        }
+    )
 
     assert _receipt_validator([finished])._attempted_module_evidence() == _AttemptedModules(
         ("core",), True, None
@@ -560,6 +627,68 @@ def test_a_terminal_receipt_still_sets_the_denominator():
     assert set(beside_a_crash.modules) == {f"m{index}" for index in range(40)} | {"core", "jms"}
 
 
+def test_prior_run_same_sha_receipt_cannot_narrow_current_coverage():
+    stale = _current_build_receipt(
+        {
+            "receipt_id": "inv-maven-prior-0001",
+            "run_id": "prior-run",
+            "target_sha": _CURRENT_TARGET_SHA,
+            "exit_code": 0,
+            "module_outcomes": [{"module": "stale-scoped-module", "status": "SUCCESS"}],
+        }
+    )
+
+    evidence = _receipt_validator([stale])._attempted_module_evidence()
+
+    assert evidence == _AttemptedModules((), True, None)
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        _current_build_receipt(
+            {
+                "receipt_id": "inv-maven-changed-target-0001",
+                "target_sha": "b" * 40,
+                "exit_code": 0,
+                "module_outcomes": [{"module": "stale-target", "status": "SUCCESS"}],
+            }
+        ),
+        _current_build_receipt(
+            {
+                "receipt_id": "inv-maven-foreign-domain-0001",
+                "domain_id": "/workspace/foreign",
+                "exit_code": 0,
+                "module_outcomes": [{"module": "foreign-domain", "status": "SUCCESS"}],
+            }
+        ),
+    ],
+)
+def test_same_run_changed_target_or_foreign_domain_cannot_narrow(receipt):
+    assert _receipt_validator([receipt])._attempted_module_evidence(
+        "/workspace/proj"
+    ) == _AttemptedModules((), True, None)
+
+
+@pytest.mark.parametrize(
+    "run_pin",
+    ["{not-json", {"run_id": "other-run", "target_repo_sha": _CURRENT_TARGET_SHA}],
+)
+def test_unreadable_or_mismatched_run_pin_caps_denominator(run_pin):
+    validator = PhysicalValidator(
+        docker_orchestrator=ReceiptOrchestrator(
+            [_current_build_receipt({"receipt_id": "inv-maven-current-0001", "exit_code": 0})],
+            run_pin=run_pin,
+        ),
+        project_path="/workspace",
+        receipt_run_id=_CURRENT_RECEIPT_RUN,
+    )
+
+    assert validator._attempted_module_evidence() == _AttemptedModules(
+        (), False, "build_receipt_scope_unavailable"
+    )
+
+
 def test_an_unreadable_receipt_line_states_nothing_and_hides_what_it_stated():
     """P4's third verb. A half-written or clipped receipt line was skipped as if
     the run had never written it — so the widest statement in a container could
@@ -569,11 +698,28 @@ def test_an_unreadable_receipt_line_states_nothing_and_hides_what_it_stated():
     orchestrator.receipts = []
     truncated = json.dumps(_killed_receipt())[:40]
     orchestrator.execute_command = lambda command, **_k: (
-        {"success": True, "exit_code": 0, "output": "EXISTS"}
-        if command.strip().startswith("test -d")
-        else {"success": True, "exit_code": 0, "output": truncated}
+        {
+            "success": True,
+            "exit_code": 0,
+            "output": json.dumps(
+                {
+                    "run_id": _CURRENT_RECEIPT_RUN,
+                    "target_repo_sha": _CURRENT_TARGET_SHA,
+                }
+            ),
+        }
+        if "run-pin.json" in command
+        else (
+            {"success": True, "exit_code": 0, "output": "EXISTS"}
+            if command.strip().startswith("test -d")
+            else {"success": True, "exit_code": 0, "output": truncated}
+        )
     )
-    validator = PhysicalValidator(docker_orchestrator=orchestrator, project_path="/workspace")
+    validator = PhysicalValidator(
+        docker_orchestrator=orchestrator,
+        project_path="/workspace",
+        receipt_run_id=_CURRENT_RECEIPT_RUN,
+    )
 
     evidence = validator._attempted_module_evidence()
 
@@ -597,10 +743,8 @@ def test_a_probe_that_threw_is_not_the_fact_that_no_receipt_exists():
                 raise RuntimeError("container flake")
             return {"success": True, "exit_code": 0, "output": "EXISTS"}
 
-    for fail_on in ("test -d", "cat "):
-        validator = PhysicalValidator(
-            docker_orchestrator=Flaky(fail_on), project_path="/workspace"
-        )
+    for fail_on in ("test -d", "for file in"):
+        validator = PhysicalValidator(docker_orchestrator=Flaky(fail_on), project_path="/workspace")
 
         assert validator._attempted_module_evidence() == _AttemptedModules(
             (), False, "build_receipts_unreadable"
@@ -1041,18 +1185,24 @@ def _reactor_receipts(*, wide_lifecycle="finished"):
     `mvn -pl m0` retry that finished, exit 0, naming one module.
     """
     return [
-        {
-            "receipt_id": "inv-maven-1-0001",
-            "exit_code": 1,
-            "lifecycle_state": wide_lifecycle,
-            "module_outcomes": [{"module": name, "status": "success"} for name in MAVEN_MODULES],
-        },
-        {
-            "receipt_id": "inv-maven-1-0002",
-            "exit_code": 0,
-            "lifecycle_state": "finished",
-            "module_outcomes": [{"module": "m0", "status": "success"}],
-        },
+        _current_build_receipt(
+            {
+                "receipt_id": "inv-maven-1-0001",
+                "exit_code": 1,
+                "lifecycle_state": wide_lifecycle,
+                "module_outcomes": [
+                    {"module": name, "status": "success"} for name in MAVEN_MODULES
+                ],
+            }
+        ),
+        _current_build_receipt(
+            {
+                "receipt_id": "inv-maven-1-0002",
+                "exit_code": 0,
+                "lifecycle_state": "finished",
+                "module_outcomes": [{"module": "m0", "status": "success"}],
+            }
+        ),
     ]
 
 
@@ -1060,11 +1210,14 @@ def _build_logic_receipt():
     """polaris's shape: one synchronous dispatch naming a subproject that no
     derived expectation mentions."""
     return [
-        {
-            "receipt_id": "inv-gradle-1-0001",
-            "exit_code": 0,
-            "module_outcomes": [{"module": "build-logic", "status": "attempted"}],
-        }
+        _current_build_receipt(
+            {
+                "receipt_id": "inv-gradle-1-0001",
+                "exit_code": 0,
+                "module_outcomes": [{"module": "build-logic", "status": "attempted"}],
+            },
+            root="/workspace/polaris",
+        )
     ]
 
 
@@ -1231,6 +1384,6 @@ def test_no_degraded_read_of_the_same_receipts_can_improve_the_verdict():
                 f"{state}: {label} improved the verdict from "
                 f"{clean['evidence_status']} to {degraded['evidence_status']}"
             )
-            assert degraded["build_complete"] <= clean["build_complete"], (
-                f"{state}: {label} completed a build the clean read did not"
-            )
+            assert (
+                degraded["build_complete"] <= clean["build_complete"]
+            ), f"{state}: {label} completed a build the clean read did not"

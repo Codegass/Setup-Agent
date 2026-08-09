@@ -13,13 +13,25 @@ single_module            -> everything else (root build, no reactor modules)
 
 import json
 
+from test_container_io import FakeContainer
+
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+_ATOMIC_WRITE_PREFIXES = (
+    "mkdir -p -- ",
+    ": > ",
+    "printf '%s' ",
+    "base64 --decode ",
+    "python3 -c ",
+    "rm -f -- ",
+    "mv -f -- ",
+)
 
 
 class FakeOrch:
     """Answers the analyzer's shell probes from a canned filesystem set and
-    captures the manifest heredoc write."""
+    captures the atomically persisted manifest."""
 
     def __init__(self, existing_paths, find_output="", test_find_output=""):
         self.existing = set(existing_paths)
@@ -27,8 +39,12 @@ class FakeOrch:
         self.test_find_output = test_find_output
         self.pom = ""
         self.files = {}
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     def execute_command(self, cmd, workdir=None):
+        if cmd.startswith(_ATOMIC_WRITE_PREFIXES):
+            return self.atomic.execute_command(cmd)
         if cmd.startswith("mkdir -p"):
             return {"success": True, "exit_code": 0, "output": ""}
         if "<<" in cmd and REQUIREMENTS_PATH in cmd:  # heredoc manifest write

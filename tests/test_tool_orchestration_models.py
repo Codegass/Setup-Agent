@@ -43,18 +43,16 @@ def test_tool_execution_status_is_separate_from_tool_result_outcome():
     execution = ToolExecution(
         call=ToolCall(name="bash", raw_params={"command": "mvn test"}),
         result=result,
-        status="recovery_attempted",
+        status="failure",
         raw_params={"command": "mvn test"},
         validated_params={"command": "mvn test", "working_directory": "/workspace"},
         executed_params={"command": "mvn test", "working_directory": "/workspace"},
         duration_ms=12.5,
         observation_text="handled timeout",
-        recovery_applied=True,
-        recovery_strategy="bash_timeout_guidance",
         attempted_execution=True,
     )
 
-    assert execution.status == "recovery_attempted"
+    assert execution.status == "failure"
     assert execution.result.succeeded is False
     assert execution.executed_params["working_directory"] == "/workspace"
 

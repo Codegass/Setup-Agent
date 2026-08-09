@@ -14,6 +14,8 @@ Scripted-orchestrator style (house pattern, tests/test_python_tool.py):
 first-matching-substring rule wins, every command recorded.
 """
 
+import pytest
+
 from sag.tools.internal.python_tool import PythonTool
 from tests.test_python_tool import (
     Orch,
@@ -25,6 +27,8 @@ from tests.test_python_tool import (
     ok,
     tvm_provider_rules,
 )
+
+pytestmark = pytest.mark.usefixtures("exact_python_runner_authority")
 
 # The provider builds fine, just below the declared floor: the manifest floor
 # is `>=0.1.13` and the local checkout produces `0.1.13.dev47`.

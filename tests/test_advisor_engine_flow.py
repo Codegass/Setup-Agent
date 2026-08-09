@@ -25,7 +25,7 @@ measurable against the Plan-2 churn baseline instead of merely asserted.
 from types import SimpleNamespace
 
 import pytest
-from test_verdict_finalizer import FakeVerdictOrchestrator
+from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authority
 
 import sag.agent.native_messages as native_messages
 from sag.agent.advisor import AdvisorTool
@@ -197,7 +197,9 @@ def _engine(tmp_path, *, advisor_mode="same-model", max_iterations=20):
     engine.phase_machine = machine
     engine.max_iterations = max_iterations
     engine.run_evidence_state = RunEvidenceState(run_id="advisor-flow")
-    engine.verdict_finalizer = VerdictFinalizer(FakeVerdictOrchestrator())
+    verdict_orchestrator = FakeVerdictOrchestrator()
+    bind_verdict_authority(verdict_orchestrator, engine.run_evidence_state.run_id)
+    engine.verdict_finalizer = VerdictFinalizer(verdict_orchestrator)
     engine.transition_policy = PhaseTransitionPolicy()
     engine._repair_global_remaining = 2
     engine._repair_phase_remaining = {"build": 1, "test": 1}
@@ -334,22 +336,22 @@ def _redirect_spy(engine):
     return rules
 
 
-def test_the_guarantees_consult_at_entry_redirect_once_and_still_complete(tmp_path, pairing_spy):
+def test_consult_at_entry_and_direct_judge_claim_still_complete(tmp_path, pairing_spy):
     engine = _engine(tmp_path)
     rules = _redirect_spy(engine)
 
     termination = engine.run_setup_loop("set up the project", max_iterations=20)
 
-    # Exactly the one redirect guarantee the script still trips. (Audit
-    # 2026-07-26: before-acting used to precede it and cancel turn 3.)
-    assert rules == ["before-giving-up"]
+    # A terminal claim reaches the physical judge directly. The advisor cannot
+    # pre-judge it from a weaker transcript projection.
+    assert rules == []
     # Nothing was cancelled: both scripted compiles reached the tool.
     assert engine.tools["build"].calls == ["compile", "compile"]
 
     telemetry = engine.advisor_telemetry
     assert telemetry["mode"] == "same-model"
-    # Three consults: the harness's at build entry, then the model's two.
-    assert [call["phase"] for call in telemetry["calls"]] == ["build", "build", "build"]
+    # Three consults: build-entry, the model's explicit consult, report-entry.
+    assert [call["phase"] for call in telemetry["calls"]] == ["build", "build", "report"]
     assert [call["outcome"] for call in telemetry["calls"]] == ["advice", "advice", "advice"]
     assert all(call["advice_chars"] == len(ADVICE) for call in telemetry["calls"])
     assert [call["max_tokens"] for call in engine.llm_client.advisor_calls] == [2048, 2048, 2048]
@@ -360,8 +362,8 @@ def test_the_guarantees_consult_at_entry_redirect_once_and_still_complete(tmp_pa
         call["id"] for message in build_entry_request for call in message.get("tool_calls") or ()
     ] == ["advisor-entry-1"]
 
-    # The redirects flow through the ordinary evidence-recording path, so the
-    # dispatcher paired everything and the renderer never had to repair.
+    # Every real call flows through the ordinary evidence-recording path, so
+    # the dispatcher paired everything and the renderer never had to repair.
     assert pairing_spy, "the renderer must have run"
     assert all(before == after for before, after in pairing_spy)
     for request in engine.llm_client.requests:
@@ -371,7 +373,7 @@ def test_the_guarantees_consult_at_entry_redirect_once_and_still_complete(tmp_pa
     assert engine.phase_machine.is_complete
 
 
-def test_the_entry_consult_and_the_redirect_reach_the_model_as_tool_results(tmp_path):
+def test_entry_consults_reach_model_without_a_terminal_claim_redirect(tmp_path):
     engine = _engine(tmp_path)
 
     engine.run_setup_loop("set up the project", max_iterations=20)
@@ -382,9 +384,7 @@ def test_the_entry_consult_and_the_redirect_reach_the_model_as_tool_results(tmp_
         for message in request
         if message["role"] == "tool"
     ]
-    assert any(
-        "A failure occurred since your last advisor consult" in text for text in tool_messages
-    )
+    assert not any("This claim was not evaluated" in text for text in tool_messages)
     # The entry consult's advice is a tool result like any other...
     assert any(ADVICE in text for text in tool_messages)
     # ...opened by a harness-authored assistant turn that says so.

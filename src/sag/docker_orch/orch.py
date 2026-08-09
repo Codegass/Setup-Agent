@@ -1,5 +1,7 @@
 """Docker Orchestrator for managing containers and volumes."""
 
+import base64
+import binascii
 import os
 import re
 import shlex
@@ -18,6 +20,7 @@ from sag.config import get_config
 from sag.runtime.exec_env import DEFAULT_UTF8_ENVIRONMENT, default_utf8_environment
 
 ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
+CONTROL_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 UNKNOWN_EXIT_FAILURE_MARKERS = (
     "BUILD FAILURE",
     "BUILD FAILED",
@@ -32,6 +35,9 @@ MAVEN_ENFORCER_VERSION_RANGE_MARKERS = (
     "Detected Maven Version:",
     "is not in the allowed range",
 )
+DETACHED_TERMINAL_AUTHORITY = "docker_exec_inspect_v1"
+DETACHED_POLL_TAIL_MAX_BYTES = 6144
+DETACHED_INLINE_OUTPUT_MAX_CHARS = 10000
 
 
 def _has_unknown_exit_failure_marker(output: str) -> bool:
@@ -71,6 +77,20 @@ class DockerOrchestrator:
             self.volume_name = "sag-default-vol"
 
         logger.info(f"Docker Orchestrator initialized for project: {project_name}")
+
+    def evidence_store_identity(self) -> str:
+        """Return the immutable Docker identity of the current evidence store.
+
+        Container names are reusable. Binding host authority to a name would
+        authorize a replacement container after teardown, so callers receive
+        only Docker's immutable container id.
+        """
+
+        container = self.client.containers.get(self.container_name)
+        container_id = str(getattr(container, "id", "") or "").strip()
+        if not container_id:
+            raise RuntimeError("container has no immutable Docker id")
+        return f"docker:{container_id}"
 
     def create_and_start_container(self) -> bool:
         """Create and start a new container for the project."""
@@ -273,20 +293,80 @@ class DockerOrchestrator:
             raise
 
     def _runtime_profile_prefix(self) -> str:
-        """Return shell sources needed before running commands in the container."""
-        return (
-            "export LANG=${LANG:-C.UTF-8}; "
-            "export LC_ALL=${LC_ALL:-C.UTF-8}; "
-            "source /etc/profile 2>/dev/null || true; "
-            "source ~/.bashrc 2>/dev/null || true; "
-            f"source {ENV_OVERLAY_SCRIPT_PATH} 2>/dev/null || true"
-        )
+        """Return locale setup that cannot execute project-writable shell code."""
+        return "export LANG=${LANG:-C.UTF-8}; " "export LC_ALL=${LC_ALL:-C.UTF-8}"
+
+    def _control_exec_environment(self) -> Dict[str, str]:
+        """Environment for host-control transport, isolated from runtime overlays."""
+
+        return {
+            **default_utf8_environment(),
+            "PATH": CONTROL_EXEC_PATH,
+            "BASH_ENV": "",
+            "ENV": "",
+            "CDPATH": "",
+        }
+
+    @staticmethod
+    def _isolated_exec_argv(
+        command: str,
+        *,
+        runtime_environment: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> list[str]:
+        """Build an argv whose controller utilities never use project PATH.
+
+        Docker starts only absolute host-control executables. For a normal
+        project command, ``/usr/bin/env`` installs the already validated
+        runtime environment for the inner ``/bin/bash``; timeout and the outer
+        shell remain under the fixed control environment.
+        """
+
+        if runtime_environment is None:
+            argv = ["/bin/bash", "-c", command]
+        else:
+            assignments = [f"{key}={value}" for key, value in runtime_environment.items()]
+            argv = ["/usr/bin/env", *assignments, "/bin/bash", "-c", command]
+        if timeout_seconds is not None and timeout_seconds > 0:
+            argv = [
+                "/usr/bin/timeout",
+                "--preserve-status",
+                str(timeout_seconds),
+                *argv,
+            ]
+        return argv
 
     def _default_exec_environment(
         self, environment: Optional[Dict[str, str]] = None
     ) -> Dict[str, str]:
-        """Merge caller-provided env with SAG's safe UTF-8 execution defaults."""
-        return default_utf8_environment(environment)
+        """Merge controller env with the exact host-authorized runtime overlay."""
+
+        base = {
+            **default_utf8_environment(environment),
+            "PATH": CONTROL_EXEC_PATH,
+            "BASH_ENV": "",
+            "ENV": "",
+            "CDPATH": "",
+        }
+        # Normal project commands require a run-scoped host authority. Container
+        # bootstrap and control-plane I/O use ``execute_control_command``
+        # explicitly; treating an unavailable authority as an empty overlay
+        # would otherwise turn a fresh orchestrator into an unrecorded runner.
+        from sag.agent.evidence_publications import (
+            EvidencePublicationAuthority,
+            current_evidence_publication_authority,
+        )
+
+        authority = current_evidence_publication_authority(self)
+        if not isinstance(authority, EvidencePublicationAuthority):
+            from sag.runtime.env_overlay import EnvOverlayUnavailableError
+
+            raise EnvOverlayUnavailableError(
+                "runtime environment has no host publication authority"
+            )
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        return EnvOverlayStore(self).authorized_environment(base)
 
     def _is_json_content(self, output: str, command: str) -> bool:
         """
@@ -494,6 +574,7 @@ class DockerOrchestrator:
         environment: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
         truncate_output: bool = True,
+        _clean_control_path: bool = False,
     ) -> Dict[str, Any]:
         """
         Execute a command in the container.
@@ -525,25 +606,17 @@ class DockerOrchestrator:
         # Get the container object
         container = self.client.containers.get(self.container_name)
 
-        # Build the command to be executed in the container with proper environment loading
-        # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
-        # CRITICAL FIX: Source environment files BEFORE changing directory
-        # This prevents the source commands from resetting the working directory
+        # Shell startup files are never sourced. Runtime variables are injected
+        # through Docker's environment argument after strict host publication
+        # verification; this prefix carries locale defaults only.
         runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
-            # Source environment first, THEN change to the specified working directory
             quoted_workdir = shlex.quote(workdir)
             wrapped_command = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
         else:
             # No working directory specified, use default behavior
             wrapped_command = f"{runtime_profile_prefix}; {command}"
         timeout_seconds = int(timeout) if timeout is not None else None
-        if timeout_seconds is not None and timeout_seconds > 0:
-            escaped_command = shlex.quote(wrapped_command)
-            wrapped_command = (
-                f"timeout --preserve-status {timeout_seconds} bash -c {escaped_command}"
-            )
-        exec_command = ["/bin/bash", "-c", wrapped_command]
 
         logger.info(f"Executing command in container: {command}")
         if workdir:
@@ -552,7 +625,15 @@ class DockerOrchestrator:
         runner_dispatched = False
         try:
             # Prepare environment
-            exec_env = self._default_exec_environment(environment)
+            runtime_environment = (
+                None if _clean_control_path else self._default_exec_environment(environment)
+            )
+            exec_command = self._isolated_exec_argv(
+                wrapped_command,
+                runtime_environment=runtime_environment,
+                timeout_seconds=timeout_seconds,
+            )
+            exec_env = self._control_exec_environment()
 
             # Execute the command with stderr capture
             # Use demux to separate stdout and stderr when requested
@@ -686,25 +767,80 @@ class DockerOrchestrator:
             }
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
+            dispatch_status = (
+                "environment_overlay_unavailable"
+                if getattr(e, "code", None) == "environment_overlay_unavailable"
+                and not runner_dispatched
+                else ("execution_observation_failed" if runner_dispatched else "dispatch_failed")
+            )
             return {
                 "success": False,
                 "exit_code": -1,
                 "output": str(e),
-                "dispatch_status": (
-                    "execution_observation_failed" if runner_dispatched else "dispatch_failed"
-                ),
+                "dispatch_status": dispatch_status,
                 "runner_dispatched": runner_dispatched,
+            }
+
+    def execute_control_command(
+        self,
+        command: str,
+        workdir: Optional[str] = None,
+        capture_stderr: bool = True,
+        environment: Optional[Dict[str, str]] = None,
+        timeout: Optional[int] = None,
+        truncate_output: bool = True,
+    ) -> Dict[str, Any]:
+        """Execute host-control I/O without profiles or runtime overlay authority.
+
+        ``environment`` is accepted for call-shape compatibility but cannot
+        alter the fixed control environment.  Evidence transports should not
+        have an ambient project-controlled environment channel.
+        """
+
+        del environment
+        try:
+            return self.execute_command(
+                command,
+                workdir=workdir,
+                capture_stderr=capture_stderr,
+                timeout=timeout,
+                truncate_output=truncate_output,
+                _clean_control_path=True,
+            )
+        except TypeError as exc:
+            # A monkeypatched legacy method cannot prove that it honored the
+            # clean-control flag. Never retry it through the normal runtime
+            # environment: that would make a compatibility seam an authority
+            # bypass.
+            if not any(
+                name in str(exc)
+                for name in (
+                    "_clean_control_path",
+                    "capture_stderr",
+                    "truncate_output",
+                    "workdir",
+                    "timeout",
+                )
+            ):
+                raise
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": "clean control transport unavailable",
+                "dispatch_status": "control_transport_unavailable",
+                "runner_dispatched": False,
             }
 
     def execute_command_with_monitoring(
         self,
         command: str,
-        workdir: str = None,
+        workdir: Optional[str] = None,
         silent_timeout: int = 600,  # 10 minutes no output
         absolute_timeout: int = 2400,  # 40 minutes total
         use_timeout_wrapper: bool = True,
         enable_cpu_monitoring: bool = True,
         optimize_for_maven: bool = True,
+        _clean_control_path: bool = False,
     ) -> Dict[str, Any]:
         """
         Enhanced execute_command with comprehensive timeout and monitoring capabilities.
@@ -740,30 +876,20 @@ class DockerOrchestrator:
             command = " && ".join(optimized_parts)
             logger.info(f"🔧 Applied Maven optimizations to mvn parts of compound command")
 
-        # Build the command with proper working directory handling
-        # CRITICAL FIX: Source environment files BEFORE changing directory
-        # This prevents the source commands from resetting the working directory
+        # Runtime environment is injected below; shell startup files are never
+        # sourced. The prefix carries locale defaults only.
         runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
-            # Source environment first, THEN change to the specified working directory
             quoted_workdir = shlex.quote(workdir)
             base_cmd = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
         else:
             # No working directory specified, use default
             base_cmd = f"{runtime_profile_prefix}; {command}"
 
-        # Wrap with GNU timeout if requested
+        # Timeout is applied as an absolute outer argv below, never through
+        # the project runtime PATH.
         if use_timeout_wrapper:
-            # Use timeout with preserve-status to get the actual exit code
-            # The entire command (including cd) needs to be wrapped
-            # Use double quotes and escape them properly for nested shell execution
-            escaped_cmd = base_cmd.replace("'", "'\\''")
-            final_command = f"timeout --preserve-status {absolute_timeout} bash -c '{escaped_cmd}'"
             logger.info(f"🕐 Wrapped command with {absolute_timeout}s absolute timeout")
-        else:
-            final_command = base_cmd
-
-        exec_command = ["/bin/bash", "-c", final_command]
 
         logger.info(f"Executing command with monitoring: {command}")
         if workdir:
@@ -784,6 +910,12 @@ class DockerOrchestrator:
 
         runner_dispatched = False
         try:
+            runtime_environment = None if _clean_control_path else self._default_exec_environment()
+            exec_command = self._isolated_exec_argv(
+                base_cmd,
+                runtime_environment=runtime_environment,
+                timeout_seconds=absolute_timeout if use_timeout_wrapper else None,
+            )
             # Start the command execution
             # NOTE: We don't use Docker's workdir parameter here because we handle it
             # explicitly with cd in the bash command for better compatibility with timeout wrapper
@@ -792,7 +924,7 @@ class DockerOrchestrator:
                 workdir=None,  # Handled by cd command in bash
                 stream=True,  # Enable streaming to monitor output
                 demux=True,  # Separate stdout/stderr
-                environment=self._default_exec_environment(),
+                environment=self._control_exec_environment(),
             )
             runner_dispatched = True
 
@@ -827,17 +959,44 @@ class DockerOrchestrator:
         except Exception as e:
             monitoring_state["process_terminated"] = True
             logger.error(f"Failed to execute command '{command}': {e}")
+            dispatch_status = (
+                "environment_overlay_unavailable"
+                if getattr(e, "code", None) == "environment_overlay_unavailable"
+                and not runner_dispatched
+                else ("execution_observation_failed" if runner_dispatched else "dispatch_failed")
+            )
             return {
                 "success": False,
                 "exit_code": -1,
                 "output": f"Execution failed: {str(e)}",
                 "termination_reason": "exception",
-                "dispatch_status": (
-                    "execution_observation_failed" if runner_dispatched else "dispatch_failed"
-                ),
+                "dispatch_status": dispatch_status,
                 "runner_dispatched": runner_dispatched,
                 "monitoring_info": monitoring_state,
             }
+
+    def execute_control_command_with_monitoring(
+        self,
+        command: str,
+        workdir: Optional[str] = None,
+        silent_timeout: int = 600,
+        absolute_timeout: int = 2400,
+        use_timeout_wrapper: bool = True,
+        enable_cpu_monitoring: bool = True,
+        optimize_for_maven: bool = False,
+    ) -> Dict[str, Any]:
+        """Stream a host-control command under the isolated control environment."""
+
+        return self.execute_command_with_monitoring(
+            command,
+            workdir=workdir,
+            silent_timeout=silent_timeout,
+            absolute_timeout=absolute_timeout,
+            use_timeout_wrapper=use_timeout_wrapper,
+            enable_cpu_monitoring=enable_cpu_monitoring,
+            optimize_for_maven=optimize_for_maven,
+            _clean_control_path=True,
+        )
 
     def _optimize_maven_command(self, command: str, timeout_seconds: int) -> str:
         """Apply Maven-specific optimizations to reduce timeout risks."""
@@ -950,74 +1109,321 @@ class DockerOrchestrator:
         command: str,
         workdir: Optional[str] = None,
         environment: Optional[Dict[str, str]] = None,
+        _clean_control_path: bool = False,
     ) -> Dict[str, Any]:
-        """Start a command detached from the exec stream.
+        """Start a command whose terminal status is owned by the Docker daemon.
 
-        Output goes to a container log file and the exit code to <log>.exit
-        when the command finishes; the process is never killed by a stream or
-        socket failure. Returns a handle for poll_detached_command.
+        Output goes to a container log file, while the physical exit status is
+        retained by Docker's exec record.  A container file cannot be terminal
+        authority: the project command and its descendants may share the
+        supervisor's uid and can therefore replace any predictable marker
+        after the original leader exits.
         """
         job_id = uuid.uuid4().hex[:12]
         log_path = f"{self.DISPATCH_DIR}/{job_id}.log"
         exit_code_path = f"{log_path}.exit"
         pid_path = f"{self.DISPATCH_DIR}/{job_id}.pid"
+        pgid_path = f"{self.DISPATCH_DIR}/{job_id}.pgid"
+        identity_path = f"{self.DISPATCH_DIR}/{job_id}.identity"
+
+        try:
+            runtime_environment = (
+                self._control_exec_environment()
+                if _clean_control_path
+                else self._default_exec_environment(environment)
+            )
+        except Exception as exc:
+            dispatch_status = (
+                "environment_overlay_unavailable"
+                if getattr(exc, "code", None) == "environment_overlay_unavailable"
+                else "dispatch_failed"
+            )
+            return {
+                "started": False,
+                "job_id": job_id,
+                "pid": None,
+                "pgid": None,
+                "process_identity_token": "",
+                "docker_exec_id": "",
+                "container_id": "",
+                "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+                "start_accepted": False,
+                "startup_identity_verified": False,
+                "pid_path": pid_path,
+                "pgid_path": pgid_path,
+                "identity_path": identity_path,
+                "log_path": log_path,
+                "exit_code_path": exit_code_path,
+                "command": command,
+                "launch_output": str(exc),
+                "dispatch_status": dispatch_status,
+                "runner_dispatched": False,
+                "runner_dispatch_state": "not_accepted",
+            }
 
         runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             inner = f"{runtime_profile_prefix}; cd {shlex.quote(workdir)} && {command}"
         else:
             inner = f"{runtime_profile_prefix}; {command}"
-        # Write the exit code atomically (tmp + mv) so a poll can never read a
-        # created-but-empty exit file.
-        quoted_exit = shlex.quote(exit_code_path)
-        quoted_exit_tmp = shlex.quote(exit_code_path + ".tmp")
-        # Run the user command in a subshell: runtime profiles (or the command
-        # itself) may enable `set -e`, but that must never prevent the outer
-        # launcher from recording the terminal status. Preserve the original
-        # command exit code after atomically publishing the marker; only a
-        # marker-write failure is allowed to replace it.
-        wrapped = (
-            f"set +e; ( {inner} ); rc=$?; "
-            f'printf \'%s\\n\' "$rc" > {quoted_exit_tmp} && mv {quoted_exit_tmp} {quoted_exit}; '
-            'marker_rc=$?; if [ "$marker_rc" -ne 0 ]; then exit "$marker_rc"; fi; '
-            'exit "$rc"'
+        # The command itself runs in a fresh session/process group.  The Docker
+        # exec process remains in the foreground as its supervisor, so Docker
+        # records the status returned by ``setsid --wait`` outside the
+        # container filesystem. Cleanup can still signal exactly ``-PGID``.
+        quoted_pid = shlex.quote(pid_path)
+        quoted_pid_tmp = shlex.quote(pid_path + ".tmp")
+        quoted_pgid = shlex.quote(pgid_path)
+        quoted_pgid_tmp = shlex.quote(pgid_path + ".tmp")
+        quoted_identity = shlex.quote(identity_path)
+        quoted_identity_tmp = shlex.quote(identity_path + ".tmp")
+        runtime_exec = " ".join(
+            [
+                "/usr/bin/env",
+                *(shlex.quote(f"{key}={value}") for key, value in runtime_environment.items()),
+                "/bin/bash",
+                "-c",
+                shlex.quote(inner),
+            ]
         )
-        launcher = (
-            f"mkdir -p {self.DISPATCH_DIR} && "
-            f"(nohup bash -c {shlex.quote(wrapped)} > {shlex.quote(log_path)} 2>&1 & "
-            f'pid=$!; printf \'%s\\n\' "$pid" > {shlex.quote(pid_path)}; echo "$pid")'
+        job_script = (
+            "set +e; job_pid=$$; "
+            'job_pgid="$(ps -o pgid= -p "$job_pid" 2>/dev/null | tr -d \' \')"; '
+            'job_sid="$(ps -o sid= -p "$job_pid" 2>/dev/null | tr -d \' \')"; '
+            'stat_line="$(cat "/proc/$job_pid/stat" 2>/dev/null)" || exit 124; '
+            "stat_rest=${stat_line##*) }; set -- $stat_rest; job_start_ticks=${20:-}; "
+            'job_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || exit 124; '
+            'case "$job_pid:$job_pgid:$job_sid" in '
+            "([0-9]*:[0-9]*:[0-9]*) ;; (*) exit 125 ;; esac; "
+            'case "$job_start_ticks:$job_boot_id" in '
+            "([0-9]*:[0-9a-fA-F-]*) ;; (*) exit 125 ;; esac; "
+            '[ "$job_pid" = "$job_pgid" ] && [ "$job_pid" = "$job_sid" ] || exit 125; '
+            'job_identity="$(printf \'%s:%s:%s:%s\' "$job_boot_id" "$job_pid" '
+            '"$job_pgid" "$job_start_ticks" | sha256sum | awk \'{print $1}\')"; '
+            f"printf '%s\\n' \"$job_pid\" > {quoted_pid_tmp} && "
+            f"mv {quoted_pid_tmp} {quoted_pid} && "
+            f"printf '%s\\n' \"$job_pgid\" > {quoted_pgid_tmp} && "
+            f"mv {quoted_pgid_tmp} {quoted_pgid} && "
+            f"printf '%s\n' \"$job_identity\" > {quoted_identity_tmp} && "
+            f"mv {quoted_identity_tmp} {quoted_identity} || exit 126; "
+            f"exec {runtime_exec}"
+        )
+        supervisor = (
+            f"set +e; umask 077; mkdir -p {self.DISPATCH_DIR} || exit 126; "
+            f": > {shlex.quote(log_path)} || exit 126; "
+            f"/usr/bin/setsid --fork --wait /bin/bash -c {shlex.quote(job_script)} "
+            f'> {shlex.quote(log_path)} 2>&1; rc=$?; exit "$rc"'
         )
 
-        result = self.execute_command(launcher, workdir=None, environment=environment, timeout=60)
+        docker_exec_id = ""
+        container_id = ""
+        runner_dispatched = False
+        start_accepted = False
+        try:
+            container = self.client.containers.get(self.container_name)
+            container_id = str(getattr(container, "id", "") or "").strip()
+            if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+                raise RuntimeError("container has no immutable Docker id")
+            created = self.client.api.exec_create(
+                container_id,
+                ["/bin/bash", "-c", supervisor],
+                stdout=False,
+                stderr=False,
+                environment=self._control_exec_environment(),
+                workdir=None,
+            )
+            docker_exec_id = str((created or {}).get("Id") or "").strip()
+            if re.fullmatch(r"[0-9a-f]{64}", docker_exec_id) is None:
+                raise RuntimeError("Docker did not return an immutable exec id")
+        except Exception as exc:
+            logger.error(f"Failed to dispatch detached command: {command}: {exc}")
+            return {
+                "started": False,
+                "job_id": job_id,
+                "pid": None,
+                "pgid": None,
+                "process_identity_token": "",
+                "docker_exec_id": docker_exec_id,
+                "container_id": container_id,
+                "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+                "start_accepted": False,
+                "startup_identity_verified": False,
+                "pid_path": pid_path,
+                "pgid_path": pgid_path,
+                "identity_path": identity_path,
+                "log_path": log_path,
+                "exit_code_path": exit_code_path,
+                "command": command,
+                "launch_output": str(exc),
+                "dispatch_status": "dispatch_failed",
+                "runner_dispatched": runner_dispatched,
+                "runner_dispatch_state": "not_accepted",
+            }
+
+        try:
+            self.client.api.exec_start(docker_exec_id, detach=True)
+            runner_dispatched = True
+            start_accepted = True
+        except Exception as exc:
+            # A detached start response can be lost after Docker accepted the
+            # exec. Inspect the daemon record before classifying the dispatch;
+            # otherwise a retry can duplicate a runner that is already live.
+            terminal = self.inspect_detached_terminal(
+                {
+                    "docker_exec_id": docker_exec_id,
+                    "container_id": container_id,
+                    "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+                    "start_accepted": False,
+                    "startup_identity_verified": False,
+                }
+            )
+            if terminal.get("state") == "running" and terminal.get("probe_success") is True:
+                runner_dispatched = True
+                start_accepted = True
+            else:
+                logger.error(f"Detached start outcome is unknown for {command}: {exc}")
+                return {
+                    "started": False,
+                    "job_id": job_id,
+                    "pid": None,
+                    "pgid": None,
+                    "process_identity_token": "",
+                    "docker_exec_id": docker_exec_id,
+                    "container_id": container_id,
+                    "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+                    "start_accepted": False,
+                    "startup_identity_verified": False,
+                    "pid_path": pid_path,
+                    "pgid_path": pgid_path,
+                    "identity_path": identity_path,
+                    "log_path": log_path,
+                    "exit_code_path": exit_code_path,
+                    "command": command,
+                    "launch_output": str(exc),
+                    "dispatch_status": "dispatch_unknown",
+                    "runner_dispatched": None,
+                    "runner_dispatch_state": "unknown",
+                }
+
+        identity_probe = (
+            'i=0; while [ "$i" -lt 100 ] && '
+            f"[ ! -s {quoted_pid} -o ! -s {quoted_pgid} -o ! -s {quoted_identity} ]; do "
+            "sleep 0.05; i=$((i + 1)); done; "
+            f'pid="$(cat {quoted_pid} 2>/dev/null)"; '
+            f'pgid="$(cat {quoted_pgid} 2>/dev/null)"; '
+            f'identity="$(cat {quoted_identity} 2>/dev/null)"; '
+            'case "$pid:$pgid" in ([0-9]*:[0-9]*) ;; (*) exit 70 ;; esac; '
+            '[ "$pid" = "$pgid" ] || exit 70; '
+            'case "$identity" in ([0-9a-f][0-9a-f]*) ;; (*) exit 70 ;; esac; '
+            'printf \'PID:%s\\nPGID:%s\\nIDENTITY:%s\\n\' "$pid" "$pgid" "$identity"'
+        )
+        result = self.execute_control_command(identity_probe, workdir=None, timeout=60)
+        if not isinstance(result, dict):
+            result = {}
 
         pid: Optional[int] = None
-        for token in reversed((result.get("output") or "").split()):
-            if token.isdigit():
-                pid = int(token)
-                break
-        started = result.get("exit_code") == 0 and pid is not None
+        pgid: Optional[int] = None
+        process_identity_token = ""
+        pid_markers = 0
+        pgid_markers = 0
+        identity_markers = 0
+        for line in str(result.get("output") or "").splitlines():
+            marker, separator, value = line.strip().partition(":")
+            if not separator:
+                continue
+            if marker == "PID" and value.isdigit():
+                pid_markers += 1
+                pid = int(value)
+            elif marker == "PGID" and value.isdigit():
+                pgid_markers += 1
+                pgid = int(value)
+            elif marker == "IDENTITY" and re.fullmatch(r"[0-9a-f]{64}", value):
+                identity_markers += 1
+                process_identity_token = value
+        started = (
+            isinstance(result, dict)
+            and result.get("success") is not False
+            and result.get("exit_code") == 0
+            and not result.get("dispatch_status")
+            and pid_markers == 1
+            and pgid_markers == 1
+            and identity_markers == 1
+            and pid is not None
+            and pgid is not None
+            and pid > 1
+            and pid == pgid
+            and bool(process_identity_token)
+        )
 
         if started:
-            logger.info(f"🚀 Dispatched detached command (pid {pid}, log {log_path}): {command}")
+            logger.info(
+                f"🚀 Dispatched detached command (pid {pid}, pgid {pgid}, "
+                f"log {log_path}): {command}"
+            )
         else:
             logger.error(
                 f"Failed to dispatch detached command: {command} "
                 f"(exit={result.get('exit_code')}, output={result.get('output', '')[:200]})"
             )
+            # Container-written identity files are useful only after the
+            # clean probe returned one unique, self-consistent tuple.  Partial
+            # or duplicate markers must not survive as signal authority.
+            pid = None
+            pgid = None
+            process_identity_token = ""
 
-        return {
+        handle = {
             "started": started,
             "job_id": job_id,
             "pid": pid,
+            "pgid": pgid,
+            "process_identity_token": process_identity_token,
+            "docker_exec_id": docker_exec_id,
+            "container_id": container_id,
+            "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+            "start_accepted": start_accepted,
+            "startup_identity_verified": started,
             "pid_path": pid_path,
+            "pgid_path": pgid_path,
+            "identity_path": identity_path,
             "log_path": log_path,
             "exit_code_path": exit_code_path,
             "command": command,
             "launch_output": result.get("output", ""),
+            "dispatch_status": (
+                result.get("dispatch_status")
+                if started
+                else str(result.get("dispatch_status") or "execution_observation_failed")
+            ),
+            "runner_dispatched": runner_dispatched,
+            "runner_dispatch_state": "accepted",
         }
+        if started:
+            remembered = self.__dict__.setdefault("_detached_handles", {})
+            remembered[job_id] = dict(handle)
+        return handle
+
+    def execute_control_command_detached(
+        self,
+        command: str,
+        workdir: Optional[str] = None,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch detached host-control work without runtime overlay influence."""
+
+        del environment
+        return self.execute_command_detached(
+            command,
+            workdir=workdir,
+            _clean_control_path=True,
+        )
 
     def detached_handle(self, job_id: str) -> Dict[str, Any]:
-        """Reconstruct a stable detached-job handle from its public poll id."""
+        """Return an in-memory host handle, or an explicitly incomplete one.
+
+        A Docker exec id cannot be reconstructed from a container-controlled
+        file or from a job id. Durable restart recovery must obtain it from the
+        host-sealed obligation rather than silently downgrading authority.
+        """
         if (
             not job_id
             or len(job_id) > 64
@@ -1027,13 +1433,141 @@ class DockerOrchestrator:
             )
         ):
             raise ValueError("invalid detached job id")
+        remembered = self.__dict__.get("_detached_handles", {}).get(job_id)
+        if isinstance(remembered, dict):
+            return dict(remembered)
         log_path = f"{self.DISPATCH_DIR}/{job_id}.log"
         return {
             "job_id": job_id,
             "pid": None,
+            "pgid": None,
+            "process_identity_token": "",
+            "docker_exec_id": "",
+            "container_id": "",
+            "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+            "start_accepted": False,
+            "startup_identity_verified": False,
+            "runner_dispatch_state": "unknown",
             "pid_path": f"{self.DISPATCH_DIR}/{job_id}.pid",
+            "pgid_path": f"{self.DISPATCH_DIR}/{job_id}.pgid",
+            "identity_path": f"{self.DISPATCH_DIR}/{job_id}.identity",
             "log_path": log_path,
             "exit_code_path": f"{log_path}.exit",
+        }
+
+    def inspect_detached_terminal(self, handle: Dict[str, Any]) -> Dict[str, Any]:
+        """Read detached process truth exclusively from Docker's exec record.
+
+        The immutable exec id and container id are host-side dispatch facts.
+        Neither an exit marker nor any other container-controlled byte is a
+        fallback when those facts are absent, conflict, or cannot be inspected.
+        """
+
+        docker_exec_id = str(handle.get("docker_exec_id") or "").strip()
+        expected_container_id = str(handle.get("container_id") or "").strip()
+        authority = str(handle.get("terminal_authority") or "").strip()
+        start_accepted = handle.get("start_accepted")
+        if (
+            authority != DETACHED_TERMINAL_AUTHORITY
+            or re.fullmatch(r"[0-9a-f]{64}", docker_exec_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", expected_container_id) is None
+            or type(start_accepted) is not bool
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "running": False,
+                "finished": False,
+                "exit_code": None,
+                "probe_error": "detached_daemon_identity_missing",
+                "start_accepted": False,
+            }
+
+        try:
+            container = self.client.containers.get(self.container_name)
+            current_container_id = str(getattr(container, "id", "") or "").strip()
+            if current_container_id != expected_container_id:
+                raise ValueError("detached container identity conflict")
+            inspected = self.client.api.exec_inspect(docker_exec_id)
+        except Exception as exc:
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "running": False,
+                "finished": False,
+                "exit_code": None,
+                "probe_error": f"detached_daemon_inspect_failed:{type(exc).__name__}",
+                "start_accepted": bool(start_accepted),
+            }
+
+        if not isinstance(inspected, dict):
+            inspected = {}
+        inspected_exec_id = str(inspected.get("ID") or "").strip()
+        inspected_container_id = str(inspected.get("ContainerID") or "").strip()
+        running = inspected.get("Running")
+        if (
+            inspected_exec_id != docker_exec_id
+            or inspected_container_id != expected_container_id
+            or not isinstance(running, bool)
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "running": False,
+                "finished": False,
+                "exit_code": None,
+                "probe_error": "detached_daemon_identity_conflict",
+                "start_accepted": bool(start_accepted),
+            }
+        if running:
+            return {
+                "probe_success": True,
+                "state": "running",
+                "running": True,
+                "finished": False,
+                "exit_code": None,
+                "probe_error": None,
+                # A daemon-owned Running=true observation is itself a durable
+                # acceptance fact even when exec_start's HTTP response was
+                # lost.  Finished=false/exit-zero is not: Docker may retain a
+                # created-but-never-started exec in exactly that shape.
+                "start_accepted": True,
+            }
+
+        if start_accepted is not True:
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "running": False,
+                "finished": False,
+                "exit_code": None,
+                "probe_error": "detached_start_acceptance_unproven",
+                "start_accepted": False,
+            }
+
+        exit_code = inspected.get("ExitCode")
+        if (
+            not isinstance(exit_code, int)
+            or isinstance(exit_code, bool)
+            or not 0 <= exit_code <= 255
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "running": False,
+                "finished": False,
+                "exit_code": None,
+                "probe_error": "detached_daemon_exit_code_invalid",
+                "start_accepted": True,
+            }
+        return {
+            "probe_success": True,
+            "state": "finished",
+            "running": False,
+            "finished": True,
+            "exit_code": exit_code,
+            "probe_error": None,
+            "start_accepted": True,
         }
 
     def poll_detached_command(
@@ -1051,79 +1585,131 @@ class DockerOrchestrator:
         slack)? ``NOW:`` always carries the container clock so the caller's
         next ``progress_since`` never mixes host and container time.
         """
+        terminal = self.inspect_detached_terminal(handle)
+        if terminal.get("probe_success") is not True:
+            return {
+                "finished": False,
+                "running": False,
+                "exit_code": None,
+                "tail": "",
+                "log_size": 0,
+                "probe_success": False,
+                "terminal_probe_success": False,
+                "progress_probe_success": False,
+                "state": "unknown",
+                "now_epoch": None,
+                "progress_fresh": None,
+                "probe_error": terminal.get("probe_error") or "detached_daemon_inspect_failed",
+            }
+
         log_path = shlex.quote(handle["log_path"])
-        exit_code_path = shlex.quote(handle["exit_code_path"])
-        pid = handle.get("pid")
-        if pid:
-            pid_assignment = f"pid={int(pid)}; "
-        else:
-            pid_path = shlex.quote(handle.get("pid_path") or f"{handle['log_path']}.pid")
-            pid_assignment = f'pid="$(cat {pid_path} 2>/dev/null)"; '
-        progress_probe = 'echo "NOW:$(date +%s)"; '
+        tail_count = max(1, min(1000, int(tail_lines)))
+        progress_probe = 'echo "NOW:$(/usr/bin/date +%s)"; '
         if progress_workdir and progress_since is not None:
             quoted_dir = shlex.quote(progress_workdir)
             progress_probe += (
                 f"if [ -d {quoted_dir} ]; then "
-                f"fresh=$(find {quoted_dir} "
+                f"fresh=$(/usr/bin/find {quoted_dir} "
                 f"\\( -path '*/target/*' -o -path '*/build/*' "
                 f"-o -path '*/.setup_agent/pytest-reports/*' \\) "
                 f"-type f -newermt @{int(progress_since) - 1} -print -quit 2>/dev/null); "
                 f'if [ -n "$fresh" ]; then echo "PROGRESS:FRESH"; '
                 f'else echo "PROGRESS:NONE"; fi; fi; '
             )
-        probe = pid_assignment + (
-            f'if [ -f {exit_code_path} ]; then echo "STATE:EXIT:$(cat {exit_code_path})"; '
-            f'elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; '
-            f'then echo "STATE:RUNNING"; '
-            f'else echo "STATE:VANISHED"; fi; '
-            f'echo "SIZE:$(wc -c < {log_path} 2>/dev/null || echo 0)"; '
+        probe = (
+            "set -o pipefail; "
+            f'echo "SIZE:$(/usr/bin/wc -c < {log_path} 2>/dev/null || echo 0)"; '
             f"{progress_probe}"
-            f'echo "---TAIL---"; tail -n {int(tail_lines)} {log_path} 2>/dev/null'
+            'echo "---TAIL---"; '
+            f"/usr/bin/tail -c {DETACHED_POLL_TAIL_MAX_BYTES} {log_path} 2>/dev/null "
+            f"| /usr/bin/tail -n {tail_count} "
+            "| /usr/bin/base64 -w 0"
         )
-        result = self.execute_command(probe, workdir=None, timeout=60)
-        output = result.get("output") or ""
+        result = self.execute_control_command(probe, workdir=None, timeout=60)
+        transport_succeeded = bool(
+            isinstance(result, dict)
+            and result.get("success") is not False
+            and result.get("exit_code") == 0
+            and not result.get("dispatch_status")
+        )
+        # This probe carries diagnostics only. Terminal truth was already read
+        # from Docker; marker-looking bytes in either section have no authority
+        # over the physical exit code.
+        output = (result.get("output") or "") if transport_succeeded else ""
 
         # Only the head (before ---TAIL---) carries trusted markers; build
         # output in the tail could itself contain STATE:/SIZE: lines.
-        head, _, tail_section = output.partition("---TAIL---")
-        tail = tail_section.strip()
+        separator_count = output.count("---TAIL---")
+        head, separator, tail_section = output.partition("---TAIL---")
+        tail = ""
 
-        finished = False
-        running = False
-        state = "unknown"
-        exit_code: Optional[int] = None
+        finished = bool(terminal.get("finished"))
+        running = bool(terminal.get("running"))
+        state = str(terminal.get("state") or "unknown")
+        exit_code = terminal.get("exit_code")
         log_size = 0
         now_epoch: Optional[int] = None
         progress_fresh: Optional[bool] = None
+        size_markers = 0
+        now_markers = 0
+        progress_markers = 0
+        malformed = not transport_succeeded or not separator or separator_count != 1
         for line in head.splitlines():
             stripped = line.strip()
-            if stripped.startswith("STATE:EXIT:"):
-                finished = True
-                state = "finished"
-                code_text = stripped.rsplit(":", 1)[-1].strip()
-                try:
-                    exit_code = int(code_text)
-                except ValueError:
-                    exit_code = None
-            elif stripped == "STATE:RUNNING":
-                running = True
-                state = "running"
-            elif stripped == "STATE:VANISHED":
-                state = "vanished"
-            elif stripped.startswith("SIZE:"):
+            if stripped.startswith("SIZE:"):
+                size_markers += 1
                 try:
                     log_size = int(stripped.split(":", 1)[1].strip())
                 except ValueError:
-                    log_size = 0
+                    malformed = True
+                if not 0 <= log_size <= (2**63 - 1):
+                    malformed = True
             elif stripped.startswith("NOW:"):
+                now_markers += 1
                 try:
                     now_epoch = int(stripped.split(":", 1)[1].strip())
                 except ValueError:
-                    now_epoch = None
+                    malformed = True
+                if now_epoch is not None and now_epoch <= 0:
+                    malformed = True
             elif stripped == "PROGRESS:FRESH":
+                progress_markers += 1
                 progress_fresh = True
             elif stripped == "PROGRESS:NONE":
+                progress_markers += 1
                 progress_fresh = False
+            elif stripped:
+                malformed = True
+
+        if size_markers != 1 or now_markers != 1 or progress_markers > 1:
+            malformed = True
+        encoded_tail = tail_section.strip()
+        try:
+            tail_bytes = base64.b64decode(encoded_tail, validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            tail_bytes = b""
+            malformed = True
+        if len(tail_bytes) > DETACHED_POLL_TAIL_MAX_BYTES:
+            tail_bytes = b""
+            malformed = True
+        if not malformed:
+            tail = tail_bytes.decode("utf-8", errors="replace").strip()
+        progress_probe_success = transport_succeeded and not malformed
+        if not progress_probe_success:
+            return {
+                "finished": False,
+                "running": False,
+                "exit_code": None,
+                "tail": "",
+                "log_size": 0,
+                "probe_success": False,
+                "terminal_probe_success": True,
+                "progress_probe_success": False,
+                "state": "unknown",
+                "now_epoch": None,
+                "progress_fresh": None,
+                "probe_error": "malformed_detached_log_probe",
+            }
 
         return {
             "finished": finished,
@@ -1131,14 +1717,19 @@ class DockerOrchestrator:
             "exit_code": exit_code,
             "tail": tail,
             "log_size": log_size,
-            "probe_success": result.get("exit_code") == 0,
+            "probe_success": True,
+            "terminal_probe_success": True,
+            "progress_probe_success": progress_probe_success,
             "state": state,
             "now_epoch": now_epoch,
             "progress_fresh": progress_fresh,
+            "probe_error": None,
         }
 
     @staticmethod
     def _detached_poll_state(poll: Dict[str, Any]) -> str:
+        if poll.get("probe_success") is not True:
+            return "unknown"
         state = poll.get("state")
         if state in {"finished", "running", "vanished"}:
             return str(state)
@@ -1199,13 +1790,82 @@ class DockerOrchestrator:
 
         handle = self.execute_command_detached(command, workdir=workdir, environment=environment)
         if not handle.get("started"):
+            if handle.get("runner_dispatched") is True:
+                # Docker accepted and started the exec, but the clean startup
+                # identity handshake did not complete. Losing that fact would
+                # permit a duplicate dispatch and leave an untracked process.
+                # Preserve the daemon-bound handle as pending; if the daemon
+                # already has a framed terminal observation, collect it now.
+                poll = self.poll_detached_command(handle, tail_lines=tail_lines)
+                if self._detached_poll_state(poll) == "finished":
+                    return self.collect_detached_result(handle, poll)
+                last_tail = str(poll.get("tail") or "")
+                return {
+                    "success": True,
+                    "exit_code": None,
+                    "output": (
+                        (
+                            "Docker accepted the detached runner, but its startup "
+                            "PID/PGID identity could not be observed"
+                            if handle.get("runner_dispatched") is True
+                            else "Docker returned an ambiguous detached start result, "
+                            "and daemon inspection could not determine whether it ran"
+                        )
+                        + " through clean control transport. The daemon-bound handle "
+                        "was preserved as pending; no duplicate dispatch is permitted.\n"
+                        "Controller-owned job barrier: no model action is requested."
+                    ),
+                    "termination_reason": None,
+                    "dispatch_status": "liveness_unknown_detached",
+                    "runner_dispatched": handle.get("runner_dispatched"),
+                    "runner_dispatch_state": handle.get("runner_dispatch_state"),
+                    "lifecycle_state": "pending",
+                    "liveness_state": "unknown",
+                    "handoff_reason": "startup_identity_unavailable",
+                    "dispatch": {
+                        **handle,
+                        "last_tail": last_tail,
+                        "log_size": int(poll.get("log_size") or 0),
+                        "handoff_reason": "startup_identity_unavailable",
+                    },
+                }
+            if handle.get("runner_dispatch_state") == "unknown":
+                # A created Docker exec can look terminal/exit-zero even when
+                # exec_start never sent its request. Until startup acceptance
+                # is proven, daemon terminal state and container-controlled log
+                # bytes cannot be promoted into a successful tool result.
+                return {
+                    "success": False,
+                    "exit_code": None,
+                    "output": (
+                        "Docker returned an ambiguous detached start result. "
+                        "No terminal success is claimable until startup acceptance "
+                        "has a host-observed identity handshake."
+                    ),
+                    "termination_reason": None,
+                    "dispatch_status": "dispatch_unknown",
+                    "runner_dispatched": None,
+                    "runner_dispatch_state": "unknown",
+                    "lifecycle_state": "pending",
+                    "liveness_state": "unknown",
+                    "handoff_reason": "startup_acceptance_unproven",
+                    "dispatch": {
+                        **handle,
+                        "handoff_reason": "startup_acceptance_unproven",
+                    },
+                }
+            dispatch_status = str(handle.get("dispatch_status") or "dispatch_failed")
+            raw_exit = handle.get("exit_code")
+            exit_code = (
+                raw_exit if isinstance(raw_exit, int) and not isinstance(raw_exit, bool) else -1
+            )
             return {
                 "success": False,
-                "exit_code": 1,
+                "exit_code": exit_code,
                 "output": f"Failed to dispatch command: {handle.get('launch_output', '')}",
                 "termination_reason": None,
-                "dispatch_status": "dispatch_failed",
-                "runner_dispatched": False,
+                "dispatch_status": dispatch_status,
+                "runner_dispatched": bool(handle.get("runner_dispatched")),
                 "dispatch": handle,
             }
 
@@ -1278,13 +1938,11 @@ class DockerOrchestrator:
             if self._detached_poll_state(poll) in {"finished", "vanished"}:
                 return self.collect_detached_result(handle, poll)
             ts = now()
-            if poll.get("probe_success") is False:
-                # The probe did not answer. That is not an observation of
-                # quiet — it is no observation at all (P2: no basis is its own
-                # answer), so it may not be reported as one. The clock keeps
-                # running (a container we cannot probe must still be handed
-                # back bounded), but the handoff states what actually happened
-                # instead of a log size we never measured.
+            if poll.get("progress_probe_success", poll.get("probe_success")) is False:
+                # Docker may have answered liveness while the clean diagnostic
+                # probe did not answer. That is not an observation of quiet —
+                # it is no progress observation at all, so it may not be
+                # reported as one.
                 unanswered_probes += 1
                 continue
             unanswered_probes = 0
@@ -1384,11 +2042,9 @@ class DockerOrchestrator:
             f"{handoff_summary}\n"
             f"Background job: pid {handle['pid']}, log file {handle['log_path']}\n"
             f"Last output:\n{final_poll.get('tail') or '(no output yet)'}\n\n"
-            f"NEXT STEPS — poll the log instead of re-running the command:\n"
-            f"  1. Progress: bash(command=\"tail -n 50 {handle['log_path']}\")\n"
-            f"  2. Completion: bash(command=\"cat {handle['exit_code_path']} 2>/dev/null || echo STILL_RUNNING\") "
-            f"— prints the exit code once the command finishes\n"
-            f"  3. Do other useful work between polls; do NOT start the same build again."
+            "Controller-owned job barrier: the harness will poll this registered job, "
+            "reconcile its terminal marker, and settle its evidence. No model action is "
+            "requested; do not poll or dispatch this job again."
         )
         return {
             "success": True,
@@ -1413,22 +2069,75 @@ class DockerOrchestrator:
         self, handle: Dict[str, Any], poll: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Build an execute_command-shaped result for a finished detached command."""
+        state = self._detached_poll_state(poll)
+        exit_code = poll.get("exit_code")
+        accepted = bool(
+            handle.get("start_accepted") is True
+            and handle.get("runner_dispatch_state") == "accepted"
+            and handle.get("runner_dispatched") is True
+        )
+        terminal_observed = bool(
+            poll.get("probe_success") is True
+            and poll.get("terminal_probe_success") is True
+            and state == "finished"
+            and type(exit_code) is int
+            and 0 <= exit_code <= 255
+        )
+        if not accepted or not terminal_observed:
+            return {
+                "success": False,
+                "exit_code": None,
+                "output": (
+                    "Detached terminal result is unavailable because daemon start "
+                    "acceptance or the complete terminal observation was not proven."
+                ),
+                "full_output": "",
+                "termination_reason": None,
+                "dispatch_status": (
+                    "dispatch_unknown" if not accepted else "execution_observation_failed"
+                ),
+                "runner_dispatched": handle.get("runner_dispatched"),
+                "runner_dispatch_state": handle.get("runner_dispatch_state"),
+                "dispatch": handle,
+                "lifecycle_state": "pending",
+                "execution_observation_complete": False,
+            }
         # Read the complete log (truncate_output=False): a finished build log is
         # exactly what the agent needs to diagnose a failure, and the orchestrator's
         # emergency truncation would otherwise gut the middle of it (only first/last
         # 25 lines survive), hiding the real compiler/reactor error. The full text
         # goes into `full_output` for the build tools to persist to the output store;
         # the inline `output` stays bounded so it never floods the model context.
-        log_result = self.execute_command(
+        log_result = self.execute_control_command(
             f"cat {shlex.quote(handle['log_path'])}",
             workdir=None,
             timeout=120,
             truncate_output=False,
         )
-        full_output = log_result.get("output") or poll.get("tail") or ""
+        log_observed = bool(
+            isinstance(log_result, dict)
+            and log_result.get("success") is not False
+            and log_result.get("exit_code") == 0
+            and not log_result.get("dispatch_status")
+        )
+        if not log_observed:
+            tail = str(poll.get("tail") or "")
+            diagnostic = "[detached terminal log could not be read through clean control transport]"
+            incomplete_output = f"{tail}\n{diagnostic}" if tail else diagnostic
+            return {
+                "success": False,
+                "exit_code": exit_code,
+                "output": incomplete_output,
+                "full_output": incomplete_output,
+                "termination_reason": None,
+                "dispatch_status": "execution_observation_failed",
+                "runner_dispatched": True,
+                "dispatch": handle,
+                "lifecycle_state": state,
+                "execution_observation_complete": False,
+            }
 
-        state = self._detached_poll_state(poll)
-        exit_code = poll.get("exit_code")
+        full_output = log_result.get("output") or ""
         if exit_code is None and state == "vanished":
             # A vanished process with no exit file is explicit crash evidence.
             exit_code = 1
@@ -1443,8 +2152,14 @@ class DockerOrchestrator:
                 full_output += "\n[detached command ended without recording an exit code]"
 
         inline_output = full_output
-        if len(inline_output) > 10000:
+        if len(inline_output) > DETACHED_INLINE_OUTPUT_MAX_CHARS:
             inline_output = self._truncate_output_smartly(full_output)
+        if len(inline_output) > DETACHED_INLINE_OUTPUT_MAX_CHARS:
+            marker = "\n...[detached inline output clipped]...\n"
+            content_budget = DETACHED_INLINE_OUTPUT_MAX_CHARS - len(marker)
+            head_budget = content_budget // 2
+            tail_budget = content_budget - head_budget
+            inline_output = full_output[:head_budget] + marker + full_output[-tail_budget:]
 
         return {
             "success": exit_code == 0,
@@ -1456,6 +2171,7 @@ class DockerOrchestrator:
             "runner_dispatched": True,
             "dispatch": handle,
             "lifecycle_state": state,
+            "execution_observation_complete": True,
         }
 
     def _collect_detached_result(
@@ -1643,7 +2359,7 @@ class DockerOrchestrator:
                 f"ps -eo args | grep -F {shlex.quote(fragment)} "
                 f"| grep -v -e grep -e 'ps -eo' | head -1"
             )
-            result = self.execute_command(probe, workdir=None, timeout=30)
+            result = self.execute_control_command(probe, workdir=None, timeout=30)
             output = result.get("output") or ""
             if result.get("exit_code") != 0 or "command not found" in output.lower():
                 return None
@@ -1957,7 +2673,7 @@ class DockerOrchestrator:
             comment_json = json.dumps(comment_data, indent=2)
 
             # Write to container
-            result = self.execute_command(
+            result = self.execute_control_command(
                 f"echo '{comment_json}' > {self.config.workspace_path}/.sag_last_comment.json"
             )
 
@@ -1980,7 +2696,7 @@ class DockerOrchestrator:
                 return "Container not running"
 
             # Read comment file from container
-            result = self.execute_command(
+            result = self.execute_control_command(
                 f"cat {self.config.workspace_path}/.sag_last_comment.json 2>/dev/null || echo '{{}}'"
             )
 
@@ -2143,7 +2859,7 @@ class DockerOrchestrator:
             logger.info("🔧 CRITICAL: Creating persistent workspace directory")
             for i, command in enumerate(workspace_commands):
                 logger.info(f"Workspace setup {i+1}/{len(workspace_commands)}: {command}")
-                result = self.execute_command(
+                result = self.execute_control_command(
                     command, workdir=None
                 )  # Use no workdir for workspace creation
 
@@ -2160,7 +2876,7 @@ class DockerOrchestrator:
 
             # Update package lists first
             logger.info("📦 Updating package lists...")
-            update_result = self.execute_command("apt-get update -qq", workdir=None)
+            update_result = self.execute_control_command("apt-get update -qq", workdir=None)
             if not update_result["success"]:
                 logger.warning("⚠️ Package list update failed, continuing with cached lists")
 
@@ -2179,12 +2895,17 @@ class DockerOrchestrator:
                 "grep",
                 "findutils",
                 "less",
+                "unzip",
+                "procps",
+                "util-linux",
+                "coreutils",
+                "iproute2",
             ]
 
             install_command = f"apt-get install -y -qq {' '.join(essential_packages)}"
             logger.info(f"📦 Installing essential packages: {' '.join(essential_packages)}")
 
-            install_result = self.execute_command(install_command, workdir=None)
+            install_result = self.execute_control_command(install_command, workdir=None)
 
             if not install_result["success"]:
                 logger.error("❌ Essential package installation failed")
@@ -2193,7 +2914,7 @@ class DockerOrchestrator:
 
                 # Try to install Git separately as it's critical for the workflow
                 logger.info("🔧 Attempting to install Git separately...")
-                git_result = self.execute_command("apt-get install -y git", workdir=None)
+                git_result = self.execute_control_command("apt-get install -y git", workdir=None)
                 if not git_result["success"]:
                     logger.error(
                         "❌ CRITICAL: Git installation failed - this will cause chain failure B"
@@ -2211,6 +2932,10 @@ class DockerOrchestrator:
                 ("curl --version | head -1", "curl"),
                 ("python3 --version", "Python3"),
                 (
+                    "command -v setsid ps sha256sum timeout base64 >/dev/null",
+                    "Detached job controller prerequisites",
+                ),
+                (
                     f"test -d {self.config.workspace_path} && echo 'Workspace exists' || echo 'Workspace missing'",
                     "Workspace",
                 ),
@@ -2224,7 +2949,7 @@ class DockerOrchestrator:
             verification_failed = False
 
             for cmd, tool_name in verification_commands:
-                result = self.execute_command(cmd, workdir=None)
+                result = self.execute_control_command(cmd, workdir=None)
                 if result["success"]:
                     output_summary = (
                         result["output"][:100] + "..."
@@ -2267,7 +2992,7 @@ cd "$WORKSPACE_PATH" 2>/dev/null || cd /root
 """
 
             # Write environment script
-            script_result = self.execute_command(
+            script_result = self.execute_control_command(
                 f"echo '{env_script}' > /etc/profile.d/sag_env.sh && chmod +x /etc/profile.d/sag_env.sh",
                 workdir=None,
             )

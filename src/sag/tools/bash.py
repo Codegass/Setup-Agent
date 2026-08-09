@@ -16,6 +16,7 @@ from .internal.build_utils import (
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
+    detached_runner_from_command,
 )
 
 
@@ -197,9 +198,33 @@ class BashTool(BaseTool):
         )
         return result
 
-    def _ensure_working_directory(self, requested_workdir: str) -> str:
-        """Smart working directory validation and setup."""
-        return self._validate_and_fix_working_directory(requested_workdir)
+    def _working_directory_available(self, requested_workdir: str) -> tuple[bool, str]:
+        """Observe whether the submitted cwd exists without changing it.
+
+        This probe is deliberately read-only.  A missing or unprobeable cwd is
+        a typed pre-execution refusal; the shell tool must never create the
+        directory or silently dispatch the command from another location.
+        """
+
+        if not isinstance(requested_workdir, str) or not requested_workdir.strip():
+            return False, "working directory must be a non-empty string"
+        try:
+            probe = self.docker_orchestrator.execute_command(
+                f"test -d -- {shlex.quote(requested_workdir)}",
+                workdir=None,
+            )
+        except Exception as exc:
+            return False, f"working-directory probe failed: {type(exc).__name__}"
+        if not isinstance(probe, dict):
+            return False, "working-directory probe returned no structured result"
+        if probe.get("dispatch_status") or probe.get("exit_code") == -1:
+            return False, "working-directory probe did not reach a terminal result"
+        succeeded = probe.get("success")
+        if succeeded is None:
+            succeeded = probe.get("exit_code") == 0
+        if succeeded:
+            return True, ""
+        return False, f"working directory does not exist or is unavailable: {requested_workdir}"
 
     def _validate_parameters(self, kwargs: Dict[str, Any]) -> None:
         super()._validate_parameters(kwargs)
@@ -497,8 +522,8 @@ class BashTool(BaseTool):
                     f"  - timeout (optional): Maximum total execution time in seconds (default: 60)\n"
                     f"  - working_directory (optional): Working directory (default: /workspace)\n"
                     f"  - environment (optional): Additional environment variables\n\n"
-                    f"Example: bash(command='mvn clean test', timeout=3600, working_directory='/workspace/project')\n"
-                    f"Example: bash(command='ls -la', timeout=30)"
+                    "Example syntax: bash(command='ls -la', timeout=30, "
+                    "working_directory='/workspace/project')"
                 ),
                 error=f"Invalid parameters: {invalid_params}",
                 error_code="INVALID_PARAMETERS",
@@ -514,8 +539,7 @@ class BashTool(BaseTool):
                 output=(
                     "❌ Missing required parameter: 'command'\n\n"
                     "The bash tool requires a 'command' parameter.\n"
-                    "Example: bash(command='ls -la', timeout=30)\n"
-                    "Example: bash(command='mvn clean test', timeout=3600)"
+                    "Example syntax: bash(command='ls -la', timeout=30)"
                 ),
                 error="Missing required parameter: command",
                 error_code="MISSING_COMMAND",
@@ -590,32 +614,25 @@ class BashTool(BaseTool):
                 suggestions=[suggestion, "Use non-interactive alternatives"],
             )
 
-        # Smart working directory validation and setup
-        workdir = self._ensure_working_directory(working_directory)
-
-        # Deterministic, minimal fallback for build tools
-        # Only when user did not specify a subdir (workdir is /workspace or None),
-        # and /workspace/<project> exists, prepend cd. Do not override explicit workdir.
-        if ("mvn" in command or "gradle" in command) and self.docker_orchestrator:
-            try:
-                if not workdir or workdir == "/workspace":
-                    project_name = getattr(self.docker_orchestrator, "project_name", None)
-                    if project_name:
-                        candidate = f"/workspace/{project_name}"
-                        chk = self.docker_orchestrator.execute_command(
-                            f"test -d {candidate} && echo EXISTS || echo MISSING", workdir=None
-                        )
-                        if chk.get("exit_code") == 0 and "EXISTS" in (chk.get("output") or ""):
-                            command = f"cd {candidate} && {command}"
-                            logger.info(
-                                f"🔧 Prepended cd to project root for build tool: {candidate}"
-                            )
-                # Add gentle guidance to prefer the dedicated build tool for Maven/Gradle
-                logger.info(
-                    "⚠️ Consider using the build tool for richer diagnostics, auto fail-at-end, and structured test data."
-                )
-            except Exception as _e:
-                logger.debug(f"Bash build-tool workdir fallback skipped: {_e}")
+        # Validate the submitted cwd without creating or substituting one.
+        # ActionIntent/envelope/runner metadata must describe the same command
+        # and cwd byte-for-byte.
+        cwd_available, cwd_error = self._working_directory_available(working_directory)
+        if not cwd_available:
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
+                output=f"Working directory unavailable: {working_directory}",
+                error=cwd_error,
+                error_code="WORKING_DIRECTORY_UNAVAILABLE",
+                failure_category="validation",
+                retryable=True,
+                suggestions=[
+                    "Observed fact: the submitted working directory is unavailable",
+                    "Constraint: shell execution does not create or substitute a working directory",
+                ],
+            )
+        workdir = working_directory
 
         # Check if this is a background command
         is_background = self._is_background_command(command)
@@ -696,12 +713,11 @@ class BashTool(BaseTool):
                 detached_result = classify_detached_completion(
                     result.get("exit_code"),
                     str(result.get("output") or ""),
+                    runner=detached_runner_from_command(command),
                     full_output=str(result.get("full_output") or result.get("output") or ""),
                     poll_ref=detached_poll_ref(result),
                     invocation_status=(
-                        "crashed"
-                        if result.get("lifecycle_state") == "vanished"
-                        else "completed"
+                        "crashed" if result.get("lifecycle_state") == "vanished" else "completed"
                     ),
                 )
                 if not detached_result.succeeded:
@@ -908,34 +924,107 @@ class BashTool(BaseTool):
             handle = self.docker_orchestrator.execute_command_detached(
                 command, workdir=workdir, environment=env_vars
             )
-            if handle.get("started"):
-                return detached_handoff_tool_result(
-                    "bash",
-                    command,
-                    {
-                        "output": f"Background command dispatched as job:{handle['job_id']}",
-                        "dispatch": handle,
-                    },
-                )
-            return ToolResult.completed_failure(
-                output=handle.get("launch_output", ""),
-                error="Failed to dispatch background process",
-                suggestions=[
-                    "Check command syntax",
-                    "Verify the command can run in the container",
-                    "Check container logs for errors",
-                ],
-                error_code="BACKGROUND_START_FAILED",
-                metadata=self._with_execution_metadata(
-                    {},
-                    command=command,
-                    working_directory=workdir,
-                    exit_code=None,
-                    timed_out=False,
-                    duration=None,
-                    executed=False,
-                ),
+            source_dispatch_status = str(handle.get("dispatch_status") or "").strip()
+            dispatch_status = source_dispatch_status
+            start_definitively_not_accepted = bool(
+                handle.get("started") is False
+                and handle.get("start_accepted") is False
+                and handle.get("runner_dispatched") is False
+                and handle.get("runner_dispatch_state") == "not_accepted"
             )
+            if start_definitively_not_accepted:
+                failure_metadata = {
+                    "dispatch_status": dispatch_status or "dispatch_failed",
+                    "runner_dispatched": False,
+                    "runner_dispatch_state": "not_accepted",
+                    "start_accepted": False,
+                    "startup_identity_verified": handle.get("startup_identity_verified"),
+                    "job_id": handle.get("job_id"),
+                    "terminal_authority": handle.get("terminal_authority"),
+                    "docker_exec_id": handle.get("docker_exec_id"),
+                    "container_id": handle.get("container_id"),
+                    "log_path": handle.get("log_path"),
+                    "dispatch": dict(handle),
+                }
+                return ToolResult.completed_failure(
+                    output=handle.get("launch_output", ""),
+                    error="Failed to dispatch background process",
+                    suggestions=[
+                        "Check command syntax",
+                        "Verify the command can run in the container",
+                        "Check container logs for errors",
+                    ],
+                    error_code="BACKGROUND_START_FAILED",
+                    metadata=self._with_execution_metadata(
+                        failure_metadata,
+                        command=command,
+                        working_directory=workdir,
+                        exit_code=None,
+                        timed_out=False,
+                        duration=None,
+                        executed=False,
+                    ),
+                )
+
+            # Anything other than a proven non-acceptance remains a controller
+            # barrier. In particular, a lost exec_start response may describe
+            # a runner Docker already accepted; returning a completed failure
+            # would invite a duplicate retry.
+            if not dispatch_status:
+                dispatch_status = (
+                    "running_detached" if handle.get("started") is True else "dispatch_unknown"
+                )
+            elif dispatch_status not in DETACHED_HANDOFF_STATUSES:
+                dispatch_status = (
+                    "liveness_unknown_detached"
+                    if (
+                        handle.get("start_accepted") is True
+                        and handle.get("runner_dispatched") is True
+                        and handle.get("runner_dispatch_state") == "accepted"
+                    )
+                    else "dispatch_unknown"
+                )
+            handoff_result: Dict[str, Any] = {
+                "output": (
+                    f"Background command dispatched as job:{handle['job_id']}"
+                    if handle.get("started") is True
+                    else str(handle.get("launch_output") or "Background dispatch is unresolved")
+                ),
+                "dispatch_status": dispatch_status,
+                "runner_dispatched": handle.get("runner_dispatched"),
+                "handoff_reason": "explicit_background_command",
+                "dispatch": dict(handle),
+                # Generic Bash background execution has no frozen invocation
+                # contract or trustworthy pre-dispatch report snapshot. It
+                # therefore enters the controller's ephemeral barrier but may
+                # not mint an obligation whose later settlement could claim
+                # pre-existing report XML as evidence from this command.
+                "job_obligation_persisted": False,
+                "job_obligation_persistence_code": (
+                    "bash_background_evidence_boundary_unavailable"
+                    if (
+                        handle.get("started") is True
+                        and handle.get("start_accepted") is True
+                        and handle.get("runner_dispatched") is True
+                        and handle.get("runner_dispatch_state") == "accepted"
+                        and handle.get("startup_identity_verified") is True
+                    )
+                    else "invalid_dispatch_handle"
+                ),
+            }
+            pending = detached_handoff_tool_result("bash", command, handoff_result)
+            pending.metadata.update(
+                {
+                    # Keep the host-returned handle byte-for-byte equivalent
+                    # while projecting the fields the ReAct barrier validates.
+                    "dispatch": dict(handle),
+                    "source_dispatch_status": source_dispatch_status,
+                    "working_directory": workdir,
+                    "startup_identity_verified": handle.get("startup_identity_verified"),
+                    "started": handle.get("started"),
+                }
+            )
+            return pending
 
         except Exception as e:
             logger.error(f"Failed to execute background command: {e}")
@@ -1035,9 +1124,9 @@ class BashTool(BaseTool):
 
         # Version/usage probes finish in milliseconds regardless of the binary —
         # but only when the WHOLE command is a single short invocation. A probe
-        # flag inside a compound or piped command belongs to one segment only
-        # (`mvn --version && mvn clean install`, `mvn test | grep -v WARNING`)
-        # and must not exempt the long build from dispatch-and-poll.
+        # flag inside a compound or piped command belongs to one segment only;
+        # a short version probe before a later command must not exempt the
+        # remaining work from dispatch-and-poll.
         first_line_tokens = stripped.split()
         if (
             len(first_line_tokens) <= 3
@@ -1328,8 +1417,12 @@ class BashTool(BaseTool):
     def _generate_error_suggestions(
         self, error_analysis: dict, command: str, exit_code: int
     ) -> list:
-        """Generate specific suggestions based on error analysis."""
-        suggestions = []
+        """Project bounded observations from a failed shell command.
+
+        The shell runner reports what failed and relevant constraints.  It
+        does not author the next build, package, diagnostic, or repair call.
+        """
+        observations = []
         error_type = error_analysis.get("error_type", "general")
 
         # A failing hand-rolled mvn/gradle invocation is almost always the
@@ -1345,39 +1438,17 @@ class BashTool(BaseTool):
             or tok.endswith("gradlew")
             for tok in command_head[:1]
         ):
-            suggestions.append(
-                "Use build(action='compile'|'test'|'package') instead of bash — it resolves "
-                "the registered Maven/JDK toolchain automatically (bash uses the stale system PATH)"
+            observations.append(
+                "Observed boundary: the failed command invoked a build runner through bash; "
+                "the public build affordance owns registered toolchain resolution"
             )
 
         if error_type == "compilation_error":
-            compilation_errors = error_analysis.get("compilation_errors", [])
             error_count = error_analysis.get("error_count", 0)
-            suggestions.extend(
-                [
-                    f"Compilation failed with {error_count} errors",
-                    "Check source code for syntax errors",
-                    "Verify character encoding (use UTF-8 for source files)",
-                    "Check Java/compiler version compatibility",
-                    "Review the first few errors as they often cascade",
-                ]
-            )
-            # Add specific encoding fix if detected
-            if any("unmappable character" in err.lower() for err in compilation_errors):
-                suggestions.insert(
-                    0, "Fix encoding: Add -Dfile.encoding=UTF-8 to MAVEN_OPTS or gradle.properties"
-                )
+            observations.append(f"Observed category: compilation failed with {error_count} errors")
 
         elif error_type == "build_failed":
-            suggestions.extend(
-                [
-                    "Build failed - check compilation errors above",
-                    "Verify all dependencies are available",
-                    "Check if build tool (Maven/Gradle) is properly configured",
-                    "Try running with -X (Maven) or --debug (Gradle) for detailed output",
-                    "Clean and rebuild: 'mvn clean' or 'gradle clean'",
-                ]
-            )
+            observations.append("Observed category: build command failed")
 
         elif error_type == "test_failed":
             test_stats = error_analysis.get("test_stats", {})
@@ -1385,134 +1456,64 @@ class BashTool(BaseTool):
                 total = test_stats.get("total", 0)
                 failures = test_stats.get("failures", 0)
                 errors = test_stats.get("errors", 0)
-                suggestions.append(
+                observations.append(
                     f"Tests failed: {failures} failures, {errors} errors out of {total} tests"
                 )
-            suggestions.extend(
-                [
-                    "Review test failure details in the output above",
-                    "Check test logs for detailed error messages",
-                    "Run tests individually to isolate failures",
-                    "Verify test environment and dependencies",
-                    "Use -DskipTests to skip tests temporarily (not recommended for production)",
-                ]
-            )
+            else:
+                observations.append("Observed category: test command failed")
 
         elif error_type == "permission":
-            suggestions.extend(
+            observations.extend(
                 [
-                    "Try running with sudo if appropriate",
-                    "Check file/directory permissions with 'ls -la'",
-                    "Ensure the user has necessary permissions",
-                    "Verify ownership with 'ls -l' command",
+                    "Observed category: permission denied",
+                    "Constraint: the requested operation requires access to its target",
                 ]
             )
         elif error_type == "not_found":
-            suggestions.extend(
+            observations.extend(
                 [
-                    "Verify the file/directory path is correct",
-                    "Use 'ls' or 'find' to locate the resource",
-                    "Check if you're in the correct working directory",
-                    "Use absolute paths instead of relative paths",
+                    "Observed category: requested path was not found",
+                    "Relevant facts: submitted path and working directory",
                 ]
             )
         elif error_type == "command_not_found":
             cmd_name = command.split()[0] if command else "command"
-            suggestions.extend(
+            observations.extend(
                 [
-                    f"Install {cmd_name} using the package manager",
-                    f"Check if {cmd_name} is in PATH with 'which {cmd_name}'",
-                    "Verify the command name is spelled correctly",
-                    "Use the full path to the executable",
+                    f"Observed capability: executable {cmd_name!r} was not found",
+                    "Relevant constraints: executable identity and active PATH",
                 ]
             )
         elif error_type == "network":
-            suggestions.extend(
+            observations.extend(
                 [
-                    "Check network connectivity",
-                    "Verify the target host is reachable",
-                    "Check firewall/proxy settings",
-                    "Try again after a brief delay",
+                    "Observed category: network operation failed",
+                    "Relevant constraints: target reachability, DNS, proxy, and firewall policy",
                 ]
             )
         elif error_type == "disk_space":
-            suggestions.extend(
+            observations.extend(
                 [
-                    "Check disk space with 'df -h'",
-                    "Clean up unnecessary files",
-                    "Remove old logs or temporary files",
-                    "Increase container disk allocation if needed",
+                    "Observed category: insufficient disk space",
+                    "Constraint: the operation requires additional writable capacity",
                 ]
             )
         elif error_type == "package_not_found":
-            suggestions.extend(
+            observations.extend(
                 [
-                    "Update package lists with 'apt-get update' or equivalent",
-                    "Check the package name spelling",
-                    "Search for the package with 'apt-cache search' or equivalent",
-                    "Add required repositories if package is from external source",
+                    "Observed category: requested package was not found",
+                    "Relevant constraints: package identity and configured repository inventory",
                 ]
             )
         else:
-            # Generic suggestions
-            suggestions.extend(
-                [
-                    "Check the command syntax and parameters",
-                    "Verify that required files/directories exist",
-                    f"Command exited with code {exit_code}",
-                    "Review the error output for specific issues",
-                ]
-            )
+            observations.append(f"Observed exit code: {exit_code}")
 
-        return suggestions
+        return observations
 
     def _get_recovery_commands(self, error_analysis: dict) -> list:
-        """Get recovery commands based on error type."""
-        recovery_commands = []
-        error_type = error_analysis.get("error_type", "general")
-
-        if error_type == "permission":
-            recovery_commands.extend(
-                [
-                    "ls -la",  # Check permissions
-                    "whoami",  # Check current user
-                    "id",  # Check user groups
-                ]
-            )
-        elif error_type == "not_found":
-            recovery_commands.extend(
-                [
-                    "pwd",  # Check current directory
-                    "ls -la",  # List files
-                    "find . -name '*' -type f | head -20",  # Search for files
-                ]
-            )
-        elif error_type == "command_not_found":
-            recovery_commands.extend(
-                [
-                    "echo $PATH",  # Check PATH
-                    "which <command>",  # Check if command exists
-                    "apt-get update && apt-cache search <command>",  # Search for package
-                ]
-            )
-        elif error_type == "network":
-            recovery_commands.extend(
-                [
-                    "ping -c 3 google.com",  # Check internet
-                    "cat /etc/resolv.conf",  # Check DNS
-                    "ip addr show",  # Check network interfaces
-                ]
-            )
-        elif error_type == "disk_space":
-            recovery_commands.extend(
-                [
-                    "df -h",  # Check disk space
-                    "du -sh /*",  # Check directory sizes
-                    "find /tmp -type f -mtime +7 -delete",  # Clean old tmp files
-                ]
-            )
-
-        return recovery_commands
+        """Compatibility field: the evidence layer no longer composes commands."""
+        del error_analysis
+        return []
 
     def _get_command_timeout(self, command: str) -> tuple[int, int]:
         """
@@ -1590,156 +1591,6 @@ class BashTool(BaseTool):
         # Default for regular commands
         else:
             return (60, 300)  # 1 min silent, 5 min total
-
-    def _validate_and_fix_working_directory(self, requested_workdir: str) -> str:
-        """
-        Validate working directory exists and fix if needed.
-
-        PRIORITY LOGIC:
-        1. FIRST: Try to ensure /workspace works (this is the standard)
-        2. SECOND: Try to repair /workspace if it's missing
-        3. LAST RESORT: Fall back to alternative directories only if /workspace is completely broken
-
-        This ensures clone operations happen in the correct workspace location.
-        """
-        logger.debug(f"🔍 Validating working directory: {requested_workdir}")
-
-        # PRIORITY 1: If requesting /workspace (or subdirs), try to ensure it works
-        if requested_workdir.startswith("/workspace"):
-            logger.info(f"🎯 PRIORITY: Ensuring /workspace is available for proper project setup")
-
-            # First check if /workspace exists
-            workspace_check = self.docker_orchestrator.execute_command(
-                "test -d /workspace && echo 'EXISTS' || echo 'MISSING'", workdir=None
-            )
-
-            if workspace_check["success"] and "EXISTS" in workspace_check["output"]:
-                logger.info(f"✅ /workspace exists and is accessible")
-                # Verify the specific subdirectory if needed
-                if requested_workdir != "/workspace":
-                    subdir_check = self.docker_orchestrator.execute_command(
-                        f"test -d {requested_workdir} && echo 'EXISTS' || echo 'MISSING'",
-                        workdir=None,
-                    )
-                    if subdir_check["success"] and "EXISTS" in subdir_check["output"]:
-                        logger.debug(f"✅ Subdirectory {requested_workdir} exists")
-                        return requested_workdir
-                    else:
-                        # Try to create the subdirectory
-                        logger.info(f"🔧 Creating subdirectory: {requested_workdir}")
-                        create_subdir = self.docker_orchestrator.execute_command(
-                            f"mkdir -p {requested_workdir} && echo 'CREATED'",
-                            workdir="/workspace",  # Use /workspace as base since it exists
-                        )
-                        if create_subdir["success"] and "CREATED" in create_subdir["output"]:
-                            logger.info(f"✅ Created subdirectory: {requested_workdir}")
-                            return requested_workdir
-                        else:
-                            logger.warning(
-                                f"⚠️ Could not create {requested_workdir}, using /workspace"
-                            )
-                            return "/workspace"
-                else:
-                    return "/workspace"
-
-            # PRIORITY 2: /workspace is missing, try to repair it
-            logger.warning(f"⚠️ /workspace is missing - attempting repair")
-            repair_steps = [
-                ("mkdir -p /workspace", "Create /workspace directory"),
-                ("chmod 755 /workspace", "Set /workspace permissions"),
-                ("touch /workspace/.sag_workspace_marker", "Create workspace marker"),
-                ("chown root:root /workspace", "Set workspace ownership"),
-            ]
-
-            workspace_repaired = True
-            for repair_cmd, description in repair_steps:
-                logger.info(f"🔧 REPAIR: {description}")
-                repair_result = self.docker_orchestrator.execute_command(repair_cmd, workdir=None)
-
-                if not repair_result["success"]:
-                    logger.error(f"❌ REPAIR FAILED: {description}")
-                    workspace_repaired = False
-                    break
-                else:
-                    logger.info(f"✅ REPAIR SUCCESS: {description}")
-
-            if workspace_repaired:
-                # Verify repair worked
-                verify_result = self.docker_orchestrator.execute_command(
-                    "test -d /workspace && test -w /workspace && echo 'REPAIRED' || echo 'FAILED'",
-                    workdir=None,
-                )
-                if verify_result["success"] and "REPAIRED" in verify_result["output"]:
-                    logger.info(f"✅ WORKSPACE REPAIRED: /workspace is now available")
-
-                    # Now try to create the requested subdirectory if needed
-                    if requested_workdir != "/workspace":
-                        create_result = self.docker_orchestrator.execute_command(
-                            f"mkdir -p {requested_workdir} && echo 'CREATED'", workdir="/workspace"
-                        )
-                        if create_result["success"]:
-                            logger.info(
-                                f"✅ Created requested directory after repair: {requested_workdir}"
-                            )
-                            return requested_workdir
-                        else:
-                            logger.warning(
-                                f"⚠️ Could not create {requested_workdir} after repair, using /workspace"
-                            )
-                            return "/workspace"
-                    else:
-                        return "/workspace"
-                else:
-                    logger.error(f"❌ WORKSPACE REPAIR VERIFICATION FAILED")
-                    workspace_repaired = False
-
-            # PRIORITY 3: LAST RESORT - /workspace cannot be repaired
-            if not workspace_repaired:
-                logger.error(
-                    f"❌ CRITICAL: Cannot establish /workspace - falling back to alternative directories"
-                )
-                logger.error(f"❌ This may cause issues with project cloning and file operations")
-
-        # For non-workspace directories or as last resort fallback
-        logger.info(f"🔍 Checking alternative directory: {requested_workdir}")
-        check_result = self.docker_orchestrator.execute_command(
-            f"test -d {requested_workdir} && echo 'EXISTS' || echo 'MISSING'", workdir=None
-        )
-
-        if check_result["success"] and "EXISTS" in check_result["output"]:
-            logger.debug(f"✅ Alternative directory {requested_workdir} exists")
-            return requested_workdir
-
-        # Try to create the alternative directory
-        logger.info(f"🔧 Attempting to create alternative directory: {requested_workdir}")
-        create_result = self.docker_orchestrator.execute_command(
-            f"mkdir -p {requested_workdir} && echo 'CREATED' || echo 'FAILED'", workdir=None
-        )
-
-        if create_result["success"] and "CREATED" in create_result["output"]:
-            logger.warning(f"⚠️ FALLBACK: Using alternative directory: {requested_workdir}")
-            return requested_workdir
-
-        # Ultimate fallback to known good directories
-        fallback_dirs = ["/root", "/tmp", "/"]
-
-        for fallback_dir in fallback_dirs:
-            logger.error(f"🆘 ULTIMATE FALLBACK: Trying {fallback_dir}")
-            fallback_check = self.docker_orchestrator.execute_command(
-                f"test -d {fallback_dir} && echo 'EXISTS' || echo 'MISSING'", workdir=None
-            )
-
-            if fallback_check["success"] and "EXISTS" in fallback_check["output"]:
-                logger.error(
-                    f"🆘 USING EMERGENCY FALLBACK: {fallback_dir} (MAJOR ISSUE - workspace unavailable)"
-                )
-                return fallback_dir
-
-        # Last resort: no workdir (let Docker decide)
-        logger.error(
-            f"❌ COMPLETE FAILURE: No working directory available - using container default"
-        )
-        return None
 
     def _enhance_grep_command(self, command: str) -> str:
         """Enhance grep commands with helpful default flags."""
@@ -1845,7 +1696,7 @@ GREP INVESTIGATION EXAMPLES:
                 "working_directory": {
                     "type": "string",
                     "description": "Working directory for command execution (default: /workspace)",
-                    "default": None,
+                    "default": "/workspace",
                 },
             },
             "required": ["command"],

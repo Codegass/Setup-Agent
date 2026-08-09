@@ -35,21 +35,30 @@ be the same kind of untrue sentence the plan is about.
 from __future__ import annotations
 
 import json
-import shlex
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from loguru import logger
 
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    evidence_publication_authority_for,
+    latest_publication_raw_sha256,
+    publish_evidence_revision,
+    verify_evidence_bytes,
+    verify_latest_evidence_bytes,
+)
 from sag.runtime.container_io import read_container_text
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
+from sag.utils.container_io import (
+    WRITE_COMPARE_CONFLICT,
+    compare_publish_container_text_atomic,
+)
 
 # The manifest key the structure fact lives under. Additive: a manifest written
 # before this design carries no such key and every reader degrades to the
 # survey's proposal, which is exactly today's behaviour.
 STRUCTURE_KEY = "module_structure"
-STRUCTURE_SCHEMA_VERSION = 1
-
-_STRUCTURE_HEREDOC = "SAG_STRUCTURE_EOF"
+STRUCTURE_SCHEMA_VERSION = 2
 
 # How a dispatch ENDED, as the dispatch layer states it on the receipt.
 # `finished` means the process wrote its OWN exit status
@@ -135,12 +144,17 @@ def structure_from_receipt(receipt: Mapping[str, Any] | None) -> Optional[Dict[s
             modules.append(name)
     if not modules:
         return None
-    return {
+    structure: Dict[str, Any] = {
         "schema_version": STRUCTURE_SCHEMA_VERSION,
         "provenance": receipt_id,
         "modules": modules,
-        "keys": [key for key in (module_key(name) for name in modules) if key],
+        "keys": list(dict.fromkeys(key for key in (module_key(name) for name in modules) if key)),
     }
+    for key in ("target_sha", "config_fingerprint"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            structure[key] = value
+    return structure
 
 
 def read_module_structure(requirements: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -148,17 +162,57 @@ def read_module_structure(requirements: Mapping[str, Any] | None) -> Dict[str, A
     structure = (requirements or {}).get(STRUCTURE_KEY)
     if not isinstance(structure, Mapping):
         return {}
+    raw_version = structure.get("schema_version", 1)
+    if (
+        isinstance(raw_version, bool)
+        or not isinstance(raw_version, int)
+        or raw_version not in {1, STRUCTURE_SCHEMA_VERSION}
+    ):
+        # A future structure may assign different meaning to every field.  It
+        # is unavailable evidence, not a best-effort v2 projection; malformed
+        # versions likewise never escape through int(...) coercion.
+        return {}
     provenance = str(structure.get("provenance") or "").strip()
     modules = [str(name) for name in (structure.get("modules") or ()) if str(name).strip()]
     if not provenance or not modules:
         return {}
-    return {
-        "schema_version": int(structure.get("schema_version") or STRUCTURE_SCHEMA_VERSION),
+    result = {
+        "schema_version": raw_version,
         "provenance": provenance,
         "modules": modules,
         "keys": [str(key) for key in (structure.get("keys") or ()) if str(key)]
         or [key for key in (module_key(name) for name in modules) if key],
     }
+    for key in ("target_sha", "config_fingerprint"):
+        value = str(structure.get(key) or "").strip()
+        if value:
+            result[key] = value
+    # Structure is a fact about one surveyed checkout/config pair.  Legacy
+    # unpinned structures remain readable only beside an equally unpinned
+    # survey; a partial pin in either direction cannot authorize reuse.
+    return result if _matches_survey_identity(result, requirements) else {}
+
+
+def _matches_survey_identity(
+    structure: Mapping[str, Any],
+    requirements: Mapping[str, Any] | None,
+) -> bool:
+    """Whether a receipt structure belongs to this exact surveyed tree.
+
+    Pins are absent on both sides for legacy manifests/receipts, preserving
+    their historical behavior.  Once either side states a target SHA or config
+    fingerprint, equality is required in both directions: an unavailable pin
+    cannot authorize carrying evidence across a survey boundary.
+    """
+
+    survey = (requirements or {}).get("survey")
+    survey = survey if isinstance(survey, Mapping) else {}
+    for key in ("target_sha", "config_fingerprint"):
+        observed = str(structure.get(key) or "").strip()
+        expected = str(survey.get(key) or "").strip()
+        if observed != expected:
+            return False
+    return True
 
 
 def preserve_receipt_structure(
@@ -172,7 +226,11 @@ def preserve_receipt_structure(
     replace a receipt.
     """
     proven = read_module_structure(existing)
-    if proven and not read_module_structure(incoming):
+    if (
+        proven
+        and not read_module_structure(incoming)
+        and _matches_survey_identity(proven, incoming)
+    ):
         incoming[STRUCTURE_KEY] = proven
     return incoming
 
@@ -228,49 +286,151 @@ def promote_structure(
     lands with the next real dispatch. Pinned by
     test_a_failed_promotion_is_recovered_by_the_next_terminal_receipt.
     """
+    live_run_id = str((receipt or {}).get("run_id") or "").strip()
+    if live_run_id:
+        try:
+            # Imported lazily: invocation_receipts owns this writer's caller
+            # and imports receipt_structure during module initialization.
+            from sag.agent.invocation_receipts import validate_receipt_v2
+
+            validated_receipt = validate_receipt_v2(receipt or {})
+            receipt_body = json.dumps(validated_receipt, sort_keys=True).encode("utf-8")
+            receipt_check = verify_evidence_bytes(
+                execute,
+                record_kind="invocation_receipt",
+                record_id=str(validated_receipt["receipt_id"]),
+                raw=receipt_body,
+                run_id=live_run_id,
+                contract_id=validated_receipt.get("contract_id"),
+                contract_hash=validated_receipt.get("contract_hash"),
+            )
+            if not receipt_check.authorized:
+                logger.warning(
+                    "receipt-proven structure refused: source receipt lacks "
+                    "current host publication authority"
+                )
+                return False
+            receipt = validated_receipt
+        except (TypeError, ValueError):
+            return False
     structure = structure_from_receipt(receipt)
     if not structure:
         return False
-    try:
-        # A read-MODIFY-write of the survey's whole manifest is a machine
-        # consumer, so it reads through the lossless path (`container_io`
-        # exists because DockerOrchestrator strips and may truncate ordinary
-        # output on its way to the model). An absent manifest is created; a
-        # manifest whose body does not parse is NOT a manifest we may rewrite —
-        # treating it as empty would replace every stated requirement with one
-        # structure key.
-        content = read_container_text(
-            _ExecuteOnly(execute), BUILD_REQUIREMENTS_PATH, exact_bytes=True
+    for _attempt in range(3):
+        authority = evidence_publication_authority_for(execute)
+        publication_head = authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
+        expected_publication = latest_publication_raw_sha256(
+            execute, BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
         )
-        if content is None:
-            manifest: Dict[str, Any] = {}
-        else:
-            manifest = json.loads(content)
-        if not isinstance(manifest, dict):
-            return False
-        if not structure_updates(read_module_structure(manifest), structure):
-            return False
-        manifest[STRUCTURE_KEY] = structure
-        body = json.dumps(manifest, indent=2, sort_keys=True)
-        temp = f"{BUILD_REQUIREMENTS_PATH}.tmp"
-        result = (
-            execute(
-                f"cat > {shlex.quote(temp)} <<'{_STRUCTURE_HEREDOC}' && "
-                f"mv -f {shlex.quote(temp)} {shlex.quote(BUILD_REQUIREMENTS_PATH)}\n"
-                f"{body}\n{_STRUCTURE_HEREDOC}"
+        try:
+            # A read-MODIFY-write of the survey's whole manifest is a machine
+            # consumer, so it reads through the lossless path (`container_io`
+            # exists because DockerOrchestrator strips and may truncate ordinary
+            # output on its way to the model). An absent or non-v1 manifest is
+            # NOT a survey identity we may enrich: treating it as empty would
+            # manufacture authority beside one structure key.
+            content = read_container_text(
+                _ExecuteOnly(execute), BUILD_REQUIREMENTS_PATH, exact_bytes=True
             )
-            or {}
-        )
-        return bool(result.get("success") or result.get("exit_code") == 0)
-    except Exception as exc:
-        # Warning, not debug: a lost promotion is invisible in every other
-        # channel, and the round-four review found the debug line was the only
-        # trace a permanently-lost improvement left.
-        logger.warning(
-            f"receipt-proven structure not persisted for "
-            f"{str((receipt or {}).get('receipt_id') or 'unknown receipt')}: {exc}"
-        )
-        return False
+            if live_run_id:
+                if publication_head is None:
+                    if content is not None:
+                        logger.warning("receipt structure refused an unpublished base manifest")
+                        return False
+                elif publication_head.publication_state == "revoked":
+                    if content is not None:
+                        return False
+                elif (
+                    content is None
+                    or not verify_latest_evidence_bytes(
+                        execute,
+                        record_kind="build_requirements",
+                        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                        raw=content.encode("utf-8"),
+                    ).authorized
+                ):
+                    logger.warning(
+                        "receipt structure refused a base manifest that is not "
+                        "the current host revision"
+                    )
+                    return False
+            if content is None:
+                # A structure is derived evidence about one surveyed manifest;
+                # without a complete v1 survey body there is no target/config
+                # identity to bind it to.  The receipt remains authoritative,
+                # but it cannot manufacture a requirements artifact.
+                return False
+            else:
+                manifest = json.loads(content)
+            from sag.tools.internal.build_preflight import validate_build_requirements_v1
+
+            try:
+                manifest = validate_build_requirements_v1(manifest)
+            except (TypeError, ValueError):
+                return False
+            if not _matches_survey_identity(structure, manifest):
+                return False
+            if not structure_updates(read_module_structure(manifest), structure):
+                return False
+            manifest[STRUCTURE_KEY] = structure
+            try:
+                # Promotion is a whole-body writer.  Revalidate after the
+                # additive update so no already-authorized poison is laundered
+                # into a fresh host head beside a valid structure object.
+                manifest = validate_build_requirements_v1(manifest)
+            except (TypeError, ValueError):
+                return False
+            body = json.dumps(manifest, indent=2, sort_keys=True)
+            result = compare_publish_container_text_atomic(
+                execute,
+                BUILD_REQUIREMENTS_PATH,
+                body,
+                expected_content=content,
+                validate_json=True,
+            )
+            if result.persisted:
+                raw = body.encode("utf-8")
+                publication = publish_evidence_revision(
+                    execute,
+                    record_kind="receipt_structure",
+                    record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                    logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                    raw=raw,
+                    expected_previous_raw_sha256=expected_publication,
+                )
+                if publication.published:
+                    return True
+                logger.warning(
+                    "receipt-proven structure reached the container but host "
+                    f"publication failed: {publication.status}"
+                )
+                return False
+            if result.code == WRITE_COMPARE_CONFLICT:
+                # Another whole-manifest writer won. Re-read its exact body and
+                # re-apply the widening rule; a stale narrow receipt then
+                # becomes a no-op instead of overwriting newer wide evidence.
+                continue
+            logger.warning(
+                f"receipt-proven structure not persisted for "
+                f"{str((receipt or {}).get('receipt_id') or 'unknown receipt')}: "
+                f"{result.code}"
+            )
+            return False
+        except Exception as exc:
+            # Warning, not debug: a lost promotion is invisible in every other
+            # channel, and the round-four review found the debug line was the only
+            # trace a permanently-lost improvement left.
+            logger.warning(
+                f"receipt-proven structure not persisted for "
+                f"{str((receipt or {}).get('receipt_id') or 'unknown receipt')}: {exc}"
+            )
+            return False
+    logger.warning(
+        f"receipt-proven structure not persisted for "
+        f"{str((receipt or {}).get('receipt_id') or 'unknown receipt')}: compare retry exhausted"
+    )
+    return False
 
 
 class _ExecuteOnly:

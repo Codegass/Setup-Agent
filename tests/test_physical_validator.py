@@ -16,6 +16,13 @@ import re
 
 import pytest
 
+from sag.agent.control_events import canonical_json
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    publish_evidence_revision,
+)
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import (
     PhysicalValidator,
     _format_build_duration,
@@ -27,11 +34,22 @@ from sag.config.settings import (
     Config,
 )
 from sag.tools.report_tool import ReportTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 
 # ---------------------------------------------------------------------------
 # Fake orchestrators
 # ---------------------------------------------------------------------------
+def _empty_named_evidence_stream(command):
+    if "SAG_NAMED_JSON_RECORD_V1" not in command:
+        return None
+    return {
+        "success": True,
+        "exit_code": 0,
+        "output": frame_named_json_record_stream([]),
+    }
+
+
 class FakeBuildOrchestrator:
     """Simulates a container filesystem for the build-validation shell commands.
 
@@ -46,10 +64,42 @@ class FakeBuildOrchestrator:
         self.files = set(files)
         self.dirs = set(dirs)
         self.commands = []
+        self.requirements = {}
+        publication = publish_evidence_revision(
+            self,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            raw=canonical_json(self.requirements).encode("utf-8"),
+            expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+        )
+        assert publication.published
+
+    def read_file(self, path):
+        if path == REQUIREMENTS_PATH:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "content": canonical_json(self.requirements),
+            }
+        return None
 
     def execute_command(self, command):
         self.commands.append(command)
+        if "SAG_NAMED_JSON_RECORD_V1" in command and REQUIREMENTS_PATH in command:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(
+                    [("build-requirements.json", canonical_json(self.requirements))]
+                ),
+            }
+        framed = _empty_named_evidence_stream(command)
+        if framed is not None:
+            return framed
         c = command.strip()
+        if c in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
+            return {"success": True, "exit_code": 0, "output": canonical_json(self.requirements)}
         for op, pool in (("test -d ", self.dirs), ("test -f ", self.files)):
             if c.startswith(op):
                 path = c[len(op) :].split()[0]
@@ -116,6 +166,9 @@ class FakeReportOrchestrator:
 
     def execute_command(self, command):
         self.commands.append(command)
+        framed = _empty_named_evidence_stream(command)
+        if framed is not None:
+            return framed
         c = command.strip()
         if "-type d" in c and "surefire-reports" in c:
             return {"exit_code": 0, "output": self.report_dir}

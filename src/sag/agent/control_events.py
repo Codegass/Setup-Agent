@@ -27,7 +27,35 @@ from pydantic import (
     model_validator,
 )
 
-CONTROL_EVENT_SCHEMA_VERSION = 2
+from .action_intents import bounded_exact_params
+from .repair_contexts import (
+    RepairContext,
+    repair_context_sha256,
+)
+
+CONTROL_EVENT_SCHEMA_VERSION = 5
+STRICT_CONTROL_PAYLOAD_MAX_CANONICAL_BYTES = 32 * 1024
+CONTROL_EVENT_MAX_RAW_BYTES = 256 * 1024
+# Document maps (400 entries with bounded section indexes) are the largest
+# live artifact class. The host event stores only its digest/length, but the
+# publication boundary must still accept those exact already-bounded bytes.
+EVIDENCE_PUBLICATION_MAX_RECORD_BYTES = 32 * 1024 * 1024
+
+
+def _reject_duplicate_json_keys(json_data: str | bytes | bytearray) -> None:
+    """Reject duplicate object members before the JSON parser can collapse them."""
+
+    def reject(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key!r}")
+            value[key] = child
+        return value
+
+    json.loads(json_data, object_pairs_hook=reject)
+
+
 # `planner_response` and `scheduler_decision` are HISTORICAL kinds: the engine
 # stopped emitting them when Plan 2 Task 8 deleted the reasoning scheduler and
 # the plan lock. They stay in the schema so transcripts recorded before that
@@ -49,14 +77,36 @@ CONTROL_EVENT_KINDS = (
     # Plan 8 Stage 1: the books of a detached job, closed after the call that
     # started it returned. Appended for the same reason.
     "job_settled",
-    # …and the other outcome: a job the run never heard back from. Both branches
-    # of §3.2 are in the stream, so replay reproduces either state.
+    # Historical Plan-8 close vocabulary. It remains parseable for archived
+    # streams; new runs use `job_live_at_close` and never emit this conflation.
     "job_unsettled",
+    # WS2: process truth and evidence-persistence truth are orthogonal. These
+    # kinds are appended so every historical tuple position stays stable.
+    "job_terminal_observed",
+    "job_terminal_unpersisted",
+    "job_live_at_close",
+    "job_barrier_integrity_failure",
+    "completion_claim_decision",
+    # WS9: a bounded physical diagnostic/cleanup observation for one
+    # registered job group.  It is not a conclusion about project cause.
+    "job_stall_observed",
+    # Repair lineage v3: appended so every historical tuple position remains
+    # stable. The payload contains the exact bounded context used live.
+    "repair_context_opened",
+    # Evidence authority foundation: the host-owned control stream commits the
+    # exact bytes of records mirrored into the project-writable container.  A
+    # mirror row alone never becomes publication authority.
+    "evidence_publication",
+    # The immutable Docker store identity is committed before the first
+    # publication so restart cannot rebind one evidence epoch to a replacement
+    # container with the same reusable name.
+    "evidence_store_bound",
 )
 ControlEventKind = Literal[
     "planner_response",
     "scheduler_decision",
     "action_envelope",
+    "repair_context_opened",
     "forced_action",
     "tool_result",
     "validator_observation",
@@ -67,6 +117,14 @@ ControlEventKind = Literal[
     "claim_transition",
     "job_settled",
     "job_unsettled",
+    "job_terminal_observed",
+    "job_terminal_unpersisted",
+    "job_live_at_close",
+    "job_barrier_integrity_failure",
+    "completion_claim_decision",
+    "job_stall_observed",
+    "evidence_publication",
+    "evidence_store_bound",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -184,6 +242,11 @@ class RunPin(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    # Absent only on historical run-pin artifacts. Current writers always set
+    # it; metrics-v2 marks a pin without it incomplete and the evaluator
+    # rejects it as a current project row.
+    run_id: str | None = Field(default=None, min_length=1)
+
     # None until the target repo SHA is observed. The pin is written
     # UNCONDITIONALLY at agent startup so the reproducibility file always
     # exists (a run that never observes a target SHA still leaves a pin for
@@ -243,6 +306,7 @@ class RunPin(BaseModel):
     def runtime_defaults(
         cls,
         *,
+        run_id: str,
         target_repo_sha: str,
         container_image_digest: str,
         sag_git_sha: str,
@@ -255,6 +319,7 @@ class RunPin(BaseModel):
         dependency_cache_state: str,
     ) -> "RunPin":
         return cls(
+            run_id=run_id,
             target_repo_sha=target_repo_sha,
             container_image_digest=container_image_digest,
             sag_git_sha=sag_git_sha,
@@ -270,7 +335,210 @@ class RunPin(BaseModel):
 
 
 class _StrictPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any):
+        del _fields_set
+        return cls.model_validate(values)
+
+    @classmethod
+    def model_validate_json(cls, json_data: Any, *args: Any, **kwargs: Any):
+        if isinstance(json_data, str):
+            raw_size = len(json_data.encode("utf-8"))
+        elif isinstance(json_data, (bytes, bytearray)):
+            raw_size = len(json_data)
+        else:
+            raise TypeError("control payload JSON must be str, bytes, or bytearray")
+        # Strict bounded payloads never need more wire slack than this; the
+        # 32KiB semantic payload cap is enforced after parsing where required.
+        if raw_size > STRICT_CONTROL_PAYLOAD_MAX_CANONICAL_BYTES * 2:
+            raise ValueError("control payload JSON exceeds its raw byte limit")
+        _reject_duplicate_json_keys(json_data)
+        return super().model_validate_json(json_data, *args, **kwargs)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ):
+        del deep
+        payload = self.model_dump(mode="python", round_trip=True)
+        payload.update(dict(update or {}))
+        return type(self).model_validate(payload)
+
+
+EVIDENCE_MUTABLE_RECORD_KINDS = frozenset(
+    {
+        "job_obligation",
+        "build_requirements",
+        "run_pin",
+        "document_map",
+        "env_overlay",
+        "receipt_structure",
+        "stall_cleanup",
+        "report_metrics",
+        "verdict",
+    }
+)
+EVIDENCE_PUBLICATION_GENESIS_SHA256 = "0" * 64
+
+
+class EvidenceStoreBoundPayload(_StrictPayload):
+    """Host commitment binding one evidence run to one immutable store."""
+
+    run_id: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        strict=True,
+    )
+    store_identity: str = Field(
+        min_length=1,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+        strict=True,
+    )
+
+
+class EvidencePublicationPayload(_StrictPayload):
+    """Host-owned commitment to one immutable evidence-record byte string.
+
+    The closed vocabulary prevents a generic file hash from accidentally
+    becoming evidence authority.  Contract linkage is absent-preserving: a
+    record either commits both the contract identity and body hash or neither.
+    """
+
+    record_kind: Literal[
+        "invocation_contract",
+        "invocation_receipt",
+        "receipt_assessment",
+        "policy_claim",
+        "job_obligation",
+        "repair_context",
+        "build_requirements",
+        "run_pin",
+        # Reserved now so wiring another live artifact does not silently widen
+        # the authority vocabulary or require a control-event schema change.
+        "document_map",
+        "env_overlay",
+        "receipt_structure",
+        "stall_diagnostic",
+        "stall_seal",
+        "stall_cleanup",
+        "report_metrics",
+        "testcase_row_input",
+        "verdict",
+    ]
+    record_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        strict=True,
+    )
+    raw_sha256: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
+    byte_count: int = Field(
+        ge=0,
+        le=EVIDENCE_PUBLICATION_MAX_RECORD_BYTES,
+        strict=True,
+    )
+    run_id: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        strict=True,
+    )
+    contract_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        strict=True,
+    )
+    contract_hash: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        strict=True,
+    )
+    publication_state: Literal["present", "revoked"] = "present"
+    logical_artifact_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        strict=True,
+    )
+    revision: int | None = Field(default=None, ge=1, strict=True)
+    previous_raw_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        strict=True,
+    )
+    previous_publication_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        strict=True,
+    )
+
+    @model_serializer(mode="wrap")
+    def _absent_contract_binding_stays_absent(self, handler):
+        data = handler(self)
+        for field in (
+            "contract_id",
+            "contract_hash",
+            "logical_artifact_id",
+            "revision",
+            "previous_raw_sha256",
+            "previous_publication_sha256",
+        ):
+            if field not in self.model_fields_set:
+                data.pop(field, None)
+        return data
+
+    @model_validator(mode="after")
+    def _contract_binding_is_absent_or_complete(self) -> "EvidencePublicationPayload":
+        contract_id_present = "contract_id" in self.model_fields_set
+        contract_hash_present = "contract_hash" in self.model_fields_set
+        if contract_id_present != contract_hash_present:
+            raise ValueError("publication contract identity and hash must appear together")
+        if contract_id_present and (self.contract_id is None or self.contract_hash is None):
+            raise ValueError("publication contract identity and hash cannot be null")
+        if self.record_kind == "invocation_contract" and (
+            self.contract_id != self.record_id or self.contract_hash is None
+        ):
+            raise ValueError(
+                "an invocation-contract publication must bind its own identity and hash"
+            )
+        mutable = self.record_kind in EVIDENCE_MUTABLE_RECORD_KINDS
+        lineage_fields = (
+            "logical_artifact_id",
+            "revision",
+            "previous_raw_sha256",
+            "previous_publication_sha256",
+        )
+        present_lineage = {field for field in lineage_fields if field in self.model_fields_set}
+        if mutable:
+            if present_lineage != set(lineage_fields) or any(
+                getattr(self, field) is None for field in lineage_fields
+            ):
+                raise ValueError("mutable publication requires one complete revision tuple")
+            if self.record_id != self.logical_artifact_id:
+                raise ValueError(
+                    "mutable publication record_id must equal its stable logical artifact id"
+                )
+        elif present_lineage:
+            raise ValueError("immutable publication cannot carry mutable revision fields")
+        if self.publication_state == "revoked":
+            if not mutable:
+                raise ValueError("only a mutable artifact can be revoked")
+            if self.raw_sha256 != EVIDENCE_PUBLICATION_GENESIS_SHA256 or self.byte_count != 0:
+                raise ValueError("revocation must carry the canonical empty tombstone")
+            if contract_id_present:
+                raise ValueError("revocation cannot bind an invocation contract")
+        elif self.byte_count < 1 or self.raw_sha256 == EVIDENCE_PUBLICATION_GENESIS_SHA256:
+            raise ValueError("present publication must commit non-empty record bytes")
+        return self
 
 
 class PlannerResponsePayload(_StrictPayload):
@@ -292,6 +560,23 @@ class ActionEnvelopePayload(_StrictPayload):
     tool: str = Field(min_length=1)
     exact_params: dict[str, Any]
     envelope_sha256: str
+    intent_id: str | None = Field(default=None, min_length=1)
+    intent_source: Literal["model", "controller"] | None = None
+    action_fingerprint: str | None = Field(default=None, min_length=1)
+    trigger_assessment_id: str | None = Field(default=None, min_length=1)
+    repair_context_id: str | None = Field(default=None, min_length=1)
+    repair_context_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    domain_id: str | None = Field(default=None, min_length=1, max_length=256)
+    blocking_fact_refs: tuple[str, ...] = Field(default=(), max_length=64)
+    repair_hypothesis: str = Field(default="", max_length=4096)
+    next_action_kind: str | None = Field(default=None, min_length=1, max_length=256)
+    expected_observation: tuple[str, ...] = Field(default=(), max_length=64)
+    stop_condition: str = Field(default="", max_length=4096)
+
+    @field_validator("exact_params", mode="before")
+    @classmethod
+    def _exact_params_are_bounded(cls, value: Any) -> dict[str, Any]:
+        return bounded_exact_params(value)
 
     @model_validator(mode="after")
     def _carries_an_action_identity(self) -> "ActionEnvelopePayload":
@@ -304,6 +589,113 @@ class ActionEnvelopePayload(_StrictPayload):
         """
         if self.plan_index is None and not self.tool_call_id:
             raise ValueError("action envelope requires plan_index or tool_call_id")
+        lineage = (
+            self.intent_id,
+            self.intent_source,
+            self.action_fingerprint,
+        )
+        if any(value is not None for value in lineage) and not all(
+            value is not None for value in lineage
+        ):
+            raise ValueError("action intent identity must be recorded as one complete tuple")
+        repair_tuple = (
+            self.trigger_assessment_id,
+            self.repair_context_id,
+            self.repair_context_sha256,
+        )
+        repair_audit = (
+            self.domain_id,
+            self.blocking_fact_refs,
+            self.repair_hypothesis,
+            self.next_action_kind,
+            self.expected_observation,
+            self.stop_condition,
+        )
+        repair_linked = any(value is not None for value in repair_tuple) or any(repair_audit)
+        if repair_linked:
+            if not all(value is not None for value in repair_tuple):
+                raise ValueError("repair trigger/context/digest must be one complete tuple")
+            if not all(lineage) or self.intent_source != "model":
+                raise ValueError("repair-linked envelope requires a complete model intent")
+            missing = [
+                name
+                for name, value in (
+                    ("domain_id", self.domain_id),
+                    ("blocking_fact_refs", self.blocking_fact_refs),
+                    ("repair_hypothesis", self.repair_hypothesis.strip()),
+                    ("next_action_kind", self.next_action_kind),
+                    ("expected_observation", self.expected_observation),
+                    ("stop_condition", self.stop_condition.strip()),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError("repair intent audit is incomplete: " + ", ".join(missing))
+        expected = action_envelope_sha256(
+            plan_index=self.plan_index,
+            tool_call_id=self.tool_call_id,
+            tool=self.tool,
+            exact_params=self.exact_params,
+            intent_id=self.intent_id,
+            intent_source=self.intent_source,
+            action_fingerprint=self.action_fingerprint,
+            trigger_assessment_id=self.trigger_assessment_id,
+            repair_context_id=self.repair_context_id,
+            repair_context_sha256=self.repair_context_sha256,
+            domain_id=self.domain_id,
+            blocking_fact_refs=self.blocking_fact_refs or None,
+            repair_hypothesis=self.repair_hypothesis or None,
+            next_action_kind=self.next_action_kind,
+            expected_observation=self.expected_observation or None,
+            stop_condition=self.stop_condition or None,
+        )
+        if self.envelope_sha256 != expected:
+            raise ValueError("action envelope hash mismatch")
+        if (
+            len(canonical_json(self.model_dump(mode="json", exclude_unset=True)).encode("utf-8"))
+            > STRICT_CONTROL_PAYLOAD_MAX_CANONICAL_BYTES
+        ):
+            raise ValueError("action envelope exceeds its canonical byte limit")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _intent_lineage_absent_stays_absent(self, handler):
+        data = handler(self)
+        for name in (
+            "intent_id",
+            "intent_source",
+            "action_fingerprint",
+            "trigger_assessment_id",
+            "repair_context_id",
+            "repair_context_sha256",
+            "domain_id",
+            "blocking_fact_refs",
+            "repair_hypothesis",
+            "next_action_kind",
+            "expected_observation",
+            "stop_condition",
+        ):
+            if name not in self.model_fields_set:
+                data.pop(name, None)
+        return data
+
+
+class RepairContextOpenedPayload(_StrictPayload):
+    """Full bounded context projection that makes repair replay self-contained."""
+
+    source_gate_sequence: int = Field(ge=1)
+    source_phase_attempt_id: str = Field(min_length=1, max_length=256)
+    context: RepairContext
+    context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _context_hash_matches_projection(self) -> "RepairContextOpenedPayload":
+        if repair_context_sha256(self.context) != self.context_sha256:
+            raise ValueError("repair context hash mismatch")
+        if len(canonical_json(self.model_dump(mode="json")).encode("utf-8")) > (
+            STRICT_CONTROL_PAYLOAD_MAX_CANONICAL_BYTES
+        ):
+            raise ValueError("repair context opened payload exceeds its byte limit")
         return self
 
 
@@ -341,13 +733,9 @@ class TestCandidateResolutionPayload(_StrictPayload):
     @model_validator(mode="after")
     def _status_matches_candidates(self) -> "TestCandidateResolutionPayload":
         if self.status == "available" and (
-            not self.workspace_root
-            or not self.project_root
-            or not self.candidates
+            not self.workspace_root or not self.project_root or not self.candidates
         ):
-            raise ValueError(
-                "available test-candidate resolution requires roots and candidates"
-            )
+            raise ValueError("available test-candidate resolution requires roots and candidates")
         if self.status != "available" and self.candidates:
             raise ValueError("failed test-candidate resolution cannot contain coordinates")
         return self
@@ -375,24 +763,46 @@ class ForcedActionPayload(_StrictPayload):
     parent_execution_id: str | None = None
     candidate_resolution: TestCandidateResolutionPayload
     action_sha256: str
+    intent_id: str | None = Field(default=None, min_length=1)
+    intent_source: Literal["controller"] | None = None
+    action_fingerprint: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _valid_action_digest(self) -> "ForcedActionPayload":
-        if forced_action_sha256(
-            policy=self.policy,
-            trigger=self.trigger,
-            phase=self.phase,
-            source_attempt_id=self.source_attempt_id,
-            reason_code=self.reason_code,
-            tool=self.tool,
-            exact_params=self.exact_params,
-            candidate_root=self.candidate_root,
-            candidate_system=self.candidate_system,
-            parent_execution_id=self.parent_execution_id,
-            candidate_resolution=self.candidate_resolution.model_dump(mode="json"),
-        ) != self.action_sha256:
+        if (
+            forced_action_sha256(
+                policy=self.policy,
+                trigger=self.trigger,
+                phase=self.phase,
+                source_attempt_id=self.source_attempt_id,
+                reason_code=self.reason_code,
+                tool=self.tool,
+                exact_params=self.exact_params,
+                candidate_root=self.candidate_root,
+                candidate_system=self.candidate_system,
+                parent_execution_id=self.parent_execution_id,
+                candidate_resolution=self.candidate_resolution.model_dump(mode="json"),
+                intent_id=self.intent_id,
+                intent_source=self.intent_source,
+                action_fingerprint=self.action_fingerprint,
+            )
+            != self.action_sha256
+        ):
             raise ValueError("forced action hash mismatch")
+        lineage = (self.intent_id, self.intent_source, self.action_fingerprint)
+        if any(value is not None for value in lineage) and not all(
+            value is not None for value in lineage
+        ):
+            raise ValueError("forced action intent identity must be complete")
         return self
+
+    @model_serializer(mode="wrap")
+    def _intent_lineage_absent_stays_absent(self, handler):
+        data = handler(self)
+        for name in ("intent_id", "intent_source", "action_fingerprint"):
+            if name not in self.model_fields_set:
+                data.pop(name, None)
+        return data
 
 
 class ActualExecutionPayload(_StrictPayload):
@@ -408,6 +818,11 @@ class ActualExecutionPayload(_StrictPayload):
     ]
     roles: tuple[Literal["build", "test"], ...] = ()
     result: dict[str, Any]
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _params_are_exact_and_bounded(cls, value: Any) -> dict[str, Any]:
+        return bounded_exact_params(value)
 
     @model_validator(mode="after")
     def _no_full_output_body(self) -> "ActualExecutionPayload":
@@ -434,6 +849,11 @@ class ToolResultPayload(_StrictPayload):
     actual_executions: tuple[ActualExecutionPayload, ...] = ()
     output_sha256: str | None = None
 
+    @field_validator("params", mode="before")
+    @classmethod
+    def _params_are_exact_and_bounded(cls, value: Any) -> dict[str, Any]:
+        return bounded_exact_params(value)
+
     @model_validator(mode="after")
     def _no_full_output_body(self) -> "ToolResultPayload":
         _validate_control_result_projection(self.result)
@@ -446,6 +866,25 @@ class ValidatorObservationPayload(_StrictPayload):
     reason: str = ""
     evidence_refs: tuple[str, ...] = ()
     validated_facts: dict[str, Any] = Field(default_factory=dict)
+    control_disposition: (
+        Literal[
+            "terminal_claimable",
+            "wait_required",
+            "repair_required",
+            "harness_recovery_required",
+            "terminal_blocked",
+        ]
+        | None
+    ) = None
+    blocker_owner: Literal["none", "project", "harness", "unknown"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _ownership_absent_stays_absent(self, handler):
+        data = handler(self)
+        for name in ("control_disposition", "blocker_owner"):
+            if name not in self.model_fields_set:
+                data.pop(name, None)
+        return data
 
 
 class GateDecisionPayload(_StrictPayload):
@@ -461,6 +900,28 @@ class GateDecisionPayload(_StrictPayload):
     validated_facts: dict[str, Any] = Field(default_factory=dict)
     source_attempt_id: str | None = None
     test_candidate_resolution: TestCandidateResolutionPayload | None = None
+    control_disposition: (
+        Literal[
+            "terminal_claimable",
+            "wait_required",
+            "repair_required",
+            "harness_recovery_required",
+            "terminal_blocked",
+        ]
+        | None
+    ) = None
+    blocker_owner: Literal["none", "project", "harness", "unknown"] | None = None
+    # Required by ReplayHeader v3. Absent stays absent for archived v1/v2
+    # transcripts and is rejected by the v3 replay policy, not this parser.
+    code: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_serializer(mode="wrap")
+    def _ownership_absent_stays_absent(self, handler):
+        data = handler(self)
+        for name in ("control_disposition", "blocker_owner", "code"):
+            if name not in self.model_fields_set:
+                data.pop(name, None)
+        return data
 
 
 class PhaseTransitionPayload(_StrictPayload):
@@ -574,10 +1035,140 @@ class JobUnsettledPayload(_StrictPayload):
     obligation: dict[str, Any] = Field(default_factory=dict)
 
 
+class JobTerminalObservedPayload(_StrictPayload):
+    """Small process fact persisted before receipt settlement is attempted."""
+
+    job_id: str = Field(min_length=1)
+    exit_code: int
+    marker_ref: str = Field(min_length=1)
+    observed_at: str = Field(min_length=1)
+    obligation_ref: str = Field(min_length=1)
+
+
+class JobTerminalUnpersistedPayload(_StrictPayload):
+    """Terminal process whose complete invocation receipt could not persist."""
+
+    job_id: str = Field(min_length=1)
+    exit_code: int
+    # An ephemeral handle can fail before a receipt identity can be frozen.
+    attempted_receipt_id: str = ""
+    persistence_code: str = Field(min_length=1)
+    attempt_count: int = Field(ge=0)
+    obligation_ref: str = Field(min_length=1)
+    log_ref: str = ""
+    contract_id: str | None = Field(default=None, min_length=1)
+
+
+class JobLiveAtClosePayload(_StrictPayload):
+    """A process still lacking a terminal marker at the final close boundary."""
+
+    job_id: str = Field(min_length=1)
+    obligation_ref: str = Field(min_length=1)
+    log_ref: str = ""
+    close_reason: str = Field(min_length=1)
+
+
+class JobBarrierIntegrityFailurePayload(_StrictPayload):
+    """Bounded controller failures that prevented safe barrier reconciliation."""
+
+    failures: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("failures")
+    @classmethod
+    def _failures_are_nonempty(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not failure.strip() for failure in value):
+            raise ValueError("job barrier integrity failures must be non-empty strings")
+        return value
+
+
+class CompletionClaimDecisionPayload(_StrictPayload):
+    """The authoritative no-op completion decision made by LoopMemory."""
+
+    phase_attempt_id: str = Field(min_length=1)
+    claim_kind: Literal["done", "blocked"]
+    judge_disposition: Literal[
+        "terminal_claimable",
+        "wait_required",
+        "repair_required",
+        "harness_recovery_required",
+        "terminal_blocked",
+    ]
+    blocker_id: str = ""
+    mechanical_evidence_digest: str = Field(min_length=1)
+    assessment_fingerprints: tuple[str, ...] = ()
+    open_job_fingerprints: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    target_fingerprint: str = ""
+    config_fingerprint: str = ""
+    fact_fingerprint: str = ""
+    expected_decision: Literal["continue", "agent_no_progress", "not_counted"]
+    expected_recurrence_count: int = Field(ge=0)
+    expected_reason_code: str = Field(min_length=1)
+    expected_close_phase: bool = False
+
+
+class JobStallObservedPayload(_StrictPayload):
+    """One physical stall-control observation, never a project diagnosis."""
+
+    job_id: str = Field(min_length=1)
+    obligation_ref: str = Field(min_length=1)
+    diagnostic_ref: str = Field(min_length=1)
+    diagnostic_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observation: Literal[
+        "cpu_active",
+        "io_wait",
+        "thread_join_wait",
+        "deadlock_signature",
+        "unknown",
+    ]
+    progress_signals: tuple[str, ...] = ()
+    controller_code: str = Field(min_length=1)
+    evidence_sealed: bool = False
+    term_sent: bool = False
+    kill_sent: bool = False
+    group_live: bool
+
+    @field_validator("progress_signals")
+    @classmethod
+    def _progress_signals_are_typed(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = {
+            "cpu_active",
+            "log_growth",
+            "artifact_delta",
+            "report_delta",
+            "child_process_transition",
+        }
+        if any(signal not in allowed for signal in value):
+            raise ValueError("job stall progress signal is not recognized")
+        return tuple(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _cleanup_fields_are_consistent(self) -> "JobStallObservedPayload":
+        if self.kill_sent and not self.term_sent:
+            raise ValueError("KILL cannot precede TERM")
+        if (self.term_sent or self.kill_sent) and not self.evidence_sealed:
+            raise ValueError("cleanup signals require sealed evidence")
+        return self
+
+
+def job_stall_transition(payload: Mapping[str, Any]) -> str | None:
+    """Project only mechanically proven progress/stall into LoopMemory."""
+
+    observed = JobStallObservedPayload.model_validate(payload)
+    if observed.progress_signals:
+        return "progress"
+    if observed.evidence_sealed:
+        return "stalled"
+    # Empty progress signals also occur when a later probe is incomplete or
+    # transport fails. Absence of an observation is not a no-progress fact.
+    return None
+
+
 _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "planner_response": PlannerResponsePayload,
     "scheduler_decision": SchedulerDecisionPayload,
     "action_envelope": ActionEnvelopePayload,
+    "repair_context_opened": RepairContextOpenedPayload,
     "forced_action": ForcedActionPayload,
     "tool_result": ToolResultPayload,
     "validator_observation": ValidatorObservationPayload,
@@ -588,13 +1179,21 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "claim_transition": ClaimTransitionPayload,
     "job_settled": JobSettledPayload,
     "job_unsettled": JobUnsettledPayload,
+    "job_terminal_observed": JobTerminalObservedPayload,
+    "job_terminal_unpersisted": JobTerminalUnpersistedPayload,
+    "job_live_at_close": JobLiveAtClosePayload,
+    "job_barrier_integrity_failure": JobBarrierIntegrityFailurePayload,
+    "completion_claim_decision": CompletionClaimDecisionPayload,
+    "job_stall_observed": JobStallObservedPayload,
+    "evidence_publication": EvidencePublicationPayload,
+    "evidence_store_bound": EvidenceStoreBoundPayload,
 }
 
 
 class ControlEvent(BaseModel):
     """One strict event row. Payload fields are validated per event kind."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
     sequence: int = Field(ge=1)
     kind: ControlEventKind
@@ -602,6 +1201,35 @@ class ControlEvent(BaseModel):
     source: SourceExcerpt | None = None
     timestamp: str | None = None
     event_id: str | None = None
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any):
+        del _fields_set
+        return cls.model_validate(values)
+
+    @classmethod
+    def model_validate_json(cls, json_data: Any, *args: Any, **kwargs: Any):
+        if isinstance(json_data, str):
+            raw_size = len(json_data.encode("utf-8"))
+        elif isinstance(json_data, (bytes, bytearray)):
+            raw_size = len(json_data)
+        else:
+            raise TypeError("control event JSON must be str, bytes, or bytearray")
+        if raw_size > CONTROL_EVENT_MAX_RAW_BYTES:
+            raise ValueError("control event JSON exceeds its raw byte limit")
+        _reject_duplicate_json_keys(json_data)
+        return super().model_validate_json(json_data, *args, **kwargs)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> "ControlEvent":
+        del deep
+        payload = self.model_dump(mode="python", round_trip=True)
+        payload.update(dict(update or {}))
+        return type(self).model_validate(payload)
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "ControlEvent":
@@ -626,6 +1254,18 @@ def action_envelope_sha256(
     tool: str,
     exact_params: Mapping[str, Any],
     tool_call_id: str | None = None,
+    intent_id: str | None = None,
+    intent_source: str | None = None,
+    action_fingerprint: str | None = None,
+    trigger_assessment_id: str | None = None,
+    repair_context_id: str | None = None,
+    repair_context_sha256: str | None = None,
+    domain_id: str | None = None,
+    blocking_fact_refs: tuple[str, ...] | list[str] | None = None,
+    repair_hypothesis: str | None = None,
+    next_action_kind: str | None = None,
+    expected_observation: tuple[str, ...] | list[str] | None = None,
+    stop_condition: str | None = None,
 ) -> str:
     """Digest one action envelope under whichever protocol identity keys it.
 
@@ -640,9 +1280,30 @@ def action_envelope_sha256(
         identity = f"tool_call:{tool_call_id}"
     else:
         raise ValueError("action envelope hash requires plan_index or tool_call_id")
-    return canonical_sha256(
-        {"plan_index": identity, "tool": str(tool), "exact_params": dict(exact_params)}
-    )
+    payload: dict[str, Any] = {
+        "plan_index": identity,
+        "tool": str(tool),
+        "exact_params": bounded_exact_params(exact_params),
+    }
+    lineage = {
+        "intent_id": intent_id,
+        "intent_source": intent_source,
+        "action_fingerprint": action_fingerprint,
+        "trigger_assessment_id": trigger_assessment_id,
+        "repair_context_id": repair_context_id,
+        "repair_context_sha256": repair_context_sha256,
+        "domain_id": domain_id,
+        "blocking_fact_refs": list(blocking_fact_refs) if blocking_fact_refs is not None else None,
+        "repair_hypothesis": repair_hypothesis,
+        "next_action_kind": next_action_kind,
+        "expected_observation": (
+            list(expected_observation) if expected_observation is not None else None
+        ),
+        "stop_condition": stop_condition,
+    }
+    if any(value is not None for value in lineage.values()):
+        payload.update({key: value for key, value in lineage.items() if value is not None})
+    return canonical_sha256(payload)
 
 
 def forced_action_sha256(
@@ -658,23 +1319,32 @@ def forced_action_sha256(
     candidate_system: str | None,
     parent_execution_id: str | None,
     candidate_resolution: Mapping[str, Any],
+    intent_id: str | None = None,
+    intent_source: str | None = None,
+    action_fingerprint: str | None = None,
 ) -> str:
     """Digest the complete harness-owned action contract."""
-    return canonical_sha256(
-        {
-            "policy": policy,
-            "trigger": trigger,
-            "phase": phase,
-            "source_attempt_id": source_attempt_id,
-            "reason_code": reason_code,
-            "tool": tool,
-            "exact_params": dict(exact_params),
-            "candidate_root": candidate_root,
-            "candidate_system": candidate_system,
-            "parent_execution_id": parent_execution_id,
-            "candidate_resolution": dict(candidate_resolution),
-        }
-    )
+    payload: dict[str, Any] = {
+        "policy": policy,
+        "trigger": trigger,
+        "phase": phase,
+        "source_attempt_id": source_attempt_id,
+        "reason_code": reason_code,
+        "tool": tool,
+        "exact_params": dict(exact_params),
+        "candidate_root": candidate_root,
+        "candidate_system": candidate_system,
+        "parent_execution_id": parent_execution_id,
+        "candidate_resolution": dict(candidate_resolution),
+    }
+    lineage = {
+        "intent_id": intent_id,
+        "intent_source": intent_source,
+        "action_fingerprint": action_fingerprint,
+    }
+    if any(value is not None for value in lineage.values()):
+        payload.update({key: value for key, value in lineage.items() if value is not None})
+    return canonical_sha256(payload)
 
 
 def _validate_control_result_projection(result: Mapping[str, Any]) -> None:
@@ -732,6 +1402,11 @@ class ControlEventSink:
     ) -> ControlEvent:
         with self._lock:
             sequence = self._sequence + 1
+            resolved_source = (
+                source
+                if source is None or isinstance(source, SourceExcerpt)
+                else SourceExcerpt.model_validate(source)
+            )
             event = ControlEvent(
                 sequence=sequence,
                 kind=kind,
@@ -740,7 +1415,7 @@ class ControlEventSink:
                     if isinstance(payload, BaseModel)
                     else dict(payload)
                 ),
-                source=source,
+                source=resolved_source,
                 timestamp=self._clock(),
                 event_id=self._id_factory(sequence),
             )
@@ -780,14 +1455,21 @@ class ControlEventSink:
 
 __all__ = [
     "CONTROL_EVENT_KINDS",
+    "CONTROL_EVENT_MAX_RAW_BYTES",
     "CONTROL_EVENT_SCHEMA_VERSION",
     "ControlEvent",
     "ControlEventKind",
     "ControlEventSink",
+    "EVIDENCE_MUTABLE_RECORD_KINDS",
+    "EVIDENCE_PUBLICATION_GENESIS_SHA256",
+    "EVIDENCE_PUBLICATION_MAX_RECORD_BYTES",
+    "EvidencePublicationPayload",
+    "EvidenceStoreBoundPayload",
     "RunPin",
     "SourceExcerpt",
     "SourceFileManifest",
     "action_envelope_sha256",
+    "job_stall_transition",
     "canonical_json",
     "canonical_sha256",
     "compact_control_value",

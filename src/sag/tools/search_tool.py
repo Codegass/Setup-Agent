@@ -97,9 +97,27 @@ class SearchTool(BaseTool):
         if poll.get("finished") or poll.get("state") in {"finished", "vanished"}:
             completed = self.docker_orchestrator.collect_detached_result(handle, poll)
             full_output = str(completed.get("full_output") or completed.get("output") or tail)
+            runner = None
+            try:
+                from sag.agent.job_obligations import read_obligations
+
+                runner = next(
+                    (
+                        str(record.get("tool") or "")
+                        for record in (read_obligations(self.docker_orchestrator) or ())
+                        if str(record.get("job_id") or "") == job_id
+                    ),
+                    None,
+                )
+            except Exception:
+                # The exit status remains usable when historical jobs predate
+                # the obligation ledger; runner identity is then honestly
+                # unknown and the generic high-confidence fallback applies.
+                runner = None
             result = classify_detached_completion(
                 completed.get("exit_code"),
                 str(completed.get("output") or tail),
+                runner=runner,
                 full_output=full_output,
                 poll_ref=poll_ref,
                 invocation_status=(

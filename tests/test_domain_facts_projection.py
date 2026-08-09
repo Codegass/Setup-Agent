@@ -26,6 +26,13 @@ import json
 import shlex
 
 import pytest
+from container_evidence_fakes import add_published_mutable_json
+
+from sag.agent.claim_records import PolicyClaim, validate_claim_v1
+from sag.agent.document_map import DocumentMapEntry, document_map_payload, entry_id
+from sag.agent.evidence_publications import DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
+from sag.agent.evidence_publications import publish_evidence_bytes
+from sag.agent.evidence_records import frame_named_json_record_stream
 from test_build_domain_graph import (
     BIG,
     BIGTOP_FILES,
@@ -238,6 +245,15 @@ class _ClaimsOrch:
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            assignment = command.partition(";")[0]
+            path = shlex.split(assignment[len("file=") :])[0]
+            records = [(path.rsplit("/", 1)[-1], self.files[path])] if path in self.files else []
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
         if command.startswith("find "):
             if self.listing_fails:
                 return {"success": False, "exit_code": 1, "output": ""}
@@ -447,17 +463,36 @@ def test_a_partial_map_entry_without_a_reason_keeps_the_key_absent():
     assert fact["open_conflicts"] == [{"kind": "partial_map", "path": f"{APP}/vendor/blob.bin"}]
 
 
-def test_a_missing_document_map_leaves_open_conflicts_absent():
+def test_a_missing_document_map_is_an_explicit_integrity_conflict():
     class _NoMapOrch(_ClaimsOrch):
         pass
 
     (fact,) = build_domain_facts(_NoMapOrch({}), [_domain(APP)])
-    assert "open_conflicts" not in fact
+    assert fact["open_conflicts"] == [
+        {
+            "kind": "document_map_integrity_unavailable",
+            "reason": "verified_absence",
+        }
+    ]
 
 
 def test_document_map_is_read_from_the_documented_persistence_path():
-    payload = json.dumps({"partial_map": [{"path": f"{APP}/vendor/blob.bin", "reason": "binary"}]})
-    orch = _ClaimsOrch({"/workspace/.setup_agent/document_map.json": payload})
+    payload = document_map_payload(
+        {
+            "entries": [],
+            "partial_map": [{"path": f"{APP}/vendor/blob.bin", "reason": "binary"}],
+        }
+    )
+    orch = _ClaimsOrch({})
+    add_published_mutable_json(
+        orch,
+        orch,
+        path=DOC_MAP_PATH,
+        record_kind="document_map",
+        record_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+        payload=payload,
+    )
     (fact,) = build_domain_facts(orch, [_domain(APP)])
     assert fact["open_conflicts"] == [
         {"kind": "partial_map", "path": f"{APP}/vendor/blob.bin", "reason": "binary"}
@@ -555,6 +590,26 @@ class StageAOrch(FakeOrchestrator):
     def execute_command(self, command, **kwargs):
         if command.startswith("realpath -m -- "):
             return {"success": True, "exit_code": 0, "output": "\n".join(shlex.split(command)[3:])}
+        if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            assignment = command.partition(";")[0]
+            path = shlex.split(assignment[len("file=") :])[0]
+            records = [(path.rsplit("/", 1)[-1], self.files[path])] if path in self.files else []
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
+        if "SAG_NAMED_JSON_RECORD_V1" in command and POLICY_CLAIMS_DIR in command:
+            records = [
+                (path.rsplit("/", 1)[-1], body)
+                for path, body in sorted(self.stage_a.items())
+                if path.startswith(f"{POLICY_CLAIMS_DIR}/") and path.endswith(".json")
+            ]
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
         if command.startswith("find ") and POLICY_CLAIMS_DIR in command:
             listing = [path for path in sorted(self.stage_a) if path.startswith(POLICY_CLAIMS_DIR)]
             return {"success": bool(listing), "exit_code": 0, "output": "\n".join(listing)}
@@ -567,48 +622,97 @@ class StageAOrch(FakeOrchestrator):
 
 
 DOC_MAP_PATH = "/workspace/.setup_agent/document_map.json"
-TF_LIFECYCLE_ID = "lifecycle-111111111111"
-DG_CONSTRAINT_ID = "tool_constraint-222222222222"
-SPARK_DEPENDENCY_ID = "dependency-333333333333"
 DOCUMENTED_ARGV = ["mvn", "-f", f"{TF}/pom.xml", "install", "-DskipITs"]
 
+TF_DOCUMENT_PATH = f"{TF}/README.md"
+DG_DOCUMENT_PATH = f"{DG}/gradle.properties"
+SPARK_DOCUMENT_PATH = f"{SPARK}/build.gradle"
+TF_SOURCE_HASH = "1" * 64
+DG_SOURCE_HASH = "2" * 64
+SPARK_SOURCE_HASH = "3" * 64
+
+TF_LIFECYCLE_CLAIM = PolicyClaim(
+    kind="lifecycle",
+    typed_value={"argv": DOCUMENTED_ARGV, "cwd": BIG},
+    source_class="repository_doc",
+    source_ref={
+        "entry_id": entry_id(TF_DOCUMENT_PATH),
+        "source_hash": TF_SOURCE_HASH,
+        "source_range": "L10",
+    },
+    extraction_method="markdown_fenced_command",
+)
+DG_CONSTRAINT_CLAIM = PolicyClaim(
+    kind="tool_constraint",
+    typed_value={"tool": "maven", "constraint": "[3.9,)"},
+    source_class="config",
+    source_ref={
+        "entry_id": entry_id(DG_DOCUMENT_PATH),
+        "source_hash": DG_SOURCE_HASH,
+        "source_range": "L4",
+    },
+    extraction_method="maven_wrapper_literal",
+    applicability={"domain": DG},
+)
+SPARK_DEPENDENCY_CLAIM = PolicyClaim(
+    kind="dependency",
+    typed_value={
+        "group": "org.apache.bigtop",
+        "name": "bigpetstore-data-generator",
+        "version": "3.6.0-SNAPSHOT",
+    },
+    source_class="config",
+    source_ref={
+        "entry_id": entry_id(SPARK_DOCUMENT_PATH),
+        "source_hash": SPARK_SOURCE_HASH,
+        "source_range": "L8",
+    },
+    extraction_method="gradle_dependency_literal",
+    applicability={"domain": SPARK},
+)
+STAGE_A_CLAIMS = (
+    TF_LIFECYCLE_CLAIM,
+    DG_CONSTRAINT_CLAIM,
+    SPARK_DEPENDENCY_CLAIM,
+)
+TF_LIFECYCLE_ID = TF_LIFECYCLE_CLAIM.claim_id
+DG_CONSTRAINT_ID = DG_CONSTRAINT_CLAIM.claim_id
+SPARK_DEPENDENCY_ID = SPARK_DEPENDENCY_CLAIM.claim_id
+
+STAGE_A_DOCUMENT_MAP = {
+    "entries": sorted(
+        [
+            DocumentMapEntry(
+                entry_id=entry_id(TF_DOCUMENT_PATH),
+                path=TF_DOCUMENT_PATH,
+                realpath=TF_DOCUMENT_PATH,
+                source_hash=TF_SOURCE_HASH,
+                kind="markdown",
+            ),
+            DocumentMapEntry(
+                entry_id=entry_id(DG_DOCUMENT_PATH),
+                path=DG_DOCUMENT_PATH,
+                realpath=DG_DOCUMENT_PATH,
+                source_hash=DG_SOURCE_HASH,
+                kind="properties",
+            ),
+            DocumentMapEntry(
+                entry_id=entry_id(SPARK_DOCUMENT_PATH),
+                path=SPARK_DOCUMENT_PATH,
+                realpath=SPARK_DOCUMENT_PATH,
+                source_hash=SPARK_SOURCE_HASH,
+                kind="gradle",
+            ),
+        ],
+        key=lambda entry: entry.path,
+    ),
+    "partial_map": [{"path": f"{DG}/vendor/blob.bin", "reason": "binary"}],
+}
 STAGE_A_FILES = {
-    f"{POLICY_CLAIMS_DIR}/{TF_LIFECYCLE_ID}.json": json.dumps(
-        {
-            "claim_id": TF_LIFECYCLE_ID,
-            "kind": "lifecycle",
-            "source_class": "repository_doc",
-            "typed_value": {"argv": DOCUMENTED_ARGV, "cwd": BIG},
-        }
-    ),
-    f"{POLICY_CLAIMS_DIR}/{DG_CONSTRAINT_ID}.json": json.dumps(
-        {
-            "claim_id": DG_CONSTRAINT_ID,
-            "kind": "tool_constraint",
-            "source_class": "config",
-            "applicability": {"domain": DG},
-            "typed_value": {"tool": "maven", "constraint": "[3.9,)"},
-        }
-    ),
-    f"{POLICY_CLAIMS_DIR}/{SPARK_DEPENDENCY_ID}.json": json.dumps(
-        {
-            "claim_id": SPARK_DEPENDENCY_ID,
-            "kind": "dependency",
-            "source_class": "config",
-            "applicability": {"domain": SPARK},
-            "typed_value": {
-                "group": "org.apache.bigtop",
-                "name": "bigpetstore-data-generator",
-                "version": "3.6.0-SNAPSHOT",
-            },
-        }
-    ),
-    DOC_MAP_PATH: json.dumps(
-        {
-            "document_map_fingerprint": "f" * 64,
-            "partial_map": [{"path": f"{DG}/vendor/blob.bin", "reason": "binary"}],
-        }
-    ),
+    **{
+        f"{POLICY_CLAIMS_DIR}/{claim.claim_id}.json": json.dumps(claim.payload(), sort_keys=True)
+        for claim in STAGE_A_CLAIMS
+    },
 }
 
 
@@ -619,11 +723,44 @@ def _analyze_bigtop_stage_a(stage_a_files=STAGE_A_FILES):
         test_dirs=BIGTOP_TEST_DIRS,
         stage_a_files=stage_a_files,
     )
+    for path, raw in sorted(orch.stage_a.items()):
+        if not path.startswith(f"{POLICY_CLAIMS_DIR}/") or not path.endswith(".json"):
+            continue
+        record_id = path.rsplit("/", 1)[-1][:-5]
+        validate_claim_v1(json.loads(raw), expected_id=record_id)
+        assert publish_evidence_bytes(
+            orch,
+            record_kind="policy_claim",
+            record_id=record_id,
+            raw=raw.encode("utf-8"),
+        ).published
+    current_document_map = (
+        STAGE_A_DOCUMENT_MAP if stage_a_files else {"entries": [], "partial_map": []}
+    )
+    current_document_payload = document_map_payload(current_document_map)
+    add_published_mutable_json(
+        orch,
+        orch.atomic,
+        path=DOC_MAP_PATH,
+        record_kind="document_map",
+        record_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+        payload=current_document_payload,
+    )
     analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
     analysis = {"build_system": "maven", "maven_modules": []}
     analysis["build_recommendation"] = analyzer._recommend_build_approach(BIG, analysis)
     analyzer._recommend_test_approach(BIG, analysis["build_recommendation"])
-    analyzer._persist_build_requirements(BIG, analysis)
+    analysis["_current_policy_claim_ids"] = sorted(
+        path.rsplit("/", 1)[-1][:-5]
+        for path in orch.stage_a
+        if path.startswith(f"{POLICY_CLAIMS_DIR}/") and path.endswith(".json")
+    )
+    analyzer._persist_build_requirements(
+        BIG,
+        analysis,
+        document_map=current_document_map,
+    )
     return orch, analysis, json.loads(orch.files[REQUIREMENTS_PATH])
 
 
@@ -669,6 +806,52 @@ def test_a_bigtop_survey_without_stage_a_files_still_projects_domain_facts():
     assert "open_conflicts" not in facts[TF]
 
 
+def test_unpublished_claim_mirror_cannot_be_washed_into_a_new_manifest():
+    orch, analysis, manifest = _analyze_bigtop_stage_a()
+    persisted = json.dumps(manifest, sort_keys=True)
+    forged = PolicyClaim(
+        kind="lifecycle",
+        typed_value={"argv": ["mvn", "deploy"], "cwd": SPARK},
+        source_class="repository_doc",
+        source_ref={
+            "entry_id": "doc-444444444444",
+            "source_hash": "4" * 64,
+            "source_range": "L1",
+        },
+        extraction_method="markdown_fenced_command",
+    )
+    orch.stage_a[f"{POLICY_CLAIMS_DIR}/{forged.claim_id}.json"] = json.dumps(
+        forged.payload(), sort_keys=True
+    )
+
+    with pytest.raises(RuntimeError, match="policy_claim_ledger_unavailable"):
+        ProjectAnalyzerTool(docker_orchestrator=orch)._persist_build_requirements(BIG, analysis)
+
+    assert json.dumps(json.loads(orch.files[REQUIREMENTS_PATH]), sort_keys=True) == persisted
+
+
+def test_deleting_a_host_published_claim_blocks_manifest_republication():
+    orch, analysis, manifest = _analyze_bigtop_stage_a()
+    persisted = json.dumps(manifest, sort_keys=True)
+    orch.stage_a.pop(f"{POLICY_CLAIMS_DIR}/{SPARK_DEPENDENCY_ID}.json")
+
+    with pytest.raises(RuntimeError, match="policy_claim_ledger_unavailable"):
+        ProjectAnalyzerTool(docker_orchestrator=orch)._persist_build_requirements(BIG, analysis)
+
+    assert json.dumps(json.loads(orch.files[REQUIREMENTS_PATH]), sort_keys=True) == persisted
+
+
+def test_prior_published_claim_cannot_survive_a_new_smaller_survey_set():
+    orch, analysis, manifest = _analyze_bigtop_stage_a()
+    persisted = json.dumps(manifest, sort_keys=True)
+    analysis["_current_policy_claim_ids"] = sorted({TF_LIFECYCLE_ID, DG_CONSTRAINT_ID})
+
+    with pytest.raises(RuntimeError, match="policy_claim_current_set_mismatch"):
+        ProjectAnalyzerTool(docker_orchestrator=orch)._persist_build_requirements(BIG, analysis)
+
+    assert json.dumps(json.loads(orch.files[REQUIREMENTS_PATH]), sort_keys=True) == persisted
+
+
 SOLO = "/workspace/solo"
 SOLO_FILES = {
     f"{SOLO}/pom.xml": (
@@ -696,18 +879,31 @@ def test_a_single_domain_manifest_gains_no_domain_facts_key():
 
 
 def test_native_capability_state_rides_the_python_survey_facts():
-    _orch, analysis, _manifest = _analyze_bigtop_stage_a()
+    orch, analysis, _manifest = _analyze_bigtop_stage_a()
     analysis["python_config"] = {
+        "python_version": "3.11",
+        "python_constraint": None,
+        "python_constraint_source": None,
+        "python_installer": "pip",
+        "python_install_commands": [],
+        "python_install_note": None,
+        "python_install_source": None,
+        "python_packages": [],
+        "python_distribution_name": None,
+        "python_build_backend": None,
+        "python_declared_dependencies": [],
+        "python_package_paths": [],
+        "python_local_providers": [],
+        "python_smoke_candidates": [],
+        "python_venv": f"{DG}/python/.venv",
+        "has_c_extensions": False,
         "has_native_build": True,
         "python_root": f"{DG}/python",
+        "native_build_mode": "cmake",
         "native_artifact_roots": ["build"],
+        "test_hints": {"pytest_args": None, "test_deps": []},
     }
-    orch = StageAOrch(
-        BIGTOP_FILES,
-        source_dirs=BIGTOP_SOURCE_DIRS,
-        test_dirs=BIGTOP_TEST_DIRS,
-        stage_a_files=STAGE_A_FILES,
-    )
+    analysis["_current_policy_claim_ids"] = sorted(claim.claim_id for claim in STAGE_A_CLAIMS)
     ProjectAnalyzerTool(docker_orchestrator=orch)._persist_build_requirements(BIG, analysis)
     facts = _facts_by_root(json.loads(orch.files[REQUIREMENTS_PATH])["domain_facts"])
     # Where the native core WOULD land is a survey fact; whether it is BUILT is
@@ -761,9 +957,9 @@ def _assert_domain_knowledge_is_coordinates_only(text):
     """Every rendered line that names a surveyed domain is a coordinate line.
 
     This is the recommended-call boundary stated positively: the phase contract
-    may still name the tool a PHASE uses (``build(action='compile')``), but the
-    survey's per-domain knowledge reaches the model as coordinates and nothing
-    else — no per-domain call, order or probe sequence.
+    names the terminal evidence needed to close, while the survey's per-domain
+    knowledge reaches the model as coordinates and nothing else — no per-domain
+    call, order or probe sequence.
     """
     for line in text.splitlines():
         if any(root in line for root in (TF, DG, SPARK, TQ)):

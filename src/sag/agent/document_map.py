@@ -34,7 +34,6 @@ module never raises. A transport failure degrades to an empty map with a
 visible conflict, never to a map that pretends to be complete.
 """
 
-import base64
 import hashlib
 import json
 import posixpath
@@ -47,17 +46,28 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from loguru import logger
 
 from sag.agent import invocation_receipts
+from sag.agent.evidence_publications import (
+    DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+    MutablePublicationObservation,
+    evidence_publication_authority_for,
+    latest_publication_raw_sha256,
+    publish_evidence_revision,
+    verify_latest_evidence_bytes,
+)
+from sag.agent.evidence_records import (
+    PublishedJsonObjectRead,
+    decode_named_json_record_stream,
+    execute_named_json_file_stream,
+)
+from sag.runtime.container_io import read_container_text
+from sag.utils.container_io import (
+    WRITE_COMPARE_CONFLICT,
+    compare_publish_container_text_atomic,
+)
 
 DOCUMENT_MAP_SCHEMA_VERSION = 1
 DOCUMENT_MAP_DIR = "/workspace/.setup_agent"
 DOCUMENT_MAP_PATH = f"{DOCUMENT_MAP_DIR}/document_map.json"
-# Heredoc delimiter for the atomic write. The body is single-line JSON, so no
-# map content can ever collide with it.
-DOCUMENT_MAP_HEREDOC = "SAGDOCMAP"
-# Streamed-write chunk size: safely under the kernel's ~128KB per-argument
-# bound with heredoc framing overhead included.
-WRITE_CHUNK_CHARS = 100_000
-
 WORKSPACE_ROOT = "/workspace"
 
 # Shared contract (plan §"Stage A" shared contracts), copied into the run pin.
@@ -115,6 +125,47 @@ PARTIAL_REASONS = (
 )
 
 DISCOVERY_STATUSES = ("indexed", "truncated")
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_GIT_OBJECT_RE = re.compile(r"[0-9a-f]{7,64}")
+_DOCUMENT_KINDS = frozenset(
+    {
+        "cmake",
+        "dockerfile",
+        "gradle",
+        "markdown",
+        "properties",
+        "python",
+        "requirements",
+        "shell",
+        "toml",
+        "unknown",
+        "xml",
+        "yaml",
+    }
+)
+_SECTION_KINDS = frozenset(
+    {
+        "array_table",
+        "assignment",
+        "code_block",
+        "command",
+        "directive",
+        "heading",
+        "job",
+        "key",
+        "option",
+        "set",
+        "step",
+        "table",
+        "tag_path",
+    }
+)
+
+
+class DocumentSourceChangedError(RuntimeError):
+    """The bytes behind one published map handle changed before extraction."""
+
 
 # The candidate predicate, in the container's own `find` syntax. Portable
 # predicates only (`-name`/`-iname`/`-path`): the depth rules that `-path`
@@ -434,13 +485,26 @@ def read_entry_text(
     entry was hashed and indexed over, and then be talking about a different
     document than the one the handle names.
 
+    When the handle carries ``source_hash``, the exact bounded bytes fetched
+    here must still match it.  A mismatch raises ``DocumentSourceChangedError``
+    so a claim extractor can record a typed survey conflict without treating
+    the changed document as the bytes the published handle named.
+
     None when the entry names no path or the read failed; an unreadable
     document states nothing, and nothing is guessed on its behalf.
     """
     path = _field(entry, "path")
     if not path:
         return None
-    return _read_head(execute, path)
+    text = _read_head(execute, path)
+    if text is None:
+        return None
+    expected = _field(entry, "source_hash").strip().lower()
+    if expected:
+        actual = hashlib.sha256(_raw_bytes(text)).hexdigest()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected) or actual != expected:
+            raise DocumentSourceChangedError(f"document bytes changed after mapping: {path}")
+    return text
 
 
 def _probe_target_sha(
@@ -902,6 +966,257 @@ _INDEXERS: Dict[str, Callable[[str, Sequence[str]], List[Tuple[str, str, int, in
 # ---------------------------------------------------------------------------
 
 
+def validate_document_map_v1(
+    payload: Mapping[str, Any],
+    expected_id: str = DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+) -> Dict[str, Any]:
+    """Validate one complete canonical DocumentMap v1 object.
+
+    Publication authority answers *who authorized these exact bytes*; this
+    validator separately answers *whether those bytes are the documented map
+    schema*.  The stable host publication identity is not carried in the
+    repository-writable mirror, so ``expected_id`` is fixed at this boundary.
+    """
+
+    if expected_id != DOCUMENT_MAP_LOGICAL_ARTIFACT_ID:
+        raise ValueError("document map publication identity is invalid")
+    if not isinstance(payload, Mapping):
+        raise ValueError("document map must be an object")
+    body = dict(payload)
+    _require_exact_keys(
+        body,
+        required={
+            "schema_version",
+            "parser_version",
+            "document_map_fingerprint",
+            "entries",
+            "partial_map",
+        },
+        field="document map",
+    )
+    if type(body["schema_version"]) is not int or body["schema_version"] != 1:
+        raise ValueError("document map schema_version is not v1")
+    if body["parser_version"] != PARSER_VERSION:
+        raise ValueError("document map parser_version is not current")
+
+    entries = body["entries"]
+    if not isinstance(entries, list) or len(entries) > MAX_FILES:
+        raise ValueError("document map entries are not a bounded list")
+    entry_paths: List[str] = []
+    entry_ids: set[str] = set()
+    target_shas: List[str] = []
+    target_presence: List[bool] = []
+    for position, candidate in enumerate(entries):
+        if not isinstance(candidate, Mapping):
+            raise ValueError(f"document map entry {position} is not an object")
+        record = dict(candidate)
+        _require_exact_keys(
+            record,
+            required={
+                "entry_id",
+                "path",
+                "realpath",
+                "source_hash",
+                "kind",
+                "section_index",
+                "parser_version",
+                "discovery_status",
+            },
+            optional={"target_sha"},
+            field=f"document map entry {position}",
+        )
+        path = _canonical_workspace_path(record["path"], f"entry {position} path")
+        _canonical_workspace_path(record["realpath"], f"entry {position} realpath")
+        identity = record["entry_id"]
+        if type(identity) is not str or identity != entry_id(path) or identity in entry_ids:
+            raise ValueError(f"document map entry {position} identity is not canonical")
+        entry_ids.add(identity)
+        entry_paths.append(path)
+        if (
+            type(record["source_hash"]) is not str
+            or _SHA256_RE.fullmatch(record["source_hash"]) is None
+        ):
+            raise ValueError(f"document map entry {position} source_hash is invalid")
+        if type(record["kind"]) is not str or record["kind"] not in _DOCUMENT_KINDS:
+            raise ValueError(f"document map entry {position} kind is invalid")
+        if record["parser_version"] != PARSER_VERSION:
+            raise ValueError(f"document map entry {position} parser_version is invalid")
+        if record["discovery_status"] not in DISCOVERY_STATUSES:
+            raise ValueError(f"document map entry {position} discovery_status is invalid")
+        _validate_section_index(record["section_index"], position)
+
+        has_target = "target_sha" in record
+        target_presence.append(has_target)
+        if has_target:
+            target = record["target_sha"]
+            if type(target) is not str or _GIT_OBJECT_RE.fullmatch(target) is None:
+                raise ValueError(f"document map entry {position} target_sha is invalid")
+            target_shas.append(target)
+
+    if entry_paths != sorted(entry_paths) or len(set(entry_paths)) != len(entry_paths):
+        raise ValueError("document map entries are not in canonical path order")
+    if target_presence and any(target_presence) and not all(target_presence):
+        raise ValueError("document map target_sha coverage is incomplete")
+    if len(set(target_shas)) > 1:
+        raise ValueError("document map entries disagree on target_sha")
+
+    fingerprint = body["document_map_fingerprint"]
+    if (
+        type(fingerprint) is not str
+        or _SHA256_RE.fullmatch(fingerprint) is None
+        or fingerprint != document_map_fingerprint(entries)
+    ):
+        raise ValueError("document map fingerprint is invalid")
+
+    partial_map = body["partial_map"]
+    if not isinstance(partial_map, list) or len(partial_map) > MAX_CANDIDATE_PATHS + 1:
+        raise ValueError("document map partial_map is not a bounded list")
+    partial_paths: List[str] = []
+    for position, candidate in enumerate(partial_map):
+        if not isinstance(candidate, Mapping):
+            raise ValueError(f"document map partial entry {position} is not an object")
+        conflict = dict(candidate)
+        _require_exact_keys(
+            conflict,
+            required={"path", "reason"},
+            field=f"document map partial entry {position}",
+        )
+        path = _canonical_workspace_path(conflict["path"], f"partial entry {position} path")
+        reason = conflict["reason"]
+        if type(reason) is not str or reason not in PARTIAL_REASONS:
+            raise ValueError(f"document map partial entry {position} reason is invalid")
+        partial_paths.append(path)
+    if partial_paths != sorted(partial_paths) or len(set(partial_paths)) != len(partial_paths):
+        raise ValueError("document map partial entries are not in canonical path order")
+    if set(entry_paths).intersection(partial_paths):
+        raise ValueError("document map cannot both index and exclude one path")
+    if len(entries) + len(partial_map) > MAX_CANDIDATE_PATHS + 1:
+        raise ValueError("document map exceeds the discovery boundary")
+    return body
+
+
+def read_live_document_map(source: Any) -> PublishedJsonObjectRead:
+    """Read the fixed map mirror only at its exact current host revision.
+
+    The single framed read preserves the physical ``document_map.json`` name
+    and exact bytes.  One authority lock then verifies the stable logical head,
+    latest revision, tombstone state and the complete current document-map set.
+    A verified absent head returns ``complete=True, payload=None``; callers that
+    require Stage A to have produced a map decide whether absence is acceptable.
+    """
+
+    try:
+        result = execute_named_json_file_stream(source, DOCUMENT_MAP_PATH)
+    except Exception as exc:
+        return PublishedJsonObjectRead(conflict="stream_unreadable", detail=str(exc))
+    decoded = decode_named_json_record_stream(result)
+    if not decoded.complete or decoded.conflict is not None or len(decoded.records) > 1:
+        return PublishedJsonObjectRead(conflict=decoded.conflict or "stream_unreadable")
+
+    authority = evidence_publication_authority_for(source)
+    payload: Dict[str, Any] | None = None
+    raw: bytes | None = None
+    observed: Dict[str, MutablePublicationObservation] = {}
+    if decoded.records:
+        record = decoded.records[0]
+        if record.filename != posixpath.basename(DOCUMENT_MAP_PATH):
+            return PublishedJsonObjectRead(
+                conflict="record_filename_invalid",
+                detail=record.filename,
+            )
+        try:
+            normalized = validate_document_map_v1(
+                record.payload,
+                DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+            )
+            if normalized != record.payload:
+                raise ValueError("document map is not canonical")
+        except (KeyError, TypeError, ValueError) as exc:
+            return PublishedJsonObjectRead(
+                conflict="record_schema_invalid",
+                detail=f"{record.filename}: {exc}",
+            )
+        observed[DOCUMENT_MAP_LOGICAL_ARTIFACT_ID] = MutablePublicationObservation(
+            logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+            raw_sha256=record.raw_sha256,
+            byte_count=record.byte_count,
+            run_id=str(getattr(authority, "run_id", "") or ""),
+        )
+        payload = normalized
+        raw = record.raw
+
+    check = authority.verify_latest_record_set("document_map", observed)
+    if not check.authorized:
+        return PublishedJsonObjectRead(
+            conflict=f"publication_set_{check.status}",
+            detail=check.detail or check.status,
+        )
+    return PublishedJsonObjectRead(payload=payload, raw=raw, complete=True)
+
+
+def _require_exact_keys(
+    value: Mapping[str, Any],
+    *,
+    required: set[str],
+    optional: set[str] | None = None,
+    field: str,
+) -> None:
+    allowed = required | (optional or set())
+    if not required.issubset(value) or set(value) - allowed:
+        raise ValueError(f"{field} has missing or unknown fields")
+
+
+def _canonical_workspace_path(value: Any, field: str) -> str:
+    if type(value) is not str or not value or len(value) > 4096:
+        raise ValueError(f"{field} is invalid")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError(f"{field} is invalid")
+    if posixpath.normpath(value) != value or not _inside_workspace(value):
+        raise ValueError(f"{field} is not a canonical workspace path")
+    return value
+
+
+def _validate_section_index(value: Any, entry_position: int) -> None:
+    if not isinstance(value, list) or len(value) > SECTION_INDEX_CAP:
+        raise ValueError(f"document map entry {entry_position} section_index is invalid")
+    order: List[Tuple[int, int, str, str]] = []
+    for position, candidate in enumerate(value):
+        if not isinstance(candidate, Mapping):
+            raise ValueError(f"document map entry {entry_position} section {position} is invalid")
+        section = dict(candidate)
+        _require_exact_keys(
+            section,
+            required={"section_id", "kind", "title_or_key", "start_line", "end_line"},
+            field=f"document map entry {entry_position} section {position}",
+        )
+        if section["section_id"] != f"sec-{position:04d}":
+            raise ValueError(f"document map entry {entry_position} section id is not canonical")
+        if type(section["kind"]) is not str or section["kind"] not in _SECTION_KINDS:
+            raise ValueError(f"document map entry {entry_position} section kind is invalid")
+        title = section["title_or_key"]
+        if (
+            type(title) is not str
+            or len(title) > MAX_FILE_BYTES
+            or "\x00" in title
+            or "\n" in title
+            or "\r" in title
+        ):
+            raise ValueError(f"document map entry {entry_position} section title is invalid")
+        start = section["start_line"]
+        end = section["end_line"]
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or start < 1
+            or end < start
+            or end > MAX_FILE_BYTES + 1
+        ):
+            raise ValueError(f"document map entry {entry_position} section range is invalid")
+        order.append((start, end, section["kind"], title))
+    if order != sorted(order):
+        raise ValueError(f"document map entry {entry_position} sections are not canonical")
+
+
 def document_map_payload(document_map: Mapping[str, Any]) -> Dict[str, Any]:
     """The persisted body: the map, its fingerprint and its conflict list."""
     entries = [_entry_payload(entry) for entry in (document_map or {}).get("entries") or []]
@@ -931,38 +1246,98 @@ def write_document_map(
     except (TypeError, ValueError) as exc:
         logger.debug(f"document map is not serializable: {exc}")
         return False
-    temp = f"{DOCUMENT_MAP_PATH}.tmp"
-    encoded_temp = f"{temp}.b64"
-    # Live p6v-bigtop-r2: the whole map as ONE heredoc argument exceeded the
-    # kernel's per-argument bound (~128KB) and the write failed silently. The
-    # body streams as base64 in bounded chunks (heredoc newlines are harmless
-    # inside base64), is decoded container-side, and the reader still only
-    # ever sees the atomic `mv`.
-    encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
-    chunks = [
-        encoded[start : start + WRITE_CHUNK_CHARS]
-        for start in range(0, len(encoded), WRITE_CHUNK_CHARS)
-    ] or [""]
-    commands = [f"mkdir -p {shlex.quote(DOCUMENT_MAP_DIR)} && : > {shlex.quote(encoded_temp)}"]
-    for chunk in chunks:
-        commands.append(
-            f"cat >> {shlex.quote(encoded_temp)} <<'{DOCUMENT_MAP_HEREDOC}'\n"
-            f"{chunk}\n{DOCUMENT_MAP_HEREDOC}"
+    raw = body.encode("utf-8")
+    for _attempt in range(3):
+        authority = evidence_publication_authority_for(execute)
+        head = authority.latest_head(DOCUMENT_MAP_LOGICAL_ARTIFACT_ID)
+        expected_publication = latest_publication_raw_sha256(
+            execute, DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
         )
-    commands.append(
-        f"base64 -d {shlex.quote(encoded_temp)} > {shlex.quote(temp)} && "
-        f"rm -f {shlex.quote(encoded_temp)} && "
-        f"mv -f {shlex.quote(temp)} {shlex.quote(DOCUMENT_MAP_PATH)}"
-    )
-    try:
-        for command in commands:
-            result = execute(command) or {}
-            if not _succeeded(result):
+        try:
+            content = read_container_text(
+                _ExecuteOnly(execute), DOCUMENT_MAP_PATH, exact_bytes=True
+            )
+        except Exception as exc:
+            logger.debug(f"document map base is unreadable: {exc}")
+            return False
+        if head is not None:
+            if head.publication_state == "revoked":
                 return False
-    except Exception as exc:
-        logger.debug(f"document map not persisted: {exc}")
-        return False
-    return True
+            current = bool(
+                content is not None
+                and verify_latest_evidence_bytes(
+                    execute,
+                    record_kind="document_map",
+                    record_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+                    logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+                    raw=content.encode("utf-8"),
+                ).authorized
+            )
+            if not current:
+                # Complete the host half of an interrupted exact same write;
+                # the desired map was independently recomputed above.
+                if content == body:
+                    return publish_evidence_revision(
+                        execute,
+                        record_kind="document_map",
+                        record_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+                        logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+                        raw=raw,
+                        expected_previous_raw_sha256=expected_publication,
+                    ).published
+                return False
+        try:
+            result = compare_publish_container_text_atomic(
+                execute,
+                DOCUMENT_MAP_PATH,
+                body,
+                expected_content=content,
+                validate_json=True,
+            )
+        except Exception as exc:
+            logger.debug(f"document map not persisted: {exc}")
+            return False
+        if result.persisted:
+            publication = publish_evidence_revision(
+                execute,
+                record_kind="document_map",
+                record_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
+                raw=raw,
+                expected_previous_raw_sha256=expected_publication,
+            )
+            if publication.published:
+                return True
+            logger.warning(
+                "Document map reached the container but host publication failed: "
+                f"{publication.status}"
+            )
+            return False
+        if result.code != WRITE_COMPARE_CONFLICT:
+            logger.debug(f"document map not persisted: {result.code}")
+            return False
+    return False
+
+
+class _ExecuteOnly:
+    """Lossless-reader adapter for writers that receive an execute callable."""
+
+    def __init__(self, execute: Callable[..., Optional[Mapping[str, Any]]]) -> None:
+        self._execute = execute
+        # Explicit in-memory test-double transport used by read_container_text.
+        owner = getattr(execute, "__self__", None)
+        for candidate in (execute, owner):
+            persisted = getattr(candidate, "persisted", None)
+            if isinstance(persisted, dict):
+                self.files = persisted
+                break
+            files = getattr(candidate, "files", None)
+            if isinstance(files, dict):
+                self.files = files
+                break
+
+    def execute_command(self, command: str, **kwargs: Any) -> Optional[Mapping[str, Any]]:
+        return self._execute(command, **kwargs)
 
 
 # ---------------------------------------------------------------------------

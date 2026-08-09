@@ -10,9 +10,9 @@ passed, C-extension .so missing) into a FAILED final verdict.
 Two coordinated fixes under test here:
 
 A. phase_objective(phase, build_system): Python projects get build/test
-   objectives that prescribe deps -> compile and pytest via build tool, and
-   explicitly forbid blocking on the absence of a Java compile target. The
-   Java strings stay byte-identical (snapshot test below).
+   outcome contracts that require ecosystem-appropriate terminal evidence and
+   explicitly forbid treating absence of a Java compile target as failure. The
+   Java evidence contract remains byte-pinned (snapshot test below).
 
 B. Scoped cap in SetupAgent._get_verified_final_status: an agent-blocked build
    phase caps the verdict to FAILED only when physical build evidence AGREES
@@ -245,37 +245,34 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
 # ---------------------------------------------------------------------------
 
 # Byte-identical snapshot of the JAVA build objective (the template source).
-# If this fails, the Java guidance changed — that is out of scope for the
-# Python fix and must be an intentional, separate change. dim (d) of the
-# Category-3 analyzer diet made this the FACTS wording (survey coordinates,
-# not "Recommended Build"); that is now THE Java build objective.
+# The model-visible Java contract is byte-pinned so a selected call or project
+# ordering cannot silently creep back into the setup objective.
 _JAVA_BUILD_OBJECTIVE_SNAPSHOT = (
-    "Make the project compile: build(action='compile'). Consult the survey facts "
-    "for the build coordinates — an aggregator root can compile nothing at the "
-    "root while the real sources live in island modules. If the survey facts show NO Java "
-    "compile target (a packaging/meta-project), phase(action='blocked', "
-    "outcome='unknown', ...) with that "
-    "evidence instead of forcing a compile. If compilation fails on missing "
-    "dependencies, build(action='deps') can resolve them — but do not run deps "
-    "first by default (multi-module reactors can fail dependency resolution while "
-    "compiling fine). Never run mvn/gradle via bash — build resolves the "
-    "registered toolchain. Long builds detach; poll the job ref with search."
+    "Establish terminal build evidence for every required surveyed build coordinate. "
+    "An aggregator root with no sources is not compile evidence for source-bearing "
+    "islands; each required island needs a current receipt and artifact/coverage evidence, "
+    "or a typed evidence-backed blocker. A packaging or meta-project with no compile "
+    "target is not a failed compile by itself. Build evidence must use the registered "
+    "toolchain. While a controller-owned job barrier is active, waiting and settlement "
+    "are automatic and no unrelated work may start."
 )
 
 
 def test_python_build_objective_forbids_blocking_on_missing_java_target():
     obj = phase_objective("build", "pip/poetry")
-    assert "build(action='deps')" in obj
-    assert "build(action='compile')" in obj
     assert "no Java compile target" in obj
-    assert "NOT grounds for phase(action='blocked', outcome='failed'" in obj
+    assert "not grounds for a failed build" in obj
+    assert "dependency readiness" in obj
+    assert "registered interpreter" in obj
+    assert "build(action=" not in obj
     assert obj != PHASE_OBJECTIVES["build"]
 
 
-def test_python_test_objective_prescribes_pytest_via_build_tool():
+def test_python_test_objective_states_evidence_without_selecting_a_call():
     obj = phase_objective("test", "python")
-    assert "pytest" in obj
-    assert "build(action='test')" in obj
+    assert "terminal Python runner evidence" in obj
+    assert "bounded-smoke constraint" in obj
+    assert "build(action=" not in obj
 
 
 def test_java_build_objective_is_byte_identical_snapshot():
@@ -322,8 +319,9 @@ def test_build_intro_uses_python_objective_for_python_project():
         }
     )
     intro = engine._phase_intro_step().content
-    assert "NOT grounds for phase(action='blocked', outcome='failed'" in intro
-    assert "Make the project compile" not in intro
+    assert "not grounds for a failed build" in intro
+    assert "terminal build evidence" not in intro
+    assert "build(action=" not in intro
 
 
 def test_build_intro_keeps_java_objective_for_maven_project():

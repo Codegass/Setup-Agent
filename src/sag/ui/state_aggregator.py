@@ -345,6 +345,8 @@ class UIStateAggregator:
         self._state = self._append_timeline(timeline_event, kind="evidence")
 
     def _handle_tool_recovery(self, event: UIEvent) -> None:
+        """Project an archived legacy recovery event into the current UI state."""
+
         retry_count = event.metadata.get("retry_count", 0)
         try:
             retry_count = int(retry_count)

@@ -19,6 +19,11 @@ aggregate (replay has no container), never the primary; the PARTIAL middle and
 the module-coverage conflict survive into the sealed snapshot.
 """
 
+from test_verdict_finalizer import (
+    FakeVerdictOrchestrator,
+    bind_verdict_authority,
+)
+
 from sag.agent.evidence_state import EvidenceRole, StateScope
 from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
 from sag.agent.phase_machine import PhaseAttemptRecord
@@ -40,36 +45,6 @@ class RunEvidenceState(_RunEvidenceState):
         )
 
 
-class FakeVerdictOrchestrator:
-    def __init__(self):
-        self.commands = []
-        self.files = {}
-
-    def execute_command(self, command):
-        self.commands.append(command)
-        if command.startswith("mkdir -p "):
-            return {"success": True, "exit_code": 0, "output": ""}
-        if command.startswith("test -f ") and " && cat " in command:
-            path = command.split()[2]
-            if path not in self.files:
-                return {"success": False, "exit_code": 1, "output": ""}
-            return {"success": True, "exit_code": 0, "output": self.files[path]}
-        if command.startswith("cat > "):
-            path = command.split()[2]
-            payload = command.split("\n", 1)[1].rsplit("\n", 1)[0]
-            self.files[path] = payload + "\n"
-            return {"success": True, "exit_code": 0, "output": ""}
-        if command.startswith("truncate -s -1 "):
-            path = command.split()[-1]
-            self.files[path] = self.files[path][:-1]
-            return {"success": True, "exit_code": 0, "output": ""}
-        if command.startswith("mv "):
-            _, source, target = command.split()
-            self.files[target] = self.files.pop(source)
-            return {"success": True, "exit_code": 0, "output": ""}
-        return {"success": True, "exit_code": 0, "output": ""}
-
-
 class FakePhysicalValidator:
     """Answers validate_build_status like the real tri-state oracle."""
 
@@ -85,8 +60,10 @@ class FakePhysicalValidator:
 
 
 def _finalize(state, validator, *, orchestrator=None):
+    verdict_orchestrator = orchestrator or FakeVerdictOrchestrator()
+    bind_verdict_authority(verdict_orchestrator, state.run_id)
     finalizer = VerdictFinalizer(
-        orchestrator or FakeVerdictOrchestrator(),
+        verdict_orchestrator,
         validator=validator,
         project_name="proj",
     )
@@ -333,24 +310,45 @@ def _bigtop_module_validator():
         systems=["maven", "gradle"],
         modules_by_system={
             "maven": [
-                {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
-                 "report_dirs": [], "has_test_sources": False},
-                {"path": "bigtop-test-framework", "name": "bigtop-test-framework",
-                 "class_count": 0, "jar_count": 0, "report_dirs": [],
-                 "has_test_sources": True},
+                {
+                    "path": ".",
+                    "name": ".",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": False,
+                },
+                {
+                    "path": "bigtop-test-framework",
+                    "name": "bigtop-test-framework",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": True,
+                },
             ],
             "gradle": [
-                {"path": "bigtop-data-generators/bigtop-samplers",
-                 "name": "bigtop-samplers", "class_count": 39, "jar_count": 1,
-                 "report_dirs": ["/workspace/bigtop/x/build/test-results/test"],
-                 "has_test_sources": True},
-                {"path": "bigtop-bigpetstore/bigpetstore-transaction-queue",
-                 "name": "tq", "class_count": 0, "jar_count": 0,
-                 "report_dirs": [], "has_test_sources": True},
+                {
+                    "path": "bigtop-data-generators/bigtop-samplers",
+                    "name": "bigtop-samplers",
+                    "class_count": 39,
+                    "jar_count": 1,
+                    "report_dirs": ["/workspace/bigtop/x/build/test-results/test"],
+                    "has_test_sources": True,
+                },
+                {
+                    "path": "bigtop-bigpetstore/bigpetstore-transaction-queue",
+                    "name": "tq",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": True,
+                },
             ],
         },
-        tests_by_path={"bigtop-samplers": {"tests_total": 50, "tests_passed": 50,
-                                           "failing_count": 0}},
+        tests_by_path={
+            "bigtop-samplers": {"tests_total": 50, "tests_passed": 50, "failing_count": 0}
+        },
     )
 
 

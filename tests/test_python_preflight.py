@@ -124,7 +124,8 @@ def test_matched_version_probes_functionality_exactly_once_when_healthy():
     # command (the ensurepip module check), no repair traffic at all.
     orch = PyOrch("Python 3.12.3")
     outcome = PythonPreflight(orch).run("3.12", constraint=">=3.10",
-                                        source="requires-python")
+                                        source="requires-python",
+                                        venv_path="/workspace/tvm/.venv")
     assert outcome.matched is True
     assert outcome.provisioned is False
     assert outcome.narration == ""
@@ -220,7 +221,12 @@ def test_mismatch_provisions_via_uv_and_narrates(monkeypatch):
     orch = PyOrch("Python 3.8.10", manifest={"python_venv": "/workspace/proj/.venv"})
     # Overlay registration talks to the container too; stub it out.
     monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
-    outcome = PythonPreflight(orch).run("3.11", constraint=">=3.11", source="requires-python")
+    outcome = PythonPreflight(orch).run(
+        "3.11",
+        constraint=">=3.11",
+        source="requires-python",
+        venv_path="/workspace/proj/.venv",
+    )
     assert outcome.provisioned is True
     assert outcome.mismatch is False
     assert "[pre-flight] Required: Python 3.11 (source: requires-python)" in outcome.narration
@@ -234,6 +240,21 @@ def test_mismatch_provisions_via_uv_and_narrates(monkeypatch):
         "uv venv --seed --python 3.11 /workspace/proj/.venv" in c
         for c in orch.commands
     )
+
+
+def test_preflight_never_uses_container_manifest_as_live_path_authority(monkeypatch):
+    orch = PyOrch(
+        "Python 3.8.10",
+        manifest={"python_venv": "/workspace/forged/.venv"},
+    )
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+
+    outcome = PythonPreflight(orch).run("3.11", source="requires-python")
+
+    assert outcome.provisioned is True
+    assert "/workspace/.venv" in outcome.narration
+    assert not any("/workspace/forged/.venv" in command for command in orch.commands)
+    assert not any(REQUIREMENTS_PATH in command for command in orch.commands)
 
 
 def test_uv_unavailable_falls_back_to_apt(monkeypatch):

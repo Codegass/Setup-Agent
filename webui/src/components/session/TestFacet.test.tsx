@@ -20,6 +20,50 @@ const multi = {
   modules: [{ name: "streams", path: "streams", buildStatus: "success", testSource: "runner_xml", testsPassed: 1, testsFailed: 0 }],
 } as any
 
+const igniteShape = {
+  test: {
+    state: "success",
+    pass: 2,
+    fail: 0,
+    skip: 0,
+    total: 2,
+    evidenceLayers: {
+      projectionStatus: "metrics-v2-artifact-unavailable",
+      tests: {
+        claimed: {
+          latestSubjects: {
+            executed: null, passed: null, failed: null, errors: null, skipped: null,
+            availability: "unavailable", reason: "module-qualified subject/case identity was not sealed",
+          },
+          latestCases: {
+            executed: null, passed: null, failed: null, errors: null, skipped: null,
+            availability: "unavailable", reason: "module-qualified subject/case identity was not sealed",
+          },
+          receiptExecutions: {
+            executed: 2, passed: 2, failed: 0, errors: 0, skipped: 0, availability: "available",
+          },
+        },
+        quarantinedObservations: {
+          executed: 2887, passed: 267, failed: 28, errors: 2481, skipped: 111, availability: "available",
+        },
+        unattributedObservations: {
+          executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, availability: "available",
+        },
+        staleObservations: {
+          executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, availability: "available",
+        },
+      },
+      evidence: {
+        integrity: "complete", receiptsExpected: 1, receiptsPersisted: 1,
+        terminalReceiptsUnpersisted: 0, conflictCount: 0,
+      },
+    },
+    failingNames: [],
+  },
+  moduleSummary: { singleModule: true },
+  modules: [],
+} as any
+
 describe("TestFacet", () => {
   it("shows conclusion + FAILING + a 'View test details' detail for single-module", () => {
     render(<TestFacet detail={single} />)
@@ -38,5 +82,20 @@ describe("TestFacet", () => {
     fireEvent.click(screen.getByRole("button", { name: /per-module breakdown/i }))
     expect(screen.getByRole("dialog", { name: /per-module test breakdown/i })).toBeInTheDocument()
     expect(screen.getByText("streams")).toBeInTheDocument()
+  })
+
+  it("separates claimed grains from non-verdict-bearing observations", () => {
+    render(<TestFacet detail={igniteShape} />)
+
+    expect(screen.getByText("Claimed latest subjects")).toBeInTheDocument()
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0)
+    expect(screen.queryByText(/100% pass/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole("img", { name: /2 passed, 0 failed, 2 total/i })).not.toBeInTheDocument()
+    expect(screen.getByText("Receipt executions")).toBeInTheDocument()
+    expect(screen.getByText("2 / 2 passed")).toBeInTheDocument()
+    expect(screen.getByText("Quarantined observations · not verdict-bearing")).toBeInTheDocument()
+    expect(screen.getByText("267 / 2,887 passed")).toBeInTheDocument()
+    expect(screen.getByText("Evidence transport")).toBeInTheDocument()
+    expect(screen.getByText("complete")).toBeInTheDocument()
   })
 })

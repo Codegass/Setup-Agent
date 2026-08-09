@@ -104,8 +104,9 @@ def test_build_intro_carries_python_ecosystem_objective():
     # The FACTS python build objective (dim d) — the ecosystem override, not a
     # pre-hoc prescription block (dim e, which is deleted).
     assert "A Python project has no Java compile target" in intro
-    assert "build(action='deps')" in intro
-    assert "Never run pip/python via bash" in intro
+    assert "dependency readiness" in intro
+    assert "registered interpreter" in intro
+    assert "build(action=" not in intro
     # coordinates line (dim b): system + where, no goal/rationale action wording
     assert "Build coordinates: python at /workspace/pyyaml." in intro
     assert "Recommended Build" not in intro
@@ -113,8 +114,10 @@ def test_build_intro_carries_python_ecosystem_objective():
 
 def test_test_intro_carries_pytest_objective():
     intro = _engine_at(3, _python_env())._phase_intro_step().content
-    assert "pytest via build(action='test')" in intro
+    assert "terminal Python runner evidence" in intro
+    assert "executed, passed, failed, error, and skipped counts" in intro
     assert "Partial pass above threshold is a valid outcome" in intro
+    assert "build(action=" not in intro
     assert "Recommended Tests" not in intro
 
 
@@ -124,7 +127,7 @@ def test_objective_also_keys_off_legacy_pip_poetry_label():
     build_intro = _engine_at(2, _python_env("pip/poetry"))._phase_intro_step().content
     test_intro = _engine_at(3, _python_env("pip/poetry"))._phase_intro_step().content
     assert "A Python project has no Java compile target" in build_intro
-    assert "pytest via build(action='test')" in test_intro
+    assert "terminal Python runner evidence" in test_intro
 
 
 def test_no_prehoc_guidance_block_ever_renders():
@@ -156,16 +159,7 @@ _MAVEN_BUILD_INTRO_SNAPSHOT = (
     "• analyze [unknown]: maven project analyzed\n"
     "→ current: build\n"
     "\n"
-    "Objective: Make the project compile: build(action='compile'). Consult the "
-    "survey facts for the build coordinates — an aggregator root can compile "
-    "nothing at the root while the real sources live in island modules. If the "
-    "survey facts show NO Java compile target (a packaging/meta-project), "
-    "phase(action='blocked', outcome='unknown', ...) with that evidence instead "
-    "of forcing a compile. If compilation fails on missing dependencies, "
-    "build(action='deps') can resolve them — but do not run deps first by "
-    "default (multi-module reactors can fail dependency resolution while "
-    "compiling fine). Never run mvn/gradle via bash — build resolves the "
-    "registered toolchain. Long builds detach; poll the job ref with search.\n"
+    f"Objective: {PHASE_OBJECTIVES['build']}\n"
     "Build coordinates: maven at /workspace/demo.\n"
     "Budget: flexible — up to ~132 iterations available (a small reserve is kept "
     "for later phases). When finished, call phase(action='done', "
@@ -182,12 +176,7 @@ _MAVEN_TEST_INTRO_SNAPSHOT = (
     "• build [unknown]: compiled 120 classes\n"
     "→ current: test\n"
     "\n"
-    "Objective: Run the test suite: build(action='test'). Run it where the "
-    "survey facts place the tests (they can live in a different module — and "
-    "even a different build system — than the build); otherwise use the build "
-    "root. Partial pass above threshold is a valid outcome — report the numbers "
-    "honestly in key_results. If tests genuinely cannot run, "
-    "phase(action='blocked', outcome='failed', ...) with evidence.\n"
+    f"Objective: {PHASE_OBJECTIVES['test']}\n"
     "Budget: flexible — up to ~136 iterations available (a small reserve is kept "
     "for later phases). When finished, call phase(action='done', "
     "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
@@ -247,15 +236,13 @@ def test_analyzer_recommendation_untouched_for_java():
 # ---------------------------------------------------------------------------
 
 
-def test_kickoff_build_objective_softens_blocking_to_conditional():
+def test_kickoff_build_objective_is_an_ecosystem_neutral_evidence_contract():
     kickoff = FACTS_KICKOFF_PHASE_OBJECTIVES["build"]
-    assert kickoff != KICKOFF_PHASE_OBJECTIVES["build"] or True  # variant exists
-    assert (
-        "AND the project is not a Python/other-ecosystem project" in kickoff
-    )
-    # The Java meta-project escape hatch itself is kept, just made conditional.
-    assert "phase(action='blocked', outcome='unknown'" in kickoff
-    # dim (d): the FACTS variant carries no "Recommended Build/Tests" prose.
+    assert kickoff == KICKOFF_PHASE_OBJECTIVES["build"] == PHASE_OBJECTIVES["build"]
+    assert "terminal build evidence" in kickoff
+    assert "required surveyed build coordinate" in kickoff
+    assert "meta-project with no compile target is not a failed compile" in kickoff
+    assert "build(action=" not in kickoff
     assert "Recommended Build" not in kickoff
     assert "Recommended Tests" not in kickoff
 
@@ -264,9 +251,19 @@ def test_kickoff_other_phases_carry_facts_objectives():
     from sag.agent.react_engine import kickoff_phase_objectives
 
     tasks = kickoff_phase_objectives()
-    for name in ("analyze", "build", "test"):
+    selected_calls = (
+        "project(action='clone'",
+        "project(action='provision'",
+        "project(action='analyze'",
+        "build(action='deps'",
+        "build(action='compile'",
+        "build(action='test'",
+        "report(action=",
+    )
+    for name in ("provision", "analyze", "build", "test", "report"):
         assert "Recommended Build" not in tasks[name]
         assert "Recommended Tests" not in tasks[name]
+        assert [call for call in selected_calls if call in tasks[name]] == []
 
 
 def test_agent_authors_kickoff_plan_from_kickoff_objectives():
@@ -404,15 +401,16 @@ def test_live_python_build_intro_carries_objective_and_coordinates():
     # dim (c) deleted: no project brief projection renders.
     assert "=== PROJECT BRIEF v1 ===" not in intro
     assert "A Python project has no Java compile target" in intro
-    assert "build(action='deps')" in intro
+    assert "dependency readiness" in intro
+    assert "build(action=" not in intro
     assert f"Build coordinates: python at {_PY_REPO_ROOT}." in intro
 
 
 def test_live_python_test_intro_carries_pytest_objective():
     _, env = _analyzed_env(_PY_REPO_ROOT, _PY_REPO_FILES)
     intro = _engine_at(3, env)._phase_intro_step().content
-    assert "pytest" in intro
-    assert "build(action='test')" in intro
+    assert "terminal Python runner evidence" in intro
+    assert "build(action=" not in intro
     assert "Partial pass above threshold is a valid" in intro
     # pytest runs AT the build root by construction — the split-root call-out
     # (test_root == build_root) must not render a test coordinates line.
@@ -458,7 +456,9 @@ def test_live_maven_intros_match_facts_contract():
     build_intro = _engine_at(2, env)._phase_intro_step().content
     test_intro = _engine_at(3, env)._phase_intro_step().content
     assert "=== PROJECT BRIEF v1 ===" not in build_intro
-    assert "Make the project compile: build(action='compile')" in build_intro
+    assert "terminal build evidence" in build_intro
+    assert "build(action=" not in build_intro
     assert f"Build coordinates: maven at {_MAVEN_REPO_ROOT}." in build_intro
     assert "=== PROJECT BRIEF v1 ===" not in test_intro
-    assert "Run the test suite: build(action='test')" in test_intro
+    assert "terminal runner evidence" in test_intro
+    assert "build(action=" not in test_intro

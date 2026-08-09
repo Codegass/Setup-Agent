@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from threading import Lock, Thread
 from typing import Annotated, Any
@@ -96,47 +95,14 @@ class AgentTaskLauncher:
                 )
 
     def _read_project_name(self, orchestrator: Any, fallback: str) -> str:
-        from loguru import logger
-
+        """Mechanically resolve a workspace root; ignore project_meta.json."""
         try:
-            result = orchestrator.execute_command(
-                "cat /workspace/.setup_agent/project_meta.json 2>/dev/null"
-            )
+            from sag.main import detect_project_directory_in_container
+
+            project_name = detect_project_directory_in_container(orchestrator)
         except Exception:
-            logger.warning("Failed to read project metadata from workspace")
             return fallback
-
-        if not isinstance(result, dict):
-            return fallback
-
-        if result.get("exit_code") != 0:
-            return fallback
-
-        output = result.get("output", "")
-        if not isinstance(output, str):
-            return fallback
-
-        output = output.strip()
-        if not output:
-            return fallback
-
-        try:
-            metadata = json.loads(output)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse workspace project metadata")
-            return fallback
-
-        if not isinstance(metadata, dict):
-            return fallback
-
-        project_name = metadata.get("project_name")
-        if not isinstance(project_name, str):
-            return fallback
-
-        project_name = project_name.strip()
-        if project_name:
-            return project_name
-        return fallback
+        return project_name or fallback
 
     def _task_with_source_session(self, task: str, source_session: str | None) -> str:
         if not source_session:

@@ -1,11 +1,9 @@
 # tests/test_live_loop_wiring.py
 """Plan 6 Stage F Task F1 — the contract loop, wired into a live run.
 
-Stages A–E built the machinery and proved it in isolation. The verified gap
-this suite closes is that `discover_document_map`, the claim extractors,
-`claim_graph` and repair CREATION had zero production callers: every one of
-them was exercised only by its own lane's tests, so a real session produced no
-map, no claims, no proposals and no claim transitions.
+Stages A–E built the evidence machinery and proved it in isolation. This suite
+keeps the document-map, claim, and model-owned repair-context seams wired into
+a real run without reviving the retired harness proposal protocol.
 
 Three seams are asserted here, each against the shape a real run leaves behind:
 
@@ -13,16 +11,15 @@ Three seams are asserted here, each against the shape a real run leaves behind:
   indexed entries state, and persists both, so the DomainFacts projection that
   follows reads real claims; either half failing is a recorded conflict on the
   analysis, never an analyze failure;
-* the REPAIR seam — a failure-class assessment with no proposal on disk gets
-  one built from a bounded, typed retrieval over the persisted map, and the
-  observation the failing receipt produced then surfaces it; one creation
-  attempt per assessment, whatever the answer was;
-* the CLAIM seam — `expectation_met` confirms the claims its contract cited and
-  a typed `falsifier_*` contradicts them and retracts what rested on them, as
-  ONE event group with a terminal record (plan §Stage C binding note (a)).
+* the REPAIR boundary — a failure assessment never causes the harness to
+  synthesize or surface a project call; RepairContext begins only after a
+  rejected judge gate and the next ActionIntent belongs to the model;
+* the CLAIM seam — receipt assessments and supporting claim citations never
+  move a claim by themselves. Until an explicit mechanical predicate-to-claim
+  binding exists, both positive and falsifying generic outcomes fail closed.
 
-Fake-orchestrator style (house pattern, shared with tests/test_document_map.py
-and tests/test_repair_contracts.py); the engine plumbing is the shared
+Fake-orchestrator style (house pattern, shared with tests/test_document_map.py);
+the engine plumbing is the shared
 `forced_engine` fixture from tests/test_forced_attempt_native.py.
 """
 
@@ -30,23 +27,35 @@ import hashlib
 import json
 import shlex
 
+import pytest
+
+from test_container_io import FakeContainer as AtomicFakeContainer
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 
-from sag.agent.claim_graph import CLAIM_GRAPH_PATH, group_identity, read_claim_files
+from sag.agent.action_intents import action_fingerprint
+from sag.agent.claim_graph import CLAIM_GRAPH_PATH, read_claim_files
 from sag.agent.claim_records import CLAIM_DIR, entry_has_extractors
-from sag.agent.control_events import ControlEvent
-from sag.agent.document_map import DOCUMENT_MAP_PATH, MAX_FILE_BYTES, read_entry_text
+from sag.agent.document_map import DOCUMENT_MAP_PATH, MAX_FILE_BYTES, entry_id, read_entry_text
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
-from sag.agent.invocation_contracts import CONTRACT_DIR
+from sag.agent.evidence_publications import current_evidence_publication_authority
+from sag.agent.evidence_records import (
+    frame_json_record_stream,
+    frame_named_json_record_stream,
+    read_json_records,
+)
+from sag.agent.invocation_contracts import CONTRACT_DIR, build_contract, read_frozen_contract
 from sag.agent.react_types import ReActStep, StepType
-from sag.agent.repair_contracts import REPAIR_DIR, read_records, repair_block
 from sag.tools.base import ToolResult
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import (
+    BUILD_REQUIREMENTS_SCHEMA_VERSION,
+    REQUIREMENTS_PATH,
+)
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
 ROOT = "/workspace/proj"
 DOMAIN = f"{ROOT}/core"
 SHA = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809111213"
+LEGACY_REPAIR_DIR = "/workspace/.setup_agent/repair_contracts"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +118,8 @@ class FakeContainer:
         self.sha = sha
         self.writable = writable
         self.commands = []
+        self._atomic = AtomicFakeContainer()
+        self._atomic.files = self.files
 
     # -- helpers ---------------------------------------------------------
     def _relative(self, path):
@@ -126,6 +137,27 @@ class FakeContainer:
     # -- transport -------------------------------------------------------
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        # The absent-or-identical publisher is one multi-line python command.
+        # Recognize it before the legacy newline guard discards tokenization.
+        if "python3 -c" in command and "fcntl.flock" in command:
+            if not self.writable:
+                return fail("Read-only file system")
+            return self._atomic.execute_command(command)
+        tokens = shlex.split(command) if "\n" not in command else []
+        atomic_command = (
+            tokens[:3] == ["mkdir", "-p", "--"]
+            or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+            or tokens[:2] == ["base64", "--decode"]
+            or tokens[:3] == ["mv", "-f", "--"]
+            or (
+                tokens[:2] == ["python3", "-c"]
+                and ("hashlib.sha256" in tokens[2] or "json.load" in tokens[2])
+            )
+        )
+        if atomic_command:
+            if not self.writable and tokens[:2] != ["rm", "-f"]:
+                return fail("Read-only file system")
+            return self._atomic.execute_command(command)
         if "rev-parse HEAD" in command:
             return ok(self.sha) if self.sha else fail("")
         if " find . " in command:
@@ -175,6 +207,21 @@ class FakeContainer:
             path = command.split("cat > ", 1)[1].split(" ", 1)[0]
             self.files[path] = command.split("<<'SAGEOF'\n", 1)[1].rsplit("\nSAGEOF", 1)[0]
             return ok("")
+        if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            assignment = command.partition(";")[0]
+            path = shlex.split(assignment[len("file=") :])[0]
+            records = [(path.rsplit("/", 1)[-1], self.files[path])] if path in self.files else []
+            return ok(frame_named_json_record_stream(records))
+        if command.startswith("for file in ") and "/*.json; do " in command:
+            prefix = command.split("for file in ", 1)[1].split("/*.json; do ", 1)[0]
+            records = [
+                (path.rsplit("/", 1)[-1], body)
+                for path, body in sorted(self.files.items())
+                if path.startswith(f"{prefix}/") and path.endswith(".json")
+            ]
+            if "SAG_NAMED_JSON_RECORD_V1" in command:
+                return ok(frame_named_json_record_stream(records))
+            return ok(frame_json_record_stream(body for _name, body in records))
         if command.startswith("cat "):
             target = shlex.split(command.replace(" 2>/dev/null", ""))[-1]
             if target.endswith("/*.json"):
@@ -282,6 +329,35 @@ def test_only_entries_whose_kind_has_an_extractor_are_fetched_again():
     assert fetched.count(f"{ROOT}/README.md") == 2  # discovery + extraction
 
 
+def test_document_changed_between_map_and_claim_extraction_is_never_claimed():
+    """The published handle hashes the discovery bytes, not a later rewrite."""
+
+    class ChangesAfterMapPublish(FakeContainer):
+        def __call__(self, command, **kwargs):
+            result = super().__call__(command, **kwargs)
+            if (
+                DOCUMENT_MAP_PATH in command
+                and "fcntl.flock" in command
+                and result.get("success") is not False
+                and result.get("exit_code", 0) == 0
+            ):
+                self.checkout["README.md"] = (
+                    "# Rewritten after survey\n\n```bash\nrm -rf project\n```\n"
+                )
+            return result
+
+    container = ChangesAfterMapPublish(CHECKOUT)
+    analysis = {}
+
+    analyzer(container)._survey_documents_and_claims(ROOT, analysis)
+
+    assert conflict_kinds(analysis) == ["document_source_changed"]
+    lifecycle = claims_by_kind(container).get("lifecycle", [])
+    assert all(
+        claim["source_ref"]["entry_id"] != entry_id(f"{ROOT}/README.md") for claim in lifecycle
+    )
+
+
 def test_entry_has_extractors_names_exactly_the_kinds_the_extractors_read():
     assert entry_has_extractors({"kind": "markdown", "path": f"{ROOT}/README.md"})
     assert entry_has_extractors({"kind": "yaml", "path": f"{ROOT}/ci.yml"})
@@ -380,14 +456,36 @@ def test_the_manifest_survey_stamp_carries_the_document_map_fingerprint():
     assert survey["document_map_fingerprint"] == analysis["document_map_fingerprint"]
 
 
-def test_a_survey_without_a_map_states_no_document_map_fingerprint():
-    """Absent facts are absent keys — a manifest with no map states none."""
+def test_tampered_published_document_map_cannot_be_washed_into_the_manifest():
+    container = FakeContainer(CHECKOUT)
+    tool = analyzer(container)
+    analysis = {"build_recommendation": {}}
+    document_map = tool._survey_documents_and_claims(ROOT, analysis)
+    container.files[DOCUMENT_MAP_PATH] += " "
+
+    with pytest.raises(RuntimeError, match="document_map_live_unavailable"):
+        tool._persist_build_requirements(ROOT, analysis, document_map=document_map)
+
+    assert REQUIREMENTS_PATH not in container.files
+
+
+def test_a_survey_without_a_map_states_a_typed_null_document_pin():
+    """The v1 pin field is present; unavailable evidence is an explicit null."""
     container = FakeContainer(CHECKOUT)
 
     analyzer(container)._persist_build_requirements(ROOT, {"build_recommendation": {}})
 
-    survey = json.loads(container.files[REQUIREMENTS_PATH])["survey"]
-    assert "document_map_fingerprint" not in survey
+    manifest = json.loads(container.files[REQUIREMENTS_PATH])
+    assert manifest["schema_version"] == BUILD_REQUIREMENTS_SCHEMA_VERSION
+    survey = manifest["survey"]
+    assert set(survey) == {
+        "project_path",
+        "analyzer_version",
+        "config_fingerprint",
+        "target_sha",
+        "document_map_fingerprint",
+    }
+    assert survey["document_map_fingerprint"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +493,6 @@ def test_a_survey_without_a_map_states_no_document_map_fingerprint():
 # ---------------------------------------------------------------------------
 
 RECEIPT_ID = "rcpt-maven-0001"
-CONTRACT_ID = "ic-000001-abcdefabcdef"
 MODULE_README = "# Build\n\n```bash\nmvn -B test\n```\n"
 
 
@@ -490,19 +587,35 @@ MANIFEST = {
     "domain_facts": [{"domain_id": "dom-000001", "root": DOMAIN, "fact_epoch": 1}],
 }
 
-CONTRACT = {
-    "schema_version": 1,
-    "contract_id": CONTRACT_ID,
-    "envelope_id": "envelope-000001",
-    "domain_id": "dom-000001",
-    "fact_epoch": 1,
-    "intent_source": "model",
-    "requested_call": {"tool": "build", "params": {"action": "test"}},
-    "effective_action": "test",
-    "expected_cwd": DOMAIN,
-    "expected_argv": "mvn -B test",
-    "supporting_claim_ids": [LIFECYCLE_CLAIM["claim_id"]],
-}
+_CONTRACT_PARAMS = {"action": "test", "working_directory": DOMAIN}
+_CONTRACT_INTENT_DOMAIN = "dom-000001"
+CONTRACT = build_contract(
+    run_id="run-pytest",
+    envelope_id="envelope-000001",
+    tool="build",
+    params=_CONTRACT_PARAMS,
+    effective_tool="maven",
+    effective_action="test",
+    expected_cwd=DOMAIN,
+    expected_argv="-B test",
+    execution_binding="argv_v1",
+    intent_source="model",
+    intent_id="intent-live-loop-claims",
+    intent_domain_id=_CONTRACT_INTENT_DOMAIN,
+    intent_exact_params=_CONTRACT_PARAMS,
+    action_fingerprint=action_fingerprint(
+        domain_id=_CONTRACT_INTENT_DOMAIN,
+        tool="build",
+        params=_CONTRACT_PARAMS,
+    ),
+    target_sha=SHA,
+    config_fingerprint="cfg-1",
+    document_map_fingerprint=DOCUMENT_MAP_BODY["document_map_fingerprint"],
+    domain_id=DOMAIN,
+    fact_epoch=1,
+    supporting_claim_ids=[LIFECYCLE_CLAIM["claim_id"]],
+)
+CONTRACT_ID = CONTRACT["contract_id"]
 
 
 def engine_container(*, assessments=(), claims=(), repairs=(), contract=CONTRACT):
@@ -510,17 +623,26 @@ def engine_container(*, assessments=(), claims=(), repairs=(), contract=CONTRACT
         REQUIREMENTS_PATH: json.dumps(MANIFEST, sort_keys=True),
         DOCUMENT_MAP_PATH: json.dumps(DOCUMENT_MAP_BODY, sort_keys=True),
     }
+    contract_raw = None
     if contract:
-        files[f"{CONTRACT_DIR}/{contract['contract_id']}.json"] = json.dumps(
-            contract, sort_keys=True
-        )
+        contract_raw = json.dumps(contract, sort_keys=True)
+        files[f"{CONTRACT_DIR}/{contract['contract_id']}.json"] = contract_raw
     for body in assessments:
         files[f"{ASSESSMENT_DIR}/{body['assessment_id']}.json"] = json.dumps(body, sort_keys=True)
     for body in claims:
         files[f"{CLAIM_DIR}/{body['claim_id']}.json"] = json.dumps(body, sort_keys=True)
     for body in repairs:
-        files[f"{REPAIR_DIR}/{body['repair_id']}.json"] = json.dumps(body, sort_keys=True)
-    return FakeContainer({"core/README.md": MODULE_README}, files)
+        files[f"{LEGACY_REPAIR_DIR}/{body['repair_id']}.json"] = json.dumps(body, sort_keys=True)
+    container = FakeContainer({"core/README.md": MODULE_README}, files)
+    if contract and contract_raw is not None:
+        current_evidence_publication_authority().publish_bytes(
+            record_kind="invocation_contract",
+            record_id=contract["contract_id"],
+            raw=contract_raw.encode("utf-8"),
+            contract_id=contract["contract_id"],
+            contract_hash=contract["contract_hash"],
+        )
+    return container
 
 
 def wire(forced_engine_factory, container, *, metadata):
@@ -548,63 +670,51 @@ def transitions(engine):
     return [payload for kind, payload in engine.control_events if kind == "claim_transition"]
 
 
-def repairs_on_disk(container):
+def legacy_repairs_on_disk(container):
     return [
         json.loads(body)
         for path, body in sorted(container.files.items())
-        if path.startswith(f"{REPAIR_DIR}/")
+        if path.startswith(f"{LEGACY_REPAIR_DIR}/")
     ]
 
 
 # ---------------------------------------------------------------------------
-# item 2: the repair seam — a fresh failure assessment gets its proposal
+# item 2: no legacy harness proposal seam remains
 # ---------------------------------------------------------------------------
 
 
-def test_a_failure_assessment_without_a_repair_gets_one_and_it_is_surfaced(
+def test_a_failure_assessment_does_not_create_or_surface_a_harness_proposal(
     forced_engine,  # noqa: F811
 ):
-    """Spec §C6: retrieval is reactive — this is the first moment it is legal,
-    and the block the model sees is the proposal it just produced."""
+    """A receipt verdict is evidence, not authority to synthesize a call."""
     trigger = assessment_body("semantic_failure")
     container = engine_container(assessments=[trigger])
     engine = wire(forced_engine, container, metadata={"receipt_id": RECEIPT_ID})
 
     step = engine._append_native_observation("call-1", "BUILD FAILURE", source_tool="build")
 
-    created = repairs_on_disk(container)
-    assert len(created) == 1
-    repair = created[0]
-    assert repair["trigger_assessment_id"] == trigger["assessment_id"]
-    assert repair["proposed_public_call"] == {
-        "tool": "build",
-        "params": {"action": "test", "working_directory": DOMAIN},
-    }
-    assert step.content.count("[repair]") == 1
-    assert step.content.endswith(repair_block(repair))
+    assert legacy_repairs_on_disk(container) == []
+    assert container.fetches() == []
+    assert step.content == "BUILD FAILURE"
 
 
-def test_the_claims_the_proposal_cites_are_persisted_with_it(
+def test_persisted_claims_do_not_authorize_a_harness_selected_repair(
     forced_engine,  # noqa: F811
 ):
-    """Provenance must be lookupable: a proposal citing an unstored claim
-    would be self-attested."""
+    """Claims may constrain a later model intent but never compose one."""
     container = engine_container(assessments=[assessment_body("semantic_failure")])
     engine = wire(forced_engine, container, metadata={"receipt_id": RECEIPT_ID})
 
     engine._append_native_observation("call-1", "BUILD FAILURE", source_tool="build")
 
-    repair = repairs_on_disk(container)[0]
-    stored = {body["claim_id"] for body in container.claims().values()}
-    assert repair["supporting_claim_ids"]
-    assert set(repair["supporting_claim_ids"]) <= stored
+    assert legacy_repairs_on_disk(container) == []
+    assert container.fetches() == []
 
 
-def test_repair_creation_is_attempted_once_per_assessment(
+def test_repeated_failure_observations_do_not_start_hidden_retrieval(
     forced_engine,  # noqa: F811
 ):
-    """Bounded: a second observation about the same failure must not re-read
-    the repository, whatever the first answer was."""
+    """Repair context starts at a rejected judge gate, not raw log text."""
     container = engine_container(assessments=[assessment_body("semantic_failure")])
     engine = wire(forced_engine, container, metadata={"receipt_id": RECEIPT_ID})
 
@@ -612,11 +722,11 @@ def test_repair_creation_is_attempted_once_per_assessment(
     reads = container.fetches()
     engine._append_native_observation("call-2", "BUILD FAILURE", source_tool="build")
 
-    assert reads
+    assert reads == []
     assert container.fetches() == reads
 
 
-def test_an_assessment_that_already_has_a_repair_reads_no_document(
+def test_historical_harness_repair_record_is_not_surfaced_to_the_model(
     forced_engine,  # noqa: F811
 ):
     trigger = assessment_body("semantic_failure")
@@ -637,19 +747,19 @@ def test_an_assessment_that_already_has_a_repair_reads_no_document(
     step = engine._append_native_observation("call-1", "BUILD FAILURE", source_tool="build")
 
     assert container.fetches() == []
-    assert step.content.endswith(repair_block(repair))
+    assert step.content == "BUILD FAILURE"
 
 
-def test_a_passing_receipt_creates_no_repair(forced_engine):  # noqa: F811
+def test_a_passing_receipt_creates_no_legacy_repair(forced_engine):  # noqa: F811
     container = engine_container(assessments=[assessment_body("expectation_met")])
     engine = wire(forced_engine, container, metadata={"receipt_id": RECEIPT_ID})
 
     engine._append_native_observation("call-1", "50 tests passed", source_tool="build")
 
-    assert repairs_on_disk(container) == []
+    assert legacy_repairs_on_disk(container) == []
 
 
-def test_repair_creation_never_breaks_the_observation(forced_engine):  # noqa: F811
+def test_observation_does_not_depend_on_legacy_repair_storage(forced_engine):  # noqa: F811
     class Hostile(FakeContainer):
         def execute_command(self, command, **kwargs):
             raise RuntimeError("the container is gone")
@@ -666,7 +776,7 @@ def test_repair_creation_never_breaks_the_observation(forced_engine):  # noqa: F
 # ---------------------------------------------------------------------------
 
 
-def test_expectation_met_confirms_the_claims_the_contract_cited(
+def test_expectation_met_does_not_move_supporting_claims(
     forced_engine,  # noqa: F811
 ):
     trigger = assessment_body("expectation_met")
@@ -676,29 +786,17 @@ def test_expectation_met_confirms_the_claims_the_contract_cited(
         container,
         metadata={"receipt_id": RECEIPT_ID, "contract_id": CONTRACT_ID},
     )
+    assert read_frozen_contract(container.execute_command, CONTRACT_ID) == CONTRACT
 
     engine._append_native_observation("call-1", "50 tests passed", source_tool="build")
 
-    group = group_identity(trigger["assessment_id"])
-    assert transitions(engine) == [
-        {
-            "group_id": group,
-            "claim_id": LIFECYCLE_CLAIM["claim_id"],
-            "from_status": "untested",
-            "to_status": "confirmed",
-            "cause_assessment_id": trigger["assessment_id"],
-        },
-        {"group_id": group, "terminal": True},
-    ]
-    snapshot = json.loads(container.files[CLAIM_GRAPH_PATH])
-    assert {claim["claim_id"]: claim.get("evidence_status") for claim in snapshot["claims"]} == {
-        LIFECYCLE_CLAIM["claim_id"]: "confirmed"
-    }
+    assert transitions(engine) == []
+    assert CLAIM_GRAPH_PATH not in container.files
 
 
-def test_the_committed_group_validates_as_control_events(forced_engine):  # noqa: F811
-    """The engine's emitter swallows emission failures by design, so a payload
-    the strict sink refuses would lose the whole group in silence."""
+def test_a_falsifier_without_named_predicate_binding_emits_no_group(
+    forced_engine,  # noqa: F811
+):
     container = engine_container(
         assessments=[assessment_body("falsifier_report_delta")],
         claims=[LIFECYCLE_CLAIM, CONCLUSION_CLAIM],
@@ -708,17 +806,15 @@ def test_the_committed_group_validates_as_control_events(forced_engine):  # noqa
         container,
         metadata={"receipt_id": RECEIPT_ID, "contract_id": CONTRACT_ID},
     )
+    assert read_frozen_contract(container.execute_command, CONTRACT_ID) == CONTRACT
 
     engine._append_native_observation("call-1", "exit 0, no report", source_tool="build")
 
-    emitted = transitions(engine)
-    assert emitted
-    for sequence, payload in enumerate(emitted, start=1):
-        event = ControlEvent(sequence=sequence, kind="claim_transition", payload=payload)
-        assert event.payload == payload
+    assert transitions(engine) == []
+    assert CLAIM_GRAPH_PATH not in container.files
 
 
-def test_a_falsifier_contradicts_the_claims_and_retracts_what_rested_on_them(
+def test_a_falsifier_does_not_treat_supporting_claims_as_tested_predicates(
     forced_engine,  # noqa: F811
 ):
     trigger = assessment_body("falsifier_report_delta")
@@ -731,18 +827,8 @@ def test_a_falsifier_contradicts_the_claims_and_retracts_what_rested_on_them(
 
     engine._append_native_observation("call-1", "exit 0, no report", source_tool="build")
 
-    group = group_identity(trigger["assessment_id"])
-    moved = {
-        payload["claim_id"]: payload["to_status"]
-        for payload in transitions(engine)
-        if not payload.get("terminal")
-    }
-    assert moved == {
-        LIFECYCLE_CLAIM["claim_id"]: "contradicted",
-        CONCLUSION_CLAIM["claim_id"]: "unknown",
-    }
-    assert {payload["group_id"] for payload in transitions(engine)} == {group}
-    assert transitions(engine)[-1] == {"group_id": group, "terminal": True}
+    assert transitions(engine) == []
+    assert CLAIM_GRAPH_PATH not in container.files
 
 
 def test_an_honest_failure_moves_no_claim(forced_engine):  # noqa: F811
@@ -779,18 +865,23 @@ def test_a_contract_citing_an_unpersisted_claim_is_skipped_rather_than_crashing(
     assert step.content == "50 tests passed"
 
 
-def test_the_graph_and_the_repair_layer_read_the_claims_directory_identically():
-    """`claim_graph.read_claim_files` restates the Stage C3 glob read so the C1
-    graph does not depend on the C3 layer to read its own subjects. Two readers
-    of one directory must not disagree about what a stored claim is."""
+def test_the_graph_and_evidence_reader_read_the_claims_directory_identically():
+    """Two active readers must not disagree about a stored claim."""
     container = engine_container(claims=[LIFECYCLE_CLAIM, CONCLUSION_CLAIM])
 
     assert read_claim_files(container.execute_command) == sorted(
-        read_records(container, CLAIM_DIR), key=lambda body: body["claim_id"]
+        read_json_records(container, CLAIM_DIR), key=lambda body: body["claim_id"]
     )
 
 
-def test_claim_transitions_are_committed_once_per_assessment(
+def test_the_forgiving_claim_reader_never_promotes_a_duplicate_key_neighbour():
+    container = engine_container(claims=[LIFECYCLE_CLAIM])
+    container.files[f"{CLAIM_DIR}/duplicate.json"] = '{"claim_id":"first","claim_id":"second"}'
+
+    assert read_claim_files(container.execute_command) == [LIFECYCLE_CLAIM]
+
+
+def test_repeated_assessment_observation_never_synthesizes_claim_transitions(
     forced_engine,  # noqa: F811
 ):
     container = engine_container(
@@ -805,7 +896,8 @@ def test_claim_transitions_are_committed_once_per_assessment(
     engine._append_native_observation("call-1", "50 tests passed", source_tool="build")
     engine._append_native_observation("call-2", "50 tests passed", source_tool="build")
 
-    assert len(transitions(engine)) == 2  # one move + one terminal record
+    assert transitions(engine) == []
+    assert CLAIM_GRAPH_PATH not in container.files
 
 
 def test_a_contract_that_cites_no_claim_moves_nothing(forced_engine):  # noqa: F811
@@ -841,58 +933,8 @@ def test_a_non_build_observation_reads_no_evidence_at_all(forced_engine):  # noq
     assert container.commands == []
 
 
-def test_a_persisted_analyze_time_pin_reaches_the_repair_builder():
-    """Live p6v-tvm-r4: the survey minted the numpy pin claim at analyze
-    time, the dependency failure was typed, and no repair appeared — the
-    builder only saw the retrieval's own extraction. Persisted claims and
-    retrieved claims are one store."""
-    import json as _json
-
+def test_harness_repair_builder_is_not_a_live_engine_surface():
+    """The model, not an engine helper, selects the next public call."""
     from sag.agent.react_engine import ReActEngine
 
-    pin_claim = {
-        "claim_id": "dependency-bf50d1004469",
-        "kind": "dependency",
-        "source_class": "config",
-        "typed_value": {
-            "ecosystem": "pip",
-            "package": "numpy",
-            "specifier": "==",
-            "version": "1.26.*",
-        },
-        "applicability": {},
-        "source_ref": {"entry_id": "doc-x", "source_hash": "ab" * 32, "source_range": "L29"},
-    }
-    trigger = {
-        "assessment_id": "asm-x-dependency_incompatible_numpy-0daebc4b",
-        "receipt_id": "inv-python-2-0003",
-        "typed_code": "dependency_incompatible_numpy",
-        "detail": "ValueError: Could not convert T.float32 to a NumPy dtype",
-    }
-    contract = {"contract_id": "ic-x", "expected_cwd": "/workspace/tvm", "domain_id": ""}
-    written = {}
-
-    def execute(command, **_kwargs):
-        if "repair_contracts" in command and "mv -f" in command:
-            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
-            written[_json.loads(body)["repair_id"]] = _json.loads(body)
-            return {"success": True, "exit_code": 0, "output": ""}
-        return {"success": True, "exit_code": 0, "output": ""}
-
-    ReActEngine._create_repair_for(
-        execute,
-        trigger,
-        document_map={"entries": []},
-        requirements={"build_root": "/workspace/tvm"},
-        contract=contract,
-        fetch_text=lambda entry: "",
-        persisted_claims=[pin_claim],
-    )
-
-    assert len(written) == 1
-    repair = next(iter(written.values()))
-    call = repair["proposed_public_call"]
-    assert call["tool"] == "build"
-    assert call["params"]["action"] == "deps"
-    assert "numpy==1.26.*" in _json.dumps(call["params"])
-    assert "dependency-bf50d1004469" in repair["supporting_claim_ids"]
+    assert not hasattr(ReActEngine, "_create_repair_for")

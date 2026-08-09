@@ -15,7 +15,19 @@ from typing import Any
 
 from loguru import logger
 
-from sag.agent.verdict_finalizer import VERDICT_SNAPSHOT_PATH, RunVerdictSnapshot
+from sag.agent.evidence_publications import (
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    EvidencePublicationRecoveryError,
+)
+from sag.agent.control_events import RunPin, canonical_json
+from sag.agent.verdict_finalizer import (
+    VERDICT_SNAPSHOT_PATH,
+    RunVerdictSnapshot,
+    read_live_verdict_snapshot,
+)
+from sag.runtime.container_io import resolve_control_execute
 from sag.web.context_trace import ContextTraceBuilder
 from sag.web.models import (
     BuildSummary,
@@ -49,6 +61,15 @@ _CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
 # the per-file cap and stop once the total budget is spent.
 _MAX_CONTEXT_FILE_CHARS = 1_000_000
 _MAX_CONTEXT_TOTAL_CHARS = 8_000_000
+
+
+def _execute_control(orchestrator: Any, command: str, **kwargs: Any) -> Any:
+    """Run dashboard artifact I/O outside the project runtime environment."""
+
+    execute = resolve_control_execute(orchestrator)
+    if execute is None:
+        raise RuntimeError("container control transport is unavailable")
+    return execute(command, **kwargs)
 
 
 class SessionRegistry:
@@ -376,6 +397,7 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
             failing_names=test.get("failing_names") or [],
             conflicts=test.get("conflicts") or [],
             evidence_refs=test.get("evidence_refs") or [],
+            evidence_layers=test.get("evidence_layers"),
         ),
         report=_text(item.get("report"), default="none"),
         files=_to_int(item.get("files")),
@@ -574,17 +596,88 @@ def _session_sort_key(row: ExecutionSessionSummary) -> tuple[str, str]:
 
 def _read_setup_verdict_snapshot(
     orchestrator: Any,
+    *,
+    logs_root: Path | None = None,
+    project_name: str | None = None,
 ) -> tuple[RunVerdictSnapshot | None, str]:
     raw = _read_container_file(orchestrator, VERDICT_SNAPSHOT_PATH)
     if raw is None:
         return None, "missing"
     try:
-        return RunVerdictSnapshot.model_validate_json(raw), "valid"
+        forensic = RunVerdictSnapshot.model_validate_json(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None, "corrupt"
 
+    live = read_live_verdict_snapshot(orchestrator)
+    if live.run_id == forensic.run_id and live.model_dump_json() == forensic.model_dump_json():
+        return live, "valid"
 
-def _snapshot_test_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
+    if logs_root is not None and project_name:
+        session_dir = _matching_log_session_dir(logs_root, project_name)
+        control_path = session_dir / "control_events.jsonl" if session_dir is not None else None
+        run_pin_path = session_dir / "run-pin.json" if session_dir is not None else None
+        pin_raw: bytes | None = None
+        expected_run_id: str | None = None
+        if run_pin_path is not None and run_pin_path.is_file():
+            try:
+                pin_raw = run_pin_path.read_bytes()
+                pin = RunPin.model_validate_json(pin_raw)
+                expected_run_id = pin.run_id
+                if (
+                    type(expected_run_id) is not str
+                    or not expected_run_id
+                    or pin_raw != canonical_json(pin).encode("utf-8")
+                ):
+                    pin_raw = None
+                    expected_run_id = None
+            except (OSError, TypeError, ValueError):
+                pin_raw = None
+                expected_run_id = None
+        if (
+            control_path is not None
+            and control_path.is_file()
+            and pin_raw is not None
+            and expected_run_id is not None
+            and forensic.run_id == expected_run_id
+        ):
+            try:
+                authority = EvidencePublicationAuthority.recover_from_host_jsonl(
+                    control_path,
+                    run_id=expected_run_id,
+                )
+            except (EvidencePublicationRecoveryError, TypeError, ValueError, OSError):
+                authority = None
+            if (
+                authority is not None
+                and authority.verify_latest_bytes(
+                    record_kind="run_pin",
+                    record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+                    logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+                    raw=pin_raw,
+                    run_id=expected_run_id,
+                ).authorized
+                and authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID) is not None
+            ):
+                live = read_live_verdict_snapshot(orchestrator, authority=authority)
+                if (
+                    live.run_id == forensic.run_id
+                    and live.model_dump_json() == forensic.model_dump_json()
+                ):
+                    return live, "valid"
+    return None, "untrusted"
+
+
+def _snapshot_test_payload(
+    snapshot: RunVerdictSnapshot,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if metrics is None:
+        from sag.tools.report_metrics import build_evidence_layer_projection
+
+        metrics = build_evidence_layer_projection(
+            snapshot=snapshot.model_dump(mode="json"),
+            conflicts=list(snapshot.conflicts),
+        )
     tests = snapshot.test_stats
     return {
         "state": snapshot.verdict,
@@ -605,6 +698,7 @@ def _snapshot_test_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
         "declared_total": tests.discovered,
         "conflicts": list(snapshot.conflicts),
         "evidence_refs": list(snapshot.input_refs),
+        "evidence_layers": metrics,
     }
 
 
@@ -636,7 +730,15 @@ def _setup_artifact_item(
         return None
 
     trunk_path, trunk_data = trunk
-    snapshot, snapshot_status = _read_setup_verdict_snapshot(orchestrator)
+    project_name = _text(
+        trunk_data.get("project_name"),
+        default=workspace_id.removeprefix("sag-"),
+    )
+    snapshot, snapshot_status = _read_setup_verdict_snapshot(
+        orchestrator,
+        logs_root=logs_root,
+        project_name=project_name,
+    )
     tasks = _raw_task_dicts(trunk_data)
     legacy = snapshot_status == "missing" and trunk_data.get("legacy") is True
 
@@ -653,7 +755,10 @@ def _setup_artifact_item(
     module_metrics = _read_module_metrics(orchestrator)
 
     if snapshot is not None:
-        test = _snapshot_test_payload(snapshot)
+        test = _snapshot_test_payload(
+            snapshot,
+            metrics if isinstance(metrics, dict) and metrics.get("schema_version") == 2 else None,
+        )
         build_payload = _snapshot_build_payload(snapshot)
         canonical_verdict = snapshot.verdict
         evidence_status = snapshot.verdict
@@ -685,11 +790,6 @@ def _setup_artifact_item(
         verdict_source = "snapshot"
 
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
-    project_name = _text(
-        trunk_data.get("project_name"),
-        default=workspace_id.removeprefix("sag-"),
-    )
-
     return {
         "id": _setup_session_id(context_id, created, workspace_id),
         "workspace": workspace_id,
@@ -720,9 +820,9 @@ def _setup_artifact_item(
         "report_path": report_path,
         "report_raw": report_raw,
         "logs": _setup_logs(logs_root or Path("logs"), project_name),
-        "model": _optional_text(metrics.get("model")) if isinstance(metrics, dict) else None,
-        "steps": metrics.get("total_iterations") if isinstance(metrics, dict) else None,
-        "step_budget": metrics.get("max_iterations") if isinstance(metrics, dict) else None,
+        "model": _metrics_model(metrics),
+        "steps": _legacy_metrics_value(metrics, "total_iterations"),
+        "step_budget": _legacy_metrics_value(metrics, "max_iterations"),
     }
 
 
@@ -757,9 +857,9 @@ def _context_filenames(orchestrator: Any) -> list[str]:
         "-printf '%P\\n' 2>/dev/null || true"
     )
     try:
-        result = orchestrator.execute_command(command, timeout=5)
+        result = _execute_control(orchestrator, command, timeout=5)
     except TypeError:
-        result = orchestrator.execute_command(command)
+        result = _execute_control(orchestrator, command)
     except Exception:
         return []
 
@@ -780,9 +880,9 @@ def _latest_setup_report_path(orchestrator: Any) -> str | None:
         "2>/dev/null | sort | tail -1"
     )
     try:
-        result = orchestrator.execute_command(command, timeout=5)
+        result = _execute_control(orchestrator, command, timeout=5)
     except TypeError:
-        result = orchestrator.execute_command(command)
+        result = _execute_control(orchestrator, command)
     except Exception:
         return None
 
@@ -992,9 +1092,14 @@ def _setup_session_id(context_id: str, created: str, workspace_id: str) -> str:
     return f"SETUP-{label}-latest"
 
 
-def _read_report_metrics(orchestrator: Any) -> dict[str, Any] | None:
-    """Read the structured metrics artifact, or None when absent/invalid."""
-    from sag.tools.report_metrics import METRICS_PATH
+def _read_report_metrics(orchestrator: Any) -> Any:
+    """Read live v2 authority or an explicitly forensic legacy-v1 payload."""
+    from sag.tools.report_metrics import (
+        METRICS_PATH,
+        LegacyReportMetricsV1,
+        read_live_report_metrics,
+        read_report_metrics,
+    )
 
     raw = _read_container_file(orchestrator, METRICS_PATH)
     if not raw:
@@ -1003,7 +1108,13 @@ def _read_report_metrics(orchestrator: Any) -> dict[str, Any] | None:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    return data if isinstance(data, dict) else None
+    parsed = read_report_metrics(data)
+    if isinstance(parsed, LegacyReportMetricsV1):
+        return parsed
+    if not isinstance(parsed, dict):
+        return None
+    live = read_live_report_metrics(orchestrator)
+    return live.payload if live.complete and live.conflict is None else None
 
 
 def _read_module_metrics(orchestrator: Any) -> dict[str, Any] | None:
@@ -1034,8 +1145,34 @@ def _module_rollup_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any
     return summary if isinstance(summary, dict) else None
 
 
-def _test_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(metrics, dict):
+def _legacy_metrics_payload(metrics: Any) -> dict[str, Any] | None:
+    from sag.tools.report_metrics import LegacyReportMetricsV1
+
+    if isinstance(metrics, LegacyReportMetricsV1):
+        return dict(metrics.payload)
+    # Direct helpers historically accepted raw v1 dictionaries. Keep that
+    # explicitly forensic compatibility without ever accepting a v2 dict.
+    if isinstance(metrics, dict) and metrics.get("version") == 1:
+        return metrics
+    return None
+
+
+def _legacy_metrics_value(metrics: Any, key: str) -> Any:
+    payload = _legacy_metrics_payload(metrics)
+    return payload.get(key) if payload is not None else None
+
+
+def _metrics_model(metrics: Any) -> str | None:
+    if isinstance(metrics, dict) and metrics.get("schema_version") == 2:
+        run = metrics.get("run")
+        return _optional_text(run.get("model_pin")) if isinstance(run, dict) else None
+    value = _legacy_metrics_value(metrics, "model")
+    return _optional_text(value)
+
+
+def _test_payload_from_metrics(metrics: Any) -> dict[str, Any] | None:
+    metrics = _legacy_metrics_payload(metrics)
+    if metrics is None:
         return None
     test = metrics.get("test")
     if not isinstance(test, dict):
@@ -1065,8 +1202,9 @@ def _test_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]
     }
 
 
-def _build_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(metrics, dict):
+def _build_payload_from_metrics(metrics: Any) -> dict[str, Any] | None:
+    metrics = _legacy_metrics_payload(metrics)
+    if metrics is None:
         return None
     build = metrics.get("build")
     if not isinstance(build, dict):
@@ -1533,9 +1671,13 @@ def _duration(start: str, finish: str) -> str:
 
 def _read_container_file(orchestrator: Any, path: str) -> str | None:
     try:
-        result = orchestrator.execute_command(f"cat {shlex.quote(path)} 2>/dev/null", timeout=5)
+        result = _execute_control(
+            orchestrator,
+            f"cat {shlex.quote(path)} 2>/dev/null",
+            timeout=5,
+        )
     except TypeError:
-        result = orchestrator.execute_command(f"cat {shlex.quote(path)} 2>/dev/null")
+        result = _execute_control(orchestrator, f"cat {shlex.quote(path)} 2>/dev/null")
     except Exception:
         logger.debug("Failed to read container artifact {}", path)
         return None
@@ -1570,9 +1712,9 @@ def _write_index_payload(orchestrator: Any, payload: dict[str, Any]) -> None:
         f"printf %s {shlex.quote(raw)} > {shlex.quote(SESSION_INDEX_PATH)}"
     )
     try:
-        result = orchestrator.execute_command(command, timeout=5)
+        result = _execute_control(orchestrator, command, timeout=5)
     except TypeError:
-        result = orchestrator.execute_command(command)
+        result = _execute_control(orchestrator, command)
 
     if isinstance(result, dict) and result.get("exit_code", 0) != 0:
         output = result.get("output") or result.get("stderr") or "unknown error"
@@ -1608,9 +1750,9 @@ def _read_context_trace(orchestrator: Any) -> ContextTrace | None:
         "-printf '%P\\n' 2>/dev/null || true"
     )
     try:
-        result = orchestrator.execute_command(command, timeout=5)
+        result = _execute_control(orchestrator, command, timeout=5)
     except TypeError:
-        result = orchestrator.execute_command(command)
+        result = _execute_control(orchestrator, command)
     except Exception:
         return None
 

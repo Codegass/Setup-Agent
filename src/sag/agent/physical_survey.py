@@ -1812,12 +1812,15 @@ def _under_root(path: Any, root: str) -> bool:
 
 
 def read_policy_claims(orch) -> List[Dict[str, Any]]:
-    """Every persisted claim record under ``<workspace>/.setup_agent/claims/``.
+    """Forensic view of claim mirrors under ``.setup_agent/claims``.
 
     Ordered by ``claim_id`` so two surveys of the same container read
     identically. Anything that is not a JSON object carrying a well-formed
     ``claim_id`` is skipped — an absent directory yields ``[]``, which is what
-    an absent fact looks like everywhere else in the survey.
+    an absent fact looks like everywhere else in the survey.  This helper is
+    retained for historical/display tests only; production derivations use
+    ``claim_records.read_live_policy_claim_ledger`` so container bytes alone
+    cannot authorize a new manifest.
     """
     if not orch:
         return []
@@ -1850,7 +1853,12 @@ def read_policy_claims(orch) -> List[Dict[str, Any]]:
 
 
 def read_document_map(orch) -> Dict[str, Any]:
-    """The persisted document map, ``{}`` when absent or unparseable."""
+    """Forensic mirror view of the map, ``{}`` when absent or unparseable.
+
+    This compatibility helper is for historical/display callers only. Live
+    evidence derivation uses ``document_map.read_live_document_map`` so valid
+    repository-writable JSON cannot authorize a new fact by itself.
+    """
     if not orch:
         return {}
     try:
@@ -2156,14 +2164,32 @@ def build_domain_facts(
     exists, and ``documented_actions`` are claim IDENTIFIERS — the commands a
     document quotes never travel with them.
 
-    ``claims`` / ``document_map`` default to reading the persisted Stage A
-    files through ``orch``; callers that already hold them (the analyzer reads
-    the claims once for the edges) pass them in to avoid a second read.
+    ``document_map`` defaults to its strict live authority. Production callers
+    pass the claim ledger and map they already verified so each host-authorized
+    artifact is read once; the ``claims=None`` fallback remains a forensic
+    compatibility surface for historical callers.
     """
     if not domains:
         return []
     records = read_policy_claims(orch) if claims is None else list(claims)
-    mapping = read_document_map(orch) if document_map is None else (document_map or {})
+    document_map_integrity_reason: Optional[str] = None
+    if document_map is None and orch is not None:
+        from sag.agent.document_map import read_live_document_map
+
+        live_map = read_live_document_map(orch)
+        if live_map.complete and live_map.conflict is None and live_map.payload is not None:
+            mapping = dict(live_map.payload)
+        else:
+            mapping = {}
+            document_map_integrity_reason = (
+                "verified_absence"
+                if live_map.complete and live_map.conflict is None
+                else live_map.conflict or "stream_unavailable"
+            )
+    else:
+        # ``orch is None`` is the pure projection/unit boundary. An explicit
+        # map is an already-verified upstream handoff, not a second loose read.
+        mapping = document_map or {}
     partial_map = mapping.get("partial_map") if isinstance(mapping, dict) else None
 
     facts: List[Dict[str, Any]] = []
@@ -2186,6 +2212,13 @@ def build_domain_facts(
         if capability_state:
             fact["capability_state"] = capability_state
         open_conflicts = _domain_open_conflicts(root, edges, partial_map)
+        if document_map_integrity_reason is not None:
+            open_conflicts.append(
+                {
+                    "kind": "document_map_integrity_unavailable",
+                    "reason": document_map_integrity_reason,
+                }
+            )
         if open_conflicts:
             fact["open_conflicts"] = open_conflicts
         fact["fact_epoch"] = int(fact_epoch)

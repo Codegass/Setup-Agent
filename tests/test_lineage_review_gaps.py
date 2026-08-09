@@ -1,151 +1,21 @@
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from test_evidence_ingestion import _engine
-from test_lineage_idempotence_followup import _ResultTool, _stats
+from test_lineage_idempotence_followup import _stats
 
 from sag.agent.evidence_state import RunEvidenceState, ToolObservation
-from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
+from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
 from sag.tools.base import (
     UNPERSISTED_DRAFT_MAX_BYTES,
     ActualToolExecution,
-    OutputPersistenceError,
     ToolResult,
     UnpersistedToolResult,
 )
 
 ROOT = Path(__file__).parents[1]
-
-
-class _PomLocator:
-    project_name = "sample"
-
-    def execute_command(self, command):
-        return {
-            "success": True,
-            "output": "/workspace/sample/pom.xml",
-            "exit_code": 0,
-        }
-
-
-def _tool_orchestrator(tools, context_manager):
-    return ToolOrchestrator(
-        tools=tools,
-        context_manager=context_manager,
-        recent_tool_executions=[],
-        successful_states={},
-        repository_url=None,
-        track_tool_execution=lambda *args: None,
-        update_successful_states=lambda *args: None,
-        add_system_guidance=lambda *args, **kwargs: None,
-        get_timestamp=lambda: "ts",
-    )
-
-
-def _draft(*, error_code="REPLACEMENT_PERSISTENCE_FAILED"):
-    return UnpersistedToolResult.from_failed_construction(
-        invocation_status=InvocationStatus.COMPLETED,
-        operation_outcome=OperationOutcome.FAILED,
-        evidence_status=EvidenceStatus.CONFLICT,
-        payload={
-            "error": "replacement output could not be persisted",
-            "error_code": error_code,
-            "failure_signature": f"{error_code}:signature",
-            "error_tail_preview": "replacement persistence failed",
-            "conflicts": ["replacement_persistence_failed"],
-            "test_stats": _stats(passed=2, failed=3),
-        },
-    )
-
-
-def test_maven_pom_discovery_reraises_replacement_persistence_error_with_lineage():
-    original = ToolResult.completed_failure(
-        output="no pom at requested root",
-        error="No pom.xml found at /workspace",
-        error_code="NO_POM_XML",
-        test_stats=_stats(passed=3, failed=2),
-    )
-
-    def fail_replacement_construction():
-        raise OutputPersistenceError(
-            "primary and emergency persistence failed",
-            draft=_draft(),
-        )
-
-    maven = _ResultTool("maven", [original, fail_replacement_construction])
-    maven._parameter_schema["properties"]["pom_file"] = {"type": "string"}
-    orchestrator = _tool_orchestrator(
-        {"maven": maven},
-        SimpleNamespace(orchestrator=_PomLocator()),
-    )
-
-    with pytest.raises(OutputPersistenceError) as raised:
-        orchestrator.execute(
-            ToolCall(
-                name="maven",
-                raw_params={"command": "test"},
-                validated_params={"command": "test"},
-            )
-        )
-
-    error = raised.value
-    replacement_params = {
-        "command": "test",
-        "pom_file": "/workspace/sample/pom.xml",
-        "working_directory": "/workspace/sample",
-    }
-    assert error.tool_name == "maven"
-    assert error.params == replacement_params
-    assert error.execution_id
-    assert error.draft is not None
-    assert error.draft.execution_id == error.execution_id
-    assert len(error.actual_executions) == 1
-    assert error.actual_executions[0].tool_name == "maven"
-    assert error.actual_executions[0].params == {"command": "test"}
-    assert error.actual_executions[0].result is original
-
-
-def test_recovery_broad_catches_reraise_output_persistence_errors_first():
-    source_path = ROOT / "src" / "sag" / "agent" / "tool_recovery.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    violations = []
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        body = ast.Module(body=node.body, type_ignores=[])
-        calls_safe_execute = any(
-            isinstance(child, ast.Attribute) and child.attr == "safe_execute"
-            for child in ast.walk(body)
-        )
-        if not calls_safe_execute:
-            continue
-        exception_index = next(
-            (
-                index
-                for index, handler in enumerate(node.handlers)
-                if isinstance(handler.type, ast.Name) and handler.type.id == "Exception"
-            ),
-            None,
-        )
-        if exception_index is None:
-            continue
-        persistence_index = next(
-            (
-                index
-                for index, handler in enumerate(node.handlers)
-                if isinstance(handler.type, ast.Name)
-                and handler.type.id == "OutputPersistenceError"
-            ),
-            None,
-        )
-        if persistence_index is None or persistence_index > exception_index:
-            violations.append(node.lineno)
-
-    assert violations == []
 
 
 @pytest.mark.parametrize("difference", ["tool_name", "params", "result"])

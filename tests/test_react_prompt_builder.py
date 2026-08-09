@@ -48,8 +48,11 @@ def test_initial_prompt_preserves_repository_and_tool_markers():
 
     assert "You are SAG (Setup-Agent)" in prompt
     assert "https://example.test/repo.git" in prompt
-    assert "dummy: Dummy tool for prompt tests" in prompt
-    assert "Usage: dummy()" in prompt
+    # Tool capabilities are carried by the structured function schemas.  The
+    # setup system prompt must not duplicate free-form descriptions/examples,
+    # which can silently select a call or an ordering before evidence exists.
+    assert "dummy: Dummy tool for prompt tests" not in prompt
+    assert "Usage: dummy()" not in prompt
     assert "HOW YOU ACT" in prompt
 
 
@@ -72,7 +75,6 @@ def test_initial_prompt_includes_repository_ref_when_present():
     )
 
     assert "Repository ref: rel/commons-cli-1.11.0" in prompt
-    assert 'ref="rel/commons-cli-1.11.0"' in prompt
 
 
 def test_initial_prompt_omits_repository_ref_when_absent():

@@ -9,7 +9,7 @@ MavenTool/GradleTool; here the consolidated build facade is the hot path.
 Single pre-flight ownership: the facade runs pre-flight/bounded-retry/[scope]
 and passes _env_preflight=False to the internal tools, so exactly ONE layer
 probes the container — and reruns — per build. The internal tools keep the
-guarantee only for direct callers (tool_recovery's delegate path).
+guarantee only for callers that invoke them directly.
 
 PR #12's orchestration layer owns working-directory injection, so the facade
 adds NO workdir defaulting — only the [scope] warning when the model
@@ -17,14 +17,83 @@ EXPLICITLY narrows below a healthy reactor's recommended build root (or, for
 maven, passes a -pl module selection).
 """
 
+import hashlib
 import json
 import shlex
 
+import pytest
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+
+from sag.agent.action_intents import action_fingerprint
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+from sag.agent.invocation_contracts import action_context, current_contract
+from sag.runtime.env_overlay import (
+    DEFAULT_OVERLAY_JSON,
+    RUNTIME_REQUIREMENT_CONFLICT,
+    EnvOverlayStore,
+)
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.gradle_tool import GradleTool
+from build_requirements_fakes import complete_build_requirements_v1
+
+pytestmark = pytest.mark.usefixtures(
+    "facade_contract_authority",
+    "exact_build_facade_authority",
+    "exact_internal_runner_authority",
+)
 from sag.tools.internal.maven_tool import MavenTool
+
+
+def _requirements(**overrides):
+    return complete_build_requirements_v1(
+        project_root="/workspace/proj",
+        **overrides,
+    )
+
+
+def _published_requirements(manifest):
+    """Expand the terse behavior-specific fixture fields into strict live v1."""
+
+    overrides = dict(manifest or {})
+    project_root = (
+        "/workspace" if overrides.get("build_root") == "/workspace" else "/workspace/proj"
+    )
+    if overrides.get("root_shape") == "healthy_reactor":
+        overrides.setdefault("fail_at_end", True)
+        overrides.setdefault("test_fail_at_end", True)
+    return complete_build_requirements_v1(project_root=project_root, **overrides)
+
+
+def _domain_id(root):
+    return "dom-" + hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
+
+
+def _domain_requirements(*roots, java_version="11", java_version_source=None):
+    domains = [{"root": root, "system": "maven"} for root in roots]
+    facts = [
+        {
+            "domain_id": _domain_id(root),
+            "root": root,
+            "role": "unknown",
+            "environment": "unknown",
+            "fact_epoch": 1,
+            "system": "maven",
+        }
+        for root in roots
+    ]
+    return _requirements(
+        java_version=java_version,
+        java_version_source=java_version_source,
+        root_shape=(
+            "single_module" if roots[0] == "/workspace/proj" else "pathological_aggregator"
+        ),
+        build_root=roots[0],
+        build_islands=domains,
+        build_domains=domains,
+        domain_facts=facts,
+    )
 
 
 class ScriptedOrch:
@@ -38,10 +107,20 @@ class ScriptedOrch:
         project_name="proj",
     ):
         self.java = java
-        self.manifest = manifest or {}
+        self.manifest = _published_requirements(manifest)
         self.markers = set(markers)
         self.project_name = project_name
         self.commands = []
+        self.evidence = ContainerFS()
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=self.manifest,
+        )
 
     def read_file(self, path):
         self.commands.append(f"read_file {path}")
@@ -55,6 +134,12 @@ class ScriptedOrch:
 
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
+        if REQUIREMENTS_PATH in cmd and "SAG_NAMED_JSON_RECORD_V1" in cmd:
+            return self.evidence(cmd)
+        if cmd.startswith("cat ") and "/invocation_contracts/" in cmd:
+            return {"success": False, "exit_code": 1, "output": ""}
+        if cmd.startswith("test ! -e ") and "/invocation_contracts/" in cmd:
+            return {"success": True, "exit_code": 0, "output": ""}
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
@@ -89,9 +174,53 @@ class ScriptedBackendTool:
         return self._results.pop(0) if len(self._results) > 1 else self._results[0]
 
 
+class RuntimeScriptedOrch(ScriptedOrch):
+    """Adds exact file persistence and a real target SHA for dynamic JDK tests."""
+
+    def __init__(self, *args, sha="a" * 40, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sha = sha
+        self.files = {}
+
+    def read_file(self, path):
+        self.commands.append(f"read_file {path}")
+        if path == REQUIREMENTS_PATH and self.manifest:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "content": json.dumps(self.manifest),
+            }
+        if path in self.files:
+            return {"success": True, "exit_code": 0, "content": self.files[path]}
+        return None
+
+    def write_file(self, path, content):
+        self.files[path] = content
+        return {"success": True, "exit_code": 0, "output": ""}
+
+    def execute_command(self, cmd, workdir=None, timeout=None):
+        if "rev-parse HEAD" in cmd:
+            self.commands.append(cmd)
+            return {"success": True, "exit_code": 0, "output": self.sha}
+        return super().execute_command(cmd, workdir=workdir, timeout=timeout)
+
+
+class ContractCapturingBackendTool(ScriptedBackendTool):
+    def __init__(self, *results):
+        super().__init__(*results)
+        self.contracts = []
+
+    def execute(self, **kwargs):
+        self.contracts.append(dict(current_contract() or {}))
+        return super().execute(**kwargs)
+
+
 ENFORCER_FAIL = (
     "[ERROR] RequireJavaVersion failed ... Detected JDK Version: "
     "11.0.2 is not in the allowed range [17,). BUILD FAILURE"
+)
+REAL_MAVEN_JAVA_FAIL = (
+    "[ERROR] Required Java version 17 is not met by current version 11.0.27. " "BUILD FAILURE"
 )
 
 
@@ -106,11 +235,13 @@ def _tool(orch, maven=None, gradle=None):
 def _patch_provision(monkeypatch, ok=True):
     import sag.tools.internal.build_preflight as bp
 
-    monkeypatch.setattr(
-        bp.JdkPreflight,
-        "_provision",
-        (lambda self, v: f"/usr/lib/jvm/java-{v}-openjdk-arm64") if ok else (lambda self, v: None),
-    )
+    def provision(self, version):
+        if not ok:
+            return None
+        self.orchestrator.java = version
+        return f"/usr/lib/jvm/java-{version}-openjdk-arm64"
+
+    monkeypatch.setattr(bp.JdkPreflight, "_provision", provision)
     monkeypatch.setattr(bp, "_register_overlay", lambda orchestrator, home, version: True)
 
 
@@ -118,6 +249,23 @@ def test_matching_jdk_no_narration():
     orch = ScriptedOrch(java="17", manifest={"java_version": "17"})
     result = _tool(orch).execute(action="compile", working_directory="/workspace/proj")
     assert "[pre-flight]" not in (result.output or "")
+
+
+def test_contract_records_probe_provenance_when_survey_states_no_jdk_requirement():
+    orch = ScriptedOrch(java="17", manifest={})
+    backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
+
+    result = _tool(orch, maven=backend).execute(
+        action="compile",
+        working_directory="/workspace/proj",
+    )
+
+    assert result.succeeded is True
+    assert backend.contracts[0]["effective_jdk"] == {
+        "major": "17",
+        "runtime_authority": "dispatch_probe",
+        "provenance": {"source": "java_runtime_probe"},
+    }
 
 
 def test_mismatch_narrated_in_observation(monkeypatch):
@@ -141,6 +289,191 @@ def test_version_error_triggers_single_retry_then_success(monkeypatch):
     assert len(maven.calls) == 2  # original + exactly one retry
     assert "[pre-flight] build error requires Java 17, re-provisioned, retry 1/1" in result.output
     assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+
+
+def test_initial_and_jdk_retry_contracts_preserve_repair_context_digest(monkeypatch):
+    _patch_provision(monkeypatch)
+    backend = ContractCapturingBackendTool(
+        ToolResult.completed_failure(output=ENFORCER_FAIL),
+        ToolResult.completed_success(output="BUILD SUCCESS"),
+    )
+    orch = ScriptedOrch(java="11", manifest={})
+    params = {"action": "compile", "working_directory": "/workspace/proj"}
+    domain_id = "test:/workspace/proj"
+
+    with action_context(
+        envelope_id="envelope-repair-jdk",
+        intent_source="model",
+        intent_id="intent-repair-jdk",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+        trigger_assessment_id="asm-gate-jdk",
+        repair_context_id="rcx-123456789abc",
+        repair_context_sha256="e" * 64,
+    ):
+        result = _tool(orch, maven=backend).execute(
+            action="compile",
+            working_directory="/workspace/proj",
+        )
+
+    assert result.succeeded is True
+    assert len(backend.contracts) == 2
+    assert {contract["repair_context_sha256"] for contract in backend.contracts} == {"e" * 64}
+    assert {contract["repair_context_id"] for contract in backend.contracts} == {"rcx-123456789abc"}
+    assert backend.contracts[1]["predecessor_contract_id"] == backend.contracts[0]["contract_id"]
+
+
+def test_real_maven_required_java_wording_triggers_one_runtime_retry(monkeypatch):
+    _patch_provision(monkeypatch)
+    maven = ScriptedBackendTool(
+        ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL, error="failed"),
+        ToolResult.completed_success(output="BUILD SUCCESS"),
+    )
+    orch = ScriptedOrch(java="11", manifest={})
+
+    result = _tool(orch, maven=maven).execute(
+        action="compile",
+        working_directory="/workspace/proj",
+    )
+
+    assert result.succeeded is True
+    assert len(maven.calls) == 2
+    assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+
+
+def test_runner_observed_jdk_persists_and_next_invocation_outranks_static_survey(
+    monkeypatch,
+):
+    _patch_provision(monkeypatch)
+    manifest = _domain_requirements(
+        "/workspace/proj",
+        "/workspace/proj/auxiliary",
+        java_version_source="maven-compiler",
+    )
+    orch = RuntimeScriptedOrch(java="11", manifest=manifest)
+    first_backend = ContractCapturingBackendTool(
+        ToolResult.completed_failure(
+            output=REAL_MAVEN_JAVA_FAIL,
+            error="failed",
+            metadata={"receipt_id": "inv-maven-compile-0001"},
+        ),
+        ToolResult.completed_success(output="BUILD SUCCESS"),
+    )
+
+    first = _tool(orch, maven=first_backend).execute(
+        action="compile",
+        working_directory="/workspace/proj",
+    )
+
+    assert first.succeeded is True
+    assert [
+        contract["effective_jdk"]["requirement_authority"] for contract in first_backend.contracts
+    ] == ["static_survey", "runner_observed"]
+    assert first_backend.contracts[0]["effective_jdk"]["major"] == "11"
+    assert first_backend.contracts[1]["effective_jdk"]["major"] == "17"
+    assert (
+        first_backend.contracts[1]["predecessor_contract_id"]
+        == first_backend.contracts[0]["contract_id"]
+    )
+    stored = json.loads(orch.files[DEFAULT_OVERLAY_JSON])
+    (runtime_fact,) = stored["tools"]["java"]["runtime_requirements"]
+    assert runtime_fact["target_sha"] == orch.sha
+    assert runtime_fact["domain_id"] == _domain_id("/workspace/proj")
+    assert runtime_fact["domain_root"] == "/workspace/proj"
+    assert runtime_fact["required_major"] == "17"
+    assert runtime_fact["source_ref"] == "inv-maven-compile-0001"
+    assert runtime_fact["active_runtime"]["major"] == "17"
+
+    next_backend = ContractCapturingBackendTool(
+        ToolResult.completed_success(output="BUILD SUCCESS")
+    )
+    next_result = _tool(orch, maven=next_backend).execute(
+        action="compile",
+        working_directory="/workspace/proj",
+    )
+
+    assert next_result.succeeded is True
+    assert next_backend.contracts[0]["effective_jdk"]["major"] == "17"
+    assert (
+        next_backend.contracts[0]["effective_jdk"]["requirement_authority"] == "persisted_dynamic"
+    )
+
+
+def test_same_scope_runtime_conflict_refuses_dispatch_without_latest_wins():
+    manifest = _domain_requirements(
+        "/workspace/proj",
+        "/workspace/proj/auxiliary",
+    )
+    orch = RuntimeScriptedOrch(java="17", manifest=manifest)
+    store = EnvOverlayStore(orch)
+    scope = {
+        "target_sha": orch.sha,
+        "domain_id": _domain_id("/workspace/proj"),
+        "domain_root": "/workspace/proj",
+    }
+    store.record_runtime_requirement(
+        "java",
+        **scope,
+        required_major="17",
+        source_ref="inv-1",
+        observed_at="2026-08-08T12:00:00Z",
+    )
+    store.record_runtime_requirement(
+        "java",
+        **scope,
+        required_major="21",
+        source_ref="inv-2",
+        observed_at="2026-08-08T12:01:00Z",
+    )
+    backend = ContractCapturingBackendTool()
+
+    result = _tool(orch, maven=backend).execute(
+        action="compile",
+        working_directory="/workspace/proj",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == RUNTIME_REQUIREMENT_CONFLICT
+    assert result.metadata["runner_dispatched"] is False
+    assert backend.calls == []
+
+
+def test_sibling_domain_does_not_inherit_dynamic_jdk_requirement(monkeypatch):
+    _patch_provision(monkeypatch)
+    manifest = _domain_requirements(
+        "/workspace/proj/a",
+        "/workspace/proj/b",
+        java_version_source="maven-compiler",
+    )
+    orch = RuntimeScriptedOrch(
+        java="17",
+        manifest=manifest,
+        markers=("/workspace/proj/a/pom.xml", "/workspace/proj/b/pom.xml"),
+    )
+    EnvOverlayStore(orch).record_runtime_requirement(
+        "java",
+        target_sha=orch.sha,
+        domain_id=_domain_id("/workspace/proj/a"),
+        domain_root="/workspace/proj/a",
+        required_major="17",
+        source_ref="inv-a",
+        observed_at="2026-08-08T12:00:00Z",
+    )
+    backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
+
+    result = _tool(orch, maven=backend).execute(
+        action="compile",
+        working_directory="/workspace/proj/b",
+    )
+
+    assert result.succeeded is True
+    assert backend.contracts[0]["effective_jdk"]["major"] == "11"
+    assert backend.contracts[0]["effective_jdk"]["requirement_authority"] == "static_survey"
     assert result.succeeded
 
 
@@ -206,9 +539,7 @@ def test_no_scope_warning_at_recommended_root():
     assert "[scope]" not in (result.output or "")
 
 
-def test_no_scope_warning_when_workdir_resolved_by_detection_fallback():
-    # The facade's own project-name fallback (not the model) lands below the
-    # manifest build_root: not an explicit narrowing, so stay quiet.
+def test_default_workdir_is_not_retargeted_from_project_name():
     orch = ScriptedOrch(
         java="17",
         manifest={
@@ -220,7 +551,14 @@ def test_no_scope_warning_when_workdir_resolved_by_detection_fallback():
         project_name="proj",
     )
     result = _tool(orch).execute(action="test")  # default "/workspace"
-    assert "[scope]" not in (result.output or "")
+    assert result.operation_outcome.value == "unknown"
+    assert result.error_code == "BUILD_SYSTEM_NOT_DETECTED"
+    assert result.metadata == {
+        "runner_dispatched": False,
+        "working_directory": "/workspace",
+    }
+    assert result.facts["working_directory"] == "/workspace"
+    assert not any("/workspace/proj/" in command for command in orch.commands)
 
 
 def test_scope_warning_for_pl_token_in_args():
@@ -250,7 +588,14 @@ def test_no_scope_warning_for_pl_substring_lookalike():
     assert "[scope]" not in (result.output or "")
 
 
-def test_backends_delegate_with_env_preflight_disabled():
+@pytest.mark.parametrize(
+    ("marker", "action", "backend_name"),
+    (
+        ("/workspace/proj/pom.xml", "compile", "maven"),
+        ("/workspace/proj/build.gradle", "test", "gradle"),
+    ),
+)
+def test_backends_delegate_with_env_preflight_disabled(marker, action, backend_name):
     # Single ownership: the facade already ran the pre-flight, so the
     # backends must tell the internal tools to skip theirs.
     maven = ScriptedBackendTool()
@@ -258,22 +603,13 @@ def test_backends_delegate_with_env_preflight_disabled():
     orch = ScriptedOrch(
         java="17",
         manifest={"java_version": "17"},
-        markers=("/workspace/proj/pom.xml",),
+        markers=(marker,),
     )
     _tool(orch, maven=maven, gradle=gradle).execute(
-        action="compile", working_directory="/workspace/proj"
+        action=action, working_directory="/workspace/proj"
     )
-    assert maven.calls[0]["_env_preflight"] is False
-
-    orch = ScriptedOrch(
-        java="17",
-        manifest={"java_version": "17"},
-        markers=("/workspace/proj/build.gradle",),
-    )
-    _tool(orch, maven=maven, gradle=gradle).execute(
-        action="test", working_directory="/workspace/proj"
-    )
-    assert gradle.calls[0]["_env_preflight"] is False
+    selected = maven if backend_name == "maven" else gradle
+    assert selected.calls[0]["_env_preflight"] is False
 
 
 def test_deps_action_skips_preflight():
@@ -303,8 +639,7 @@ def test_gradle_version_error_single_retry(monkeypatch):
 # --- Internal MavenTool/GradleTool wiring (donor port) ----------------------
 #
 # The same pre-flight + bounded retry guards the internal tools ONLY for
-# direct callers (tool_recovery resolves the backend delegates and calls
-# safe_execute directly). On the facade path the backends pass
+# direct callers. On the facade path the backends pass
 # _env_preflight=False and the internal tools run NO probes, NO narration and
 # NO retry — the facade owns all of it (single pre-flight ownership). The
 # donor's workdir re-targeting ("defaulting to the recommended reactor
@@ -322,13 +657,26 @@ class MavenScriptedOrch:
         build_output="BUILD SUCCESS",
         build_ok=True,
         project_name="proj",
+        *,
+        publish_manifest=True,
     ):
         self.java = java
-        self.manifest = manifest or {}
+        self.manifest = _published_requirements(manifest)
         self.build_output = build_output
         self.build_ok = build_ok
         self.commands = []
         self.project_name = project_name
+        self.evidence = ContainerFS()
+        if publish_manifest:
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=self.manifest,
+            )
 
     def read_file(self, path):
         self.commands.append(f"read_file {path}")
@@ -342,6 +690,12 @@ class MavenScriptedOrch:
 
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
+        if REQUIREMENTS_PATH in cmd and "SAG_NAMED_JSON_RECORD_V1" in cmd:
+            return self.evidence(cmd)
+        if cmd.startswith("cat ") and "/invocation_contracts/" in cmd:
+            return {"success": False, "exit_code": 1, "output": ""}
+        if cmd.startswith("test ! -e ") and "/invocation_contracts/" in cmd:
+            return {"success": True, "exit_code": 0, "output": ""}
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
@@ -454,10 +808,8 @@ def test_maven_tool_no_scope_warning_at_recommended_root():
 
 
 def test_maven_tool_unscoped_invocation_never_retargets_or_warns():
-    # The tool's own project-name fallback (not the model) lands below the
-    # manifest build_root: not an explicit narrowing, so stay quiet. The
-    # donor's re-targeting default is superseded by PR #12's orchestration
-    # injection and is deliberately not ported.
+    # Internal backends receive the facade's frozen cwd and cannot use the
+    # Docker project name to replace it.
     orch = MavenScriptedOrch(
         java="17",
         manifest={
@@ -468,6 +820,15 @@ def test_maven_tool_unscoped_invocation_never_retargets_or_warns():
     )
     result = _internal_maven_tool(orch).execute(command="test")  # default "/workspace"
     assert "defaulting to the recommended reactor root" not in (result.output or "")
+    assert not any("/workspace/proj/pom.xml" in command for command in orch.commands)
+
+
+def test_gradle_tool_unscoped_invocation_never_retargets_from_project_name():
+    orch = GradleScriptedOrch(java="17", project_name="proj")
+
+    result = _internal_gradle_tool(orch).execute(command="build")
+
+    assert not any("/workspace/proj/build.gradle" in command for command in orch.commands)
     assert "[scope]" not in (result.output or "")
 
 
@@ -527,6 +888,8 @@ def test_maven_tool_schema_does_not_expose_env_preflight():
 class GradleScriptedOrch(MavenScriptedOrch):
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
+        if REQUIREMENTS_PATH in cmd and "SAG_NAMED_JSON_RECORD_V1" in cmd:
+            return self.evidence(cmd)
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
@@ -556,6 +919,26 @@ def _internal_gradle_tool(orch):
     tool.toolchain_manager = None
     tool.output_storage = None
     return tool
+
+
+@pytest.mark.parametrize("runner", ("maven", "gradle"))
+def test_direct_internal_runner_rejects_an_unpublished_manifest_before_probing(runner):
+    if runner == "maven":
+        orch = MavenScriptedOrch(publish_manifest=False)
+        result = _internal_maven_tool(orch).execute(
+            command="compile", working_directory="/workspace/proj"
+        )
+    else:
+        orch = GradleScriptedOrch(publish_manifest=False)
+        result = _internal_gradle_tool(orch).execute(
+            command="build", working_directory="/workspace/proj"
+        )
+
+    assert result.error_code == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert result.metadata["runner_dispatched"] is False
+    assert result.metadata["blocker_owner"] == "harness"
+    assert not any("java -version" in command for command in orch.commands)
+    assert not any(command.startswith(("mvn", "gradle")) for command in orch.commands)
 
 
 def _gradle_runs(orch, task):

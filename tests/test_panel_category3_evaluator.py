@@ -8,8 +8,21 @@ anchor FAIL with a named reason and never a crash.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
+from build_requirements_fakes import complete_python_build_requirements_v1
+from container_evidence_fakes import canonical_json, complete_run_pin
+from sag.agent.control_events import ControlEventSink
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+)
+from sag.agent.verdict_finalizer import RunVerdictSnapshot
 from scripts.panel_category3_evaluator import (
     AnchorResult,
     RunArtifacts,
@@ -26,8 +39,25 @@ from scripts.panel_category3_evaluator import (
 # --------------------------------------------------------------------------
 # builders
 # --------------------------------------------------------------------------
+class _StableArchiveStore:
+    """One deterministic immutable-store identity per synthetic archive."""
+
+    def __init__(self, archive_root):
+        digest = hashlib.sha256(str(archive_root.resolve()).encode("utf-8")).hexdigest()
+        self.identity = f"test-category3-archive:{digest}"
+
+    def evidence_store_identity(self):
+        return self.identity
+
+
+def _bind_archive_store(authority, archive_root):
+    authority.bind_store(_StableArchiveStore(archive_root))
+    return authority
+
+
 def artifacts(**kw) -> RunArtifacts:
     base = dict(
+        run_id="unit-run",
         verdict="success",
         build_judgment="success",
         build_source="physical",
@@ -46,7 +76,9 @@ def artifacts(**kw) -> RunArtifacts:
     return RunArtifacts(**base)
 
 
-def inv(tool="build", action="test", workdir="/workspace/proj", success=True, metadata=None, **extra):
+def inv(
+    tool="build", action="test", workdir="/workspace/proj", success=True, metadata=None, **extra
+):
     """Build a ToolInvocation matching the REAL projected schema.
 
     Real runs surface build/test/pytest through ``tool='build'``,
@@ -65,7 +97,13 @@ def inv(tool="build", action="test", workdir="/workspace/proj", success=True, me
     )
 
 
-def pytest_inv(workdir="/workspace/tvm", success=False, command=None, collected_after_deselection=None, collected=None):
+def pytest_inv(
+    workdir="/workspace/tvm",
+    success=False,
+    command=None,
+    collected_after_deselection=None,
+    collected=None,
+):
     """A build(action='test') pytest invocation as the python backend records it."""
     md: dict = {}
     if command is not None:
@@ -91,7 +129,12 @@ def _bigtop_pass_kwargs():
         unique_executed=50,
         unique_failed=0,
         invocations=(
-            inv(tool="build", action="install", workdir="/workspace/bigtop/data-generators", success=True),
+            inv(
+                tool="build",
+                action="install",
+                workdir="/workspace/bigtop/data-generators",
+                success=True,
+            ),
         ),
     )
 
@@ -138,7 +181,12 @@ def test_bigtop_compiled_classes_missing_fails_with_named_reason():
 def test_bigtop_requires_a_successful_data_generators_build():
     kw = _bigtop_pass_kwargs()
     kw["invocations"] = (
-        inv(tool="build", action="install", workdir="/workspace/bigtop/data-generators", success=False),
+        inv(
+            tool="build",
+            action="install",
+            workdir="/workspace/bigtop/data-generators",
+            success=False,
+        ),
     )
     fails = names_failing(evaluate_bigtop(artifacts(**kw)))
     assert "data_generators_build_success" in fails
@@ -146,7 +194,9 @@ def test_bigtop_requires_a_successful_data_generators_build():
 
 def test_bigtop_non_data_generators_success_does_not_satisfy_anchor():
     kw = _bigtop_pass_kwargs()
-    kw["invocations"] = (inv(tool="build", action="install", workdir="/workspace/bigtop", success=True),)
+    kw["invocations"] = (
+        inv(tool="build", action="install", workdir="/workspace/bigtop", success=True),
+    )
     fails = names_failing(evaluate_bigtop(artifacts(**kw)))
     assert "data_generators_build_success" in fails
 
@@ -191,8 +241,9 @@ def _rejected_attempt(workdir="/workspace"):
 
 
 def _real_test(workdir, command="/usr/bin/mvn --fail-at-end verify", success=True):
-    return inv(tool="build", action="test", workdir=workdir, success=success,
-               metadata={"command": command})
+    return inv(
+        tool="build", action="test", workdir=workdir, success=success, metadata={"command": command}
+    )
 
 
 def test_httpcomponents_all_anchors_pass():
@@ -210,9 +261,16 @@ def test_httpcomponents_mis_scoped_16_tests_fail_the_floor():
 def test_httpcomponents_test_workdir_not_root_fails():
     kw = _http_pass_kwargs()
     kw["invocations"] = (
-        inv(tool="build", action="test", workdir="/workspace/httpcomponents-client/httpclient5", success=True),
+        inv(
+            tool="build",
+            action="test",
+            workdir="/workspace/httpcomponents-client/httpclient5",
+            success=True,
+        ),
     )
-    fails = names_failing(evaluate_httpcomponents(artifacts(**kw), project_root="/workspace/httpcomponents-client"))
+    fails = names_failing(
+        evaluate_httpcomponents(artifacts(**kw), project_root="/workspace/httpcomponents-client")
+    )
     assert "test_phase_workdir_is_root" in fails
 
 
@@ -223,8 +281,18 @@ def test_httpcomponents_uses_control_record_root_not_the_invocations():
     kw = _http_pass_kwargs()
     kw["project_root"] = "/workspace/httpcomponents-client"
     kw["invocations"] = (
-        inv(tool="build", action="test", workdir="/workspace/httpcomponents-client/httpclient5", success=True),
-        inv(tool="build", action="test", workdir="/workspace/httpcomponents-client/httpclient5", success=True),
+        inv(
+            tool="build",
+            action="test",
+            workdir="/workspace/httpcomponents-client/httpclient5",
+            success=True,
+        ),
+        inv(
+            tool="build",
+            action="test",
+            workdir="/workspace/httpcomponents-client/httpclient5",
+            success=True,
+        ),
     )
     fails = names_failing(evaluate_httpcomponents(artifacts(**kw)))
     assert "test_phase_workdir_is_root" in fails
@@ -234,7 +302,12 @@ def test_httpcomponents_any_mis_scoped_test_fails_not_just_last():
     # An early mis-scoped test must fail even if the LAST test is at root.
     kw = _http_pass_kwargs()
     kw["invocations"] = (
-        inv(tool="build", action="test", workdir="/workspace/httpcomponents-client/httpclient5", success=True),
+        inv(
+            tool="build",
+            action="test",
+            workdir="/workspace/httpcomponents-client/httpclient5",
+            success=True,
+        ),
         inv(tool="build", action="test", workdir="/workspace/httpcomponents-client", success=True),
     )
     fails = names_failing(evaluate_httpcomponents(artifacts(**kw)))
@@ -252,7 +325,9 @@ def test_httpcomponents_missing_project_root_fails_named():
 
 def test_httpcomponents_missing_test_invocation_fails_named():
     kw = _http_pass_kwargs()
-    kw["invocations"] = (inv(tool="build", action="compile", workdir="/workspace/httpcomponents-client"),)
+    kw["invocations"] = (
+        inv(tool="build", action="compile", workdir="/workspace/httpcomponents-client"),
+    )
     results = evaluate_httpcomponents(artifacts(**kw))
     anchor = next(r for r in results if r.name == "test_phase_workdir_is_root")
     assert not anchor.passed
@@ -421,8 +496,9 @@ def test_tvm_success_judgment_without_green_and_not_failed_fails():
 def test_tvm_pytest_without_filter_fails_never_sweep():
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        pytest_inv(workdir="/workspace/tvm",
-                   command="pytest --maxfail=1", collected_after_deselection=12),
+        pytest_inv(
+            workdir="/workspace/tvm", command="pytest --maxfail=1", collected_after_deselection=12
+        ),
     )
     fails = names_failing(evaluate_tvm(artifacts(**kw)))
     assert "never_sweep_while_unbuilt" in fails
@@ -431,8 +507,9 @@ def test_tvm_pytest_without_filter_fails_never_sweep():
 def test_tvm_maxfail_alone_does_not_select():
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        pytest_inv(workdir="/workspace/tvm",
-                   command="pytest --maxfail=1", collected_after_deselection=3),
+        pytest_inv(
+            workdir="/workspace/tvm", command="pytest --maxfail=1", collected_after_deselection=3
+        ),
     )
     fails = names_failing(evaluate_tvm(artifacts(**kw)))
     assert "never_sweep_while_unbuilt" in fails
@@ -443,9 +520,11 @@ def test_tvm_deselect_does_not_select():
     # filter (round-review P2-2).
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        pytest_inv(workdir="/workspace/tvm",
-                   command="pytest --deselect tests/python/test_x.py::test_y",
-                   collected_after_deselection=40),
+        pytest_inv(
+            workdir="/workspace/tvm",
+            command="pytest --deselect tests/python/test_x.py::test_y",
+            collected_after_deselection=40,
+        ),
     )
     fails = names_failing(evaluate_tvm(artifacts(**kw)))
     assert "never_sweep_while_unbuilt" in fails
@@ -454,8 +533,11 @@ def test_tvm_deselect_does_not_select():
 def test_tvm_node_id_path_counts_as_selection():
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        pytest_inv(workdir="/workspace/tvm",
-                   command="pytest tests/python/test_x.py::test_y", collected_after_deselection=1),
+        pytest_inv(
+            workdir="/workspace/tvm",
+            command="pytest tests/python/test_x.py::test_y",
+            collected_after_deselection=1,
+        ),
     )
     fails = names_failing(evaluate_tvm(artifacts(**kw)))
     assert "never_sweep_while_unbuilt" not in fails
@@ -464,8 +546,7 @@ def test_tvm_node_id_path_counts_as_selection():
 def test_tvm_collected_after_deselection_over_50_fails_never_sweep():
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        pytest_inv(workdir="/workspace/tvm",
-                   command="pytest -k x", collected_after_deselection=51),
+        pytest_inv(workdir="/workspace/tvm", command="pytest -k x", collected_after_deselection=51),
     )
     fails = names_failing(evaluate_tvm(artifacts(**kw)))
     assert "never_sweep_while_unbuilt" in fails
@@ -474,8 +555,9 @@ def test_tvm_collected_after_deselection_over_50_fails_never_sweep():
 def test_tvm_filtered_pytest_missing_collected_field_fails_named_not_crash():
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        pytest_inv(workdir="/workspace/tvm",
-                   command="pytest -k x", collected=8),  # collected present, but no *_after_deselection
+        pytest_inv(
+            workdir="/workspace/tvm", command="pytest -k x", collected=8
+        ),  # collected present, but no *_after_deselection
     )
     results = evaluate_tvm(artifacts(**kw))
     anchor = next(r for r in results if r.name == "never_sweep_while_unbuilt")
@@ -503,8 +585,12 @@ def test_tvm_maven_only_test_is_not_a_sweep_and_passes():
     # absence of a python smoke).
     kw = _tvm_pass_kwargs()
     kw["invocations"] = (
-        inv(tool="build", action="test", workdir="/workspace/tvm",
-            metadata={"command": "mvn -q test"}),
+        inv(
+            tool="build",
+            action="test",
+            workdir="/workspace/tvm",
+            metadata={"command": "mvn -q test"},
+        ),
     )
     results = evaluate_tvm(artifacts(**kw))
     anchor = next(r for r in results if r.name == "never_sweep_while_unbuilt")
@@ -682,27 +768,93 @@ def test_evaluate_probe_pyyaml_needs_floor_kwarg():
 # loader (structured artifacts on disk)
 # --------------------------------------------------------------------------
 def _write_session(tmp_path, *, verdict, build_evidence, unique, events, manifest):
-    import json as _json
-
     setup = tmp_path / ".setup_agent"
     setup.mkdir(parents=True)
-    (setup / "verdict.json").write_text(
-        _json.dumps(
-            {
-                "schema_version": 3,
-                "verdict": verdict,
-                "build_evidence": build_evidence,
-                "test_stats": {"unique": unique},
-            }
-        ),
-        encoding="utf-8",
+    run_id = "category3-loader-run"
+    pin_raw = canonical_json(complete_run_pin(run_id, "a" * 40)).encode("utf-8")
+    (setup / "run-pin.json").write_bytes(pin_raw)
+    (tmp_path / "run-pin.json").write_bytes(pin_raw)
+
+    unique_counts = dict(unique)
+    unique_counts.setdefault("failed", 0)
+    unique_counts.setdefault("errors", 0)
+    unique_counts.setdefault("skipped", 0)
+    unique_counts.setdefault(
+        "passed",
+        int(unique_counts.get("executed") or 0)
+        - int(unique_counts["failed"])
+        - int(unique_counts["errors"])
+        - int(unique_counts["skipped"]),
     )
-    lines = []
-    for seq, ev in enumerate(events, 1):
-        lines.append(_json.dumps({"sequence": seq, "kind": "tool_result", "payload": ev}))
-    (setup / "control_events.jsonl").write_text("\n".join(lines), encoding="utf-8")
+    snapshot = RunVerdictSnapshot(
+        run_id=run_id,
+        finalized_at="2026-08-09T06:00:00Z",
+        verdict=verdict,
+        build_evidence=build_evidence,
+        test_stats={"unique": unique_counts, "raw": unique_counts},
+    )
+    verdict_raw = snapshot.model_dump_json().encode("utf-8")
+    (setup / "verdict.json").write_bytes(verdict_raw)
+
+    mirror_path = setup / "control_events.jsonl"
+
+    def mirror(line: str) -> None:
+        with mirror_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    sink = ControlEventSink(tmp_path / "control_events.jsonl", mirror=mirror)
+    authority = _bind_archive_store(
+        EvidencePublicationAuthority.for_live_run(run_id=run_id, sink=sink),
+        tmp_path,
+    )
+    authority.publish_revision(
+        record_kind="run_pin",
+        record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        raw=pin_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
+    for seq, event in enumerate(events, 1):
+        params = dict(event.get("params") or {})
+        action = str(params.get("action") or "")
+        tool = str(event.get("tool") or "")
+        if tool == "project":
+            scope = "project_analysis"
+        elif action == "test":
+            scope = "test_runtime"
+        elif action == "deps":
+            scope = "dependencies"
+        else:
+            scope = "artifacts"
+        sink.emit(
+            "tool_result",
+            {
+                "envelope_id": f"env-{seq}",
+                "execution_id": f"exec-{seq}",
+                "tool": tool,
+                "params": params,
+                "scope": scope,
+                "roles": ["test"] if action == "test" else ["build"],
+                "result": dict(event.get("result") or {}),
+            },
+        )
     if manifest is not None:
-        (setup / "build_requirements.json").write_text(_json.dumps(manifest), encoding="utf-8")
+        manifest_raw = canonical_json(manifest).encode("utf-8")
+        (setup / "build_requirements.json").write_bytes(manifest_raw)
+        authority.publish_revision(
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            raw=manifest_raw,
+            expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+        )
+    authority.publish_revision(
+        record_kind="verdict",
+        record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        raw=verdict_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
     return tmp_path
 
 
@@ -712,17 +864,28 @@ def test_loader_reads_verdict_invocations_and_manifest(tmp_path):
     session = _write_session(
         tmp_path / "session_x",
         verdict="failed",
-        build_evidence={"judgment": "failed", "source": "physical", "green": False, "compiled_classes": 121},
+        build_evidence={
+            "judgment": "failed",
+            "source": "physical",
+            "green": False,
+            "compiled_classes": 121,
+        },
         unique={"executed": 50, "failed": 0, "errors": 0},
         events=[
             {
                 "tool": "project",
                 "params": {"action": "clone", "repo_url": "https://x/bigtop.git"},
-                "result": {"operation_outcome": "success", "metadata": {"clone_path": "/workspace/bigtop"}},
+                "result": {
+                    "operation_outcome": "success",
+                    "metadata": {"clone_path": "/workspace/bigtop"},
+                },
             },
             {
                 "tool": "build",
-                "params": {"action": "test", "working_directory": "/workspace/bigtop/data-generators"},
+                "params": {
+                    "action": "test",
+                    "working_directory": "/workspace/bigtop/data-generators",
+                },
                 "result": {"operation_outcome": "success"},
             },
             {
@@ -731,12 +894,14 @@ def test_loader_reads_verdict_invocations_and_manifest(tmp_path):
                 "result": {"operation_outcome": "failed"},
             },
         ],
-        manifest={
-            "survey": {"analyzer_version": 7, "project_path": "/workspace/bigtop", "config_fingerprint": "abc"},
-            "python_packages": ["yaml"],
-        },
+        manifest=complete_python_build_requirements_v1(
+            project_root="/workspace/bigtop",
+            config_fingerprint="abc",
+            python_packages=["yaml"],
+        ),
     )
     art = load_run_artifacts(session)
+    assert art.run_id == "category3-loader-run"
     assert art.verdict == "failed"
     assert art.build_judgment == "failed"
     assert art.build_source == "physical"
@@ -765,7 +930,10 @@ def test_loader_reads_pytest_command_and_collected_from_metadata(tmp_path):
             {
                 "tool": "project",
                 "params": {"action": "analyze", "project_path": "/workspace/tvm"},
-                "result": {"operation_outcome": "success", "metadata": {"project_path": "/workspace/tvm"}},
+                "result": {
+                    "operation_outcome": "success",
+                    "metadata": {"project_path": "/workspace/tvm"},
+                },
             },
             {
                 "tool": "build",
@@ -790,8 +958,8 @@ def test_loader_reads_pytest_command_and_collected_from_metadata(tmp_path):
     assert pytests[0].collected_after_deselection() == 2
 
 
-def test_loader_stampless_manifest_is_not_stamped(tmp_path):
-    from scripts.panel_category3_evaluator import load_run_artifacts
+def test_loader_rejects_a_published_stampless_manifest(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
 
     session = _write_session(
         tmp_path / "session_stampless",
@@ -801,9 +969,8 @@ def test_loader_stampless_manifest_is_not_stamped(tmp_path):
         events=[],
         manifest={"python_packages": ["yaml"]},  # no survey stamp
     )
-    art = load_run_artifacts(session)
-    assert art.manifest_present is True
-    assert art.manifest_stamped is False
+    with pytest.raises(EvaluationError, match="valid v1 manifest"):
+        load_run_artifacts(session)
 
 
 def test_loader_missing_verdict_raises_named(tmp_path):
@@ -828,3 +995,159 @@ def test_loader_absent_manifest_is_not_present(tmp_path):
     art = load_run_artifacts(session)
     assert art.manifest_present is False
     assert art.manifest_python_packages is None
+
+
+def _loader_session(tmp_path, *, manifest=None):
+    return _write_session(
+        tmp_path / "session_authority",
+        verdict="failed",
+        build_evidence={"judgment": "failed", "source": "physical"},
+        unique={"executed": 1, "failed": 1, "errors": 0},
+        events=[],
+        manifest=manifest,
+    )
+
+
+def test_loader_rejects_container_mirrors_without_host_control_authority(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    session = _loader_session(tmp_path)
+    (session / "control_events.jsonl").unlink()
+
+    with pytest.raises(EvaluationError, match="host control event stream"):
+        load_run_artifacts(session)
+
+
+def test_loader_ignores_a_tampered_container_event_mirror(tmp_path):
+    from scripts.panel_category3_evaluator import load_run_artifacts
+
+    session = _loader_session(tmp_path)
+    (session / ".setup_agent" / "control_events.jsonl").write_text(
+        '{"kind":"tool_result","payload":{"tool":"spoof"}}\n',
+        encoding="utf-8",
+    )
+
+    assert load_run_artifacts(session).invocations == ()
+
+
+def test_loader_rejects_a_tampered_verdict_mirror(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    session = _loader_session(tmp_path)
+    path = session / ".setup_agent" / "verdict.json"
+    snapshot = RunVerdictSnapshot.model_validate_json(path.read_bytes())
+    path.write_text(
+        snapshot.model_copy(update={"finalized_at": "2026-08-09T06:00:01Z"}).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EvaluationError, match="current host publication"):
+        load_run_artifacts(session)
+
+
+def test_loader_rejects_a_deleted_verdict_even_with_a_root_raw_copy(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    session = _loader_session(tmp_path)
+    verdict = session / ".setup_agent" / "verdict.json"
+    (session / "verdict.json").write_bytes(verdict.read_bytes())
+    verdict.unlink()
+
+    with pytest.raises(EvaluationError, match="container verdict mirror"):
+        load_run_artifacts(session)
+
+
+def test_loader_rejects_a_foreign_run_verdict(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    session = _loader_session(tmp_path)
+    path = session / ".setup_agent" / "verdict.json"
+    snapshot = RunVerdictSnapshot.model_validate_json(path.read_bytes())
+    path.write_text(
+        snapshot.model_copy(update={"run_id": "foreign-run"}).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EvaluationError, match="run_id disagrees"):
+        load_run_artifacts(session)
+
+
+def test_loader_rejects_an_unpublished_manifest_mirror(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    session = _loader_session(tmp_path)
+    (session / ".setup_agent" / "build_requirements.json").write_text(
+        canonical_json({"python_packages": ["yaml"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EvaluationError, match="no matching current host publication"):
+        load_run_artifacts(session)
+
+
+def test_loader_rejects_a_tampered_or_deleted_manifest_mirror(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    manifest = complete_python_build_requirements_v1(
+        project_root="/workspace/project",
+        config_fingerprint="abc",
+        python_packages=["yaml"],
+    )
+    session = _loader_session(tmp_path, manifest=manifest)
+    path = session / ".setup_agent" / "build_requirements.json"
+    original = path.read_bytes()
+    path.write_text(canonical_json({**manifest, "python_packages": []}), encoding="utf-8")
+    with pytest.raises(EvaluationError, match="exact current host publication"):
+        load_run_artifacts(session)
+
+    path.write_bytes(original)
+    path.unlink()
+    with pytest.raises(EvaluationError, match="missing while the host authority"):
+        load_run_artifacts(session)
+
+
+def test_loader_rejects_a_stale_manifest_when_host_has_a_future_revision(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    manifest = complete_python_build_requirements_v1(
+        project_root="/workspace/project",
+        python_packages=["yaml"],
+    )
+    session = _loader_session(tmp_path, manifest=manifest)
+    mirror_path = session / ".setup_agent" / "control_events.jsonl"
+
+    def mirror(line: str) -> None:
+        with mirror_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    sink = ControlEventSink(session / "control_events.jsonl", mirror=mirror)
+    authority = EvidencePublicationAuthority.for_live_run(
+        run_id="category3-loader-run",
+        sink=sink,
+    )
+    _bind_archive_store(authority, session)
+    head = authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
+    assert head is not None
+    authority.publish_revision(
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        raw=canonical_json({**manifest, "python_packages": ["yaml", "future"]}).encode("utf-8"),
+        expected_previous_raw_sha256=head.raw_sha256,
+    )
+
+    with pytest.raises(EvaluationError, match="exact current host publication"):
+        load_run_artifacts(session)
+
+
+def test_loader_never_falls_back_to_root_raw_artifacts(tmp_path):
+    from scripts.panel_category3_evaluator import EvaluationError, load_run_artifacts
+
+    session = tmp_path / "raw-only"
+    session.mkdir()
+    (session / "verdict.json").write_text('{"verdict":"success"}', encoding="utf-8")
+    (session / "control_events.jsonl").write_text("", encoding="utf-8")
+    (session / "build_requirements.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(EvaluationError, match="host run pin"):
+        load_run_artifacts(session)

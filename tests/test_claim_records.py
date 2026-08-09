@@ -31,13 +31,13 @@ import hashlib
 import json
 
 import pytest
+from container_evidence_fakes import ScriptedOrchestrator, canonical_json
 from pydantic import TypeAdapter, ValidationError
 from test_receipt_v2_and_assessments import ContainerFS
 
 from sag.agent import claim_records
 from sag.agent.claim_records import (
     CLAIM_DIR,
-    CLAIM_HEREDOC,
     CLAIM_SCHEMA_VERSION,
     EVIDENCE_STATUSES,
     LIFECYCLE_RUNNERS,
@@ -63,6 +63,8 @@ from sag.agent.claim_records import (
     extract_tool_constraints,
     find_claim_conflicts,
     parse_claim,
+    read_live_policy_claim_ledger,
+    validate_claim_v1,
     write_claims,
 )
 
@@ -84,18 +86,6 @@ def entry(path, kind, *, body="", status="indexed", sections=None):
         "parser_version": 1,
         "discovery_status": status,
     }
-
-
-def claims_written(commands):
-    """Every claim body persisted through the recorded commands."""
-    payloads = []
-    for command in commands:
-        if CLAIM_DIR not in command or CLAIM_HEREDOC not in command:
-            continue
-        _, _, rest = command.partition("\n")
-        body, _, _ = rest.partition(f"\n{CLAIM_HEREDOC}")
-        payloads.append(json.loads(body))
-    return payloads
 
 
 def line_of(text, needle):
@@ -984,8 +974,24 @@ def test_write_claims_persists_each_claim_atomically():
     for claim in (readme, workflow):
         final = f"{CLAIM_DIR}/{claim.claim_id}.json"
         assert json.loads(execute.files[final]) == claim.payload()
-    assert all("mv -f " in command for command in execute.writes())
-    assert claims_written(execute.commands) == [readme.payload(), workflow.payload()]
+    assert all(command.startswith("mv -f -- ") for command in execute.writes())
+    assert sum("json.load" in command for command in execute.commands) == 2
+    assert not any(path.endswith(".tmp") for path in execute.files)
+
+
+def test_write_claims_streams_a_large_payload_with_bounded_commands():
+    class LargeClaim:
+        def payload(self):
+            return {"claim_id": "large-claim", "detail": "x" * 180_000}
+
+    execute = ContainerFS()
+
+    assert write_claims(execute, [LargeClaim()]) is True
+
+    final = f"{CLAIM_DIR}/large-claim.json"
+    assert json.loads(execute.files[final]) == LargeClaim().payload()
+    assert max(map(len, execute.commands)) <= 60_200
+    assert not any(path.endswith(".tmp") for path in execute.files)
 
 
 def test_a_persisted_claim_states_its_schema_and_omits_absent_facts():
@@ -1033,10 +1039,49 @@ def test_write_claims_never_overwrites_a_different_body_under_one_id():
     assert len(execute.writes()) == 1
 
 
+def test_semantically_equal_noncanonical_mirror_cannot_self_authorize_on_replay():
+    claim = policy_claim()
+    path = f"{CLAIM_DIR}/{claim.claim_id}.json"
+    source = ScriptedOrchestrator(
+        files={path: json.dumps(claim.payload(), sort_keys=True, indent=2)}
+    )
+
+    assert write_claims(source.execute_command, [claim]) is False
+    ledger = read_live_policy_claim_ledger(source)
+
+    assert ledger.complete is False
+    assert ledger.conflict == "publication_not_published"
+
+
 def test_write_claims_reports_a_failed_persist_without_raising():
     execute = ContainerFS(writable=False)
 
     assert write_claims(execute, [policy_claim()]) is False
+
+
+def test_write_claims_preserves_a_concurrent_final_and_cleans_temps_on_failure():
+    claim = policy_claim()
+    final = f"{CLAIM_DIR}/{claim.claim_id}.json"
+    old_body = '{"complete":"old"}'
+    container = ContainerFS()
+    read_finished = False
+    injected = False
+
+    def execute(command, **kwargs):
+        nonlocal injected, read_finished
+        if command.startswith("cat "):
+            read_finished = True
+            return {"exit_code": 1, "output": "No such file"}
+        if read_finished and not injected:
+            container.files[final] = old_body
+            container.atomic.fail_on = "mv -f --"
+            injected = True
+        return container(command, **kwargs)
+
+    assert write_claims(execute, [claim]) is False
+
+    assert container.files[final] == old_body
+    assert not any(path != final and path.endswith(".tmp") for path in container.files)
 
 
 def test_write_claims_never_raises_when_the_container_is_gone():
@@ -1051,6 +1096,63 @@ def test_write_claims_persists_nothing_for_an_empty_batch():
 
     assert write_claims(execute, []) is True
     assert execute.commands == []
+
+
+def test_live_claim_ledger_requires_exact_host_published_bytes_and_filename():
+    source = ScriptedOrchestrator()
+    claim = policy_claim()
+
+    assert write_claims(source.execute_command, [claim]) is True
+    ledger = read_live_policy_claim_ledger(source)
+
+    assert ledger.complete is True
+    assert ledger.conflict is None
+    assert [record.payload for record in ledger.records] == [claim.payload()]
+
+    path = f"{CLAIM_DIR}/{claim.claim_id}.json"
+    source.filesystem.files[path] = canonical_json(
+        {**claim.payload(), "evidence_status": "confirmed"}
+    )
+    tampered = read_live_policy_claim_ledger(source)
+    assert tampered.complete is False
+    assert tampered.conflict == "publication_mismatch"
+
+
+def test_live_claim_ledger_rejects_unpublished_mirror():
+    claim = policy_claim()
+    path = f"{CLAIM_DIR}/{claim.claim_id}.json"
+    raw = canonical_json(claim.payload())
+    mirror_only = ScriptedOrchestrator(files={path: raw})
+
+    unpublished = read_live_policy_claim_ledger(mirror_only)
+    assert unpublished.complete is False
+    assert unpublished.conflict == "publication_not_published"
+
+
+def test_live_claim_ledger_rejects_a_missing_published_record():
+    claim = policy_claim()
+    path = f"{CLAIM_DIR}/{claim.claim_id}.json"
+    published = ScriptedOrchestrator()
+    assert write_claims(published.execute_command, [claim]) is True
+    published.filesystem.files.pop(path)
+    deleted = read_live_policy_claim_ledger(published)
+    assert deleted.complete is False
+    assert deleted.conflict == "publication_set_mismatch"
+
+
+def test_live_claim_ledger_rejects_filename_schema_and_future_version_conflicts():
+    claim = policy_claim()
+    source = ScriptedOrchestrator(
+        files={f"{CLAIM_DIR}/wrong-identity.json": canonical_json(claim.payload())}
+    )
+    mismatch = read_live_policy_claim_ledger(source)
+    assert mismatch.complete is False
+    assert mismatch.conflict == "record_schema_invalid"
+
+    future = dict(claim.payload())
+    future["schema_version"] = CLAIM_SCHEMA_VERSION + 1
+    with pytest.raises(ValueError, match="canonical schema"):
+        validate_claim_v1(future, expected_id=claim.claim_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,9 +1207,7 @@ def test_shell_continuations_join_and_yield_the_pip_pin():
     )
 
     pins = extract_dependency_pins(entry, text)
-    numpy_pins = [
-        pin for pin in pins if pin.typed_value.get("package") == "numpy"
-    ]
+    numpy_pins = [pin for pin in pins if pin.typed_value.get("package") == "numpy"]
     assert len(numpy_pins) == 1
     assert numpy_pins[0].typed_value["specifier"] == "=="
     assert numpy_pins[0].typed_value["version"] == "1.26.*"

@@ -2,7 +2,6 @@ import pytest
 
 from sag.agent.output_storage import OutputStorageManager
 from sag.agent.tool_orchestration import (
-    RecoveryDecision,
     ToolCall,
     ToolExecutionRecord,
     ToolOrchestrator,
@@ -135,10 +134,27 @@ def test_format_tool_result_surfaces_maven_version_contract():
     assert "Current Maven executable: /usr/bin/mvn" in formatted
     assert "Current Maven version: 3.6.3" in formatted
     assert "Compatible Maven candidate: none" in formatted
-    assert "requirement='[3.9,)'" in formatted
-    assert "maven_version_requirement='[3.9,)'" in formatted
+    assert "Next action:" not in formatted
+    assert "project(action='env'" not in formatted
+    assert "build(action=" not in formatted
     # The consolidated build facade surfaces the same contract.
     assert "Maven version requirement: [3.9,) (source: build_error)" in formatted_for_build
+
+
+def test_runner_failure_suggestions_do_not_bypass_model_owned_repair_intent():
+    result = ToolResult.completed_failure(
+        output="[ERROR] compilation failed",
+        error="Maven build failed",
+        error_code="COMPILATION_ERROR",
+        suggestions=["Run build(action='compile', args='-pl core')"],
+    )
+
+    formatted = format_tool_result("build", result)
+
+    assert "COMPILATION_ERROR" in formatted
+    assert "compilation failed" in formatted
+    assert "Suggestions:" not in formatted
+    assert "-pl core" not in formatted
 
 
 def test_failed_observation_and_lifecycle_event_preserve_failure_provenance():
@@ -192,21 +208,36 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
     assert execution.status == "success"
     assert execution.result.output == "ran pwd"
     assert execution.attempted_execution is True
-    assert execution.executed_params == {"command": "pwd"}
+    assert execution.executed_params == {
+        "command": "pwd",
+        "working_directory": "/workspace",
+    }
     assert "echo executed successfully" in execution.observation_text
-    assert [event.event_type for event in events] == ["tool_start", "tool_result"]
+    assert [event.event_type for event in events] == [
+        "tool_start",
+        "tool_parameters_fixed",
+        "tool_result",
+    ]
     assert events[-1].metadata["status"] == "success"
     assert events[-1].metadata["invocation_status"] == "completed"
     assert events[-1].metadata["operation_outcome"] == "success"
     assert events[-1].metadata["evidence_status"] == "verified"
     assert events[-1].metadata["error_code"] is None
-    assert events[-1].metadata["executed_params"] == {"command": "pwd"}
-    assert events[-1].metadata["recovery_applied"] is False
-    assert execution.call.execution_signature == "echo:[('command', 'pwd')]"
+    assert events[-1].metadata["executed_params"] == {
+        "command": "pwd",
+        "working_directory": "/workspace",
+    }
+    assert "recovery_applied" not in events[-1].metadata
+    assert execution.call.execution_signature == (
+        "echo:[('command', 'pwd'), ('working_directory', '/workspace')]"
+    )
     assert tracking_calls == [(execution.call.execution_signature, execution.result)]
     assert len(state_updates) == 1
     assert state_updates[0][0] == "echo"
-    assert state_updates[0][1] == {"command": "pwd"}
+    assert state_updates[0][1] == {
+        "command": "pwd",
+        "working_directory": "/workspace",
+    }
     assert state_updates[0][2] is execution.result
 
 
@@ -432,7 +463,7 @@ def test_lifecycle_events_include_required_metadata():
         "command": "pwd",
         "working_directory": "/workspace",
     }
-    assert result.metadata["recovery_applied"] is False
+    assert "recovery_applied" not in result.metadata
 
 
 def test_orchestrator_returns_missing_tool_execution_with_existing_feedback():
@@ -558,9 +589,8 @@ def test_manage_context_invalidation_metadata_only_for_successful_context_change
     assert "invalidate_trunk_cache" not in failed_changing_execution.metadata
 
 
-def test_unexpected_safe_execute_exception_reaches_recovery_and_preserves_crash(monkeypatch):
+def test_unexpected_safe_execute_exception_fails_closed_and_preserves_crash():
     tracking_calls = []
-    recovery_calls = []
     events = []
     orchestrator = ToolOrchestrator(
         tools={"explode": ExplodingSafeExecuteTool()},
@@ -574,34 +604,16 @@ def test_unexpected_safe_execute_exception_reaches_recovery_and_preserves_crash(
         get_timestamp=lambda: "ts",
         event_sink=events.append,
     )
-    monkeypatch.setattr(
-        orchestrator.recovery_handler,
-        "recover",
-        lambda tool_name, params, result: (
-            recovery_calls.append((tool_name, params, result))
-            or RecoveryDecision(
-                should_recover=False,
-                strategy="crash_declined",
-                guidance="Crash recovery is unsupported",
-            )
-        ),
-    )
-
     execution = orchestrator.execute(ToolCall(name="explode", raw_params={"command": "pwd"}))
 
-    assert len(recovery_calls) == 1
-    tool_name, params, crashed = recovery_calls[0]
-    assert tool_name == "explode"
-    assert params == {"command": "pwd"}
-    assert crashed is execution.result
     assert execution.status == "exception"
     assert execution.result.succeeded is False
     assert execution.result.invocation_status is InvocationStatus.CRASHED
     assert execution.result.operation_outcome is OperationOutcome.FAILED
     assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
     assert execution.attempted_execution is True
-    assert execution.metadata["recovery"]["strategy"] == "crash_declined"
-    assert execution.metadata["recovery"]["attempted"] is False
+    assert "recovery" not in execution.metadata
+    assert "recovery_strategy" not in execution.metadata
     assert tracking_calls == [("explode:[('command', 'pwd')]", execution.result)]
     error_event = events[-1]
     assert error_event.event_type == "tool_error"
@@ -613,65 +625,23 @@ def test_unexpected_safe_execute_exception_reaches_recovery_and_preserves_crash(
     assert error_metadata["failure_signature"] == execution.result.failure_signature
     assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
     assert error_metadata["output_ref"] == execution.result.output_ref
-    assert error_metadata["recovery_attempted"] is False
+    assert "recovery_attempted" not in error_metadata
 
 
-def test_unexpected_safe_execute_exception_honors_supported_replacement(monkeypatch):
-    recovery_calls = []
-    tracking_calls = []
-    events = []
-    replacement = ToolResult.completed_success(output="recovered from crash")
+def test_tool_orchestrator_has_no_harness_authored_replacement_channel():
     orchestrator = ToolOrchestrator(
         tools={"explode": ExplodingSafeExecuteTool()},
         context_manager=None,
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
-        event_sink=events.append,
     )
 
-    def recover(tool_name, params, failed_result):
-        recovery_calls.append((tool_name, params, failed_result))
-        return RecoveryDecision(
-            should_recover=True,
-            strategy="crash_replacement",
-            guidance="Use the supported replacement",
-            replacement_result=replacement,
-            replacement_params={"command": "fallback"},
-        )
-
-    monkeypatch.setattr(orchestrator.recovery_handler, "recover", recover)
-
-    execution = orchestrator.execute(ToolCall(name="explode", raw_params={"command": "pwd"}))
-
-    assert len(recovery_calls) == 1
-    tool_name, params, crashed = recovery_calls[0]
-    assert tool_name == "explode"
-    assert params == {"command": "pwd"}
-    assert crashed.invocation_status is InvocationStatus.CRASHED
-    assert crashed.operation_outcome is OperationOutcome.FAILED
-    assert execution.status == "recovered"
-    assert execution.result is replacement
-    assert execution.recovery_applied is True
-    assert execution.recovery_strategy == "crash_replacement"
-    assert execution.executed_params == {"command": "fallback"}
-    assert execution.metadata["recovery"]["success"] is True
-    assert tracking_calls == [("explode:[('command', 'pwd')]", replacement)]
-    recovery_event = next(event for event in events if event.event_type == "tool_recovery")
-    assert recovery_event.metadata["recovery_strategy"] == "crash_replacement"
-    error_event = events[-1]
-    assert error_event.event_type == "tool_error"
-    assert all(event.event_type != "tool_result" for event in events)
-    assert error_event.metadata["invocation_status"] == "crashed"
-    assert error_event.metadata["operation_outcome"] == "failed"
-    assert error_event.metadata["failure_signature"] == crashed.failure_signature
-    assert error_event.metadata["error_tail_preview"] == crashed.error_tail_preview
-    assert error_event.metadata["output_ref"] == crashed.output_ref
-    assert error_event.metadata["recovery_attempted"] is True
+    assert not hasattr(orchestrator, "recovery_handler")
 
 
 def test_event_sink_exception_does_not_abort_successful_execution():

@@ -18,6 +18,8 @@ tests/test_python_tool.py and tests/test_native_smoke_capability_gate.py).
 
 import json
 
+import pytest
+
 from test_native_smoke_capability_gate import (
     TVM_ROOT,
     junit_rules,
@@ -33,7 +35,9 @@ from test_python_tool import (
     tvm_native_smoke_rules,
 )
 
-from sag.tools.internal.python_tool import PythonTool
+from sag.tools.internal.python_tool import NATIVE_SMOKE_RECEIPT_JSON, PythonTool
+
+pytestmark = pytest.mark.usefixtures("exact_python_runner_authority")
 
 HEAD_SHA = "1b0e2c9d4f6a8b3c5d7e9f0a1b2c3d4e5f607182"
 OTHER_SHA = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c"
@@ -257,14 +261,14 @@ def test_receipt_from_another_target_sha_does_not_unlock_the_full_suite():
     assert result.metadata["collection_scope"] == "filtered"
 
 
-def test_valid_positive_receipt_on_the_current_sha_still_unlocks_the_full_suite():
+def test_unpublished_positive_receipt_on_current_sha_stays_bounded():
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
             receipt_rule(positive_receipt()),
             head_rule(),
             *tvm_native_smoke_rules("3 tests collected in 0.2s"),
-            *junit_rules(tests=357),
+            *junit_rules(tests=3),
             ("--collect-only", ok("357 tests collected in 1.2s")),
         ],
     )
@@ -272,29 +276,30 @@ def test_valid_positive_receipt_on_the_current_sha_still_unlocks_the_full_suite(
     result = PythonTool(orch).execute("test", working_directory=TVM_ROOT)
 
     assert result.succeeded is True
-    assert result.metadata["smoke_receipt_present"] is True
-    assert result.metadata["collection_scope"] == "full"
-    assert result.metadata["collected"] == 357
+    assert result.metadata["smoke_receipt_present"] is False
+    assert result.metadata["collection_scope"] == "filtered"
+    assert result.metadata["collected_after_deselection"] == 3
 
 
-def test_positive_receipt_without_target_sha_still_unlocks_and_skips_rev_parse():
-    """A receipt minted where the SHA was unavailable carries no binding — it
-    must not be rejected for a fact it never claimed, and no git command runs."""
+def test_unpublished_positive_receipt_without_target_sha_stays_bounded():
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
             receipt_rule(positive_receipt(target_sha=None)),
             *tvm_native_smoke_rules("3 tests collected in 0.2s"),
-            *junit_rules(tests=357),
+            *junit_rules(tests=3),
             ("--collect-only", ok("357 tests collected in 1.2s")),
         ],
     )
 
     result = PythonTool(orch).execute("test", working_directory=TVM_ROOT)
 
-    assert result.metadata["smoke_receipt_present"] is True
-    assert result.metadata["collection_scope"] == "full"
-    assert not any("rev-parse HEAD" in command for command in gate_commands(orch))
+    assert result.metadata["smoke_receipt_present"] is False
+    assert result.metadata["collection_scope"] == "filtered"
+    assert not any(
+        command == f"cat {NATIVE_SMOKE_RECEIPT_JSON}"
+        for command in gate_commands(orch)
+    )
 
 
 # ---------------------------------------------------------------------------

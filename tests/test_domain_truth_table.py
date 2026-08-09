@@ -21,6 +21,7 @@ from sag.agent.attempt_policy import (
     UntriedIslandsRequirement,
     untried_islands_requirement,
 )
+from sag.agent.evidence_records import frame_json_record_stream
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.phase_gates import (
     ClaimDisposition,
@@ -146,14 +147,20 @@ class DomainOrch:
 
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=None):
         self.commands.append(command)
+        if command.startswith("for file in ") and any(
+            directory in command
+            for directory in ("invocation_receipts", "evidence_assessments", "job_obligations")
+        ):
+            records = self.receipts if "invocation_receipts" in command else ()
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_json_record_stream(records),
+            }
         if REQUIREMENTS_PATH in command:
             if self.manifest is None:
                 return {"success": False, "exit_code": 1, "output": "No such file"}
             return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
-        if "invocation_receipts" in command:
-            # write_receipt persists single-line JSON, one file per invocation.
-            body = "".join(f"{json.dumps(receipt, sort_keys=True)}\n" for receipt in self.receipts)
-            return {"success": True, "exit_code": 0, "output": body}
         if "test -d" in command:
             return {"success": True, "exit_code": 0, "output": "exists"}
         return {"success": True, "exit_code": 0, "output": ""}

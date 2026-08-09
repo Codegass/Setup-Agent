@@ -1,0 +1,112 @@
+{
+  "schema_version": 2,
+  "identity_version": "module-qualified-v1",
+  "receipt_executions": [
+    {
+      "execution_id": "receipt-alpha-1#row-1",
+      "receipt_id": "receipt-alpha-1",
+      "execution_index": 1,
+      "qualifying_invocation": true,
+      "disposition": "claimed",
+      "target_sha": "fixture-target-sha",
+      "domain_id": "maven-reactor-root",
+      "module_coordinate": "com.acme:alpha",
+      "framework": "junit-jupiter",
+      "owner": "com.acme.SharedTest",
+      "test_name": "roundTrip",
+      "parameter_id": "size=1",
+      "outcome": "failed",
+      "report_path": "alpha/target/surefire-reports/TEST-com.acme.SharedTest.xml"
+    },
+    {
+      "execution_id": "receipt-alpha-2#row-1",
+      "receipt_id": "receipt-alpha-2",
+      "execution_index": 2,
+      "qualifying_invocation": true,
+      "disposition": "claimed",
+      "target_sha": "fixture-target-sha",
+      "domain_id": "maven-reactor-root",
+      "module_coordinate": "com.acme:alpha",
+      "framework": "junit-jupiter",
+      "owner": "com.acme.SharedTest",
+      "test_name": "roundTrip",
+      "parameter_id": "size=1",
+      "outcome": "passed",
+      "report_path": "alpha/target/surefire-reports/TEST-com.acme.SharedTest.xml"
+    },
+    {
+      "execution_id": "receipt-alpha-2#row-2",
+      "receipt_id": "receipt-alpha-2",
+      "execution_index": 2,
+      "qualifying_invocation": true,
+      "disposition": "claimed",
+      "target_sha": "fixture-target-sha",
+      "domain_id": "maven-reactor-root",
+      "module_coordinate": "com.acme:alpha",
+      "framework": "junit-jupiter",
+      "owner": "com.acme.SharedTest",
+      "test_name": "roundTrip",
+      "parameter_id": "size=2",
+      "outcome": "skipped",
+      "report_path": "alpha/target/surefire-reports/TEST-com.acme.SharedTest.xml"
+    },
+    {
+      "execution_id": "receipt-beta-1#row-1",
+      "receipt_id": "receipt-beta-1",
+      "execution_index": 1,
+      "qualifying_invocation": true,
+      "disposition": "claimed",
+      "target_sha": "fixture-target-sha",
+      "domain_id": "maven-reactor-root",
+      "module_coordinate": "com.acme:beta",
+      "framework": "junit-jupiter",
+      "owner": "com.acme.SharedTest",
+      "test_name": "roundTrip",
+      "parameter_id": null,
+      "outcome": "passed",
+      "report_path": "beta/target/surefire-reports/TEST-com.acme.SharedTest.xml"
+    },
+    {
+      "execution_id": "receipt-beta-1#row-1",
+      "receipt_id": "receipt-beta-1",
+      "execution_index": 1,
+      "qualifying_invocation": true,
+      "disposition": "claimed",
+      "target_sha": "fixture-target-sha",
+      "domain_id": "maven-reactor-root",
+      "module_coordinate": "com.acme:beta",
+      "framework": "junit-jupiter",
+      "owner": "com.acme.SharedTest",
+      "test_name": "roundTrip",
+      "parameter_id": null,
+      "outcome": "passed",
+      "report_path": "beta/build/duplicate-report/TEST-com.acme.SharedTest.xml"
+    }
+  ],
+  "report_observations": [
+    {
+      "observation_id": "obs-quarantined-1",
+      "disposition": "quarantined",
+      "reason": "terminal_receipt_unpersisted",
+      "report_path": "quarantine/TEST-com.acme.Quarantined.xml",
+      "outcome": "error",
+      "attributed_identity": false
+    },
+    {
+      "observation_id": "obs-unattributed-1",
+      "disposition": "unattributed",
+      "reason": "missing_receipt",
+      "report_path": "unattributed/TEST-com.acme.Unknown.xml",
+      "outcome": "passed",
+      "attributed_identity": false
+    },
+    {
+      "observation_id": "obs-stale-1",
+      "disposition": "stale",
+      "reason": "target_sha_mismatch",
+      "report_path": "stale/TEST-com.acme.Old.xml",
+      "outcome": "failed",
+      "attributed_identity": false
+    }
+  ]
+}

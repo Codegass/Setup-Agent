@@ -21,6 +21,17 @@ from types import SimpleNamespace
 from sag.agent.project_fact_projection import render_recommended_build_facts
 from sag.agent.react_engine import ReActEngine
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+from tests.container_evidence_fakes import strict_published_evidence
+
+_ATOMIC_WRITE_PREFIXES = (
+    "mkdir -p -- ",
+    ": > ",
+    "printf '%s' ",
+    "base64 --decode ",
+    "python3 -c ",
+    "rm -f -- ",
+    "mv -f -- ",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -28,7 +39,7 @@ from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 # --------------------------------------------------------------------------- #
 class FakeOrchestrator:
     """Answers `test -e` existence probes, the packaging grep, the source-dir
-    and test-dir `find`s, and the manifest heredoc write, from canned sets."""
+    and test-dir `find`s, and the atomic manifest write, from canned sets."""
 
     def __init__(
         self,
@@ -46,7 +57,13 @@ class FakeOrchestrator:
         # A `grep ... maven-publish <root>/build.gradle*` hits iff the root is in
         # this set (the live signal that an island PUBLISHES to the local repo).
         self.publish_roots = {r.rstrip("/") for r in publish_roots}
-        self.files = {}
+        self.atomic = strict_published_evidence(
+            self,
+            run_id="run-build-islands",
+            target_sha="b" * 40,
+            run_pin=False,
+        )
+        self.files = self.atomic.files
 
     @staticmethod
     def _matching(command, candidate_dirs):
@@ -61,6 +78,8 @@ class FakeOrchestrator:
         return [d for d in candidate_dirs if any(d.endswith(s) for s in suffixes)]
 
     def execute_command(self, command, **kwargs):
+        if command.startswith(_ATOMIC_WRITE_PREFIXES) or "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.atomic(command, **kwargs)
         if command.startswith("mkdir -p"):
             return {"success": True, "output": "", "exit_code": 0}
         if "<<'SAGEOF'" in command:  # heredoc manifest write

@@ -10,7 +10,8 @@ from __future__ import annotations
 import base64
 import binascii
 import shlex
-from typing import Any, Mapping, Optional
+from collections.abc import Callable
+from typing import Any, Mapping, Optional, cast
 
 _PAYLOAD_MARKER = "__SAG_FILE_BASE64__"
 _MISSING_MARKER = "__SAG_FILE_MISSING__"
@@ -18,6 +19,36 @@ _MISSING_MARKER = "__SAG_FILE_MISSING__"
 
 class ContainerFileReadError(RuntimeError):
     """The file existed (or its state was unknown) but could not be read safely."""
+
+
+def resolve_control_execute(source: Any) -> Callable[..., Any] | None:
+    """Resolve the clean host-control executor, retaining a narrow fake fallback.
+
+    A strict evidence transport must not run through the project runtime
+    environment.  Production orchestrators expose ``execute_control_command``;
+    older test doubles intentionally fall back to ``execute_command``.  Writers
+    often receive a bound ``execute_command`` callback, so its owner is checked
+    before the callback itself is accepted.
+    """
+
+    clean = getattr(source, "execute_control_command", None)
+    if callable(clean):
+        return cast(Callable[..., Any], clean)
+    owner = getattr(source, "__self__", None) if callable(source) else None
+    owner_clean = getattr(owner, "execute_control_command", None)
+    if callable(owner_clean):
+        return cast(Callable[..., Any], owner_clean)
+    if owner is not None:
+        # A bound normal executor is not a free-standing compatibility fake.
+        # Falling back to it would re-enter the project-controlled runtime
+        # overlay for evidence reads/writes merely because a caller passed the
+        # method instead of its owner.  Production owners must expose the
+        # clean control channel explicitly.
+        return None
+    execute = getattr(source, "execute_command", None)
+    if callable(execute):
+        return cast(Callable[..., Any], execute)
+    return cast(Callable[..., Any], source) if callable(source) else None
 
 
 def _command_succeeded(result: Mapping[str, Any]) -> bool:
@@ -42,15 +73,18 @@ def command_did_not_run(result: Any) -> bool:
 
 def _execute_untruncated(orchestrator: Any, command: str) -> Mapping[str, Any]:
     """Use the production no-truncation API, with a narrow test-double fallback."""
+    execute = resolve_control_execute(orchestrator)
+    if execute is None:
+        raise ContainerFileReadError("container read source is not executable")
     try:
-        result = orchestrator.execute_command(command, truncate_output=False)
+        result = execute(command, truncate_output=False)
     except TypeError as exc:
         # Several small unit-test orchestrators predate the presentation flag.
         # Production DockerOrchestrator accepts it; only fall back when Python
         # explicitly rejected that keyword.
         if "truncate_output" not in str(exc):
             raise
-        result = orchestrator.execute_command(command)
+        result = execute(command)
     if not isinstance(result, Mapping):
         raise ContainerFileReadError("container read returned a non-mapping result")
     return result
@@ -133,9 +167,22 @@ def read_container_text(
         )
         result = _execute_untruncated(orchestrator, transport)
         output = str(result.get("output") or "")
-        if output.startswith(_MISSING_MARKER) or result.get("exit_code") == 44:
+        dispatch_status = result.get("dispatch_status")
+        exit_code = result.get("exit_code")
+        if (
+            type(exit_code) is int
+            and exit_code == 44
+            and result.get("success") is False
+            and not dispatch_status
+            and output == _MISSING_MARKER
+        ):
             return None
         if output.startswith(_PAYLOAD_MARKER):
+            if not _command_succeeded(result) or dispatch_status:
+                raise ContainerFileReadError(
+                    f"lossless container read did not succeed for {path}: "
+                    f"{str(result.get('output') or '')[:120]}"
+                )
             encoded = output[len(_PAYLOAD_MARKER) :]
             try:
                 raw = base64.b64decode(encoded, validate=True)

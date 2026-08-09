@@ -86,9 +86,11 @@ def test_tool_result_preserves_assessment_after_rejected_outcome_change():
 
 
 class FakeBashOrchestrator:
-    def __init__(self, result):
+    def __init__(self, result, *, detached_handle=None):
         self.container_name = "demo-container"
         self.result = result
+        self.detached_handle = detached_handle
+        self.command_calls = []
         self.detached_calls = []
 
     def execute_command(
@@ -99,7 +101,8 @@ class FakeBashOrchestrator:
         environment=None,
         timeout=None,
     ):
-        if "test -d /workspace" in command:
+        self.command_calls.append(command)
+        if "test -d /workspace" in command or "test -d -- /workspace" in command:
             return {
                 "success": True,
                 "output": "EXISTS",
@@ -116,6 +119,8 @@ class FakeBashOrchestrator:
         self.detached_calls.append(
             {"command": command, "workdir": workdir, "environment": environment}
         )
+        if self.detached_handle is not None:
+            return dict(self.detached_handle)
         if not self.result.get("success"):
             return {
                 "started": False,
@@ -210,13 +215,42 @@ def test_bash_interactive_command_reports_pre_execution_facts():
     assert result.metadata["execution"]["timed_out"] is False
 
 
-def test_bash_background_dispatch_is_pending_and_uses_canonical_job_handle():
+def _detached_bash_handle(**overrides):
+    handle = {
+        "started": True,
+        "job_id": "bash-background",
+        "pid": 1234,
+        "pgid": 1234,
+        "process_identity_token": "a" * 64,
+        "docker_exec_id": "b" * 64,
+        "container_id": "c" * 64,
+        "terminal_authority": "docker_exec_inspect_v1",
+        "start_accepted": True,
+        "startup_identity_verified": True,
+        "pid_path": "/tmp/sag_jobs/bash-background.pid",
+        "pgid_path": "/tmp/sag_jobs/bash-background.pgid",
+        "identity_path": "/tmp/sag_jobs/bash-background.identity",
+        "log_path": "/tmp/sag_jobs/bash-background.log",
+        "exit_code_path": "/tmp/sag_jobs/bash-background.log.exit",
+        "command": "sleep 60",
+        "launch_output": "",
+        "dispatch_status": None,
+        "runner_dispatched": True,
+        "runner_dispatch_state": "accepted",
+    }
+    handle.update(overrides)
+    return handle
+
+
+def test_bash_background_dispatch_is_pending_and_preserves_accepted_handle():
+    handle = _detached_bash_handle()
     orchestrator = FakeBashOrchestrator(
         {
             "success": True,
             "output": "1234",
             "exit_code": 0,
-        }
+        },
+        detached_handle=handle,
     )
     tool = BashTool(docker_orchestrator=orchestrator)
 
@@ -226,6 +260,20 @@ def test_bash_background_dispatch_is_pending_and_uses_canonical_job_handle():
     assert result.operation_outcome.value == "unknown"
     assert result.evidence_status.value == "unknown"
     assert result.poll_ref == "job:bash-background"
+    assert result.metadata["dispatch_status"] == "running_detached"
+    assert result.metadata["runner_dispatched"] is True
+    assert result.metadata["runner_dispatch_state"] == "accepted"
+    assert result.metadata["start_accepted"] is True
+    assert result.metadata["startup_identity_verified"] is True
+    assert result.metadata["process_identity_token"] == "a" * 64
+    assert result.metadata["docker_exec_id"] == "b" * 64
+    assert result.metadata["container_id"] == "c" * 64
+    assert result.metadata["dispatch"] == handle
+    assert result.metadata["job_obligation_persisted"] is False
+    assert (
+        result.metadata["job_obligation_persistence_code"]
+        == "bash_background_evidence_boundary_unavailable"
+    )
     assert orchestrator.detached_calls == [
         {
             "command": "sleep 60",
@@ -235,14 +283,125 @@ def test_bash_background_dispatch_is_pending_and_uses_canonical_job_handle():
     ]
 
 
+def test_bash_background_cannot_claim_preexisting_report_without_frozen_boundary():
+    handle = _detached_bash_handle()
+    orchestrator = FakeBashOrchestrator(
+        {
+            "success": True,
+            "exit_code": 0,
+            "output": (
+                f"{'d' * 64}  " "/workspace/project/target/surefire-reports/TEST-preexisting.xml"
+            ),
+        },
+        detached_handle=handle,
+    )
+
+    result = BashTool(docker_orchestrator=orchestrator).execute(
+        command="sleep 60 &", working_directory="/workspace/project"
+    )
+
+    assert result.invocation_status.value == "pending"
+    assert result.metadata["job_obligation_persisted"] is False
+    assert (
+        result.metadata["job_obligation_persistence_code"]
+        == "bash_background_evidence_boundary_unavailable"
+    )
+    assert orchestrator.command_calls == ["test -d -- /workspace/project"]
+
+
+def test_bash_background_unknown_start_is_pending_without_retrying_dispatch():
+    handle = _detached_bash_handle(
+        started=False,
+        pid=None,
+        pgid=None,
+        process_identity_token="",
+        start_accepted=False,
+        startup_identity_verified=False,
+        launch_output="exec_start response lost",
+        dispatch_status="dispatch_unknown",
+        runner_dispatched=None,
+        runner_dispatch_state="unknown",
+    )
+    orchestrator = FakeBashOrchestrator(
+        {"success": False, "output": "exec_start response lost", "exit_code": -1},
+        detached_handle=handle,
+    )
+
+    result = BashTool(docker_orchestrator=orchestrator).execute(
+        command="sleep 60 &", working_directory="/workspace/project"
+    )
+
+    assert result.invocation_status.value == "pending"
+    assert result.operation_outcome.value == "unknown"
+    assert result.evidence_status.value == "unknown"
+    assert result.poll_ref == "job:bash-background"
+    assert result.error_code is None
+    assert result.metadata["dispatch_status"] == "dispatch_unknown"
+    assert result.metadata["runner_dispatched"] is None
+    assert result.metadata["runner_dispatch_state"] == "unknown"
+    assert result.metadata["start_accepted"] is False
+    assert result.metadata["startup_identity_verified"] is False
+    assert result.metadata["dispatch"] == handle
+    assert result.metadata["job_obligation_persisted"] is False
+    assert result.metadata["job_obligation_persistence_code"] == "invalid_dispatch_handle"
+    assert len(orchestrator.detached_calls) == 1
+
+
+def test_bash_background_accepted_start_with_unreadable_identity_stays_in_barrier():
+    handle = _detached_bash_handle(
+        started=False,
+        pid=None,
+        pgid=None,
+        process_identity_token="",
+        startup_identity_verified=False,
+        launch_output="startup identity probe failed",
+        dispatch_status="execution_observation_failed",
+    )
+    orchestrator = FakeBashOrchestrator(
+        {"success": False, "output": "startup identity probe failed", "exit_code": -1},
+        detached_handle=handle,
+    )
+
+    result = BashTool(docker_orchestrator=orchestrator).execute(
+        command="sleep 60 &", working_directory="/workspace/project"
+    )
+
+    assert result.invocation_status.value == "pending"
+    assert result.error_code is None
+    assert result.metadata["dispatch_status"] == "liveness_unknown_detached"
+    assert result.metadata["source_dispatch_status"] == "execution_observation_failed"
+    assert result.metadata["runner_dispatched"] is True
+    assert result.metadata["runner_dispatch_state"] == "accepted"
+    assert result.metadata["start_accepted"] is True
+    assert result.metadata["startup_identity_verified"] is False
+    assert result.metadata["dispatch"] == handle
+    assert result.metadata["job_obligation_persisted"] is False
+    assert result.metadata["job_obligation_persistence_code"] == "invalid_dispatch_handle"
+
+
 def test_bash_background_failed_start_preserves_execution_facts():
+    handle = _detached_bash_handle(
+        started=False,
+        pid=None,
+        pgid=None,
+        process_identity_token="",
+        docker_exec_id="",
+        container_id="",
+        start_accepted=False,
+        startup_identity_verified=False,
+        launch_output="permission denied",
+        dispatch_status="dispatch_failed",
+        runner_dispatched=False,
+        runner_dispatch_state="not_accepted",
+    )
     tool = BashTool(
         docker_orchestrator=FakeBashOrchestrator(
             {
                 "success": False,
                 "output": "permission denied",
                 "exit_code": 126,
-            }
+            },
+            detached_handle=handle,
         )
     )
 

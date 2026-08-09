@@ -98,7 +98,10 @@ def test_env_schema_describes_atomic_activation_default():
 
     schema = tool.get_parameter_schema()
 
-    assert schema["properties"]["activate"]["default"] is True
+    env_branch = schema["allOf"][0]
+    assert env_branch["if"]["properties"]["action"]["const"] == "env"
+    assert env_branch["then"]["properties"]["activate"]["default"] is True
+    assert "default" not in schema["properties"]["activate"]
     assert schema["properties"]["activate"]["enum"] == [True]
     assert "activate" in schema["properties"]["executable"]["description"]
     assert "requirement" in schema["properties"]

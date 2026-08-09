@@ -21,11 +21,12 @@ import hashlib
 import json
 import shlex
 
+from test_container_io import FakeContainer
 from test_python_tool import fail, ok
 
 from sag.agent import document_map
+from sag.agent.evidence_publications import DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
 from sag.agent.document_map import (
-    DOCUMENT_MAP_HEREDOC,
     DOCUMENT_MAP_PATH,
     GENERATED_SEGMENTS,
     MAX_DEPTH,
@@ -151,6 +152,8 @@ class FakeTree:
         self.realpath_ok = realpath_ok
         self.commands = []
         self.persisted = {}
+        self.atomic = FakeContainer()
+        self.atomic.files = self.persisted
 
     # -- helpers ---------------------------------------------------------
     def relative(self, path):
@@ -167,6 +170,23 @@ class FakeTree:
     # -- transport -------------------------------------------------------
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        tokens = (
+            shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
+        )
+        atomic_command = (
+            tokens[:3] == ["mkdir", "-p", "--"]
+            or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+            or tokens[:2] == ["base64", "--decode"]
+            or tokens[:3] == ["mv", "-f", "--"]
+            or (
+                tokens[:2] == ["python3", "-c"]
+                and ("hashlib.sha256" in tokens[2] or "json.load" in tokens[2])
+            )
+        )
+        if atomic_command:
+            if not self.writable and tokens[:2] != ["rm", "-f"]:
+                return fail("Read-only file system")
+            return self.atomic.execute_command(command)
         if "rev-parse HEAD" in command:
             return ok(self.sha) if self.sha else fail("")
         if " find . " in command:
@@ -185,31 +205,6 @@ class FakeTree:
             if relative in self.unreadable or relative not in self.files:
                 return fail(f"head: {path}: No such file or directory")
             return ok(self.files[relative][: int(arguments[2])])
-        if ": > " in command and command.split(": > ", 1)[1].split()[0].endswith(".b64"):
-            # streamed write, step 1: reset the base64 staging file
-            if not self.writable:
-                return fail("Read-only file system")
-            self._staged = {"path": command.split(": > ", 1)[1].split()[0], "chunks": []}
-            return ok("")
-        if "cat >> " in command and "\n" in command:
-            # streamed write, step 2..n: append one bounded base64 chunk
-            if not self.writable:
-                return fail("Read-only file system")
-            header, _, rest = command.partition("\n")
-            heredoc = header.rsplit("<<'", 1)[1].split("'", 1)[0]
-            chunk, _, _ = rest.partition(f"\n{heredoc}")
-            getattr(self, "_staged", {"chunks": []})["chunks"].append(chunk)
-            return ok("")
-        if "base64 -d " in command and "mv -f " in command:
-            # streamed write, final step: decode + atomic move
-            if not self.writable:
-                return fail("Read-only file system")
-            import base64 as _b64
-
-            staged = getattr(self, "_staged", {"chunks": []})
-            body = _b64.b64decode("".join(staged["chunks"]).encode("ascii")).decode("utf-8")
-            self.persisted[command.rsplit("mv -f ", 1)[1].split()[1]] = body
-            return ok("")
         if "mv -f " in command and "\n" in command:
             if not self.writable:
                 return fail("Read-only file system")
@@ -956,13 +951,17 @@ def test_write_document_map_persists_atomically_to_the_pinned_path():
 
     assert write_document_map(execute, result) is True
 
-    setup = [command for command in execute.commands if ": > " in command][-1]
-    assert f"mkdir -p {shlex.quote('/workspace/.setup_agent')}" in setup
-    appends = [command for command in execute.commands if "cat >> " in command]
-    assert appends and all(DOCUMENT_MAP_HEREDOC in command for command in appends)
-    finish = [command for command in execute.commands if "base64 -d " in command][-1]
-    assert f"{DOCUMENT_MAP_PATH}.tmp" in finish
-    assert finish.rsplit("mv -f ", 1)[1].split()[1] == DOCUMENT_MAP_PATH
+    assert any(command == "mkdir -p -- /workspace/.setup_agent" for command in execute.commands)
+    appends = [command for command in execute.commands if command.startswith("printf '%s'")]
+    assert appends
+    compare = [
+        command
+        for command in execute.commands
+        if command.startswith("python3 -c ") and "fcntl.flock" in command
+    ][-1]
+    assert shlex.split(compare)[3] == DOCUMENT_MAP_PATH
+    assert max(map(len, execute.commands)) <= 60200
+    assert not any(path.endswith(".tmp") for path in execute.persisted)
 
 
 def test_the_persisted_body_is_the_map_its_fingerprint_and_its_conflicts():
@@ -1018,6 +1017,40 @@ def test_write_document_map_accepts_already_serialized_entries():
     assert json.loads(execute.persisted[DOCUMENT_MAP_PATH])["entries"] == plain["entries"]
 
 
+def test_document_map_refuses_tampered_base_after_a_host_revision(
+    bind_host_evidence_publication_authority,
+):
+    execute = FakeTree(files={"README.md": README})
+    first = discover_document_map(execute, ROOT)
+    assert write_document_map(execute, first) is True
+    first_head = bind_host_evidence_publication_authority.latest_head(
+        DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
+    )
+    execute.persisted[DOCUMENT_MAP_PATH] = '{"schema_version":1,"entries":[]}'
+
+    assert write_document_map(execute, {"entries": [], "partial_map": []}) is False
+    assert (
+        bind_host_evidence_publication_authority.latest_head(DOCUMENT_MAP_LOGICAL_ARTIFACT_ID)
+        == first_head
+    )
+
+
+def test_document_map_completes_host_publication_for_exact_recomputed_crash_bytes(
+    bind_host_evidence_publication_authority,
+):
+    execute = FakeTree(files={"README.md": README})
+    first = discover_document_map(execute, ROOT)
+    assert write_document_map(execute, first) is True
+    desired = {"entries": [], "partial_map": []}
+    desired_body = json.dumps(document_map.document_map_payload(desired), sort_keys=True)
+    execute.persisted[DOCUMENT_MAP_PATH] = desired_body
+
+    assert write_document_map(execute, desired) is True
+    head = bind_host_evidence_publication_authority.latest_head(DOCUMENT_MAP_LOGICAL_ARTIFACT_ID)
+    assert head.revision == 2
+    assert head.raw_sha256 == hashlib.sha256(desired_body.encode()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # transport failure
 # ---------------------------------------------------------------------------
@@ -1071,8 +1104,6 @@ def test_a_map_larger_than_one_argument_streams_in_bounded_chunks():
     """Live p6v-bigtop-r2: the whole map as ONE heredoc argument exceeded the
     kernel's ~128KB per-argument bound and the write failed silently. Large
     bodies must stream; every append must stay under the chunk bound."""
-    from sag.agent.document_map import WRITE_CHUNK_CHARS
-
     big_entries = [
         {
             "entry_id": f"doc-{index:012d}",
@@ -1100,10 +1131,10 @@ def test_a_map_larger_than_one_argument_streams_in_bounded_chunks():
 
     assert write_document_map(execute, plain) is True
 
-    appends = [command for command in execute.commands if "cat >> " in command]
+    appends = [command for command in execute.commands if command.startswith("printf '%s'")]
     assert len(appends) >= 2  # genuinely streamed
     for command in appends:
-        chunk = command.partition("\n")[2].rpartition("\n")[0]
-        assert len(chunk) <= WRITE_CHUNK_CHARS
+        assert len(shlex.split(command)[2]) <= 60_000
+        assert len(command) <= 60_200
     body = json.loads(execute.persisted[DOCUMENT_MAP_PATH])
     assert body["entries"] == big_entries

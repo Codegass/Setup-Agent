@@ -25,19 +25,40 @@ by the recorded-session regressions at the bottom of this file.
 """
 
 import glob
+import hashlib
 import importlib.util
 import json
 import os
 
 import pytest
 
-from sag.agent.control_events import action_envelope_sha256
+from container_evidence_fakes import canonical_json, complete_run_pin
+from sag.agent.action_intents import action_fingerprint
+from sag.agent.control_events import ControlEventSink, action_envelope_sha256
 from sag.agent.evidence_assessments import ReceiptAssessment
-from sag.agent.invocation_contracts import build_contract
+from sag.agent.evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+)
+from sag.agent.invocation_contracts import ARGV_EXECUTION_BINDING, build_contract
+from sag.agent.verdict_finalizer import RunVerdictSnapshot
 
 SMOKE_PATH = "tests/python/all-platform-minimal-test"
 SMOKE_COMMAND = f"/workspace/tvm/.venv/bin/python -m pytest {SMOKE_PATH} --maxfail=1"
 FULL_COMMAND = "/workspace/tvm/.venv/bin/python -m pytest"
+
+
+class _StableArchiveStore:
+    """One deterministic immutable-store identity per synthetic archive."""
+
+    def __init__(self, archive_root):
+        digest = hashlib.sha256(str(archive_root.resolve()).encode("utf-8")).hexdigest()
+        self.identity = f"test-native-policy-archive:{digest}"
+
+    def evidence_store_identity(self):
+        return self.identity
 
 
 def load_verifier_module():
@@ -130,9 +151,95 @@ def write_session(tmp_path, attempts, *, receipt=None, verdict=None):
     return session
 
 
+def write_authorized_tvm_session(
+    tmp_path,
+    attempts,
+    *,
+    receipt=None,
+    run_id="native-policy-run",
+):
+    """Materialize one strict archived run with host-rooted publications."""
+
+    session = tmp_path / "authorized-session"
+    control = session / ".setup_agent"
+    control.mkdir(parents=True, exist_ok=True)
+    pin_raw = canonical_json(complete_run_pin(run_id, "a" * 40)).encode("utf-8")
+    (session / "run-pin.json").write_bytes(pin_raw)
+    (control / "run-pin.json").write_bytes(pin_raw)
+    snapshot = RunVerdictSnapshot(
+        run_id=run_id,
+        finalized_at="2026-08-09T06:00:00Z",
+        verdict="failed",
+    )
+    verdict_raw = snapshot.model_dump_json().encode("utf-8")
+    (control / "verdict.json").write_bytes(verdict_raw)
+
+    mirror_path = control / "control_events.jsonl"
+
+    def mirror(line):
+        with mirror_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    sink = ControlEventSink(session / "control_events.jsonl", mirror=mirror)
+    authority = EvidencePublicationAuthority.for_live_run(run_id=run_id, sink=sink)
+    authority.bind_store(_StableArchiveStore(session))
+    authority.publish_revision(
+        record_kind="run_pin",
+        record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        raw=pin_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
+    for index, meta in enumerate(attempts, 1):
+        envelope_id = f"env-{index}"
+        exact_params = {"action": "test"}
+        sink.emit(
+            "action_envelope",
+            {
+                "envelope_id": envelope_id,
+                "tool_call_id": f"call-{index}",
+                "tool": "build",
+                "exact_params": exact_params,
+                "envelope_sha256": action_envelope_sha256(
+                    tool_call_id=f"call-{index}",
+                    tool="build",
+                    exact_params=exact_params,
+                ),
+            },
+        )
+        sink.emit(
+            "tool_result",
+            {
+                "envelope_id": envelope_id,
+                "execution_id": f"exec-{index}",
+                "tool": "build",
+                "params": exact_params,
+                "scope": "test_runtime",
+                "roles": ["test"],
+                "result": {
+                    "operation_outcome": "success",
+                    "metadata": dict(meta),
+                },
+            },
+        )
+    authority.publish_revision(
+        record_kind="verdict",
+        record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        raw=verdict_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
+    if receipt is not None:
+        (control / "native_smoke_receipt.json").write_text(
+            json.dumps(receipt),
+            encoding="utf-8",
+        )
+    return session
+
+
 def run_tvm(session):
     module = load_verifier_module()
-    verifier = module.Verifier(str(session))
+    verifier = module.Verifier(str(session), forensic=True)
     verifier.assert_tvm()
     return verifier
 
@@ -201,11 +308,11 @@ def test_all_skipped_with_failures_is_not_subject_to_the_negative(tmp_path):
     assert not named_failure(verifier, "tvm.attempt1.no_receipt_on_all_skipped")
 
 
-# -- 2. session-level receipt positive evidence -----------------------------
+# -- 2. raw native-smoke sidecars are forensic and inert --------------------
 
 
-def test_persisted_receipt_without_passed_stat_fails(tmp_path):
-    """The live TVM receipt shape: executed 3, skipped 3, no `passed` key."""
+def test_persisted_receipt_without_passed_stat_is_inert(tmp_path):
+    """The raw sidecar cannot become permission by merely existing."""
     session = write_session(
         tmp_path,
         [attempt_meta(tests=3, skipped=3)],
@@ -219,10 +326,10 @@ def test_persisted_receipt_without_passed_stat_fails(tmp_path):
 
     verifier = run_tvm(session)
 
-    assert named_failure(verifier, "tvm.receipt.positive_evidence")
+    assert not stated(verifier, "tvm.receipt.positive_evidence")
 
 
-def test_persisted_receipt_with_zero_passed_fails(tmp_path):
+def test_persisted_receipt_with_zero_passed_is_inert(tmp_path):
     session = write_session(
         tmp_path,
         [attempt_meta(tests=3, skipped=3)],
@@ -231,10 +338,10 @@ def test_persisted_receipt_with_zero_passed_fails(tmp_path):
 
     verifier = run_tvm(session)
 
-    assert named_failure(verifier, "tvm.receipt.positive_evidence")
+    assert not stated(verifier, "tvm.receipt.positive_evidence")
 
 
-def test_persisted_receipt_with_positive_passed_passes(tmp_path):
+def test_persisted_receipt_with_positive_passed_is_not_a_permission(tmp_path):
     session = write_session(
         tmp_path,
         [attempt_meta(tests=3, skipped=2, receipt_written=True)],
@@ -243,7 +350,7 @@ def test_persisted_receipt_with_positive_passed_passes(tmp_path):
 
     verifier = run_tvm(session)
 
-    assert "tvm.receipt.positive_evidence" in verifier.passes
+    assert not stated(verifier, "tvm.receipt.positive_evidence")
     assert verifier.failures == []
 
 
@@ -254,6 +361,105 @@ def test_absent_receipt_file_asserts_nothing(tmp_path):
 
     assert not any(name == "tvm.receipt.positive_evidence" for name in verifier.passes)
     assert not named_failure(verifier, "tvm.receipt.positive_evidence")
+
+
+def test_strict_verifier_accepts_one_host_authorized_archived_run(tmp_path):
+    module = load_verifier_module()
+    session = write_authorized_tvm_session(
+        tmp_path,
+        [attempt_meta(tests=3, skipped=2, receipt_written=True)],
+    )
+
+    verifier = module.Verifier(str(session))
+    verifier.assert_tvm()
+
+    assert verifier.failures == []
+    assert "tvm.pytest.attempted" in verifier.passes
+
+
+def test_raw_or_future_smoke_sidecar_cannot_unlock_a_full_attempt(tmp_path):
+    module = load_verifier_module()
+    session = write_authorized_tvm_session(
+        tmp_path,
+        [attempt_meta(scope="full", command=FULL_COMMAND, tests=900)],
+        receipt={
+            "attempt": 99,
+            "project_root": "/workspace/future",
+            "stats": {"passed": 900},
+        },
+    )
+
+    verifier = module.Verifier(str(session))
+    verifier.assert_tvm()
+
+    assert named_failure(verifier, "tvm.attempt1.scope.filtered")
+    assert not any("tvm.receipt.positive_evidence" in item for item in verifier.passes)
+    assert not named_failure(verifier, "tvm.receipt.positive_evidence")
+
+
+def test_strict_verifier_rejects_mirror_only_events(tmp_path):
+    module = load_verifier_module()
+    session = write_authorized_tvm_session(
+        tmp_path,
+        [attempt_meta(tests=3, skipped=2, receipt_written=True)],
+    )
+    (session / "control_events.jsonl").unlink()
+
+    with pytest.raises(module.VerificationError, match="host control event stream"):
+        module.Verifier(str(session))
+
+
+def test_strict_verifier_rejects_tampered_or_foreign_verdicts(tmp_path):
+    module = load_verifier_module()
+    session = write_authorized_tvm_session(
+        tmp_path,
+        [attempt_meta(tests=3, skipped=2, receipt_written=True)],
+    )
+    path = session / ".setup_agent" / "verdict.json"
+    snapshot = RunVerdictSnapshot.model_validate_json(path.read_bytes())
+    path.write_text(
+        snapshot.model_copy(update={"finalized_at": "2026-08-09T06:00:01Z"}).model_dump_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(module.VerificationError, match="current host publication"):
+        module.Verifier(str(session))
+
+    path.write_text(
+        snapshot.model_copy(update={"run_id": "foreign-run"}).model_dump_json(),
+        encoding="utf-8",
+    )
+    with pytest.raises(module.VerificationError, match="run_id disagrees"):
+        module.Verifier(str(session))
+
+
+def test_strict_verifier_rejects_deleted_verdict_despite_root_raw_copy(tmp_path):
+    module = load_verifier_module()
+    session = write_authorized_tvm_session(
+        tmp_path,
+        [attempt_meta(tests=3, skipped=2, receipt_written=True)],
+    )
+    path = session / ".setup_agent" / "verdict.json"
+    (session / "verdict.json").write_bytes(path.read_bytes())
+    path.unlink()
+
+    with pytest.raises(module.VerificationError, match="container verdict mirror"):
+        module.Verifier(str(session))
+
+
+def test_acceptance_cli_has_no_forensic_fallback(tmp_path, monkeypatch, capsys):
+    module = load_verifier_module()
+    session = write_session(
+        tmp_path,
+        [attempt_meta(tests=3, skipped=2, receipt_written=True)],
+    )
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        ["verify_native_test_policy.py", str(session), "--profile", "tvm"],
+    )
+
+    assert module.main() == 1
+    assert "FAIL archive.authority" in capsys.readouterr().out
 
 
 # -- 3. receipt_minted tracking requires positive junit evidence ------------
@@ -318,16 +524,30 @@ NO_DOCUMENT_MAP = object()
 
 def make_contract(*, envelope_id=ENVELOPE, argv="--fail-at-end verify", **overrides):
     """One frozen contract, hashed by the module that owns the formula."""
-    contract = build_contract(
+    params = {"action": "test"}
+    domain_id = "test:verifier-fixture"
+    values = dict(
+        run_id="run-verifier-fixture",
         envelope_id=envelope_id,
         tool="build",
-        params={"action": "test"},
+        params=params,
+        effective_tool="maven",
         effective_action="verify",
         expected_cwd=PROJECT,
         expected_argv=argv,
+        execution_binding=ARGV_EXECUTION_BINDING,
+        intent_source="controller",
+        intent_id=f"intent-{envelope_id}",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
     )
-    contract.update(overrides)
-    return contract
+    values.update(overrides)
+    return build_contract(**values)
 
 
 def make_receipt(receipt_id, *, contract=None, outcome="completed", **overrides):
@@ -417,7 +637,7 @@ DOCUMENT_MAP = {"document_map_fingerprint": "a" * 64, "entries": [], "partial_ma
 
 def run_assertions(session, *names):
     module = load_verifier_module()
-    verifier = module.Verifier(str(session))
+    verifier = module.Verifier(str(session), forensic=True)
     for name in names:
         getattr(verifier, name)()
     return verifier
@@ -679,7 +899,7 @@ LIVE_LOGS = os.path.join(
 )
 LIVE_TVM = os.path.join(LIVE_LOGS, "session_20260726_153134_67903")
 
-# The four locked Plan 5 profiles (plan §Stage F "STILL 6/10/10/10"). None of
+# The four locked Plan 5 profiles. None of
 # them froze a contract, so every Plan 6 assertion must stay silent on all four.
 PLAN5_PROFILES = (
     ("cli", "session_20260726_192837_88194", 6),
@@ -692,13 +912,14 @@ PLAN6_ASSERTIONS = ("contracts.chain", "evidence.assessments_present", "survey.d
 
 
 @pytest.mark.skipif(not os.path.isdir(LIVE_TVM), reason="recorded TVM session not present")
-def test_live_tvm_session_now_fails_on_the_vacuous_receipt():
+def test_live_tvm_session_treats_the_vacuous_sidecar_as_inert():
     module = load_verifier_module()
-    verifier = module.Verifier(LIVE_TVM)
+    verifier = module.Verifier(LIVE_TVM, forensic=True)
     verifier.assert_pairing_and_hashes()
     verifier.assert_tvm()
 
-    assert named_failure(verifier, "tvm.receipt.positive_evidence")
+    assert not stated(verifier, "tvm.receipt.positive_evidence")
+    assert named_failure(verifier, "tvm.attempt1.no_receipt_on_all_skipped")
     for name in (
         "pairing.exact",
         "envelope.hashes",
@@ -715,18 +936,18 @@ def test_live_tvm_session_now_fails_on_the_vacuous_receipt():
 def test_plan5_recorded_profiles_keep_their_exact_assertion_sets(
     profile, session_name, expected_passes
 ):
-    """The locked 6/10/10/10, re-graded by the Plan 6 verifier.
+    """The locked profiles, inspected explicitly as legacy forensic data.
 
     These four recordings predate contracts, so arming the new assertions must
-    not add a single pass or failure to any of them: the counts below are the
-    Plan 5 numbers, unchanged, and the Plan 6 names appear nowhere.
+    not add a pass or failure to any of them. These two TVM recordings never
+    carried a positive raw-sidecar assertion, so their count remains 10.
     """
     session = os.path.join(LIVE_LOGS, session_name)
     if not os.path.isdir(session):
         pytest.skip(f"recorded session {session_name} not present")
 
     module = load_verifier_module()
-    verifier = module.Verifier(session)
+    verifier = module.Verifier(session, forensic=True)
     verifier.assert_pairing_and_hashes()
     verifier.assert_receipts_immutable()
     verifier.assert_contract_chain()

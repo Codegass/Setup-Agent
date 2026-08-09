@@ -8,9 +8,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
-from sag.agent.claim_records import CLAIM_DIR
+from sag.agent.action_intents import bounded_exact_params
 from sag.agent.evidence_assessments import (
-    ASSESSMENT_DIR,
     CAPABILITY_PREFIX,
     ControlAssessment,
     assess_dispatch,
@@ -19,29 +18,35 @@ from sag.agent.evidence_assessments import (
     write_assessment,
 )
 from sag.agent.invocation_contracts import (
+    CONTRACT_AUTHORITY_MISSING,
     CONTRACT_DIR,
     CONTRACT_PERSIST_FAILED,
+    authorized_facade_envelope_id,
     current_action_context,
     dispatch_contract,
     freeze_contract,
-    unrecorded_envelope_id,
 )
-from sag.agent.repair_contracts import read_records
-from sag.agent.retry_authority import (
-    RETRY_WITHOUT_DELTA,
-    RETRY_WITHOUT_DELTA_CODE,
-    blocking_entry,
-    candidate_contract,
-    read_ledger,
+from sag.agent.invocation_receipts import (
+    active_receipt_run_id,
+    nearest_domain_fact_epoch,
+    nearest_domain_root,
+    producer_observations_sha256,
+    python_import_targets,
 )
+from sag.agent.invocation_receipts import target_sha as probe_target_sha
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
+from sag.runtime.env_overlay import (
+    RUNTIME_REQUIREMENT_CONFLICT,
+    EnvOverlayStore,
+)
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.internal.build_preflight import (
-    JdkPreflight,
     REQUIREMENTS_PATH,
+    JdkPreflight,
     active_java_major,
+    active_java_runtime,
     classify_version_error,
-    read_build_requirements,
+    read_live_build_requirements,
 )
 
 from .backends import (
@@ -90,24 +95,18 @@ NATIVE_DEFINITIONS_INCONSISTENT_CODE = "native_definitions_inconsistent"
 NATIVE_SYSTEM_UNSUPPORTED = "NATIVE_SYSTEM_UNSUPPORTED"
 NATIVE_SYSTEM_UNSUPPORTED_CODE = "native_system_unsupported"
 
-# --- claim-backed exact pins on the deps verb (plan §Stage E item 3) --------
+# --- direct Python dependency targets remain disabled ----------------------
 PIN_WITHOUT_PROVENANCE = "PIN_WITHOUT_PROVENANCE"
 PIN_WITHOUT_PROVENANCE_CODE = "pin_without_provenance"
-# `pkg==literal` and nothing else. A range, an extra, a flag or a URL is not an
-# exact pin, and the only args this verb accepts are exact pins a claim states.
-EXACT_PIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9.*+!_-]*$")
-# The claim scopes whose typed_value may state a native definition. `env`
-# claims carry all four (a CI `CMAKE_ARGS` assignment, a `-DUSE_X=ON` inside
-# it, `set(USE_X ...)` and `option(USE_X ...)`), and nothing else does.
-NATIVE_CLAIM_SCOPES = ("environment", "cmake_definition", "cmake_set", "cmake_option")
-
 # The edge statuses that lock a consumer, worst first. `compatible` unlocks and
 # `not_applicable` disposes, so neither appears here.
 _EDGE_REFUSALS = {
     "version_incompatible": ("DOMAIN_EDGE_BLOCKED", "domain_edge_blocked"),
     "unverified": ("DOMAIN_EDGE_UNVERIFIED", "domain_edge_unverified"),
 }
-_SEALED_CLAUSE = "this consumer is sealed blocked; record the mismatch, do not silently alias"
+RUNTIME_REQUIREMENT_STATE_UNAVAILABLE = "java_runtime_requirement_state_unavailable"
+BUILD_PARAMETER_INVALID = "BUILD_PARAMETER_INVALID"
+BUILD_REQUIREMENTS_UNAVAILABLE = "BUILD_REQUIREMENTS_UNAVAILABLE"
 
 
 def _absolute_root(value: Any) -> Optional[str]:
@@ -139,6 +138,66 @@ def _manifest_domain_edges(requirements: Mapping[str, Any]) -> List[Mapping[str,
     return [item for item in raw if isinstance(item, Mapping)]
 
 
+def _runtime_domain_scope(
+    requirements: Mapping[str, Any],
+    working_directory: str,
+) -> Dict[str, str]:
+    """Exact dynamic-runtime scope; nearest surveyed domain wins.
+
+    This mirrors the contract/receipt domain lookup but always names a root:
+    a survey with no domain projection scopes the runtime to the invocation's
+    own root instead of granting a checkout-wide default.
+    """
+    directory = _absolute_root(working_directory)
+    if not directory:
+        return {}
+    best: Optional[Mapping[str, Any]] = None
+    best_root = ""
+    facts = requirements.get("domain_facts") if isinstance(requirements, Mapping) else None
+    for fact in facts if isinstance(facts, (list, tuple)) else ():
+        if not isinstance(fact, Mapping):
+            continue
+        root = _absolute_root(fact.get("root"))
+        if not root or not _is_contained(directory, root):
+            continue
+        if len(root) >= len(best_root):
+            best, best_root = fact, root
+    scope = {"domain_root": best_root or directory}
+    domain_id = str((best or {}).get("domain_id") or "").strip()
+    if domain_id:
+        scope["domain_id"] = domain_id
+    return scope
+
+
+def _effective_jdk_binding(
+    resolution: Mapping[str, Any],
+    outcome: Any,
+) -> Optional[Dict[str, Any]]:
+    """The runtime a dispatch will see plus why its requirement won."""
+    required = str(resolution.get("required_major") or "").strip()
+    active = str(getattr(outcome, "active_version", None) or "").strip()
+    authority = str(resolution.get("authority") or "").strip()
+    if not any((required, active, authority)):
+        return None
+    binding: Dict[str, Any] = {}
+    if active:
+        binding["major"] = active
+    if required:
+        binding["requirement_major"] = required
+    if authority:
+        binding["requirement_authority"] = authority
+    provenance = resolution.get("provenance")
+    if isinstance(provenance, Mapping) and provenance:
+        binding["provenance"] = dict(provenance)
+    elif active and not required:
+        # No requirement was asserted, but a registered runtime made the
+        # preflight probe the dispatch environment.  State that observation's
+        # source instead of emitting an unprovenanced effective major.
+        binding["runtime_authority"] = "dispatch_probe"
+        binding["provenance"] = {"source": "java_runtime_probe"}
+    return binding
+
+
 class BuildTool(BaseTool):
     def __init__(
         self,
@@ -151,14 +210,11 @@ class BuildTool(BaseTool):
         super().__init__(
             name="build",
             description=(
-                "Build the project: action = deps | compile | test | package. "
-                "The build system (maven/gradle/python) is auto-selected from project files, "
-                "and the CORRECT toolchain (registered Maven/JDK versions) is resolved "
-                "automatically — bash mvn/gradle uses the stale system PATH and often picks "
-                "the wrong version, even when project docs show a raw command. "
-                "python: deps installs into ./.venv via the project's own tool "
-                "(poetry/pipenv/pip ladder); test runs pytest once with JUnit XML. "
-                "Long builds run detached and hand back a log ref — never killed."
+                "Project build runner facade: action = deps | compile | test | package. "
+                "It detects maven, gradle, or python project markers, resolves the registered "
+                "toolchain, and records each dispatched runner in a durable invocation receipt. "
+                "Python deps uses the project's installer and ./.venv; Python test records JUnit "
+                "XML. Long-running dispatches return a controller-owned job reference."
             ),
         )
         self.docker_orchestrator = docker_orchestrator
@@ -170,6 +226,62 @@ class BuildTool(BaseTool):
             self._backends["gradle"] = GradleBackend(gradle_tool)
         if python_tool is not None:
             self._backends["python"] = PythonBackend(python_tool)
+
+    @staticmethod
+    def _public_parameter_problem(
+        *,
+        verb: str,
+        args: Optional[str],
+        timeout: Optional[int],
+        maven_version_requirement: Optional[str],
+        features: Optional[Sequence[str]],
+        definitions: Optional[Mapping[str, str]],
+    ) -> Optional[str]:
+        """Return the first public parameter no selected operation can consume.
+
+        This is deliberately independent of project discovery, so invalid
+        model input cannot trigger even a marker probe. Ecosystem-specific
+        validation follows immediately after the one necessary marker read.
+        """
+
+        if timeout is not None and (type(timeout) is not int or timeout <= 0):
+            return "timeout must be a positive integer (boolean is not an integer timeout)"
+        if args is not None and (
+            not isinstance(args, str) or not args.strip() or args != args.strip()
+        ):
+            return "args must be omitted or canonical non-empty text"
+        if verb != "native" and (features is not None or definitions is not None):
+            return "features and definitions are consumed only by action='native'"
+        if maven_version_requirement is not None and (
+            not isinstance(maven_version_requirement, str)
+            or not maven_version_requirement.strip()
+            or maven_version_requirement != maven_version_requirement.strip()
+        ):
+            return "maven_version_requirement must be omitted or canonical non-empty text"
+        return None
+
+    @staticmethod
+    def _parameter_refusal(
+        *,
+        detail: str,
+        verb: str,
+        working_directory: str,
+        system: Optional[str] = None,
+    ) -> ToolResult:
+        facts: Dict[str, Any] = {
+            "requested_action": verb,
+            "working_directory": working_directory,
+        }
+        if system:
+            facts["system"] = system
+        return ToolResult.completed_failure(
+            output=f"[build parameter] {detail}; no project runner was dispatched",
+            error=detail,
+            error_code=BUILD_PARAMETER_INVALID,
+            facts=facts,
+            metadata={"runner_dispatched": False},
+            suggestions=["Submit only parameters consumed by the selected public action"],
+        )
 
     def execute(
         self,
@@ -189,40 +301,121 @@ class BuildTool(BaseTool):
                 suggestions=[f"Use action= {' | '.join(_ACTIONS)}"],
             )
 
-        # Whether the caller scoped this invocation itself. PR #12's
-        # orchestration layer owns working-directory injection, so the facade
-        # never re-targets; explicitness only gates the [scope] warning below.
+        # Contract authority is checked before marker detection, manifest
+        # reads, native/pin gates, toolchain preflight or backend
+        # materialization. The facade may use a unique unrecorded identity only
+        # for a sinkless non-repair engine intent; empty scope, active repair,
+        # and a live control recorder all fail closed with zero runner calls.
+        scope = current_action_context()
+        envelope_id = authorized_facade_envelope_id(scope)
+        if envelope_id is None:
+            return ToolResult.completed_failure(
+                output=(
+                    "[contract] this build call has no engine-owned action envelope "
+                    "or authorized sinkless intent; no discovery, preflight or runner "
+                    "was dispatched"
+                ),
+                error="invocation contract authority missing",
+                error_code=CONTRACT_AUTHORITY_MISSING,
+                facts={
+                    "requested_action": verb,
+                    "working_directory": working_directory,
+                },
+                metadata={"runner_dispatched": False},
+            )
+
+        # The normalizer has already materialized schema defaults before the
+        # engine minted ActionIntent. Reconstruct that exact public call from
+        # this Python invocation and require byte-for-byte JSON equality with
+        # the engine-owned scope before even probing a build marker. The facade
+        # cannot silently add seven optional nulls or freeze a nearby call.
+        actual_public_params: Dict[str, Any] = {
+            "action": action,
+            "working_directory": working_directory,
+        }
+        for key, value in (
+            ("args", args),
+            ("timeout", timeout),
+            ("maven_version_requirement", maven_version_requirement),
+            ("features", list(features) if features is not None else None),
+            ("definitions", dict(definitions) if definitions is not None else None),
+        ):
+            # Preserve the engine-owned exact shape: a normalizer may retain
+            # an explicit JSON null, while a genuinely absent default remains
+            # absent. Non-null runtime values can never be omitted.
+            if value is not None or key in (scope.intent_exact_params or {}):
+                actual_public_params[key] = value
+        try:
+            actual_public_params = bounded_exact_params(actual_public_params)
+        except (TypeError, ValueError):
+            actual_public_params = {}
+        if actual_public_params != scope.intent_exact_params:
+            return ToolResult.completed_failure(
+                output=(
+                    "[contract] the BuildTool invocation differs from its engine-owned "
+                    "ActionIntent; no discovery, preflight or runner was dispatched"
+                ),
+                error="invocation contract authority mismatch",
+                error_code=CONTRACT_AUTHORITY_MISSING,
+                facts={"requested_action": verb, "working_directory": working_directory},
+                metadata={"runner_dispatched": False},
+            )
+
+        parameter_problem = self._public_parameter_problem(
+            verb=verb,
+            args=args,
+            timeout=timeout,
+            maven_version_requirement=maven_version_requirement,
+            features=features,
+            definitions=definitions,
+        )
+        if parameter_problem:
+            return self._parameter_refusal(
+                detail=parameter_problem,
+                verb=verb,
+                working_directory=working_directory,
+            )
+
+        # Whether the caller scoped this invocation itself. The normalized
+        # working directory is already frozen model intent; the facade never
+        # replaces it with a project-name-derived path.
         explicitly_scoped = working_directory not in (None, "", "/workspace")
-        # The call AS SUBMITTED. The facade may re-target the working directory
-        # below; the contract records both, because a normalization the caller
-        # never asked for is exactly the kind of fact §C3 keeps separate.
+        # The call AS SUBMITTED. Contract cwd and runner cwd remain identical.
         # `provenance` is deliberately NOT a parameter here (spec §C8): the
         # supporting claim ids are looked up from stored evidence, so nothing
         # the model writes can appear in them.
-        requested_call_params = {
-            "action": verb,
-            "args": args,
-            "working_directory": working_directory,
-            "timeout": timeout,
-            "maven_version_requirement": maven_version_requirement,
-            "features": list(features) if features is not None else None,
-            "definitions": dict(definitions) if definitions is not None else None,
-        }
+        requested_call_params = dict(scope.intent_exact_params)
+
+        # Every routing decision below (ecosystem, domain edge, island goal,
+        # JDK and the contract pins themselves) must descend from the exact
+        # host-published manifest revision. A readable container mirror is
+        # forensic data only: accepting it here would let a tampered manifest
+        # mint a fresh, apparently-authoritative invocation contract.
+        manifest_read = read_live_build_requirements(self.docker_orchestrator)
+        if (
+            not manifest_read.complete
+            or manifest_read.conflict is not None
+            or manifest_read.payload is None
+        ):
+            conflict = manifest_read.conflict or "absent"
+            return ToolResult.completed_failure(
+                output=(
+                    "[evidence] build requirements are not a complete current "
+                    "host-published revision; no project probe, preflight or runner "
+                    "was dispatched"
+                ),
+                error="live build requirements unavailable",
+                error_code=BUILD_REQUIREMENTS_UNAVAILABLE,
+                facts={
+                    "requested_action": verb,
+                    "working_directory": working_directory,
+                    "build_requirements_status": conflict,
+                },
+                metadata={"runner_dispatched": False, "blocker_owner": "harness"},
+            )
+        requirements = dict(manifest_read.payload)
 
         system, checked = self._detect_system(working_directory)
-        if system is None and working_directory in (None, "", "/workspace"):
-            # Standard layout: clone creates /workspace/<repo>. The legacy
-            # MavenTool probed the project subdirectory before giving up; the
-            # facade must too, or build(action=...) without working_directory
-            # always returns verdict=unknown.
-            project_name = getattr(self.docker_orchestrator, "project_name", None)
-            if project_name:
-                candidate = f"/workspace/{project_name}"
-                fallback_system, fallback_checked = self._detect_system(candidate)
-                checked = checked + [f"{candidate}/{marker}" for marker in fallback_checked]
-                if fallback_system is not None:
-                    system = fallback_system
-                    working_directory = candidate
         if system is None:
             return ToolResult.completed(
                 operation_outcome="unknown",
@@ -231,11 +424,30 @@ class BuildTool(BaseTool):
                     f"No known build system marker found in {working_directory}. "
                     "This is a detection result, not ground truth."
                 ),
-                facts={"checked": checked},
+                error_code="BUILD_SYSTEM_NOT_DETECTED",
+                facts={
+                    "checked": checked,
+                    "working_directory": working_directory,
+                },
                 suggestions=[
-                    f"Inspect the directory: search('file:{working_directory}', '.') or bash ls",
-                    "If a wrapper script or build file exists deeper, cd there and retry",
+                    "Observed fact: no supported build marker exists at the submitted root.",
+                    "Constraint: working_directory is never inferred or retargeted.",
                 ],
+                metadata={
+                    "runner_dispatched": False,
+                    "working_directory": working_directory,
+                },
+            )
+
+        if maven_version_requirement is not None and system != "maven":
+            return self._parameter_refusal(
+                detail=(
+                    "maven_version_requirement is consumed only by the Maven backend; "
+                    f"the detected backend is {system}"
+                ),
+                verb=verb,
+                working_directory=working_directory,
+                system=system,
             )
 
         backend = self._backends.get(system)
@@ -243,9 +455,24 @@ class BuildTool(BaseTool):
             return ToolResult.completed_failure(
                 output=f"No backend for {system}",
                 error="backend unavailable",
+                error_code="BUILD_BACKEND_UNAVAILABLE",
+                metadata={"runner_dispatched": False},
             )
 
-        requirements = read_build_requirements(self.docker_orchestrator)
+        # On Python ``deps`` the public args value is a direct installer
+        # target.  That path is entirely disabled until a typed shared
+        # PolicyClaim authority exists, and the refusal precedes manifest or
+        # preflight reads. Empty/whitespace args were already rejected above;
+        # omitting args installs only project-declared dependencies.
+        pin_refusal = self._pin_without_provenance_refusal(
+            verb=verb,
+            system=system,
+            args=args,
+            working_directory=working_directory,
+        )
+        if pin_refusal is not None:
+            return pin_refusal
+        dependency_pin_claim_ids: List[str] = []
 
         # --- typed native affordance (spec §C8) — PRE-MATERIALIZATION -------
         # Validate the allowlists, resolve the platform feature and PROVE the
@@ -271,11 +498,6 @@ class BuildTool(BaseTool):
         # is the caller's own scoping). On the python backend an arg IS an
         # install target, so it may only ever be a literal pin a dependency
         # claim already states.
-        pin_refusal = self._pin_without_provenance_refusal(
-            verb=verb, system=system, args=args, working_directory=working_directory
-        )
-        if pin_refusal is not None:
-            return pin_refusal
         # --- end claim-backed exact pins ------------------------------------
 
         # --- domain-edge execution law (spec §C2) — PRE-MATERIALIZATION -----
@@ -305,6 +527,11 @@ class BuildTool(BaseTool):
         preamble_lines: List[str] = []
         jdk_retry_meta: Optional[Dict[str, Optional[str]]] = None
         outcome = None
+        jdk_store: Optional[EnvOverlayStore] = None
+        runtime_target_sha: Optional[str] = None
+        runtime_scope: Dict[str, str] = {}
+        runtime_resolution: Dict[str, Any] = {}
+        effective_jdk: Optional[Dict[str, Any]] = None
         if effective_verb != verb:
             preamble_lines.append(
                 "[island] "
@@ -312,10 +539,149 @@ class BuildTool(BaseTool):
                 f"at {island_context['island_root']}; executing install"
             )
         if effective_verb in _PREFLIGHT_VERBS and system != "python":
-            outcome = JdkPreflight(self.docker_orchestrator).run(
-                requirements.get("java_version"),
-                source=requirements.get("java_version_source") or "unknown",
+            runtime_target_sha = probe_target_sha(
+                self.docker_orchestrator.execute_command,
+                working_directory,
             )
+            runtime_scope = _runtime_domain_scope(requirements, working_directory)
+            static_major = str(requirements.get("java_version") or "").strip() or None
+            static_source = str(requirements.get("java_version_source") or "").strip() or "unknown"
+            if runtime_target_sha and runtime_scope:
+                jdk_store = EnvOverlayStore(self.docker_orchestrator)
+                try:
+                    runtime_resolution = jdk_store.resolve_runtime_requirement(
+                        "java",
+                        target_sha=runtime_target_sha,
+                        domain_root=runtime_scope["domain_root"],
+                        domain_id=runtime_scope.get("domain_id"),
+                        static_major=static_major,
+                        static_source=static_source,
+                    )
+                except Exception as exc:
+                    # An unreadable dynamic store cannot honestly license a
+                    # static downgrade: whether a newer runner fact exists is
+                    # unknown.  Refuse before contract freeze / dispatch.
+                    logger.warning(f"dynamic Java requirement state unavailable: {exc}")
+                    return ToolResult.completed_failure(
+                        output=(
+                            "[pre-flight] dynamic Java requirement state could not be read; "
+                            "no JVM runner was dispatched"
+                        ),
+                        error="dynamic Java requirement state unavailable",
+                        error_code=RUNTIME_REQUIREMENT_STATE_UNAVAILABLE,
+                        facts={
+                            "target_sha": runtime_target_sha,
+                            **runtime_scope,
+                        },
+                        metadata={"runner_dispatched": False},
+                    )
+            elif static_major:
+                runtime_resolution = {
+                    "required_major": static_major,
+                    "authority": "static_survey",
+                    "provenance": {"source": static_source},
+                }
+            runtime_conflict = runtime_resolution.get("conflict")
+            if isinstance(runtime_conflict, Mapping):
+                conflict_detail = dict(runtime_conflict)
+                write_assessment(
+                    self.docker_orchestrator.execute_command,
+                    ControlAssessment(
+                        event_or_intent_id=next_control_event_id("jdk-runtime"),
+                        stage="precondition",
+                        typed_code=RUNTIME_REQUIREMENT_CONFLICT,
+                        detail=(
+                            f"{runtime_target_sha} {runtime_scope} has conflicting Java "
+                            f"requirements {conflict_detail.get('required_majors')}"
+                        ),
+                    ),
+                )
+                return ToolResult.completed_failure(
+                    output=(
+                        "[pre-flight] runner evidence states conflicting Java runtime "
+                        "requirements for this exact checkout and build domain; no JVM "
+                        "runner was dispatched"
+                    ),
+                    error="conflicting Java runtime requirements",
+                    error_code=RUNTIME_REQUIREMENT_CONFLICT,
+                    facts={
+                        "target_sha": runtime_target_sha,
+                        **runtime_scope,
+                        **conflict_detail,
+                    },
+                    metadata={"runner_dispatched": False},
+                )
+            outcome = JdkPreflight(self.docker_orchestrator).run(
+                runtime_resolution.get("required_major"),
+                source=(
+                    str(runtime_resolution.get("authority") or "unknown")
+                    + ":"
+                    + str(
+                        (runtime_resolution.get("provenance") or {}).get("source_ref")
+                        or (runtime_resolution.get("provenance") or {}).get("source")
+                        or "unknown"
+                    )
+                ),
+            )
+            if not outcome.active_version:
+                dispatch_runtime = active_java_runtime(self.docker_orchestrator)
+                if dispatch_runtime.get("major"):
+                    outcome.active_version = dispatch_runtime["major"]
+            if (
+                outcome.provisioned
+                and jdk_store is not None
+                and runtime_target_sha
+                and runtime_scope
+                and runtime_resolution.get("authority") == "persisted_dynamic"
+            ):
+                provenance = runtime_resolution.get("provenance") or {}
+                source_ref = str(provenance.get("source_ref") or "").strip()
+                if source_ref:
+                    try:
+                        post_runtime = active_java_runtime(self.docker_orchestrator)
+                        jdk_store.confirm_runtime_requirement(
+                            "java",
+                            target_sha=runtime_target_sha,
+                            domain_root=runtime_scope["domain_root"],
+                            domain_id=runtime_scope.get("domain_id"),
+                            source_ref=source_ref,
+                            active_runtime=post_runtime,
+                        )
+                        refreshed = [
+                            record
+                            for record in jdk_store.scoped_runtime_requirements(
+                                "java",
+                                target_sha=runtime_target_sha,
+                                domain_root=runtime_scope["domain_root"],
+                                domain_id=runtime_scope.get("domain_id"),
+                            )
+                            if record.get("source_ref") == source_ref
+                            and record.get("required_major")
+                            == runtime_resolution.get("required_major")
+                        ]
+                        if refreshed:
+                            runtime_resolution["provenance"] = max(
+                                refreshed,
+                                key=lambda record: int(record.get("observed_sequence", 0)),
+                            )
+                    except Exception as exc:
+                        logger.warning(f"dynamic Java activation state did not persist: {exc}")
+                        return ToolResult.completed_failure(
+                            output=(
+                                "[pre-flight] Java provisioning passed its dispatch probe, "
+                                "but the scoped activation fact did not persist; no JVM "
+                                "runner was dispatched"
+                            ),
+                            error="dynamic Java activation state unavailable",
+                            error_code=RUNTIME_REQUIREMENT_STATE_UNAVAILABLE,
+                            facts={
+                                "target_sha": runtime_target_sha,
+                                **runtime_scope,
+                                "required_major": runtime_resolution.get("required_major"),
+                            },
+                            metadata={"runner_dispatched": False},
+                        )
+            effective_jdk = _effective_jdk_binding(runtime_resolution, outcome)
             if outcome.narration:
                 preamble_lines.append(outcome.narration)
 
@@ -367,36 +733,25 @@ class BuildTool(BaseTool):
         effective_action = backend.effective_action(materialized)
         expected_argv = backend.expected_argv(materialized)
 
-        # --- material-progress retry law (spec §C7) — PRE-FREEZE ------------
-        # The CONTROLLER signs recurrence after each failure-class assessment;
-        # this facade only validates it and keeps no second store of its own.
-        # A refused dispatch must leave nothing behind, so the check runs
-        # BEFORE the freeze: no contract, no receipt, no runner.
-        retry_refusal = self._retry_without_delta_refusal(
-            system=system,
-            requested_verb=verb,
-            effective_verb=effective_verb,
-            effective_action=effective_action,
-            working_directory=working_directory,
-            expected_argv=expected_argv,
-            requirements=requirements,
-            preamble_lines=preamble_lines,
-        )
-        if retry_refusal is not None:
-            return retry_refusal
-        # --- end material-progress retry law --------------------------------
-
-        scope = current_action_context()
-        envelope_id = scope.envelope_id or unrecorded_envelope_id()
         contract = freeze_contract(
             self.docker_orchestrator.execute_command,
+            run_id=active_receipt_run_id(),
             envelope_id=envelope_id,
             tool=self.name,
             params=requested_call_params,
+            effective_tool=system,
             effective_action=effective_action,
             expected_cwd=working_directory,
             expected_argv=expected_argv,
+            execution_binding=backend.EXECUTION_BINDING,
             intent_source=scope.intent_source,
+            intent_id=scope.intent_id,
+            intent_domain_id=scope.intent_domain_id,
+            intent_exact_params=scope.intent_exact_params,
+            action_fingerprint=scope.action_fingerprint,
+            trigger_assessment_id=scope.trigger_assessment_id,
+            repair_context_id=scope.repair_context_id,
+            repair_context_sha256=scope.repair_context_sha256,
             requirements=requirements,
             # Plan 6 Stage F1: the document-map pin the assessor compares
             # against (`_current_fingerprints` already reads the same stamp).
@@ -412,7 +767,12 @@ class BuildTool(BaseTool):
             # gate's lookup of stored evidence, never from a call parameter,
             # so a frozen native contract carries the provenance that
             # authorized it and a reader can follow it back to the documents.
-            supporting_claim_ids=(native_bundle or {}).get("supporting_claim_ids"),
+            supporting_claim_ids=(
+                (native_bundle or {}).get("supporting_claim_ids") or dependency_pin_claim_ids
+            ),
+            predecessor_contract_id=scope.predecessor_contract_id,
+            effective_jdk=effective_jdk,
+            target_sha_value=runtime_target_sha,
         )
         if contract is None:
             write_assessment(
@@ -444,6 +804,7 @@ class BuildTool(BaseTool):
                     "effective_action": effective_verb,
                     "working_directory": working_directory,
                 },
+                metadata={"runner_dispatched": False},
                 suggestions=[
                     "Check that /workspace/.setup_agent is writable in the container",
                     "Retry the same build call once the workspace accepts writes",
@@ -468,38 +829,208 @@ class BuildTool(BaseTool):
                 params=materialized,
             )
 
-        # The contract is bound for the dispatch only: the runner reads it to
-        # bind its receipt back, and nothing outside this block inherits it.
+        # Each physical dispatch owns the runtime-bound contract active at that
+        # moment.  A retry under a runner-observed JDK must not borrow the first
+        # dispatch's static-runtime commitment.
+        actual_executions = []
+        execution_contracts: List[Mapping[str, Any]] = []
         with dispatch_contract(contract):
-            actual_executions = [_execute_backend()]
-            inner = actual_executions[-1].result
+            actual_executions.append(_execute_backend())
+        execution_contracts.append(contract)
+        inner = actual_executions[-1].result
 
-            # Bounded retry (spec §1c): a version-shaped failure means the JDK in
-            # the error text is authoritative (static analysis cannot always see
-            # it); re-provision from it and rerun EXACTLY once, never more. The
-            # rerun is the SAME materialized argv, so it runs under the same
-            # frozen contract.
-            if outcome is not None and not inner.succeeded:
-                failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
-                needed = classify_version_error(failure_text)
-                active = outcome.active_version or active_java_major(self.docker_orchestrator)
-                if needed and needed != active:
+        # Bounded retry (spec §1c): one physical failure may authorize at most
+        # one retry.  The runner's version wording is persisted BEFORE the
+        # environment changes, then the same dispatch environment must verify
+        # the new runtime before a new contract can freeze.
+        if outcome is not None and not inner.succeeded:
+            failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
+            needed = classify_version_error(failure_text)
+            active = outcome.active_version or active_java_major(self.docker_orchestrator)
+            if needed and needed != active:
+                retry_resolution: Dict[str, Any] = {
+                    "required_major": needed,
+                    "authority": "runner_observed",
+                    "provenance": {},
+                }
+                source_ref = str(
+                    (inner.metadata or {}).get("receipt_id")
+                    or getattr(inner, "output_ref", None)
+                    or (inner.metadata or {}).get("output_ref_id")
+                    or ""
+                ).strip()
+                observation: Optional[Dict[str, Any]] = None
+                if jdk_store is not None and runtime_target_sha and runtime_scope:
+                    if not source_ref:
+                        preamble_lines.append(
+                            "[pre-flight] the Java requirement had no durable receipt/output "
+                            "reference; automatic runtime retry was not authorized"
+                        )
+                        needed = None
+                    else:
+                        observed_runtime = active_java_runtime(self.docker_orchestrator)
+                        try:
+                            jdk_store.record_runtime_requirement(
+                                "java",
+                                target_sha=runtime_target_sha,
+                                domain_root=runtime_scope["domain_root"],
+                                domain_id=runtime_scope.get("domain_id"),
+                                required_major=needed,
+                                source_ref=source_ref,
+                                observed_runtime=observed_runtime,
+                            )
+                            observation = next(
+                                record
+                                for record in jdk_store.scoped_runtime_requirements(
+                                    "java",
+                                    target_sha=runtime_target_sha,
+                                    domain_root=runtime_scope["domain_root"],
+                                    domain_id=runtime_scope.get("domain_id"),
+                                )
+                                if record.get("source_ref") == source_ref
+                                and record.get("required_major") == needed
+                            )
+                            retry_resolution = jdk_store.resolve_runtime_requirement(
+                                "java",
+                                target_sha=runtime_target_sha,
+                                domain_root=runtime_scope["domain_root"],
+                                domain_id=runtime_scope.get("domain_id"),
+                                static_major=requirements.get("java_version"),
+                                static_source=requirements.get("java_version_source"),
+                                runner_observed=observation,
+                            )
+                        except Exception as exc:
+                            logger.warning(f"runner-observed Java requirement not persisted: {exc}")
+                            preamble_lines.append(
+                                "[pre-flight] the runner-observed Java requirement could not "
+                                "be persisted; automatic runtime retry was not authorized"
+                            )
+                            needed = None
+
+                retry_conflict = retry_resolution.get("conflict")
+                if isinstance(retry_conflict, Mapping):
+                    inner.metadata["runtime_requirement_conflict"] = dict(retry_conflict)
+                    if RUNTIME_REQUIREMENT_CONFLICT not in inner.conflicts:
+                        inner.conflicts.append(RUNTIME_REQUIREMENT_CONFLICT)
+                    write_assessment(
+                        self.docker_orchestrator.execute_command,
+                        ControlAssessment(
+                            event_or_intent_id=next_control_event_id("jdk-runtime"),
+                            stage="postcondition",
+                            typed_code=RUNTIME_REQUIREMENT_CONFLICT,
+                            detail=(
+                                f"runner observation {source_ref or 'current-output'} conflicts "
+                                f"with same-scope Java requirements "
+                                f"{retry_conflict.get('required_majors')}"
+                            ),
+                        ),
+                    )
+                    preamble_lines.append(
+                        "[pre-flight] the runner observation conflicts with an existing "
+                        "same-scope Java requirement; automatic runtime retry was not authorized"
+                    )
+                    needed = None
+
+                if needed:
                     retry_outcome = JdkPreflight(self.docker_orchestrator).run(
-                        needed, source="build-error"
+                        needed,
+                        source=f"runner_observed:{source_ref or 'current-output'}",
                     )
                     if retry_outcome.provisioned:
-                        preamble_lines.append(
-                            f"[pre-flight] build error requires Java {needed}, "
-                            "re-provisioned, retry 1/1"
-                        )
-                        jdk_retry_meta = {"from": active, "to": needed}
-                        actual_executions.append(_execute_backend())
-                        inner = actual_executions[-1].result
+                        post_runtime = active_java_runtime(self.docker_orchestrator)
+                        if jdk_store is not None and observation is not None:
+                            assert runtime_target_sha is not None
+                            assert runtime_scope.get("domain_root")
+                            try:
+                                jdk_store.confirm_runtime_requirement(
+                                    "java",
+                                    target_sha=runtime_target_sha,
+                                    domain_root=runtime_scope["domain_root"],
+                                    domain_id=runtime_scope.get("domain_id"),
+                                    source_ref=source_ref,
+                                    active_runtime=post_runtime,
+                                )
+                                # Carry the confirmed record, including active
+                                # runtime, into contract/receipt provenance.
+                                observation = next(
+                                    record
+                                    for record in jdk_store.scoped_runtime_requirements(
+                                        "java",
+                                        target_sha=runtime_target_sha,
+                                        domain_root=runtime_scope["domain_root"],
+                                        domain_id=runtime_scope.get("domain_id"),
+                                    )
+                                    if record.get("source_ref") == source_ref
+                                    and record.get("required_major") == needed
+                                )
+                                retry_resolution = {
+                                    "required_major": needed,
+                                    "authority": "runner_observed",
+                                    "provenance": observation,
+                                }
+                            except Exception as exc:
+                                logger.warning(f"confirmed Java runtime state not persisted: {exc}")
+                                preamble_lines.append(
+                                    "[pre-flight] Java changed, but its exact-scope "
+                                    "postcondition record did not persist; retry was not dispatched"
+                                )
+                                retry_outcome.provisioned = False
+                        if retry_outcome.provisioned:
+                            retry_effective_jdk = _effective_jdk_binding(
+                                retry_resolution,
+                                retry_outcome,
+                            )
+                            retry_contract = freeze_contract(
+                                self.docker_orchestrator.execute_command,
+                                run_id=active_receipt_run_id(),
+                                envelope_id=envelope_id,
+                                tool=self.name,
+                                params=requested_call_params,
+                                effective_tool=system,
+                                effective_action=effective_action,
+                                expected_cwd=working_directory,
+                                expected_argv=expected_argv,
+                                execution_binding=backend.EXECUTION_BINDING,
+                                intent_source=scope.intent_source,
+                                intent_id=scope.intent_id,
+                                intent_domain_id=scope.intent_domain_id,
+                                intent_exact_params=scope.intent_exact_params,
+                                action_fingerprint=scope.action_fingerprint,
+                                trigger_assessment_id=scope.trigger_assessment_id,
+                                repair_context_id=scope.repair_context_id,
+                                repair_context_sha256=scope.repair_context_sha256,
+                                requirements=requirements,
+                                document_map_fingerprint=(
+                                    (requirements.get("survey") or {}).get(
+                                        "document_map_fingerprint"
+                                    )
+                                    if isinstance(requirements, Mapping)
+                                    else None
+                                ),
+                                supporting_claim_ids=(
+                                    (native_bundle or {}).get("supporting_claim_ids")
+                                    or dependency_pin_claim_ids
+                                ),
+                                predecessor_contract_id=contract.get("contract_id"),
+                                effective_jdk=retry_effective_jdk,
+                                target_sha_value=runtime_target_sha,
+                            )
+                            if retry_contract is not None:
+                                preamble_lines.append(
+                                    f"[pre-flight] build error requires Java {needed}, "
+                                    "re-provisioned, retry 1/1"
+                                )
+                                jdk_retry_meta = {"from": active, "to": needed}
+                                with dispatch_contract(retry_contract):
+                                    actual_executions.append(_execute_backend())
+                                execution_contracts.append(retry_contract)
+                                contract = retry_contract
+                                inner = actual_executions[-1].result
 
         # --- contract-vs-receipt assessment (Plan 6 Stage C, spec §C5) ------
         # What the dispatch MEANT is decided here, against the contract that
         # authorized it — never inside the runner, which only knows what it did.
-        self._assess_receipts(contract, requirements, actual_executions)
+        self._assess_receipts(requirements, actual_executions, execution_contracts)
 
         # Computed last so it lands FIRST: the model must read what actually ran
         # before it reasons about the result (spec §Stage D contract 4).
@@ -548,9 +1079,11 @@ class BuildTool(BaseTool):
            the same contradiction (spec §C8);
         3. the SYSTEM — this is python machinery, and a maven/gradle tree gets
            a plain answer rather than a native install it cannot use;
-        4. PROVENANCE — a `capability_absent_<feature>` assessment on record
-           AND a stored claim for every definition. Model parameters carry no
-           provenance, so this is the only place authority can come from.
+        4. PROVENANCE — a typed current-run capability assessment AND a typed
+           current project claim for every definition, both sealed by the
+           host publication ledger. That complete live reader is not wired
+           yet, so legacy container JSON cannot pass this gate and native
+           dispatch remains fail-closed.
 
         Every refusal records a `ControlAssessment`: it mints no receipt, and a
         reader of the evidence directory must still learn what was stopped.
@@ -677,10 +1210,10 @@ class BuildTool(BaseTool):
                 closing=NATIVE_UNSOURCED_CLAUSE,
                 working_directory=working_directory,
                 suggestions=[
-                    "Run the project's own test/build first — a receipt is what proves a "
-                    "capability absent",
-                    "Let targeted retrieval read the project's CI/CMake documents, then "
-                    "accept the repair it proposes",
+                    "Required evidence is absent: only a completed project build/test "
+                    "receipt can prove the capability absent",
+                    "Any subsequent model-owned ordinary ActionIntent must cite the stored "
+                    "CI/CMake claims and capability assessment it relies on",
                 ],
             )
 
@@ -726,44 +1259,25 @@ class BuildTool(BaseTool):
         return None
 
     def _capability_absences(self) -> set:
-        """Every `capability_absent_<name>` code the assessment directory holds.
+        """No capability is live authority until its typed binding is complete.
 
-        The assessments are the c2 assessor's own output: a capability is
-        absent because a RECEIPT said so, never because a call said so.
+        Historical assessment JSON remains useful for display, but the native
+        facade cannot consume it through the forgiving directory reader.  A
+        future positive path must bind a host-published assessment to the
+        current receipt/run/target/domain and to the exact native producer
+        observation before returning a capability here.
         """
-        return {
-            str(record.get("typed_code") or "").strip()
-            for record in read_records(self.docker_orchestrator, ASSESSMENT_DIR)
-            if str(record.get("typed_code") or "").strip().startswith(CAPABILITY_PREFIX)
-        }
+        return set()
 
     def _definition_claims(self, definitions: Mapping[str, str]) -> Dict[str, List[str]]:
-        """`{definition key: [claim_id, ...]}` for the keys stored claims state.
+        """No definition claim is live authority through the loose JSON view.
 
-        A key with no claim is simply absent from the mapping — that absence is
-        what the provenance gate refuses on. Matching is on the definition NAME
-        the claim carries, because the claim is what proves the switch is
-        project-owned; which value the project's own default happens to be is a
-        separate fact, and reading it as consent would let a documented
-        `set(USE_X OFF)` authorize nothing at all.
+        The positive native path is intentionally closed alongside capability
+        assessment authority. It reopens only when the claim reader validates
+        and host-binds the exact current PolicyClaim set; arbitrary persisted
+        strings or supporting ids must never authorize an install.
         """
-        found: Dict[str, List[str]] = {}
-        for record in read_records(self.docker_orchestrator, CLAIM_DIR):
-            if str(record.get("kind") or "").strip() != "env":
-                continue
-            typed_value = record.get("typed_value")
-            if not isinstance(typed_value, Mapping):
-                continue
-            if str(typed_value.get("scope") or "").strip() not in NATIVE_CLAIM_SCOPES:
-                continue
-            name = str(typed_value.get("name") or "").strip()
-            identifier = str(record.get("claim_id") or "").strip()
-            if not identifier or name not in definitions:
-                continue
-            found.setdefault(name, [])
-            if identifier not in found[name]:
-                found[name].append(identifier)
-        return found
+        return {}
 
     def _native_refusal(
         self,
@@ -800,7 +1314,7 @@ class BuildTool(BaseTool):
             suggestions=suggestions,
         )
 
-    # --- claim-backed exact pins on `deps` (plan §Stage E item 3) -----------
+    # --- direct Python dependency targets remain disabled -----------------
 
     def _pin_without_provenance_refusal(
         self,
@@ -810,25 +1324,18 @@ class BuildTool(BaseTool):
         args: Optional[str],
         working_directory: str,
     ) -> Optional[ToolResult]:
-        """Refuse a python `deps` arg no dependency claim states, or None.
+        """Refuse every non-empty Python `deps` target, or return None.
 
         On the python backend a `deps` arg is an install TARGET — the harness
-        would type it into a `pip install`. So it may only ever be an exact pin
-        (`pkg==literal`) that a stored dependency claim already carries. Every
-        other arg, pin-shaped or not, is a package choice with no project
-        source behind it.
+        would type it into a `pip install`.  Until the facade and judge share
+        one typed PolicyClaim verifier, even an exact-looking pin plus an
+        opaque supporting id is insufficient authority. The empty-args path
+        still installs the dependency set declared by the project itself.
         """
         requested = str(args or "").strip()
         if verb != "deps" or system != "python" or not requested:
             return None
-        pinned = EXACT_PIN.match(requested) is not None
-        if pinned and self._pin_claim_ids(requested):
-            return None
-        detail = (
-            f"[deps] {requested!r} is not an exact pin (pkg==literal)"
-            if not pinned
-            else f"[deps] no dependency claim states the pin {requested!r}"
-        )
+        detail = f"[deps] direct install target {requested!r} is disabled"
         facts: Dict[str, Any] = {
             "requested_action": verb,
             "requested_args": requested,
@@ -861,43 +1368,23 @@ class BuildTool(BaseTool):
             suggestions=[
                 "Call build(action='deps') with no args to install the project's own "
                 "declared dependencies",
-                "Accept a repair proposal — its pin is cited from a stored claim",
+                "Record a project dependency in its own config instead of injecting a pin",
             ],
         )
-
-    def _pin_claim_ids(self, pin: str) -> List[str]:
-        """The dependency claims whose typed_value carries this literal pin."""
-        found: List[str] = []
-        for record in read_records(self.docker_orchestrator, CLAIM_DIR):
-            if str(record.get("kind") or "").strip() != "dependency":
-                continue
-            typed_value = record.get("typed_value")
-            if not isinstance(typed_value, Mapping):
-                continue
-            package = str(typed_value.get("package") or "").strip()
-            specifier = str(typed_value.get("specifier") or "").strip()
-            version = str(typed_value.get("version") or "").strip()
-            literals = {f"{package}{specifier}{version}"} | {
-                str(value).strip() for value in typed_value.values() if isinstance(value, str)
-            }
-            identifier = str(record.get("claim_id") or "").strip()
-            if identifier and pin in literals and identifier not in found:
-                found.append(identifier)
-        return found
 
     # --- contract-vs-receipt assessment (spec §C5) --------------------------
 
     def _assess_receipts(
         self,
-        contract: Optional[Mapping[str, Any]],
         requirements: Mapping[str, Any],
         executions: List[Any],
+        contracts: Sequence[Mapping[str, Any]],
     ) -> None:
         """Assess every receipt this facade call minted, and persist the verdicts.
 
         Each physical dispatch is assessed on its own — the JDK-driven rerun is
-        a second dispatch under the same contract, and reading only the last
-        receipt would erase the first one's meaning.
+        a second dispatch under a new runtime-bound contract, and reading only
+        the last receipt would erase the first one's meaning.
 
         This never changes the result and never raises: the model is waiting on
         a build, and a verdict that could not be written is a missing evidence
@@ -906,7 +1393,7 @@ class BuildTool(BaseTool):
         that gate reads the assessment directory and lands in Stage D.
         """
         assessed = set()
-        for execution in executions:
+        for execution, contract in zip(executions, contracts):
             result = getattr(execution, "result", None)
             metadata = getattr(result, "metadata", None) or {}
             receipt_id = str(metadata.get("receipt_id") or "").strip()
@@ -929,6 +1416,14 @@ class BuildTool(BaseTool):
                     # the receipt keeps only its hash, and a fault the build
                     # stated in prose is readable nowhere else.
                     output=getattr(result, "raw_output", None) or getattr(result, "output", None),
+                    evidence_ref=(
+                        str(
+                            getattr(result, "output_ref", None)
+                            or metadata.get("output_ref_id")
+                            or ""
+                        ).strip()
+                        or None
+                    ),
                 )
             except Exception as exc:  # evidence never breaks the build result
                 logger.debug(f"receipt {receipt_id} was not assessed: {exc}")
@@ -937,7 +1432,7 @@ class BuildTool(BaseTool):
     def _current_fingerprints(
         requirements: Mapping[str, Any],
         receipt: Mapping[str, Any],
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         """The pins the harness can state NOW, without a second probe.
 
         The survey stamp is the current config/document-map pin, and the
@@ -946,7 +1441,7 @@ class BuildTool(BaseTool):
         before. A pin nobody currently states stays absent, so it can never be
         read as a mismatch.
         """
-        current: Dict[str, str] = {}
+        current: Dict[str, Any] = {}
         survey = requirements.get("survey") if isinstance(requirements, Mapping) else None
         if isinstance(survey, Mapping):
             for key in ("config_fingerprint", "document_map_fingerprint", "survey_fingerprint"):
@@ -956,111 +1451,24 @@ class BuildTool(BaseTool):
         target_sha = str((receipt or {}).get("target_sha") or "").strip()
         if target_sha:
             current["target_sha"] = target_sha
+        current_cwd = str(
+            (receipt or {}).get("actual_cwd") or (receipt or {}).get("working_directory") or ""
+        ).strip()
+        domain_root = nearest_domain_root(requirements, current_cwd)
+        if domain_root:
+            current["domain_id"] = domain_root
+        fact_epoch = nearest_domain_fact_epoch(requirements, current_cwd)
+        if fact_epoch is not None:
+            current["fact_epoch"] = fact_epoch
+        import_targets = (
+            python_import_targets(requirements)
+            if str((receipt or {}).get("tool") or "").strip().lower() == "python"
+            else None
+        )
+        if import_targets is not None:
+            current["python_import_targets"] = import_targets
+            current["python_import_targets_sha256"] = producer_observations_sha256(import_targets)
         return current
-
-    # --- material-progress retry law (spec §C7) -----------------------------
-
-    def _retry_without_delta_refusal(
-        self,
-        *,
-        system: str,
-        requested_verb: str,
-        effective_verb: str,
-        effective_action: str,
-        working_directory: str,
-        expected_argv: Optional[str],
-        requirements: Mapping[str, Any],
-        preamble_lines: List[str],
-    ) -> Optional[ToolResult]:
-        """Refuse a dispatch the ledger has already seen fail, or None to proceed.
-
-        Spec §C7 gives deterministic failures a law: the same action, against
-        the same tree, in the same environment, that already failed the same
-        typed way may not simply be run again. It needs a material delta — a
-        different argv, a different environment fingerprint, an accepted repair
-        or a newer fact epoch — and prose, revisions and restated expectations
-        are not deltas.
-
-        The recurrence state is the controller's (`retry_authority`); this
-        facade reads it and answers. The refusal mints no receipt, so it also
-        records a `ControlAssessment`: a reader of the evidence directory must
-        still learn that this intent was stopped and why. Persisting that is
-        best effort and never gates the refusal.
-
-        Never raises: a ledger this facade cannot read states no recurrence,
-        and an unreadable file is not authority to stop a build.
-        """
-        execute = self.docker_orchestrator.execute_command
-        try:
-            # A run that has recorded no failure has no recurrence to validate,
-            # so the ledger read is the whole cost of the law on a first
-            # dispatch — the candidate (and its target-sha probe) is only built
-            # when there is something to compare it against.
-            ledger = read_ledger(execute)
-            if not ledger:
-                return None
-            candidate = candidate_contract(
-                execute,
-                tool=self.name,
-                effective_action=effective_action,
-                expected_cwd=working_directory,
-                expected_argv=expected_argv,
-                requirements=requirements,
-            )
-            blocked = blocking_entry(execute, candidate, ledger=ledger)
-        except Exception as exc:  # the authority never breaks a first dispatch
-            logger.debug(f"retry authority not consulted for {working_directory}: {exc}")
-            return None
-        if blocked is None:
-            return None
-        retry_key, entry = blocked
-        typed_code = str(entry.get("typed_code") or "").strip()
-        count = entry.get("count")
-        headline = (
-            f"[retry] {system} {effective_verb} at {working_directory} already failed "
-            f"as {typed_code} ×{count} with this exact action, tree and environment"
-        )
-        closing = (
-            "a repeat needs material progress: change the argv, change the toolchain "
-            "or environment, accept a repair proposal, or record a new project fact — "
-            "a rerun on its own cannot fail differently"
-        )
-        facts: Dict[str, Any] = {
-            "retry_key": retry_key,
-            "prior_typed_code": typed_code,
-            "prior_failure_count": count,
-            "requested_action": requested_verb,
-            "effective_action": effective_verb,
-            "working_directory": working_directory,
-            "system": system,
-        }
-        metadata: Dict[str, Any] = dict(facts)
-        metadata["runner_dispatched"] = False
-        write_assessment(
-            self.docker_orchestrator.execute_command,
-            ControlAssessment(
-                event_or_intent_id=next_control_event_id("build-retry"),
-                stage="precondition",
-                typed_code=RETRY_WITHOUT_DELTA_CODE,
-                detail=(
-                    f"{retry_key} already failed as {typed_code} ×{count}; this dispatch "
-                    "states no material delta"
-                ),
-            ),
-        )
-        return ToolResult.completed_failure(
-            output="\n".join(preamble_lines + [headline, closing]),
-            error=f"identical retry after {typed_code}",
-            error_code=RETRY_WITHOUT_DELTA,
-            facts=facts,
-            metadata=metadata,
-            suggestions=[
-                "Read the recorded failure before rerunning: search(target='output_...') "
-                "on the prior attempt's output ref",
-                "Change the invocation itself (args, working_directory, action) or the "
-                "environment it runs in, then retry",
-            ],
-        )
 
     # --- domain-edge execution law (spec §C2) -------------------------------
 
@@ -1093,36 +1501,25 @@ class BuildTool(BaseTool):
         error_code, typed_code = _EDGE_REFUSALS[status]
         consumer = _absolute_root(edge.get("consumer")) or str(edge.get("consumer") or "")
         producer = _absolute_root(edge.get("producer")) or str(edge.get("producer") or "")
-        # Verbatim: the detail carries the mismatched coordinates, and a
-        # paraphrase is how a mismatch becomes an alias.
+        # Raw detail is project-authored survey material.  Keep it in the typed
+        # internal assessment for audit, but never let arbitrary prose select a
+        # producer-first repair order in the model-facing result.
         detail = str(edge.get("detail") or "").strip()
 
         if status == "version_incompatible":
             headline = (
-                f"[domain-edge] {consumer} consumes an artifact of {producer} "
-                "across a version_incompatible edge"
-            )
-            closing = _SEALED_CLAUSE
-            error = f"domain edge blocks {consumer}"
-            suggestions = [
-                f"Record the mismatch as a project fact, then build {producer} "
-                "at the version this consumer requires",
-                "Do not retarget the consumer at a different artifact version",
-            ]
-        else:
-            headline = (
-                f"[domain-edge] {consumer} consumes an artifact {producer} builds, "
-                "on an unverified edge"
+                "[domain-edge] status=version_incompatible "
+                f"consumer={consumer} producer={producer}"
             )
             closing = (
-                f"{producer} must produce first; this consumer stays locked until "
-                "that edge is verified"
+                "runner dispatch is blocked because the recorded edge status is "
+                "version_incompatible"
             )
+            error = f"domain edge blocks {consumer}"
+        else:
+            headline = "[domain-edge] status=unverified " f"consumer={consumer} producer={producer}"
+            closing = "runner dispatch remains locked; the edge has no current verification receipt"
             error = f"domain edge is unverified for {consumer}"
-            suggestions = [
-                f"Build {producer} first, then retry this consumer",
-                f"Read {producer}'s declared coordinates to verify or refute the edge",
-            ]
 
         facts: Dict[str, Any] = {
             "domain_edge_status": status,
@@ -1137,9 +1534,6 @@ class BuildTool(BaseTool):
         if edge_id:
             facts["edge_id"] = edge_id
             metadata["edge_id"] = edge_id
-        if detail:
-            facts["domain_edge_detail"] = detail
-
         write_assessment(
             self.docker_orchestrator.execute_command,
             ControlAssessment(
@@ -1150,12 +1544,12 @@ class BuildTool(BaseTool):
             ),
         )
         return ToolResult.completed_failure(
-            output="\n".join(line for line in (headline, detail, closing) if line),
+            output="\n".join((headline, closing)),
             error=error,
             error_code=error_code,
             facts=facts,
             metadata=metadata,
-            suggestions=suggestions,
+            suggestions=[],
         )
 
     @staticmethod
@@ -1407,8 +1801,8 @@ class BuildTool(BaseTool):
                 "args": {
                     "type": "string",
                     "description": "Extra flags passed through to the underlying tool. "
-                    "On a python deps call this is an install target, so it accepts "
-                    "only an exact pin (pkg==literal) a project document states.",
+                    "Omit it for Python deps: that action installs only dependencies "
+                    "declared by the project; direct install targets are disabled.",
                 },
                 "working_directory": {"type": "string", "default": "/workspace"},
                 "timeout": {
@@ -1429,7 +1823,8 @@ class BuildTool(BaseTool):
                         "action=native only: the named capabilities to enable, for "
                         f"example {list(sorted(NATIVE_FEATURE_RESOLVER))}. The harness "
                         "resolves each to packages and a probe; the call never names "
-                        "either."
+                        "either. Dispatch remains unavailable until the typed "
+                        "current-run capability binding is present."
                     ),
                 },
                 "definitions": {
@@ -1439,7 +1834,8 @@ class BuildTool(BaseTool):
                         "action=native only: build definitions, "
                         f"{NATIVE_DEFINITION_KEY.pattern} = "
                         f"{'|'.join(NATIVE_DEFINITION_VALUES)}. Must agree with "
-                        "features, and each key needs a stored project claim."
+                        "features, and each key needs a host-published typed current "
+                        "project claim; loose stored JSON never authorizes dispatch."
                     ),
                 },
             },

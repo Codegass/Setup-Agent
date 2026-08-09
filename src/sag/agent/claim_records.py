@@ -73,6 +73,13 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from sag.agent.control_events import canonical_sha256
+from sag.agent.evidence_publications import publish_evidence_bytes
+from sag.agent.evidence_records import (
+    EvidencePublicationBinding,
+    PublishedNamedJsonRecordStreamRead,
+    read_live_published_json_records,
+)
+from sag.utils.container_io import compare_publish_container_text_atomic
 
 CLAIM_SCHEMA_VERSION = 1
 CLAIM_DIR = "/workspace/.setup_agent/claims"
@@ -81,6 +88,7 @@ CLAIM_DIR = "/workspace/.setup_agent/claims"
 CLAIM_HEREDOC = "SAGCLAIM"
 CLAIM_ID_DIGEST_CHARS = 12
 DETAIL_MAX_CHARS = 200
+_CLAIM_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 # Spec §C1/§C5: the three independent dimensions of a claim. Source class says
 # WHERE it came from, source status whether that source is still current, and
@@ -105,6 +113,11 @@ EvidenceStatus = Literal[
     "untested", "unknown", "confirmed", "blocked", "contradicted", "not_applicable"
 ]
 ClaimKind = Literal["tool_constraint", "lifecycle", "dependency", "env", "capability"]
+
+
+def _valid_claim_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_CLAIM_ID_PATTERN.fullmatch(value))
+
 
 # The first token a documented command must resolve to before it is recorded as
 # a lifecycle claim. `./gradlew` resolves through its basename; `make`, `git`
@@ -435,6 +448,75 @@ def parse_claim(payload: Mapping[str, Any]) -> Any:
         if key not in ("schema_version", "claim_id", "support_claim_ids")
     }
     return _CLAIM_ADAPTER.validate_python(body)
+
+
+def validate_claim_v1(
+    payload: Mapping[str, Any],
+    expected_id: str | None = None,
+) -> dict[str, Any]:
+    """Return one exact current claim record or reject it fail-closed.
+
+    ``parse_claim`` remains the typed model boundary.  A live persisted record
+    additionally has to be the model's exact canonical projection: its schema,
+    derived claim id, support set, optional fields and JSON scalar types cannot
+    be supplied independently by container-controlled bytes.  Comparing strict
+    JSON encodings (rather than Python values) keeps ``true`` distinct from
+    ``1`` and ``1`` distinct from ``1.0``.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("claim record must be a JSON object")
+    candidate = dict(payload)
+    if expected_id is not None and (
+        not isinstance(expected_id, str) or not _valid_claim_id(expected_id)
+    ):
+        raise ValueError("claim filename identity is invalid")
+    try:
+        claim = parse_claim(candidate)
+        normalized: dict[str, Any] = dict(claim.payload())
+        candidate_json = json.dumps(
+            candidate,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        normalized_json = json.dumps(
+            normalized,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"claim record is invalid: {exc}") from exc
+    if candidate_json != normalized_json:
+        raise ValueError("claim record is not the exact canonical schema")
+    identifier = normalized.get("claim_id")
+    if not isinstance(identifier, str) or not _valid_claim_id(identifier):
+        raise ValueError("claim identity is invalid")
+    if expected_id is not None and identifier != expected_id:
+        raise ValueError("claim payload identity does not match its filename")
+    return normalized
+
+
+def read_live_policy_claim_ledger(source: Any) -> PublishedNamedJsonRecordStreamRead:
+    """Read the complete current claim ledger through host publication.
+
+    Container files are only mirrors.  A valid live ledger must preserve each
+    atomic filename/raw body, pass :func:`validate_claim_v1`, match every host
+    publication byte-for-byte and contain exactly the host-authorized current
+    ID set.  Historical callers that intentionally inspect loose container
+    bytes continue to use ``physical_survey.read_policy_claims``.
+    """
+
+    return read_live_published_json_records(
+        source,
+        CLAIM_DIR,
+        record_kind="policy_claim",
+        validator=lambda body, record_id: validate_claim_v1(body, expected_id=record_id),
+        publication_binding=lambda _body: EvidencePublicationBinding(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1375,29 +1457,54 @@ def write_claim(execute: Callable[..., Any], claim: Any) -> bool:
     final = f"{CLAIM_DIR}/{identifier}.json"
     existing = _read_existing(execute, final)
     if existing is not None:
-        if existing == payload:
-            return True
+        existing_payload, existing_raw = existing
+        if existing_payload == payload and existing_raw == body:
+            publication = publish_evidence_bytes(
+                execute,
+                record_kind="policy_claim",
+                record_id=identifier,
+                raw=existing_raw.encode("utf-8"),
+            )
+            if publication.published:
+                return True
+            logger.warning(
+                f"claim {identifier} persisted but host publication failed: "
+                f"{publication.status}"
+            )
+            return False
         logger.warning(
             f"claim {identifier} already records a different body; claims are "
             "written once per source and this write was refused"
         )
         return False
-    temp = f"{final}.tmp"
-    command = (
-        f"mkdir -p {shlex.quote(CLAIM_DIR)} && "
-        f"cat > {shlex.quote(temp)} <<'{CLAIM_HEREDOC}' && "
-        f"mv -f {shlex.quote(temp)} {shlex.quote(final)}\n"
-        f"{body}\n{CLAIM_HEREDOC}"
-    )
     try:
-        result = execute(command) or {}
+        result = compare_publish_container_text_atomic(
+            execute,
+            final,
+            body,
+            expected_content=None,
+            validate_json=True,
+        )
     except Exception as exc:
         logger.debug(f"claim {identifier} not persisted: {exc}")
         return False
-    return _succeeded(result)
+    if not result.persisted:
+        return False
+    publication = publish_evidence_bytes(
+        execute,
+        record_kind="policy_claim",
+        record_id=identifier,
+        raw=body.encode("utf-8"),
+    )
+    if not publication.published:
+        logger.warning(
+            f"claim {identifier} persisted but host publication failed: {publication.status}"
+        )
+        return False
+    return True
 
 
-def _read_existing(execute: Callable[..., Any], path: str) -> dict[str, Any] | None:
+def _read_existing(execute: Callable[..., Any], path: str) -> tuple[dict[str, Any], str] | None:
     """The claim already at `path`, or None when there is none to honour.
 
     An unparseable file is reported as a body that matches nothing, so the
@@ -1408,14 +1515,14 @@ def _read_existing(execute: Callable[..., Any], path: str) -> dict[str, Any] | N
     except Exception as exc:
         logger.debug(f"claim {path} unreadable: {exc}")
         return None
-    content = str(result.get("output") or "").strip()
-    if not _succeeded(result) or not content:
+    content = result.get("output")
+    if not _succeeded(result) or not isinstance(content, str) or not content:
         return None
     try:
         payload = json.loads(content)
     except (TypeError, ValueError):
-        return {"unparseable": path}
-    return payload if isinstance(payload, dict) else {"unparseable": path}
+        return {"unparseable": path}, content
+    return (payload, content) if isinstance(payload, dict) else ({"unparseable": path}, content)
 
 
 def _succeeded(result: Mapping[str, Any]) -> bool:
@@ -1455,6 +1562,8 @@ __all__ = [
     "extract_tool_constraints",
     "find_claim_conflicts",
     "parse_claim",
+    "read_live_policy_claim_ledger",
+    "validate_claim_v1",
     "write_claim",
     "write_claims",
 ]

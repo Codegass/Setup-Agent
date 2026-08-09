@@ -1,8 +1,32 @@
+import base64
 import shlex
 import subprocess
+import sys
 
+from sag.agent.control_events import ControlEventSink
+from sag.agent.evidence_publications import EvidencePublicationAuthority
 from sag.docker_orch import orch
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.runtime.env_overlay import EnvOverlayStore, EnvOverlayUnavailableError
+
+
+def test_docker_orchestrator_import_is_order_independent_in_a_fresh_interpreter():
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from sag.docker_orch.orch import DockerOrchestrator; "
+                "from sag.runtime import EnvOverlayStore; "
+                "from sag.agent import SetupAgent, ReActEngine"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe.returncode == 0, probe.stderr
 
 
 class FakeExecResult:
@@ -18,6 +42,8 @@ class FakeStreamingExecResult:
 
 
 class FakeContainer:
+    id = "c" * 64
+
     def __init__(self, exec_result=None):
         self.exec_calls = []
         self.exec_result = exec_result or FakeExecResult()
@@ -44,14 +70,63 @@ class FakeContainers:
 class FakeClient:
     def __init__(self, container):
         self.containers = FakeContainers(container)
+        self.api = FakeDaemonAPI(container.id)
 
 
-def build_orchestrator(container):
+class FakeDaemonAPI:
+    def __init__(self, container_id):
+        self.container_id = container_id
+        self.exec_id = "d" * 64
+        self.create_calls = []
+        self.start_calls = []
+
+    def exec_create(self, container, cmd, **kwargs):
+        self.create_calls.append({"container": container, "cmd": cmd, "kwargs": kwargs})
+        return {"Id": self.exec_id}
+
+    def exec_start(self, exec_id, **kwargs):
+        self.start_calls.append({"exec_id": exec_id, "kwargs": kwargs})
+
+    def exec_inspect(self, exec_id):
+        return {
+            "ID": exec_id,
+            "ContainerID": self.container_id,
+            "Running": False,
+            "ExitCode": 0,
+        }
+
+
+def build_orchestrator(container, *, authorize_runtime=True):
     orchestrator = DockerOrchestrator.__new__(DockerOrchestrator)
     orchestrator.client = FakeClient(container)
     orchestrator.container_name = "sag-demo"
     orchestrator.is_container_running = lambda: True
+    if authorize_runtime:
+        orchestrator._sag_evidence_publication_authority = EvidencePublicationAuthority(
+            run_id=f"run-orchestrator-{id(orchestrator)}"
+        )
+
+        def runtime_environment(environment=None):
+            runtime = orchestrator._control_exec_environment()
+            for key, value in (environment or {}).items():
+                if key not in {"PATH", "BASH_ENV", "ENV", "CDPATH"}:
+                    runtime[key] = value
+            return runtime
+
+        orchestrator._default_exec_environment = runtime_environment
     return orchestrator
+
+
+def test_normal_runner_without_host_authority_is_not_dispatched():
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container, authorize_runtime=False)
+
+    result = orchestrator.execute_command("mvn test")
+
+    assert result["success"] is False
+    assert result["dispatch_status"] == "environment_overlay_unavailable"
+    assert result["runner_dispatched"] is False
+    assert container.exec_calls == []
 
 
 def test_runtime_profile_prefix_exports_utf8_locale_before_tools_run():
@@ -62,7 +137,7 @@ def test_runtime_profile_prefix_exports_utf8_locale_before_tools_run():
     assert "export LANG=${LANG:-C.UTF-8}" in prefix
     assert "export LC_ALL=${LC_ALL:-C.UTF-8}" in prefix
     assert prefix.index("export LANG=${LANG:-C.UTF-8}") < prefix.index(
-        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
+        "export LC_ALL=${LC_ALL:-C.UTF-8}"
     )
 
 
@@ -77,6 +152,7 @@ def test_execute_command_passes_utf8_environment_to_docker_exec():
     exec_env = container.exec_calls[-1]["kwargs"]["environment"]
     assert exec_env["LANG"] == "C.UTF-8"
     assert exec_env["LC_ALL"] == "C.UTF-8"
+    assert "LANG=C.UTF-8" in container.exec_calls[-1]["exec_command"]
 
 
 def test_execute_command_preserves_explicit_environment_overrides():
@@ -85,14 +161,26 @@ def test_execute_command_preserves_explicit_environment_overrides():
 
     result = orchestrator.execute_command(
         "locale",
-        environment={"LANG": "en_US.UTF-8", "CUSTOM_FLAG": "1"},
+        environment={
+            "LANG": "en_US.UTF-8",
+            "CUSTOM_FLAG": "1",
+            "PATH": "/workspace/attacker",
+            "BASH_ENV": "/workspace/.bashrc",
+        },
     )
 
     assert result["success"] is True
     exec_env = container.exec_calls[-1]["kwargs"]["environment"]
-    assert exec_env["LANG"] == "en_US.UTF-8"
+    assert exec_env["LANG"] == "C.UTF-8"
     assert exec_env["LC_ALL"] == "C.UTF-8"
-    assert exec_env["CUSTOM_FLAG"] == "1"
+    assert exec_env["PATH"] == orch.CONTROL_EXEC_PATH
+    assert exec_env["BASH_ENV"] == ""
+    runtime_argv = container.exec_calls[-1]["exec_command"]
+    assert "LANG=en_US.UTF-8" in runtime_argv
+    assert "CUSTOM_FLAG=1" in runtime_argv
+    assert f"PATH={orch.CONTROL_EXEC_PATH}" in runtime_argv
+    assert "PATH=/workspace/attacker" not in runtime_argv
+    assert "BASH_ENV=/workspace/.bashrc" not in runtime_argv
 
 
 def test_execute_command_with_monitoring_passes_utf8_environment_to_docker_exec():
@@ -179,21 +267,18 @@ def test_connect_to_container_passes_utf8_environment_to_docker_exec(monkeypatch
     ]
 
 
-def test_runtime_profile_prefix_sources_env_overlay_after_shell_profiles():
+def test_runtime_profile_prefix_never_sources_project_writable_profiles_or_overlay():
     orchestrator = DockerOrchestrator.__new__(DockerOrchestrator)
 
     prefix = orchestrator._runtime_profile_prefix()
 
     assert orch.ENV_OVERLAY_SCRIPT_PATH == "/workspace/.setup_agent/env_overlay.sh"
-    assert prefix.index("source /etc/profile 2>/dev/null || true") < (
-        prefix.index("source ~/.bashrc 2>/dev/null || true")
-    )
-    assert prefix.index("source ~/.bashrc 2>/dev/null || true") < prefix.index(
-        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
-    )
+    assert "source /etc/profile" not in prefix
+    assert "source ~/.bashrc" not in prefix
+    assert orch.ENV_OVERLAY_SCRIPT_PATH not in prefix
 
 
-def test_runtime_profile_prefix_overlay_wins_over_profile_path(tmp_path):
+def test_project_writable_profile_and_overlay_cannot_change_runtime_prefix(tmp_path):
     orchestrator = DockerOrchestrator.__new__(DockerOrchestrator)
     old_bin = tmp_path / "old-bin"
     new_bin = tmp_path / "new-bin"
@@ -212,23 +297,19 @@ def test_runtime_profile_prefix_overlay_wins_over_profile_path(tmp_path):
     bashrc.write_text(f"export PATH={shlex.quote(str(old_bin))}:$PATH\n")
     overlay.write_text(f"export PATH={shlex.quote(str(new_bin))}:$PATH\n")
 
-    prefix = (
-        orchestrator._runtime_profile_prefix()
-        .replace("/etc/profile", str(profile))
-        .replace("~/.bashrc", str(bashrc))
-        .replace(orch.ENV_OVERLAY_SCRIPT_PATH, str(overlay))
-    )
+    prefix = orchestrator._runtime_profile_prefix()
     completed = subprocess.run(
         ["/bin/bash", "-c", f"{prefix}; command -v mvn"],
         check=True,
         capture_output=True,
         text=True,
+        env={"PATH": f"{old_bin}:/usr/bin:/bin"},
     )
 
-    assert completed.stdout.strip() == str(new_maven)
+    assert completed.stdout.strip() == str(old_maven)
 
 
-def test_execute_command_sources_env_overlay_after_profiles_before_cd_and_command():
+def test_execute_command_never_sources_profiles_or_overlay_before_command():
     container = FakeContainer()
     orchestrator = build_orchestrator(container)
     workdir = "/workspace/project"
@@ -236,14 +317,82 @@ def test_execute_command_sources_env_overlay_after_profiles_before_cd_and_comman
     result = orchestrator.execute_command("echo hi", workdir=workdir)
 
     assert result["success"] is True
-    wrapped_command = container.exec_calls[-1]["exec_command"][2]
-    assert wrapped_command.index("source /etc/profile 2>/dev/null || true") < (
-        wrapped_command.index("source ~/.bashrc 2>/dev/null || true")
-    )
-    assert wrapped_command.index("source ~/.bashrc 2>/dev/null || true") < wrapped_command.index(
-        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
-    )
+    wrapped_command = container.exec_calls[-1]["exec_command"][-1]
+    assert "source /etc/profile" not in wrapped_command
+    assert "source ~/.bashrc" not in wrapped_command
+    assert orch.ENV_OVERLAY_SCRIPT_PATH not in wrapped_command
     assert wrapped_command.endswith(f"cd {shlex.quote(workdir)} && echo hi")
+
+
+def test_clean_control_command_uses_fixed_path_and_no_runtime_sources():
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_control_command(
+        "command -v base64",
+        environment={"PATH": "/workspace/attacker", "BASH_ENV": "/workspace/.bashrc"},
+    )
+
+    assert result["success"] is True
+    call = container.exec_calls[-1]
+    wrapped_command = call["exec_command"][-1]
+    assert "source /etc/profile" not in wrapped_command
+    assert "source ~/.bashrc" not in wrapped_command
+    assert orch.ENV_OVERLAY_SCRIPT_PATH not in wrapped_command
+    assert call["kwargs"]["environment"]["PATH"] == orch.CONTROL_EXEC_PATH
+    assert call["kwargs"]["environment"]["BASH_ENV"] == ""
+
+
+def test_clean_control_command_never_invokes_runtime_overlay_resolution(monkeypatch):
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+
+    def poisoned_runtime_environment(_environment=None):
+        raise AssertionError("project overlay resolver must not run")
+
+    monkeypatch.setattr(orchestrator, "_default_exec_environment", poisoned_runtime_environment)
+
+    result = orchestrator.execute_control_command("printf safe")
+
+    assert result["success"] is True
+    assert len(container.exec_calls) == 1
+
+
+def test_normal_runner_refuses_typed_unavailable_overlay_before_dispatch(monkeypatch):
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+
+    def unavailable(_environment=None):
+        raise EnvOverlayUnavailableError("published overlay was tampered")
+
+    monkeypatch.setattr(orchestrator, "_default_exec_environment", unavailable)
+
+    result = orchestrator.execute_command("mvn test", workdir="/workspace/project")
+
+    assert result["success"] is False
+    assert result["dispatch_status"] == "environment_overlay_unavailable"
+    assert result["runner_dispatched"] is False
+    assert container.exec_calls == []
+
+
+def test_normal_runner_environment_is_derived_from_authorized_overlay(monkeypatch, tmp_path):
+    orchestrator = DockerOrchestrator.__new__(DockerOrchestrator)
+    orchestrator.evidence_store_identity = lambda: "docker:test-overlay-environment"
+    orchestrator._sag_evidence_publication_authority = EvidencePublicationAuthority(
+        run_id="run-overlay-env",
+        sink=ControlEventSink(tmp_path / "control-events.jsonl"),
+    )
+
+    def authorized(_store, base):
+        assert base["CUSTOM"] == "1"
+        return {**base, "JAVA_HOME": "/opt/jdk-21", "PATH": "/opt/jdk-21/bin:/usr/bin"}
+
+    monkeypatch.setattr(EnvOverlayStore, "authorized_environment", authorized)
+
+    environment = orchestrator._default_exec_environment({"CUSTOM": "1"})
+
+    assert environment["JAVA_HOME"] == "/opt/jdk-21"
+    assert environment["PATH"] == "/opt/jdk-21/bin:/usr/bin"
 
 
 def test_execute_command_shell_quotes_workdir_with_space_and_single_quote():
@@ -254,12 +403,12 @@ def test_execute_command_shell_quotes_workdir_with_space_and_single_quote():
     result = orchestrator.execute_command("echo hi", workdir=workdir)
 
     assert result["success"] is True
-    wrapped_command = container.exec_calls[-1]["exec_command"][2]
+    wrapped_command = container.exec_calls[-1]["exec_command"][-1]
     assert f"cd {shlex.quote(workdir)} && echo hi" in wrapped_command
     assert "cd /workspace/project with" not in wrapped_command
 
 
-def test_execute_command_with_monitoring_sources_env_overlay_after_profiles():
+def test_execute_command_with_monitoring_never_sources_profiles_or_overlay():
     container = FakeContainer(FakeStreamingExecResult())
     orchestrator = build_orchestrator(container)
     workdir = "/workspace/project"
@@ -272,14 +421,104 @@ def test_execute_command_with_monitoring_sources_env_overlay_after_profiles():
     )
 
     assert result["success"] is True
-    wrapped_command = container.exec_calls[-1]["exec_command"][2]
-    assert wrapped_command.index("source /etc/profile 2>/dev/null || true") < (
-        wrapped_command.index("source ~/.bashrc 2>/dev/null || true")
-    )
-    assert wrapped_command.index("source ~/.bashrc 2>/dev/null || true") < wrapped_command.index(
-        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
-    )
+    wrapped_command = container.exec_calls[-1]["exec_command"][-1]
+    assert "source /etc/profile" not in wrapped_command
+    assert "source ~/.bashrc" not in wrapped_command
+    assert orch.ENV_OVERLAY_SCRIPT_PATH not in wrapped_command
     assert wrapped_command.endswith(f"cd {shlex.quote(workdir)} && echo hi")
+
+
+def test_clean_control_stream_uses_fixed_environment(monkeypatch):
+    container = FakeContainer(FakeStreamingExecResult())
+    orchestrator = build_orchestrator(container)
+
+    def poisoned_runtime_environment(_environment=None):
+        raise AssertionError("runtime overlay resolver must not run")
+
+    monkeypatch.setattr(orchestrator, "_default_exec_environment", poisoned_runtime_environment)
+
+    result = orchestrator.execute_control_command_with_monitoring(
+        "printf safe",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is True
+    assert container.exec_calls[-1]["kwargs"]["environment"]["PATH"] == orch.CONTROL_EXEC_PATH
+
+
+def test_clean_control_detached_launcher_never_uses_normal_runner(monkeypatch):
+    orchestrator = build_orchestrator(FakeContainer())
+    calls = []
+
+    def clean(command, **kwargs):
+        calls.append((command, kwargs))
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": f"PID:42\nPGID:42\nIDENTITY:{'a' * 64}\n",
+        }
+
+    def normal(*_args, **_kwargs):
+        raise AssertionError("normal runner must not launch control work")
+
+    monkeypatch.setattr(orchestrator, "execute_control_command", clean)
+    monkeypatch.setattr(orchestrator, "execute_command", normal)
+
+    result = orchestrator.execute_control_command_detached(
+        "printf safe",
+        workdir="/workspace/project",
+    )
+
+    assert result["started"] is True
+    assert len(calls) == 1
+    launcher = calls[0][0]
+    assert "source /etc/profile" not in launcher
+    assert "source ~/.bashrc" not in launcher
+    assert orch.ENV_OVERLAY_SCRIPT_PATH not in launcher
+
+
+def test_detached_evidence_poll_and_log_collection_use_clean_control_path(monkeypatch):
+    orchestrator = build_orchestrator(FakeContainer())
+    clean_commands = []
+
+    def clean(command, **_kwargs):
+        clean_commands.append(command)
+        if command.startswith("cat "):
+            return {"success": True, "exit_code": 0, "output": "BUILD SUCCESS"}
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": (
+                "SIZE:13\nNOW:1\n---TAIL---\n" + base64.b64encode(b"BUILD SUCCESS").decode("ascii")
+            ),
+        }
+
+    def normal(*_args, **_kwargs):
+        raise AssertionError("runtime PATH must not observe detached evidence")
+
+    monkeypatch.setattr(orchestrator, "execute_control_command", clean)
+    monkeypatch.setattr(orchestrator, "execute_command", normal)
+    handle = {
+        "log_path": "/tmp/sag_jobs/job.log",
+        "exit_code_path": "/tmp/sag_jobs/job.log.exit",
+        "pid": 42,
+        "process_identity_token": "a" * 64,
+        "terminal_authority": "docker_exec_inspect_v1",
+        "docker_exec_id": "d" * 64,
+        "container_id": "c" * 64,
+        "start_accepted": True,
+        "startup_identity_verified": True,
+        "runner_dispatched": True,
+        "runner_dispatch_state": "accepted",
+    }
+
+    poll = orchestrator.poll_detached_command(handle)
+    result = orchestrator.collect_detached_result(handle, poll)
+
+    assert poll["finished"] is True
+    assert result["success"] is True
+    assert len(clean_commands) == 2
 
 
 def test_execute_command_with_monitoring_treats_unknown_exit_build_failure_as_failure():
@@ -325,8 +564,7 @@ def test_execute_command_with_monitoring_treats_unknown_exit_pip_terminal_failur
             exit_code=None,
             output=[
                 (
-                    b"ERROR: No matching distribution found for "
-                    b"apache-tvm-ffi>=0.1.13\n",
+                    b"ERROR: No matching distribution found for " b"apache-tvm-ffi>=0.1.13\n",
                     b"",
                 )
             ],
@@ -406,9 +644,14 @@ def test_execute_command_with_monitoring_preserves_quoted_workdir_in_timeout_wra
     )
 
     assert result["success"] is True
-    final_command = container.exec_calls[-1]["exec_command"][2]
-    timeout_args = shlex.split(final_command)
-    assert timeout_args[:5] == ["timeout", "--preserve-status", "2400", "bash", "-c"]
-    base_command = timeout_args[5]
+    timeout_args = container.exec_calls[-1]["exec_command"]
+    assert timeout_args[:4] == [
+        "/usr/bin/timeout",
+        "--preserve-status",
+        "2400",
+        "/usr/bin/env",
+    ]
+    assert timeout_args[-3:-1] == ["/bin/bash", "-c"]
+    base_command = timeout_args[-1]
     assert f"cd {shlex.quote(workdir)} && echo hi" in base_command
     assert "cd /workspace/project with" not in base_command

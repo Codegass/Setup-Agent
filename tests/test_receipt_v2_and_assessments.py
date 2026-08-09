@@ -26,6 +26,7 @@ import hashlib
 import json
 import shlex
 
+from test_container_io import FakeContainer
 from test_invocation_receipts import (
     HASH_A,
     HASH_B,
@@ -43,9 +44,9 @@ from test_python_tool import (
 )
 
 from sag.agent import invocation_receipts
+from sag.agent.action_intents import action_fingerprint
 from sag.agent.evidence_assessments import (
     ASSESSMENT_DIR,
-    ASSESSMENT_HEREDOC,
     ASSESSMENT_SCHEMA_VERSION,
     ControlAssessment,
     ReceiptAssessment,
@@ -64,6 +65,12 @@ from sag.agent.invocation_receipts import (
     survey_pins,
     target_sha,
     toolchain_fingerprint,
+)
+from sag.agent.invocation_contracts import (
+    ARGV_EXECUTION_BINDING,
+    PYTHON_FACADE_EXECUTION_BINDING,
+    build_contract,
+    dispatch_contract,
 )
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
 
@@ -91,19 +98,85 @@ V1_ARGS = {
     "after": {SUREFIRE: HASH_A},
 }
 
+
+def python_test_authority(working_directory, *, args=None):
+    params = {"action": "test", "working_directory": working_directory}
+    if args is not None:
+        params["args"] = args
+    domain_id = f"test:{working_directory}"
+    contract = build_contract(
+        run_id="run-receipt-v2-python",
+        envelope_id="envelope-receipt-v2-python",
+        tool="build",
+        params=params,
+        effective_tool="python",
+        effective_action="test",
+        expected_cwd=working_directory,
+        expected_argv=None,
+        execution_binding=PYTHON_FACADE_EXECUTION_BINDING,
+        intent_source="controller",
+        intent_id="intent-receipt-v2-python",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+    )
+    return dispatch_contract(contract)
+
+
+def argv_contract_authority(*, executor, action, working_directory, expected_argv):
+    lowered = action.lower()
+    public_action = (
+        "test"
+        if "test" in lowered or "verify" in lowered
+        else "compile"
+        if "compile" in lowered
+        else "deps"
+        if "depend" in lowered
+        else "install"
+        if "install" in lowered or "publishtomavenlocal" in lowered
+        else "package"
+    )
+    params = {"action": public_action, "working_directory": working_directory}
+    domain_id = f"test:{working_directory}"
+    contract = build_contract(
+        run_id=f"run-receipt-v2-{executor}",
+        envelope_id=f"envelope-receipt-v2-{executor}-{action}",
+        tool="build",
+        params=params,
+        effective_tool=executor,
+        effective_action=action,
+        expected_cwd=working_directory,
+        expected_argv=expected_argv,
+        execution_binding=ARGV_EXECUTION_BINDING,
+        intent_source="controller",
+        intent_id=f"intent-receipt-v2-{executor}-{action}",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+    )
+    return dispatch_contract(contract)
+
 SHA = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809111213"
 
 
 def assessments_written(commands):
-    """Every assessment body persisted through the recorded commands."""
-    payloads = []
+    """Replay bounded transport commands and return finalized assessments."""
+    filesystem = FakeContainer()
     for command in commands:
-        if ASSESSMENT_DIR not in command or ASSESSMENT_HEREDOC not in command:
-            continue
-        _, _, rest = command.partition("\n")
-        body, _, _ = rest.partition(f"\n{ASSESSMENT_HEREDOC}")
-        payloads.append(json.loads(body))
-    return payloads
+        filesystem.execute_command(command)
+    return [
+        json.loads(body)
+        for path, body in sorted(filesystem.files.items())
+        if path.startswith(f"{ASSESSMENT_DIR}/") and path.endswith(".json")
+    ]
 
 
 class ContainerFS:
@@ -118,9 +191,56 @@ class ContainerFS:
         self.files = dict(files or {})
         self.writable = writable
         self.commands = []
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        tokens = (
+            shlex.split(command)
+            if "\n" not in command or command.startswith("python3 -c ")
+            else []
+        )
+        if tokens[:2] == ["python3", "-c"] and "fcntl.flock" in tokens[2]:
+            target, candidate, _lock_path, expected, expected_bytes, expected_sha = tokens[3:9]
+            candidate_bytes = self.files.get(candidate, "").encode("utf-8")
+            if (
+                len(candidate_bytes) != int(expected_bytes)
+                or hashlib.sha256(candidate_bytes).hexdigest() != expected_sha
+            ):
+                return {
+                    "success": False,
+                    "exit_code": 76,
+                    "output": "SAG_CAS_CANDIDATE_INVALID\n",
+                }
+            current = self.files.get(target)
+            actual = (
+                "absent"
+                if current is None
+                else "sha256:" + hashlib.sha256(current.encode("utf-8")).hexdigest()
+            )
+            if actual != expected:
+                return {
+                    "success": False,
+                    "exit_code": 75,
+                    "output": "SAG_CAS_CONFLICT\n",
+                }
+            self.files[target] = self.files.pop(candidate)
+            return {"success": True, "exit_code": 0, "output": ""}
+        atomic_command = (
+            tokens[:3] == ["mkdir", "-p", "--"]
+            or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+            or tokens[:2] == ["base64", "--decode"]
+            or tokens[:3] == ["mv", "-f", "--"]
+            or (
+                tokens[:2] == ["python3", "-c"]
+                and ("hashlib.sha256" in tokens[2] or "json.load" in tokens[2])
+            )
+        )
+        if atomic_command:
+            if not self.writable and tokens[:2] != ["rm", "-f"]:
+                return fail("Read-only file system")
+            return self.atomic.execute_command(command)
         if command.startswith("cat ") and "\n" not in command:
             path = shlex.split(command)[-1]
             if path in self.files:
@@ -222,6 +342,8 @@ def test_receipt_v2_omits_every_fact_it_does_not_know():
     assert set(receipt) == {
         "schema_version",
         *V1_KEYS,
+        # Every live v2 receipt is bound to one process run.
+        "run_id",
         # The one fact a dispatch always knows: where it ran.
         "actual_cwd",
     }
@@ -538,6 +660,7 @@ def test_record_invocation_persists_every_v2_fact_it_could_observe():
         requirements=V2_MANIFEST,
         contract_id="ic-000000000abc",
         contract_hash="e" * 64,
+        execution_binding=ARGV_EXECUTION_BINDING,
         compliance="exact",
     )
 
@@ -652,6 +775,7 @@ def test_record_invocation_still_writes_a_receipt_when_every_probe_is_silent():
         "schema_version",
         *V1_KEYS,
         "actual_cwd",
+        "run_id",
     }
 
 
@@ -705,6 +829,7 @@ def test_receipt_assessment_payload_states_the_typed_verdict():
         "assessment_id": assessment.assessment_id,
         "receipt_id": "inv-gradle-1-0001",
         "typed_code": "compile_no_source_mismatch",
+        "blocker_owner": "project",
         "detail": "every executed compile task reported NO-SOURCE",
         "fingerprints": {"target_sha": SHA},
         "created_event": "evt-42",
@@ -719,6 +844,7 @@ def test_receipt_assessment_payload_omits_the_facts_it_was_not_given():
         "assessment_id": assessment.assessment_id,
         "receipt_id": "inv-gradle-1-0001",
         "typed_code": "x",
+        "blocker_owner": "unknown",
     }
 
 
@@ -736,6 +862,7 @@ def test_control_assessment_payload_names_the_stage_that_refused():
         "event_or_intent_id": "ctl-python_test-0001",
         "stage": "precondition",
         "typed_code": "PYTEST_ARGS_REJECTED",
+        "blocker_owner": "unknown",
         "detail": "'make' is not an existing test path",
     }
 
@@ -752,10 +879,32 @@ def test_write_assessment_persists_atomically_under_the_assessment_dir():
 
     final = f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json"
     (write,) = execute.writes()
-    assert f"mkdir -p {ASSESSMENT_DIR}" in write
-    assert f"{final}.tmp" in write
-    assert f"mv -f {final}.tmp {final}" in write
+    assert any(command == f"mkdir -p -- {ASSESSMENT_DIR}" for command in execute.commands)
+    assert write.startswith("mv -f -- ")
+    assert ".candidate." in write
+    assert any(
+        command.startswith("python3 -c ")
+        and "fcntl.flock" in command
+        and final in command
+        for command in execute.commands
+    )
     assert json.loads(execute.files[final]) == assessment.payload()
+
+
+def test_large_assessment_streams_without_an_oversized_shell_command():
+    execute = ContainerFS()
+    assessment = ReceiptAssessment(
+        receipt_id="inv-gradle-1-0001",
+        typed_code="expectation_unmet",
+        created_event="event-" + ("x" * 200_000),
+    )
+
+    assert write_assessment(execute, assessment) is True
+
+    final = f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json"
+    assert json.loads(execute.files[final]) == assessment.payload()
+    assert max(map(len, execute.commands)) <= 60200
+    assert not any(path.endswith(".tmp") for path in execute.files)
 
 
 def test_write_assessment_is_idempotent_for_the_same_body():
@@ -766,7 +915,8 @@ def test_write_assessment_is_idempotent_for_the_same_body():
     assert write_assessment(execute, assessment) is True
 
     assert len(execute.writes()) == 1
-    assert assessments_written(execute.commands) == [assessment.payload()]
+    final = f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json"
+    assert json.loads(execute.files[final]) == assessment.payload()
 
 
 def test_write_assessment_never_overwrites_a_different_body_under_one_id():
@@ -826,7 +976,9 @@ def test_control_assessment_stage_must_be_one_of_the_typed_stages():
 # ---------------------------------------------------------------------------
 
 
-def test_gradle_no_source_appends_an_assessment_and_writes_the_receipt_once():
+def test_gradle_no_source_appends_an_assessment_and_writes_the_receipt_once(
+    facade_contract_authority,
+):
     from test_semantic_action_conservation import SelfProbingGradleOrchestrator
 
     orchestrator = SelfProbingGradleOrchestrator(
@@ -834,11 +986,17 @@ def test_gradle_no_source_appends_an_assessment_and_writes_the_receipt_once():
     )
     from sag.tools.internal.gradle_tool import GradleTool
 
-    result = GradleTool(orchestrator).execute(
-        tasks="compileJava",
+    with argv_contract_authority(
+        executor="gradle",
+        action="compileJava",
         working_directory="/workspace/p",
-        use_wrapper=False,
-    )
+        expected_argv="--build-cache compileJava",
+    ):
+        result = GradleTool(orchestrator).execute(
+            tasks="compileJava",
+            working_directory="/workspace/p",
+            use_wrapper=False,
+        )
 
     assert result.succeeded is False
     (receipt,) = receipts_written(orchestrator.commands)
@@ -867,12 +1025,17 @@ def test_gradle_no_source_appends_an_assessment_and_writes_the_receipt_once():
 # ---------------------------------------------------------------------------
 
 
-def test_rejected_pytest_args_write_a_precondition_control_assessment():
+def test_rejected_pytest_args_write_a_precondition_control_assessment(
+    facade_contract_authority,
+):
     from sag.tools.internal.python_tool import PythonTool
 
     orch = Orch(manifest=dict(MANIFEST))
 
-    result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args="make test")
+    with python_test_authority("/workspace/proj", args="make test"):
+        result = PythonTool(orch).execute(
+            "test", working_directory="/workspace/proj", args="make test"
+        )
 
     assert result.error_code == "PYTEST_ARGS_REJECTED"
     (assessment,) = assessments_written(orch.commands)
@@ -884,7 +1047,9 @@ def test_rejected_pytest_args_write_a_precondition_control_assessment():
     assert receipts_written(orch.commands) == []
 
 
-def test_unavailable_native_smoke_writes_a_precondition_control_assessment():
+def test_unavailable_native_smoke_writes_a_precondition_control_assessment(
+    facade_contract_authority,
+):
     from sag.tools.internal.python_tool import PythonTool
 
     orch = Orch(
@@ -892,7 +1057,8 @@ def test_unavailable_native_smoke_writes_a_precondition_control_assessment():
         rules=tvm_native_smoke_rules("3 tests collected in 0.2s", target_exists=False),
     )
 
-    result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
+    with python_test_authority("/workspace/tvm"):
+        result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
 
     assert result.error_code == "NATIVE_SMOKE_UNAVAILABLE"
     (assessment,) = assessments_written(orch.commands)
@@ -901,14 +1067,17 @@ def test_unavailable_native_smoke_writes_a_precondition_control_assessment():
     assert receipts_written(orch.commands) == []
 
 
-def test_two_distinct_refusals_are_two_distinct_control_assessments():
+def test_two_distinct_refusals_are_two_distinct_control_assessments(
+    facade_contract_authority,
+):
     from sag.tools.internal.python_tool import PythonTool
 
     orch = Orch(manifest=dict(MANIFEST))
     tool = PythonTool(orch)
 
-    tool.execute("test", working_directory="/workspace/proj", args="make test")
-    tool.execute("test", working_directory="/workspace/proj", args="make test")
+    with python_test_authority("/workspace/proj", args="make test"):
+        tool.execute("test", working_directory="/workspace/proj", args="make test")
+        tool.execute("test", working_directory="/workspace/proj", args="make test")
 
     ids = [assessment["assessment_id"] for assessment in assessments_written(orch.commands)]
     assert len(ids) == 2

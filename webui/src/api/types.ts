@@ -19,6 +19,86 @@ export interface SystemSummary {
   cpuLoad?: number | null
 }
 
+export interface EvidenceCountSummary {
+  executed: number | null
+  passed: number | null
+  failed: number | null
+  errors: number | null
+  skipped: number | null
+  availability?: "available" | "unavailable" | null
+  reason?: string | null
+  basis?: string | null
+}
+
+export interface ObservationCountSummary extends EvidenceCountSummary {
+  reportFileCount?: number | null
+  reasonCounts?: Record<string, number> | null
+}
+
+export interface TestEvidenceLayers {
+  claimed: {
+    latestSubjects: EvidenceCountSummary
+    latestCases: EvidenceCountSummary
+    receiptExecutions: EvidenceCountSummary
+  }
+  quarantinedObservations: ObservationCountSummary
+  unattributedObservations: ObservationCountSummary
+  staleObservations: ObservationCountSummary
+  retriedCases?: number | null
+  flakyCases?: number | null
+}
+
+export interface MetricsV2EvidenceSummary {
+  integrity: "complete" | "degraded" | "failed" | "unavailable"
+  receiptsExpected: number | null
+  receiptsPersisted: number | null
+  terminalReceiptsUnpersisted: number | null
+  conflictCount: number
+}
+
+export interface MetricsV2Summary {
+  schemaVersion: 2
+  identityVersion: "module-qualified-v1"
+  run: {
+    runId: string | null
+    targetSha: string | null
+    sagSha: string | null
+    promptHash: string | null
+    controlBundleHash: string | null
+    imageDigest: string | null
+    modelPin: string | null
+    runOrderIndex: number | null
+    pinStatus: "complete" | "incomplete"
+    missingPins: string[]
+  }
+  outcome: {
+    verdict: CanonicalVerdict
+    buildState: string
+    testState: string
+    terminalReason: string
+  }
+  evidence: MetricsV2EvidenceSummary
+  tests: TestEvidenceLayers
+  coverage: {
+    domainsDiscovered: number | null
+    domainsAttempted: number | null
+    domainsTerminal: number | null
+    domainsWithClaimedTests: number | null
+  }
+  control: {
+    terminalRefusalRecurrences: number | null
+    unsettledJobs: number | null
+    cleanupEscalations: number | null
+    midrunHumanApprovals: number | null
+  }
+}
+
+export interface EvidenceLayerProjectionSummary {
+  projectionStatus: "metrics-v2-artifact-unavailable"
+  tests: TestEvidenceLayers
+  evidence: MetricsV2EvidenceSummary
+}
+
 export interface TestSummary {
   state: string
   pass: number
@@ -41,6 +121,7 @@ export interface TestSummary {
   conflicts?: string[]
   evidenceRefs?: string[]
   note?: string
+  evidenceLayers?: MetricsV2Summary | EvidenceLayerProjectionSummary | null
 }
 
 export interface BuildSummary {

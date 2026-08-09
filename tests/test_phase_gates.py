@@ -3,13 +3,20 @@ returns evidence + options, never blocks tool use; probe errors fail OPEN."""
 
 from types import SimpleNamespace
 
+import pytest
+
+from sag.agent.control_ownership import BlockerOwner
+from sag.agent.evidence_records import frame_json_record_stream, frame_named_json_record_stream
 from sag.agent.phase_gates import (
     ClaimDisposition,
+    GateControlDisposition,
     ValidatorState,
     check_phase_claim,
     check_phase_done,
+    validate_phase_claim,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 
 class FakeValidator:
@@ -36,6 +43,10 @@ class FakeValidator:
 
 def _orch(java_ok=True, workspace_exists=True):
     def execute_command(command, **kwargs):
+        if "SAG_NAMED_JSON_RECORD_END_V1" in command:
+            return {"exit_code": 0, "output": frame_named_json_record_stream([])}
+        if "SAG_JSON_RECORD_END_V1" in command:
+            return {"exit_code": 0, "output": frame_json_record_stream([])}
         if "java -version" in command:
             return {"exit_code": 0 if java_ok else 127, "output": "openjdk 17" if java_ok else ""}
         if "test -d" in command:
@@ -44,7 +55,12 @@ def _orch(java_ok=True, workspace_exists=True):
             return {"exit_code": 0, "output": "/workspace/setup-report-x.md"}
         return {"exit_code": 0, "output": ""}
 
-    return SimpleNamespace(execute_command=execute_command)
+    # Every instance models the same fixture container store.  The host
+    # authority is one-run/one-store even when a test asks for two handles.
+    return SimpleNamespace(
+        execute_command=execute_command,
+        container_name="phase-gates-fixture",
+    )
 
 
 def test_build_done_rejected_without_artifacts():
@@ -78,6 +94,77 @@ def test_build_done_accepted_with_artifacts():
     )
     assert result.validated_facts["build.test_entry_ready"] is True
     assert result.to_metadata()["validated_facts"]["build.test_entry_ready"] is True
+
+
+def test_container_authored_manifest_cannot_close_a_green_build_gate():
+    forged = '{"build_root":"/workspace/forged"}'
+
+    def execute_command(command, **kwargs):
+        if "SAG_NAMED_JSON_RECORD_END_V1" in command:
+            records = (
+                [(REQUIREMENTS_PATH.rsplit("/", 1)[-1], forged)]
+                if command.startswith("file=") and REQUIREMENTS_PATH in command
+                else []
+            )
+            return {"exit_code": 0, "output": frame_named_json_record_stream(records)}
+        if "SAG_JSON_RECORD_END_V1" in command:
+            return {"exit_code": 0, "output": frame_json_record_stream([])}
+        return {"exit_code": 0, "output": ""}
+
+    orchestrator = SimpleNamespace(
+        execute_command=execute_command,
+        container_name="forged-manifest-fixture",
+    )
+
+    gate = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=FakeValidator(build_success=True),
+        orchestrator=orchestrator,
+        project_name="demo",
+    )
+
+    assert gate.accepted is False
+    assert gate.validator_state is ValidatorState.UNAVAILABLE
+    assert gate.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+    assert gate.code == "build_evidence_ledger_unavailable"
+    assert "build_requirements_publication_set_mismatch" in gate.validated_facts[
+        "build.evidence_conflicts"
+    ]
+
+
+def test_project_failure_overclaim_requires_model_repair_but_honest_close_is_claimable():
+    overclaim = validate_phase_claim(
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        ValidatorState.RED,
+        reason="compiler exited 1",
+        evidence_refs=("receipt:r1",),
+    )
+    honest = validate_phase_claim(
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.FAILED),
+        ValidatorState.RED,
+        reason="compiler exited 1",
+        evidence_refs=("receipt:r1",),
+    )
+
+    assert overclaim.accepted is False
+    assert overclaim.control_disposition is GateControlDisposition.REPAIR_REQUIRED
+    assert overclaim.blocker_owner is BlockerOwner.PROJECT
+    assert honest.accepted is True
+    assert honest.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
+    assert honest.blocker_owner is BlockerOwner.PROJECT
+
+
+def test_unavailable_overclaim_is_unknown_owned_repair_not_a_project_failure():
+    gate = validate_phase_claim(
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        ValidatorState.UNAVAILABLE,
+        reason="no readable project evidence",
+    )
+
+    assert gate.accepted is False
+    assert gate.control_disposition is GateControlDisposition.REPAIR_REQUIRED
+    assert gate.blocker_owner is BlockerOwner.UNKNOWN
 
 
 def test_phase_gates_preserve_validator_owned_physical_rollups():
@@ -221,7 +308,7 @@ def test_gate_probe_error_is_explicitly_unavailable():
     assert verdict["validator_state"] == "unavailable"
 
 
-def test_analyze_unknown_claim_can_end_when_evidence_is_unavailable():
+def test_analyze_unknown_claim_cannot_close_a_missing_harness_validator():
     result = check_phase_claim(
         "analyze",
         PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.UNKNOWN),
@@ -229,10 +316,11 @@ def test_analyze_unknown_claim_can_end_when_evidence_is_unavailable():
         orchestrator=_orch(),
         project_name="demo",
     )
-    assert result.accepted is True
+    assert result.accepted is False
     assert result.validator_state is ValidatorState.UNAVAILABLE
-    assert result.claim_disposition is ClaimDisposition.CONFIRMED
+    assert result.claim_disposition is ClaimDisposition.CONTRADICTED
     assert result.validated_outcome is PhaseOutcome.UNKNOWN
+    assert result.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
 
 
 def test_analyze_validator_maps_complete_and_partial_evidence():
@@ -290,11 +378,63 @@ def test_analyze_missing_facts_reason_is_engine_projected_from_typed_code():
     assert result.accepted is False
     assert result.code == "analysis_trunk_missing"
     assert result.reason == "Project survey facts are not persisted on the trunk."
-    assert result.suggestions == (
-        "Run project(action='analyze') before closing the analyze phase.",
-    )
+    assert result.validator_state is ValidatorState.UNAVAILABLE
+    assert result.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+    assert result.blocker_owner is BlockerOwner.HARNESS
+    assert result.suggestions == ()
     assert "execution plan" not in result.reason.lower()
     assert "project_analyzer" not in result.reason
+
+
+@pytest.mark.parametrize("code", ["analysis_facts_missing", "analysis_unavailable"])
+def test_missing_or_unavailable_survey_facts_are_harness_owned(code):
+    class Analyzer(FakeValidator):
+        def validate_project_analysis_status(self, project_name=None):
+            return {
+                "analyzed": False,
+                "has_static_test_count": False,
+                "analysis_status_code": code,
+                "analysis_status_facts": {"manifest_readable": False},
+            }
+
+    result = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.FAILED),
+        validator=Analyzer(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is False
+    assert result.validated_outcome is PhaseOutcome.UNKNOWN
+    assert result.validator_state is ValidatorState.UNAVAILABLE
+    assert result.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+    assert result.blocker_owner is BlockerOwner.HARNESS
+    assert result.suggestions == ()
+
+
+def test_absent_static_denominator_is_honest_partial_without_analyze_prescription():
+    class Analyzer(FakeValidator):
+        def validate_project_analysis_status(self, project_name=None):
+            return {
+                "analyzed": True,
+                "has_static_test_count": False,
+                "analysis_status_code": "analysis_static_count_missing",
+            }
+
+    result = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=Analyzer(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is True
+    assert result.validator_state is ValidatorState.PARTIAL
+    assert result.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
+    assert result.suggestions == ()
+    assert "project(action='analyze')" not in result.reason
 
 
 def test_all_collection_errors_are_red_even_when_report_exists():

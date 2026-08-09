@@ -1,6 +1,15 @@
 import json
 
+from sag.agent.control_events import ControlEventSink
+from sag.agent.evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+)
+from sag.agent.verdict_finalizer import validate_verdict_snapshot_v3
 from scripts.collect_control_layer_ab import check_surfaces, prepare_surface_artifacts
+from container_evidence_fakes import canonical_json, complete_run_pin
 
 
 def _artifacts(tmp_path, *, cli_passed=541, cli_flaky=3):
@@ -75,6 +84,29 @@ def _artifacts(tmp_path, *, cli_passed=541, cli_flaky=3):
             }
         ),
         encoding="utf-8",
+    )
+    pin_raw = canonical_json(complete_run_pin("surface-run", "a" * 40)).encode("utf-8")
+    (tmp_path / "run-pin.json").write_bytes(pin_raw)
+    (setup / "run-pin.json").write_bytes(pin_raw)
+    verdict_path = setup / "verdict.json"
+    snapshot = validate_verdict_snapshot_v3(json.loads(verdict_path.read_text(encoding="utf-8")))
+    verdict_raw = snapshot.model_dump_json().encode("utf-8")
+    verdict_path.write_bytes(verdict_raw)
+    sink = ControlEventSink(tmp_path / "control_events.jsonl")
+    authority = EvidencePublicationAuthority.for_live_run(run_id="surface-run", sink=sink)
+    authority.publish_revision(
+        record_kind="run_pin",
+        record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        raw=pin_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    )
+    authority.publish_revision(
+        record_kind="verdict",
+        record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        raw=verdict_raw,
+        expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
     )
     return tmp_path
 

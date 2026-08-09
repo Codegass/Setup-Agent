@@ -295,17 +295,16 @@ class _DenominatorOrch:
         return {"exit_code": 0, "output": ""}
 
 
-def test_collect_only_denominator_outranks_static_count_on_python():
-    """python: env-summary static=32927 present AND collected=1927 -> the gate
-    denominator is 1927 (ground truth), the static heuristic is preserved as
-    evidence only."""
-    validator = PhysicalValidator(docker_orchestrator=_DenominatorOrch(), project_path="/workspace")
+def test_unpublished_collect_only_mirror_cannot_override_static_count_on_python():
+    orch = _DenominatorOrch()
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
     result = validator.validate_project_analysis_status("click")
 
-    assert result["static_test_count"] == 1927
-    assert result["static_test_count_source"] == "pytest_collect_only"
-    assert result["static_test_count_static_scan"] == 32927
+    assert result["static_test_count"] == 32927
+    assert "static_test_count_source" not in result
+    assert "static_test_count_static_scan" not in result
+    assert not any(COLLECTED_JSON in command for command in orch.commands)
 
 
 def test_java_env_summary_static_count_priority_unchanged():

@@ -17,9 +17,10 @@ A. A Python-primary repo (classifier -> project_type 'python') that also ships a
    ADDITIVELY, Java+Maven for that binding. Python must not displace Java, and
    Java must not displace python. Java-primary projects are unchanged.
 
-B. The report's '## Actionable Recommendations' template must be
-   language-aware: a snapshot whose build system is python renders pytest/pip
-   guidance and NEVER emits 'mvn' strings.
+B. The report may describe the detected language, but an ecosystem label alone
+   cannot authorize a synthetic pytest/pip/mvn command. Only observed survey or
+   execution text may appear, and it must be labeled as evidence rather than a
+   recommendation.
 """
 
 from sag.tools.internal.project_setup_tool import (
@@ -260,16 +261,16 @@ def _render_recommendations(build_system):
     return "\n".join(tool._render_issues_recommendations(snapshot))
 
 
-def test_python_snapshot_recommendations_have_no_mvn():
-    """A python snapshot must render pytest/pip guidance and NEVER 'mvn'."""
+def test_python_snapshot_without_survey_does_not_invent_ecosystem_commands():
+    """An ecosystem label alone cannot become a Python or Maven command."""
     text = _render_recommendations("python")
     assert "mvn" not in text
-    assert "pytest" in text
+    assert "pytest" not in text
+    assert "no project command is inferred" in text
 
 
-def test_python_snapshot_recommendations_low_exec_rate_no_mvn():
-    """Even the low-execution-rate branch (which historically emitted
-    'mvn test -pl ...') must stay python for a python snapshot."""
+def test_python_low_execution_rate_reports_gap_without_selecting_a_runner():
+    """Low coverage is a fact, not authority to compose a repair command."""
     from sag.tools.report_tool import ReportTool
 
     tool = ReportTool.__new__(ReportTool)
@@ -291,10 +292,13 @@ def test_python_snapshot_recommendations_low_exec_rate_no_mvn():
     }
     text = "\n".join(tool._render_issues_recommendations(snapshot))
     assert "mvn" not in text
-    assert "pytest" in text
+    assert "pytest" not in text
+    assert "Low Execution Rate" in text
+    assert "no project command is inferred" in text
 
 
-def test_maven_snapshot_recommendations_unchanged():
-    """Java snapshots keep the maven recommendations byte-for-byte."""
+def test_maven_snapshot_without_survey_does_not_invent_maven_command():
+    """A Maven label cannot authorize a synthetic command in the report."""
     text = _render_recommendations("maven")
-    assert "mvn clean test -DskipTests=false" in text
+    assert "mvn clean test -DskipTests=false" not in text
+    assert "no project command is inferred" in text

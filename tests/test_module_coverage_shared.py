@@ -13,11 +13,14 @@ carry the checklist. Same algorithm both places, or the in-run guidance and
 the sealed verdict would disagree (the exact split this campaign just fixed).
 """
 
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.module_coverage import (
     coverage_checklist_line,
     coverage_conflicts,
     module_coverage,
 )
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 
 class FakeValidator:
@@ -43,20 +46,40 @@ def _bigtop_validator():
         primary="maven",
         by_system={
             "maven": [
-                {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
-                 "report_dirs": [], "has_test_sources": False},
-                {"path": "bigtop-test-framework", "name": "bigtop-test-framework",
-                 "class_count": 0, "jar_count": 0, "report_dirs": [],
-                 "has_test_sources": True},
+                {
+                    "path": ".",
+                    "name": ".",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": False,
+                },
+                {
+                    "path": "bigtop-test-framework",
+                    "name": "bigtop-test-framework",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": True,
+                },
             ],
             "gradle": [
-                {"path": "bigtop-data-generators/bigtop-samplers",
-                 "name": "bigtop-samplers", "class_count": 39, "jar_count": 1,
-                 "report_dirs": ["/x/build/test-results/test"],
-                 "has_test_sources": True},
-                {"path": "bigtop-bigpetstore/bigpetstore-spark", "name": "spark",
-                 "class_count": 0, "jar_count": 0, "report_dirs": [],
-                 "has_test_sources": True},
+                {
+                    "path": "bigtop-data-generators/bigtop-samplers",
+                    "name": "bigtop-samplers",
+                    "class_count": 39,
+                    "jar_count": 1,
+                    "report_dirs": ["/x/build/test-results/test"],
+                    "has_test_sources": True,
+                },
+                {
+                    "path": "bigtop-bigpetstore/bigpetstore-spark",
+                    "name": "spark",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": True,
+                },
             ],
         },
         tests_by_path={
@@ -94,22 +117,32 @@ def _httpcomponents_validator():
     tested. scan_modules marks the root aggregator_shell=True; the coverage
     summary must exclude it so the ratio reads 5/5, not 5/6."""
     modules = [
-        {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
-         "report_dirs": [], "has_test_sources": False, "aggregator_shell": True},
+        {
+            "path": ".",
+            "name": ".",
+            "class_count": 0,
+            "jar_count": 0,
+            "report_dirs": [],
+            "has_test_sources": False,
+            "aggregator_shell": True,
+        },
     ]
     for i in range(1, 6):
-        modules.append({
-            "path": f"module{i}", "name": f"module{i}",
-            "class_count": 100 + i, "jar_count": 1,
-            "report_dirs": [f"/x/module{i}/target/surefire-reports"],
-            "has_test_sources": True,
-        })
+        modules.append(
+            {
+                "path": f"module{i}",
+                "name": f"module{i}",
+                "class_count": 100 + i,
+                "jar_count": 1,
+                "report_dirs": [f"/x/module{i}/target/surefire-reports"],
+                "has_test_sources": True,
+            }
+        )
     return FakeValidator(
         primary="maven",
         by_system={"maven": modules},
         tests_by_path={
-            f"module{i}": {"tests_total": 400 + i, "tests_passed": 400 + i,
-                           "failing_count": 0}
+            f"module{i}": {"tests_total": 400 + i, "tests_passed": 400 + i, "failing_count": 0}
             for i in range(1, 6)
         },
     )
@@ -133,6 +166,12 @@ def test_aggregator_shell_root_excluded_from_module_ratio():
 def test_aggregator_shell_verdict_folds_to_success():
     """End-to-end: with the shell uncounted, an otherwise-green run seals SUCCESS
     (the httpcomponents cap folded it to partial)."""
+    from container_evidence_fakes import ContainerFS
+    from sag.agent.evidence_publications import (
+        EvidencePublicationAuthority,
+        install_evidence_publication_authority,
+        reset_evidence_publication_authority,
+    )
     from sag.agent.evidence_state import EvidenceRole, StateScope
     from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
     from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
@@ -153,29 +192,17 @@ def test_aggregator_shell_verdict_folds_to_success():
 
     class Orch:
         def __init__(self):
-            self.files = {}
+            self.filesystem = ContainerFS()
+            self.files = self.filesystem.files
 
-        def execute_command(self, command):
-            if command.startswith("mkdir -p "):
-                return {"success": True, "exit_code": 0, "output": ""}
-            if command.startswith("test -f ") and " && cat " in command:
-                path = command.split()[2]
-                if path not in self.files:
-                    return {"success": False, "exit_code": 1, "output": ""}
-                return {"success": True, "exit_code": 0, "output": self.files[path]}
-            if command.startswith("cat > "):
-                path = command.split()[2]
-                self.files[path] = command.split("\n", 1)[1].rsplit("\n", 1)[0] + "\n"
-                return {"success": True, "exit_code": 0, "output": ""}
-            if command.startswith("truncate -s -1 "):
-                path = command.split()[-1]
-                self.files[path] = self.files[path][:-1]
-                return {"success": True, "exit_code": 0, "output": ""}
-            if command.startswith("mv "):
-                _, src, tgt = command.split()
-                self.files[tgt] = self.files.pop(src)
-                return {"success": True, "exit_code": 0, "output": ""}
-            return {"success": True, "exit_code": 0, "output": ""}
+        def execute_command(self, command, **kwargs):
+            return self.filesystem(command, **kwargs)
+
+    class Sink:
+        path = "/host/module-coverage-control-events.jsonl"
+
+        def emit(self, kind, payload, *, source=None):
+            del kind, payload, source
 
     class V:
         project_path = "/workspace"
@@ -184,9 +211,14 @@ def test_aggregator_shell_verdict_folds_to_success():
             self._cov = cov
 
         def validate_build_status(self, project_name):
-            return {"success": True, "build_complete": True, "reason": "all compiled",
-                    "conflicts": [], "evidence_status": "success",
-                    "evidence": {"class_count": 515}}
+            return {
+                "success": True,
+                "build_complete": True,
+                "reason": "all compiled",
+                "conflicts": [],
+                "evidence_status": "success",
+                "evidence": {"class_count": 515},
+            }
 
         def _detect_build_system(self, project_dir):
             return self._cov._detect_build_system(project_dir)
@@ -199,12 +231,14 @@ def test_aggregator_shell_verdict_folds_to_success():
 
     state = RunEvidenceState(run_id="session-httpcomponents")
     state.ingest_tool_result(
-        StateScope.ARTIFACTS, "build",
+        StateScope.ARTIFACTS,
+        "build",
         ToolResult.completed_success(output="all modules built", refs=["output_build"]),
         provenance="output_build",
     )
     state.ingest_tool_result(
-        StateScope.TEST_RUNTIME, "build",
+        StateScope.TEST_RUNTIME,
+        "build",
         ToolResult.completed_success(
             output="green",
             test_stats=TestStats(discovered=2255, executed=2255, passed=2255, failed=0, skipped=0),
@@ -212,7 +246,18 @@ def test_aggregator_shell_verdict_folds_to_success():
         ),
         provenance="output_tests",
     )
-    finalizer = VerdictFinalizer(Orch(), validator=V(inner), project_name="httpcomponents-client")
+    orchestrator = Orch()
+    authority = EvidencePublicationAuthority(
+        run_id=state.run_id,
+        sink=Sink(),
+    )
+    token = install_evidence_publication_authority(authority, orchestrator=orchestrator)
+    reset_evidence_publication_authority(token)
+    finalizer = VerdictFinalizer(
+        orchestrator,
+        validator=V(inner),
+        project_name="httpcomponents-client",
+    )
     snapshot = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
     assert "build_modules_incomplete" not in snapshot.conflicts
     assert snapshot.verdict == "success"
@@ -276,7 +321,9 @@ def test_build_gate_response_names_unbuilt_modules():
     islands taught the agent to give up. The gate's reason must carry the
     checklist — on ACCEPTANCE too, not only on rejection."""
     claim = PhaseClaim(
-        phase="build", signal="done", claimed_outcome="partial",
+        phase="build",
+        signal="done",
+        claimed_outcome="partial",
         key_results="built the samplers island",
     )
     gate = check_phase_claim("build", claim, _gate_validator(), None, "bigtop")
@@ -290,7 +337,9 @@ def test_blocked_rejection_is_informative_not_gaslighting():
     """The rejection must explain WHY blocked does not fit AND what remains —
     never a bare 'evidence is green' to an agent that just watched a failure."""
     claim = PhaseClaim(
-        phase="build", signal="blocked", claimed_outcome="failed",
+        phase="build",
+        signal="blocked",
+        claimed_outcome="failed",
         reason="maven island will not compile",
     )
     gate = check_phase_claim("build", claim, _gate_validator(), None, "bigtop")
@@ -301,49 +350,108 @@ def test_blocked_rejection_is_informative_not_gaslighting():
     assert "1/4 built" in text or "no output yet" in text
 
 
-# ---- Loop guidance names the untried recommended targets (fix 3) ----
+# ---- Loop guidance names factual untried coordinates (fix 3) ----
 
 from types import SimpleNamespace
 
 from sag.agent.react_engine import ReActEngine
 
 
-def _loop_engine(islands, observed_workdirs):
+def _loop_engine(islands, observed_workdirs, *, receipt=True, tool_name="build"):
     """The redirect reads islands from the SHARED manifest (panel review: the
     trunk recommendation is projected by treatment dim (b), so sourcing there
     made the allowlisted loop differ across arms)."""
-    import json
-
-    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+    from sag.agent.evidence_state import RunEvidenceState, StateScope
+    from sag.tools.base import ToolResult
 
     engine = ReActEngine.__new__(ReActEngine)
+    run_id = "module-loop"
+    target_sha = "c" * 40
+    durable_receipts = {}
+    state = RunEvidenceState(run_id=run_id)
+    for index, workdir in enumerate(observed_workdirs):
+        receipt_id = f"receipt-{index}"
+        metadata = {"receipt_id": receipt_id} if receipt else {}
+        state.ingest_tool_result(
+            StateScope.ARTIFACTS,
+            tool_name,
+            ToolResult.completed_failure(
+                output="compile attempted",
+                error="fixture failure",
+                metadata=metadata,
+            ),
+            params={"action": "compile", "working_directory": workdir},
+            source_phase="build",
+            source_attempt_id="build-1",
+            execution_id=f"exec-{index}",
+        )
+        if receipt:
+            durable_receipts[receipt_id] = {
+                "schema_version": 2,
+                "receipt_id": receipt_id,
+                "run_id": run_id,
+                "tool": next(
+                    (
+                        str(island["system"])
+                        for island in islands
+                        if workdir == island["root"]
+                        or workdir.startswith(str(island["root"]).rstrip("/") + "/")
+                    ),
+                    "maven",
+                ),
+                "requested_action": "compile",
+                "effective_action": "compile",
+                "working_directory": workdir,
+                "actual_cwd": workdir,
+                "target_sha": target_sha,
+                "domain_id": workdir,
+                "outcome": "failed",
+                "exit_code": 1,
+            }
 
     class ManifestOrch:
+        def __init__(self):
+            self.evidence = strict_published_evidence(
+                self,
+                run_id=run_id,
+                target_sha=target_sha,
+                receipts=tuple(durable_receipts.values()),
+            )
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload={
+                    "survey": {"project_path": "/workspace/bigtop"},
+                    "build_islands": islands,
+                },
+            )
+            self.files = self.evidence.files
+
         def execute_command(self, command, **kwargs):
-            if command in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
-                return {
-                    "success": True,
-                    "exit_code": 0,
-                    "output": json.dumps({"build_islands": islands}),
-                }
-            return {"success": True, "exit_code": 0, "output": ""}
+            return self.evidence(command)
 
     engine.physical_validator = SimpleNamespace(docker_orchestrator=ManifestOrch())
     engine.context_manager = SimpleNamespace(load_trunk_context=lambda: None)
-    engine.run_evidence_state = SimpleNamespace(
-        tool_observations=tuple(
-            SimpleNamespace(params={"working_directory": wd}) for wd in observed_workdirs
-        )
-    )
+    engine.run_evidence_state = state
     return engine
 
 
 BIGTOP_ISLANDS = [
     {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven", "goal": "install"},
-    {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle",
-     "goal": "publishToMavenLocal"},
-    {"root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark", "system": "gradle",
-     "goal": "build"},
+    {
+        "root": "/workspace/bigtop/bigtop-data-generators",
+        "system": "gradle",
+        "goal": "publishToMavenLocal",
+    },
+    {
+        "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+        "system": "gradle",
+        "goal": "build",
+    },
 ]
 
 
@@ -362,9 +470,36 @@ def test_loop_guidance_names_untried_islands():
         BIGTOP_ISLANDS, observed_workdirs=["/workspace/bigtop/bigtop-test-framework"]
     )
     text = engine._loop_guidance(_guide_decision())
+    factual_line = text.split("Untried surveyed build coordinates:", 1)[1]
     assert "bigtop-data-generators" in text
     assert "bigpetstore-spark" in text
-    assert "bigtop-test-framework" not in text.split("Untried")[-1]
+    assert "bigtop-test-framework" not in factual_line
+    assert "gradle at /workspace/bigtop/bigtop-data-generators" in factual_line
+    assert "publishToMavenLocal" not in factual_line
+    assert "goal" not in factual_line.lower()
+    assert "build(action=" not in factual_line
+
+
+def test_loop_guidance_does_not_treat_an_unreceipted_observation_as_tried():
+    engine = _loop_engine(
+        BIGTOP_ISLANDS,
+        observed_workdirs=["/workspace/bigtop/bigtop-test-framework"],
+        receipt=False,
+    )
+
+    text = engine._loop_guidance(_guide_decision())
+    assert "maven at /workspace/bigtop/bigtop-test-framework" in text
+
+
+def test_loop_guidance_does_not_treat_a_non_build_receipt_as_an_island_attempt():
+    engine = _loop_engine(
+        BIGTOP_ISLANDS,
+        observed_workdirs=["/workspace/bigtop/bigtop-test-framework"],
+        tool_name="project",
+    )
+
+    text = engine._loop_guidance(_guide_decision())
+    assert "maven at /workspace/bigtop/bigtop-test-framework" in text
 
 
 def test_loop_guidance_stays_clean_when_all_islands_tried_or_no_islands():
@@ -372,6 +507,14 @@ def test_loop_guidance_stays_clean_when_all_islands_tried_or_no_islands():
     assert "Untried" not in engine._loop_guidance(_guide_decision())
     engine2 = _loop_engine([], observed_workdirs=[])
     assert "Untried" not in engine2._loop_guidance(_guide_decision())
+
+
+def test_loop_guidance_ignores_a_tampered_manifest_mirror():
+    engine = _loop_engine(BIGTOP_ISLANDS, observed_workdirs=[])
+    orchestrator = engine.physical_validator.docker_orchestrator
+    orchestrator.evidence.files[REQUIREMENTS_PATH] += " "
+
+    assert "Untried" not in engine._loop_guidance(_guide_decision())
 
 
 # ---- Test phase reads the native-core state before sweeping (fix 4) ----
@@ -418,16 +561,21 @@ def test_test_phase_stays_clean_when_native_built_or_not_native():
     for record in engine.phase_machine.records:
         if record.phase == "build":
             object.__setattr__(record, "validated_outcome", "success")
-    assert "smoke" not in engine._phase_intro_step().content.lower()
+    built_intro = engine._phase_intro_step().content
+    assert "The NATIVE core was not built" not in built_intro
+    assert "Do NOT sweep the full suite" not in built_intro
     # plain (non-native) python repo -> the pytest FACTS objective, no reactive
     # smoke steer (the steer is native-only and evidence-triggered).
     engine2 = _engine_at(3, _python_env())
     intro2 = engine2._phase_intro_step().content
-    assert "pytest via build(action='test')" in intro2
-    assert "smoke" not in intro2.lower()
+    assert "terminal Python runner evidence" in intro2
+    assert "build(action=" not in intro2
+    assert "The NATIVE core was not built" not in intro2
+    assert "Do NOT sweep the full suite" not in intro2
 
 
 # ---- Island-keyed checklist: actionable coordinates, not raw module names ----
+
 
 def test_checklist_prefers_islands_with_full_roots_and_goals():
     """bigtop6 live: the module-scan checklist showed 15 basenames (half noise:
@@ -435,12 +583,17 @@ def test_checklist_prefers_islands_with_full_roots_and_goals():
     root for 86 calls. With islands known, the checklist must be keyed to the
     4 actionable islands, each with its FULL root and goal."""
     islands = [
-        {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven",
-         "goal": "install"},
-        {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle",
-         "goal": "publishToMavenLocal"},
-        {"root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
-         "system": "gradle", "goal": "build"},
+        {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven", "goal": "install"},
+        {
+            "root": "/workspace/bigtop/bigtop-data-generators",
+            "system": "gradle",
+            "goal": "publishToMavenLocal",
+        },
+        {
+            "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+            "system": "gradle",
+            "goal": "build",
+        },
     ]
     coverage = module_coverage(_bigtop_validator(), "bigtop")
     line = coverage_checklist_line(coverage, islands=islands)

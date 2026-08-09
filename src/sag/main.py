@@ -6,7 +6,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import click
 from loguru import logger
@@ -24,7 +24,7 @@ from sag.agent.verdict_finalizer import (
     ReportDeliveryStatus,
     RunTermination,
     RunVerdictSnapshot,
-    read_verdict_snapshot,
+    read_live_verdict_snapshot,
 )
 from sag.config import (
     Config,
@@ -51,25 +51,42 @@ def _render_setup_cli_result(
     snapshot: RunVerdictSnapshot,
     termination: RunTermination,
     project_name: str,
+    *,
+    metrics_v2: Mapping[str, Any] | None = None,
 ) -> tuple[str, int]:
     """Render the setup result and translate only the sealed verdict to an exit code."""
-    tests = snapshot.test_stats
-    flaky = f" ({tests.flaky_count} flaky)" if tests.flaky_count else ""
+    from sag.tools.report_metrics import (
+        build_evidence_layer_projection,
+        format_evidence_layer_lines,
+    )
+
+    if metrics_v2 is None:
+        metrics_v2 = build_evidence_layer_projection(
+            snapshot=snapshot.model_dump(mode="json"),
+            conflicts=[*snapshot.conflicts],
+        )
+
     lines = [
         f"Project: {project_name}",
         f"Verdict: {snapshot.verdict.upper()}",
-        (
-            f"Tests: {tests.executed} unique "
-            f"({tests.passed} passed{flaky}, {tests.failed} failed, "
-            f"{tests.errors} errors, {tests.skipped} skipped)"
-        ),
+        *format_evidence_layer_lines(metrics_v2),
     ]
-    if tests.raw.executed != tests.executed:
-        lines.append(f"Raw executions (diagnostic): {tests.raw.executed}")
     lines.append(f"Report delivery: {termination.report_delivery_status.value}")
     if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
         lines.append("WARNING: setup report delivery failed; sealed verdict is unchanged")
     return "\n".join(lines), 0 if snapshot.verdict == "success" else 1
+
+
+def _read_metrics_v2_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
+    """Read only host-authorized current metrics; legacy stays forensic."""
+
+    from sag.tools.report_metrics import read_live_report_metrics
+
+    try:
+        read = read_live_report_metrics(orchestrator)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return read.payload if read.complete and read.conflict is None else None
 
 
 def _start_agent_session_logging(config: Config) -> None:
@@ -78,6 +95,15 @@ def _start_agent_session_logging(config: Config) -> None:
     if config.verbose and session_logger:
         logger.info(f"Session ID: {session_logger.session_id}")
         logger.info(f"Logs directory: {session_logger.session_log_dir}")
+
+
+def _execute_control(orchestrator, command: str, **kwargs):
+    """Run mechanical container I/O without requiring a project runtime."""
+
+    execute = getattr(orchestrator, "execute_control_command", None)
+    if not callable(execute):
+        execute = orchestrator.execute_command
+    return execute(command, **kwargs)
 
 
 def detect_project_directory_in_container(orchestrator: DockerOrchestrator) -> Optional[str]:
@@ -97,7 +123,7 @@ def detect_project_directory_in_container(orchestrator: DockerOrchestrator) -> O
     """
     try:
         # List directories in /workspace, excluding system directories
-        result = orchestrator.execute_command("ls -d /workspace/*/ 2>/dev/null | head -10")
+        result = _execute_control(orchestrator, "ls -d /workspace/*/ 2>/dev/null | head -10")
 
         if result.get("exit_code") != 0:
             return None
@@ -116,10 +142,11 @@ def detect_project_directory_in_container(orchestrator: DockerOrchestrator) -> O
 
         # Check for directories with build files (pom.xml, build.gradle, package.json, etc.)
         for dir_path in project_dirs:
-            check_result = orchestrator.execute_command(
+            check_result = _execute_control(
+                orchestrator,
                 f"test -f {dir_path}/pom.xml || test -f {dir_path}/build.gradle || "
                 f"test -f {dir_path}/package.json || test -f {dir_path}/requirements.txt || "
-                f"test -f {dir_path}/pyproject.toml && echo FOUND || echo NOTFOUND"
+                f"test -f {dir_path}/pyproject.toml && echo FOUND || echo NOTFOUND",
             )
             if "FOUND" in check_result.get("output", ""):
                 # Return just the directory name, not full path
@@ -138,8 +165,7 @@ def detect_project_directory_in_container(orchestrator: DockerOrchestrator) -> O
 
 
 def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str, Any]]:
-    """
-    Read project metadata from /workspace/.setup_agent/project_meta.json.
+    """Forensically read the legacy container project metadata mirror.
 
     This metadata is created during `sag project` and contains:
     - project_name: The actual project directory name (from URL)
@@ -155,8 +181,8 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
         Dictionary with project metadata, or None if not found/readable
     """
     try:
-        result = orchestrator.execute_command(
-            "cat /workspace/.setup_agent/project_meta.json 2>/dev/null"
+        result = _execute_control(
+            orchestrator, "cat /workspace/.setup_agent/project_meta.json 2>/dev/null"
         )
 
         if result.get("exit_code") != 0:
@@ -200,8 +226,8 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
         logger.info(f"Saving artifacts to {session_dir}")
 
         # Check if .setup_agent folder exists in container
-        check_result = orchestrator.execute_command(
-            "test -d /workspace/.setup_agent && echo 'EXISTS' || echo 'NOT_FOUND'"
+        check_result = _execute_control(
+            orchestrator, "test -d /workspace/.setup_agent && echo 'EXISTS' || echo 'NOT_FOUND'"
         )
 
         if check_result.get("output", "").strip() == "EXISTS":
@@ -220,8 +246,9 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
             logger.info(".setup_agent folder not found in container, skipping")
 
         # Find and copy setup-report-*.md files
-        find_result = orchestrator.execute_command(
-            "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | head -10"
+        find_result = _execute_control(
+            orchestrator,
+            "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | head -10",
         )
 
         report_files = find_result.get("output", "").strip().split("\n")
@@ -276,9 +303,10 @@ def _run_coverage_pass(orchestrator, project_name: str) -> bool:
             return False
         wrote = apply_coverage(orchestrator, project_dir, build_system)
         # Pollution guard (warn-only): tracked source files must be unchanged.
-        dirty = orchestrator.execute_command(
+        dirty = _execute_control(
+            orchestrator,
             f"cd {project_dir} && git status --porcelain 2>/dev/null "
-            f"| grep -vE 'target/|build/|\\.setup_agent' | head -5"
+            f"| grep -vE 'target/|build/|\\.setup_agent' | head -5",
         )
         if (dirty.get("output") or "").strip():
             logger.warning(f"Coverage pass left source-tree changes:\n{dirty['output']}")
@@ -494,11 +522,12 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
             docker_label=docker_label,
             project_ref=project_ref,
         )
-        snapshot = read_verdict_snapshot(orchestrator)
+        snapshot = read_live_verdict_snapshot(orchestrator)
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
             project_name,
+            metrics_v2=_read_metrics_v2_for_cli(orchestrator),
         )
 
         # Save artifacts if recording is enabled
@@ -593,29 +622,17 @@ def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
             console.print("[yellow]⚠️ Container is not running. Starting it...[/yellow]")
             orchestrator.start_container()
 
-        # Try to read project metadata first (preferred method)
-        # This was saved during 'sag project' setup
-        metadata = read_project_metadata(orchestrator)
-
-        if metadata:
-            # Use project_name from metadata - this is the actual directory name
-            actual_project_name = metadata.get("project_name", docker_label)
-            if actual_project_name != docker_label:
-                console.print(
-                    f"[dim]Note:[/dim] Container '{docker_name}' contains project '{actual_project_name}'"
-                )
+        # project_meta.json is project-writable forensic state, not routing
+        # authority. Resolve the workspace mechanically and fall back to the
+        # host-selected Docker label when no unique build root is observable.
+        detected = detect_project_directory_in_container(orchestrator)
+        if detected and detected != docker_label:
+            actual_project_name = detected
+            console.print(
+                f"[dim]Note:[/dim] Detected project directory: /workspace/{actual_project_name}"
+            )
         else:
-            # Fallback: probe the container to find the project directory
-            logger.info("No project metadata found, falling back to directory detection")
-            detected = detect_project_directory_in_container(orchestrator)
-            if detected and detected != docker_label:
-                actual_project_name = detected
-                console.print(
-                    f"[dim]Note:[/dim] Detected project directory: /workspace/{actual_project_name}"
-                )
-            else:
-                # Last resort: use docker_label as project_name
-                actual_project_name = docker_label
+            actual_project_name = detected or docker_label
 
         # Only show task info in non-UI mode (UI manager handles this)
         if not config.ui_mode:
@@ -1157,7 +1174,7 @@ class _ContainerInspectSource:
             )
 
     def _run(self, command: str) -> Optional[str]:
-        result = self.orchestrator.execute_command(command)
+        result = _execute_control(self.orchestrator, command)
         if result.get("exit_code") != 0:
             return None
         return result.get("output", "")

@@ -5,8 +5,8 @@ import json
 import re
 import shlex
 import time
-from dataclasses import asdict
-from typing import Any, Dict, List, Mapping, Optional
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -23,22 +23,28 @@ from sag.tools.base import (
     is_output_storage_ref,
     new_execution_id,
 )
-from sag.tools.internal.build_utils import DETACHED_HANDOFF_STATUSES
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
+from .action_intents import (
+    ActionIntent,
+    EngineActionIntentFactory,
+    bounded_exact_params,
+    canonical_params,
+    validate_repair_action_affordance,
+)
 from .attempt_ledger import compact_steps
 from .attempt_policy import (
     TestAttemptRequirement,
     TestCandidateResolution,
+    build_attempt_directories,
     forced_test_refusal_receipts,
     has_test_candidate_refresh_receipt,
     required_test_attempt,
+    resolve_current_build_receipt_scope,
     resolve_survey_test_candidates,
     test_execution_binding,
     test_execution_matches_candidate,
 )
-from .claim_records import CLAIM_DIR
-from .claim_graph import commit_assessment_transitions
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
     ControlEventSink,
@@ -46,23 +52,49 @@ from .control_events import (
     canonical_sha256,
     compact_control_value,
     forced_action_sha256,
+    job_stall_transition,
 )
-from .evidence_assessments import ASSESSMENT_DIR, ensure_receipt_assessed
-from .job_obligations import (
-    OBLIGATION_DIR,
-    open_obligations,
-    read_obligations,
-    settle_open_obligations,
-    settlement_from_ledger,
+from .control_ownership import BlockerOwner
+from .evidence_assessments import (
+    ControlAssessment,
+    ensure_receipt_assessed,
+    write_assessment,
 )
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
-from .invocation_contracts import action_context, clear_action_context, set_action_context
-from .loop_memory import LoopDecision, LoopEvent, LoopMemory
+from .invocation_contracts import (
+    CONTRACT_AUTHORITY_MISSING,
+    CONTRACT_PERSIST_FAILED,
+    action_context,
+    clear_action_context,
+    set_action_context,
+)
+from .job_obligations import (
+    DETACHED_TERMINAL_AUTHORITY,
+    OBLIGATION_DIR,
+    ObligationReconciliation,
+    blocks_model,
+    observe_detached_terminal,
+    process_is_live,
+    read_obligations,
+    reconcile_job_obligations,
+    settlement_from_ledger,
+)
+from .loop_memory import (
+    CompletionClaimDecision,
+    CompletionClaimEvent,
+    LoopDecision,
+    LoopEvent,
+    LoopMemory,
+)
 from .native_messages import render_messages
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_gates import (
+    JOB_BARRIER_FACT,
+    JOB_INTEGRITY_FACT,
     OPEN_OBLIGATIONS_FACT,
+    TERMINAL_UNPERSISTED_FACT,
     ClaimDisposition,
+    GateControlDisposition,
     GateResult,
     ValidatorState,
     check_phase_claim,
@@ -87,30 +119,30 @@ from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_types import ReactModelMode, ReActStep, StepType
-from .repair_contracts import (
-    REPAIR_DIR,
-    REPAIR_TOOL,
-    accepted_repair_for,
-    build_repair,
-    clear_accepted_repair,
-    is_failure_class,
-    read_records,
-    retrieve_for,
-    set_accepted_repair,
-    surfacing_block,
-    write_repair,
+from .repair_contexts import (
+    ConstraintSet,
+    RepairConstraint,
+    RepairContext,
+    RepairFingerprintSet,
+    ToolSemanticAffordance,
+    build_repair_context,
+    repair_context_reference_set,
+    repair_context_sha256,
+    write_repair_context,
 )
-from .retry_authority import (
-    RETRY_TOOL,
-    compute_retry_key,
-    failure_codes,
-    read_frozen_contract,
-    record_failure,
-    toolchain_state_fingerprint,
+from .replay import recover_active_repair_context_from_path
+from .stall_diagnostics import (
+    STALL_CONFIRMATION_TRIGGER,
+    WALL_GUARD_TRIGGER,
+    JobProgressSnapshot,
+    StallControlResult,
+    control_stalled_job,
+    probe_job_progress,
 )
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ActualToolExecution,
+    PreDispatchControlError,
     ToolCall,
     ToolExecution,
     ToolExecutionRecord,
@@ -126,105 +158,126 @@ from .verdict_finalizer import (
     VerdictFinalizer,
 )
 
-# Per-phase objectives for the setup phase machine (spec §3.1). These
-# prescribe TOOLS, never raw commands — task text outranks prompt guidance
-# (round-4 lesson), so the only safe vocabulary here is the tool surface.
-#
-# dim (d) deleted (Category-3 analyzer diet, 2026-07-20): these ARE the
-# facts-wording objectives. The old "Recommended Build/Tests" variants and the
-# `.replace()`-derived FACTS_* maps that sat beside them are gone — the survey
-# facts (detected build system + manifest coordinates) are the only wording.
+_STRICT_LINEAGE_CONTROL_KINDS = frozenset(
+    {
+        "action_envelope",
+        "forced_action",
+        "tool_result",
+        "gate_decision",
+        "repair_context_opened",
+        "phase_transition",
+        "evidence_close",
+    }
+)
+_REPAIR_GUIDANCE_MAX_BYTES = 32 * 1024
+_REPAIR_PREDISPATCH_REFUSAL_CODES = frozenset(
+    {
+        "ACTION_INTENT_INVALID",
+        "ACTION_INTENT_BINDING_MISMATCH",
+        "ACTION_ENVELOPE_IDENTITY_MISSING",
+        "ACTION_ENVELOPE_PERSIST_FAILED",
+        "ACTION_PARAMS_UNRECORDABLE",
+        CONTRACT_AUTHORITY_MISSING,
+        CONTRACT_PERSIST_FAILED,
+        "REPAIR_ACTION_AFFORDANCE_MISMATCH",
+        "REPAIR_CONTEXT_NOT_ACTIVE",
+        "REPAIR_INTENT_DOMAIN_MISMATCH",
+        "REPAIR_INTENT_INVALID_OBSERVATION",
+        "REPAIR_INTENT_INVALID_REFS",
+        "REPAIR_INTENT_LINEAGE_MISMATCH",
+        "REPAIR_INTENT_REQUIRED",
+        "REPAIR_LINEAGE_RECORDING_REQUIRED",
+        "REPAIR_TOOL_NOT_ALLOWED",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _PreparedRejectedCompletion:
+    """Backward-compatible four-item projection plus unactivated context."""
+
+    claim: PhaseClaim
+    gate: GateResult
+    event: CompletionClaimEvent
+    decision: CompletionClaimDecision
+    context: RepairContext | None = None
+
+    def _legacy(
+        self,
+    ) -> tuple[PhaseClaim, GateResult, CompletionClaimEvent, CompletionClaimDecision]:
+        return (self.claim, self.gate, self.event, self.decision)
+
+    def __iter__(self):
+        return iter(self._legacy())
+
+    def __getitem__(self, index):
+        return self._legacy()[index]
+
+
+# Per-phase outcome contracts for the setup state machine.  They describe the
+# state and evidence required to close a phase; they never select a public tool
+# call or an order of project actions.  Neutral tool syntax is supplied once by
+# the generated schemas, while reactive corrective loops remain evidence-gated.
 PHASE_OBJECTIVES = {
     "provision": (
-        "Get the repository cloned and the toolchain installed: "
-        "project(action='clone', repo_url=...), then project(action='provision', ...) "
-        "for the JDK the project needs. Claim phase(action='done', outcome='success', ...) "
-        "with what was installed."
+        "Establish a checkout of the requested repository and ref plus a measured, "
+        "compatible toolchain. Completion evidence must name the resolved commit and "
+        "the active runtime identities. A checkout or runtime that cannot be established "
+        "remains an explicit blocker or unknown fact."
     ),
     "analyze": (
-        "Understand the project: project(action='analyze'). Record build system, the "
-        "build coordinates from the survey facts (target dirs), test counts, and special "
-        "requirements in key_results. An honest 'unknown' with evidence is acceptable."
+        "Review the engine-created project fact sheet and document map. The persisted facts "
+        "must describe the observed build system, build/test roots, test counts, constraints, "
+        "and open conflicts. Facts need refreshing only after a relevant checkout or "
+        "configuration change. An honest 'unknown' with evidence is acceptable."
     ),
     "build": (
-        "Make the project compile: build(action='compile'). Consult the survey facts "
-        "for the build coordinates — an aggregator root can compile nothing at the "
-        "root while the real sources live in island modules. If the survey facts show NO Java "
-        "compile target (a packaging/meta-project), phase(action='blocked', "
-        "outcome='unknown', ...) with that "
-        "evidence instead of forcing a compile. If compilation fails on missing "
-        "dependencies, build(action='deps') can resolve them — but do not run deps "
-        "first by default (multi-module reactors can fail dependency resolution while "
-        "compiling fine). Never run mvn/gradle via bash — build resolves the "
-        "registered toolchain. Long builds detach; poll the job ref with search."
+        "Establish terminal build evidence for every required surveyed build coordinate. "
+        "An aggregator root with no sources is not compile evidence for source-bearing "
+        "islands; each required island needs a current receipt and artifact/coverage evidence, "
+        "or a typed evidence-backed blocker. A packaging or meta-project with no compile "
+        "target is not a failed compile by itself. Build evidence must use the registered "
+        "toolchain. While a controller-owned job barrier is active, waiting and settlement "
+        "are automatic and no unrelated work may start."
     ),
     "test": (
-        "Run the test suite: build(action='test'). Run it where the "
-        "survey facts place the tests (they can live in a different module — and "
-        "even a different build system — than the build); otherwise use the build root. "
-        "Partial pass above "
-        "threshold is a valid outcome — report the numbers honestly in key_results. "
-        "If tests genuinely cannot run, phase(action='blocked', outcome='failed', ...) "
-        "with evidence."
+        "Establish terminal runner evidence for the required surveyed test coordinates. "
+        "Test coordinates can live in a different module or build system from build "
+        "coordinates. Persist executed, passed, failed, error, and skipped counts with their "
+        "receipt references. Partial pass above threshold is a valid outcome when reported "
+        "honestly; absence of a runner receipt cannot support test success."
     ),
     "report": (
-        "Generate the final report with the report tool, then "
-        "phase(action='done', outcome='success', ...)."
+        "Persist the final setup report grounded in the sealed verdict, current receipts, "
+        "artifacts, test counts, and unresolved conflicts. Completion requires a durable report "
+        "artifact reference; report delivery status does not rewrite the verdict."
     ),
 }
 
-# Python overrides for the build/test objectives (live-run 2026-06-24 pyyaml
-# false-red, root cause 1): the Java build objective tells the agent to
-# phase(action='blocked') when the survey facts show no Java compile target —
-# on a Python project the agent obeyed, and the blocked-build cap turned an
-# honest physical PARTIAL into FAILED. Python projects get their own build and
-# test objectives; the Java strings above apply to Java projects (see
-# phase_objective). These carry no "Recommended" wording, so dim (d) never
-# touched them.
+# Python keeps an ecosystem-specific evidence contract without prescribing an
+# install/build/test sequence.  In particular, absence of a Java target is a
+# not-applicable fact, never a Python build failure.
 PYTHON_PHASE_OBJECTIVES = {
     "build": (
-        "Set up the environment and install dependencies: build(action='deps'), "
-        "then verify byte-compilation with build(action='compile'). A Python "
-        "project has no Java compile target — that is NOT grounds for "
-        "phase(action='blocked', outcome='failed', ...). Block only when the "
-        "environment or dependency "
-        "install itself genuinely fails, with that evidence. Never run "
-        "pip/python via bash — build resolves the registered toolchain. Long "
-        "installs detach; poll the job ref with search."
+        "Establish the Python environment, dependency readiness, and byte/native build "
+        "evidence required by the surveyed project. A Python project has no Java compile "
+        "target; that absence is not grounds for a failed build. Any blocker must cite the "
+        "environment, dependency, or build receipt that establishes it. Evidence must use "
+        "the registered interpreter. While a controller-owned job barrier is active, waiting "
+        "and settlement are automatic and no unrelated work may start."
     ),
     "test": (
-        "Run the test suite with pytest via build(action='test'). Run it in "
-        "the test location the survey facts name when one is present; otherwise "
-        "the project root. Partial pass above threshold is a valid outcome — "
-        "report the numbers honestly in key_results. If tests genuinely cannot "
-        "run, phase(action='blocked', outcome='failed', ...) with evidence."
+        "Establish terminal Python runner evidence at the surveyed test coordinates, with "
+        "executed, passed, failed, error, and skipped counts bound to receipt references. "
+        "When native readiness is absent or unknown, the surveyed bounded-smoke constraint "
+        "limits collection until capability evidence changes. Partial pass above threshold is "
+        "a valid outcome when reported honestly; no runner receipt cannot support success."
     ),
 }
 
-# Kickoff-plan variant of the build objective. The plan is authored at t=0,
-# BEFORE the repo is cloned/analyzed, so it cannot know the ecosystem — and
-# live python runs (4/5, 2026-06/07 probes) obeyed the unconditional
-# "NO Java compile target -> phase(action='blocked')" instruction and blocked
-# the build phase. The sentence is made conditional here; the project-aware
-# correction happens AT RUNTIME in the phase intros (phase_objective), once the
-# analyzer has run.
-_KICKOFF_BLOCK_SENTENCE_BEFORE = (
-    "If the survey facts show NO Java compile target (a packaging/meta-project), "
-)
-_KICKOFF_BLOCK_SENTENCE_AFTER = (
-    "If the survey facts show NO Java compile target (a packaging/meta-project) "
-    "AND the project is not a Python/other-ecosystem project, "
-)
-assert _KICKOFF_BLOCK_SENTENCE_BEFORE in PHASE_OBJECTIVES["build"], (
-    "kickoff softening lost its anchor — update _KICKOFF_BLOCK_SENTENCE_BEFORE "
-    "alongside PHASE_OBJECTIVES['build']"
-)
-KICKOFF_PHASE_OBJECTIVES = {
-    **PHASE_OBJECTIVES,
-    "build": PHASE_OBJECTIVES["build"].replace(
-        _KICKOFF_BLOCK_SENTENCE_BEFORE, _KICKOFF_BLOCK_SENTENCE_AFTER
-    ),
-}
+# Kickoff tasks are authored before the ecosystem is known.  The base contracts
+# are deliberately ecosystem-neutral, so kickoff needs no prescriptive rewrite.
+KICKOFF_PHASE_OBJECTIVES = dict(PHASE_OBJECTIVES)
 
 # Back-compat aliases: dim (d) collapsed the FACTS_* variants INTO the base
 # maps above, so these names now point at the same facts-wording objects. Kept
@@ -235,10 +288,7 @@ FACTS_KICKOFF_PHASE_OBJECTIVES = KICKOFF_PHASE_OBJECTIVES
 
 
 def kickoff_phase_objectives() -> dict:
-    """The kickoff task texts. dim (d) deleted: the facts wording (detected
-    build system + manifest coordinates) is THE wording — the old
-    "Recommended Build/Tests" phrasing is gone, so there is no variant to
-    select between."""
+    """Return outcome/evidence contracts for the engine-owned phase tasks."""
     return KICKOFF_PHASE_OBJECTIVES
 
 
@@ -309,15 +359,14 @@ def is_python_build_system(build_system: Optional[str]) -> bool:
 
 
 def phase_objective(phase: str, build_system: Optional[str] = None) -> str:
-    """Project-aware phase objective (spec §3.1).
+    """Project-aware phase outcome/evidence contract (spec §3.1).
 
     When the analyzer detected a Python project, the build/test phases get the
     PYTHON_PHASE_OBJECTIVES overrides; every other project (and an unknown
     build system) gets the PHASE_OBJECTIVES defaults.
 
-    dim (d) deleted: PHASE_OBJECTIVES/PYTHON_PHASE_OBJECTIVES already carry the
-    facts wording (detected build system + manifest coordinates) — there is no
-    longer a variant to select between."""
+    Both maps are non-prescriptive: coordinates are projected separately from
+    the survey, and neutral call syntax comes from the tool schemas."""
     if is_python_build_system(build_system):
         override = PYTHON_PHASE_OBJECTIVES.get(phase)
         if override:
@@ -393,6 +442,7 @@ class ReActEngine(UIEventEmitter):
         control_event_sink: Optional[ControlEventSink] = None,
         target_repo_sha_callback=None,
         orchestrator=None,
+        llm_client: Any | None = None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -410,6 +460,11 @@ class ReActEngine(UIEventEmitter):
         self.run_evidence_state = run_evidence_state
         self.verdict_finalizer = verdict_finalizer
         self.loop_memory = LoopMemory()
+        # At most one evidence-triggered model repair is active.  It is
+        # replaced only by a new judge assessment and cleared only after a
+        # differently fingerprinted, frozen-and-dispatched model action.
+        self._pending_repair_context: RepairContext | None = None
+        self._last_invocation_contract_id: str | None = None
         if transition_policy is None:
             self.transition_policy = PhaseTransitionPolicy(repair_guard=self.loop_memory)
         else:
@@ -517,7 +572,15 @@ class ReActEngine(UIEventEmitter):
             test_pass_threshold=self.config.test_pass_threshold,
             build_coverage_threshold=self.config.build_coverage_threshold,
             test_execution_threshold=self.config.test_execution_threshold,
+            receipt_run_id=(
+                self.run_evidence_state.run_id if self.run_evidence_state is not None else None
+            ),
         )
+        self._analysis_facts_recovery_attempted = False
+        phase_tool = self.tools.get("phase")
+        bind_recovery = getattr(phase_tool, "bind_analysis_facts_recovery", None)
+        if callable(bind_recovery):
+            bind_recovery(self._recover_analysis_facts_once)
         # Share the validator with the context manager so ContextTool's
         # completion-evidence gate reuses it (probe cache + threshold) instead
         # of constructing a fresh one per completion attempt.
@@ -548,17 +611,30 @@ class ReActEngine(UIEventEmitter):
 
         # Initialize token tracker and LLM client for monitoring model usage
         self.token_tracker = TokenTracker()
-        self.llm_client = ReactLLMClient(
-            config=self.config,
-            tools=self.tools,
-            token_tracker=self.token_tracker,
-            trace_context=lambda: {
-                "iteration": self.current_iteration,
-                "timestamp": self._get_timestamp(),
-                "agent_logger": self.agent_logger,
-            },
-        )
-        self.llm_client.setup()
+        if llm_client is None:
+            self.llm_client = ReactLLMClient(
+                config=self.config,
+                tools=self.tools,
+                token_tracker=self.token_tracker,
+                trace_context=lambda: {
+                    "iteration": self.current_iteration,
+                    "timestamp": self._get_timestamp(),
+                    "agent_logger": self.agent_logger,
+                },
+                repair_context_provider=lambda: self._pending_repair_context,
+            )
+            self.llm_client.setup()
+        else:
+            # Controller-only callers can install a tripwire client without
+            # constructing provider capabilities.  The normal production path
+            # remains unchanged and still owns ReactLLMClient setup above.
+            self.llm_client = llm_client
+
+        # The append-only control stream is the authority after a process
+        # restart.  Rebuild a still-open judge context before any new model
+        # turn; malformed, unanswered or forged lineage raises and prevents
+        # the engine from continuing with guessed repair state.
+        self._restore_active_repair_context()
 
         logger.info(
             "ReAct Engine initialized with the native executor loop, physical validation, "
@@ -570,6 +646,67 @@ class ReActEngine(UIEventEmitter):
             logger.info(f"Repository URL: {repository_url}")
         if repository_ref:
             logger.info(f"Repository ref: {repository_ref}")
+
+    @classmethod
+    def for_controller_loop(
+        cls,
+        *,
+        orchestrator: Any,
+        llm_client: Any,
+        control_event_sink: ControlEventSink,
+        run_id: str,
+        loop_memory: LoopMemory | None = None,
+        repository_url: str | None = None,
+        max_wall_clock_seconds: int = 180,
+        dispatch_stall_seconds: int = 2,
+        max_iterations: int = 1,
+        obligation_poll_seconds: float = 1.0,
+        report_reserve_seconds: int = 0,
+    ) -> "ReActEngine":
+        """Construct the real no-phase controller loop with explicit bounds.
+
+        This is the public construction path for callers that exercise the
+        obligation barrier without provisioning a model provider or a phase
+        machine.  It deliberately goes through ``__init__`` so the controller,
+        validator, context manager, and output storage are production objects;
+        only the external model dependency is injected.
+        """
+
+        if max_wall_clock_seconds <= 0:
+            raise ValueError("controller-loop wall clock must be positive")
+        if dispatch_stall_seconds < 0:
+            raise ValueError("controller-loop stall threshold cannot be negative")
+        if max_iterations <= 0:
+            raise ValueError("controller-loop max iterations must be positive")
+        if obligation_poll_seconds <= 0:
+            raise ValueError("controller-loop poll interval must be positive")
+        if report_reserve_seconds < 0:
+            raise ValueError("controller-loop report reserve cannot be negative")
+
+        context_manager = ContextManager(workspace_path="/workspace", orchestrator=orchestrator)
+        engine = cls(
+            context_manager,
+            [],
+            repository_url=repository_url,
+            phase_machine=None,
+            run_evidence_state=RunEvidenceState(run_id=run_id),
+            control_event_sink=control_event_sink,
+            orchestrator=orchestrator,
+            llm_client=llm_client,
+        )
+        engine.config = engine.config.model_copy(
+            update={
+                "max_wall_clock_seconds": max_wall_clock_seconds,
+                "dispatch_stall_seconds": dispatch_stall_seconds,
+                "advisor_mode": "off",
+            }
+        )
+        engine.max_iterations = max_iterations
+        engine.loop_memory = loop_memory or engine.loop_memory
+        engine.transition_policy.repair_guard = engine.loop_memory
+        engine._OBLIGATION_POLL_SECONDS = obligation_poll_seconds
+        engine._REPORT_RESERVE_SECONDS = report_reserve_seconds
+        return engine
 
     def set_repository_url(self, repository_url: str, repository_ref: str | None = None):
         """Set the repository target for the current project."""
@@ -992,6 +1129,8 @@ class ReActEngine(UIEventEmitter):
     # report; the reserve doubles that so the wait can never starve it.
     _REPORT_RESERVE_SECONDS = 600
     _OBLIGATION_POLL_SECONDS = 30
+    _JOB_INTEGRITY_RETRIES = 2
+    _JOB_MARKER_RECONCILE_ATTEMPTS = 30
 
     def _hold_deadline(self) -> Optional[float]:
         """When must any hold stop — ONE computation (P3, spec §4.2).
@@ -1016,76 +1155,787 @@ class ReActEngine(UIEventEmitter):
             orchestrator.hold_deadline_provider = self._hold_deadline
 
     def _await_open_obligations(self, reason, *, now=None, sleep=None) -> None:
-        """Spend leftover wall clock on a job that is still running, bounded.
+        """Compatibility wrapper over the controller-owned runtime barrier."""
+        self._drain_job_barrier(reason=reason, now=now, sleep=sleep)
 
-        p7d camel ended at ~85 minutes with the test job alive, 11,492
-        observed tests unclaimable, and ~35 minutes of the 7,200s cap unused
-        — the budget evaporated while the one thing that needed time was
-        denied it. Settlement (§3.2) can only claim a job that EXITED during
-        the run, so the close now waits for the exit file while three things
-        hold: an open obligation's job has not exited, the clock is outside
-        the report reserve, and the close is a working close. It spends only
-        budget already allocated — the cap and the reserve are hard lines —
-        never runs for ABORTED/CANCELLED closes, and never waits on a ledger
-        it cannot read (the §3.3 cap already answers for that state).
-        """
+    def _ephemeral_job_handles(self) -> Dict[str, Dict[str, Any]]:
+        handles = getattr(self, "_job_barrier_ephemeral_handles", None)
+        if handles is None:
+            handles = {}
+            self._job_barrier_ephemeral_handles = handles
+        return handles
+
+    def _capture_job_barrier_from_result(self) -> bool:
+        """Register a detached handle even when its complete ledger write failed."""
+        try:
+            result = self._answered_action_result()
+        except Exception:
+            result = None
+        metadata = getattr(result, "metadata", None) or {}
+        job_id = str(metadata.get("job_id") or "").strip()
+        persistence = metadata.get("job_obligation_persisted")
+        persistence_present = "job_obligation_persisted" in metadata
+        dispatch_status = str(metadata.get("dispatch_status") or "").strip()
+        detached_status = dispatch_status in {
+            "running_detached",
+            "liveness_unknown_detached",
+            "dispatch_unknown",
+        }
+        invocation_status = getattr(getattr(result, "invocation_status", None), "value", "")
+        poll_ref = str(getattr(result, "poll_ref", None) or "").strip()
+        source_tool = next(
+            (
+                str(getattr(step, "tool_name", None) or "").strip()
+                for step in reversed(getattr(self, "steps", None) or ())
+                if getattr(step, "step_type", None) is StepType.ACTION
+            ),
+            "",
+        )
+        detached_shaped = bool(
+            detached_status
+            or persistence_present
+            or (invocation_status == "pending" and (job_id or poll_ref))
+        )
+
+        # A running SearchTool result observes an EXISTING dispatch.  Its
+        # obligation acknowledgement belongs to the original runner, so the
+        # poll quite correctly carries none.  Require the matching durable
+        # ledger witness instead of misclassifying it as a new malformed
+        # handoff; either way it is an immediate same-turn barrier.
+        is_existing_job_poll = bool(
+            source_tool == "search"
+            and detached_status
+            and not persistence_present
+            and job_id
+            and poll_ref == f"job:{job_id}"
+        )
+        if is_existing_job_poll:
+            records = read_obligations(getattr(self, "orchestrator", None))
+            if records is None:
+                self._record_job_barrier_integrity_failure(
+                    (f"detached_result_poll_ledger_unreadable:{job_id}",)
+                )
+            elif not any(
+                str(record.get("job_id") or "").strip() == job_id and blocks_model(record)
+                for record in records
+            ):
+                self._record_job_barrier_integrity_failure(
+                    (f"detached_result_poll_obligation_missing:{job_id}",)
+                )
+            return True
+
+        if detached_shaped:
+            failures: List[str] = []
+            if not detached_status:
+                failures.append("detached_result_dispatch_status_invalid")
+            if not persistence_present or not isinstance(persistence, bool):
+                failures.append("detached_result_persistence_invalid")
+            if not job_id:
+                failures.append("detached_result_job_id_missing")
+            if poll_ref and job_id and poll_ref != f"job:{job_id}":
+                failures.append("detached_result_poll_ref_mismatch")
+            if metadata.get("terminal_authority") != DETACHED_TERMINAL_AUTHORITY:
+                failures.append("detached_result_terminal_authority_missing")
+            for field in ("docker_exec_id", "container_id"):
+                if re.fullmatch(r"[0-9a-f]{64}", str(metadata.get(field) or "")) is None:
+                    failures.append(f"detached_result_{field}_missing")
+            start_accepted = metadata.get("start_accepted")
+            startup_identity_verified = metadata.get("startup_identity_verified")
+            started = metadata.get("started")
+            runner_dispatch_state = str(metadata.get("runner_dispatch_state") or "")
+            runner_dispatched = metadata.get("runner_dispatched")
+            if type(start_accepted) is not bool:
+                failures.append("detached_result_start_acceptance_missing")
+            if (
+                type(startup_identity_verified) is not bool
+                or type(started) is not bool
+                or startup_identity_verified is not started
+            ):
+                failures.append("detached_result_startup_identity_invalid")
+            if persistence is True and startup_identity_verified is not True:
+                failures.append("detached_result_persisted_identity_unverified")
+            elif dispatch_status == "dispatch_unknown":
+                if (
+                    start_accepted is not False
+                    or startup_identity_verified is not False
+                    or started is not False
+                    or runner_dispatch_state != "unknown"
+                    or runner_dispatched is not None
+                    or persistence is not False
+                    or str(metadata.get("job_obligation_persistence_code") or "")
+                    != "invalid_dispatch_handle"
+                ):
+                    failures.append("detached_result_unknown_dispatch_inconsistent")
+            elif (
+                start_accepted is not True
+                or runner_dispatch_state != "accepted"
+                or runner_dispatched is not True
+            ):
+                failures.append("detached_result_start_acceptance_unproven")
+            if not str(metadata.get("log_path") or "").strip():
+                failures.append("detached_result_log_path_missing")
+            if failures:
+                self._record_job_barrier_integrity_failure(failures)
+                return True
+        memory = getattr(self, "loop_memory", None)
+        if job_id and memory is not None and metadata.get("start_accepted") is True:
+            memory.observe_job_transition(
+                job_id,
+                "running",
+                progress_fingerprint=canonical_sha256(
+                    {
+                        "pid": metadata.get("pid"),
+                        "pgid": metadata.get("pgid"),
+                        "pid_path": metadata.get("pid_path"),
+                        "pgid_path": metadata.get("pgid_path"),
+                        "log_path": metadata.get("log_path"),
+                    }
+                ),
+            )
+        if persistence is False and job_id:
+            self._ephemeral_job_handles()[job_id] = {
+                key: metadata.get(key)
+                for key in (
+                    "job_id",
+                    "pid",
+                    "pgid",
+                    "pid_path",
+                    "pgid_path",
+                    "identity_path",
+                    "process_identity_token",
+                    "terminal_authority",
+                    "docker_exec_id",
+                    "container_id",
+                    "start_accepted",
+                    "startup_identity_verified",
+                    "started",
+                    "runner_dispatch_state",
+                    "runner_dispatched",
+                    "log_path",
+                    "exit_code_path",
+                    "handoff_reason",
+                    "working_directory",
+                    "job_obligation_persistence_code",
+                )
+            }
+            return True
+        if persistence is False:
+            self._ephemeral_job_handles()["unidentified-detached-job"] = {
+                "job_id": "unidentified-detached-job",
+                "job_obligation_persistence_code": str(
+                    metadata.get("job_obligation_persistence_code") or "invalid_dispatch_handle"
+                ),
+            }
+            return True
+        if persistence is True and job_id:
+            # The dispatch result is the write acknowledgement.  Re-reading
+            # the ledger here is both redundant and unsafe: a transient read
+            # failure used to turn a successfully persisted detached job into
+            # ``False`` and let later calls in the same model turn execute.
+            # The next controller drain performs the full typed reconciliation.
+            return True
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return False
+        records = read_obligations(orchestrator)
+        if records is None:
+            self._record_job_barrier_integrity_failure(("ledger_unreadable_after_tool_result",))
+            return True
+        return bool(records and any(blocks_model(record) for record in records))
+
+    def _announce_job_reconciliation(self, reconciliation: ObligationReconciliation) -> None:
+        """Project typed lifecycle facts before the model can receive a turn."""
+        lines: List[str] = []
+        state = getattr(self, "run_evidence_state", None)
+
+        terminal_announced = self._assessment_guard("_announced_job_terminals")
+        for terminal in reconciliation.terminal_observations:
+            if terminal.job_id in terminal_announced:
+                continue
+            terminal_announced.add(terminal.job_id)
+            self._emit_control_event("job_terminal_observed", terminal.event_payload())
+            lines.append(
+                f"[job terminal] job {terminal.job_id}: exit {terminal.exit_code}; "
+                "receipt settlement pending"
+            )
+
+        settled_announced = self._assessment_guard("_announced_job_settlements")
+        for settlement in reconciliation.settlements:
+            if settlement.job_id in settled_announced:
+                continue
+            settled_announced.add(settlement.job_id)
+            self._emit_control_event("job_settled", settlement.event_payload())
+            lines.append(settlement.notice())
+
+        unpersisted_announced = self._assessment_guard("_announced_job_terminal_unpersisted")
+        for terminal in reconciliation.terminal_unpersisted:
+            if terminal.job_id in unpersisted_announced:
+                continue
+            unpersisted_announced.add(terminal.job_id)
+            self._emit_control_event("job_terminal_unpersisted", terminal.event_payload())
+            lines.append(terminal.notice())
+            if state is not None and not state.sealed:
+                state.set_fact(
+                    f"job_terminal_unpersisted.{terminal.job_id}",
+                    terminal.event_payload(),
+                    evidence_ref=terminal.obligation_ref,
+                )
+                state.record_conflict(f"job_terminal_unpersisted:{terminal.job_id}")
+
+        if lines and hasattr(self, "steps"):
+            self.steps.append(
+                ReActStep(
+                    step_type=StepType.SYSTEM_GUIDANCE,
+                    content="\n".join(lines),
+                    timestamp=self._get_timestamp(),
+                )
+            )
+
+    def _reconcile_ephemeral_jobs(self) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        """Wait for runner handles whose complete obligation never landed."""
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return (), ("ephemeral_job_orchestrator_unavailable",)
+        running: List[str] = []
+        failures: List[str] = []
+        state = getattr(self, "run_evidence_state", None)
+        announced = self._assessment_guard("_announced_ephemeral_job_terminals")
+        for job_id, handle in list(self._ephemeral_job_handles().items()):
+            observation = observe_detached_terminal(orchestrator, handle)
+            if observation.state == "running":
+                if observation.start_accepted:
+                    # Running=true came from the Docker daemon, so an
+                    # ambiguous exec_start response is now resolved without
+                    # trusting any container-written PID/log marker.
+                    handle["start_accepted"] = True
+                    handle["runner_dispatch_state"] = "accepted"
+                    handle["runner_dispatched"] = True
+                    memory = getattr(self, "loop_memory", None)
+                    if memory is not None:
+                        memory.observe_job_transition(
+                            job_id,
+                            "running",
+                            progress_fingerprint=canonical_sha256(
+                                {
+                                    "docker_exec_id": handle.get("docker_exec_id"),
+                                    "container_id": handle.get("container_id"),
+                                    "start_accepted": True,
+                                }
+                            ),
+                        )
+                running.append(job_id)
+                continue
+            if observation.state != "terminal":
+                failures.append(f"{job_id}:terminal_authority_{observation.state}")
+                continue
+            if job_id not in announced:
+                announced.add(job_id)
+                terminal_payload = {
+                    "job_id": job_id,
+                    "exit_code": observation.exit_code,
+                    "marker_ref": observation.marker_ref,
+                    "obligation_ref": "unpersisted",
+                    "observed_at": self._get_timestamp(),
+                }
+                self._emit_control_event("job_terminal_observed", terminal_payload)
+                unpersisted_payload = {
+                    "job_id": job_id,
+                    "exit_code": observation.exit_code,
+                    "attempted_receipt_id": "",
+                    "persistence_code": str(
+                        handle.get("job_obligation_persistence_code")
+                        or "obligation_transport_write_failed"
+                    ),
+                    "attempt_count": 0,
+                    "obligation_ref": "unpersisted",
+                    "log_ref": str(handle.get("log_path") or ""),
+                }
+                self._emit_control_event("job_terminal_unpersisted", unpersisted_payload)
+                if state is not None and not state.sealed:
+                    state.set_fact(
+                        f"job_terminal_unpersisted.{job_id}",
+                        unpersisted_payload,
+                        evidence_ref=str(handle.get("log_path") or "unpersisted"),
+                    )
+                    state.record_conflict(f"job_terminal_unpersisted:{job_id}")
+                if hasattr(self, "steps"):
+                    self.steps.append(
+                        ReActStep(
+                            step_type=StepType.SYSTEM_GUIDANCE,
+                            content=(
+                                f"[terminal-unpersisted] job {job_id}: exit "
+                                f"{observation.exit_code}; detached obligation was not persisted"
+                            ),
+                            timestamp=self._get_timestamp(),
+                        )
+                    )
+                self._job_barrier_evidence_unpersisted = True
+            self._ephemeral_job_handles().pop(job_id, None)
+        return tuple(running), tuple(failures)
+
+    def _record_live_jobs_at_close(self, job_ids: Sequence[str], reason: Any) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        records = read_obligations(getattr(self, "orchestrator", None))
+        if records is None:
+            self._record_job_barrier_integrity_failure(
+                ("ledger_unreadable_while_recording_live_jobs",)
+            )
+            return
+        by_id = {str(record.get("job_id") or ""): record for record in records}
+        announced = self._assessment_guard("_announced_jobs_live_at_close")
+        reason_text = getattr(reason, "value", None) or str(reason or "deadline")
+        for job_id in sorted(set(job_ids)):
+            if not job_id or job_id in announced:
+                continue
+            durable = by_id.get(job_id)
+            ephemeral = self._ephemeral_job_handles().get(job_id)
+            if durable is not None and not process_is_live(durable):
+                # The process crossed terminal settlement after the wall
+                # observation but before this projection.  Current ledger
+                # truth wins; do not preserve a stale live claim.
+                continue
+            if durable is None and ephemeral is None:
+                self._record_job_barrier_integrity_failure(
+                    (f"{job_id}:live_projection_record_missing",)
+                )
+                continue
+            announced.add(job_id)
+            record = durable or ephemeral or {}
+            payload = compact_control_value(
+                {
+                    "job_id": job_id,
+                    "obligation_ref": (
+                        f"{OBLIGATION_DIR}/{job_id}.json" if job_id in by_id else "unpersisted"
+                    ),
+                    "log_ref": str(record.get("log_path") or ""),
+                    "close_reason": reason_text,
+                }
+            )
+            self._emit_control_event("job_live_at_close", payload)
+            if state is not None and not state.sealed:
+                state.set_fact(
+                    f"job_live_at_close.{job_id}",
+                    payload,
+                    evidence_ref=payload["obligation_ref"],
+                )
+                state.record_conflict(f"job_live_at_close:{job_id}")
+
+    def _record_job_barrier_integrity_failure(self, failures: Sequence[str]) -> None:
+        """Persist the controller failure in the same shape replay rebuilds."""
+        normalized = tuple(
+            dict.fromkeys(str(item).strip() for item in failures if str(item).strip())
+        )
+        if not normalized:
+            normalized = ("job_barrier_integrity_failure",)
+        # The control record/run fact is the durable witness; this engine-held
+        # flag guarantees no further model turn can slip through when the
+        # malformed result left no ledger or ephemeral handle to sweep.
+        if not str(getattr(self, "_fatal_harness_control_failure", "") or "").strip():
+            self._fatal_harness_control_failure = normalized[0]
+        announced = self._assessment_guard("_announced_job_barrier_integrity_failures")
+        if announced:
+            return
+        announced.add("recorded")
+        payload = {"failures": list(normalized)}
+        self._emit_control_event("job_barrier_integrity_failure", payload)
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            state.set_fact(
+                "job_barrier_integrity_failure",
+                payload,
+                evidence_ref="control:job_barrier_integrity_failure",
+            )
+            state.record_conflict("job_barrier_integrity_failure")
+
+    def _job_barrier_progress_states(self) -> Dict[str, Dict[str, Any]]:
+        states = getattr(self, "_job_barrier_progress_by_job", None)
+        if states is None:
+            states = {}
+            self._job_barrier_progress_by_job = states
+        return states
+
+    def _record_job_stall_observation(
+        self,
+        job: Mapping[str, Any],
+        result: StallControlResult,
+    ) -> None:
+        """Mirror one durable physical diagnostic into event and live state."""
+
+        diagnostic = result.diagnostic
+        if diagnostic is None or not diagnostic.persisted:
+            return
+        cleanup = result.cleanup
+        progress_signals = tuple(result.progress.signals if result.progress else ())
+        payload = {
+            "job_id": result.job_id,
+            "obligation_ref": (
+                "unpersisted"
+                if job.get("_ephemeral") is True
+                else f"{OBLIGATION_DIR}/{result.job_id}.json"
+            ),
+            "diagnostic_ref": diagnostic.evidence_ref,
+            "diagnostic_fingerprint": diagnostic.diagnostic_fingerprint,
+            "observation": diagnostic.observation,
+            "progress_signals": list(progress_signals),
+            "controller_code": result.code,
+            "evidence_sealed": bool(result.seal and result.seal.persisted),
+            "term_sent": bool(cleanup and cleanup.term_sent),
+            "kill_sent": bool(cleanup and cleanup.kill_sent),
+            # A cleanup refusal cannot prove the group dead. Only the cleanup
+            # result's explicit terminal predicate may serialize false.
+            "group_live": (
+                False if cleanup is not None and cleanup.process_group_terminal else True
+            ),
+        }
+        fingerprint = canonical_sha256(payload)
+        announced = self._assessment_guard("_announced_job_stall_observations")
+        if fingerprint in announced:
+            return
+        announced.add(fingerprint)
+        self._emit_control_event("job_stall_observed", payload)
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            state.set_fact(
+                f"job_stall_observed.{result.job_id}.{fingerprint[:12]}",
+                payload,
+                evidence_ref=diagnostic.evidence_ref,
+            )
+        memory = getattr(self, "loop_memory", None)
+        if memory is not None:
+            transition = job_stall_transition(payload)
+            if transition is not None:
+                memory.observe_job_transition(
+                    result.job_id,
+                    transition,
+                    progress_fingerprint=fingerprint,
+                )
+
+    @staticmethod
+    def _stall_control_failure(result: StallControlResult) -> str:
+        nested = ""
+        if result.progress is not None and result.progress.code != "observed":
+            nested = f":{result.progress.code}"
+        elif result.diagnostic is not None and not result.diagnostic.persisted:
+            nested = f":{result.diagnostic.code}"
+        elif result.seal is not None and not result.seal.persisted:
+            nested = f":{result.seal.code}"
+        elif result.cleanup is not None:
+            nested = f":{result.cleanup.code}"
+        return f"{result.job_id}:stall_control_{result.code}{nested}"
+
+    @staticmethod
+    def _has_stall_control_identity(job: Mapping[str, Any]) -> bool:
+        """Whether WS9 may observe/signal this dispatch without guessing."""
+
+        pid = job.get("pid")
+        pgid = job.get("pgid")
+        token = str(job.get("process_identity_token") or "")
+        docker_exec_id = str(job.get("docker_exec_id") or "")
+        container_id = str(job.get("container_id") or "")
+        return bool(
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and pid > 0
+            and pgid == pid
+            and re.fullmatch(r"[0-9a-f]{64}", token)
+            and job.get("terminal_authority") == DETACHED_TERMINAL_AUTHORITY
+            and re.fullmatch(r"[0-9a-f]{64}", docker_exec_id)
+            and re.fullmatch(r"[0-9a-f]{64}", container_id)
+            and job.get("start_accepted") is True
+            and job.get("startup_identity_verified") is True
+            and job.get("runner_dispatch_state") == "accepted"
+        )
+
+    def _await_cleanup_marker(
+        self,
+        job_id: str,
+        *,
+        now,
+        sleep,
+    ) -> str:
+        """Let the external supervisor publish exit, then settle normally."""
+
+        deadline = self._hold_deadline()
+        for _ in range(self._JOB_MARKER_RECONCILE_ATTEMPTS):
+            reconciliation = reconcile_job_obligations(self.orchestrator)
+            self._announce_job_reconciliation(reconciliation)
+            if reconciliation.terminal_unpersisted or getattr(
+                self, "_job_barrier_evidence_unpersisted", False
+            ):
+                return "evidence_unpersisted"
+            if reconciliation.integrity_failures:
+                self._record_job_barrier_integrity_failure(reconciliation.integrity_failures)
+                return "integrity_failure"
+            active = set(reconciliation.running_job_ids) | set(
+                reconciliation.settlement_pending_job_ids
+            )
+            if job_id not in active:
+                return "cleared"
+            if job_id in reconciliation.settlement_pending_job_ids:
+                # Settlement retries are immediate and bounded by WS2.
+                continue
+            if deadline is not None and now() >= deadline:
+                break
+            sleep(1.0)
+        self._record_job_barrier_integrity_failure(
+            (f"{job_id}:terminal_marker_missing_after_cleanup",)
+        )
+        return "integrity_failure"
+
+    def _drain_job_barrier(self, reason=None, *, now=None, sleep=None) -> str:
+        """Poll, diagnose, clean, and settle jobs without model/advisor turns."""
         import time as _time
 
         now = now or _time.time
         sleep = sleep or _time.sleep
-        if reason in (EvidenceCloseReason.ABORTED, EvidenceCloseReason.CANCELLED):
-            return
-        deadline = self._hold_deadline()
-        if deadline is None:
-            return  # margin unknown is margin absent
         orchestrator = getattr(self, "orchestrator", None)
         if orchestrator is None:
-            return
-        from .job_obligations import is_open, read_obligations
+            if self._ephemeral_job_handles():
+                self._record_job_barrier_integrity_failure(
+                    ("ephemeral_job_orchestrator_unavailable",)
+                )
+                return "integrity_failure"
+            return "cleared"
+        records = read_obligations(orchestrator)
+        ephemeral = bool(self._ephemeral_job_handles())
+        if records == [] and not ephemeral:
+            return "cleared"
+        from sag.runtime.container_io import resolve_control_execute
 
-        waited = False
-        while now() < deadline:
-            records = read_obligations(orchestrator)
-            if records is None:
-                return  # unreadable ledger: never wait on a guess
-            pending = [
-                record
-                for record in records
-                if is_open(record) and str(record.get("exit_code_path") or "").strip()
-            ]
-            if not pending:
-                return
-            still_running = []
-            for record in pending:
-                probe = orchestrator.execute_command(
-                    f"cat {str(record.get('exit_code_path'))} 2>/dev/null"
+        execute = resolve_control_execute(orchestrator)
+        if not callable(execute):
+            self._record_job_barrier_integrity_failure(("orchestrator_unavailable",))
+            return "integrity_failure"
+        wait_for_running = reason not in (
+            EvidenceCloseReason.ABORTED,
+            EvidenceCloseReason.CANCELLED,
+        )
+        integrity_attempts = 0
+        progress_states = self._job_barrier_progress_states()
+        stall_seconds = max(
+            0,
+            int(getattr(getattr(self, "config", None), "dispatch_stall_seconds", 600)),
+        )
+        while True:
+            reconciliation = reconcile_job_obligations(orchestrator)
+            self._announce_job_reconciliation(reconciliation)
+            ephemeral_running, ephemeral_failures = self._reconcile_ephemeral_jobs()
+            running = tuple(sorted(set(reconciliation.running_job_ids + ephemeral_running)))
+            durable_records = read_obligations(orchestrator)
+            failures = list(reconciliation.integrity_failures) + list(ephemeral_failures)
+            if durable_records is None:
+                failures.append("ledger_unreadable_after_reconciliation")
+                durable_records = []
+            durable_by_id = {
+                str(record.get("job_id") or ""): dict(record)
+                for record in durable_records
+                if str(record.get("job_id") or "")
+            }
+            job_records: Dict[str, Dict[str, Any]] = dict(durable_by_id)
+            for job_id, handle in self._ephemeral_job_handles().items():
+                job_records.setdefault(job_id, {**handle, "_ephemeral": True})
+            if reconciliation.terminal_unpersisted or getattr(
+                self, "_job_barrier_evidence_unpersisted", False
+            ):
+                return "evidence_unpersisted"
+            if failures:
+                integrity_attempts += 1
+                if integrity_attempts >= self._JOB_INTEGRITY_RETRIES:
+                    self._record_job_barrier_integrity_failure(failures)
+                    return "integrity_failure"
+                deadline = self._hold_deadline()
+                remaining = max(deadline - now(), 0.0) if deadline is not None else 0.0
+                sleep(min(1.0, remaining))
+                continue
+            integrity_attempts = 0
+            if reconciliation.settlement_pending_job_ids:
+                # Persistence recovery is immediate and bounded; it is not a
+                # process poll and spends no model iteration.
+                continue
+            if not running:
+                progress_states.clear()
+                return "cleared"
+            deadline = self._hold_deadline()
+            if not wait_for_running or deadline is None:
+                self._record_live_jobs_at_close(running, reason)
+                return "live_at_deadline"
+
+            observed_at = now()
+            if observed_at >= deadline:
+                terminal_jobs: List[str] = []
+                verified_live_jobs: List[str] = []
+                wall_guard_failures: List[str] = []
+                for job_id in running:
+                    job = job_records.get(job_id)
+                    if not job:
+                        wall_guard_failures.append(
+                            f"{job_id}:wall_guard_registered_job_record_missing"
+                        )
+                        continue
+                    if not self._has_stall_control_identity(job):
+                        # An exit marker that has not appeared says only that
+                        # terminal truth is unavailable.  Without the launcher's
+                        # fenced identity, the wall guard cannot make the
+                        # stronger physical claim that the job is still live.
+                        wall_guard_failures.append(f"{job_id}:wall_guard_identity_unavailable")
+                        continue
+                    prior = progress_states.get(job_id, {}).get("snapshot")
+                    result = control_stalled_job(
+                        execute,
+                        job,
+                        trigger=WALL_GUARD_TRIGGER,
+                        previous=prior if isinstance(prior, JobProgressSnapshot) else None,
+                        now=now,
+                        sleep=sleep,
+                    )
+                    if result.progress is not None and result.progress.code == "observed":
+                        progress_states.setdefault(job_id, {})[
+                            "snapshot"
+                        ] = result.progress.snapshot
+                    if result.code == "terminal_no_wait":
+                        terminal_jobs.append(job_id)
+                    elif (
+                        result.progress is not None
+                        and result.progress.code == "observed"
+                        and result.progress.snapshot.process_state == "running"
+                    ):
+                        verified_live_jobs.append(job_id)
+                    else:
+                        wall_guard_failures.append(self._stall_control_failure(result))
+                for job_id in terminal_jobs:
+                    marker_status = self._await_cleanup_marker(job_id, now=now, sleep=sleep)
+                    if marker_status != "cleared":
+                        return marker_status
+                if terminal_jobs:
+                    continue
+                if verified_live_jobs:
+                    self._record_live_jobs_at_close(verified_live_jobs, reason)
+                if wall_guard_failures:
+                    self._record_job_barrier_integrity_failure(wall_guard_failures)
+                    return "integrity_failure"
+                if not verified_live_jobs:
+                    self._record_job_barrier_integrity_failure(
+                        ("wall_guard_produced_no_terminal_or_live_observation",)
+                    )
+                    return "integrity_failure"
+                return "live_at_deadline"
+
+            control_failures: List[str] = []
+            live_after_cleanup: List[str] = []
+            marker_jobs: List[str] = []
+            for job_id in running:
+                job = job_records.get(job_id)
+                if not job:
+                    control_failures.append(f"{job_id}:registered_job_record_missing")
+                    continue
+                if not self._has_stall_control_identity(job):
+                    # Schema-v1 obligations predate safe PGID identity. They
+                    # keep the controller barrier and ordinary exit-marker
+                    # reconciliation, but never gain diagnostic/signal
+                    # authority by inference.
+                    continue
+                progress_state = progress_states.setdefault(job_id, {})
+                previous = progress_state.get("snapshot")
+                previous_snapshot = previous if isinstance(previous, JobProgressSnapshot) else None
+                handoff_stall = str(
+                    job.get("handoff_reason") or ""
+                ) == "stalled" and not progress_state.get("handoff_stall_consumed")
+                due_for_confirmation = handoff_stall
+
+                if not handoff_stall:
+                    progress = probe_job_progress(
+                        execute,
+                        job,
+                        previous=previous_snapshot,
+                    )
+                    if progress.code != "observed":
+                        failures_seen = int(progress_state.get("probe_failures") or 0) + 1
+                        progress_state["probe_failures"] = failures_seen
+                        if failures_seen >= self._JOB_INTEGRITY_RETRIES:
+                            control_failures.append(
+                                f"{job_id}:stall_control_progress_unobservable:" f"{progress.code}"
+                            )
+                        continue
+                    progress_state["probe_failures"] = 0
+                    progress_state["snapshot"] = progress.snapshot
+                    previous_snapshot = progress.snapshot
+                    if progress.snapshot.process_state == "terminal":
+                        marker_jobs.append(job_id)
+                        continue
+                    if progress.progressing:
+                        progress_state["last_progress_at"] = observed_at
+                        memory = getattr(self, "loop_memory", None)
+                        if memory is not None:
+                            memory.observe_job_transition(
+                                job_id,
+                                "progress",
+                                progress_fingerprint=canonical_sha256(
+                                    {
+                                        "snapshot": progress.snapshot.as_dict(),
+                                        "signals": progress.signals,
+                                    }
+                                ),
+                            )
+                    elif "last_progress_at" not in progress_state:
+                        progress_state["last_progress_at"] = observed_at
+                    due_for_confirmation = bool(
+                        stall_seconds > 0
+                        and observed_at - float(progress_state["last_progress_at"]) >= stall_seconds
+                    )
+
+                if not due_for_confirmation:
+                    continue
+                progress_state["handoff_stall_consumed"] = True
+                result = control_stalled_job(
+                    execute,
+                    job,
+                    trigger=STALL_CONFIRMATION_TRIGGER,
+                    previous=previous_snapshot,
+                    now=now,
+                    sleep=sleep,
                 )
-                exited = bool(
-                    isinstance(probe, dict)
-                    and probe.get("success") is not False
-                    and probe.get("exit_code", 0) == 0
-                    and str(probe.get("output") or "").strip()
-                )
-                if not exited:
-                    still_running.append(str(record.get("job_id") or ""))
-            if not still_running:
-                return  # every open job has exited; the sweep can settle them
+                self._record_job_stall_observation(job, result)
+                if result.progress is not None and result.progress.code == "observed":
+                    progress_state["snapshot"] = result.progress.snapshot
+                if result.code == "progress_observed":
+                    progress_state["last_progress_at"] = now()
+                    continue
+                if result.code == "terminal_no_wait":
+                    marker_jobs.append(job_id)
+                    continue
+                if result.confirmed_stall and result.cleanup is not None:
+                    if result.marker_reconciliation_required:
+                        marker_jobs.append(job_id)
+                        continue
+                    # No supervisor marker and no physically terminal cleanup
+                    # means the ledger still truthfully carries a potentially
+                    # live job, even if identity verification itself failed.
+                    live_after_cleanup.append(job_id)
+                    control_failures.append(self._stall_control_failure(result))
+                    continue
+                failures_seen = int(progress_state.get("control_failures") or 0) + 1
+                progress_state["control_failures"] = failures_seen
+                if failures_seen >= self._JOB_INTEGRITY_RETRIES:
+                    control_failures.append(self._stall_control_failure(result))
+
+            if control_failures:
+                if live_after_cleanup:
+                    self._record_live_jobs_at_close(live_after_cleanup, "cleanup_failed")
+                self._record_job_barrier_integrity_failure(control_failures)
+                return "integrity_failure"
+            if marker_jobs:
+                for job_id in sorted(set(marker_jobs)):
+                    marker_status = self._await_cleanup_marker(job_id, now=now, sleep=sleep)
+                    if marker_status != "cleared":
+                        return marker_status
+                continue
+
             remaining = deadline - now()
-            if remaining <= 0:
-                break
-            if not waited:
-                waited = True
-                logger.info(
-                    f"evidence-close waiting for running job(s) "
-                    f"{', '.join(still_running)}: {remaining:.0f}s of wall clock "
-                    f"remain before the report reserve"
-                )
-            sleep(min(self._OBLIGATION_POLL_SECONDS, remaining))
-        if waited:
-            logger.warning(
-                "evidence-close wait reached the report reserve with job(s) "
-                "still running; closing with job_unsettled"
+            logger.info(
+                f"controller job barrier waiting for {', '.join(running)}: "
+                f"{remaining:.0f}s remain before the report reserve"
             )
+            sleep(min(self._OBLIGATION_POLL_SECONDS, remaining))
 
     def _finalize_evidence(self, reason: EvidenceCloseReason):
         state = getattr(self, "run_evidence_state", None)
@@ -1101,7 +1951,7 @@ class ReActEngine(UIEventEmitter):
             # honest conflict.
             self._await_open_obligations(reason)
             self._sweep_job_obligations()
-            self._record_unsettled_job_conflicts()
+            self._record_unsettled_job_conflicts(reason)
         snapshot = finalizer.finalize(state, reason)
         if not was_sealed:
             self._emit_control_event("evidence_close", {"reason": reason.value})
@@ -1414,6 +2264,16 @@ class ReActEngine(UIEventEmitter):
             str(action["tool"]),
             dict(action["params"]),
         )
+        controller_intent = EngineActionIntentFactory.for_controller().from_submission(
+            {
+                "domain_id": self._action_domain_id(exact_params),
+                "tool": tool,
+                "params": exact_params,
+                "next_action_kind": str(exact_params.get("action") or tool),
+            },
+            tool_call_id=f"controller:{machine.current_attempt_id}:{trigger}",
+            predecessor_contract_id=getattr(self, "_last_invocation_contract_id", None),
+        )
         sink = getattr(self, "control_event_sink", None)
         envelope_id = f"forced-{sink.sequence + 1:06d}" if sink is not None else None
         resolution_snapshot = resolution.to_snapshot()
@@ -1425,11 +2285,14 @@ class ReActEngine(UIEventEmitter):
             "source_attempt_id": str(machine.current_attempt_id),
             "reason_code": requirement.reason_code,
             "tool": tool,
-            "exact_params": compact_control_value(exact_params),
+            "exact_params": bounded_exact_params(exact_params),
             "candidate_root": requirement.root,
             "candidate_system": requirement.system,
             "parent_execution_id": requirement.parent_execution_id,
             "candidate_resolution": resolution_snapshot,
+            "intent_id": controller_intent.intent_id,
+            "intent_source": controller_intent.source,
+            "action_fingerprint": controller_intent.action_fingerprint,
         }
         forced_payload["action_sha256"] = forced_action_sha256(
             policy="test_attempt_required",
@@ -1443,6 +2306,9 @@ class ReActEngine(UIEventEmitter):
             candidate_system=requirement.system,
             parent_execution_id=requirement.parent_execution_id,
             candidate_resolution=resolution_snapshot,
+            intent_id=controller_intent.intent_id,
+            intent_source=controller_intent.source,
+            action_fingerprint=controller_intent.action_fingerprint,
         )
 
         self._forcing_required_test_attempt = True
@@ -1456,13 +2322,20 @@ class ReActEngine(UIEventEmitter):
                 raw_action_text=f"HARNESS FORCED: {requirement.action_text()}",
                 source_step_index=getattr(self, "current_iteration", 0),
                 model_used="harness",
+                action_intent=controller_intent,
             )
             # The harness authored this intent, so the contract the facade
             # freezes for it must say `controller` — a forced attempt is never
             # the model's call (Plan 6 Stage B, spec §C3).
             with action_context(
-                envelope_id=forced_payload["envelope_id"],
+                envelope_id=envelope_id,
                 intent_source="controller",
+                intent_id=controller_intent.intent_id,
+                intent_domain_id=controller_intent.domain_id,
+                intent_exact_params=bounded_exact_params(exact_params),
+                action_fingerprint=controller_intent.action_fingerprint,
+                predecessor_contract_id=controller_intent.predecessor_contract_id,
+                control_recording_active=sink is not None,
             ):
                 execution = self._execute_tool_call(call)
             if tool == "build":
@@ -1519,6 +2392,7 @@ class ReActEngine(UIEventEmitter):
                 result=result,
                 actual_executions=actual_executions,
             )
+            self._observe_action_intent_progress(execution)
             self._apply_tool_execution_loop_effects(execution)
             self._append_native_observation(
                 forced_call_id,
@@ -1531,9 +2405,7 @@ class ReActEngine(UIEventEmitter):
             self._forcing_required_test_attempt = False
 
     def _phase_intro_step(self) -> ReActStep:
-        """The clean-window digest that opens every phase (GTD reset): goal
-        picture so far, the new phase's objective (tools, never raw commands),
-        and the flexible budget note."""
+        """Open a clean phase window with state, evidence contract, and budget."""
         machine = self.phase_machine
         phase = machine.current_phase
         _, reserved, remaining = self._phase_budget_numbers(phase)
@@ -1545,11 +2417,11 @@ class ReActEngine(UIEventEmitter):
         # renders Python guidance (review 2026-07-19 — the pyyaml false-block
         # shape reopened). Idempotent and token-free.
         survey_state = ""
-        if phase in ("build", "test"):
+        if phase in ("analyze", "build", "test"):
             survey_state = self._ensure_project_facts()
         # Project-aware objective: by build/test time the analyzer has recorded
         # the detected build system on the trunk, so a Python project gets the
-        # Python objective (deps -> compile, pytest) instead of the Java one.
+        # Python evidence contract instead of the Java one.
         objective = phase_objective(phase, self._detected_build_system())
         lines = [
             f"=== PHASE: {phase.upper()} ===",
@@ -1563,10 +2435,26 @@ class ReActEngine(UIEventEmitter):
             f"For an external impediment, call phase(action='blocked', "
             f"outcome='failed|partial|unknown', reason=..., evidence=[refs]).",
         ]
-        # Surface the analyzer's build recommendation directly in the build/test
-        # intro so the target/goal is present even if the model didn't carry it
-        # forward in analyze key_results (Bigtop: compile the right reactor/module,
-        # or block honestly on a meta-project — don't compile an empty root).
+        # Surface only survey status and coordinates.  The phase contract names
+        # required evidence; neither source chooses a public project action.
+        if phase == "analyze":
+            survey_projection = {
+                "created": (
+                    "Engine survey status: created — the framework survey computed and "
+                    "persisted the project fact sheet before the model's first analyze-phase action."
+                ),
+                "present": (
+                    "Engine survey status: present — the current project fact sheet is already "
+                    "persisted; no analyze call is required to create it."
+                ),
+                "failed": (
+                    "Engine survey status: failed — the harness could not establish the current "
+                    "fact sheet; this is a harness evidence failure, not a request to guess a "
+                    "replacement project action."
+                ),
+            }.get(survey_state)
+            if survey_projection:
+                lines.insert(lines.index(f"Objective: {objective}") + 1, survey_projection)
         if phase in ("build", "test"):
             if survey_state == "created":
                 lines.append(
@@ -1616,7 +2504,7 @@ class ReActEngine(UIEventEmitter):
     def _detected_build_system(self) -> Optional[str]:
         """The analyzer-detected build system, read best-effort from the trunk's
         environment_summary (the same plumbing as _recommended_build_line).
-        Any failure abstains with None -> the Java-default objectives."""
+        Any failure abstains with None -> the ecosystem-neutral objectives."""
         try:
             trunk = self.context_manager.load_trunk_context()
             env = getattr(trunk, "environment_summary", None) or {}
@@ -1636,8 +2524,11 @@ class ReActEngine(UIEventEmitter):
         return env.get("build_recommendation") or {}
 
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
-        """One-line build/test recommendation from the analyzer, read from the
-        trunk's environment_summary. Best-effort: any failure yields no line."""
+        """One-line build/test coordinate fact from the survey.
+
+        The legacy method name remains for callers; the projection contains no
+        goal, rationale, selected action, or ordering.
+        """
         try:
             trunk = self.context_manager.load_trunk_context()
             rec = (getattr(trunk, "environment_summary", None) or {}).get("build_recommendation")
@@ -1741,6 +2632,7 @@ class ReActEngine(UIEventEmitter):
         repair_request: RepairRequest | None = None,
     ) -> None:
         machine = self.phase_machine
+        self._pending_repair_context = None
         self._emit_control_phase_transition(decision, repair_request=repair_request)
         appended = machine.apply(decision)
         for applied in appended:
@@ -1781,70 +2673,6 @@ class ReActEngine(UIEventEmitter):
         except Exception:
             return getattr(self.context_manager, "project_name", None)
 
-    def _handle_repair_signal(self, metadata: Dict[str, Any]) -> str | None:
-        machine = self.phase_machine
-        state = getattr(self, "run_evidence_state", None)
-        if state is None or state.sealed:
-            return None
-        try:
-            request = RepairRequest.from_metadata(metadata.get("repair_request") or {})
-        except (TypeError, ValueError) as exc:
-            self.agent_logger.warning(f"Rejected malformed repair proposal: {exc}")
-            return None
-        if (
-            request.from_phase != machine.current_phase
-            or request.source_attempt_id != machine.current_attempt_id
-        ):
-            self.agent_logger.warning("Rejected repair proposal for a stale phase attempt")
-            return None
-        required_attempt = self._missing_required_test_attempt()
-        if required_attempt is not None:
-            self._force_required_test_attempt(
-                required_attempt,
-                trigger="repair_refusal",
-            )
-            self._add_system_guidance(
-                "TEST_ATTEMPT_REQUIRED: a test repair must be grounded in a "
-                "terminal runner receipt. The harness executed the required "
-                f"action: {required_attempt.action_text()}",
-                priority=9,
-            )
-            return None
-
-        claim = PhaseClaim(
-            phase=request.from_phase,
-            signal="done",
-            claimed_outcome=PhaseOutcome.FAILED,
-            reason=request.hypothesis,
-            evidence_refs=request.evidence_refs,
-        )
-        gate = check_phase_claim(
-            request.from_phase,
-            claim,
-            getattr(self, "physical_validator", None),
-            getattr(getattr(self, "physical_validator", None), "docker_orchestrator", None),
-            self._project_name_for_gate(),
-            sealed=self._evidence_is_sealed(),
-        )
-        gate = self._cap_unresolved_test_gate(claim, gate)
-        self._emit_control_gate(claim, gate)
-        if not gate.accepted:
-            self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
-            return None
-        self._record_gate_facts(request.from_phase, gate)
-        record = machine.close_attempt(gate)
-        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
-        decision = policy.request_repair(
-            request,
-            state=state,
-            budgets=self._repair_budgets(),
-            source_record=record,
-        )
-        if decision.route.kind == "repair":
-            self._consume_repair_budget(request.from_phase)
-        self._apply_phase_decision(record, decision, repair_request=request)
-        return "repair"
-
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:
         """Validate terminal claims, then route them through exactly one policy call."""
         if getattr(self, "phase_machine", None) is None:
@@ -1859,10 +2687,14 @@ class ReActEngine(UIEventEmitter):
             if signal == "note":
                 self._persist_phase_note(machine.current_phase, metadata.get("text", ""))
                 return signal
-            if signal == "repair":
-                return self._handle_repair_signal(metadata)
             if signal not in {"done", "blocked"}:
                 self.agent_logger.warning(f"Ignoring unknown phase signal: {signal}")
+                return None
+            if metadata.get("rejected_completion_control_owned") is True:
+                # _prepare/_apply_rejected_completion_control owns the durable
+                # gate -> optional repair_context_opened sequence for this
+                # rejected terminal result. Re-emitting it here creates a bare
+                # second gate that neither live restart nor replay can pair.
                 return None
 
             claim_data = metadata.get("phase_claim")
@@ -2397,11 +3229,9 @@ class ReActEngine(UIEventEmitter):
             self._journal_intro_dirty = True
             self._journal_last_ledger = None
             self._start_phase_branch()
-            # Same seam as `_apply_phase_decision`: a run that STARTS in build
-            # or test (a resumed flow) gets its entry consult too.
-            self._maybe_consult_advisor_at_phase_entry()
         else:
             self.steps = []
+        phase_entry_advisor_pending = phase_mode
 
         # The system prompt is rebuilt once and re-sent on EVERY request — the
         # audit finding in spec §3.1 was that the old loop rendered it once and
@@ -2440,6 +3270,20 @@ class ReActEngine(UIEventEmitter):
                     if phase_mode:
                         return self.abort(reason="wall clock cap exceeded")
                     return False
+
+                barrier_status = self._drain_job_barrier()
+                if barrier_status != "cleared":
+                    self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason=f"job barrier {barrier_status}")
+                    return False
+
+                if phase_entry_advisor_pending:
+                    # A resumed build/test run gets its entry consult only
+                    # after every inherited job is terminal and settlement is
+                    # resolved. Advisor/model work is forbidden inside barrier.
+                    self._maybe_consult_advisor_at_phase_entry()
+                    phase_entry_advisor_pending = False
 
                 if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
                     self._export_token_usage_csv()
@@ -2499,6 +3343,17 @@ class ReActEngine(UIEventEmitter):
 
                 executed_steps = self._execute_native_calls(turn)
                 added = max(len(self.steps) - steps_before, 0)
+
+                harness_failure = str(
+                    getattr(self, "_fatal_harness_control_failure", "") or ""
+                ).strip()
+                if harness_failure:
+                    self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(
+                            reason=("harness control recovery exhausted: " f"{harness_failure}")
+                        )
+                    return False
 
                 if phase_mode:
                     self._handle_phase_signals(executed_steps)
@@ -2586,43 +3441,395 @@ class ReActEngine(UIEventEmitter):
             record = self.phase_machine.record_abort(reason, evidence=[])
             self._record_phase_audit(record)
 
+    def _restore_active_repair_context(self) -> None:
+        sink = getattr(self, "control_event_sink", None)
+        path = getattr(sink, "path", None)
+        if path is None:
+            return
+        state = recover_active_repair_context_from_path(path)
+        if state.context is None:
+            return
+        self._pending_repair_context = state.context
+        self._add_system_guidance(
+            self._repair_context_guidance(state.context),
+            priority=9,
+        )
+
     def _emit_control_event(self, kind: str, payload: Dict[str, Any]):
+        lifecycle_states = {
+            "job_terminal_observed": "terminal",
+            "job_terminal_unpersisted": "terminal_unpersisted",
+            "job_live_at_close": "live_at_close",
+            "job_settled": "settled",
+        }
+        lifecycle_state = lifecycle_states.get(kind)
+        loop_memory = getattr(self, "loop_memory", None)
+        if lifecycle_state and loop_memory is not None:
+            job_id = str(payload.get("job_id") or "").strip()
+            if job_id:
+                loop_memory.observe_job_transition(
+                    job_id,
+                    lifecycle_state,
+                    progress_fingerprint=canonical_sha256(compact_control_value(payload)),
+                )
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return None
+        if kind in _STRICT_LINEAGE_CONTROL_KINDS:
+            # These payloads carry hashes over exact bounded values. Passing
+            # them through compact_control_value would truncate strings while
+            # retaining the digest of the original, making the live record
+            # unverifiable. Invalid or unwritable lineage is a hard failure.
+            return sink.emit(kind, payload)
         try:
             return sink.emit(kind, compact_control_value(payload))
         except Exception as exc:
             logger.warning(f"Control-event emission failed for {kind}: {exc}")
             return None
 
-    def _detect_accepted_repair(
+    def _action_domain_id(self, params: Mapping[str, Any] | None = None) -> str:
+        values = dict(params or {})
+        working_directory = str(
+            values.get("working_directory")
+            or values.get("cwd")
+            or values.get("workdir")
+            or self.successful_states.get("working_directory")
+            or "/workspace"
+        ).strip()
+        phase = str(getattr(getattr(self, "phase_machine", None), "current_phase", "") or "")
+        return f"{phase or 'run'}:{working_directory}"
+
+    def _mint_model_action_intent(
         self,
-        tool: str,
+        call: ToolCall,
+        params: Mapping[str, Any],
+    ) -> ActionIntent:
+        """Assign model provenance to one validated public call.
+
+        When a RepairContext is active the model must supply its own
+        hypothesis/observation/stop fields.  The engine links those fields to
+        the stored context and refuses invented evidence refs or a tool outside
+        the neutral affordance set; it never fills in a project command.
+        """
+
+        pending = getattr(self, "_pending_repair_context", None)
+        repair_submission = call.repair_intent_submission
+        tool_name = str(call.name or "").strip().lower()
+        submission: dict[str, Any] = {
+            "domain_id": self._action_domain_id(params),
+            "tool": tool_name,
+            "params": dict(params),
+        }
+        trigger_assessment_id = None
+        repair_context_id = None
+        repair_context_digest = None
+
+        if pending is not None:
+            allowed_tools = {
+                str(item.tool or "").strip().lower() for item in pending.allowed_tool_affordances
+            }
+            if tool_name in allowed_tools:
+                if not isinstance(repair_submission, Mapping):
+                    raise PreDispatchControlError(
+                        "This action responds to a judge RepairContext and requires the "
+                        "model-owned repair_intent fields shown in the tool schema.",
+                        error_code="REPAIR_INTENT_REQUIRED",
+                        metadata={"repair_context_id": pending.repair_context_id},
+                    )
+                submission.update(dict(repair_submission))
+                try:
+                    selected_affordance = validate_repair_action_affordance(
+                        tool=tool_name,
+                        params=params,
+                        next_action_kind=submission.get("next_action_kind"),
+                        context=pending,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise PreDispatchControlError(
+                        f"repair_intent does not match the active tool affordance: {exc}",
+                        error_code="REPAIR_ACTION_AFFORDANCE_MISMATCH",
+                        metadata={"repair_context_id": pending.repair_context_id},
+                    ) from exc
+                allowed_refs = repair_context_reference_set(
+                    pending,
+                    affordance=selected_affordance,
+                )
+                submitted_refs = {
+                    str(value or "").strip()
+                    for value in submission.get("blocking_fact_refs") or ()
+                    if str(value or "").strip()
+                }
+                if not submitted_refs or not submitted_refs.issubset(allowed_refs):
+                    raise PreDispatchControlError(
+                        "repair_intent.blocking_fact_refs must cite only the active "
+                        "RepairContext assessment or evidence refs.",
+                        error_code="REPAIR_INTENT_INVALID_REFS",
+                        metadata={"repair_context_id": pending.repair_context_id},
+                    )
+                expected_observations = {
+                    str(value or "").strip()
+                    for value in submission.get("expected_observation") or ()
+                    if str(value or "").strip()
+                }
+                if not expected_observations or not expected_observations.issubset(
+                    set(pending.admissible_observation_types)
+                ):
+                    raise PreDispatchControlError(
+                        "repair_intent.expected_observation must name only active "
+                        "RepairContext observation types.",
+                        error_code="REPAIR_INTENT_INVALID_OBSERVATION",
+                        metadata={"repair_context_id": pending.repair_context_id},
+                    )
+                trigger_assessment_id = pending.trigger_assessment_id
+                repair_context_id = pending.repair_context_id
+                repair_context_digest = repair_context_sha256(pending)
+            elif (
+                tool_name == "phase"
+                and str(params.get("action") or "").strip().lower() in {"done", "blocked"}
+                and repair_submission is None
+            ):
+                # A judge context cannot trap the model in an endless repair
+                # loop.  It may still make an explicit terminal claim, which
+                # the phase gate independently accepts or contradicts.  This
+                # is the sole non-affordance exception; note/advisor/report/
+                # context calls do not repair the rejected project claim.
+                pass
+            else:
+                raise PreDispatchControlError(
+                    "The selected tool is not an affordance in the active RepairContext.",
+                    error_code="REPAIR_TOOL_NOT_ALLOWED",
+                    metadata={"repair_context_id": pending.repair_context_id},
+                )
+        elif repair_submission is not None:
+            raise PreDispatchControlError(
+                "repair_intent was supplied without an active judge RepairContext.",
+                error_code="REPAIR_CONTEXT_NOT_ACTIVE",
+            )
+
+        try:
+            return EngineActionIntentFactory.for_model().from_submission(
+                submission,
+                tool_call_id=str(getattr(self, "_active_native_tool_call_id", "") or ""),
+                trigger_assessment_id=trigger_assessment_id,
+                repair_context_id=repair_context_id,
+                repair_context_sha256=repair_context_digest,
+                predecessor_contract_id=getattr(self, "_last_invocation_contract_id", None),
+            )
+        except Exception as exc:
+            raise PreDispatchControlError(
+                f"ActionIntent validation failed: {exc}",
+                error_code="ACTION_INTENT_INVALID",
+                metadata={
+                    "repair_context_id": repair_context_id,
+                    "trigger_assessment_id": trigger_assessment_id,
+                },
+            ) from exc
+
+    def _validate_action_intent_repair_lineage(
+        self,
+        call: ToolCall,
+        params: Mapping[str, Any],
+        intent: ActionIntent,
+    ) -> None:
+        """Re-enter the active judge context for every dispatch boundary.
+
+        A caller may supply an already-minted ActionIntent (forced/controller
+        paths and tests do), so validating only the model-submission factory
+        would leave a stale or constructed repair intent as an authority seam.
+        """
+
+        pending = getattr(self, "_pending_repair_context", None)
+        terminal_claim = str(call.name or "").strip().lower() == "phase" and str(
+            params.get("action") or ""
+        ).strip().lower() in {"done", "blocked"}
+        if pending is None:
+            if intent.repair_context_id is not None:
+                raise PreDispatchControlError(
+                    "ActionIntent links a repair context that is not active.",
+                    error_code="REPAIR_CONTEXT_NOT_ACTIVE",
+                    metadata={"runner_dispatched": False},
+                )
+            return
+        if terminal_claim and intent.repair_context_id is None:
+            if (
+                intent.source == "model"
+                and bool(str(intent.intent_id or "").strip())
+                and bool(str(intent.action_fingerprint or "").strip())
+            ):
+                return
+            raise PreDispatchControlError(
+                "Only a complete model ActionIntent may make an unlinked terminal "
+                "claim while a RepairContext is active.",
+                error_code="REPAIR_INTENT_LINEAGE_MISMATCH",
+                metadata={
+                    "runner_dispatched": False,
+                    "repair_context_id": pending.repair_context_id,
+                },
+            )
+        if intent.source == "controller" and getattr(
+            self, "_suppress_control_action_envelope", False
+        ):
+            # A mandatory controller obligation may run while a judge context
+            # is open, but it neither claims nor consumes model repair lineage.
+            return
+        expected_digest = repair_context_sha256(pending)
+        expected_tuple = (
+            pending.trigger_assessment_id,
+            pending.repair_context_id,
+            expected_digest,
+        )
+        actual_tuple = (
+            intent.trigger_assessment_id,
+            intent.repair_context_id,
+            intent.repair_context_sha256,
+        )
+        if intent.source != "model" or actual_tuple != expected_tuple:
+            raise PreDispatchControlError(
+                "ActionIntent does not carry the complete active RepairContext lineage.",
+                error_code="REPAIR_INTENT_LINEAGE_MISMATCH",
+                metadata={
+                    "runner_dispatched": False,
+                    "repair_context_id": pending.repair_context_id,
+                },
+            )
+        if pending.domain_id is not None and intent.domain_id != pending.domain_id:
+            raise PreDispatchControlError(
+                "ActionIntent domain differs from the active RepairContext.",
+                error_code="REPAIR_INTENT_DOMAIN_MISMATCH",
+                metadata={"runner_dispatched": False},
+            )
+        try:
+            affordance = validate_repair_action_affordance(
+                tool=call.name,
+                params=params,
+                next_action_kind=intent.next_action_kind,
+                context=pending,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PreDispatchControlError(
+                f"ActionIntent does not match the active tool affordance: {exc}",
+                error_code="REPAIR_ACTION_AFFORDANCE_MISMATCH",
+                metadata={"runner_dispatched": False},
+            ) from exc
+        if (
+            not set(intent.blocking_fact_refs).issubset(
+                repair_context_reference_set(pending, affordance=affordance)
+            )
+            or not intent.blocking_fact_refs
+        ):
+            raise PreDispatchControlError(
+                "ActionIntent cites refs outside the active RepairContext.",
+                error_code="REPAIR_INTENT_INVALID_REFS",
+                metadata={"runner_dispatched": False},
+            )
+        if not intent.expected_observation or not set(intent.expected_observation).issubset(
+            set(pending.admissible_observation_types)
+        ):
+            raise PreDispatchControlError(
+                "ActionIntent expects observations outside the active RepairContext.",
+                error_code="REPAIR_INTENT_INVALID_OBSERVATION",
+                metadata={"runner_dispatched": False},
+            )
+
+    def _prepare_control_action(
+        self,
+        call: ToolCall,
         params: Dict[str, Any],
-    ) -> Optional[str]:
-        """Open the acceptance scope when this call IS a live repair proposal.
+    ) -> str | None:
+        """Mint intent, persist its envelope, and open the contract scope."""
 
-        Acceptance is exact equality with a stored proposal's public call (Plan
-        6 Stage C3, spec §C6). The model cannot self-attest it: the `repair_id`
-        comes from the proposal file the call matched, and a call that matches
-        nothing clears the scope rather than inheriting the previous one.
+        if call.action_intent is None:
+            call.action_intent = self._mint_model_action_intent(call, params)
+        else:
+            # An existing intent is engine-internal data, but it still crosses
+            # the same dispatch boundary as an untrusted public call.  Pydantic
+            # does not revalidate model instances by default, so round-trip the
+            # payload to catch ``model_construct`` and then bind the executable
+            # identity to the normalized call the runner will actually see.
+            try:
+                intent = ActionIntent.model_validate(
+                    call.action_intent.model_dump(mode="python", round_trip=True)
+                )
+            except Exception as exc:
+                raise PreDispatchControlError(
+                    f"Existing ActionIntent validation failed: {exc}",
+                    error_code="ACTION_INTENT_INVALID",
+                    metadata={"runner_dispatched": False},
+                ) from exc
 
-        Bounded — only the facade a repair may propose is looked up at all."""
-        clear_accepted_repair()
-        orchestrator = getattr(self, "orchestrator", None)
-        if orchestrator is None:
-            return None
-        repair_id = accepted_repair_for(orchestrator, tool, compact_control_value(params))
-        if repair_id:
-            logger.info(f"Repair {repair_id} accepted by the model's own {tool} call")
-            set_accepted_repair(repair_id)
-        return repair_id
+            expected_tool = str(call.name or "").strip().lower()
+            expected_domain = self._action_domain_id(params)
+            try:
+                expected_params = canonical_params(params)
+            except Exception as exc:
+                raise PreDispatchControlError(
+                    f"Action parameters cannot be bound to the ActionIntent: {exc}",
+                    error_code="ACTION_INTENT_INVALID",
+                    metadata={"runner_dispatched": False},
+                ) from exc
+            mismatches = []
+            if intent.tool != expected_tool:
+                mismatches.append("tool")
+            if intent.domain_id != expected_domain:
+                mismatches.append("domain_id")
+            if intent.canonical_params != expected_params:
+                mismatches.append("canonical_params")
+            if mismatches:
+                raise PreDispatchControlError(
+                    "ActionIntent does not describe the normalized public call.",
+                    error_code="ACTION_INTENT_BINDING_MISMATCH",
+                    metadata={
+                        "runner_dispatched": False,
+                        "mismatched_fields": mismatches,
+                        "intent_id": intent.intent_id,
+                    },
+                )
+            call.action_intent = intent
+        intent = call.action_intent
+        self._validate_action_intent_repair_lineage(call, params, intent)
+        envelope_id = self._emit_control_action_envelope(
+            call.name,
+            params,
+            intent=intent,
+        )
+        if (
+            envelope_id is None
+            and intent.repair_context_id is not None
+            and not getattr(self, "_suppress_control_action_envelope", False)
+        ):
+            clear_action_context()
+            raise PreDispatchControlError(
+                "A repair-linked action requires a durable exact action envelope.",
+                error_code="REPAIR_LINEAGE_RECORDING_REQUIRED",
+                metadata={
+                    "runner_dispatched": False,
+                    "repair_context_id": intent.repair_context_id,
+                },
+            )
+        # A run without a control sink still owns its intent. Build dispatches
+        # use a unique unrecorded envelope but retain the same intent lineage.
+        if envelope_id is None and not getattr(self, "_suppress_control_action_envelope", False):
+            set_action_context(
+                envelope_id=None,
+                intent_source=intent.source,
+                intent_id=intent.intent_id,
+                intent_domain_id=intent.domain_id,
+                intent_exact_params=bounded_exact_params(params),
+                action_fingerprint=intent.action_fingerprint,
+                trigger_assessment_id=intent.trigger_assessment_id,
+                repair_context_id=intent.repair_context_id,
+                repair_context_sha256=intent.repair_context_sha256,
+                predecessor_contract_id=intent.predecessor_contract_id,
+                control_recording_active=False,
+            )
+        return envelope_id
 
     def _emit_control_action_envelope(
         self,
         tool: str,
         params: Dict[str, Any],
+        *,
+        intent: ActionIntent | None = None,
     ) -> str | None:
         """Key the envelope that every downstream `tool_result` hangs off.
 
@@ -2643,10 +3850,6 @@ class ReActEngine(UIEventEmitter):
         if getattr(self, "_suppress_control_action_envelope", False):
             return None
         clear_action_context()
-        # Plan 6 Stage C3: the same place a stale envelope is dropped is where a
-        # stale acceptance must be, so the repair scope never outlives the call
-        # that accepted it.
-        self._detect_accepted_repair(tool, params)
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return None
@@ -2657,9 +3860,19 @@ class ReActEngine(UIEventEmitter):
                     tool_call_id = getattr(step, "tool_call_id", None)
                     break
         if not tool_call_id:
-            logger.warning("Control envelope omitted because no action identity is active")
-            return None
-        safe_params = compact_control_value(params)
+            raise PreDispatchControlError(
+                "Control action has no active model tool-call identity.",
+                error_code="ACTION_ENVELOPE_IDENTITY_MISSING",
+                metadata={"runner_dispatched": False},
+            )
+        try:
+            safe_params = bounded_exact_params(params)
+        except (TypeError, ValueError) as exc:
+            raise PreDispatchControlError(
+                f"Exact action parameters cannot be recorded: {exc}",
+                error_code="ACTION_PARAMS_UNRECORDABLE",
+                metadata={"runner_dispatched": False},
+            ) from exc
         envelope_id = f"envelope-{sink.sequence + 1:06d}"
         payload: Dict[str, Any] = {
             "envelope_id": envelope_id,
@@ -2672,11 +3885,78 @@ class ReActEngine(UIEventEmitter):
             ),
             "tool_call_id": str(tool_call_id),
         }
-        emitted = self._emit_control_event("action_envelope", payload)
+        if intent is not None:
+            payload.update(
+                {
+                    "intent_id": intent.intent_id,
+                    "intent_source": intent.source,
+                    "action_fingerprint": intent.action_fingerprint,
+                }
+            )
+            if intent.trigger_assessment_id:
+                payload["trigger_assessment_id"] = intent.trigger_assessment_id
+            if intent.repair_context_id:
+                payload["repair_context_id"] = intent.repair_context_id
+                payload["repair_context_sha256"] = intent.repair_context_sha256
+                payload["domain_id"] = intent.domain_id
+                payload["blocking_fact_refs"] = list(intent.blocking_fact_refs)
+                payload["repair_hypothesis"] = intent.repair_hypothesis
+                payload["next_action_kind"] = intent.next_action_kind
+                payload["expected_observation"] = list(intent.expected_observation)
+                payload["stop_condition"] = intent.stop_condition
+            payload["envelope_sha256"] = action_envelope_sha256(
+                tool_call_id=tool_call_id,
+                tool=tool,
+                exact_params=safe_params,
+                intent_id=intent.intent_id,
+                intent_source=intent.source,
+                action_fingerprint=intent.action_fingerprint,
+                trigger_assessment_id=intent.trigger_assessment_id,
+                repair_context_id=intent.repair_context_id,
+                repair_context_sha256=intent.repair_context_sha256,
+                domain_id=(intent.domain_id if intent.repair_context_id else None),
+                blocking_fact_refs=(
+                    intent.blocking_fact_refs if intent.repair_context_id else None
+                ),
+                repair_hypothesis=(intent.repair_hypothesis if intent.repair_context_id else None),
+                next_action_kind=(intent.next_action_kind if intent.repair_context_id else None),
+                expected_observation=(
+                    intent.expected_observation if intent.repair_context_id else None
+                ),
+                stop_condition=(intent.stop_condition if intent.repair_context_id else None),
+            )
+        try:
+            emitted = self._emit_control_event("action_envelope", payload)
+        except Exception as exc:
+            clear_action_context()
+            raise PreDispatchControlError(
+                f"Exact action envelope did not persist: {type(exc).__name__}",
+                error_code="ACTION_ENVELOPE_PERSIST_FAILED",
+                metadata={"runner_dispatched": False},
+            ) from exc
         if emitted is None:
-            return None
+            clear_action_context()
+            raise PreDispatchControlError(
+                "Exact action envelope did not persist.",
+                error_code="ACTION_ENVELOPE_PERSIST_FAILED",
+                metadata={"runner_dispatched": False},
+            )
         self._active_control_envelope_id = envelope_id
-        set_action_context(envelope_id=envelope_id, intent_source="model")
+        set_action_context(
+            envelope_id=envelope_id,
+            intent_source=intent.source if intent is not None else "model",
+            intent_id=intent.intent_id if intent is not None else None,
+            intent_domain_id=intent.domain_id if intent is not None else None,
+            intent_exact_params=safe_params if intent is not None else None,
+            action_fingerprint=(intent.action_fingerprint if intent is not None else None),
+            trigger_assessment_id=(intent.trigger_assessment_id if intent is not None else None),
+            repair_context_id=intent.repair_context_id if intent is not None else None,
+            repair_context_sha256=(intent.repair_context_sha256 if intent is not None else None),
+            predecessor_contract_id=(
+                intent.predecessor_contract_id if intent is not None else None
+            ),
+            control_recording_active=True,
+        )
         return envelope_id
 
     @staticmethod
@@ -2730,49 +4010,60 @@ class ReActEngine(UIEventEmitter):
         actual_executions: List[ActualToolExecution] | None = None,
     ) -> None:
         if not envelope_id:
+            clear_action_context()
             return
         machine = getattr(self, "phase_machine", None)
-        safe_params = compact_control_value(params)
+        safe_params = bounded_exact_params(params)
+        physical_actuals = [
+            actual
+            for actual in (actual_executions or ())
+            if self._actual_execution_proves_dispatch(actual) is True
+        ]
         output_source = result.raw_output if result.raw_output is not None else result.output
-        self._emit_control_event(
-            "tool_result",
-            {
-                "envelope_id": envelope_id,
-                "execution_id": execution_id,
-                "tool": tool,
-                "params": safe_params,
-                "scope": self._tool_evidence_scope(tool, params).value,
-                "roles": [role.value for role in self._tool_evidence_roles(tool, params, result)],
-                "result": self._control_result_projection(result),
-                "source_phase": getattr(machine, "current_phase", "") or "",
-                "source_attempt_id": getattr(machine, "current_attempt_id", "") or "",
-                "actual_executions": [
-                    {
-                        "execution_id": actual.execution_id,
-                        "tool": actual.tool_name,
-                        "params": compact_control_value(actual.params),
-                        "scope": self._tool_evidence_scope(
-                            actual.tool_name,
-                            actual.params,
-                        ).value,
-                        "roles": [
-                            role.value
-                            for role in self._tool_evidence_roles(
+        try:
+            self._emit_control_event(
+                "tool_result",
+                {
+                    "envelope_id": envelope_id,
+                    "execution_id": execution_id,
+                    "tool": tool,
+                    "params": safe_params,
+                    "scope": self._tool_evidence_scope(tool, params).value,
+                    "roles": [
+                        role.value for role in self._tool_evidence_roles(tool, params, result)
+                    ],
+                    "result": self._control_result_projection(result),
+                    "source_phase": getattr(machine, "current_phase", "") or "",
+                    "source_attempt_id": getattr(machine, "current_attempt_id", "") or "",
+                    "actual_executions": [
+                        {
+                            "execution_id": actual.execution_id,
+                            "tool": actual.tool_name,
+                            "params": bounded_exact_params(actual.params),
+                            "scope": self._tool_evidence_scope(
                                 actual.tool_name,
                                 actual.params,
-                                actual.result,
-                            )
-                        ],
-                        "result": self._control_result_projection(actual.result),
-                    }
-                    for actual in (actual_executions or ())
-                ],
-                "output_sha256": hashlib.sha256(
-                    str(output_source or "").encode("utf-8", errors="replace")
-                ).hexdigest(),
-            },
-        )
-        self._active_control_envelope_id = None
+                            ).value,
+                            "roles": [
+                                role.value
+                                for role in self._tool_evidence_roles(
+                                    actual.tool_name,
+                                    actual.params,
+                                    actual.result,
+                                )
+                            ],
+                            "result": self._control_result_projection(actual.result),
+                        }
+                        for actual in physical_actuals
+                    ],
+                    "output_sha256": hashlib.sha256(
+                        str(output_source or "").encode("utf-8", errors="replace")
+                    ).hexdigest(),
+                },
+            )
+        finally:
+            self._active_control_envelope_id = None
+            clear_action_context()
         resolved_commit = (result.metadata or {}).get("resolved_commit")
         callback = getattr(self, "_target_repo_sha_callback", None)
         if resolved_commit and callable(callback):
@@ -2781,9 +4072,109 @@ class ReActEngine(UIEventEmitter):
             except Exception as exc:
                 logger.warning(f"Could not update target repository run pin: {exc}")
 
-    def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult) -> None:
+    @staticmethod
+    def _actual_execution_proves_dispatch(
+        actual: ActualToolExecution,
+    ) -> bool | None:
+        """Classify a leaf without letting the build facade self-attest.
+
+        A facade-shaped ``build`` record is only a wrapper around zero or more
+        backend executions.  Without an explicit runner marker it is unknown,
+        not physical evidence.  Other actual-execution tool names are the
+        flattened physical leaves themselves.
+        """
+
+        result = actual.result
+        metadata = dict(result.metadata or {})
+        marker = metadata.get("runner_dispatched", None)
+        if marker is not None and not isinstance(marker, bool):
+            return None
+        refused = str(result.error_code or "").strip() in (_REPAIR_PREDISPATCH_REFUSAL_CODES)
+        if marker is True and refused:
+            return None
+        if marker is True:
+            return True
+        if marker is False or refused:
+            return False
+        if str(actual.tool_name or "").strip().lower() == "build":
+            return None
+        return True
+
+    def _repair_action_dispatch_outcome(self, execution: ToolExecution) -> bool | None:
+        """Return strict repair consumption truth; None is an integrity fault."""
+
+        result = execution.result
+        metadata = dict(result.metadata or {})
+        marker = metadata.get("runner_dispatched", None)
+        if marker is not None and not isinstance(marker, bool):
+            self._record_repair_dispatch_integrity_failure("repair_runner_dispatch_marker_invalid")
+            return None
+        refusal = (
+            marker is False
+            or str(result.error_code or "").strip() in _REPAIR_PREDISPATCH_REFUSAL_CODES
+        )
+        actual_states = tuple(
+            self._actual_execution_proves_dispatch(actual) for actual in execution.actual_executions
+        )
+        if any(state is None for state in actual_states):
+            self._record_repair_dispatch_integrity_failure("repair_dispatch_evidence_unknown")
+            return None
+        actual_dispatch = any(state is True for state in actual_states)
+        dispatched = actual_dispatch or marker is True
+        if dispatched and refusal:
+            self._record_repair_dispatch_integrity_failure("repair_dispatch_evidence_contradiction")
+            return None
+        if dispatched:
+            return True
+        if refusal:
+            return False
+        self._record_repair_dispatch_integrity_failure("repair_dispatch_evidence_unknown")
+        return None
+
+    def _record_repair_dispatch_integrity_failure(self, code: str) -> None:
+        normalized = str(code or "repair_dispatch_integrity_failure").strip()
+        self._fatal_harness_control_failure = normalized
+        state = getattr(self, "run_evidence_state", None)
+        machine = getattr(self, "phase_machine", None)
+        context = getattr(self, "_pending_repair_context", None)
+        if state is None or state.sealed:
+            return
+        refs = tuple(context.observed_fact_refs) if isinstance(context, RepairContext) else ()
+        signature = f"harness_control:{getattr(machine, 'current_attempt_id', '')}:{normalized}"
+        if any(
+            blocker.status == "active" and blocker.failure_signature == signature
+            for blocker in state.blockers
+        ):
+            return
+        state.record_blocker(
+            failure_signature=signature,
+            category="harness_control",
+            error_code=normalized,
+            evidence_refs=refs,
+            source_phase=getattr(machine, "current_phase", None),
+            source_attempt_id=getattr(machine, "current_attempt_id", None),
+        )
+
+    def _gate_evidence_refs(self, gate: GateResult) -> tuple[str, ...]:
+        """Give control-derived facts stable provenance before emit/replay."""
+
+        refs = tuple(gate.evidence_refs)
+        if refs or not gate.validated_facts:
+            return refs
+        machine = getattr(self, "phase_machine", None)
+        return (
+            "control:gate:"
+            f"{getattr(machine, 'current_attempt_id', '')}:"
+            f"{gate.code or gate.control_disposition.value}",
+        )
+
+    def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult):
         validated_facts = compact_control_value(dict(gate.validated_facts))
         machine = getattr(self, "phase_machine", None)
+        control_evidence_refs = list(self._gate_evidence_refs(gate))
+        gate_code = gate.code or (
+            "phase_claim_accepted" if gate.accepted else "phase_claim_contradicted"
+        )
         gate_payload: Dict[str, Any] = {
             "phase": claim.phase,
             "signal": claim.signal,
@@ -2791,9 +4182,12 @@ class ReActEngine(UIEventEmitter):
             "validator_state": gate.validator_state.value,
             "expected_accepted": gate.accepted,
             "expected_outcome": gate.validated_outcome.value,
+            "control_disposition": gate.control_disposition.value,
+            "blocker_owner": gate.blocker_owner.value,
+            "code": gate_code,
             "reason": gate.reason,
             "key_results": claim.key_results,
-            "evidence_refs": list(gate.evidence_refs),
+            "evidence_refs": control_evidence_refs,
             "validated_facts": validated_facts,
             "source_attempt_id": getattr(machine, "current_attempt_id", None),
         }
@@ -2806,12 +4200,550 @@ class ReActEngine(UIEventEmitter):
             {
                 "phase": claim.phase,
                 "validator_state": gate.validator_state.value,
+                "control_disposition": gate.control_disposition.value,
+                "blocker_owner": gate.blocker_owner.value,
                 "reason": gate.reason,
-                "evidence_refs": list(gate.evidence_refs),
+                "evidence_refs": control_evidence_refs,
                 "validated_facts": validated_facts,
             },
         )
-        self._emit_control_event("gate_decision", gate_payload)
+        return self._emit_control_event("gate_decision", gate_payload)
+
+    def _repair_tool_affordances(self) -> tuple[ToolSemanticAffordance, ...]:
+        """Project-action capabilities, without params, examples, or ordering."""
+
+        excluded = {"advisor", "manage_context", "phase", "report"}
+        affordances: list[ToolSemanticAffordance] = []
+        for name, tool in sorted(getattr(self, "tools", {}).items()):
+            normalized = str(name or "").strip().lower()
+            if not normalized or normalized in excluded:
+                continue
+            try:
+                schema = tool.get_parameter_schema()
+            except Exception:
+                schema = {}
+            properties = dict((schema or {}).get("properties") or {})
+            action_schema = properties.get("action") or {}
+            action_kinds = tuple(
+                str(value).strip()
+                for value in action_schema.get("enum") or ()
+                if str(value).strip()
+            )
+            affordances.append(
+                ToolSemanticAffordance(
+                    tool=normalized,
+                    action_kinds=action_kinds,
+                    action_parameter=("action" if "action" in properties else None),
+                )
+            )
+        return tuple(affordances)
+
+    @staticmethod
+    def _fact_value_recursive(value: Any, key: str) -> Any:
+        if isinstance(value, Mapping):
+            if key in value:
+                return value[key]
+            for child in value.values():
+                found = ReActEngine._fact_value_recursive(child, key)
+                if found is not None:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                found = ReActEngine._fact_value_recursive(child, key)
+                if found is not None:
+                    return found
+        return None
+
+    def _repair_fingerprints(self, gate: GateResult) -> RepairFingerprintSet:
+        facts = dict(gate.validated_facts or {})
+        values: dict[str, Any] = {}
+        for field_name, fact_key in (
+            ("target_sha", "target_sha"),
+            ("survey_fingerprint", "survey_fingerprint"),
+            ("config_fingerprint", "config_fingerprint"),
+            ("document_map_fingerprint", "document_map_fingerprint"),
+            ("fact_epoch", "fact_epoch"),
+        ):
+            value = self._fact_value_recursive(facts, fact_key)
+            if value is not None:
+                values[field_name] = value
+        return RepairFingerprintSet.model_validate(values)
+
+    def _active_blocker_refs(self) -> tuple[str, ...]:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None:
+            return ()
+        return tuple(
+            sorted(
+                {
+                    str(blocker.blocker_id)
+                    for blocker in state.blockers
+                    if str(getattr(blocker, "status", "")) == "active"
+                }
+            )
+        )
+
+    def _gate_control_assessment(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+    ) -> ControlAssessment:
+        machine = getattr(self, "phase_machine", None)
+        subject_material = {
+            "phase_attempt_id": str(getattr(machine, "current_attempt_id", "") or ""),
+            "phase": claim.phase,
+            "validator_state": gate.validator_state.value,
+            "validated_outcome": gate.validated_outcome.value,
+            "control_disposition": gate.control_disposition.value,
+            "blocker_owner": gate.blocker_owner.value,
+            "code": gate.code or "phase_claim_contradicted",
+            "validated_facts": compact_control_value(dict(gate.validated_facts or {})),
+            "evidence_refs": sorted(set(gate.evidence_refs)),
+        }
+        subject_id = "gate-" + canonical_sha256(subject_material)[:16]
+        return ControlAssessment(
+            event_or_intent_id=subject_id,
+            stage="gate",
+            typed_code=gate.code or "phase_claim_contradicted",
+            detail=(
+                f"phase={claim.phase}; validator={gate.validator_state.value}; "
+                f"maximum={gate.validated_outcome.value}; "
+                f"disposition={gate.control_disposition.value}"
+            ),
+            blocker_owner=gate.blocker_owner,
+            observed_facts=compact_control_value(dict(gate.validated_facts or {})),
+            evidence_refs=tuple(gate.evidence_refs),
+        )
+
+    def _install_repair_context(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+    ) -> tuple[RepairContext | None, str]:
+        """Persist judge assessment + non-prescriptive policy context.
+
+        Both writes are evidence transport.  Two bounded attempts make a
+        transient write failure controller-owned; the model never receives an
+        ungrounded in-memory context.
+        """
+
+        orchestrator = getattr(self, "orchestrator", None)
+        from sag.runtime.container_io import resolve_control_execute
+
+        execute = resolve_control_execute(orchestrator)
+        if not callable(execute):
+            return None, "repair_context_transport_unavailable"
+        assessment = self._gate_control_assessment(claim, gate)
+        assessment_persisted = False
+        for _ in range(2):
+            if write_assessment(execute, assessment):
+                assessment_persisted = True
+                break
+        if not assessment_persisted:
+            return None, "repair_assessment_persist_failed"
+
+        try:
+            constraint = RepairConstraint(
+                constraint_id=f"constraint-{assessment.assessment_id[-8:]}",
+                kind="judge_outcome_ceiling",
+                subject=claim.phase,
+                relation="maximum_supported_outcome",
+                value=gate.validated_outcome.value,
+                source_refs=(assessment.assessment_id,),
+            )
+            context = build_repair_context(
+                trigger_assessment_id=assessment.assessment_id,
+                typed_blocker=assessment.typed_code,
+                blocker_owner=gate.blocker_owner.value,
+                domain_id=self._action_domain_id(),
+                fingerprints=self._repair_fingerprints(gate),
+                observed_fact_refs=(assessment.assessment_id, *gate.evidence_refs),
+                constraint_set=ConstraintSet(
+                    constraints=(constraint,),
+                    source_refs=(assessment.assessment_id,),
+                ),
+                allowed_tool_affordances=self._repair_tool_affordances(),
+                admissible_observation_types=(
+                    "tool_result",
+                    "receipt_assessment",
+                    "artifact_or_report_delta",
+                    "job_lifecycle_transition",
+                ),
+                open_conflict_refs=self._active_blocker_refs(),
+            )
+        except (TypeError, ValueError):
+            return None, "repair_context_projection_invalid"
+        write_code = ""
+        for _ in range(2):
+            write_result = write_repair_context(execute, context)
+            write_code = write_result.code
+            if write_result.persisted:
+                return context, "persisted"
+        return None, write_code or "repair_context_persist_failed"
+
+    @staticmethod
+    def _repair_context_guidance(context: RepairContext) -> str:
+        # This is a neutral, bounded projection of the exact context persisted
+        # in repair_context_opened. It exposes semantic capabilities and fact
+        # provenance, never a parameter value, argv or harness-selected call.
+        affordances = "; ".join(
+            (
+                f"{item.tool}: selector={item.action_parameter or 'tool'}; "
+                f"kinds={','.join(item.action_kinds) or item.tool}; "
+                f"constraint_refs={','.join(item.constraint_refs) or 'none'}"
+            )
+            for item in context.allowed_tool_affordances
+        )
+        constraints = "; ".join(
+            (
+                f"{item.constraint_id}: {item.kind} "
+                f"{item.subject} {item.relation} {item.value}; "
+                f"source_refs={','.join(item.source_refs) or 'none'}"
+            )
+            for item in context.constraint_set.constraints
+        )
+        fingerprints = ", ".join(
+            f"{key}={value}"
+            for key, value in context.fingerprints.model_dump(
+                mode="json",
+                exclude_none=True,
+            ).items()
+        )
+        guidance = (
+            f"REPAIR_CONTEXT {context.repair_context_id}\n"
+            f"Judge blocker: {context.typed_blocker}; owner={context.blocker_owner}; "
+            f"domain={context.domain_id or 'unknown'}\n"
+            f"Observed fact refs: {', '.join(context.observed_fact_refs) or 'none'}\n"
+            f"Supporting claim refs: {', '.join(context.supporting_claim_ids) or 'none'}\n"
+            f"Open conflict refs: {', '.join(context.open_conflict_refs) or 'none'}\n"
+            "Constraint-set source refs: "
+            f"{', '.join(context.constraint_set.source_refs) or 'none'}\n"
+            f"Fact fingerprints: {fingerprints or 'none'}\n"
+            f"Constraints: {constraints or 'none'}\n"
+            f"Available public semantic affordances: {affordances or 'none'}\n"
+            "Admissible new observations: "
+            f"{', '.join(context.admissible_observation_types) or 'none'}\n"
+            "Choose an ordinary public tool action yourself. For an admissible tool, "
+            "supply repair_intent with context refs, your hypothesis, the semantic "
+            "action kind, expected observation, and stop condition. The harness has "
+            "not selected parameters or a command. You may instead make an honest "
+            "terminal claim at or below the judge-supported outcome."
+        )
+        if len(guidance.encode("utf-8")) > _REPAIR_GUIDANCE_MAX_BYTES:
+            raise ValueError("repair context guidance exceeds its byte limit")
+        return guidance
+
+    def _completion_event(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+        *,
+        assessment_fingerprints: Sequence[str] = (),
+        disposition: GateControlDisposition | None = None,
+    ) -> CompletionClaimEvent:
+        facts = compact_control_value(dict(gate.validated_facts or {}))
+        job_facts = {
+            key: facts.get(key)
+            for key in (
+                JOB_BARRIER_FACT,
+                OPEN_OBLIGATIONS_FACT,
+                TERMINAL_UNPERSISTED_FACT,
+                JOB_INTEGRITY_FACT,
+            )
+            if isinstance(facts, Mapping) and facts.get(key) is not None
+        }
+        mechanical = {
+            "phase": claim.phase,
+            "validator_state": gate.validator_state.value,
+            "validated_outcome": gate.validated_outcome.value,
+            "code": gate.code,
+            "facts": facts,
+        }
+        selected_disposition = disposition or gate.control_disposition
+        return CompletionClaimEvent(
+            phase_attempt_id=str(
+                getattr(getattr(self, "phase_machine", None), "current_attempt_id", "") or ""
+            ),
+            claim_kind=claim.signal,  # type: ignore[arg-type]
+            judge_disposition=selected_disposition.value,  # type: ignore[arg-type]
+            blocker_id=gate.code or selected_disposition.value,
+            mechanical_evidence_digest=canonical_sha256(mechanical),
+            assessment_fingerprints=tuple(assessment_fingerprints),
+            open_job_fingerprints=(canonical_sha256(job_facts),) if job_facts else (),
+            target_fingerprint=str(ReActEngine._fact_value_recursive(facts, "target_sha") or ""),
+            config_fingerprint=str(
+                ReActEngine._fact_value_recursive(facts, "config_fingerprint") or ""
+            ),
+            fact_fingerprint=canonical_sha256(facts),
+            evidence_refs=gate.evidence_refs,
+            prose=" ".join((claim.key_results, claim.reason)).strip(),
+        )
+
+    def _emit_completion_claim_decision(
+        self,
+        event: CompletionClaimEvent,
+        decision: CompletionClaimDecision,
+    ) -> None:
+        self._emit_control_event(
+            "completion_claim_decision",
+            {
+                "phase_attempt_id": event.phase_attempt_id,
+                "claim_kind": event.claim_kind,
+                "judge_disposition": event.judge_disposition,
+                "blocker_id": event.blocker_id,
+                "mechanical_evidence_digest": event.mechanical_evidence_digest,
+                "assessment_fingerprints": list(event.assessment_fingerprints),
+                "open_job_fingerprints": list(event.open_job_fingerprints),
+                "evidence_refs": list(event.evidence_refs),
+                "target_fingerprint": event.target_fingerprint,
+                "config_fingerprint": event.config_fingerprint,
+                "fact_fingerprint": event.fact_fingerprint,
+                "expected_decision": decision.decision,
+                "expected_recurrence_count": decision.recurrence_count,
+                "expected_reason_code": decision.reason_code,
+                "expected_close_phase": decision.close_phase,
+            },
+        )
+
+    def _close_phase_for_agent_no_progress(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+        decision: CompletionClaimDecision,
+    ) -> bool:
+        """Finalizer-owned honest close at the judge's supported maximum."""
+
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if machine is None or state is None or state.sealed or machine.is_complete:
+            return False
+        refs = tuple(gate.evidence_refs)
+        blocker = state.record_blocker(
+            failure_signature=(
+                f"agent_no_progress:{machine.current_attempt_id}:"
+                f"{gate.code or gate.control_disposition.value}"
+            ),
+            category="agent_control",
+            error_code="agent_no_progress",
+            evidence_refs=refs,
+            source_phase=machine.current_phase,
+            source_attempt_id=machine.current_attempt_id,
+        )
+        honest_claim = PhaseClaim(
+            phase=machine.current_phase,
+            signal="done",
+            claimed_outcome=gate.validated_outcome,
+            reason=(
+                "finalizer close after three no-op completion claims; "
+                "outcome is capped at the judge-supported maximum"
+            ),
+            evidence_refs=refs,
+        )
+        honest_gate = validate_phase_claim(
+            honest_claim,
+            gate.validator_state,
+            reason=(
+                f"agent_no_progress after {decision.recurrence_count} no-op claims; "
+                f"{gate.reason}"
+            ),
+            evidence_refs=refs,
+            code="agent_no_progress",
+            validated_facts=gate.validated_facts,
+            control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
+            blocker_owner=gate.blocker_owner,
+        )
+        if not honest_gate.accepted:
+            # UNKNOWN is always claimable; this defensive fallback preserves
+            # honesty if a future gate matrix cannot accept the prior maximum.
+            honest_claim = PhaseClaim(
+                phase=machine.current_phase,
+                signal="done",
+                claimed_outcome=PhaseOutcome.UNKNOWN,
+                reason="finalizer could not safely refine beyond unknown",
+                evidence_refs=refs,
+            )
+            honest_gate = validate_phase_claim(
+                honest_claim,
+                gate.validator_state,
+                reason="agent_no_progress; conservative unknown close",
+                evidence_refs=refs,
+                code="agent_no_progress",
+                validated_facts=gate.validated_facts,
+                control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
+                blocker_owner=gate.blocker_owner,
+            )
+        self._emit_control_gate(honest_claim, honest_gate)
+        self._record_gate_facts(honest_claim.phase, honest_gate)
+        record = machine.close_attempt(honest_gate)
+        route = self.transition_policy.decide(
+            record,
+            state=state,
+            budgets=self._repair_budgets(),
+        )
+        self._pending_repair_context = None
+        self._apply_phase_decision(record, route)
+        getattr(self, "agent_logger", logger).warning(
+            f"Closed {claim.phase} at {honest_gate.validated_outcome.value} after "
+            f"{decision.recurrence_count} no-op completion claims "
+            f"({blocker.blocker_id})"
+        )
+        return True
+
+    def _prepare_rejected_completion(
+        self,
+        execution: ToolExecution,
+    ) -> _PreparedRejectedCompletion | None:
+        """Bind a rejected phase claim to ownership and convergence state."""
+
+        if execution.call.name != "phase":
+            return None
+        metadata = dict(execution.result.metadata or {})
+        claim_data = metadata.get("phase_claim")
+        gate_data = metadata.get("gate_result")
+        if not isinstance(claim_data, Mapping) or not isinstance(gate_data, Mapping):
+            return None
+        try:
+            claim = PhaseClaim.from_metadata(claim_data)
+            gate = GateResult.from_metadata(gate_data, claim=claim)
+        except (TypeError, ValueError, PermissionError):
+            return None
+        if gate.accepted or claim.signal not in {"done", "blocked"}:
+            return None
+        resolved_refs = self._gate_evidence_refs(gate)
+        if resolved_refs != gate.evidence_refs:
+            gate = replace(gate, evidence_refs=resolved_refs)
+
+        assessment_fingerprints: tuple[str, ...] = ()
+        effective_disposition = gate.control_disposition
+        context: RepairContext | None = None
+        context_status = "not_required"
+        if gate.control_disposition is GateControlDisposition.REPAIR_REQUIRED:
+            context, context_status = self._install_repair_context(claim, gate)
+            if context is not None:
+                assessment_fingerprints = (
+                    canonical_sha256(
+                        {
+                            "assessment_id": context.trigger_assessment_id,
+                            "typed_blocker": context.typed_blocker,
+                            "owner": context.blocker_owner,
+                        }
+                    ),
+                )
+            else:
+                effective_disposition = GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+                gate = replace(
+                    gate,
+                    control_disposition=effective_disposition,
+                    blocker_owner=BlockerOwner.HARNESS,
+                    reason=(
+                        f"{gate.reason}; controller could not persist the judge-owned "
+                        f"repair context ({context_status})"
+                    ),
+                    code=context_status,
+                    suggestions=(),
+                )
+
+        event = self._completion_event(
+            claim,
+            gate,
+            assessment_fingerprints=assessment_fingerprints,
+            disposition=effective_disposition,
+        )
+        decision = self.loop_memory.observe_completion_claim(event)
+        result_metadata = {
+            **metadata,
+            "gate_result": gate.to_metadata(),
+            "completion_claim_decision": decision.to_metadata(),
+            "effective_control_disposition": effective_disposition.value,
+            "rejected_completion_control_owned": True,
+        }
+        if context is not None:
+            result_metadata["repair_context_id"] = context.repair_context_id
+            result_metadata["trigger_assessment_id"] = context.trigger_assessment_id
+            result_metadata["repair_context"] = context.model_dump(mode="json")
+        elif context_status != "not_required":
+            result_metadata["repair_context_persistence"] = context_status
+            result_metadata["blocker_owner"] = "harness"
+        execution.result = execution.result.model_copy(update={"metadata": result_metadata})
+        execution.observation_text = format_tool_result(execution.call.name, execution.result)
+        return _PreparedRejectedCompletion(claim, gate, event, decision, context)
+
+    def _mark_harness_control_failure(
+        self,
+        code: str,
+        event: CompletionClaimEvent,
+    ) -> None:
+        """Make a lineage transport failure durable and stop future model turns."""
+
+        normalized = str(code or "harness_control_failure").strip()
+        state = getattr(self, "run_evidence_state", None)
+        machine = getattr(self, "phase_machine", None)
+        if state is not None and not state.sealed:
+            state.record_blocker(
+                failure_signature=(f"harness_control:{event.phase_attempt_id}:{normalized}"),
+                category="harness_control",
+                error_code=normalized,
+                evidence_refs=event.evidence_refs,
+                source_phase=getattr(machine, "current_phase", None),
+                source_attempt_id=getattr(machine, "current_attempt_id", None),
+            )
+        self._pending_repair_context = None
+        self._fatal_harness_control_failure = normalized
+
+    def _apply_rejected_completion_control(
+        self,
+        prepared: _PreparedRejectedCompletion | None,
+    ) -> bool:
+        if prepared is None:
+            return False
+        claim, gate, event, decision = prepared
+        context = prepared.context
+        try:
+            gate_event = self._emit_control_gate(claim, gate)
+        except Exception as exc:
+            logger.error(f"Gate decision failed closed: {exc}")
+            self._mark_harness_control_failure("gate_decision_persist_failed", event)
+            return True
+        if context is not None:
+            if gate_event is None:
+                self._mark_harness_control_failure(
+                    "repair_context_open_event_unavailable",
+                    event,
+                )
+                return True
+            machine = getattr(self, "phase_machine", None)
+            attempt_id = str(getattr(machine, "current_attempt_id", "") or "").strip()
+            try:
+                guidance = self._repair_context_guidance(context)
+                opened = self._emit_control_event(
+                    "repair_context_opened",
+                    {
+                        "source_gate_sequence": gate_event.sequence,
+                        "source_phase_attempt_id": attempt_id,
+                        "context": context.model_dump(mode="json"),
+                        "context_sha256": repair_context_sha256(context),
+                    },
+                )
+            except Exception as exc:
+                logger.error(f"Repair context open failed closed: {exc}")
+                opened = None
+            if opened is None:
+                self._mark_harness_control_failure(
+                    "repair_context_open_event_failed",
+                    event,
+                )
+                return True
+            # Activation and model guidance occur only after the exact event
+            # is durable. A restart can now reconstruct the same authority.
+            self._pending_repair_context = context
+            self._add_system_guidance(guidance, priority=9)
+        self._emit_completion_claim_decision(event, decision)
+        if event.judge_disposition == GateControlDisposition.HARNESS_RECOVERY_REQUIRED.value:
+            self._mark_harness_control_failure(event.blocker_id, event)
+            return True
+        if decision.decision == "agent_no_progress":
+            return self._close_phase_for_agent_no_progress(claim, gate, decision)
+        return False
 
     def _emit_control_phase_transition(
         self,
@@ -2895,10 +4827,7 @@ class ReActEngine(UIEventEmitter):
             add_system_guidance=self._add_system_guidance,
             get_timestamp=self._get_timestamp,
             event_sink=self._handle_tool_lifecycle_event,
-            before_tool_execute=lambda call, params: self._emit_control_action_envelope(
-                call.name,
-                params,
-            ),
+            before_tool_execute=self._prepare_control_action,
             output_storage=self.output_storage,
             logger=logger,
         )
@@ -2909,7 +4838,6 @@ class ReActEngine(UIEventEmitter):
             "tool_start": EventType.TOOL_START,
             "tool_parameters_fixed": EventType.TOOL_PARAMETERS_FIXED,
             "tool_result": EventType.TOOL_RESULT,
-            "tool_recovery": EventType.TOOL_RECOVERY,
             "tool_error": EventType.TOOL_ERROR,
         }
         event_type = lifecycle_event_map.get(event.event_type)
@@ -2932,12 +4860,15 @@ class ReActEngine(UIEventEmitter):
 
     def _build_tool_call_from_step(self, step: ReActStep) -> ToolCall:
         """Translate a parsed ReAct action step into an orchestration tool call."""
+        raw_params = dict(step.tool_params or {})
+        repair_submission = raw_params.pop("repair_intent", None)
         return ToolCall(
             name=step.tool_name or "",
-            raw_params=step.tool_params or {},
+            raw_params=raw_params,
             raw_action_text=step.content,
             source_step_index=self.current_iteration,
             model_used=step.model_used,
+            repair_intent_submission=repair_submission,
         )
 
     def _execute_tool_call(self, call: ToolCall) -> ToolExecution:
@@ -3108,6 +5039,15 @@ class ReActEngine(UIEventEmitter):
             logger.debug(f"framework survey unavailable: {exc}")
             return "failed"
 
+    def _recover_analysis_facts_once(self) -> Optional[str]:
+        """Spend the run's sole controller retry of the survey guarantee."""
+
+        if getattr(self, "_analysis_facts_recovery_attempted", False):
+            return None
+        self._analysis_facts_recovery_attempted = True
+        status = str(self._ensure_project_facts() or "failed").strip().lower()
+        return status if status in {"created", "present", "failed"} else "failed"
+
     def _native_smoke_guidance(self, phase: str) -> Optional[str]:
         """The bounded-smoke steer for the test phase, or None.
 
@@ -3243,56 +5183,91 @@ class ReActEngine(UIEventEmitter):
         outcome = self._build_phase_outcome()
         return outcome is not None and outcome != "success"
 
-    def _untried_island_targets(self, *, limit: int = 4) -> str:
-        """Recommended build islands with NO observed work yet, as one line.
+    def _untried_island_coordinates(self, *, limit: int = 4) -> str:
+        """Surveyed build coordinates with no persisted runner receipt yet.
 
-        A seven-step window means 'change approach' lands on an agent that may
-        no longer remember the alternatives (live bigtop 2026-07-18: it
-        hammered the one broken island for 7 calls while three healthy islands
-        sat untouched). The redirect must carry a destination.
+        This is corrective-loop navigation, not a recommendation: the shared
+        manifest supplies only ``system``/``root`` coordinates, and current run
+        receipts establish which coordinates were tried.  Survey ``goal`` and
+        action ordering never enter the model-visible line.
         """
+
         try:
-            # Panel review P1: this allowlisted corrective loop must be
-            # IDENTICAL in both arms. The trunk recommendation is projected
-            # by treatment dim (b) (goals stripped in arm F), so the islands
-            # come from the shared MANIFEST — a mechanical field both arms
-            # keep, goals included.
             orchestrator = getattr(
                 getattr(self, "physical_validator", None), "docker_orchestrator", None
             )
             if orchestrator is None:
                 return ""
-            from sag.tools.internal.build_preflight import read_build_requirements
+            from sag.tools.internal.build_preflight import read_live_build_requirements
 
-            islands = (read_build_requirements(orchestrator) or {}).get("build_islands") or []
+            live_manifest = read_live_build_requirements(orchestrator)
+            if (
+                not live_manifest.complete
+                or live_manifest.conflict is not None
+                or live_manifest.payload is None
+            ):
+                return ""
+            manifest = live_manifest.payload
+            islands = manifest.get("build_islands") or []
             if len(islands) < 2:
                 return ""
-            observed = [
-                str((getattr(obs, "params", None) or {}).get("working_directory") or "")
-                for obs in getattr(
-                    getattr(self, "run_evidence_state", None), "tool_observations", ()
+
+            state = getattr(self, "run_evidence_state", None)
+            scope = resolve_current_build_receipt_scope(
+                orchestrator,
+                run_id=state.run_id if isinstance(state, RunEvidenceState) else "",
+                manifest=manifest,
+            )
+            if not isinstance(state, RunEvidenceState):
+                attempted_roots = ()
+            else:
+                from .evidence_assessments import read_receipt
+
+                attempted_roots = build_attempt_directories(
+                    state,
+                    receipt_loader=lambda receipt_id: read_receipt(
+                        orchestrator.execute_command,
+                        receipt_id,
+                    ),
+                    scope=scope,
                 )
-            ]
-            untried = [
-                isl
-                for isl in islands
-                if isl.get("root")
-                and not any(wd.startswith(str(isl["root"])) for wd in observed if wd)
-            ]
+
+            untried = []
+            for island in islands:
+                if not isinstance(island, Mapping):
+                    continue
+                root = str(island.get("root") or "").rstrip("/")
+                if not root:
+                    continue
+                if any(
+                    attempted == root or attempted.startswith(root + "/")
+                    for attempted in attempted_roots
+                ):
+                    continue
+                untried.append((str(island.get("system") or "unknown"), root))
             if not untried:
                 return ""
+
+            def one_line(value: str, cap: int = 240) -> str:
+                return " ".join(value.split())[:cap]
+
             items = "; ".join(
-                f"{isl.get('system') or 'build'} '{isl.get('goal') or 'build'}' in {isl['root']}"
-                for isl in untried[:limit]
+                f"{one_line(system)} at {one_line(root)}"
+                for system, root in untried[: max(1, int(limit))]
             )
-            return f" Untried recommended islands: {items}."
+            binding = (
+                f" Current receipt binding: unknown ({scope.status})."
+                if not scope.available
+                else ""
+            )
+            return f"{binding} Untried surveyed build coordinates: {items}."
         except Exception:
             return ""
 
     def _loop_guidance(self, decision: LoopDecision) -> str:
         attempts = ", ".join(decision.prior_attempt_ids) or "current run"
         scopes = ", ".join(decision.missing_progress_scopes) or "declared scopes"
-        untried = self._untried_island_targets()
+        untried = self._untried_island_coordinates()
         outcome_key = getattr(decision, "outcome_key", None)
         error_code = str(getattr(outcome_key, "error_code", "") or "").lower()
         if error_code == "pytest_args_rejected":
@@ -3373,6 +5348,80 @@ class ReActEngine(UIEventEmitter):
         # consumer in the single-executor loop; Plan 3 wires it to the advisor.
         return decision
 
+    def _observe_action_intent_progress(self, execution: ToolExecution) -> bool:
+        """Advance completion epochs only for a real public experiment."""
+
+        memory = getattr(self, "loop_memory", None)
+        if memory is None:
+            return False
+        intent = execution.call.action_intent
+        if intent is None:
+            return False
+        result = execution.result
+        metadata = dict(result.metadata or {})
+        contract_id = str(metadata.get("contract_id") or "").strip()
+        if contract_id:
+            self._last_invocation_contract_id = contract_id
+        excluded = {"advisor", "manage_context", "phase", "report"}
+        if execution.call.name in excluded:
+            return False
+        passed_freeze = result.error_code not in {
+            "ACTION_INTENT_INVALID",
+            "ACTION_INTENT_BINDING_MISMATCH",
+            "ACTION_ENVELOPE_IDENTITY_MISSING",
+            "ACTION_ENVELOPE_PERSIST_FAILED",
+            "ACTION_PARAMS_UNRECORDABLE",
+            CONTRACT_AUTHORITY_MISSING,
+            "CONTRACT_PERSIST_FAILED",
+            "REPAIR_CONTEXT_NOT_ACTIVE",
+            "REPAIR_INTENT_DOMAIN_MISMATCH",
+            "REPAIR_INTENT_INVALID_REFS",
+            "REPAIR_INTENT_INVALID_OBSERVATION",
+            "REPAIR_INTENT_LINEAGE_MISMATCH",
+            "REPAIR_INTENT_REQUIRED",
+            "REPAIR_LINEAGE_RECORDING_REQUIRED",
+            "REPAIR_ACTION_AFFORDANCE_MISMATCH",
+            "REPAIR_TOOL_NOT_ALLOWED",
+        }
+        runner_dispatched = metadata.get("runner_dispatched")
+        if intent.repair_context_id:
+            repair_dispatch = self._repair_action_dispatch_outcome(execution)
+            dispatched = repair_dispatch is True
+        else:
+            dispatched = bool(execution.attempted_execution and runner_dispatched is not False)
+        progressed = memory.observe_material_action(
+            intent,
+            schema_valid=True,
+            passed_freeze=passed_freeze,
+            dispatched=dispatched,
+        )
+        if dispatched and intent.repair_context_id:
+            pending = getattr(self, "_pending_repair_context", None)
+            if pending is not None and pending.repair_context_id == intent.repair_context_id:
+                self._pending_repair_context = None
+                self._add_system_guidance(
+                    f"REPAIR_CONTEXT {intent.repair_context_id} was consumed by one "
+                    "dispatched model action. Do not reuse its repair_intent lineage; "
+                    "rely on the resulting evidence and the next judge decision.",
+                    priority=7,
+                )
+
+        evidence_body = result.raw_output if result.raw_output is not None else result.output
+        if dispatched and (
+            result.evidence_refs
+            or result.refs
+            or result.facts
+            or result.test_stats is not None
+            or execution.actual_executions
+        ):
+            memory.observe_evidence(
+                hashlib.sha256(
+                    str(evidence_body or "").encode("utf-8", errors="replace")
+                ).hexdigest(),
+                kind=f"tool:{execution.call.name}",
+            )
+        return progressed
+
     def _close_phase_for_loop(
         self,
         decision: LoopDecision,
@@ -3442,7 +5491,7 @@ class ReActEngine(UIEventEmitter):
     _ADVISOR_DIGEST_HEADER = "EVIDENCE DIGEST"
 
     def _reset_advisor_run_state(self) -> None:
-        """Run-scoped advisor state: the telemetry log plus the phase bits."""
+        """Run-scoped advisor state: telemetry plus the recurrence redirect."""
         self._advisor_calls: List[Dict[str, Any]] = []
         # Run-scoped so `advisor-entry-<n>` ids stay unique across every phase
         # entry and re-entry of the run.
@@ -3452,16 +5501,15 @@ class ReActEngine(UIEventEmitter):
     def _reset_advisor_phase_state(self) -> None:
         """Per-phase advisor state, reset with the other per-phase counters.
 
-        The cap is per phase, and the two guarantee bits describe "what has
-        happened in THIS phase since the last consult" — carrying either across
-        a transition would redirect a phase for a failure it never saw.
+        The cap is per phase, and the recurrence redirect describes what has
+        happened in this phase since the last consult. Carrying it across a
+        transition would redirect a phase for a recurrence it never saw.
 
         `_advisor_entry_consult_done` clears here on purpose: a phase RE-entry
         (a repair loop) is a new entry and gets fresh advice, bounded by the
         cap. Under the deleted before-acting redirect that same reset re-armed
         a trap instead (2026-07-26 audit)."""
         self._advisor_calls_in_phase = 0
-        self._had_failure_since_consult = False
         self._advisor_redirect_armed = False
         self._advisor_loop_guidance = ""
         self._advisor_entry_consult_done = False
@@ -3502,12 +5550,11 @@ class ReActEngine(UIEventEmitter):
         return ToolResult.completed_success(output=output, metadata={"advisor": reason})
 
     def _record_advisor_call(self, *, phase: str, advice_chars: int, outcome: str) -> int:
-        """Count one consult and clear the guarantee bits it satisfies.
+        """Count one consult and clear the recurrence redirect it satisfies.
 
         An errored consult counts exactly like an answered one: the executor
         asked, and a provider outage must not pin it behind a redirect."""
         self._advisor_calls_in_phase = int(getattr(self, "_advisor_calls_in_phase", 0)) + 1
-        self._had_failure_since_consult = False
         self._advisor_redirect_armed = False
         self._advisor_loop_guidance = ""
         calls = getattr(self, "_advisor_calls", None)
@@ -3669,7 +5716,7 @@ class ReActEngine(UIEventEmitter):
         """System reviewer brief + the whole phase transcript and evidence.
 
         The model chooses WHEN to consult, never WHAT the reviewer sees."""
-        # Prompt: src/sag/config/prompts/react_engine.yaml:280 advisor_system
+        # Prompt key: advisor_system
         system_brief = self.prompts.get("advisor_system")
         return [
             {"role": "system", "content": system_brief},
@@ -3768,9 +5815,9 @@ class ReActEngine(UIEventEmitter):
         return f"Native state: {', '.join(parts)}"
 
     def _advisor_evidence_digest(self) -> str:
-        """The deterministic evidence section: handoff projection, untried
-        islands, the armed recurrence guidance, the last test attempt's
-        collection facts, and (native projects only) the native state."""
+        """The deterministic evidence section: handoff projection, armed
+        recurrence guidance, the last test attempt's collection facts, and
+        (native projects only) the native state."""
         parts: List[str] = []
         handoff = getattr(self, "phase_handoff", None)
         if handoff is not None:
@@ -3781,9 +5828,6 @@ class ReActEngine(UIEventEmitter):
             except Exception as exc:
                 # A digest gap must not cost the run its advice.
                 self.agent_logger.warning(f"Advisor evidence digest unavailable: {exc}")
-        untried = self._untried_island_targets().strip()
-        if untried:
-            parts.append(untried)
         guidance = str(getattr(self, "_advisor_loop_guidance", "") or "").strip()
         if guidance and getattr(self, "_advisor_redirect_armed", False):
             parts.append(guidance)
@@ -3861,14 +5905,20 @@ class ReActEngine(UIEventEmitter):
     def _advisor_redirect_for_call(self, call: ToolCall) -> ToolExecution | None:
         """Pre-execution advisor gate. None when the call may proceed.
 
-        Two rules remain — before-giving-up and when-stuck. The third,
-        before-acting, was DELETED on 2026-07-26: cancelling the phase's first
+        Only the materially repeated-action rule remains.  Both older lifecycle
+        redirects are gone: ``before-acting`` cancelled correctly planned
+        batches, while ``before-giving-up`` prevented a terminal claim from
+        reaching the physical judge that now creates the facts-only
+        RepairContext.  A judge claim must not be intercepted by an advisor
+        with less authoritative evidence.
+
+        ``before-acting`` was deleted on 2026-07-26 after cancelling a phase's first
         state-changing call cancelled correctly-planned batches wholesale
         (bigtop r1), so guarantee 1 is now the harness-authored consult at
         phase entry (`_maybe_consult_advisor_at_phase_entry`), which costs no
         planned work at all.
 
-        Both remaining rules are disabled when `advisor_mode == "off"` (the
+        The remaining rule is disabled when `advisor_mode == "off"` (the
         ablation switch) or the phase cap is exhausted: a redirect the advisor
         can no longer answer would dead-lock the run, and the advisor must
         NEVER block a run."""
@@ -3881,17 +5931,6 @@ class ReActEngine(UIEventEmitter):
         params = call.validated_params or call.raw_params or {}
         state_changing = self._is_state_changing(name, params)
 
-        if self._closes_phase_on_failure(name, params) and getattr(
-            self, "_had_failure_since_consult", False
-        ):
-            return self._advisor_redirect_execution(
-                call,
-                "before-giving-up",
-                "A failure occurred since your last advisor consult. Call advisor() "
-                "before closing the phase on a failure — it may know a repair. "
-                "This claim was not evaluated.",
-            )
-
         if getattr(self, "_advisor_redirect_armed", False) and state_changing:
             return self._advisor_redirect_execution(
                 call,
@@ -3901,14 +5940,6 @@ class ReActEngine(UIEventEmitter):
             )
 
         return None
-
-    @staticmethod
-    def _closes_phase_on_failure(tool_name: str, params: Dict[str, Any]) -> bool:
-        if tool_name != "phase":
-            return False
-        action = str((params or {}).get("action") or "").strip().lower()
-        outcome = str((params or {}).get("outcome") or "").strip().lower()
-        return action == "blocked" or (action == "done" and outcome == "failed")
 
     @staticmethod
     def _advisor_redirect_execution(call: ToolCall, rule: str, message: str) -> ToolExecution:
@@ -3938,15 +5969,12 @@ class ReActEngine(UIEventEmitter):
         execution: ToolExecution,
         loop_decision: LoopDecision | None,
     ) -> None:
-        """Update the two guarantee bits from one executed tool result.
+        """Update the recurrence redirect from one executed tool result.
 
         Redirects and refusals never reached a tool, so they can neither create
         a failure to review nor evidence of being stuck."""
         if not execution.attempted_execution:
             return
-        outcome = getattr(execution.result, "operation_outcome", None)
-        if str(getattr(outcome, "value", outcome) or "") == OperationOutcome.FAILED.value:
-            self._had_failure_since_consult = True
         # `request_thinking` is LoopMemory's own redirect signal (guide /
         # force_break): the identical action and outcome recurred while the
         # relevant state stood still.
@@ -3965,8 +5993,7 @@ class ReActEngine(UIEventEmitter):
         and `report` stays closed until the verdict snapshot exists."""
         if call.name == "advisor":
             # The advisor is NEVER refused. `consult_advisor` already answers
-            # every mode, and a refused consult would strand the model behind
-            # the before-giving-up guarantee once evidence seals.
+            # every mode; a provider outage must never become a project block.
             return None
         if self._evidence_execution_closed(call):
             return self._refused_closed_evidence_execution(call)
@@ -4017,6 +6044,7 @@ class ReActEngine(UIEventEmitter):
                 execution = self._refusal_for_call(call)
             if execution is None:
                 execution = self._execute_tool_call(call)
+            rejected_completion = self._prepare_rejected_completion(execution)
             result, control_execution_id, actual_executions = self._record_execution_bundle(
                 execution, call
             )
@@ -4028,10 +6056,11 @@ class ReActEngine(UIEventEmitter):
                 control_params = call.validated_params
             else:
                 control_params = call.raw_params
-            if control_envelope_id is None:
+            if control_envelope_id is None and execution.attempted_execution:
                 control_envelope_id = self._emit_control_action_envelope(
                     call.name,
                     control_params,
+                    intent=call.action_intent,
                 )
             self._emit_control_tool_result(
                 envelope_id=control_envelope_id,
@@ -4043,6 +6072,16 @@ class ReActEngine(UIEventEmitter):
             )
         finally:
             self._active_native_tool_call_id = previous_native_call_id
+        self._observe_action_intent_progress(execution)
+        # Preserve native tool-call pairing: the tool result must immediately
+        # answer its ACTION before a newly opened RepairContext can append
+        # system guidance for the next model turn.
+        self._append_native_observation(
+            native_call_id,
+            execution.observation_text,
+            source_tool=call.name,
+        )
+        completion_closed_phase = self._apply_rejected_completion_control(rejected_completion)
         loop_decision = self._apply_tool_execution_loop_effects(execution)
         self._note_advisor_execution(execution, loop_decision)
 
@@ -4050,13 +6089,9 @@ class ReActEngine(UIEventEmitter):
         if self.config.verbose:
             self._log_tool_result_verbose(step.tool_name, result)
 
-        # Add observation step with improved formatting; the executing tool is
-        # what decides physical-evidence enrichment.
-        self._append_native_observation(
-            native_call_id,
-            execution.observation_text,
-            source_tool=call.name,
-        )
+        if completion_closed_phase:
+            logger.debug("Stopping the action batch after agent_no_progress closure")
+            return "the finalizer closed this phase after agent no progress"
 
         if result.error_code == "TEST_ATTEMPT_REQUIRED":
             required_attempt = self._missing_required_test_attempt()
@@ -4173,9 +6208,9 @@ class ReActEngine(UIEventEmitter):
             return "the loop breaker closed this phase"
 
         phase_signal = (result.metadata or {}).get("phase_signal")
-        if phase_signal in {"done", "blocked", "repair"}:
-            # The engine must apply the accepted proposal before any
-            # later action can run under a new or closed prerequisite.
+        if phase_signal in {"done", "blocked"}:
+            # The engine must apply the accepted terminal transition before
+            # any later action can run under a new or closed prerequisite.
             logger.debug(f"Stopping the action batch at phase signal {phase_signal!r}")
             return f"a {phase_signal} phase transition is being processed"
 
@@ -4191,227 +6226,14 @@ class ReActEngine(UIEventEmitter):
                 return getattr(step, "tool_result", None)
         return None
 
-    def _repair_surfacing_block(self, source_tool: Optional[str]) -> Optional[str]:
-        """The bounded `[repair]` block this observation must carry, if any.
-
-        Reactive, never anticipatory (Plan 6 Stage C3, spec §C6): a proposal is
-        surfaced only after a receipt this dispatch minted was assessed as a
-        typed failure. Plan 6 Stage F1 makes the proposal EXIST at the same
-        seam — retrieval is legal from the moment the typed code is on disk and
-        not one moment earlier — so creation runs first and surfacing then
-        finds what it needs. No receipt in the metadata means no assessment to
-        react to, so the evidence directories are not even read."""
-        if source_tool != REPAIR_TOOL:
-            return None
-        orchestrator = getattr(self, "orchestrator", None)
-        if orchestrator is None:
-            return None
-        result = self._answered_action_result()
-        receipt_id = str((getattr(result, "metadata", None) or {}).get("receipt_id") or "").strip()
-        if not receipt_id:
-            return None
-        contract_id = str(
-            (getattr(result, "metadata", None) or {}).get("contract_id") or ""
-        ).strip()
-        self._create_missing_repairs(orchestrator, receipt_id, contract_id)
-        return surfacing_block(orchestrator, receipt_id)
-
-    def _create_missing_repairs(
-        self,
-        orchestrator: Any,
-        receipt_id: str,
-        contract_id: str,
-    ) -> None:
-        """Mint the proposal a fresh failure assessment has not got yet.
-
-        Plan 6 Stage F1 (spec §C6): the loop's retrieval step had no production
-        caller, so a live failure was assessed and then answered with nothing.
-        This is where it belongs — the dispatch ran, its receipt was assessed,
-        and the typed code that routes the read is persisted.
-
-        Bounded three ways: only assessments of THIS receipt that carry a
-        failure-class code, only those with no proposal on disk, and one
-        attempt per assessment for the whole run — `unknown` is a real answer
-        (spec §C6 step 5) and re-asking would re-read the repository for it.
-
-        Never raises: a proposal that could not be created is a missing repair,
-        not a broken observation."""
-        execute = getattr(orchestrator, "execute_command", None)
-        if not callable(execute):
-            return
-        attempted = self._assessment_guard("_repair_creation_attempts")
-        try:
-            triggers = [
-                record
-                for record in read_records(orchestrator, ASSESSMENT_DIR)
-                if str(record.get("receipt_id") or "").strip() == receipt_id
-                and is_failure_class(record.get("typed_code"))
-                and str(record.get("assessment_id") or "").strip() not in attempted
-            ]
-            if not triggers:
-                return
-            answered = {
-                str(record.get("trigger_assessment_id") or "").strip()
-                for record in read_records(orchestrator, REPAIR_DIR)
-            }
-            pending = [
-                record
-                for record in triggers
-                if str(record.get("assessment_id") or "").strip() not in answered
-            ]
-            if not pending:
-                return
-
-            from sag.agent.document_map import read_entry_text
-            from sag.agent.physical_survey import read_document_map
-            from sag.tools.internal.build_preflight import read_build_requirements
-
-            document_map = read_document_map(orchestrator)
-            if not (document_map or {}).get("entries"):
-                # No map, no bounded selection: retrieval would have to read the
-                # repository, which is exactly what §C6 exists to prevent.
-                return
-            requirements = read_build_requirements(orchestrator) or {}
-            contract = read_frozen_contract(execute, contract_id) or {}
-            for trigger in pending:
-                attempted.add(str(trigger.get("assessment_id") or "").strip())
-                self._create_repair_for(
-                    execute,
-                    trigger,
-                    document_map=document_map,
-                    requirements=requirements,
-                    contract=contract,
-                    fetch_text=lambda entry: read_entry_text(execute, entry),
-                    # Live p6v-tvm-r4: the survey had ALREADY minted the numpy
-                    # pin claim at analyze time; re-reading only the retrieval's
-                    # own extraction left the builder blind to it. The builder
-                    # sees the persisted claims too — same store, one truth.
-                    persisted_claims=read_records(orchestrator, CLAIM_DIR),
-                )
-        except Exception as exc:  # retrieval never breaks an observation
-            logger.debug(f"no repair was created for receipt {receipt_id}: {exc}")
-
-    @staticmethod
-    def _create_repair_for(
-        execute,
-        trigger: Dict[str, Any],
-        *,
-        document_map: Dict[str, Any],
-        requirements: Dict[str, Any],
-        contract: Dict[str, Any],
-        fetch_text,
-        persisted_claims: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """Retrieve, propose and persist ONE repair for one assessment.
-
-        The scope comes from the survey manifest and the frozen contract, never
-        from the assessment — which states a typed code and nothing about where
-        it happened. The domain is resolved by the contract's own `domain_id`
-        rather than by re-deriving containment: the freeze already decided
-        which domain this dispatch belonged to, and a second rule for the same
-        question is a second answer waiting to happen.
-
-        The domain roots handed to the extractors are the survey's own, so a
-        claim re-read here carries the applicability it was minted with; roots
-        that disagreed would make an applicable claim look like somebody
-        else's."""
-        survey = requirements.get("survey") if isinstance(requirements, Mapping) else None
-        checkout_root = str((survey or {}).get("project_path") or "").strip()
-        domains = requirements.get("build_domains") or requirements.get("domain_facts") or ()
-        roots = [
-            str(domain.get("root") or "")
-            for domain in domains
-            if isinstance(domain, Mapping) and domain.get("root")
-        ]
-        by_domain_id = {
-            str(fact.get("domain_id") or ""): str(fact.get("root") or "")
-            for fact in requirements.get("domain_facts") or ()
-            if isinstance(fact, Mapping)
-        }
-        domain_id = str(contract.get("domain_id") or "").strip()
-        domain_root = by_domain_id.get(domain_id, "")
-        retrieved = retrieve_for(
-            str(trigger.get("typed_code") or ""),
-            document_map=document_map,
-            fetch_text=fetch_text,
-            checkout_root=checkout_root or str(requirements.get("build_root") or ""),
-            domain_id=domain_id or None,
-            applicability={"domain": domain_root} if domain_root else None,
-            domain_roots=roots,
-            execute=execute,
-        )
-        merged_claims: List[Dict[str, Any]] = []
-        seen_claim_ids: set = set()
-        for claim in list(retrieved["claims"]) + list(persisted_claims or []):
-            record = claim if isinstance(claim, dict) else getattr(claim, "__dict__", {})
-            identifier = str(
-                (record.get("claim_id") if isinstance(record, dict) else "") or id(claim)
-            )
-            if identifier in seen_claim_ids:
-                continue
-            seen_claim_ids.add(identifier)
-            merged_claims.append(claim)
-        repair = build_repair(
-            trigger,
-            merged_claims,
-            domain_id=domain_id or None,
-            domain_root=domain_root
-            or str(contract.get("expected_cwd") or requirements.get("build_root") or "")
-            or checkout_root,
-            fact_epoch=contract.get("fact_epoch"),
-            open_conflicts=retrieved["conflicts"],
-        )
-        if repair is not None:
-            write_repair(execute, repair)
-
     def _commit_claim_transitions(self, source_tool: Optional[str]) -> None:
-        """Move the claims this dispatch's own assessments settled.
+        """Never transition claims from authorization citations.
 
-        Plan 6 Stage F1 (spec §C5): a contract cites the stored claims that
-        authorized it, so a verdict on its receipt is also a verdict on those
-        claims. `expectation_met` confirms them; a typed `falsifier_*`
-        contradicts them and retracts whatever rested on them. Everything else
-        moves nothing.
-
-        Same seam as the retry authority and the repair block, for the same
-        reason: this is the one place where receipt, contract and assessment
-        are all on disk together. One commit attempt per assessment, and never
-        raises — an uncommitted group is absent to replay, not half-applied."""
-        if source_tool != REPAIR_TOOL:
-            return
-        orchestrator = getattr(self, "orchestrator", None)
-        execute = getattr(orchestrator, "execute_command", None)
-        if not callable(execute):
-            return
-        committed = self._assessment_guard("_claim_commit_attempts")
-        try:
-            metadata = getattr(self._answered_action_result(), "metadata", None) or {}
-            receipt_id = str(metadata.get("receipt_id") or "").strip()
-            contract_id = str(metadata.get("contract_id") or "").strip()
-            if not receipt_id or not contract_id:
-                return
-            contract = read_frozen_contract(execute, contract_id) or {}
-            claim_ids = [str(value).strip() for value in contract.get("supporting_claim_ids") or ()]
-            claim_ids = [value for value in claim_ids if value]
-            if not claim_ids:
-                return
-            for record in read_records(orchestrator, ASSESSMENT_DIR):
-                if str(record.get("receipt_id") or "").strip() != receipt_id:
-                    continue
-                assessment_id = str(record.get("assessment_id") or "").strip()
-                if not assessment_id or assessment_id in committed:
-                    continue
-                committed.add(assessment_id)
-                commit_assessment_transitions(
-                    execute,
-                    assessment_id=assessment_id,
-                    typed_code=record.get("typed_code"),
-                    claim_ids=claim_ids,
-                    emit=self._emit_control_event,
-                    fact_epoch=contract.get("fact_epoch"),
-                )
-        except Exception as exc:  # the claim graph never breaks an observation
-            logger.debug(f"claim transitions were not committed for this observation: {exc}")
+        Contract ``supporting_claim_ids`` explain why dispatch was permitted;
+        they do not identify the predicate a receipt tested. Until an explicit
+        predicate-subject record exists, this seam deliberately moves nothing.
+        """
+        del source_tool
 
     def _assessment_guard(self, name: str) -> set:
         """The in-memory set of assessment ids one reaction has already run for.
@@ -4426,12 +6248,13 @@ class ReActEngine(UIEventEmitter):
         return guard
 
     def _ensure_observed_receipt_assessed(self, source_tool: Optional[str]) -> None:
-        """Backstop assessor for dispatches no facade path assessed.
+        """Idempotent backstop for a build receipt not yet assessed.
 
-        The tool-recovery delegate freezes its own fallback contract but runs
-        outside the build facade, so its receipt reaches this seam without a
-        verdict (live p6v-bigtop-r3). Idempotent; never raises."""
-        if source_tool != RETRY_TOOL:
+        Detached settlement and output persistence can make a valid
+        facade-authorized receipt visible after the facade's immediate
+        assessment pass. This seam assesses only that existing receipt; it
+        never creates dispatch authority or a replacement contract."""
+        if source_tool != "build":
             return
         execute = getattr(getattr(self, "orchestrator", None), "execute_command", None)
         if not callable(execute):
@@ -4456,7 +6279,7 @@ class ReActEngine(UIEventEmitter):
         return notices
 
     def _sweep_job_obligations(self) -> None:
-        """Settle every detached job that has terminated, and announce it once.
+        """Run one non-blocking lifecycle reconciliation after an action batch.
 
         Plan 8 §3.2. p7d polaris polled its test job for the rest of the run
         and nothing ever went back to ask whether it had finished; 321 passing
@@ -4472,7 +6295,7 @@ class ReActEngine(UIEventEmitter):
 
         A SEALED run sweeps nothing. The report phase still executes action
         batches after evidence-close, and settling in that window would write a
-        receipt, an assessment, a repair proposal and a `job_settled` event AFTER
+        receipt, an assessment, a repair context and a `job_settled` event AFTER
         `evidence_close` — for a job the sealed verdict has already recorded as
         `job_unsettled`. A sealed run accepts no further evidence, and the
         obligation staying open is the honest end state, not a gap.
@@ -4487,11 +6310,20 @@ class ReActEngine(UIEventEmitter):
             # detached anything, and it must not pay two round trips to be
             # told so twice.
             records = read_obligations(orchestrator)
+            if records is None:
+                self._record_job_barrier_integrity_failure(
+                    ("ledger_unreadable_after_action_batch",)
+                )
+                return
             if not records:
                 return
+            reconciliation = reconcile_job_obligations(orchestrator, obligations=records)
+            self._announce_job_reconciliation(reconciliation)
+            if reconciliation.integrity_failures:
+                self._record_job_barrier_integrity_failure(reconciliation.integrity_failures)
+                return
             settled_now = {
-                settlement.job_id: settlement
-                for settlement in settle_open_obligations(orchestrator, obligations=records)
+                settlement.job_id: settlement for settlement in reconciliation.settlements
             }
             announced = self._assessment_guard("_announced_job_settlements")
             for record in records:
@@ -4507,102 +6339,43 @@ class ReActEngine(UIEventEmitter):
                     continue
                 announced.add(job_id)
                 self._emit_control_event("job_settled", settlement.event_payload())
-                self._pending_settlement_notices().append(settlement.notice())
-                # The same post-receipt hook a synchronous failure gets at the
-                # observation seam. The assessment itself already ran inside
-                # settlement; this is the proposal that may follow it, so a
-                # settled failure is proposable exactly like a synchronous one.
-                self._create_missing_repairs(
-                    orchestrator, settlement.receipt_id, settlement.contract_id
-                )
+                if hasattr(self, "steps"):
+                    self.steps.append(
+                        ReActStep(
+                            step_type=StepType.SYSTEM_GUIDANCE,
+                            content=settlement.notice(),
+                            timestamp=self._get_timestamp(),
+                        )
+                    )
         except Exception as exc:  # settlement never breaks the loop
             logger.debug(f"job obligations were not swept for this batch: {exc}")
 
-    def _record_unsettled_job_conflicts(self) -> None:
-        """Name every job the run never heard back from, at evidence-close.
+    def _record_unsettled_job_conflicts(self, reason="evidence_close") -> None:
+        """Compatibility close hook: only physically live jobs remain conflicts.
 
-        Spec §3.2: a job that never terminates stays an OPEN obligation and is
-        recorded on the verdict as `job_unsettled:<job_id>`, with the
-        obligation file as the fact's provenance. Nothing is guessed from a
-        partial log — an unfinished job is neither a pass nor a failure.
-
-        The state goes into the stream, not just onto the object: §3.2 asks for
-        one control event so replay reproduces the state, and that is owed by
-        BOTH branches. The settled branch has had its event since Stage 1
-        landed; this one emits `job_unsettled` for the same reason, from the
-        SAME projection the fact carries (P3 — one question, one computation),
-        and before `evidence_close`, because a sealed verdict accepts nothing."""
+        New runs emit `job_live_at_close`; `job_unsettled` remains replay-only
+        vocabulary for legacy transcripts. A terminal-unpersisted job is
+        already recorded by reconciliation and must never be projected live.
+        """
         state = getattr(self, "run_evidence_state", None)
         orchestrator = getattr(self, "orchestrator", None)
         if state is None or orchestrator is None or state.sealed:
             return
         try:
-            for record in open_obligations(orchestrator):
-                job_id = str(record.get("job_id") or "").strip()
-                if not job_id:
-                    continue
-                payload = compact_control_value(
-                    {
-                        "job_id": job_id,
-                        "evidence_ref": f"{OBLIGATION_DIR}/{job_id}.json",
-                        "obligation": {
-                            key: record.get(key)
-                            for key in ("tool", "effective_action", "argv", "log_path")
-                            if record.get(key)
-                        },
-                    }
+            records = read_obligations(orchestrator)
+            if records is None:
+                self._record_job_barrier_integrity_failure(
+                    ("ledger_unreadable_while_recording_unsettled_jobs",)
                 )
-                self._emit_control_event("job_unsettled", payload)
-                state.set_fact(
-                    f"{OPEN_OBLIGATIONS_FACT}.{job_id}",
-                    payload["obligation"],
-                    evidence_ref=payload["evidence_ref"],
-                )
-                state.record_conflict(f"job_unsettled:{job_id}")
+                return
+            live = [
+                str(record.get("job_id") or "").strip()
+                for record in records
+                if process_is_live(record)
+            ]
+            self._record_live_jobs_at_close(live, reason)
         except Exception as exc:  # the ledger never breaks a close
             logger.debug(f"unsettled job obligations were not recorded: {exc}")
-
-    def _record_retry_authority(self, source_tool: Optional[str]) -> None:
-        """Sign the retry key of a dispatch a failure-class assessment closed.
-
-        Plan 6 Stage D1 (spec §C7): the CONTROLLER owns recurrence state, and
-        this is the one seam where receipt, contract and assessment are all on
-        disk together — the same observation seam the repair block is surfaced
-        from. The build facade reads this ledger before it freezes the next
-        contract; it never keeps a second one.
-
-        Lifecycle is not a retry: a dispatch handed off detached has not failed
-        yet, so it signs nothing and there is nothing for the eventual poll to
-        be refused by.
-
-        Never raises: a key that could not be recorded is a missing authority
-        record, not a failed build."""
-        if source_tool != RETRY_TOOL:
-            return
-        execute = getattr(getattr(self, "orchestrator", None), "execute_command", None)
-        if not callable(execute):
-            return
-        try:
-            metadata = getattr(self._answered_action_result(), "metadata", None) or {}
-            if str(metadata.get("dispatch_status") or "") in DETACHED_HANDOFF_STATUSES:
-                return
-            receipt_id = str(metadata.get("receipt_id") or "").strip()
-            contract_id = str(metadata.get("contract_id") or "").strip()
-            if not receipt_id or not contract_id:
-                return
-            contract = read_frozen_contract(execute, contract_id)
-            if not contract:
-                return
-            toolchain_state = toolchain_state_fingerprint(execute)
-            for typed_code in failure_codes(execute, receipt_id):
-                record_failure(
-                    execute,
-                    compute_retry_key(contract, typed_code, toolchain_state=toolchain_state),
-                    contract_id,
-                    typed_code,
-                )
-        except Exception as exc:  # the authority never breaks an observation
-            logger.debug(f"retry authority not signed for this observation: {exc}")
 
     def _append_native_observation(
         self,
@@ -4618,7 +6391,6 @@ class ReActEngine(UIEventEmitter):
         than passed down, because `_add_observation_step` is a one-argument
         seam that callers (and tests) substitute."""
         self._ensure_observed_receipt_assessed(source_tool)
-        self._record_retry_authority(source_tool)
         self._commit_claim_transitions(source_tool)
         # Plan 8 §3.2.7: the settlement the run has not been told about yet.
         # One bounded line per settled job, on the NEXT observation, and never
@@ -4628,11 +6400,6 @@ class ReActEngine(UIEventEmitter):
         if notices:
             observation = "\n".join([str(observation or "").rstrip(), "", *notices]).lstrip()
             notices.clear()
-        block = self._repair_surfacing_block(source_tool)
-        if block:
-            # One block per observation: this is the only place an observation
-            # is appended, so the bound is structural rather than a counter.
-            observation = f"{str(observation or '').rstrip()}\n\n{block}".lstrip()
         previous_source_tool = getattr(self, "_observation_source_tool", None)
         self._observation_source_tool = source_tool
         try:
@@ -4675,6 +6442,11 @@ class ReActEngine(UIEventEmitter):
             executed.append(step)
             if batch_break_reason is not None:
                 cancelled_reason = batch_break_reason
+            elif self._capture_job_barrier_from_result():
+                # The current call was accepted and gets its real result. Every
+                # later call in the same assistant turn is answered but not
+                # executed; the controller owns the live job until terminal.
+                cancelled_reason = "controller job barrier active"
 
         # Plan 8 §3.2 trigger 1: after each executed action batch, whatever
         # tools it used. A model that spends its turns polling a log is
@@ -5028,8 +6800,6 @@ class ReActEngine(UIEventEmitter):
         Returns:
             Physical validation state dict or None
         """
-        obs_lower = observation.lower()
-
         try:
             # Get project name from context or use default
             project_name = None
@@ -5038,17 +6808,6 @@ class ReActEngine(UIEventEmitter):
 
             # Run physical validation
             validation_result = self.physical_validator.validate_build_artifacts(project_name)
-
-            # Check if we need to replay commands
-            if "build success" in obs_lower or "build fail" in obs_lower:
-                # Try to get the last build command from command tracker if available
-                if hasattr(self, "command_tracker") and self.command_tracker:
-                    last_build = self.command_tracker.get_last_build_command()
-                    if last_build:
-                        replay_result = self.physical_validator.replay_last_build_command(
-                            last_build["command"], last_build.get("working_dir")
-                        )
-                        validation_result["build_replay"] = replay_result
 
             return validation_result
 
@@ -5091,12 +6850,6 @@ class ReActEngine(UIEventEmitter):
             evidence_lines.append(
                 f"[PHYSICAL EVIDENCE: {count} Java files have no corresponding .class files]"
             )
-
-        if "build_replay" in physical_state:
-            if physical_state["build_replay"]:
-                evidence_lines.append("[PHYSICAL EVIDENCE: Build command replay succeeded]")
-            else:
-                evidence_lines.append("[PHYSICAL EVIDENCE: Build command replay failed]")
 
         # Add evidence to observation
         if evidence_lines:

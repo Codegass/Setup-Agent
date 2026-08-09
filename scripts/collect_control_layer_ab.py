@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import platform
@@ -13,6 +14,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, cast
 
@@ -26,7 +28,17 @@ from sag.agent.control_events import (
     canonical_sha256,
     sanitize_config,
 )
-from sag.agent.verdict_finalizer import RunVerdictSnapshot
+from sag.agent.evidence_publications import (
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    EvidencePublicationError,
+    MutablePublicationObservation,
+)
+from sag.agent.verdict_finalizer import (
+    RunVerdictSnapshot,
+    validate_verdict_snapshot_v3,
+)
 
 # Bar 6 spans the WS7 basis migration. The historical 4,928 figure was runner
 # executions, not canonical identities; the explicit (module, class, name,
@@ -40,6 +52,19 @@ CASSANDRA_RAW_EXECUTION_RANGE = (4800, 5100)
 
 class CollectionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AuthorizedCurrentRun:
+    """Host-rooted structured inputs for one archived current run."""
+
+    pin: RunPin
+    pin_path: Path
+    snapshot: RunVerdictSnapshot
+    snapshot_path: Path
+    events_path: Path
+    events: tuple[ControlEvent, ...]
+    authority: EvidencePublicationAuthority
 
 
 class RunMetrics(BaseModel):
@@ -152,6 +177,33 @@ def _load_json(path: Path) -> Any:
         raise CollectionError(f"cannot read structured artifact {path}: {exc}") from exc
 
 
+def _load_strict_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
+    """Read one bounded duplicate-free JSON object and preserve exact bytes."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise CollectionError(f"cannot read structured artifact {path}: {exc}") from exc
+    if not raw or len(raw) > 16 * 1024 * 1024:
+        raise CollectionError(f"structured artifact {path} has an invalid byte length")
+
+    def strict_object(pairs):
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=strict_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CollectionError(f"cannot read strict structured artifact {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CollectionError(f"structured artifact {path} is not one JSON object")
+    return payload, raw
+
+
 def _first_existing(*paths: Path) -> Path | None:
     return next((path for path in paths if path.is_file()), None)
 
@@ -175,6 +227,93 @@ def _load_pin(session: Path) -> tuple[RunPin, Path]:
         raise CollectionError(f"incomplete run pin: {detail}") from exc
 
 
+def load_authorized_current_run(session_path: str | Path) -> AuthorizedCurrentRun:
+    """Load one current run only through its host authority root.
+
+    The host run pin and host append-only control stream are outside the model's
+    container store. Container run-pin/verdict files are mirrors: both must be
+    exact current publication heads before they can feed campaign metrics.
+    """
+
+    session = Path(session_path)
+    host_pin_path = session / "run-pin.json"
+    container_pin_path = session / ".setup_agent" / "run-pin.json"
+    host_events_path = session / "control_events.jsonl"
+    verdict_path = session / ".setup_agent" / "verdict.json"
+    for path, label in (
+        (host_pin_path, "host run pin"),
+        (container_pin_path, "container run pin mirror"),
+        (host_events_path, "host control event stream"),
+        (verdict_path, "container verdict mirror"),
+    ):
+        if not path.is_file():
+            raise CollectionError(f"current run is missing its {label}")
+
+    host_pin_payload, _host_pin_raw = _load_strict_json_object(host_pin_path)
+    container_pin_payload, container_pin_raw = _load_strict_json_object(container_pin_path)
+    try:
+        pin = RunPin.model_validate(host_pin_payload)
+        container_pin = RunPin.model_validate(container_pin_payload)
+    except ValidationError as exc:
+        raise CollectionError(f"current run pin is invalid: {exc}") from exc
+    if pin.model_dump(mode="json") != container_pin.model_dump(mode="json"):
+        raise CollectionError("host/container run-pin mirrors differ")
+    if not pin.run_id:
+        raise CollectionError("current run pin is missing run_id")
+
+    try:
+        authority = EvidencePublicationAuthority.recover_from_host_jsonl(
+            host_events_path,
+            run_id=pin.run_id,
+        )
+    except (EvidencePublicationError, OSError, TypeError, ValueError) as exc:
+        raise CollectionError(f"host evidence publication stream is invalid: {exc}") from exc
+
+    pin_observation = MutablePublicationObservation(
+        logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+        raw_sha256=hashlib.sha256(container_pin_raw).hexdigest(),
+        byte_count=len(container_pin_raw),
+        run_id=pin.run_id,
+    )
+    if not authority.verify_latest_record_set(
+        "run_pin", {RUN_PIN_LOGICAL_ARTIFACT_ID: pin_observation}
+    ).authorized:
+        raise CollectionError("container run-pin mirror is not the current host publication")
+
+    verdict_payload, verdict_raw = _load_strict_json_object(verdict_path)
+    try:
+        snapshot = validate_verdict_snapshot_v3(verdict_payload)
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise CollectionError(f"invalid verdict.json: {exc}") from exc
+    if snapshot.run_id != pin.run_id:
+        raise CollectionError("verdict run_id disagrees with the host run pin")
+    if verdict_raw != snapshot.model_dump_json().encode("utf-8"):
+        raise CollectionError("verdict.json is not the exact canonical sealed body")
+    verdict_head = authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID)
+    if verdict_head is None or verdict_head.revision != 1:
+        raise CollectionError("verdict publication is missing or not terminal revision 1")
+    verdict_observation = MutablePublicationObservation(
+        logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+        raw_sha256=hashlib.sha256(verdict_raw).hexdigest(),
+        byte_count=len(verdict_raw),
+        run_id=pin.run_id,
+    )
+    if not authority.verify_latest_record_set(
+        "verdict", {VERDICT_LOGICAL_ARTIFACT_ID: verdict_observation}
+    ).authorized:
+        raise CollectionError("verdict mirror is not the current host publication")
+
+    return AuthorizedCurrentRun(
+        pin=pin,
+        pin_path=host_pin_path,
+        snapshot=snapshot,
+        snapshot_path=verdict_path,
+        events_path=host_events_path,
+        events=_read_control_events(host_events_path),
+        authority=authority,
+    )
+
+
 def _validate_current_run_pin(
     session: Path,
     *,
@@ -196,6 +335,8 @@ def _validate_current_run_pin(
         raise CollectionError(f"current run pin is invalid: {exc}") from exc
     if pin.model_dump(mode="json") != container_pin.model_dump(mode="json"):
         raise CollectionError("host/container run-pin mirrors differ")
+    if not pin.run_id:
+        raise CollectionError("current run pin is missing run_id")
     expected = {
         "target_repo_sha": target_repo_sha,
         "sag_git_sha": sag_git_sha,
@@ -618,36 +759,40 @@ def _relativize_session_path(path: Path) -> str:
 
 
 class ABCollector:
-    """Read structured run truth only. Rendered artifacts are never opened."""
+    """Read current host-authorized run truth; never rendered prose.
+
+    Historical phase-report projection is available only through the explicit
+    ``allow_legacy_forensic`` flag. A current run that contains a verdict can
+    never fall back to legacy evidence when its authority checks fail.
+    """
+
+    def __init__(self, *, allow_legacy_forensic: bool = False) -> None:
+        self.allow_legacy_forensic = bool(allow_legacy_forensic)
 
     def collect(self, session_path: str | Path) -> CollectedRun:
         session = Path(session_path)
-        pin, pin_path = _load_pin(session)
-        verdict_path = _first_existing(
-            session / ".setup_agent" / "verdict.json",
-            session / "verdict.json",
-        )
-        events_path = _first_existing(
-            session / ".setup_agent" / "control_events.jsonl",
-            session / "control_events.jsonl",
-        )
         token_path = _first_existing(
             session / "token_usage.csv", session / ".setup_agent" / "token_usage.csv"
         )
-        events = _read_control_events(events_path)
-        thought_calls, action_calls = _token_call_counts(token_path)
-        event_metrics = _event_metrics(events)
-        # Relativize EVERY stored path at generation time so the archived record
-        # (committed into repo logs/ and hand-verified) leaks no host worktree
-        # path (round-review item 5).
-        structured = [_relativize_session_path(pin_path)]
-        if events_path is not None:
-            structured.append(_relativize_session_path(events_path))
-        if token_path is not None:
-            structured.append(_relativize_session_path(token_path))
-        if verdict_path is not None:
+        current_verdict = session / ".setup_agent" / "verdict.json"
+        if current_verdict.is_file():
+            current = load_authorized_current_run(session)
+            pin = current.pin
+            pin_path = current.pin_path
+            snapshot = current.snapshot
+            verdict_path = current.snapshot_path
+            events_path = current.events_path
+            events = current.events
+            thought_calls, action_calls = _token_call_counts(token_path)
+            event_metrics = _event_metrics(events)
+            structured = [
+                _relativize_session_path(pin_path),
+                _relativize_session_path(events_path),
+            ]
+            if token_path is not None:
+                structured.append(_relativize_session_path(token_path))
             run_id, metrics = _new_snapshot_metrics(
-                _load_json(verdict_path),
+                snapshot.model_dump(mode="json"),
                 thought_calls=thought_calls,
                 action_calls=action_calls,
                 event_metrics=event_metrics,
@@ -655,6 +800,23 @@ class ABCollector:
             source_schema = "verdict_v3"
             structured.append(_relativize_session_path(verdict_path))
         else:
+            if not self.allow_legacy_forensic:
+                raise CollectionError(
+                    "current campaign collection requires a host-authorized verdict_v3"
+                )
+            pin, pin_path = _load_pin(session)
+            events_path = _first_existing(
+                session / "control_events.jsonl",
+                session / ".setup_agent" / "control_events.jsonl",
+            )
+            events = _read_control_events(events_path)
+            thought_calls, action_calls = _token_call_counts(token_path)
+            event_metrics = _event_metrics(events)
+            structured = [_relativize_session_path(pin_path)]
+            if events_path is not None:
+                structured.append(_relativize_session_path(events_path))
+            if token_path is not None:
+                structured.append(_relativize_session_path(token_path))
             run_id, metrics, phase_report = _legacy_metrics(
                 session,
                 thought_calls=thought_calls,
@@ -787,13 +949,8 @@ def prepare_surface_artifacts(
     from sag.web.session_registry import _snapshot_test_payload
 
     session = Path(session_path)
-    snapshot_path = _first_existing(
-        session / ".setup_agent" / "verdict.json",
-        session / "verdict.json",
-    )
-    if snapshot_path is None:
-        raise CollectionError("surface preparation requires verdict.json")
-    snapshot = RunVerdictSnapshot.model_validate(_load_json(snapshot_path))
+    current = load_authorized_current_run(session)
+    snapshot = current.snapshot
 
     reports = sorted(session.glob("setup-report-*.md"))
     if not reports:
@@ -835,13 +992,8 @@ def prepare_surface_artifacts(
 
 def check_surfaces(session_path: str | Path) -> SurfaceCheckResult:
     session = Path(session_path)
-    snapshot_path = _first_existing(
-        session / ".setup_agent" / "verdict.json",
-        session / "verdict.json",
-    )
-    if snapshot_path is None:
-        raise CollectionError("surface check requires verdict.json")
-    snapshot = RunVerdictSnapshot.model_validate(_load_json(snapshot_path))
+    current = load_authorized_current_run(session)
+    snapshot = current.snapshot
     expected = {
         "verdict": snapshot.verdict,
         "passed": snapshot.test_stats.unique.passed,
@@ -903,7 +1055,7 @@ def check_surfaces(session_path: str | Path) -> SurfaceCheckResult:
     return SurfaceCheckResult(
         ok=not mismatches,
         mismatches=tuple(mismatches),
-        snapshot_path=str(snapshot_path),
+        snapshot_path=str(current.snapshot_path),
     )
 
 
@@ -1204,6 +1356,7 @@ def _assert_fresh_container_name(run_name: str) -> None:
 
 def build_legacy_run_pin(
     *,
+    run_id: str,
     target_repo_sha: str,
     container_image_digest: str,
     sag_git_sha: str,
@@ -1224,6 +1377,7 @@ def build_legacy_run_pin(
         if key not in {"thinking_model", "action_model"}
     }
     return RunPin(
+        run_id=run_id,
         target_repo_sha=target_repo_sha,
         container_image_digest=container_image_digest,
         sag_git_sha=sag_git_sha,
@@ -1348,6 +1502,7 @@ def _write_external_baseline_pin(
     setup_dir = session / ".setup_agent"
     target = setup_dir / "run-pin.json" if setup_dir.is_dir() else session / "run-pin.json"
     pin = build_legacy_run_pin(
+        run_id=run_name,
         target_repo_sha=target_repo_sha,
         container_image_digest=_container_image_digest(run_name),
         sag_git_sha=sag_sha,

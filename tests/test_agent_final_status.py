@@ -5,6 +5,7 @@ import pytest
 from rich.console import Console
 
 from sag.agent.agent import SetupAgent
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.verdict_finalizer import (
     BuildEvidenceSnapshot,
@@ -17,6 +18,22 @@ from sag.agent.verdict_finalizer import (
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.tools.report_tool import ReportTool
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import ScriptedOrchestrator, add_published_mutable_json
+
+
+def _validator_with_published_manifest() -> PhysicalValidator:
+    orchestrator = ScriptedOrchestrator()
+    add_published_mutable_json(
+        orchestrator,
+        orchestrator.filesystem,
+        path="/workspace/.setup_agent/build_requirements.json",
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        payload=complete_build_requirements_v1(project_root="/workspace/demo"),
+    )
+    return PhysicalValidator(docker_orchestrator=orchestrator, project_path="/workspace")
 
 
 class FakePhysicalValidator:
@@ -354,7 +371,7 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
 
 
 def test_build_validation_refs_prefer_artifact_samples(monkeypatch):
-    validator = PhysicalValidator(project_path="/workspace")
+    validator = _validator_with_published_manifest()
 
     monkeypatch.setattr(validator, "_detect_build_system", lambda project_dir: "maven")
     monkeypatch.setattr(
@@ -396,7 +413,7 @@ def test_build_validation_refs_prefer_artifact_samples(monkeypatch):
 
 
 def test_failed_build_validation_uses_stable_conflict_and_project_fallback(monkeypatch):
-    validator = PhysicalValidator(project_path="/workspace")
+    validator = _validator_with_published_manifest()
 
     monkeypatch.setattr(validator, "_detect_build_system", lambda project_dir: "maven")
     monkeypatch.setattr(
@@ -452,7 +469,7 @@ def test_test_validation_without_reports_does_not_emit_empty_test_stats(monkeypa
     assert result["evidence_refs"] == ["/workspace/demo"]
 
 
-def test_verified_final_status_uses_project_metadata_over_docker_label():
+def test_verified_final_status_uses_controller_project_name_over_container_metadata():
     validator = FakePhysicalValidator(
         build_status={"success": True, "reason": "Build fingerprints found"},
         test_status={
@@ -477,10 +494,10 @@ def test_verified_final_status_uses_project_metadata_over_docker_label():
     agent = object.__new__(SetupAgent)
     agent.orchestrator = MetadataOrchestrator(
         docker_label="commons-vfs-utf8-check",
-        metadata='{"project_name": "commons-vfs", "docker_label": "commons-vfs-utf8-check"}',
+        metadata='{"project_name": "forged-other", "docker_label": "commons-vfs-utf8-check"}',
     )
-    agent.project_name = "commons-vfs-utf8-check"
-    agent.context_manager = SimpleNamespace(project_name="commons-vfs-utf8-check")
+    agent.project_name = "commons-vfs"
+    agent.context_manager = SimpleNamespace(project_name="commons-vfs")
     agent.physical_validator = validator
     agent.workflow_mode = "continue"
 
@@ -824,7 +841,8 @@ def test_setup_summary_renders_literal_snapshot_verdict():
 
     rendered = output.getvalue()
     assert "PARTIAL" in rendered
-    assert "8 / 10 unique tests passed" in rendered
+    assert "Claimed latest subjects: unavailable" in rendered
+    assert "Unattributed observations (not verdict-bearing): 8/10 passed" in rendered
     assert "Report delivery: delivered" in rendered
 
 

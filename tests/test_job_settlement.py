@@ -25,14 +25,31 @@ nobody vouched for stays unclaimed — the Bigtop rule is not negotiable.
 """
 
 import json
+import shlex
 
-from test_repair_contracts import ContainerFS, ScriptedOrchestrator, ok
+import pytest
+from container_evidence_fakes import ContainerFS, ScriptedOrchestrator, ok
 
-from sag.agent.invocation_receipts import RECEIPT_DIR, next_sequence
+from sag.agent.control_events import ControlEventSink
+from sag.agent.evidence_publications import (
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
+from sag.agent.invocation_receipts import (
+    RECEIPT_DIR,
+    build_receipt,
+    next_sequence,
+    write_receipt,
+)
 from sag.agent.job_obligations import (
+    MAX_SETTLEMENT_PERSIST_ATTEMPTS,
     OBLIGATION_DIR,
+    blocks_model,
     build_obligation,
+    observe_exit_marker,
     open_job_ids,
+    reconcile_job_obligations,
     settle_open_obligations,
     write_obligation,
 )
@@ -46,6 +63,23 @@ ROOT = "/workspace/polaris"
 JOB = "373f63e5a0a4"
 LOG_PATH = f"/tmp/sag_jobs/{JOB}.log"
 EXIT_PATH = f"{LOG_PATH}.exit"
+TERMINAL_AUTHORITY = "docker_exec_inspect_v1"
+DOCKER_EXEC_ID = "e" * 64
+CONTAINER_ID = "c" * 64
+TERMINAL_IDENTITY = {
+    "terminal_authority": TERMINAL_AUTHORITY,
+    "docker_exec_id": DOCKER_EXEC_ID,
+    "container_id": CONTAINER_ID,
+    "start_accepted": True,
+    "startup_identity_verified": True,
+    "runner_dispatch_state": "accepted",
+    "pid": 4711,
+    "pgid": 4711,
+    "pid_path": "/tmp/sag_jobs/fixture.pid",
+    "pgid_path": "/tmp/sag_jobs/fixture.pgid",
+    "identity_path": "/tmp/sag_jobs/fixture.identity",
+    "process_identity_token": "a" * 64,
+}
 
 # The tail of a Gradle run that served one module's tests from the build cache
 # and ran the other's. Both parsers read THIS text, on both paths.
@@ -112,15 +146,159 @@ class JobContainer(ContainerFS):
         return super().__call__(command, **kwargs)
 
 
-def _orchestrator(*, exit_code="0", reports=None, files=None):
-    orchestrator = ScriptedOrchestrator()
+class ReceiptFailingJobContainer(JobContainer):
+    """Fail selected receipt chunks while keeping the small lifecycle ledger writable."""
+
+    def __init__(self, *, receipt_failures, files=None, reports=None):
+        super().__init__(files=files, reports=reports)
+        self.receipt_failures = receipt_failures
+
+    def __call__(self, command, **kwargs):
+        if (
+            self.receipt_failures > 0
+            and RECEIPT_DIR in command
+            and command.startswith("printf '%s' ")
+        ):
+            self.receipt_failures -= 1
+            self.commands.append(command)
+            return {"success": False, "exit_code": 1, "output": "injected receipt failure"}
+        return super().__call__(command, **kwargs)
+
+
+class ReceiptLedgerReadFailingJobContainer(JobContainer):
+    """Return a valid prefix but fail the complete receipt record stream."""
+
+    def __call__(self, command, **kwargs):
+        if "for file in " in command and RECEIPT_DIR in command:
+            self.commands.append(command)
+            return {
+                "success": False,
+                "exit_code": 70,
+                "output": json.dumps({"receipt_id": "partial-only"}) + "\n",
+            }
+        return super().__call__(command, **kwargs)
+
+
+class SettlementMarkFailingJobContainer(JobContainer):
+    """Lose the first terminal receipt's ledger mark after the receipt lands."""
+
+    def __init__(self, *, files=None, reports=None):
+        super().__init__(files=files, reports=reports)
+        self.obligation_publishes = 0
+
+    def __call__(self, command, **kwargs):
+        tokens = shlex.split(command) if "\n" not in command else []
+        if (
+            tokens[:3] == ["mv", "-f", "--"]
+            and len(tokens) >= 5
+            and tokens[4].startswith(f"{OBLIGATION_DIR}/")
+        ):
+            self.obligation_publishes += 1
+            # initial, terminal observation, frozen receipt id, attempt count,
+            # then the settlement mark.
+            if self.obligation_publishes == 5:
+                self.commands.append(command)
+                return {"success": False, "exit_code": 1, "output": "lost mark"}
+        return super().__call__(command, **kwargs)
+
+
+class HostTerminalOrchestrator(ScriptedOrchestrator):
+    """Container I/O plus Docker-daemon-owned detached terminal truth."""
+
+    def __init__(self, *, terminal_state="finished", terminal_exit_code=0):
+        super().__init__()
+        self.terminal_state = terminal_state
+        self.terminal_exit_code = terminal_exit_code
+        self.detached_terminal_states = {
+            DOCKER_EXEC_ID: (terminal_state, terminal_exit_code),
+        }
+        self.terminal_inspections = []
+
+    def set_detached_terminal_state(self, exec_id, state, exit_code=None):
+        self.detached_terminal_states[exec_id] = (state, exit_code)
+
+    def inspect_detached_terminal(self, handle):
+        self.terminal_inspections.append(dict(handle))
+        if (
+            handle.get("terminal_authority") != TERMINAL_AUTHORITY
+            or handle.get("container_id") != CONTAINER_ID
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "probe_error": "terminal_identity_mismatch",
+            }
+        state, exit_code = self.detached_terminal_states.get(
+            handle.get("docker_exec_id"),
+            ("unknown", None),
+        )
+        if state == "running":
+            return {
+                "probe_success": True,
+                "state": "running",
+                "running": True,
+                "finished": False,
+                "exit_code": None,
+            }
+        if state == "finished":
+            return {
+                "probe_success": True,
+                "state": "finished",
+                "running": False,
+                "finished": True,
+                "exit_code": exit_code,
+            }
+        return {
+            "probe_success": False,
+            "state": "unknown",
+            "probe_error": "terminal_state_unknown",
+        }
+
+
+def _orchestrator(
+    *,
+    exit_code="0",
+    reports=None,
+    files=None,
+    forensic_exit_marker=False,
+):
+    try:
+        terminal_exit_code = int(exit_code) if exit_code is not None else None
+    except (TypeError, ValueError):
+        terminal_exit_code = None
+    terminal_state = (
+        "running"
+        if exit_code is None
+        else "finished" if terminal_exit_code is not None else "unknown"
+    )
+    orchestrator = HostTerminalOrchestrator(
+        terminal_state=terminal_state,
+        terminal_exit_code=terminal_exit_code,
+    )
     orchestrator.filesystem = JobContainer(
         files={
             LOG_PATH: POLARIS_LOG,
-            **({EXIT_PATH: f"{exit_code}\n"} if exit_code is not None else {}),
+            **(
+                {EXIT_PATH: f"{exit_code}\n"}
+                if forensic_exit_marker and exit_code is not None
+                else {}
+            ),
             **(files or {}),
         },
         reports=AFTER if reports is None else reports,
+    )
+    return orchestrator
+
+
+def _receipt_failing_orchestrator(*, exit_code="0", receipt_failures=1):
+    orchestrator = HostTerminalOrchestrator(
+        terminal_state="finished",
+        terminal_exit_code=int(exit_code),
+    )
+    orchestrator.filesystem = ReceiptFailingJobContainer(
+        receipt_failures=receipt_failures,
+        files={LOG_PATH: POLARIS_LOG},
+        reports=AFTER,
     )
     return orchestrator
 
@@ -145,6 +323,7 @@ def _obligation(**overrides):
         before=BEFORE,
         log_path=LOG_PATH,
         exit_code_path=EXIT_PATH,
+        **TERMINAL_IDENTITY,
         requirements_pins={
             "survey_fingerprint": "sf-8f21",
             "config_fingerprint": "cf-04ab",
@@ -203,6 +382,38 @@ def test_a_terminated_job_settles_into_an_ordinary_receipt():
     assert settlements[0].receipt_id == receipt["receipt_id"]
 
 
+def test_an_incomplete_receipt_ledger_blocks_settlement_instead_of_double_claiming():
+    orchestrator = HostTerminalOrchestrator()
+    orchestrator.filesystem = ReceiptLedgerReadFailingJobContainer(
+        files={LOG_PATH: POLARIS_LOG},
+        reports=AFTER,
+    )
+    _with_obligation(orchestrator)
+
+    reconciliation = reconcile_job_obligations(orchestrator)
+
+    assert [item.job_id for item in reconciliation.terminal_observations] == [JOB]
+    assert reconciliation.settlements == ()
+    assert reconciliation.integrity_failures == (f"{JOB}:receipt_ledger_unreadable",)
+    assert _receipts(orchestrator) == []
+    assert _ledger(orchestrator)["process_state"] == "terminal"
+    assert _ledger(orchestrator)["settlement_state"] == "pending"
+
+
+def test_a_malformed_receipt_ledger_blocks_settlement_instead_of_hiding_a_claim():
+    orchestrator = _orchestrator(
+        files={f"{RECEIPT_DIR}/broken.json": "{not json"},
+    )
+    _with_obligation(orchestrator)
+
+    reconciliation = reconcile_job_obligations(orchestrator)
+
+    assert [item.job_id for item in reconciliation.terminal_observations] == [JOB]
+    assert reconciliation.settlements == ()
+    assert reconciliation.integrity_failures == (f"{JOB}:receipt_ledger_unreadable",)
+    assert _ledger(orchestrator)["settlement_state"] == "pending"
+
+
 def test_settlement_marks_the_obligation_and_nothing_else():
     orchestrator = _with_obligation(_orchestrator())
     before_body = _ledger(orchestrator)
@@ -211,9 +422,23 @@ def test_settlement_marks_the_obligation_and_nothing_else():
 
     after_body = _ledger(orchestrator)
     assert after_body["settled_receipt_id"] == _receipts(orchestrator)[0]["receipt_id"]
-    assert {key: value for key, value in after_body.items() if key != "settled_receipt_id"} == {
-        key: value for key, value in before_body.items() if key != "settled_receipt_id"
+    lifecycle = {
+        "process_state",
+        "settlement_state",
+        "terminal_exit_code",
+        "terminal_marker_ref",
+        "terminal_observed_at",
+        "settlement_attempts",
+        "attempted_receipt_id",
+        "receipt_persistence_code",
+        "settled_receipt_id",
     }
+    assert {key: value for key, value in after_body.items() if key not in lifecycle} == {
+        key: value for key, value in before_body.items() if key not in lifecycle
+    }
+    assert after_body["process_state"] == "terminal"
+    assert after_body["settlement_state"] == "settled"
+    assert after_body["terminal_exit_code"] == 0
     assert open_job_ids(orchestrator) == ()
 
 
@@ -224,6 +449,24 @@ def test_a_job_that_has_not_terminated_stays_open():
     assert settle_open_obligations(orchestrator) == []
     assert _receipts(orchestrator) == []
     assert open_job_ids(orchestrator) == (JOB,)
+
+
+def test_reconciliation_never_falls_back_to_the_runtime_runner_for_control_io():
+    class UnsafeOnly:
+        def __init__(self):
+            self.normal_calls = 0
+
+        def execute_command(self, command, **kwargs):
+            self.normal_calls += 1
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    owner = UnsafeOnly()
+    orchestrator = owner.execute_command
+
+    reconciliation = reconcile_job_obligations(orchestrator)
+
+    assert reconciliation.integrity_failures == ("orchestrator_unavailable",)
+    assert owner.normal_calls == 0
 
 
 def test_settlement_is_idempotent():
@@ -237,6 +480,58 @@ def test_settlement_is_idempotent():
     assert len(_receipts(orchestrator)) == 1
 
 
+def test_restart_reconciliation_rejects_a_missing_settled_receipt_without_resettling():
+    orchestrator = _with_obligation(_orchestrator())
+    settle_open_obligations(orchestrator)
+    ledger = _ledger(orchestrator)
+    receipt_id = ledger["settled_receipt_id"]
+    orchestrator.filesystem.files.pop(f"{RECEIPT_DIR}/{receipt_id}.json")
+
+    reconciliation = reconcile_job_obligations(orchestrator)
+
+    assert reconciliation.settlements == ()
+    # The host expected set still names the deleted receipt, so the complete
+    # live ledger is unavailable rather than a trustworthy set with one
+    # semantically "missing" member.
+    assert reconciliation.integrity_failures == (f"{JOB}:receipt_ledger_unreadable",)
+    assert reconciliation.barrier_active is True
+    assert _ledger(orchestrator) == ledger
+    assert _receipts(orchestrator) == []
+
+
+def test_restart_reconciliation_rejects_a_corrupt_settled_receipt_without_resettling():
+    orchestrator = _with_obligation(_orchestrator())
+    settle_open_obligations(orchestrator)
+    ledger = _ledger(orchestrator)
+    receipt_id = ledger["settled_receipt_id"]
+    orchestrator.filesystem.files[f"{RECEIPT_DIR}/{receipt_id}.json"] = "{not json"
+
+    reconciliation = reconcile_job_obligations(orchestrator)
+
+    assert reconciliation.settlements == ()
+    assert reconciliation.integrity_failures == (f"{JOB}:receipt_ledger_unreadable",)
+    assert reconciliation.barrier_active is True
+    assert _ledger(orchestrator) == ledger
+
+
+def test_restart_reconciliation_rejects_settled_receipt_identity_mismatch():
+    orchestrator = _with_obligation(_orchestrator())
+    settle_open_obligations(orchestrator)
+    ledger = _ledger(orchestrator)
+    receipt_id = ledger["settled_receipt_id"]
+    receipt_path = f"{RECEIPT_DIR}/{receipt_id}.json"
+    receipt = json.loads(orchestrator.filesystem.files[receipt_path])
+    receipt["run_id"] = "different-run-epoch"
+    orchestrator.filesystem.files[receipt_path] = json.dumps(receipt, sort_keys=True)
+
+    reconciliation = reconcile_job_obligations(orchestrator)
+
+    assert reconciliation.settlements == ()
+    assert reconciliation.integrity_failures == (f"{JOB}:receipt_ledger_unreadable",)
+    assert reconciliation.barrier_active is True
+    assert _ledger(orchestrator) == ledger
+
+
 def test_a_failing_job_settles_as_a_failed_receipt():
     """A settled failure is an ordinary failure: same field, same meaning."""
     orchestrator = _with_obligation(_orchestrator(exit_code="1"))
@@ -246,6 +541,138 @@ def test_a_failing_job_settles_as_a_failed_receipt():
     (receipt,) = _receipts(orchestrator)
     assert receipt["exit_code"] == 1
     assert receipt["outcome"] == "failed"
+
+
+def test_exit_marker_observation_distinguishes_absent_malformed_and_unreadable():
+    absent = observe_exit_marker(
+        _orchestrator(exit_code=None, forensic_exit_marker=True).execute_command,
+        EXIT_PATH,
+    )
+    malformed = observe_exit_marker(
+        _orchestrator(
+            exit_code="not-an-int",
+            forensic_exit_marker=True,
+        ).execute_command,
+        EXIT_PATH,
+    )
+
+    def unreadable(_command, **_kwargs):
+        return {"success": False, "exit_code": -1, "output": "container gone"}
+
+    transport = observe_exit_marker(unreadable, EXIT_PATH)
+
+    assert absent.state == "absent"
+    assert malformed.state == "malformed"
+    assert transport.state == "unreadable"
+
+
+def test_a_transient_receipt_failure_retries_the_same_frozen_identity():
+    orchestrator = _with_obligation(_receipt_failing_orchestrator(receipt_failures=1))
+
+    first = reconcile_job_obligations(orchestrator, observed_at="2026-08-08T00:00:00Z")
+    pending = _ledger(orchestrator)
+
+    assert [item.job_id for item in first.terminal_observations] == [JOB]
+    assert first.settlement_pending_job_ids == (JOB,)
+    assert pending["process_state"] == "terminal"
+    assert pending["settlement_state"] == "pending"
+    assert pending["settlement_attempts"] == 1
+    assert pending["receipt_persistence_code"] == "transport_write_failed"
+    frozen_id = pending["attempted_receipt_id"]
+    assert frozen_id
+
+    second = reconcile_job_obligations(orchestrator)
+
+    assert second.terminal_observations == ()
+    assert [item.receipt_id for item in second.settlements] == [frozen_id]
+    assert _ledger(orchestrator)["settled_receipt_id"] == frozen_id
+    assert [receipt["receipt_id"] for receipt in _receipts(orchestrator)] == [frozen_id]
+
+
+def test_restart_after_receipt_publish_reuses_it_instead_of_minting_a_second_receipt():
+    orchestrator = HostTerminalOrchestrator()
+    orchestrator.filesystem = SettlementMarkFailingJobContainer(
+        files={LOG_PATH: POLARIS_LOG},
+        reports=AFTER,
+    )
+    _with_obligation(orchestrator)
+
+    first = reconcile_job_obligations(orchestrator)
+    pending = _ledger(orchestrator)
+    receipts_after_first = _receipts(orchestrator)
+
+    assert first.settlements == ()
+    assert first.integrity_failures == (f"{JOB}:settlement_mark_unpersisted",)
+    assert pending["settlement_state"] == "pending"
+    assert len(receipts_after_first) == 1
+    frozen_id = pending["attempted_receipt_id"]
+    assert receipts_after_first[0]["receipt_id"] == frozen_id
+
+    replayed = reconcile_job_obligations(orchestrator)
+
+    assert [settlement.receipt_id for settlement in replayed.settlements] == [frozen_id]
+    assert len(_receipts(orchestrator)) == 1
+    assert _ledger(orchestrator)["settled_receipt_id"] == frozen_id
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 137])
+def test_a_terminal_job_with_two_receipt_failures_closes_as_unpersisted(exit_code):
+    orchestrator = _with_obligation(
+        _receipt_failing_orchestrator(
+            exit_code=str(exit_code),
+            receipt_failures=2,
+        )
+    )
+
+    first = reconcile_job_obligations(orchestrator)
+    second = reconcile_job_obligations(orchestrator)
+    terminal = _ledger(orchestrator)
+
+    assert first.settlement_pending_job_ids == (JOB,)
+    assert second.settlement_pending_job_ids == ()
+    assert len(second.terminal_unpersisted) == 1
+    assert second.terminal_unpersisted[0].exit_code == exit_code
+    assert second.terminal_unpersisted[0].persistence_code == "transport_write_failed"
+    assert terminal["process_state"] == "terminal"
+    assert terminal["settlement_state"] == "unpersisted"
+    assert terminal["terminal_exit_code"] == exit_code
+    assert terminal["settlement_attempts"] == 2
+    assert blocks_model(terminal) is False
+    assert open_job_ids(orchestrator) == ()
+
+    repeated = reconcile_job_obligations(orchestrator)
+    assert len(repeated.terminal_observations) == 1
+    assert repeated.terminal_observations[0].job_id == JOB
+    assert len(repeated.terminal_unpersisted) == 1
+    assert repeated.terminal_unpersisted[0].job_id == JOB
+    assert repeated.terminal_unpersisted[0].exit_code == exit_code
+
+
+@pytest.mark.parametrize("attempts", [-1, MAX_SETTLEMENT_PERSIST_ATTEMPTS + 1])
+def test_invalid_settlement_attempt_count_is_integrity_not_an_retry_budget(attempts):
+    orchestrator = _orchestrator(exit_code="0")
+    invalid = _obligation(
+        process_state="terminal",
+        settlement_state="pending",
+        terminal_exit_code=0,
+        terminal_marker_ref=f"docker-exec:{DOCKER_EXEC_ID}",
+        terminal_observed_at="2026-08-08T12:00:00Z",
+        settlement_attempts=attempts,
+        attempted_receipt_id="inv-gradle-1-invalid-attempts",
+    )
+
+    # The strict writer refuses this shape.  The reconciliation seam still
+    # treats an explicitly supplied corrupt snapshot as integrity failure;
+    # it never turns an over-budget value into retry authority.
+    assert write_obligation(orchestrator.execute_command, invalid) is False
+    reconciliation = reconcile_job_obligations(orchestrator, obligations=[invalid])
+
+    assert reconciliation.settlements == ()
+    assert reconciliation.terminal_unpersisted == ()
+    assert reconciliation.settlement_pending_job_ids == ()
+    assert reconciliation.integrity_failures == (f"{JOB}:invalid_settlement_attempts",)
+    assert f"{OBLIGATION_DIR}/{JOB}.json" not in orchestrator.filesystem.files
+    assert _receipts(orchestrator) == []
 
 
 def test_the_module_outcomes_are_the_synchronous_parsers_output():
@@ -293,24 +720,23 @@ def test_an_untouched_report_nobody_vouched_for_stays_unclaimed():
 
 def _other_receipt(receipt_id, paths, digest=SHA_CORE, exit_code=0):
     """One receipt some OTHER dispatch wrote, claiming `paths` at `digest`."""
-    return json.dumps(
-        {
-            "schema_version": 2,
-            "receipt_id": receipt_id,
-            "tool": "gradle",
-            "requested_action": "test",
-            "effective_action": "test",
-            "argv": f"{ROOT}/gradlew :polaris-core:test",
-            "working_directory": ROOT,
-            "exit_code": exit_code,
-            "outcome": "completed" if exit_code == 0 else "failed",
-            "report_delta": {
-                "new": [{"path": path, "sha256": digest} for path in paths],
-                "changed": [],
-            },
-        },
-        sort_keys=True,
+    return build_receipt(
+        receipt_id=receipt_id,
+        tool="gradle",
+        requested_action="test",
+        effective_action="test",
+        argv=f"{ROOT}/gradlew :polaris-core:test",
+        working_directory=ROOT,
+        exit_code=exit_code,
+        before={},
+        after={path: digest for path in paths},
     )
+
+
+def _publish_other_receipt(orchestrator, receipt_id, paths, digest=SHA_CORE, exit_code=0):
+    receipt = _other_receipt(receipt_id, paths, digest=digest, exit_code=exit_code)
+    assert write_receipt(orchestrator.execute_command, receipt) is True
+    return receipt
 
 
 def _with_intervening(*paths):
@@ -322,9 +748,7 @@ def _with_intervening(*paths):
     """
     orchestrator = _with_obligation(_orchestrator())
     receipt_id = f"inv-gradle-3-{next_sequence():04d}"
-    orchestrator.filesystem.files[f"{RECEIPT_DIR}/{receipt_id}.json"] = _other_receipt(
-        receipt_id, paths
-    )
+    _publish_other_receipt(orchestrator, receipt_id, paths)
     return orchestrator
 
 
@@ -351,30 +775,23 @@ def test_the_exclusion_never_touches_what_nobody_claimed():
     assert [entry["path"] for entry in settled["report_delta"]["cached"]] == [API_REPORT]
 
 
-def test_a_settlement_whose_mark_never_landed_cannot_double_count():
-    """Risk §7, two writers to one job: if the ledger mark fails after the
-    receipt was written, the next sweep settles again — and the FIRST receipt
-    now owns every path, so the second one claims nothing. The exclusion rule
-    is what makes that harmless.
+def test_a_rolled_back_settlement_mark_cannot_mint_a_second_receipt():
+    """The host revision head makes a restored pre-settlement body forensic.
 
-    The re-read body is the SAME dispatch, ordinal included: a mark that never
-    reached disk did not re-dispatch the job.
+    A second sweep cannot accept the rolled-back mutable slot, so it neither
+    repeats settlement nor mints a second receipt.
     """
     body = _obligation()
     orchestrator = _orchestrator()
     write_obligation(orchestrator.execute_command, body)
     settle_open_obligations(orchestrator)
     # The mark that never reached disk.
-    orchestrator.filesystem.files[f"{OBLIGATION_DIR}/{JOB}.json"] = json.dumps(
-        body, sort_keys=True
-    )
+    orchestrator.filesystem.files[f"{OBLIGATION_DIR}/{JOB}.json"] = json.dumps(body, sort_keys=True)
 
-    settle_open_obligations(orchestrator)
+    reconciliation = reconcile_job_obligations(orchestrator)
 
-    first, second = sorted(_receipts(orchestrator), key=lambda receipt: receipt["receipt_id"])
-    assert len(_delta_paths(first)) == 2
-    assert _delta_paths(second) == []
-    assert second["excluded_claimed_paths"] == 2
+    assert reconciliation.integrity_failures == ("ledger_unreadable",)
+    assert len(_receipts(orchestrator)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -400,12 +817,13 @@ def test_a_receipt_from_before_this_dispatch_does_not_take_the_rewrite():
     earlier claim names.
     """
     earlier = f"inv-gradle-1-{next_sequence():04d}"
-    orchestrator = _orchestrator(
-        files={
-            f"{RECEIPT_DIR}/{earlier}.json": _other_receipt(
-                earlier, [CORE_REPORT], digest=SHA_CORE_ATTEMPT_1, exit_code=1
-            )
-        }
+    orchestrator = _orchestrator()
+    _publish_other_receipt(
+        orchestrator,
+        earlier,
+        [CORE_REPORT],
+        digest=SHA_CORE_ATTEMPT_1,
+        exit_code=1,
     )
     _with_obligation(orchestrator, before={CORE_REPORT: SHA_CORE_ATTEMPT_1, **BEFORE})
 
@@ -419,21 +837,20 @@ def test_a_receipt_from_before_this_dispatch_does_not_take_the_rewrite():
 def test_the_pre_dispatch_receipt_is_still_the_only_claim_it_ever_made():
     """Scoping the exclusion adds no claim to anyone else's books."""
     earlier = f"inv-gradle-1-{next_sequence():04d}"
-    orchestrator = _orchestrator(
-        files={
-            f"{RECEIPT_DIR}/{earlier}.json": _other_receipt(
-                earlier, [CORE_REPORT], digest=SHA_CORE_ATTEMPT_1, exit_code=1
-            )
-        }
+    orchestrator = _orchestrator()
+    _publish_other_receipt(
+        orchestrator,
+        earlier,
+        [CORE_REPORT],
+        digest=SHA_CORE_ATTEMPT_1,
+        exit_code=1,
     )
     _with_obligation(orchestrator, before={CORE_REPORT: SHA_CORE_ATTEMPT_1, **BEFORE})
 
     settle_open_obligations(orchestrator)
 
     untouched = json.loads(orchestrator.filesystem.files[f"{RECEIPT_DIR}/{earlier}.json"])
-    assert untouched["report_delta"]["new"] == [
-        {"path": CORE_REPORT, "sha256": SHA_CORE_ATTEMPT_1}
-    ]
+    assert untouched["report_delta"]["new"] == [{"path": CORE_REPORT, "sha256": SHA_CORE_ATTEMPT_1}]
 
 
 def test_an_obligation_that_cannot_order_itself_excludes_every_claim():
@@ -441,9 +858,8 @@ def test_an_obligation_that_cannot_order_itself_excludes_every_claim():
     history, so it refuses to claim a path any receipt already vouched for.
     Conservative, and stated: the notice counts what it gave up."""
     receipt_id = f"inv-gradle-3-{next_sequence():04d}"
-    orchestrator = _orchestrator(
-        files={f"{RECEIPT_DIR}/{receipt_id}.json": _other_receipt(receipt_id, [CORE_REPORT])}
-    )
+    orchestrator = _orchestrator()
+    _publish_other_receipt(orchestrator, receipt_id, [CORE_REPORT])
     body = _obligation()
     body.pop("dispatch_sequence")
     write_obligation(orchestrator.execute_command, body)
@@ -476,7 +892,7 @@ def test_no_interleaving_records_no_exclusion():
 # ---------------------------------------------------------------------------
 
 
-def _synchronous_receipt():
+def _synchronous_receipt(tmp_path):
     """What the runner writes when the same job finishes inside the call.
 
     Mirrors gradle_tool.execute()'s own call site (the parsers at
@@ -484,24 +900,32 @@ def _synchronous_receipt():
     reproduce.
     """
     orchestrator = _orchestrator()
+    authority = EvidencePublicationAuthority.for_live_run(
+        run_id="run-pytest",
+        sink=ControlEventSink(tmp_path / "sync-control-events.jsonl"),
+    )
+    token = install_evidence_publication_authority(authority, orchestrator=orchestrator)
     tool = GradleTool.__new__(GradleTool)
     tool.orchestrator = orchestrator
     tool._pending_invocation_receipt = None
-    tool._record_invocation_receipt(
-        requested_action="test",
-        argv=f"{ROOT}/gradlew --continue test",
-        working_directory=ROOT,
-        attempt=1,
-        result={"exit_code": 0, "output": POLARIS_LOG, "full_output": POLARIS_LOG},
-        before=BEFORE,
-        requirements=REQUIREMENTS,
-        module_outcomes=_gradle_module_outcomes(POLARIS_LOG),
-        cached_report_roots=_gradle_cached_report_dirs(POLARIS_LOG, ROOT),
-    )
-    return _receipts(orchestrator)[0]
+    try:
+        tool._record_invocation_receipt(
+            requested_action="test",
+            argv=f"{ROOT}/gradlew --continue test",
+            working_directory=ROOT,
+            attempt=1,
+            result={"exit_code": 0, "output": POLARIS_LOG, "full_output": POLARIS_LOG},
+            before=BEFORE,
+            requirements=REQUIREMENTS,
+            module_outcomes=_gradle_module_outcomes(POLARIS_LOG),
+            cached_report_roots=_gradle_cached_report_dirs(POLARIS_LOG, ROOT),
+        )
+        return _receipts(orchestrator)[0]
+    finally:
+        reset_evidence_publication_authority(token)
 
 
-def test_the_settled_receipt_is_field_for_field_the_synchronous_one():
+def test_the_settled_receipt_is_field_for_field_the_synchronous_one(tmp_path):
     """One schema, one writer. Only the id — which is a sequence, not a fact —
     is allowed to differ."""
     orchestrator = _with_obligation(_orchestrator())
@@ -509,7 +933,7 @@ def test_the_settled_receipt_is_field_for_field_the_synchronous_one():
     settle_open_obligations(orchestrator)
 
     settled = _receipts(orchestrator)[0]
-    synchronous = _synchronous_receipt()
+    synchronous = _synchronous_receipt(tmp_path)
     assert {key: value for key, value in settled.items() if key != "receipt_id"} == {
         key: value for key, value in synchronous.items() if key != "receipt_id"
     }
@@ -547,7 +971,7 @@ def test_the_notice_is_one_bounded_line():
 
 
 def test_the_notice_states_the_exclusion_when_there_was_one():
-    """"Earlier" would be false: the receipt that took the path was written
+    """ "Earlier" would be false: the receipt that took the path was written
     AFTER this dispatch, which is precisely why it took it."""
     orchestrator = _with_intervening(CORE_REPORT)
 

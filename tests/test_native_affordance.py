@@ -22,26 +22,38 @@ rest assert what a native call CANNOT do:
   `NATIVE_WITHOUT_PROVENANCE` — "the state is unknown, not repairable";
 * a maven/gradle tree gets a plain refusal rather than an apt install;
 * the resolver's command line carries resolver tokens only;
-* `deps` args are exact pins a dependency claim states, or nothing.
+* non-empty Python `deps` args are disabled until typed claim verification is
+  shared by the facade and judge; an opaque claim id never grants install authority.
 
-Claims and assessments are consumed through their persisted shapes only
-(hand-written fixtures; lanes a2/c2 own the producers), and the fake
-orchestrator records every command so "no runner was invoked" is checkable
-rather than asserted.
+Legacy claim and assessment shapes are retained as negative fixtures. Until a
+reader binds their typed content and exact bytes to the host-owned current-run
+publication ledger, they are display evidence only and the native facade stays
+closed. The fake orchestrator records every command so "no runner was invoked"
+is checkable rather than asserted.
 """
 
 import json
 import shlex
+from contextlib import contextmanager
 
 import pytest
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 
+pytestmark = pytest.mark.usefixtures("facade_contract_authority")
+from test_container_io import FakeContainer
+
+from sag.agent.action_intents import action_fingerprint
 from sag.agent.claim_records import CLAIM_DIR
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+from sag.agent.evidence_records import frame_json_record_stream
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
-from sag.agent.invocation_contracts import CONTRACT_DIR
-from sag.agent.repair_contracts import (
-    NO_SAFE_PROPOSAL,
-    build_repair,
-    propose_public_call,
+from sag.agent.invocation_contracts import (
+    CONTRACT_AUTHORITY_MISSING,
+    CONTRACT_DIR,
+    PYTHON_FACADE_EXECUTION_BINDING,
+    action_context,
+    build_contract,
+    dispatch_contract,
 )
 from sag.tools.base import ToolResult
 from sag.tools.build.backends import (
@@ -53,9 +65,9 @@ from sag.tools.build.backends import (
     native_cmake_args,
 )
 from sag.tools.build.build_tool import (
-    NATIVE_UNSOURCED_CLAUSE,
     _EDGE_GATED_VERBS,
     _PREFLIGHT_VERBS,
+    NATIVE_UNSOURCED_CLAUSE,
     BuildTool,
 )
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
@@ -65,6 +77,79 @@ PROJECT = "/workspace/proj"
 FEATURES = ["llvm"]
 DEFINITIONS = {"USE_LLVM": "ON", "BUILD_TESTING": "OFF"}
 CMAKE_ARGS = "-DBUILD_TESTING=OFF -DUSE_LLVM=ON"
+
+
+@contextmanager
+def build_call_scope(action, *, args=None, features=None, definitions=None):
+    params = {"action": action, "working_directory": PROJECT}
+    if args is not None:
+        params["args"] = args
+    if features is not None:
+        params["features"] = list(features)
+    if definitions is not None:
+        params["definitions"] = dict(definitions)
+    domain_id = f"test:{PROJECT}"
+    with action_context(
+        envelope_id=f"envelope-native-{action}",
+        intent_source="model",
+        intent_id=f"intent-native-{action}",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+    ):
+        yield
+
+
+@contextmanager
+def python_dispatch_scope(*, operation, params):
+    domain_id = f"test:{PROJECT}"
+    contract = build_contract(
+        run_id="run-native-affordance",
+        envelope_id=f"envelope-python-{operation}",
+        tool="build",
+        params=params,
+        effective_tool="python",
+        effective_action=operation,
+        expected_cwd=PROJECT,
+        expected_argv=None,
+        execution_binding=PYTHON_FACADE_EXECUTION_BINDING,
+        intent_source="controller",
+        intent_id=f"intent-python-{operation}",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+    )
+    with dispatch_contract(contract):
+        yield contract
+
+
+def _atomic_write_tokens(command):
+    """The shared writer's bounded command shape, or ``None`` otherwise."""
+    tokens = shlex.split(command) if "\n" not in command else []
+    if (
+        tokens[:3] == ["mkdir", "-p", "--"]
+        or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+        or tokens[:2] == ["base64", "--decode"]
+        or tokens[:3] == ["mv", "-f", "--"]
+        or (
+            tokens[:2] == ["python3", "-c"]
+            and (
+                "hashlib.sha256" in tokens[2]
+                or "json.load" in tokens[2]
+                or "fcntl.flock" in tokens[2]
+            )
+        )
+    ):
+        return tokens
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +236,6 @@ class NativeOrchestrator:
     """
 
     def __init__(self, requirements=None, markers=("pyproject.toml",), assessments=(), claims=()):
-        self.files = {REQUIREMENTS_PATH: json.dumps(requirements or {})}
         self.markers = set(markers)
         self.commands = []
         self.written = []
@@ -160,6 +244,24 @@ class NativeOrchestrator:
             CLAIM_DIR: [dict(item) for item in claims],
         }
         self.contracts = []
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="run-pytest",
+            target_sha="a" * 40,
+            run_pin=False,
+        )
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=dict(requirements or {}),
+        )
+        self.files = self.evidence.files
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     def read_file(self, path):
         if path not in self.files:
@@ -177,11 +279,30 @@ class NativeOrchestrator:
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command, **kwargs)
         directory = self._glob_directory(command)
         if directory is not None:
-            bodies = [json.dumps(record, sort_keys=True) for record in self.records[directory]]
-            return {"success": True, "output": "\n".join(bodies), "exit_code": 0}
+            return {
+                "success": True,
+                "output": frame_json_record_stream(self.records[directory]),
+                "exit_code": 0,
+            }
+        atomic_tokens = _atomic_write_tokens(command)
+        if atomic_tokens is not None:
+            result = self.atomic.execute_command(command)
+            if atomic_tokens[:3] == ["mv", "-f", "--"]:
+                final = atomic_tokens[4]
+                payload = json.loads(self.files[final])
+                if final.startswith(f"{ASSESSMENT_DIR}/"):
+                    self.written.append(payload)
+                elif final.startswith(f"{CONTRACT_DIR}/"):
+                    self.contracts.append(payload)
+            return result
         if command.startswith("cat ") and "\n" not in command:
+            path = shlex.split(command)[-1]
+            if path in self.files:
+                return {"success": True, "output": self.files[path], "exit_code": 0}
             return {"success": False, "output": "", "exit_code": 1}
         if ASSESSMENT_DIR in command and "mv -f " in command:
             self.written.append(json.loads(command.split("\n")[1]))
@@ -224,12 +345,13 @@ def native_tool(*, requirements=None, markers=("pyproject.toml",), evidence=None
 def run_native(features=FEATURES, definitions=None, *, evidence=None, **kwargs):
     definitions = DEFINITIONS if definitions is None else definitions
     tool, runner, orchestrator = native_tool(evidence=evidence, **kwargs)
-    result = tool.execute(
-        action="native",
-        working_directory=PROJECT,
-        features=features,
-        definitions=definitions,
-    )
+    with build_call_scope("native", features=features, definitions=definitions):
+        result = tool.execute(
+            action="native",
+            working_directory=PROJECT,
+            features=features,
+            definitions=definitions,
+        )
     return result, runner, orchestrator
 
 
@@ -273,8 +395,9 @@ def test_a_locked_domain_edge_does_not_refuse_a_native_call():
         },
     )
 
-    assert result.error_code != "DOMAIN_EDGE_BLOCKED"
-    assert runner.calls, "the edge law governs producing verbs, not this one"
+    assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
+    assert "domain edge" not in result.output.lower()
+    assert runner.calls == [], "the edge law is not what refused this call"
 
 
 def test_a_maven_project_is_refused_a_native_call():
@@ -415,17 +538,31 @@ def test_a_switch_for_an_unnamed_feature_is_inconsistent():
     assert runner.calls == []
 
 
-def test_a_featureless_definition_needs_no_feature():
-    """`BUILD_TESTING` names no capability, so it is not a request for one."""
+def test_a_featureless_definition_does_not_bypass_live_provenance():
+    """`BUILD_TESTING` adds no capability but still cannot trust loose claims."""
     result, runner, _ = run_native(FEATURES, DEFINITIONS, evidence=AUTHORIZED)
 
-    assert result.error_code is None
-    assert runner.calls
+    assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
+    assert runner.calls == []
 
 
 # ---------------------------------------------------------------------------
-# 4. provenance: a receipt proved it absent, a claim proves the switch owned
+# 4. provenance: loose files remain untrusted until the typed live path exists
 # ---------------------------------------------------------------------------
+
+
+def test_loose_assessment_and_claim_files_do_not_authorize_native():
+    """Legacy JSON shapes are display evidence, not live install authority."""
+
+    result, runner, orchestrator = run_native(evidence=AUTHORIZED)
+
+    assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
+    assert runner.calls == []
+    assert not any(
+        f"{directory}/*.json" in command
+        for directory in (ASSESSMENT_DIR, CLAIM_DIR)
+        for command in orchestrator.commands
+    )
 
 
 def test_without_a_capability_assessment_the_call_is_refused():
@@ -436,6 +573,10 @@ def test_without_a_capability_assessment_the_call_is_refused():
     assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
     assert "capability_absent_llvm" in result.output
     assert NATIVE_UNSOURCED_CLAUSE in result.output
+    guidance = "\n".join(result.suggestions)
+    assert "model-owned ordinary ActionIntent" in guidance
+    assert "build(action=" not in guidance
+    assert "bash(command=" not in guidance
     assert runner.calls == []
     assert typed_codes(orchestrator) == ["native_without_provenance"]
 
@@ -485,9 +626,8 @@ def test_a_claim_of_another_kind_is_not_definition_provenance():
     assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
 
 
-def test_a_claim_stating_the_switch_OFF_still_proves_it_project_owned():
-    """The claim proves the knob EXISTS and is the project's; the decision to
-    turn it on comes from the receipt that proved the capability absent."""
+def test_a_loose_claim_stating_the_switch_OFF_is_not_live_authority():
+    """A historical claim can describe the knob but cannot authorize dispatch."""
     result, runner, _ = run_native(
         evidence={
             "assessments": AUTHORIZED["assessments"],
@@ -498,20 +638,19 @@ def test_a_claim_stating_the_switch_OFF_still_proves_it_project_owned():
         }
     )
 
-    assert result.error_code is None
-    assert runner.calls
+    assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
+    assert runner.calls == []
 
 
-def test_an_authorized_call_freezes_the_claim_ids_it_was_authorized_by():
-    _, runner, orchestrator = run_native(evidence=AUTHORIZED)
+def test_loose_claim_ids_are_never_frozen_as_native_authority():
+    result, runner, orchestrator = run_native(evidence=AUTHORIZED)
 
     contracts = [
         contract for contract in orchestrator.contracts if contract.get("supporting_claim_ids")
     ]
-    assert len(contracts) == 1
-    assert contracts[0]["supporting_claim_ids"] == ["env-buildtest001", "env-usellvm0001"]
-    assert contracts[0]["requested_call"]["params"]["action"] == "native"
-    assert runner.calls
+    assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
+    assert contracts == []
+    assert runner.calls == []
 
 
 def test_provenance_is_not_a_call_parameter():
@@ -547,16 +686,11 @@ def test_a_self_attested_definition_value_cannot_stand_in_for_a_claim():
 # ---------------------------------------------------------------------------
 
 
-def test_the_authorized_call_materializes_the_native_operation():
-    _, runner, _ = run_native(evidence=AUTHORIZED)
+def test_loose_provenance_never_materializes_the_native_operation():
+    result, runner, _ = run_native(evidence=AUTHORIZED)
 
-    assert runner.calls == [
-        {
-            "operation": "native",
-            "working_directory": PROJECT,
-            "native": {"features": ["llvm"], "definitions": DEFINITIONS},
-        }
-    ]
+    assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
+    assert runner.calls == []
 
 
 def test_the_cmake_args_overlay_is_order_independent():
@@ -592,10 +726,22 @@ class ScriptedContainer:
         self.commands = []
         self.outputs = dict(outputs or {})
         self.failing = tuple(failing)
-        self.files = {}
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="run-native-affordance",
+            target_sha="a" * 40,
+            run_pin=False,
+        )
+        self.files = self.evidence.files
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command, **kwargs)
+        if _atomic_write_tokens(command) is not None:
+            return self.atomic.execute_command(command)
         if "mv -f " in command and "\n" in command:
             header, _, rest = command.partition("\n")
             heredoc = header.rsplit("<<'", 1)[1].split("'", 1)[0]
@@ -638,21 +784,28 @@ def python_native(container=None, *, bundle=None, manifest=None):
     container = container or ScriptedContainer(
         outputs={"llvm-config --version": "15.0.7\n", "test -x": "EXISTS"}
     )
-    container.files[REQUIREMENTS_PATH] = json.dumps(manifest or PYTHON_MANIFEST)
-    original = container.execute_command
-
-    def execute_command(command, **kwargs):
-        if command.startswith("cat ") and REQUIREMENTS_PATH in command:
-            container.commands.append(command)
-            return {"success": True, "output": container.files[REQUIREMENTS_PATH], "exit_code": 0}
-        return original(command, **kwargs)
-
-    container.execute_command = execute_command
-    result = PythonTool(container).execute(
-        operation="native",
-        working_directory=PROJECT,
-        native=bundle or {"features": ["llvm"], "definitions": DEFINITIONS},
+    add_published_mutable_json(
+        container,
+        container.evidence,
+        path=REQUIREMENTS_PATH,
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        payload=dict(manifest or PYTHON_MANIFEST),
     )
+    native = bundle or {"features": ["llvm"], "definitions": DEFINITIONS}
+    params = {
+        "action": "native",
+        "working_directory": PROJECT,
+        "features": list(native.get("features") or ()),
+        "definitions": dict(native.get("definitions") or {}),
+    }
+    with python_dispatch_scope(operation="native", params=params):
+        result = PythonTool(container).execute(
+            operation="native",
+            working_directory=PROJECT,
+            native=native,
+        )
     return result, container
 
 
@@ -750,7 +903,12 @@ def test_the_receipt_carries_the_probe_line_as_a_capability_observation():
         next(body for path, body in container.files.items() if "/invocation_receipts/" in path)
     )
     assert receipt["capability_observations"] == [
-        {"feature": "llvm", "probe": "llvm-config --version", "observation": "15.0.7"}
+        {
+            "feature": "llvm",
+            "probe": "llvm-config --version",
+            "probe_exit_code": "0",
+            "observation": "15.0.7",
+        }
     ]
     assert result.metadata["capability_observations"] == receipt["capability_observations"]
 
@@ -762,7 +920,7 @@ def test_a_probe_that_answers_nothing_states_no_observation():
     result, _ = python_native(container)
 
     assert result.metadata["capability_observations"] == [
-        {"feature": "llvm", "probe": "llvm-config --version"}
+        {"feature": "llvm", "probe": "llvm-config --version", "probe_exit_code": "0"}
     ]
 
 
@@ -785,108 +943,7 @@ def test_an_unvalidated_bundle_is_refused_by_the_executor_too():
 
 
 # ---------------------------------------------------------------------------
-# 7. repair proposals (plan §Stage E item 3)
-# ---------------------------------------------------------------------------
-
-
-def trigger(typed_code, *, receipt_id="inv-python-1-0001"):
-    return {
-        "schema_version": 1,
-        "assessment_id": f"asm-{receipt_id}-{typed_code}-0000abcd",
-        "receipt_id": receipt_id,
-        "typed_code": typed_code,
-    }
-
-
-def test_a_capability_with_a_matching_switch_claim_proposes_the_native_call():
-    claims = [
-        env_claim("USE_LLVM", "OFF", claim_id="env-usellvm0001", scope="cmake_option"),
-        env_claim("BUILD_TESTING", "OFF", claim_id="env-buildtest001"),
-    ]
-
-    repair = build_repair(trigger("capability_absent_llvm"), claims, domain_root=PROJECT)
-
-    assert repair["proposed_public_call"] == {
-        "tool": "build",
-        "params": {
-            "action": "native",
-            "features": ["llvm"],
-            "definitions": {"BUILD_TESTING": "OFF", "USE_LLVM": "ON"},
-            "working_directory": PROJECT,
-        },
-    }
-    assert repair["supporting_claim_ids"] == ["env-usellvm0001", "env-buildtest001"]
-    assert repair["typed_failure_or_capability"] == "capability_absent_llvm"
-
-
-def test_the_proposed_switch_value_comes_from_the_evidence_not_the_claim():
-    """The claim states the project's OFF default; the receipt states the
-    capability is absent. Enabling it is the repair."""
-    repair = build_repair(
-        trigger("capability_absent_llvm"),
-        [env_claim("USE_LLVM", "OFF", scope="cmake_set")],
-    )
-
-    assert repair["proposed_public_call"]["params"]["definitions"] == {"USE_LLVM": "ON"}
-
-
-def test_a_capability_with_no_switch_claim_proposes_no_native_call():
-    call, reason = propose_public_call(
-        trigger("capability_absent_llvm"), [env_claim("BUILD_TESTING", "OFF")]
-    )
-
-    assert call is None
-    assert reason == NO_SAFE_PROPOSAL
-    assert (
-        build_repair(trigger("capability_absent_llvm"), [env_claim("BUILD_TESTING", "OFF")]) is None
-    )
-
-
-def test_a_switch_claim_for_another_capability_proposes_nothing():
-    call, reason = propose_public_call(
-        trigger("capability_absent_llvm"), [env_claim("USE_CUDA", "ON")]
-    )
-
-    assert call is None
-    assert reason == NO_SAFE_PROPOSAL
-
-
-def test_a_single_exact_pin_proposes_a_targeted_deps_install():
-    repair = build_repair(
-        trigger("dependency_unresolved_numpy"),
-        [dependency_claim("numpy", "1.26.4", claim_id="dependency-111111111111")],
-    )
-
-    assert repair["proposed_public_call"]["params"]["action"] == "deps"
-    assert repair["proposed_public_call"]["params"]["args"] == "numpy==1.26.4"
-    assert repair["supporting_claim_ids"] == ["dependency-111111111111"]
-
-
-def test_a_range_claim_is_not_an_exact_pin():
-    repair = build_repair(
-        trigger("dependency_unresolved_numpy"),
-        [dependency_claim("numpy", "1.26.4", specifier=">=")],
-    )
-
-    assert "args" not in repair["proposed_public_call"]["params"]
-
-
-def test_several_pins_propose_the_plain_resolution():
-    """Choosing one of several pins would cite a claim for a decision the
-    claim does not state."""
-    repair = build_repair(
-        trigger("dependency_unresolved_numpy"),
-        [
-            dependency_claim("numpy", "1.26.4", claim_id="dependency-111111111111"),
-            dependency_claim("scipy", "1.13.0", claim_id="dependency-222222222222"),
-        ],
-    )
-
-    assert "args" not in repair["proposed_public_call"]["params"]
-
-
-# ---------------------------------------------------------------------------
-# 8. the deps exact-pin path (plan §Stage E item 3)
+# 7. the deps exact-pin path
 # ---------------------------------------------------------------------------
 
 
@@ -894,15 +951,19 @@ def run_deps(args, *, claims=(), markers=("pyproject.toml",)):
     tool, runner, orchestrator = native_tool(
         markers=markers, evidence={"assessments": (), "claims": claims}
     )
-    result = tool.execute(action="deps", working_directory=PROJECT, args=args)
+    with build_call_scope("deps", args=args):
+        result = tool.execute(action="deps", working_directory=PROJECT, args=args)
     return result, runner, orchestrator
 
 
-def test_a_pin_a_dependency_claim_states_is_accepted():
-    result, runner, _ = run_deps("numpy==1.26.4", claims=[dependency_claim("numpy", "1.26.4")])
+def test_a_pin_a_dependency_claim_states_is_still_refused_without_typed_shared_authority():
+    result, runner, orchestrator = run_deps(
+        "numpy==1.26.4", claims=[dependency_claim("numpy", "1.26.4")]
+    )
 
-    assert result.error_code is None
-    assert runner.calls[0]["args"] == "numpy==1.26.4"
+    assert result.error_code == "PIN_WITHOUT_PROVENANCE"
+    assert runner.calls == []
+    assert typed_codes(orchestrator) == ["pin_without_provenance"]
 
 
 def test_a_pin_no_claim_states_is_refused():
@@ -931,7 +992,8 @@ def test_a_python_deps_arg_that_is_not_an_exact_pin_is_refused(args):
     result, runner, _ = run_deps(args, claims=[dependency_claim("numpy", "1.26.4")])
 
     assert result.error_code == "PIN_WITHOUT_PROVENANCE"
-    assert "exact pin" in result.output
+    assert "direct install target" in result.output
+    assert "disabled" in result.output
     assert runner.calls == []
 
 
@@ -950,21 +1012,21 @@ def test_a_python_deps_call_without_args_is_untouched():
     assert runner.calls and "args" not in runner.calls[0]
 
 
-def test_the_executor_installs_the_validated_pin_and_nothing_else():
+def test_the_executor_cannot_bypass_the_facade_to_install_a_direct_pin():
     container = ScriptedContainer(outputs={"test -x": "EXISTS"})
-    container.files[REQUIREMENTS_PATH] = json.dumps(PYTHON_MANIFEST)
-    original = container.execute_command
-
-    def execute_command(command, **kwargs):
-        if command.startswith("cat ") and REQUIREMENTS_PATH in command:
-            container.commands.append(command)
-            return {"success": True, "output": container.files[REQUIREMENTS_PATH], "exit_code": 0}
-        return original(command, **kwargs)
-
-    container.execute_command = execute_command
-    PythonTool(container).execute(
+    add_published_mutable_json(
+        container,
+        container.evidence,
+        path=REQUIREMENTS_PATH,
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        payload=PYTHON_MANIFEST,
+    )
+    result = PythonTool(container).execute(
         operation="setup_env", working_directory=PROJECT, args="numpy==1.26.4"
     )
 
-    assert container.issued("pip install numpy==1.26.4")
+    assert result.error_code == CONTRACT_AUTHORITY_MISSING
+    assert container.issued("pip install numpy==1.26.4") == []
     assert container.issued("pip install -e .") == []

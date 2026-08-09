@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ExecutionSessionDetail } from "@/api/types"
@@ -70,6 +70,48 @@ function makeDetail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionS
   }
 }
 
+function unavailableSubjectLayers() {
+  const unavailable = {
+    executed: null,
+    passed: null,
+    failed: null,
+    errors: null,
+    skipped: null,
+    availability: "unavailable" as const,
+    reason: "module-qualified subject/case identity was not sealed",
+  }
+  return {
+    projectionStatus: "metrics-v2-artifact-unavailable" as const,
+    tests: {
+      claimed: {
+        latestSubjects: unavailable,
+        latestCases: unavailable,
+        receiptExecutions: {
+          executed: 2, passed: 2, failed: 0, errors: 0, skipped: 0, availability: "available" as const,
+        },
+      },
+      quarantinedObservations: {
+        executed: 2887, passed: 267, failed: 28, errors: 2481, skipped: 111, availability: "available" as const,
+      },
+      unattributedObservations: {
+        executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, availability: "available" as const,
+      },
+      staleObservations: {
+        executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, availability: "available" as const,
+      },
+      retriedCases: null,
+      flakyCases: null,
+    },
+    evidence: {
+      integrity: "complete" as const,
+      receiptsExpected: 1,
+      receiptsPersisted: 1,
+      terminalReceiptsUnpersisted: 0,
+      conflictCount: 0,
+    },
+  }
+}
+
 describe("OverviewTab", () => {
   it("invokes onOpenFlow when the goal button is clicked", () => {
     const onOpenFlow = vi.fn()
@@ -86,6 +128,34 @@ describe("OverviewTab", () => {
     expect(screen.getByText("7")).toBeInTheDocument()
     expect(screen.getByText(/modules built/i)).toBeInTheDocument()
     expect(screen.getByText("3 / 4")).toBeInTheDocument()
+  })
+
+  it("does not turn an Ignite-shaped primary 2/2 into a global green KPI", () => {
+    render(
+      <OverviewTab
+        detail={makeDetail({
+          test: {
+            state: "success",
+            pass: 2,
+            fail: 0,
+            skip: 0,
+            total: 2,
+            evidenceLayers: unavailableSubjectLayers(),
+          },
+        })}
+        onOpenFlow={() => {}}
+      />,
+    )
+
+    const passTile = screen.getByText("Claimed subject pass rate").parentElement
+    const failuresTile = screen.getByText("Claimed subject failures").parentElement
+    expect(passTile).not.toBeNull()
+    expect(failuresTile).not.toBeNull()
+    expect(within(passTile as HTMLElement).getByText("—")).not.toHaveClass("text-status-success")
+    expect(within(failuresTile as HTMLElement).getByText("—")).toBeInTheDocument()
+    expect(screen.queryByText("100%" )).not.toBeInTheDocument()
+    expect(screen.getByText(/module-qualified subject\/case identity was not sealed/i)).toBeInTheDocument()
+    expect(screen.getByText(/2,887 quarantined observations · not verdict-bearing/i)).toBeInTheDocument()
   })
 
   it("colors the modules-built tile amber on a partial build and green on a clean build", () => {

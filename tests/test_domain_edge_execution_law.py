@@ -24,11 +24,18 @@ consumers pin a stale version) because that is the run this law exists for.
 import importlib.util
 import json
 import os
+import shlex
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures(
+    "facade_contract_authority", "exact_build_facade_authority"
+)
+from test_container_io import FakeContainer
+
 from sag.agent.control_events import action_envelope_sha256
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
+from sag.agent.tool_orchestration import format_tool_result
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
@@ -84,6 +91,8 @@ class EdgeOrchestrator:
         self.markers = set(markers)
         self.commands = []
         self.assessments = []
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     def read_file(self, path):
         if path not in self.files:
@@ -95,8 +104,27 @@ class EdgeOrchestrator:
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        tokens = shlex.split(command) if "\n" not in command else []
+        atomic_command = (
+            tokens[:3] == ["mkdir", "-p", "--"]
+            or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+            or tokens[:2] == ["base64", "--decode"]
+            or tokens[:3] == ["mv", "-f", "--"]
+            or (
+                tokens[:2] == ["python3", "-c"]
+                and ("hashlib.sha256" in tokens[2] or "json.load" in tokens[2])
+            )
+        )
+        if atomic_command:
+            result = self.atomic.execute_command(command)
+            if tokens[:3] == ["mv", "-f", "--"]:
+                self.assessments.append(json.loads(self.files[tokens[4]]))
+            return result
         if ASSESSMENT_DIR in command:
             if command.startswith("cat "):
+                path = shlex.split(command)[-1]
+                if path in self.files:
+                    return {"success": True, "output": self.files[path], "exit_code": 0}
                 return {"success": False, "output": "", "exit_code": 1}
             self.assessments.append(json.loads(command.split("\n")[1]))
             return {"success": True, "output": "", "exit_code": 0}
@@ -132,13 +160,14 @@ def run(requirements, *, action="compile", working_directory=CONSUMER):
 # -- 1. version_incompatible: sealed blocked, no runner ---------------------
 
 
-def test_blocked_consumer_is_refused_with_the_edge_detail_verbatim():
+def test_blocked_consumer_is_refused_with_typed_edge_facts_not_raw_detail():
     result, backend, _ = run(manifest(edge("version_incompatible")))
 
     assert not result.succeeded
     assert result.error_code == "DOMAIN_EDGE_BLOCKED"
-    assert BLOCKED_DETAIL in result.output
-    assert SEALED_PHRASE in result.output
+    assert BLOCKED_DETAIL not in result.output
+    assert "status=version_incompatible" in result.output
+    assert "runner dispatch is blocked" in result.output
     assert backend.calls == [], "a sealed consumer must receive no runner invocation"
 
 
@@ -191,20 +220,62 @@ def test_a_directory_under_the_consumer_root_is_still_that_consumer():
     assert backend.calls == []
 
 
-# -- 2. unverified: locked, and it names who must produce first -------------
+# -- 2. unverified: locked, with facts but no producer-first prescription ---
 
 
-def test_unverified_consumer_is_refused_naming_the_producer():
+def test_unverified_consumer_is_refused_with_edge_facts_only():
     result, backend, orchestrator = run(manifest(edge("unverified", detail=UNVERIFIED_DETAIL)))
 
     assert not result.succeeded
     assert result.error_code == "DOMAIN_EDGE_UNVERIFIED"
-    assert UNVERIFIED_DETAIL in result.output
+    assert UNVERIFIED_DETAIL not in result.output
     assert PRODUCER in result.output
-    assert "must produce first" in result.output
+    assert CONSUMER in result.output
+    assert "runner dispatch remains locked" in result.output
+    assert "the edge has no current verification receipt" in result.output
+    assert "pending for controller resolution" not in result.output
+    assert "verification receipt" in result.output
+    assert "must produce first" not in result.output
     assert backend.calls == []
     assert orchestrator.assessments[0]["typed_code"] == "domain_edge_unverified"
     assert orchestrator.assessments[0]["stage"] == "precondition"
+
+
+def test_unverified_edge_model_projection_contains_no_selected_repair_order():
+    """The model sees the edge and lock, never the hidden suggestion channel."""
+    result, _, _ = run(manifest(edge("unverified", detail=UNVERIFIED_DETAIL)))
+    rendered = format_tool_result("build", result)
+
+    assert UNVERIFIED_DETAIL not in rendered
+    assert PRODUCER in rendered and CONSUMER in rendered
+    assert "runner dispatch remains locked" in rendered
+    assert "the edge has no current verification receipt" in rendered
+    assert "pending for controller resolution" not in rendered
+    assert "must produce first" not in rendered
+    assert f"Build {PRODUCER} first" not in rendered
+    assert "then retry this consumer" not in rendered
+    assert "build(action=" not in rendered
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "benign diagnostic detail",
+        f"Build {PRODUCER} first, then retry this consumer",
+    ],
+)
+def test_raw_domain_edge_detail_never_reaches_result_or_model_error_tail(detail):
+    result, _, orchestrator = run(manifest(edge("unverified", detail=detail)))
+
+    rendered = format_tool_result("build", result)
+    assert detail not in result.output
+    assert detail not in result.facts.values()
+    assert detail not in result.metadata.values()
+    assert detail not in (result.error_tail_preview or "")
+    assert detail not in rendered
+    # Raw project detail remains available only in the typed internal
+    # assessment; it is never the renderer's model-visible sentence.
+    assert orchestrator.assessments[0]["detail"] == detail
 
 
 def test_unverified_refusal_does_not_borrow_the_sealed_wording():
@@ -412,7 +483,7 @@ def receipt(*, receipt_id="inv-maven-1-0001", contract_id=None, contract_hash=No
 
 def run_chain(session):
     module = load_verifier_module()
-    verifier = module.Verifier(str(session))
+    verifier = module.Verifier(str(session), forensic=True)
     verifier.assert_contract_chain()
     return verifier
 
@@ -570,7 +641,7 @@ LIVE_BIGTOP = os.path.join(LIVE_LOGS, "session_20260726_195220_99607")
 def test_the_recorded_bigtop_session_keeps_its_assertion_set():
     """Plan 5 recordings have receipts and no contracts: silent, still green."""
     module = load_verifier_module()
-    verifier = module.Verifier(LIVE_BIGTOP)
+    verifier = module.Verifier(LIVE_BIGTOP, forensic=True)
     verifier.assert_pairing_and_hashes()
     verifier.assert_receipts_immutable()
     verifier.assert_contract_chain()

@@ -46,6 +46,8 @@ class EventType(str, Enum):
     TOOL_START = "tool_start"
     TOOL_PARAMETERS_FIXED = "tool_parameters_fixed"
     TOOL_RESULT = "tool_result"
+    # Legacy-ingest compatibility for archived sessions. Live orchestration no
+    # longer emits this event, but replay/UI readers must still parse it.
     TOOL_RECOVERY = "tool_recovery"
     TOOL_ERROR = "tool_error"
 

@@ -10,7 +10,9 @@ from loguru import logger
 
 from sag.agent.evidence_assessments import ReceiptAssessment, write_assessment
 from sag.agent.invocation_contracts import (
+    CONTRACT_AUTHORITY_MISSING,
     contract_receipt_fields,
+    current_contract,
     dispatch_contract,
     ensure_dispatch_contract,
 )
@@ -18,7 +20,7 @@ from sag.agent.invocation_receipts import (
     record_invocation,
     snapshot_reports,
 )
-from sag.agent.job_obligations import record_dispatch_obligation
+from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, TestStats
 
@@ -27,7 +29,7 @@ from .build_preflight import (
     JdkPreflight,
     active_java_major,
     classify_version_error,
-    read_build_requirements,
+    read_live_build_requirements,
 )
 from .build_utils import (
     DETACHED_HANDOFF_STATUSES,
@@ -37,7 +39,6 @@ from .build_utils import (
     dispatch_hold_policy,
 )
 from .toolchain_manager import ToolchainManager, ToolchainSpec
-
 
 # Gradle prints no reactor summary; what it prints is per-task outcomes:
 #   > Task :camel-core:compileJava
@@ -180,6 +181,13 @@ class GradleTool(BaseTool):
         """
 
         self._pending_invocation_receipt = None
+        if current_contract() is None:
+            return ToolResult.completed_failure(
+                output="[contract] Gradle was not dispatched: no facade-frozen contract is active.",
+                error="invocation contract authority missing",
+                error_code=CONTRACT_AUTHORITY_MISSING,
+                metadata={"runner_dispatched": False, "tool": "gradle"},
+            )
 
         # Handle command as alias for tasks
         if command and not tasks:
@@ -190,31 +198,11 @@ class GradleTool(BaseTool):
         # this never re-targets; explicitness only gates the [scope] warning.
         explicitly_scoped = working_directory not in (None, "/workspace")
 
-        # Deterministic working directory fallback (only when safe)
-        try:
-            if working_directory in (None, "/workspace") and self.orchestrator:
-                project_name = getattr(self.orchestrator, "project_name", None)
-                if project_name:
-                    probe_dir = f"/workspace/{project_name}"
-                    # Recognize Gradle project by standard files
-                    probe_cmd = f"test -f {probe_dir}/build.gradle -o -f {probe_dir}/build.gradle.kts -o -f {probe_dir}/settings.gradle -o -f {probe_dir}/settings.gradle.kts && echo EXISTS || echo MISSING"
-                    probe_res = self.orchestrator.execute_command(probe_cmd)
-                    if probe_res.get("exit_code") == 0 and "EXISTS" in (
-                        probe_res.get("output") or ""
-                    ):
-                        if working_directory != probe_dir:
-                            logger.info(
-                                f"🔧 Auto-selected project directory for Gradle: {probe_dir}"
-                            )
-                            working_directory = probe_dir
-        except Exception as _e:
-            logger.debug(f"Gradle working directory fallback skipped: {_e}")
-
         # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
         # Single-ownership rule: the consolidated build facade (BuildTool)
         # runs the pre-flight, the bounded retry and the [scope] narration on
-        # its path and passes _env_preflight=False; only direct callers (e.g.
-        # tool_recovery's delegate path) keep the guarantee here. Exactly one
+        # its path and passes _env_preflight=False; only callers that invoke the
+        # internal tool directly keep the guarantee here. Exactly one
         # layer probes the container — and reruns — per build.
         preamble_lines: List[str] = []
         outcome = None
@@ -224,7 +212,30 @@ class GradleTool(BaseTool):
         # pins it can see and omits the ones it cannot.
         requirements: Dict[str, Any] = {}
         if _env_preflight:
-            requirements = read_build_requirements(self.orchestrator)
+            manifest_read = read_live_build_requirements(self.orchestrator)
+            if (
+                not manifest_read.complete
+                or manifest_read.conflict is not None
+                or manifest_read.payload is None
+            ):
+                return ToolResult.completed_failure(
+                    output=(
+                        "[evidence] Gradle was not dispatched: build requirements are "
+                        "not a complete current host-published revision."
+                    ),
+                    error="live build requirements unavailable",
+                    error_code="BUILD_REQUIREMENTS_UNAVAILABLE",
+                    facts={
+                        "working_directory": working_directory,
+                        "build_requirements_status": manifest_read.conflict or "absent",
+                    },
+                    metadata={
+                        "runner_dispatched": False,
+                        "tool": "gradle",
+                        "blocker_owner": "harness",
+                    },
+                )
+            requirements = dict(manifest_read.payload)
             outcome = JdkPreflight(self.orchestrator).run(
                 requirements.get("java_version"),
                 source=requirements.get("java_version_source") or "unknown",
@@ -383,20 +394,31 @@ class GradleTool(BaseTool):
                     gradle_cmd, workdir=working_directory, timeout=timeout
                 )
 
+            # One contract authorizes one executor/action/cwd/vector. A valid
+            # contract for another executor is no authority at all here.
+            contract, _created = ensure_dispatch_contract(
+                self.orchestrator.execute_command,
+                tool="gradle",
+                effective_action=str(tasks or "build"),
+                expected_cwd=working_directory,
+                expected_argv=gradle_cmd,
+                requirements=requirements,
+            )
+            if contract is None:
+                return ToolResult.completed_failure(
+                    output=(
+                        "[contract] Gradle was not dispatched: the active contract does "
+                        "not match this executor, action, cwd, and argv."
+                    ),
+                    error="invocation contract authority mismatch",
+                    error_code=CONTRACT_AUTHORITY_MISSING,
+                    metadata={"runner_dispatched": False, "tool": "gradle"},
+                )
+
             def _run_build_with_receipt(attempt: int):
                 # P0-A: bracket the physical dispatch with report-XML content
                 # hashes so the reports THIS invocation wrote are attributable,
                 # instead of being inferred from a later global scan.
-                # §C3: a dispatch the facade never froze (tool-recovery's
-                # delegate path) freezes its OWN contract before running.
-                contract, _created = ensure_dispatch_contract(
-                    self.orchestrator.execute_command,
-                    tool="gradle",
-                    effective_action=str(tasks or "build"),
-                    expected_cwd=working_directory,
-                    expected_argv=gradle_cmd,
-                    requirements=requirements,
-                )
                 with dispatch_contract(contract):
                     before = snapshot_reports(
                         self.orchestrator.execute_command, [working_directory]
@@ -515,6 +537,7 @@ class GradleTool(BaseTool):
                     result.get("exit_code"),
                     str(result.get("output") or ""),
                     ref_id,
+                    runner="gradle",
                     full_output=str(full_output),
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
@@ -699,7 +722,7 @@ class GradleTool(BaseTool):
         self._pending_invocation_receipt = None
         requested = " ".join(shlex.split(str(requested_action or "")))
         if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
-            record_dispatch_obligation(
+            obligation = record_dispatch_obligation_result(
                 self.orchestrator.execute_command,
                 result=result,
                 tool="gradle",
@@ -711,6 +734,7 @@ class GradleTool(BaseTool):
                 before=before,
                 requirements=requirements,
             )
+            result.update(obligation.metadata())
             return
         after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
         self._pending_invocation_receipt = record_invocation(
@@ -783,11 +807,7 @@ class GradleTool(BaseTool):
         if resolved_gradle and resolved_gradle.candidate.source == "env_overlay":
             return resolved_gradle.candidate.path
 
-        if (
-            use_wrapper
-            and resolved_gradle
-            and resolved_gradle.candidate.source == "wrapper"
-        ):
+        if use_wrapper and resolved_gradle and resolved_gradle.candidate.source == "wrapper":
             wrapper = resolved_gradle.candidate.path
             chmod = self.orchestrator.execute_command(
                 f"chmod +x {shlex.quote(wrapper)}",

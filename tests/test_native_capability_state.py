@@ -263,7 +263,9 @@ def test_the_present_text_reaches_the_test_phase_intro():
 # ---------------------------------------------------------------------------
 
 
-def test_all_skipped_smoke_projects_up_to_three_distinct_skip_reasons():
+def test_all_skipped_smoke_projects_up_to_three_distinct_skip_reasons(
+    exact_python_runner_authority,
+):
     """The live TVM smoke showed three bare SKIPPED labels. The reasons name
     the missing capability, so they are model-visible facts."""
     orch = all_skipped_orch(skip_rules=[skip_reason_rule([LLVM_SKIP, WHEEL_SKIP, CUDA_SKIP])])
@@ -279,7 +281,9 @@ def test_all_skipped_smoke_projects_up_to_three_distinct_skip_reasons():
     assert lines[unproven + 1].startswith("[test] skip reasons: ")
 
 
-def test_skip_reasons_are_capped_at_three_deduped_and_truncated():
+def test_skip_reasons_are_capped_at_three_deduped_and_truncated(
+    exact_python_runner_authority,
+):
     long_reason = "x" * 300
     orch = all_skipped_orch(
         skip_rules=[
@@ -297,7 +301,9 @@ def test_skip_reasons_are_capped_at_three_deduped_and_truncated():
     assert line == f"[test] skip reasons: {LLVM_SKIP}; {'x' * 120}; {WHEEL_SKIP}"
 
 
-def test_no_junit_skip_messages_renders_no_line_and_invents_nothing():
+def test_no_junit_skip_messages_renders_no_line_and_invents_nothing(
+    exact_python_runner_authority,
+):
     orch = all_skipped_orch(skip_rules=[skip_reason_rule([])])
 
     result = PythonTool(orch).execute("test", working_directory=TVM_ROOT)
@@ -316,7 +322,9 @@ def test_an_unreadable_junit_report_renders_no_skip_reasons_line():
     assert "skip reasons" not in result.output
 
 
-def test_a_proven_smoke_extracts_no_skip_reasons_at_all():
+def test_a_proven_smoke_extracts_no_skip_reasons_at_all(
+    exact_python_runner_authority,
+):
     """The extraction is bounded to the all-skipped path — one extra command
     only where it is the corrective fact."""
     orch = Orch(

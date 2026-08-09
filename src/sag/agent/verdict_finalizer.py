@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -15,13 +16,25 @@ from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_valid
 from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
+from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import rescue_blocked_build, run_verdict
 
+from .evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationError,
+    MutablePublicationObservation,
+    evidence_publication_authority_for,
+)
+from .evidence_records import decode_named_json_record_stream, execute_named_json_file_stream
 from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
-from .output_storage import atomic_write_container_text
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
 VERDICT_SCHEMA_VERSION = 3
+_VERDICT_FILENAME = "verdict.json"
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
+_UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 
 
 class EvidenceCloseReason(str, Enum):
@@ -589,7 +602,11 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
         "errors",
         "error",
     )
-    errors = errors or 0
+    if errors is None:
+        # Current TestStats carries errors independently. Older parser payloads
+        # may instead expose the split only in metadata, which remains the
+        # higher-priority source above.
+        errors = stats.errors
     distinct_failures = _first_count(
         sources,
         "unique_failed_tests",
@@ -846,13 +863,14 @@ def _phase_record_snapshot(record) -> PhaseRecordSnapshot:
 
 
 def _read_snapshot_text(orchestrator) -> str | None:
-    result = orchestrator.execute_command(
-        f"test -f {VERDICT_SNAPSHOT_PATH} && cat {VERDICT_SNAPSHOT_PATH}"
-    )
-    if result.get("exit_code") != 0 and not result.get("success"):
+    try:
+        return read_container_text(orchestrator, VERDICT_SNAPSHOT_PATH, exact_bytes=True)
+    except (ContainerFileReadError, TypeError, ValueError):
+        # A failed clean observation does not license a second read through
+        # the project runtime overlay. Lightweight forensic doubles can expose
+        # ``read_file`` or an in-memory ``files`` mapping, both of which the
+        # exact reader already handles without invoking a command.
         return None
-    output = result.get("output")
-    return str(output) if output is not None else None
 
 
 def _unknown_snapshot(conflict: str) -> RunVerdictSnapshot:
@@ -865,7 +883,13 @@ def _unknown_snapshot(conflict: str) -> RunVerdictSnapshot:
 
 
 def read_verdict_snapshot(orchestrator) -> RunVerdictSnapshot:
-    """Read the immutable snapshot; missing/corrupt data never triggers recomputation."""
+    """Forensically parse container bytes without granting live authority.
+
+    This compatibility API is intentionally suitable only for diagnostics and
+    historical artifact inspection. Verdict-bearing consumers must use
+    :func:`read_live_verdict_snapshot`, which requires the exact current bytes
+    to be authorized by the host control stream.
+    """
     content = _read_snapshot_text(orchestrator)
     if content is None:
         return _unknown_snapshot("snapshot_missing")
@@ -873,6 +897,173 @@ def read_verdict_snapshot(orchestrator) -> RunVerdictSnapshot:
         return RunVerdictSnapshot.model_validate_json(content)
     except (ValueError, TypeError, json.JSONDecodeError):
         return _unknown_snapshot("snapshot_corrupt")
+
+
+def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapshot:
+    """Validate one decoded schema-v3 verdict payload without granting authority.
+
+    This pure schema boundary is shared by live and offline readers.  A caller
+    must still prove that the exact raw bytes are the current host-published
+    verdict; successful payload validation alone never makes a verdict live.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("verdict payload must be an object")
+    if type(payload.get("schema_version")) is not int:
+        raise ValueError("verdict schema version must be a strict integer")
+    if payload.get("schema_version") != VERDICT_SCHEMA_VERSION:
+        raise ValueError("verdict schema version is not supported")
+
+    raw_test_stats = payload.get("test_stats", {})
+    if not isinstance(raw_test_stats, Mapping):
+        raise ValueError("verdict test stats must be an object")
+
+    def validate_raw_count(value: Any, *, label: str) -> None:
+        if type(value) is not int or value < 0:
+            raise ValueError(f"verdict {label} count is invalid")
+
+    for basis in ("unique", "raw"):
+        raw_counts = raw_test_stats.get(basis, {})
+        if not isinstance(raw_counts, Mapping):
+            raise ValueError(f"verdict {basis} test counts must be an object")
+        for field in ("executed", "passed", "failed", "errors", "skipped"):
+            if field in raw_counts:
+                validate_raw_count(
+                    raw_counts[field],
+                    label=f"{basis} test {field}",
+                )
+    for field in (
+        "discovered",
+        "flaky_count",
+        "collection_errors",
+        "collection_errors_skipped",
+    ):
+        value = raw_test_stats.get(field)
+        if value is not None:
+            validate_raw_count(value, label=field)
+    auxiliary = raw_test_stats.get("auxiliary_test_stats")
+    if auxiliary is not None:
+        if not isinstance(auxiliary, Mapping):
+            raise ValueError("verdict auxiliary test stats must be an object")
+        for name, value in auxiliary.items():
+            if type(name) is not str or not name:
+                raise ValueError("verdict auxiliary test stat name is invalid")
+            validate_raw_count(value, label=f"auxiliary test {name}")
+
+    raw_build = payload.get("build_evidence", {})
+    if not isinstance(raw_build, Mapping):
+        raise ValueError("verdict build evidence must be an object")
+    compiled_classes = raw_build.get("compiled_classes")
+    if compiled_classes is not None:
+        validate_raw_count(compiled_classes, label="compiled class")
+
+    snapshot = RunVerdictSnapshot.model_validate(payload)
+    if type(snapshot.run_id) is not str or _RUN_ID_RE.fullmatch(snapshot.run_id) is None:
+        raise ValueError("verdict run id is invalid")
+    finalized_at = snapshot.finalized_at
+    if type(finalized_at) is not str or _UTC_TIMESTAMP_RE.fullmatch(finalized_at) is None:
+        raise ValueError("verdict finalized_at is not a sealed UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(finalized_at.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError("verdict finalized_at is invalid") from exc
+    if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("verdict finalized_at is not UTC")
+
+    def validate_counts(counts: SnapshotTestCounts, *, label: str) -> None:
+        values = (
+            counts.executed,
+            counts.passed,
+            counts.failed,
+            counts.errors,
+            counts.skipped,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError(f"verdict {label} counts are invalid")
+        if counts.executed != sum(values[1:]):
+            raise ValueError(f"verdict {label} counts do not reconcile")
+
+    tests = snapshot.test_stats
+    if tests.discovered is not None and (type(tests.discovered) is not int or tests.discovered < 0):
+        raise ValueError("verdict discovered test count is invalid")
+    if type(tests.flaky_count) is not int or tests.flaky_count < 0:
+        raise ValueError("verdict flaky test count is invalid")
+    validate_counts(tests.unique, label="unique test")
+    validate_counts(tests.raw, label="raw test")
+    if tests.raw.executed < tests.unique.executed:
+        raise ValueError("verdict raw test count is narrower than the unique basis")
+    if snapshot.build_evidence.compiled_classes is not None and (
+        type(snapshot.build_evidence.compiled_classes) is not int
+        or snapshot.build_evidence.compiled_classes < 0
+    ):
+        raise ValueError("verdict compiled class count is invalid")
+    return snapshot
+
+
+def read_live_verdict_snapshot(orchestrator, *, authority=None) -> RunVerdictSnapshot:
+    """Return only the fixed verdict file at its exact host-authorized head.
+
+    Any missing file, malformed/future schema, duplicate key, filename
+    mismatch, foreign run, unpublished mirror, stale revision, deletion or
+    tombstone becomes an explicit ``unknown`` snapshot. No fallback recomputes
+    or improves the verdict from report metrics.
+    """
+
+    try:
+        result = execute_named_json_file_stream(orchestrator, VERDICT_SNAPSHOT_PATH)
+    except Exception:
+        return _unknown_snapshot("snapshot_live_stream_unreadable")
+    decoded = decode_named_json_record_stream(result)
+    if not decoded.complete or decoded.conflict is not None or len(decoded.records) > 1:
+        return _unknown_snapshot(f"snapshot_live_{decoded.conflict or 'stream_unreadable'}")
+    try:
+        host_authority = authority or evidence_publication_authority_for(orchestrator)
+        getattr(host_authority, "assert_store")(orchestrator)
+    except (AttributeError, EvidencePublicationError, TypeError, ValueError):
+        return _unknown_snapshot("snapshot_live_publication_unavailable")
+
+    observed: dict[str, MutablePublicationObservation] = {}
+    snapshot: RunVerdictSnapshot | None = None
+    try:
+        head = host_authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID)
+    except (AttributeError, EvidencePublicationError, TypeError, ValueError):
+        return _unknown_snapshot("snapshot_live_publication_unavailable")
+    if head is not None and (
+        head.record_kind != "verdict"
+        or head.record_id != VERDICT_LOGICAL_ARTIFACT_ID
+        or head.logical_artifact_id != VERDICT_LOGICAL_ARTIFACT_ID
+        or head.revision != 1
+    ):
+        return _unknown_snapshot("snapshot_live_publication_head_invalid")
+    if decoded.records:
+        record = decoded.records[0]
+        if record.filename != _VERDICT_FILENAME:
+            return _unknown_snapshot("snapshot_live_filename_invalid")
+        try:
+            snapshot = validate_verdict_snapshot_v3(record.payload)
+        except (TypeError, ValueError):
+            return _unknown_snapshot("snapshot_live_schema_invalid")
+        canonical = snapshot.model_dump_json().encode("utf-8")
+        if record.raw != canonical:
+            return _unknown_snapshot("snapshot_live_noncanonical")
+        if snapshot.run_id != str(getattr(host_authority, "run_id", "") or ""):
+            return _unknown_snapshot("snapshot_live_foreign_run")
+        observed[VERDICT_LOGICAL_ARTIFACT_ID] = MutablePublicationObservation(
+            logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+            raw_sha256=record.raw_sha256,
+            byte_count=record.byte_count,
+            run_id=snapshot.run_id,
+        )
+
+    try:
+        check = host_authority.verify_latest_record_set("verdict", observed)
+    except (AttributeError, EvidencePublicationError, TypeError, ValueError):
+        return _unknown_snapshot("snapshot_live_publication_unavailable")
+    if not check.authorized:
+        return _unknown_snapshot(f"snapshot_live_publication_{check.status}")
+    if snapshot is None:
+        return _unknown_snapshot("snapshot_live_missing")
+    return snapshot
 
 
 class VerdictFinalizer:
@@ -946,18 +1137,11 @@ class VerdictFinalizer:
         return snapshot
 
     def has_current_snapshot(self, state: RunEvidenceState) -> bool:
-        """Return whether the verdict path contains this run's canonical bytes."""
+        """Return whether host authority seals this run's exact current bytes."""
         if not state.sealed:
             return False
         snapshot = self._snapshot_for_state(state)
-        content = _read_snapshot_text(self.orchestrator)
-        if content != snapshot.model_dump_json():
-            return False
-        try:
-            persisted = RunVerdictSnapshot.model_validate_json(content)
-        except (ValueError, TypeError, json.JSONDecodeError):
-            return False
-        return persisted.run_id == state.run_id
+        return read_live_verdict_snapshot(self.orchestrator) == snapshot
 
     def finalize(
         self,
@@ -984,19 +1168,73 @@ class VerdictFinalizer:
             state.seal(finalized_at=finalized_at, close_reason=reason.value)
 
         snapshot = self._snapshot_for_state(state)
+        try:
+            validate_verdict_snapshot_v3(snapshot.model_dump(mode="json"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sealed verdict snapshot violates the live schema") from exc
         if self.has_current_snapshot(state):
             self._snapshots[cache_key] = snapshot
             return snapshot
 
-        mkdir_result = self.orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
-        if mkdir_result.get("exit_code") != 0 and not mkdir_result.get("success"):
-            raise OSError("failed to create verdict snapshot directory")
-        atomic_write_container_text(
-            self.orchestrator,
-            VERDICT_SNAPSHOT_PATH,
-            snapshot.model_dump_json(),
-        )
-        if not self.has_current_snapshot(state):
-            raise OSError("persisted verdict snapshot does not match current run")
+        body = snapshot.model_dump_json()
+        raw = body.encode("utf-8")
+        try:
+            current = read_container_text(
+                self.orchestrator,
+                VERDICT_SNAPSHOT_PATH,
+                exact_bytes=True,
+            )
+        except (ContainerFileReadError, TypeError, ValueError) as exc:
+            raise OSError("failed to read verdict snapshot for compare-and-publish") from exc
+
+        if current != body:
+            if current is not None:
+                raise OSError("verdict compare-and-publish found unexpected existing bytes")
+            persisted = compare_publish_container_text_atomic(
+                self.orchestrator,
+                VERDICT_SNAPSHOT_PATH,
+                body,
+                expected_content=None,
+                validate_json=True,
+            )
+            if not persisted.persisted:
+                raise OSError("verdict compare-and-publish failed: " f"{persisted.code}")
+
+        # Container persistence precedes publication deliberately. If the host
+        # sink fails, these bytes remain useful forensic evidence but are not a
+        # live verdict and no cache entry is admitted.
+        try:
+            authority = evidence_publication_authority_for(self.orchestrator)
+            if snapshot.run_id != str(getattr(authority, "run_id", "") or ""):
+                raise OSError("host publication run binding differs from verdict run")
+            head = authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID)
+            if head is not None:
+                if head.revision != 1:
+                    raise OSError("host verdict publication revision is not terminal")
+                current_check = authority.verify_latest_bytes(
+                    record_kind="verdict",
+                    record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+                    logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+                    raw=raw,
+                    run_id=snapshot.run_id,
+                )
+                if not current_check.authorized:
+                    raise OSError("host verdict publication head differs from sealed bytes")
+            authority.publish_revision(
+                record_kind="verdict",
+                record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+                raw=raw,
+                expected_previous_raw_sha256=(
+                    head.raw_sha256 if head is not None else EVIDENCE_PUBLICATION_GENESIS_SHA256
+                ),
+            )
+        except OSError:
+            raise
+        except (EvidencePublicationError, TypeError, ValueError) as exc:
+            raise OSError("verdict host publication failed") from exc
+
+        if read_live_verdict_snapshot(self.orchestrator, authority=authority) != snapshot:
+            raise OSError("published verdict snapshot is not the current live run")
         self._snapshots[cache_key] = snapshot
         return snapshot

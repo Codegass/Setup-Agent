@@ -29,6 +29,8 @@ from test_python_tool import (
 
 from sag.tools.internal.python_tool import NATIVE_SMOKE_RECEIPT_JSON, PythonTool
 
+pytestmark = pytest.mark.usefixtures("exact_python_runner_authority")
+
 TVM_ROOT = "/workspace/tvm"
 
 
@@ -194,11 +196,11 @@ def test_receipt_for_another_project_root_does_not_unlock_this_one():
 
 
 # ---------------------------------------------------------------------------
-# (c) the receipt — and only the receipt — unlocks the full suite
+# (c) the legacy container mirror cannot unlock the full suite
 # ---------------------------------------------------------------------------
 
 
-def test_bare_test_with_receipt_runs_the_full_suite():
+def test_bare_test_with_unpublished_receipt_stays_bounded():
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
@@ -211,7 +213,7 @@ def test_bare_test_with_receipt_runs_the_full_suite():
                 }
             ),
             *tvm_native_smoke_rules("3 tests collected in 0.2s"),
-            *junit_rules(tests=357),
+            *junit_rules(tests=3),
             ("--collect-only", ok("357 tests collected in 1.2s")),
         ],
     )
@@ -219,12 +221,12 @@ def test_bare_test_with_receipt_runs_the_full_suite():
     result = PythonTool(orch).execute("test", working_directory=TVM_ROOT)
 
     assert result.succeeded is True
-    assert result.metadata["collection_scope"] == "full"
-    assert result.metadata["collected"] == 357
-    assert result.metadata["smoke_receipt_present"] is True
+    assert result.metadata["collection_scope"] == "filtered"
+    assert result.metadata["collected_after_deselection"] == 3
+    assert result.metadata["smoke_receipt_present"] is False
     collects = [command for command in orch.commands if "--collect-only" in command]
     assert len(collects) == 1
-    assert TVM_SMOKE_PATH not in collects[0]
+    assert TVM_SMOKE_PATH in collects[0]
 
 
 # ---------------------------------------------------------------------------
@@ -232,11 +234,9 @@ def test_bare_test_with_receipt_runs_the_full_suite():
 # ---------------------------------------------------------------------------
 
 
-def test_explicit_full_suite_args_without_receipt_are_refused_naming_the_smoke():
-    """Readiness used to relax arg sanitation to the plain allowlist, so a
-    ready-looking native project could ask for the whole tree. Without a
-    receipt the refusal must name the exact bounded smoke to run first (§3.3:
-    a concrete, machine-derived repair action)."""
+def test_explicit_full_suite_args_without_receipt_are_refused_without_replacement():
+    """Readiness cannot relax arg sanitation or let the harness replace a
+    rejected model selector with its own exact test action."""
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
@@ -251,15 +251,15 @@ def test_explicit_full_suite_args_without_receipt_are_refused_naming_the_smoke()
     assert result.succeeded is False
     assert result.error_code == "PYTEST_ARGS_REJECTED"
     assert result.metadata["smoke_receipt_present"] is False
-    assert result.metadata["replacement_args"] == f"{TVM_SMOKE_PATH} --maxfail=1"
+    assert "replacement_args" not in result.metadata
     named = f"{result.output}\n" + "\n".join(result.suggestions or [])
-    assert TVM_SMOKE_PATH in named
+    assert TVM_SMOKE_PATH not in named
     assert "receipt" in named.lower()
     assert not any("--collect-only" in command for command in orch.commands)
     assert not any("--junitxml" in command for command in orch.commands)
 
 
-def test_explicit_args_with_receipt_use_the_plain_allowlist():
+def test_explicit_broad_args_with_unpublished_receipt_are_rejected():
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
@@ -280,12 +280,11 @@ def test_explicit_args_with_receipt_use_the_plain_allowlist():
 
     result = PythonTool(orch).execute("test", working_directory=TVM_ROOT, args="tests")
 
-    assert result.succeeded is True
-    assert result.metadata["collection_scope"] == "filtered"
-    assert result.metadata["smoke_receipt_present"] is True
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert result.metadata["smoke_receipt_present"] is False
     runs = pytest_runs(orch)
-    assert len(runs) == 1
-    assert "-m pytest tests --junitxml=" in runs[0]
+    assert runs == []
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +310,7 @@ def test_output_text_carries_the_collection_line_for_a_filtered_smoke():
     assert expected in result.output
 
 
-def test_output_text_carries_the_collection_line_for_a_full_suite():
+def test_unpublished_receipt_keeps_the_collection_line_bounded():
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=[
@@ -324,7 +323,7 @@ def test_output_text_carries_the_collection_line_for_a_full_suite():
                 }
             ),
             *tvm_native_smoke_rules("3 tests collected in 0.2s"),
-            *junit_rules(tests=350, failures=2, skipped=5),
+            *junit_rules(tests=3),
             ("--collect-only", ok("357 tests collected in 1.2s")),
         ],
     )
@@ -332,7 +331,7 @@ def test_output_text_carries_the_collection_line_for_a_full_suite():
     result = PythonTool(orch).execute("test", working_directory=TVM_ROOT)
 
     assert (
-        "Collection: full — 357 collected, 357 selected, 350 executed, 0 collection errors"
+        "Collection: filtered — unknown collected, 3 selected, 3 executed, 0 collection errors"
     ) in result.output
 
 

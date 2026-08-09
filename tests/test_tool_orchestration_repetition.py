@@ -119,14 +119,14 @@ def test_java_repetition_history_emits_only_the_real_tool_result():
     assert not any(event.event_type == "tool_recovery" for event in events)
     assert result_event.metadata["status"] == execution.status
     assert result_event.metadata["duration_ms"] is not None
-    assert result_event.metadata["recovery_applied"] is False
+    assert "recovery_applied" not in result_event.metadata
     assert bash_tool.calls == 1
     assert system_tool.calls == []
 
 
 def test_three_prior_exact_calls_do_not_inject_warning_output():
     tool = CountingTool(output="real output")
-    signature = _signature("echo", "pwd")
+    signature = _signature("echo", "pwd", working_directory="/workspace")
     tracking_calls = []
     orchestrator = _orchestrator(
         tools={"echo": tool},
@@ -146,7 +146,7 @@ def test_three_prior_exact_calls_do_not_inject_warning_output():
 
 def test_four_prior_exact_calls_do_not_force_thinking_in_orchestrator():
     tool = CountingTool(output="guided output")
-    signature = _signature("echo", "pwd")
+    signature = _signature("echo", "pwd", working_directory="/workspace")
     tracking_calls = []
     orchestrator = _orchestrator(
         tools={"echo": tool},
@@ -168,7 +168,7 @@ def test_four_prior_exact_calls_do_not_force_thinking_in_orchestrator():
 def test_five_prior_exact_calls_still_execute_without_forcing_next_task():
     tool = CountingTool(output="real output")
     context = ContextWithForceNextTask()
-    signature = _signature("echo", "pwd")
+    signature = _signature("echo", "pwd", working_directory="/workspace")
     tracking_calls = []
     events = []
     orchestrator = _orchestrator(
@@ -184,7 +184,10 @@ def test_five_prior_exact_calls_still_execute_without_forcing_next_task():
     assert execution.status == "success"
     assert execution.result.succeeded is True
     assert execution.attempted_execution is True
-    assert execution.executed_params == {"command": "pwd"}
+    assert execution.executed_params == {
+        "command": "pwd",
+        "working_directory": "/workspace",
+    }
     assert tool.calls == 1
     assert "repetition_level" not in execution.metadata
     assert "force_next_task" not in execution.metadata
@@ -215,7 +218,7 @@ def test_java_repetition_no_longer_triggers_direct_auto_fix():
     assert execution.status == "success"
     assert execution.result.succeeded is True
     assert execution.result.output == "real output"
-    assert execution.recovery_strategy is None
+    assert not hasattr(execution, "recovery_strategy")
     assert execution.attempted_execution is True
     assert bash_tool.calls == 1
     assert system_tool.calls == []

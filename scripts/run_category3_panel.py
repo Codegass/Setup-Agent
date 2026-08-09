@@ -44,6 +44,7 @@ from typing import Any, Iterable, Sequence
 # REPO ROOT on sys.path (pytest adds it; 'python scripts/run_...' does not).
 import sys as _sys
 from pathlib import Path as _Path
+
 _REPO_ROOT = str(_Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in _sys.path:
     _sys.path.insert(0, _REPO_ROOT)
@@ -53,11 +54,12 @@ REPEATS = (1, 2, 3)
 CALIBRATION_RUNS = 3
 
 # The FULL --record artifact set archived per run (the raw evidence behind
-# every anchor), plus the probe logs (round-review P1-4: the evaluator anchors
-# read verdict.json + control_events + the stamped manifest, but the RAW JUnit
-# reports, pytest collection, contexts and project artifacts are the evidence
-# Chenhao hand-verifies — they must survive worktree removal, checksummed into
-# repo logs/). Entries may be files OR directories; directories are archived
+# every anchor), plus the probe logs (round-review P1-4: the evaluator recovers
+# authority from the host run pin + host control stream, then checks the exact
+# verdict and stamped-manifest mirrors. The RAW JUnit reports, pytest
+# collection, contexts and project artifacts are the evidence Chenhao
+# hand-verifies — they must survive worktree removal, checksummed into repo
+# logs/). Entries may be files OR directories; directories are archived
 # recursively with a per-file checksum. Rendered summary markdown is excluded.
 ARCHIVED_ARTIFACTS = (
     # sealed structured artifacts the anchors read
@@ -67,18 +69,18 @@ ARCHIVED_ARTIFACTS = (
     ".setup_agent/build_requirements.json",
     ".setup_agent/report_metrics.json",
     # raw --record evidence behind the executed/failed/collected anchors
-    ".setup_agent/pytest-reports",       # raw JUnit XML
+    ".setup_agent/pytest-reports",  # raw JUnit XML
     ".setup_agent/pytest_collected.json",
     ".setup_agent/project_brief.json",
     ".setup_agent/project_meta.json",
-    ".setup_agent/contexts",             # trunk/branch contexts
+    ".setup_agent/contexts",  # trunk/branch contexts
     # probe logs (session root) — the honest execution trace
     "agent_execution.log",
     "token_usage.csv",
     "main.log",
     "errors.log",
-    "run-pin.json",                      # host-side run-pin mirror
-    "control_events.jsonl",              # session-root mirror (fallback)
+    "run-pin.json",  # host authority root
+    "control_events.jsonl",  # host append-only authority stream
 )
 
 # Session-root probe logs whose name is dynamic (one per probed project).
@@ -523,8 +525,10 @@ def execute_run(
         target = artifact_dir / cli_log.name
         shutil.copy2(cli_log, target)
         checksums[cli_log.name] = sha256_file(target)
-    artifacts = load_run_artifacts(session)
-    run_id = _read_run_id(session)
+    # Grade the immutable archive we are about to register, not the live
+    # session it was copied from.  This proves the archived host roots and all
+    # exact current mirrors survived as one self-contained evidence run.
+    artifacts = load_run_artifacts(artifact_dir)
 
     append_ledger(
         ledger_path,
@@ -534,7 +538,7 @@ def execute_run(
             probe=probe,
             stage=stage,
             repeat=repeat,
-            run_id=run_id,
+            run_id=artifacts.run_id,
             artifact_dir=key,
             checksums=checksums,
             run_order_index=run_order_index,
@@ -546,19 +550,6 @@ def execute_run(
         "unique_executed": artifacts.unique_executed,
         "artifacts": artifacts,
     }
-
-
-def _read_run_id(session: Path) -> str | None:
-    for candidate in (
-        session / ".setup_agent" / "verdict.json",
-        session / "verdict.json",
-    ):
-        if candidate.is_file():
-            data = json.loads(candidate.read_text(encoding="utf-8"))
-            run_id = data.get("run_id")
-            if run_id:
-                return str(run_id)
-    return session.name
 
 
 # --------------------------------------------------------------------------
@@ -755,9 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # probe so the panel never launches over an unnoticed regression.
     if not args.skip_suite_baseline:
         failed = run_suite_and_collect_failures(worktree)
-        register_suite_baseline(
-            worktree=worktree, ledger_path=ledger_path, failed_node_ids=failed
-        )
+        register_suite_baseline(worktree=worktree, ledger_path=ledger_path, failed_node_ids=failed)
         print(f"suite baseline registered ({len(failed)} pre-existing reds)", file=sys.stderr)
 
     # Effective plan for THIS invocation: pyyaml calibration (only when pyyaml is

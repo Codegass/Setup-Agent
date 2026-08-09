@@ -37,6 +37,7 @@ from sag.agent import phase_gates
 from sag.agent.phase_gates import (
     OPEN_OBLIGATIONS_FACT,
     ClaimDisposition,
+    GateControlDisposition,
     ValidatorState,
     _ValidatorObservation,
     check_phase_claim,
@@ -267,11 +268,8 @@ def test_several_open_jobs_are_named_as_jobs():
     assert f"jobs {JOB}, 9f21c0be55aa have no terminal receipt" in gate.reason
 
 
-def test_the_whole_path_caps_the_polaris_claim_from_the_ledger_on_disk(monkeypatch):
-    """End to end at the seam the model actually reaches: an open obligation in
-    the container's ledger, a green physical inspection, an honest `partial`
-    claim — and the fact travels into `validated_facts`, so replay reproduces
-    the cap offline from the transcript alone."""
+def test_the_whole_path_defers_the_polaris_claim_to_the_controller_barrier(monkeypatch):
+    """An open lifecycle record is controller state, not project evidence."""
     monkeypatch.setattr(
         phase_gates,
         "_inspect_phase_evidence",
@@ -290,9 +288,12 @@ def test_the_whole_path_caps_the_polaris_claim_from_the_ledger_on_disk(monkeypat
         "polaris",
     )
 
-    assert gate.validated_outcome is PhaseOutcome.PARTIAL
+    assert gate.validated_outcome is PhaseOutcome.UNKNOWN
+    assert gate.accepted is False
+    assert gate.control_disposition is GateControlDisposition.WAIT_REQUIRED
     assert gate.validated_facts[OPEN_OBLIGATIONS_FACT] == [JOB]
-    assert f"job {JOB} has no terminal receipt" in gate.reason
+    assert JOB in gate.reason
+    assert "no project claim was graded" in gate.reason
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +367,7 @@ def test_the_floor_derives_the_claim_the_gate_confirms():
 
     engine._enforce_phase_floors()
 
-    (claim, gate) = engine.gates[-1]
+    claim, gate = engine.gates[-1]
     assert claim.claimed_outcome is PhaseOutcome.PARTIAL
     assert gate.validated_outcome is claim.claimed_outcome
     assert gate.disposition is ClaimDisposition.CONFIRMED
@@ -439,25 +440,16 @@ def _floor_engine_on_the_real_gate(monkeypatch, orchestrator):
     return engine
 
 
-def test_the_floor_closes_partial_on_the_obligation_the_real_gate_found(monkeypatch):
-    """End to end at the seam that aborted the run: a job with no exit file in
-    the container's ledger, a green inspection, a starved build floor."""
+def test_the_floor_probe_exposes_wait_instead_of_a_claimable_outcome(monkeypatch):
+    """The controller barrier must run before a starved phase floor can close."""
     engine = _floor_engine_on_the_real_gate(monkeypatch, Orchestrator(terminated=False))
 
-    forced = engine._enforce_phase_floors()
+    probe = engine._phase_gate_check("build")
 
-    assert forced is True
-    record = engine.phase_machine.records[0]
-    assert record.termination.value == "completed"
-    assert record.outcome is PhaseOutcome.PARTIAL
-    assert engine.phase_machine.current_phase == "test"
-    assert engine.finalized_reasons == []
-    # Premise corrected (#28, both round-four reviewers): the open-jobs list
-    # travels on the gate result and the gate_decision control event — never
-    # into run state, where the `run.` prefix would land it in the
-    # PROJECT_ANALYSIS epoch vector and a diagnostic write would count as
-    # material progress for retry authority.
-    assert engine.run_evidence_state.fact_value(OPEN_OBLIGATIONS_FACT) is None
+    assert probe["validator_state"] == "unavailable"
+    assert probe["control_disposition"] == "wait_required"
+    assert probe["validated_facts"][OPEN_OBLIGATIONS_FACT] == [JOB]
+    assert engine.phase_machine.records == ()
 
 
 def test_the_floor_closes_success_once_the_gate_settles_the_books(monkeypatch):

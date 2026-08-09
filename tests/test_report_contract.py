@@ -2,6 +2,7 @@ import json
 
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.evidence import EvidenceAssessment, EvidenceStatus, TestStats
+from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool, build_stored_test_analysis
 
@@ -26,7 +27,14 @@ class FakeReportOverlayOrchestrator:
     def read_file(self, path):
         if path in self.unreadable_paths:
             return {"success": False, "content": "", "exit_code": 1}
-        return {"success": True, "content": self.files.get(path, ""), "exit_code": 0}
+        return self.files.get(path)
+
+    def write_file(self, path, content):
+        self.files[path] = content
+        return {"success": True, "content": "", "exit_code": 0}
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        return {"success": True, "output": "", "exit_code": 0}
 
 
 class FakeReportContextManager:
@@ -56,15 +64,16 @@ class FakeReportContextManager:
 
 
 def _generate_report_with_overlay(overlay_json=None, unreadable_paths=None):
-    files = {}
-    if overlay_json is not None:
-        files["/workspace/.setup_agent/env_overlay.json"] = overlay_json
-    tool = ReportTool(
-        docker_orchestrator=FakeReportOverlayOrchestrator(
-            files,
-            unreadable_paths=unreadable_paths,
-        )
+    orchestrator = FakeReportOverlayOrchestrator(
+        unreadable_paths=unreadable_paths,
     )
+    if overlay_json is not None:
+        raw_overlay = json.loads(overlay_json) if isinstance(overlay_json, str) else overlay_json
+        store = EnvOverlayStore(orchestrator)
+        _empty, warnings = store._load_overlay()
+        assert warnings == []
+        store._write_overlay(store._normalize_overlay(raw_overlay))
+    tool = ReportTool(docker_orchestrator=orchestrator)
 
     return tool._generate_markdown_report(
         "done",
@@ -739,7 +748,9 @@ def test_markdown_report_skips_unreadable_runtime_env_overlay():
         unreadable_paths={"/workspace/.setup_agent/env_overlay.json"}
     )
 
-    assert "## Runtime Environment Overlay Evidence" not in report
+    assert "## Runtime Environment Overlay Evidence" in report
+    assert "### Overlay Warnings" in report
+    assert "Env overlay unavailable" in report
     assert "**Task completed. Setup Agent has finished.**" in report
 
 
@@ -1194,12 +1205,12 @@ def test_stored_test_analysis_preserves_unique_and_raw_metrics():
 
 
 def test_unique_counts_flow_parser_to_metrics_end_to_end():
-    """Mirror the exact production chain that the live Maven run exercised:
-    parser dict -> build_stored_test_analysis -> physical_validation ->
-    _build_report_snapshot -> assemble_report_metrics. unique_total MUST land
-    in the metrics artifact, not null. This is the test that would have caught
-    the dropped-projection bug; the layer tests passed in isolation while the
-    real chain produced unique_total=null."""
+    """An old aggregate survives as an observation, never as v2 identity.
+
+    The parser did not seal domain/module coordinates. Renaming ``unique`` to
+    ``latest_subjects`` would therefore reproduce the cross-module collision
+    metrics-v2 was introduced to prevent.
+    """
     from sag.tools.report_metrics import assemble_report_metrics
 
     parser_analysis = {
@@ -1258,10 +1269,18 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
         conflicts=[],
         evidence_refs=[],
         generated_at="2026-06-15 00:00:00",
+        persistence={
+            "receipts_expected": 0,
+            "receipts_persisted": 0,
+            "terminal_receipts_unpersisted": 0,
+        },
     )
 
-    assert metrics["test"]["total"] == 9497, "canonical latest"
-    assert metrics["test"]["raw_executions"] == 18839, "diagnostic runner rows"
-    assert metrics["test"]["unique_total"] == 9497, "unique normalized methods"
-    assert metrics["test"]["unique_passed"] == 9470
-    assert metrics["test"]["unique_failed"] == 5
+    assert metrics["schema_version"] == 2
+    assert metrics["tests"]["claimed"]["latest_subjects"]["executed"] is None
+    assert metrics["tests"]["claimed"]["latest_cases"]["executed"] is None
+    assert metrics["tests"]["claimed"]["receipt_executions"]["executed"] is None
+    observed = metrics["tests"]["unattributed_observations"]
+    assert observed["executed"] == 18839
+    assert observed["passed"] == 18805
+    assert observed["failed"] == 5

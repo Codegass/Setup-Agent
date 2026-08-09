@@ -14,6 +14,8 @@ Scripted-orchestrator style (house pattern, shared with
 tests/test_maven_gradle_tool_contracts.py).
 """
 
+import pytest
+
 from test_invocation_receipts import receipts_written
 from test_maven_gradle_tool_contracts import FakeBuildToolOrchestrator, FakeToolchainManager
 
@@ -22,6 +24,10 @@ from sag.docker_orch.orch import DockerOrchestrator
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
+
+pytestmark = pytest.mark.usefixtures(
+    "facade_contract_authority", "exact_internal_runner_authority"
+)
 
 WORKDIR = "/workspace/project"
 

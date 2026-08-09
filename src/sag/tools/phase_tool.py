@@ -1,27 +1,32 @@
 # src/sag/tools/phase_tool.py
-"""phase(action: done | blocked | note | repair, outcome=...) lifecycle surface.
+"""phase(action: done | blocked | note, outcome=...) lifecycle surface.
 
 Terminal actions are model claims.  The tool validates them against physical
 evidence and emits both claim and gate records; it never mutates phase state or
 selects the next phase."""
 
-from typing import Any, Dict, List, Optional
+import json
+from dataclasses import replace
+from typing import Any, Callable, Dict, List, Optional
 
-from sag.agent.job_obligations import open_job_ids
+from sag.agent.attempt_policy import (
+    build_attempt_requirement,
+    required_test_attempt,
+    untried_islands_requirement,
+)
+from sag.agent.job_obligations import read_obligations
 from sag.agent.phase_gates import (
+    ANALYSIS_FACTS_RECOVERY_CODES,
+    ANALYSIS_RECOVERY_FACT,
+    JOB_INTEGRITY_FACT,
     ClaimDisposition,
+    GateControlDisposition,
+    GateResult,
+    ValidatorState,
     check_phase_claim,
     settlement_capped_outcome,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
-from sag.agent.attempt_policy import (
-    build_attempt_requirement,
-    local_prerequisite_signature,
-    required_test_attempt,
-    untried_islands_requirement,
-)
-from sag.agent.phase_transitions import RepairRequest, repair_moves, repair_targets_for
-from sag.agent.repair_contracts import pending_repair_call, render_public_call
 
 from .base import BaseTool, ToolResult
 
@@ -42,9 +47,9 @@ class PhaseTool(BaseTool):
                 "Phase lifecycle: action='done' with outcome and evidence claims the current "
                 "phase ended; action='blocked' with outcome, reason, and evidence claims an "
                 "external impediment; both are checked against physical evidence. "
-                "action='repair' proposes one bounded direct-dependency repair with a failure "
-                "signature, hypothesis, and current-attempt evidence. action='note' records a "
-                "working note. The engine alone routes, repairs, or skips phases."
+                "action='note' records a working note. A rejected terminal claim returns "
+                "typed judge facts; the model chooses its next ordinary project action. "
+                "The engine alone routes or skips phases."
             ),
         )
         self.machine = machine
@@ -53,9 +58,19 @@ class PhaseTool(BaseTool):
         self.project_name = project_name
         self.gate_fn = gate_fn
         self.run_evidence_state = run_evidence_state
+        self._analysis_facts_recovery: Optional[Callable[[], Optional[str]]] = None
+        self._analysis_facts_recovery_attempted = False
+
+    def bind_analysis_facts_recovery(
+        self,
+        callback: Callable[[], Optional[str]],
+    ) -> None:
+        """Bind the controller's one-shot framework-survey recovery seam."""
+
+        self._analysis_facts_recovery = callback
 
     def _grade(self, claim: PhaseClaim, phase: str, *, sealed: bool):
-        """One graded claim, from the one gate. Called at most once per claim.
+        """One initial grade plus at most one controller-owned survey regrade.
 
         The gate settles the job ledger before it grades (spec §3.2 trigger 2),
         and a sealed run accepts no further evidence: after evidence-close the
@@ -70,7 +85,116 @@ class PhaseTool(BaseTool):
             self.project_name,
             sealed=sealed,
         )
-        return gate if gate.claim is not None else gate.with_claim(claim)
+        gate = gate if gate.claim is not None else gate.with_claim(claim)
+        callback = self._analysis_facts_recovery
+        if (
+            phase != "analyze"
+            or sealed
+            or gate.code not in ANALYSIS_FACTS_RECOVERY_CODES
+            or self._analysis_facts_recovery_attempted
+            or not callable(callback)
+        ):
+            return gate
+
+        # This is an engine-owned repair of its Category-1 survey guarantee,
+        # not a model project action.  Spend the single run-local attempt before
+        # calling so exceptions cannot manufacture retry authority.
+        self._analysis_facts_recovery_attempted = True
+        try:
+            survey_status = str(callback() or "failed").strip().lower()
+        except Exception:
+            survey_status = "failed"
+        if survey_status not in {"created", "present", "failed"}:
+            survey_status = "failed"
+        before_code = gate.code
+        final_gate = self.gate_fn(
+            phase,
+            claim,
+            self.validator,
+            self.orchestrator,
+            self.project_name,
+            sealed=sealed,
+        )
+        final_gate = final_gate if final_gate.claim is not None else final_gate.with_claim(claim)
+        after_code = final_gate.code or "unclassified"
+        resolved = bool(
+            after_code not in ANALYSIS_FACTS_RECOVERY_CODES
+            and (
+                final_gate.control_disposition
+                is not GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+                or after_code == "evidence_unpersisted"
+            )
+        )
+        return replace(
+            final_gate,
+            validated_facts={
+                **dict(final_gate.validated_facts),
+                ANALYSIS_RECOVERY_FACT: {
+                    "kind": "framework_survey",
+                    "attempt": 1,
+                    "before_code": before_code,
+                    "survey_status": survey_status,
+                    "after_code": after_code,
+                    "resolved": resolved,
+                },
+            },
+        )
+
+    @staticmethod
+    def _rejection_output(reason: str, facts: Dict[str, Any]) -> str:
+        """Bounded model-visible judge facts; no hidden metadata dependency."""
+
+        if not facts:
+            return reason
+        try:
+            rendered = json.dumps(facts, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            rendered = repr(facts)
+        if len(rendered) > 4_000:
+            rendered = rendered[:3_960] + "… [fact projection truncated]"
+        return f"{reason}\nObserved judge facts: {rendered}"
+
+    @staticmethod
+    def _rejected_claim_result(
+        claim: PhaseClaim,
+        *,
+        code: str,
+        reason: str,
+        control_disposition: GateControlDisposition,
+        blocker_owner: str,
+        validated_facts: Optional[Dict[str, Any]] = None,
+        evidence_refs: Optional[List[str]] = None,
+    ) -> ToolResult:
+        """One non-prescriptive control rejection for the engine to route."""
+
+        gate = GateResult(
+            accepted=False,
+            validated_outcome=PhaseOutcome.UNKNOWN,
+            claim_disposition=ClaimDisposition.CONTRADICTED,
+            validator_state=ValidatorState.UNAVAILABLE,
+            reason=reason,
+            evidence_refs=tuple(evidence_refs or claim.evidence_refs),
+            suggestions=(),
+            code=code,
+            validated_facts=dict(validated_facts or {}),
+            claim=claim,
+            control_disposition=control_disposition,
+            blocker_owner=blocker_owner,
+        )
+        facts = dict(validated_facts or {})
+        return ToolResult.completed_failure(
+            output=PhaseTool._rejection_output(reason, facts),
+            error=reason,
+            error_code=code,
+            facts=facts,
+            metadata={
+                "phase": claim.phase,
+                "control_disposition": control_disposition.value,
+                "blocker_owner": blocker_owner,
+                "phase_claim": claim.to_metadata(),
+                "gate_result": gate.to_metadata(),
+            },
+        )
 
     def execute(
         self,
@@ -80,10 +204,6 @@ class PhaseTool(BaseTool):
         reason: str = "",
         evidence: Optional[List[str]] = None,
         text: str = "",
-        target_phase: str = "",
-        reason_code: str = "",
-        failure_signature: str = "",
-        hypothesis: str = "",
     ) -> ToolResult:
         if self.machine.is_complete:
             return ToolResult.completed_failure(
@@ -111,122 +231,12 @@ class PhaseTool(BaseTool):
                 metadata={"phase_signal": "note", "text": text},
             )
 
-        if verb == "repair":
-            if outcome is not None:
-                return ToolResult.completed_failure(
-                    output="repair proposals do not accept a phase outcome",
-                    error="outcome is forbidden for repair",
-                    error_code="phase_repair_outcome_forbidden",
-                )
-            # A proposal the model can simply perform never needed this
-            # channel. Live p7/p7b polaris: the model agreed with a stated
-            # `java_version_mismatch` and submitted it as a build→build repair;
-            # that edge is illegal, and the engine closes the attempt before it
-            # checks legality, so both runs lost the build phase to a diagnosis
-            # they had got right. The proposed call is available in this phase
-            # already — say so, and change nothing.
-            proposal = pending_repair_call(self.orchestrator, reason_code)
-            if proposal is not None:
-                call = render_public_call(proposal["tool"], proposal["params"])
-                return ToolResult.completed_failure(
-                    output=(
-                        f"{reason_code} already has a proposed call, and it needs no "
-                        f"phase repair — make the call: {call}"
-                    ),
-                    error=f"{reason_code} is answered by a public call, not a phase repair",
-                    error_code="PHASE_REPAIR_ALREADY_PROPOSED",
-                    suggestions=[call],
-                    metadata={
-                        "phase": phase,
-                        "repair_id": proposal["repair_id"],
-                        "proposed_call": {
-                            "tool": proposal["tool"],
-                            "params": proposal["params"],
-                        },
-                    },
-                )
-            # Whether the policy has this edge needs no evidence, so the
-            # answer costs nothing when it is no. `_repair_rejection` asks the
-            # same question from inside `request_repair`, which the engine
-            # reaches only after `machine.close_attempt` — which is how p7/p7b
-            # polaris paid for `build→build` with the whole build phase.
-            legal_targets = repair_targets_for(phase)
-            if str(target_phase or "").strip().lower() not in legal_targets:
-                if legal_targets:
-                    detail = (
-                        f"repair from {phase} may target: " + ", ".join(legal_targets)
-                    )
-                else:
-                    detail = f"{phase} has no repair target"
-                return ToolResult.completed_failure(
-                    output=f"{detail}; {target_phase!r} is not a move this run has.",
-                    error=f"no repair edge {phase}->{target_phase}",
-                    error_code="PHASE_REPAIR_ILLEGAL_TARGET",
-                    suggestions=[
-                        f"phase(action='repair', target_phase='{target}', ...)"
-                        for target in legal_targets
-                    ]
-                    or [
-                        "phase(action='done', outcome='failed', reason=..., evidence=[refs])"
-                    ],
-                    metadata={"phase": phase, "legal_targets": list(legal_targets)},
-                )
-            required_attempt = required_test_attempt(
-                self.run_evidence_state,
-                self.orchestrator,
-                phase=phase,
-                attempt_id=getattr(self.machine, "current_attempt_id", None),
-            )
-            if required_attempt is not None:
-                action_text = required_attempt.action_text()
-                return ToolResult.completed_failure(
-                    output=(
-                        "Test repair requires evidence from a real test runner. "
-                        f"NEXT REQUIRED ACTION: {action_text}"
-                    ),
-                    error="test repair has no terminal test execution receipt",
-                    error_code="TEST_ATTEMPT_REQUIRED",
-                    suggestions=[action_text],
-                    metadata={
-                        "phase": phase,
-                        "test_execution_receipts": 0,
-                        **required_attempt.to_metadata(),
-                    },
-                )
-            try:
-                request = RepairRequest(
-                    from_phase=phase,
-                    target_phase=target_phase,
-                    source_attempt_id=str(self.machine.current_attempt_id or ""),
-                    reason_code=reason_code,
-                    failure_signature=failure_signature,
-                    hypothesis=hypothesis,
-                    evidence_refs=tuple(evidence or ()),
-                )
-            except ValueError as exc:
-                return ToolResult.completed_failure(
-                    output=f"Invalid repair proposal: {exc}",
-                    error=str(exc),
-                    error_code="phase_repair_invalid",
-                )
-            return ToolResult.completed_success(
-                output=(
-                    f"Repair proposal {request.from_phase}→{request.target_phase} submitted "
-                    "for engine policy validation."
-                ),
-                facts={"phase": phase},
-                metadata={
-                    "phase_signal": "repair",
-                    "repair_request": request.to_metadata(),
-                },
-            )
-
         if verb not in {"done", "blocked"}:
             return ToolResult.completed_failure(
                 output=f"Unknown phase action: {action!r}",
                 error="invalid action",
                 error_code="phase_action_invalid",
-                suggestions=["Use action= done | blocked | note | repair"],
+                suggestions=["Use action= done | blocked | note"],
             )
 
         if outcome is None or not str(outcome).strip():
@@ -262,6 +272,61 @@ class PhaseTool(BaseTool):
                 error_code="phase_blocker_reason_required",
             )
 
+        claim = PhaseClaim(
+            phase=phase,
+            signal=verb,
+            claimed_outcome=claimed_outcome,
+            key_results=key_results,
+            reason=reason,
+            evidence_refs=tuple(evidence or ()),
+        )
+
+        sealed = bool(getattr(self.run_evidence_state, "sealed", False))
+        gate = None
+        try:
+            ledger_records = read_obligations(self.orchestrator)
+        except Exception:
+            ledger_records = None
+        if ledger_records is None:
+            return self._rejected_claim_result(
+                claim,
+                code="job_evidence_integrity",
+                reason=(
+                    "Job evidence reconciliation requires harness recovery; "
+                    "the obligations ledger could not be read and no project "
+                    "claim was graded."
+                ),
+                control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+                blocker_owner="harness",
+                validated_facts={JOB_INTEGRITY_FACT: ["ledger_unreadable"]},
+            )
+        if ledger_records:
+            # Ledger control truth precedes attempt floors and island policy.
+            # The grade performs typed reconciliation and returns before any
+            # physical project inspection when a job is running, settlement is
+            # pending, or a settled receipt has lost its identity witness.
+            gate = self._grade(claim, phase, sealed=sealed)
+            if not gate.accepted and gate.control_disposition in {
+                GateControlDisposition.WAIT_REQUIRED,
+                GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            }:
+                return ToolResult.completed_failure(
+                    output=self._rejection_output(
+                        f"Phase '{phase}' {verb}-claim rejected: {gate.reason}",
+                        dict(gate.validated_facts),
+                    ),
+                    error=gate.reason or "job evidence reconciliation failed",
+                    error_code=gate.code or "job_evidence_integrity",
+                    suggestions=list(gate.suggestions),
+                    facts=dict(gate.validated_facts),
+                    metadata={
+                        "control_disposition": gate.control_disposition.value,
+                        "blocker_owner": gate.blocker_owner.value,
+                        "phase_claim": claim.to_metadata(),
+                        "gate_result": gate.to_metadata(),
+                    },
+                )
+
         required_attempt = required_test_attempt(
             self.run_evidence_state,
             self.orchestrator,
@@ -269,22 +334,19 @@ class PhaseTool(BaseTool):
             attempt_id=getattr(self.machine, "current_attempt_id", None),
         )
         if required_attempt is not None:
-            action_text = required_attempt.action_text()
-            return ToolResult.completed_failure(
-                output=(
+            return self._rejected_claim_result(
+                claim,
+                code="TEST_ATTEMPT_REQUIRED",
+                reason=(
                     "Test phase cannot terminate before one real terminal test "
-                    f"execution receipt. NEXT REQUIRED ACTION: {action_text}"
+                    "execution receipt. The controller owns and will execute the "
+                    "registered phase-floor action before the model continues."
                 ),
-                error="test-ready project has no terminal test execution receipt",
-                error_code="TEST_ATTEMPT_REQUIRED",
-                suggestions=[
-                    action_text,
-                    "Do not call phase(done|blocked) until that runner reaches a terminal result",
-                ],
-                metadata={
-                    "phase": phase,
+                control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+                blocker_owner="harness",
+                validated_facts={
                     "test_execution_receipts": 0,
-                    **required_attempt.to_metadata(),
+                    "test_attempt_requirement": required_attempt.to_metadata(),
                 },
             )
 
@@ -296,49 +358,17 @@ class PhaseTool(BaseTool):
                 attempt_id=getattr(self.machine, "current_attempt_id", None),
             )
             if build_requirement is not None:
-                return ToolResult.completed_failure(
-                    output=build_requirement,
-                    error="build phase has no build attempt receipt",
-                    error_code="BUILD_ATTEMPT_REQUIRED",
-                    suggestions=[
-                        "Run build(action='compile') at the surveyed build root",
-                        "If dependencies fail, run build(action='deps') first",
-                    ],
-                    metadata={"phase": phase},
-                )
-
-        if verb == "blocked":
-            prerequisite = local_prerequisite_signature(
-                " ".join((reason or "", *tuple(evidence or ())))
-            )
-            if prerequisite is not None:
-                return ToolResult.completed_failure(
-                    output=(
-                        f"blocked-claim rejected: '{prerequisite}' is a local, "
-                        "repairable prerequisite, not an external impediment. "
-                        "Install the missing piece (OS packages via bash "
-                        "apt-get install, python venv/pip via "
-                        "build(action='deps')) and retry before claiming blocked."
+                return self._rejected_claim_result(
+                    claim,
+                    code="BUILD_ATTEMPT_REQUIRED",
+                    reason=(
+                        "Build phase has no terminal build attempt receipt; no project "
+                        "outcome can be claimed yet."
                     ),
-                    error="local prerequisite misclassified as external blocker",
-                    error_code="LOCAL_PREREQUISITE_NOT_BLOCKER",
-                    suggestions=[
-                        "Install the missing prerequisite, then retry the failed action",
-                        "Claim blocked only after the tool-owned repair ladder is exhausted",
-                    ],
-                    metadata={"phase": phase, "prerequisite": prerequisite},
+                    control_disposition=GateControlDisposition.REPAIR_REQUIRED,
+                    blocker_owner="unknown",
+                    validated_facts={"build_attempt_requirement": build_requirement.to_metadata()},
                 )
-
-        claim = PhaseClaim(
-            phase=phase,
-            signal=verb,
-            claimed_outcome=claimed_outcome,
-            key_results=key_results,
-            reason=reason,
-            evidence_refs=tuple(evidence or ()),
-        )
-        sealed = bool(getattr(self.run_evidence_state, "sealed", False))
-
         # The §3.3 cap can make `success` unavailable, and the island rule below
         # exempts the claim the gate checks — so in that ONE state the two must
         # read one determination rather than contradict each other. The gate is
@@ -348,10 +378,8 @@ class PhaseTool(BaseTool):
         # `_settle_before_grading` makes a moment later), and a refusal that
         # costs no physical probe stays free for every other run — a giving-up
         # claim with untried islands is still answered before any inspection.
-        gate = None
         capped_outcome = None
-        if phase == "build" and not sealed and open_job_ids(self.orchestrator):
-            gate = self._grade(claim, phase, sealed=sealed)
+        if phase == "build" and not sealed and gate is not None:
             capped_outcome = settlement_capped_outcome(gate.validated_facts)
 
         # Closure-by-giving-up may not abandon surveyed islands that were
@@ -368,12 +396,17 @@ class PhaseTool(BaseTool):
             capped_outcome=capped_outcome.value if capped_outcome is not None else None,
         )
         if islands is not None:
-            return ToolResult.completed_failure(
-                output=islands.message(),
-                error="build closure abandons surveyed islands with no attempt receipt",
-                error_code="ISLAND_ATTEMPT_REQUIRED",
-                suggestions=islands.suggestions(),
-                metadata={"phase": phase, **islands.to_metadata()},
+            return self._rejected_claim_result(
+                claim,
+                code="ISLAND_ATTEMPT_REQUIRED",
+                reason=(
+                    "Build closure cannot abandon surveyed coordinates that have no "
+                    "attempt receipt. The judge records the missing coverage; the model "
+                    "must choose the next action."
+                ),
+                control_disposition=GateControlDisposition.REPAIR_REQUIRED,
+                blocker_owner="unknown",
+                validated_facts={"untried_islands": islands.to_metadata()},
             )
 
         if gate is None:
@@ -397,29 +430,45 @@ class PhaseTool(BaseTool):
                 validator_state=gate.validator_state,
                 reason=(
                     "blocked is reserved for external impediments, but the phase "
-                    f"evidence shows a real green build ({gate.reason}). Continue the "
-                    "remaining modules, or end the phase with phase(action='done', "
-                    "outcome='partial'|'failed') citing the failing modules' evidence"
+                    f"evidence shows a real green build ({gate.reason}). Any remaining "
+                    "modules stay unresolved, and the terminal outcome is bounded by "
+                    "their recorded evidence."
                 ),
                 evidence_refs=gate.evidence_refs,
                 suggestions=gate.suggestions,
                 code="blocked_contradicted_by_green_evidence",
                 validated_facts=gate.validated_facts,
                 claim=claim,
+                control_disposition=gate.control_disposition,
+                blocker_owner=gate.blocker_owner,
             )
 
         if not gate.accepted:
+            control_disposition = GateControlDisposition(gate.control_disposition).value
+            # A project/unknown repair belongs to the model.  The judge exposes
+            # facts and a maximum supported outcome, never a preferred project
+            # command or ordered next step.  Controller-owned dispositions may
+            # retain mechanical recovery diagnostics for the engine.
+            if gate.control_disposition is GateControlDisposition.REPAIR_REQUIRED:
+                gate = replace(gate, suggestions=())
             return ToolResult.completed_failure(
-                output=f"Phase '{phase}' {verb}-claim rejected: {gate.reason}",
+                output=self._rejection_output(
+                    f"Phase '{phase}' {verb}-claim rejected: {gate.reason}",
+                    dict(gate.validated_facts),
+                ),
                 error=gate.reason or "phase claim contradicted by validator evidence",
                 error_code=gate.code or "phase_claim_contradicted",
                 suggestions=list(gate.suggestions),
+                facts=dict(gate.validated_facts),
                 metadata={
+                    "control_disposition": control_disposition,
+                    "blocker_owner": gate.blocker_owner.value,
                     "phase_claim": claim.to_metadata(),
                     "gate_result": gate.to_metadata(),
                 },
             )
 
+        control_disposition = GateControlDisposition(gate.control_disposition).value
         return ToolResult.completed_success(
             output=(
                 f"Phase '{phase}' terminal claim accepted with validated outcome "
@@ -427,6 +476,8 @@ class PhaseTool(BaseTool):
             ),
             facts={"phase": phase},
             metadata={
+                "control_disposition": control_disposition,
+                "blocker_owner": gate.blocker_owner.value,
                 "phase_signal": verb,
                 "phase_claim": claim.to_metadata(),
                 "gate_result": gate.to_metadata(),
@@ -439,12 +490,12 @@ class PhaseTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["done", "blocked", "note", "repair"],
+                    "enum": ["done", "blocked", "note"],
                 },
                 "outcome": {
                     "type": "string",
                     "enum": ["unknown", "success", "partial", "failed"],
-                    "description": "Required for done/blocked; forbidden for note/repair",
+                    "description": "Required for done/blocked; forbidden for note",
                 },
                 "key_results": {
                     "type": "string",
@@ -457,36 +508,6 @@ class PhaseTool(BaseTool):
                     "description": "refs supporting the claim (output_*, job:*, file:*)",
                 },
                 "text": {"type": "string", "description": "note: working note"},
-                # The enum is the UNION of targets, so `build` is a valid value
-                # here while `build->build` is not a move at all — which is
-                # what p7/p7b polaris read it as. Both halves are derived from
-                # the policy table, and the description carries the per-source
-                # rule the enum cannot express.
-                "target_phase": {
-                    "type": "string",
-                    "enum": sorted(
-                        {target for _, targets in repair_moves() for target in targets}
-                    ),
-                    "description": (
-                        "repair: the phase to roll back to. The only moves that exist are "
-                        + ", ".join(
-                            f"{source}->{'/'.join(targets)}" for source, targets in repair_moves()
-                        )
-                        + "; a phase never repairs to itself."
-                    ),
-                },
-                "reason_code": {
-                    "type": "string",
-                    "description": "repair: typed snake_case reason code",
-                },
-                "failure_signature": {
-                    "type": "string",
-                    "description": "repair: normalized current failure identity",
-                },
-                "hypothesis": {
-                    "type": "string",
-                    "description": "repair: why the target attempt can change evidence",
-                },
             },
             "required": ["action"],
         }

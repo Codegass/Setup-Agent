@@ -29,6 +29,38 @@ function ws(overrides: Partial<WorkspaceSummary>): WorkspaceSummary {
   }
 }
 
+function evidenceLayers() {
+  const unavailable = {
+    executed: null, passed: null, failed: null, errors: null, skipped: null,
+    availability: "unavailable" as const, reason: "module-qualified subject identity unavailable",
+  }
+  return {
+    projectionStatus: "metrics-v2-artifact-unavailable" as const,
+    tests: {
+      claimed: {
+        latestSubjects: unavailable,
+        latestCases: unavailable,
+        receiptExecutions: {
+          executed: 2, passed: 2, failed: 0, errors: 0, skipped: 0, availability: "available" as const,
+        },
+      },
+      quarantinedObservations: {
+        executed: 2887, passed: 267, failed: 28, errors: 2481, skipped: 111, availability: "available" as const,
+      },
+      unattributedObservations: {
+        executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, availability: "available" as const,
+      },
+      staleObservations: {
+        executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0, availability: "available" as const,
+      },
+    },
+    evidence: {
+      integrity: "complete" as const, receiptsExpected: 1, receiptsPersisted: 1,
+      terminalReceiptsUnpersisted: 0, conflictCount: 0,
+    },
+  }
+}
+
 const data: DashboardResponse = {
   docker: { status: "connected", version: "27.1.1" },
   workspaces: [
@@ -51,6 +83,28 @@ describe("WorkspaceRail", () => {
     render(<WorkspaceRail {...props} />)
     expect(screen.getByRole("button", { name: /owner\/healthy/ })).toHaveAttribute("aria-current", "true")
     expect(screen.getByRole("button", { name: /owner\/broken/ })).toHaveAttribute("aria-current", "false")
+  })
+
+  it("does not render legacy 2/2 as a green test bar when subject identity is unavailable", () => {
+    const modern = ws({
+      id: "sag-ignite",
+      project: "apache/ignite",
+      test: {
+        state: "success", pass: 2, fail: 0, skip: 0, total: 2,
+        evidenceLayers: evidenceLayers(),
+      },
+    })
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{ ...data, workspaces: [modern] }}
+        selectedId="sag-ignite"
+      />,
+    )
+
+    expect(screen.queryByRole("img", { name: /2 passed, 0 failed, 2 total/i })).not.toBeInTheDocument()
+    expect(screen.getByLabelText(/claimed latest subjects unavailable/i)).toBeInTheDocument()
+    expect(screen.getByLabelText(/2,887 quarantined observations.*not verdict-bearing/i)).toBeInTheDocument()
   })
 
   it("orders attention-needing workspaces first", () => {

@@ -1,0 +1,10 @@
+> Task :buildSrc:checkKotlinGradlePluginConfigurationErrors
+> Task :buildSrc:compileKotlin UP-TO-DATE
+> Task :buildSrc:compileJava NO-SOURCE
+...
+> Task :processTestResources
+> Task :testClasses
+> Task :test
+
+BUILD SUCCESSFUL in 30s
+22 actionable tasks: 16 executed, 6 up-to-date

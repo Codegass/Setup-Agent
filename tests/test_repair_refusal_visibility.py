@@ -18,16 +18,16 @@ left to surface here are the refusals that legitimately end a phase — an
 exhausted budget, a loop guard, a green source. A record that states which one
 is a record the next phase can act on.
 
-The schema half of the same defect: `target_phase` was documented as "repair:
-direct dependency target" with no enum, so the legal set was stated nowhere the
-model could read it. It is derived from `_REPAIR_EDGES`, so it cannot drift.
+Historical route records remain readable, but the retired repair command and
+its arguments are no longer part of the live phase-tool API.
 """
 
+import inspect
 from types import SimpleNamespace
 
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_handoff import PhaseHandoff
-from sag.agent.phase_transitions import RepairRequest, repair_moves
+from sag.agent.phase_transitions import RepairRequest
 from sag.tools.phase_tool import PhaseTool
 
 REQUEST = RepairRequest(
@@ -102,23 +102,30 @@ def test_the_reason_survives_the_projection():
     assert route.reason_code == "java_version_mismatch"
 
 
+def test_historical_repair_hypothesis_never_rides_model_facing_handoff():
+    rendered = _rendered(accepted=True, decision_reason="repair_accepted")
+
+    assert "NEXT HYPOTHESIS" not in rendered
+    assert REQUEST.hypothesis not in rendered
+
+
 # ---------------------------------------------------------------------------
-# the legal set is stated where the model reads the parameter
+# the retired channel is absent from the model surface
 # ---------------------------------------------------------------------------
 
 
-def test_the_target_phase_parameter_names_the_moves_that_exist():
+def test_phase_tool_does_not_advertise_repair_or_target_phase():
     machine = SimpleNamespace(
         current_phase="build", current_attempt_id="build-1", is_complete=False
     )
     tool = PhaseTool(machine=machine, validator=None, orchestrator=None, project_name="x")
 
-    parameter = tool._get_parameters_schema()["properties"]["target_phase"]
+    properties = tool._get_parameters_schema()["properties"]
+    parameters = inspect.signature(tool.execute).parameters
 
-    assert parameter["enum"] == ["analyze", "build"]
-    assert "build->analyze" in parameter["description"]
-    assert "test->build" in parameter["description"]
-
-
-def test_the_documented_moves_are_the_policy_table():
-    assert repair_moves() == (("build", ("analyze",)), ("test", ("build",)))
+    assert "repair" not in properties["action"]["enum"]
+    assert "target_phase" not in properties
+    assert "target_phase" not in parameters
+    assert "reason_code" not in parameters
+    assert "failure_signature" not in parameters
+    assert "hypothesis" not in parameters

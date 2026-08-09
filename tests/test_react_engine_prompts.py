@@ -115,28 +115,99 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "https://example.test/repo.git" in prompt
     assert "CRITICAL PHASE WORKFLOW RULES" in prompt
     assert "AVAILABLE TOOLS" in prompt
-    assert "dummy: Dummy tool for prompt tests" in prompt
-    assert "Usage: dummy()" in prompt
-    assert "Handling Maven POM Parsing Errors" in prompt
-    assert "Handling Multi-Module Maven Test Execution" in prompt
+    assert "dummy: Dummy tool for prompt tests" not in prompt
+    assert "Usage: dummy()" not in prompt
+    assert "engine mechanically creates the initial project survey/fact sheet" in prompt
+    assert "no fixed post-clone action sequence is required" in prompt
+    assert "Handling Maven POM Parsing Errors" not in prompt
+    assert "Handling Multi-Module Maven Test Execution" not in prompt
     assert "HOW YOU ACT" in prompt
     assert "REMEMBER THE PHASE CYCLE" in prompt
 
 
-def test_initial_system_prompt_includes_env_overlay_runtime_guidance():
+def test_initial_system_prompt_describes_runtime_capabilities_without_selecting_calls():
     engine = make_engine(repository_url="https://example.test/repo.git")
 
     prompt = engine.prompt_builder.build_initial_system_prompt(
         repository_url=engine.repository_url,
     )
 
-    assert "Use bash to install missing runtimes" in prompt
-    assert "project(action='env'" in prompt
-    assert "env: Validate, register, and activate" in prompt
+    assert "Use bash to install missing runtimes" not in prompt
+    assert "project(action='env'" not in prompt
+    assert "env: Runtime validation, registration, and activation" in prompt
     assert "build, bash, validation, and report flows" in prompt
-    assert "exact executable/version" in prompt
-    assert "Do not use project(action='env') to rewrite project build configuration" in prompt
+    assert "does not rewrite project build configuration" in prompt
     assert "Runtime Recovery Guardrails" not in prompt
+
+
+def test_real_setup_tool_bundle_has_no_pre_evidence_routing_or_usage_examples():
+    """Exercise actual production tool classes, not a tools={} prompt.
+
+    Tool descriptions remain available in the structured schemas; the initial
+    setup prompt carries lifecycle syntax and factual capability boundaries,
+    never examples or prose that chooses a tool/order for the model.
+    """
+    from types import SimpleNamespace
+
+    from sag.agent.advisor import AdvisorTool
+    from sag.tools.bash import BashTool
+    from sag.tools.build.build_tool import BuildTool
+    from sag.tools.file_io import FileIOTool
+    from sag.tools.phase_tool import PhaseTool
+    from sag.tools.project_tool import ProjectTool
+    from sag.tools.report_tool import ReportTool
+    from sag.tools.search_tool import SearchTool
+
+    machine = SimpleNamespace(
+        current_phase="provision",
+        current_attempt_id="provision-1",
+        is_complete=False,
+    )
+    tools = [
+        BashTool(None),
+        FileIOTool(None),
+        PhaseTool(machine, None, None, "demo"),
+        BuildTool(None),
+        ProjectTool(),
+        SearchTool(None),
+        ReportTool(None, workflow_mode="setup"),
+        AdvisorTool(),
+    ]
+    builder = ReActPromptBuilder(
+        prompts=load_react_engine_prompts(),
+        context_manager=DummyContextManager(),
+        tools={tool.name: tool for tool in tools},
+    )
+
+    prompt = builder.build_initial_system_prompt(
+        repository_url="https://example.test/repo.git",
+        workflow_mode="setup",
+    )
+
+    forbidden = (
+        "PREFERRED",
+        "USE THIS",
+        "Use bash to install",
+        "use build(action=...) instead",
+        "npm install",
+        "Use this tool when all main tasks are finished",
+        "Usage:",
+    )
+    assert [text for text in forbidden if text in prompt] == []
+    assert "action= deps|compile|test|package" in prompt
+    assert "Valid actions: done, blocked, note" in prompt
+    assert "Project build runner dispatches are recorded only by the build facade" in prompt
+
+
+def test_build_schema_description_is_a_factual_boundary_not_a_router():
+    from sag.tools.build.build_tool import BuildTool
+
+    description = BuildTool(None).description
+
+    assert "action = deps | compile | test | package" in description
+    assert "durable invocation receipt" in description
+    assert "bash mvn/gradle" not in description
+    assert "wrong version" not in description
 
 
 def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():

@@ -1,4 +1,3 @@
-import json
 import shlex
 from types import SimpleNamespace
 
@@ -6,10 +5,12 @@ import pytest
 from engine_driver import execute_action_steps
 from test_evidence_ingestion import _action_step, _engine, _prepare_action_execution
 
-from sag.agent.evidence_state import RunEvidenceState, StateScope
-from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
-from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
-from sag.agent.react_engine import ReActEngine
+from container_evidence_fakes import (
+    add_published_mutable_json,
+    canonical_json,
+    strict_published_evidence,
+)
+
 from sag.agent.attempt_policy import (
     TestCandidateResolution,
     forced_test_refusal_receipts,
@@ -19,10 +20,16 @@ from sag.agent.attempt_policy import (
     survey_test_candidates,
     terminal_test_receipts,
 )
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+from sag.agent.evidence_state import RunEvidenceState, StateScope
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
+from sag.agent.react_engine import ReActEngine
+from sag.agent.tool_orchestration import ActualToolExecution, ToolCall, ToolExecution
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.phase_tool import PhaseTool
-from sag.agent.tool_orchestration import ActualToolExecution, ToolCall, ToolExecution
 
 
 class ManifestOrchestrator:
@@ -43,12 +50,36 @@ class ManifestOrchestrator:
             ],
         }
         self.realpaths = {}
+        self.auto_publish_manifest = True
         self.files = {
             "/workspace/bigtop/bigtop-data-generators/build.gradle": "",
             "/workspace/bigtop/bigtop-test-framework/build.gradle": "",
         }
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="test-attempt-policy",
+            target_sha="a" * 40,
+        )
+        self._publish_manifest()
+
+    def _publish_manifest(self):
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=self.manifest,
+        )
 
     def execute_command(self, command, workdir=None, timeout=None):
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            if self.auto_publish_manifest:
+                self._publish_manifest()
+            return self.evidence(command)
+        if "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command)
         if command.startswith("realpath -e -- "):
             path = shlex.split(command)[-1]
             resolved = self.realpaths.get(path, path)
@@ -79,11 +110,7 @@ class ManifestOrchestrator:
                 "exit_code": 0,
                 "output": self.files[path],
             }
-        return {
-            "success": True,
-            "exit_code": 0,
-            "output": json.dumps(self.manifest),
-        }
+        return self.evidence(command)
 
 
 class UnreadableManifestOrchestrator:
@@ -175,6 +202,19 @@ def test_candidates_require_a_current_survey_project_boundary():
     resolution = resolve_survey_test_candidates(orchestrator)
 
     assert resolution.status == "coordinates_missing"
+    assert resolution.candidates == ()
+
+
+def test_tampered_container_manifest_has_no_test_candidate_authority():
+    orchestrator = ManifestOrchestrator()
+    orchestrator.auto_publish_manifest = False
+    forged = dict(orchestrator.manifest)
+    forged["test_root"] = "/workspace/bigtop/forged-tests"
+    orchestrator.evidence.files[REQUIREMENTS_PATH] = canonical_json(forged)
+
+    resolution = resolve_survey_test_candidates(orchestrator)
+
+    assert resolution.status == "manifest_unreadable"
     assert resolution.candidates == ()
 
 
@@ -806,10 +846,10 @@ def test_phase_tool_rejects_zero_attempt_terminal_claims(action):
     )
 
     assert result.error_code == "TEST_ATTEMPT_REQUIRED"
-    assert result.metadata["test_execution_receipts"] == 0
-    assert result.metadata["required_action"]["params"]["working_directory"].endswith(
-        "bigtop-data-generators"
-    )
+    assert result.facts["test_execution_receipts"] == 0
+    assert result.facts["test_attempt_requirement"]["required_action"]["params"][
+        "working_directory"
+    ].endswith("bigtop-data-generators")
     assert gate.calls == []
 
 
@@ -1103,9 +1143,7 @@ def test_auxiliary_island_receipt_does_not_discharge_the_primary():
     _record_gradle_test(
         state, _terminal_gradle_result(), root="/workspace/bigtop/bigtop-test-framework"
     )
-    requirement = required_test_attempt(
-        state, orchestrator, phase="test", attempt_id="test-1"
-    )
+    requirement = required_test_attempt(state, orchestrator, phase="test", attempt_id="test-1")
     assert requirement is not None
     assert requirement.root == "/workspace/bigtop/bigtop-data-generators"
 
@@ -1116,10 +1154,7 @@ def test_primary_receipt_discharges_the_requirement():
     _record_gradle_test(
         state, _terminal_gradle_result(), root="/workspace/bigtop/bigtop-data-generators"
     )
-    assert (
-        required_test_attempt(state, orchestrator, phase="test", attempt_id="test-1")
-        is None
-    )
+    assert required_test_attempt(state, orchestrator, phase="test", attempt_id="test-1") is None
 
 
 def test_resolution_exposes_the_primary_candidate():

@@ -249,10 +249,8 @@ class EnvTool(BaseTool):
         """Mirror one registration into the toolchain registry.
 
         The overlay is the execution consumer — the dispatch shell sources it.
-        The registry is the toolchain state a dispatch's identity is taken
-        over. Live polaris and camel-quarkus both registered a runtime and were
-        then refused the very build that would have used it, because only the
-        overlay moved. Registration writes both, and never fails on the second.
+        The registry is durable runtime inventory used by resolution and
+        reporting. Registration writes both, and never fails on the second.
         """
         record_registered_runtime(
             getattr(self.store, "orchestrator", None),
@@ -303,8 +301,7 @@ class EnvTool(BaseTool):
                 ),
                 error_code="ENV_EXECUTABLE_PATH_OUTSIDE_RUNTIME_ROOTS",
                 suggestions=[
-                    "Install Maven under /workspace, /tmp, /opt, or a system /usr path, "
-                    "then register its exact bin/mvn."
+                    "Constraint: registered runtimes must resolve beneath an allowed container root"
                 ],
                 raw_data={"executable": normalized_requested, "tool": "maven"},
             )
@@ -315,7 +312,7 @@ class EnvTool(BaseTool):
                 output="",
                 error="Cannot resolve the Maven executable realpath without a runtime executor",
                 error_code="ENV_EXECUTABLE_REALPATH_UNAVAILABLE",
-                suggestions=["Retry through project(action='env') in an active SAG container."],
+                suggestions=["Observed capability: runtime realpath executor is unavailable"],
                 raw_data={"executable": normalized_requested, "tool": "maven"},
             )
 
@@ -474,7 +471,7 @@ class EnvTool(BaseTool):
                 output="",
                 error="Cannot verify Maven without a runtime command executor",
                 error_code="ENV_RUNTIME_PROBE_UNAVAILABLE",
-                suggestions=["Retry through project(action='env') in an active SAG container."],
+                suggestions=["Observed capability: runtime version probe executor is unavailable"],
                 raw_data={"executable": executable, "tool": "maven"},
             )
 
@@ -489,8 +486,7 @@ class EnvTool(BaseTool):
                 error=f"Maven runtime probe failed for {executable}",
                 error_code="ENV_RUNTIME_PROBE_FAILED",
                 suggestions=[
-                    "Run the exact executable with -version and fix its runtime dependencies "
-                    "before registering it."
+                    "Constraint: the submitted executable must complete its identity/version probe"
                 ],
                 raw_data={
                     "executable": executable,

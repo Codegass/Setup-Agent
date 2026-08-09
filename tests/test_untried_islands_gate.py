@@ -7,12 +7,14 @@ Live evidence (bigtop 2026-07-18/r1): the agent hammered one broken island
 and closed the phase while three healthy islands were never touched. The
 spec moved that guarantee into the gate; Plan 4 Task 4 implements it."""
 
-import json
 from types import SimpleNamespace
 
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 from sag.agent.attempt_policy import untried_islands_requirement
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.tools.base import ToolResult
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.phase_tool import PhaseTool
 
 BIGTOP = "/workspace/bigtop"
@@ -22,6 +24,7 @@ ISLANDS = (
     (f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-spark", "gradle"),
     (f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-transaction-queue", "gradle"),
 )
+TARGET_SHA = "a" * 40
 
 
 def _manifest(islands=ISLANDS):
@@ -37,21 +40,40 @@ def _manifest(islands=ISLANDS):
 class ManifestOrch:
     """Plain-`cat` manifest transport, matching the build-closure test double."""
 
-    def __init__(self, manifest=None, readable=True):
+    def __init__(self, manifest=None, readable=True, receipts=()):
         self.manifest = manifest
         self.readable = readable
+        self.receipts = {receipt["receipt_id"]: receipt for receipt in receipts}
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="island-gate",
+            target_sha=TARGET_SHA,
+            receipts=tuple(receipts),
+        )
+        if isinstance(manifest, dict):
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=manifest,
+            )
 
     def execute_command(self, command, workdir=None, timeout=None):
         if not self.readable:
             return {"success": False, "exit_code": 1, "output": "No such file"}
-        return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
+        return self.evidence(command)
 
 
 def _state_with_island_attempts(*roots, succeeded=False):
     """One dispatched build receipt per island root (outcome irrelevant)."""
     state = RunEvidenceState(run_id="island-gate")
+    receipts = []
     for index, root in enumerate(roots):
-        metadata = {"runner_dispatched": True, "command": "mvn -B install"}
+        receipt_id = f"receipt-island-{index}"
+        metadata = {"receipt_id": receipt_id}
         if succeeded:
             result = ToolResult.completed_success(
                 output="BUILD SUCCESS",
@@ -73,17 +95,36 @@ def _state_with_island_attempts(*roots, succeeded=False):
             source_attempt_id="build-1",
             execution_id=f"exec-{index}",
         )
-    return state
+        receipts.append(
+            {
+                "schema_version": 2,
+                "receipt_id": receipt_id,
+                "run_id": "island-gate",
+                "tool": "maven",
+                "requested_action": "compile",
+                "effective_action": "compile",
+                "working_directory": root,
+                "actual_cwd": root,
+                "target_sha": TARGET_SHA,
+                "domain_id": next(
+                    (island_root for island_root, _ in ISLANDS if root.startswith(island_root)),
+                    BIGTOP,
+                ),
+                "outcome": "completed" if succeeded else "failed",
+                "exit_code": 0 if succeeded else 1,
+            }
+        )
+    return state, receipts
 
 
 # --------------------------------------------------------------------------- #
 # Policy layer
 # --------------------------------------------------------------------------- #
 def test_closure_with_one_island_attempted_names_the_other_three():
-    state = _state_with_island_attempts(ISLANDS[0][0])
+    state, receipts = _state_with_island_attempts(ISLANDS[0][0])
     requirement = untried_islands_requirement(
         state,
-        ManifestOrch(_manifest()),
+        ManifestOrch(_manifest(), receipts=receipts),
         phase="build",
         signal="blocked",
         outcome="failed",
@@ -95,13 +136,15 @@ def test_closure_with_one_island_attempted_names_the_other_three():
         assert root in message
     # The attempted island is not re-demanded.
     assert message.count(ISLANDS[0][0]) == 0
-    # §3.3: a concrete machine-derived repair action, and never a closure call.
-    assert "NEXT REQUIRED ACTION" in message
+    # The judge names facts and blockers but never selects the next command.
+    assert "NEXT REQUIRED ACTION" not in message
+    assert "build(action" not in message
     assert "phase(" not in message
+    assert "required_action" not in requirement.to_metadata()
 
 
 def test_all_islands_attempted_with_mixed_outcomes_passes_the_policy():
-    state = _state_with_island_attempts(ISLANDS[0][0], ISLANDS[1][0], ISLANDS[3][0])
+    state, receipts = _state_with_island_attempts(ISLANDS[0][0], ISLANDS[1][0], ISLANDS[3][0])
     # The remaining island was attempted successfully — attempted is the bar.
     state.ingest_tool_result(
         StateScope.ARTIFACTS,
@@ -109,17 +152,33 @@ def test_all_islands_attempted_with_mixed_outcomes_passes_the_policy():
         ToolResult.completed_success(
             output="BUILD SUCCESSFUL",
             facts={"system": "gradle"},
-            metadata={"runner_dispatched": True, "command": "./gradlew build"},
+            metadata={"receipt_id": "receipt-island-green"},
         ),
         params={"action": "compile", "working_directory": ISLANDS[2][0]},
         source_phase="build",
         source_attempt_id="build-1",
         execution_id="exec-green",
     )
+    receipts.append(
+        {
+            "schema_version": 2,
+            "receipt_id": "receipt-island-green",
+            "run_id": "island-gate",
+            "tool": "gradle",
+            "requested_action": "compile",
+            "effective_action": "compile",
+            "working_directory": ISLANDS[2][0],
+            "actual_cwd": ISLANDS[2][0],
+            "target_sha": TARGET_SHA,
+            "domain_id": ISLANDS[2][0],
+            "outcome": "completed",
+            "exit_code": 0,
+        }
+    )
     assert (
         untried_islands_requirement(
             state,
-            ManifestOrch(_manifest()),
+            ManifestOrch(_manifest(), receipts=receipts),
             phase="build",
             signal="done",
             outcome="partial",
@@ -129,7 +188,7 @@ def test_all_islands_attempted_with_mixed_outcomes_passes_the_policy():
 
 
 def test_receipt_binds_when_the_attempt_ran_below_the_island_root():
-    state = _state_with_island_attempts(
+    state, receipts = _state_with_island_attempts(
         f"{ISLANDS[0][0]}/submodule",
         ISLANDS[1][0],
         ISLANDS[2][0],
@@ -138,7 +197,7 @@ def test_receipt_binds_when_the_attempt_ran_below_the_island_root():
     assert (
         untried_islands_requirement(
             state,
-            ManifestOrch(_manifest()),
+            ManifestOrch(_manifest(), receipts=receipts),
             phase="build",
             signal="blocked",
             outcome="failed",
@@ -147,8 +206,8 @@ def test_receipt_binds_when_the_attempt_ran_below_the_island_root():
     )
 
 
-def test_resolved_working_directory_from_metadata_binds_the_receipt():
-    """A bare build(action='compile') carries the resolved root in metadata."""
+def test_resolved_working_directory_from_metadata_does_not_bind_without_receipt():
+    """Raw metadata is a claim; only a durable receipt can mark an island tried."""
     state = RunEvidenceState(run_id="island-gate")
     for index, (root, _system) in enumerate(ISLANDS):
         state.ingest_tool_result(
@@ -168,16 +227,15 @@ def test_resolved_working_directory_from_metadata_binds_the_receipt():
             source_attempt_id="build-1",
             execution_id=f"meta-{index}",
         )
-    assert (
-        untried_islands_requirement(
-            state,
-            ManifestOrch(_manifest()),
-            phase="build",
-            signal="blocked",
-            outcome="failed",
-        )
-        is None
+    requirement = untried_islands_requirement(
+        state,
+        ManifestOrch(_manifest()),
+        phase="build",
+        signal="blocked",
+        outcome="failed",
     )
+    assert requirement is not None
+    assert requirement.roots == tuple(root for root, _ in ISLANDS)
 
 
 def test_undispatched_call_at_an_island_is_not_an_attempt_receipt():
@@ -206,7 +264,7 @@ def test_undispatched_call_at_an_island_is_not_an_attempt_receipt():
 
 
 def test_success_claim_is_exempt():
-    state = _state_with_island_attempts(ISLANDS[0][0], succeeded=True)
+    state, _ = _state_with_island_attempts(ISLANDS[0][0], succeeded=True)
     assert (
         untried_islands_requirement(
             state,
@@ -318,8 +376,8 @@ def _phase_tool(orch, state, gate):
 
 def test_phase_blocked_with_untried_islands_is_rejected_before_the_gate():
     gate = GateRecorder()
-    state = _state_with_island_attempts(ISLANDS[0][0])
-    tool = _phase_tool(ManifestOrch(_manifest()), state, gate)
+    state, receipts = _state_with_island_attempts(ISLANDS[0][0])
+    tool = _phase_tool(ManifestOrch(_manifest(), receipts=receipts), state, gate)
 
     result = tool.execute(
         action="blocked",
@@ -333,16 +391,19 @@ def test_phase_blocked_with_untried_islands_is_rejected_before_the_gate():
     assert gate.calls == []
     for root, _ in ISLANDS[1:]:
         assert root in result.output
-    assert result.metadata["untried_island_roots"] == [root for root, _ in ISLANDS[1:]]
-    assert any(ISLANDS[1][0] in suggestion for suggestion in result.suggestions)
-    # §3.3: never coach closure while a mechanical attempt remains untried.
-    assert not any("phase(" in suggestion for suggestion in result.suggestions)
+    gate_facts = result.metadata["gate_result"]["validated_facts"]
+    assert gate_facts["untried_islands"]["untried_island_roots"] == [
+        root for root, _ in ISLANDS[1:]
+    ]
+    assert result.suggestions == []
+    assert "required_action" not in gate_facts["untried_islands"]
+    assert "build(action" not in result.output
 
 
 def test_phase_done_partial_with_untried_islands_is_rejected():
     gate = GateRecorder()
-    state = _state_with_island_attempts(ISLANDS[0][0])
-    tool = _phase_tool(ManifestOrch(_manifest()), state, gate)
+    state, receipts = _state_with_island_attempts(ISLANDS[0][0])
+    tool = _phase_tool(ManifestOrch(_manifest(), receipts=receipts), state, gate)
 
     result = tool.execute(
         action="done",
@@ -363,8 +424,8 @@ def test_phase_done_success_reaches_the_gate_with_untried_islands():
         calls.append(phase)
         raise RuntimeError("gate reached")
 
-    state = _state_with_island_attempts(ISLANDS[0][0], succeeded=True)
-    tool = _phase_tool(ManifestOrch(_manifest()), state, gate)
+    state, receipts = _state_with_island_attempts(ISLANDS[0][0], succeeded=True)
+    tool = _phase_tool(ManifestOrch(_manifest(), receipts=receipts), state, gate)
 
     try:
         tool.execute(

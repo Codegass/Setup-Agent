@@ -27,9 +27,14 @@ from types import SimpleNamespace
 import pytest
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 from test_job_settlement import (
-    EXIT_PATH,
+    AFTER,
+    CONTAINER_ID,
+    DOCKER_EXEC_ID,
     JOB,
+    LOG_PATH,
+    POLARIS_LOG,
     ROOT,
+    TERMINAL_AUTHORITY,
     JobContainer,
     _obligation,
 )
@@ -41,24 +46,53 @@ from sag.agent.invocation_receipts import RECEIPT_DIR
 from sag.agent.job_obligations import OBLIGATION_DIR, write_obligation
 from sag.agent.replay import ControlReplayRunner, ReplayValidationError
 from sag.agent.verdict_finalizer import EvidenceCloseReason
-from test_job_settlement import LOG_PATH, POLARIS_LOG, AFTER
 
 FIXTURES = Path(__file__).parent / "fixtures" / "control_layer"
 
 
 class Orchestrator:
-    def __init__(self, *, terminated=True, obligation=None):
+    def __init__(self, *, terminated=True, obligation=None, create_obligation=True):
+        self.terminal_state = "finished" if terminated else "running"
         files = {LOG_PATH: POLARIS_LOG}
-        if terminated:
-            files[EXIT_PATH] = "0\n"
         self.filesystem = JobContainer(files=files, reports=AFTER)
         # Obligations are append-only, so a body that differs in anything but
         # its settlement cannot be written over this one: a test that needs a
         # different dispatch states it here, at dispatch time.
-        write_obligation(self.execute_command, obligation or _obligation())
+        if create_obligation:
+            write_obligation(self.execute_command, obligation or _obligation())
 
     def execute_command(self, command, **kwargs):
         return self.filesystem(command, **kwargs)
+
+    def execute_control_command(self, command, **kwargs):
+        return self.filesystem(command, **kwargs)
+
+    def inspect_detached_terminal(self, handle):
+        if (
+            handle.get("terminal_authority") != TERMINAL_AUTHORITY
+            or handle.get("docker_exec_id") != DOCKER_EXEC_ID
+            or handle.get("container_id") != CONTAINER_ID
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "probe_error": "terminal_identity_mismatch",
+            }
+        if self.terminal_state == "running":
+            return {
+                "probe_success": True,
+                "state": "running",
+                "running": True,
+                "finished": False,
+                "exit_code": None,
+            }
+        return {
+            "probe_success": True,
+            "state": "finished",
+            "running": False,
+            "finished": True,
+            "exit_code": 0,
+        }
 
 
 def _receipts(orchestrator):
@@ -134,20 +168,23 @@ def test_an_unfinished_job_is_neither_settled_nor_announced(forced_engine):  # n
     assert engine.control_events == []
 
 
-def test_the_next_observation_carries_one_bounded_settled_line(forced_engine):  # noqa: F811
+def test_settlement_is_projected_before_the_next_model_observation(forced_engine):  # noqa: F811
     orchestrator = Orchestrator()
     engine = _engine(forced_engine, orchestrator)
     engine._sweep_job_obligations()
 
     engine._append_native_observation("call-1", "STILL_RUNNING")
 
-    (step,) = engine.steps
-    settled = [line for line in step.content.splitlines() if line.startswith("[settled]")]
+    settlement_step, observation_step = engine.steps
+    settled = [
+        line for line in settlement_step.content.splitlines() if line.startswith("[settled]")
+    ]
     assert settled == [
         f"[settled] job {JOB}: exit 0 — receipt {_receipts(orchestrator)[0]['receipt_id']}, "
         "2 report paths claimed"
     ]
-    assert step.content.startswith("STILL_RUNNING")
+    assert observation_step.content == "STILL_RUNNING"
+    assert "[settled]" not in observation_step.content
 
 
 def test_the_notice_is_not_repeated_on_every_later_observation(forced_engine):  # noqa: F811
@@ -229,10 +266,8 @@ def test_a_job_that_never_terminated_is_a_conflict_on_the_verdict(forced_engine)
     engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
 
     state = engine.run_evidence_state
-    assert f"job_unsettled:{JOB}" in state.conflicts
-    assert state.fact_provenance(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == (
-        f"{OBLIGATION_DIR}/{JOB}.json"
-    )
+    assert f"job_live_at_close:{JOB}" in state.conflicts
+    assert state.fact_provenance(f"job_live_at_close.{JOB}") == (f"{OBLIGATION_DIR}/{JOB}.json")
 
 
 def test_a_settled_job_is_no_conflict_at_all(forced_engine):  # noqa: F811
@@ -385,17 +420,13 @@ def test_the_unsettled_verdict_state_is_written_by_a_control_event(forced_engine
 
     engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
 
-    payloads = [payload for kind, payload in engine.control_events if kind == "job_unsettled"]
+    payloads = [payload for kind, payload in engine.control_events if kind == "job_live_at_close"]
     assert payloads == [
         {
             "job_id": JOB,
-            "evidence_ref": f"{OBLIGATION_DIR}/{JOB}.json",
-            "obligation": {
-                "tool": "gradle",
-                "effective_action": "test",
-                "argv": f"{ROOT}/gradlew --continue test",
-                "log_path": LOG_PATH,
-            },
+            "obligation_ref": f"{OBLIGATION_DIR}/{JOB}.json",
+            "log_ref": LOG_PATH,
+            "close_reason": EvidenceCloseReason.DEPENDENTS_SKIPPED.value,
         }
     ]
 
@@ -409,7 +440,7 @@ def test_the_unsettled_event_precedes_the_close_it_is_a_conflict_on(forced_engin
     engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
 
     kinds = [kind for kind, _ in engine.control_events]
-    assert kinds.index("job_unsettled") < kinds.index("evidence_close")
+    assert kinds.index("job_live_at_close") < kinds.index("evidence_close")
 
 
 # An argv longer than a control payload may carry. `compact_control_value`
@@ -428,15 +459,11 @@ def test_the_event_and_the_fact_are_one_projection(forced_engine):  # noqa: F811
 
     engine._finalize_evidence(EvidenceCloseReason.DEPENDENTS_SKIPPED)
 
-    (payload,) = [payload for kind, payload in engine.control_events if kind == "job_unsettled"]
+    (payload,) = [payload for kind, payload in engine.control_events if kind == "job_live_at_close"]
     state = engine.run_evidence_state
-    # The event is bounded, so equality below can only hold for a fact that came
-    # from this payload rather than from a second look at the record.
-    assert len(payload["obligation"]["argv"]) < len(LONG_ARGV)
-    assert state.fact_value(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == payload["obligation"]
-    assert state.fact_provenance(f"{phase_gates.OPEN_OBLIGATIONS_FACT}.{JOB}") == (
-        payload["evidence_ref"]
-    )
+    assert LONG_ARGV not in json.dumps(payload)
+    assert state.fact_value(f"job_live_at_close.{JOB}") == payload
+    assert state.fact_provenance(f"job_live_at_close.{JOB}") == (payload["obligation_ref"])
 
 
 def _transcript_with(tmp_path, name, extra_rows):
@@ -530,7 +557,18 @@ def test_a_pre_plan_8_transcript_still_replays_byte_identically():
 def test_job_unsettled_is_appended_after_job_settled():
     assert CONTROL_EVENT_KINDS[11] == "job_settled"
     assert CONTROL_EVENT_KINDS[12] == "job_unsettled"
-    assert len(CONTROL_EVENT_KINDS) == 13
+    assert CONTROL_EVENT_KINDS[13:] == (
+        "job_terminal_observed",
+        "job_terminal_unpersisted",
+        "job_live_at_close",
+        "job_barrier_integrity_failure",
+        "completion_claim_decision",
+        "job_stall_observed",
+        "repair_context_opened",
+        "evidence_publication",
+        "evidence_store_bound",
+    )
+    assert len(CONTROL_EVENT_KINDS) == 22
 
 
 def test_the_job_unsettled_payload_states_the_job_its_file_and_what_it_was():
@@ -588,23 +626,24 @@ def test_the_job_settled_payload_states_the_three_facts_and_nothing_else():
 
 
 def test_a_transcript_carrying_job_settled_rows_replays_to_the_same_verdict(tmp_path):
-    """Additive means additive: an event kind this walk does not model must
-    consume nothing and block nothing — including between a `gate_decision`
-    that closed an attempt and the `phase_transition` that must follow it."""
+    """Distinct settlements consume no gate state and preserve the verdict,
+    including between a closing gate and its following phase transition."""
     source = [
         json.loads(line)
         for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     rows = [source[0]]
+    settlement_index = 0
     for row in source[1:]:
         rows.append(row)
         if row.get("kind") in {"tool_result", "gate_decision"}:
+            settlement_index += 1
             rows.append(
                 {
                     "kind": "job_settled",
                     "payload": {
-                        "job_id": JOB,
-                        "receipt_id": "inv-gradle-1-0002",
+                        "job_id": f"{JOB}-{settlement_index}",
+                        "receipt_id": f"inv-gradle-{settlement_index}-0002",
                         "exit_code": 0,
                     },
                     "source": row["source"],
@@ -638,13 +677,20 @@ def test_settlement_never_writes_a_receipt_for_a_job_it_cannot_read(forced_engin
 
     engine._sweep_job_obligations()
 
-    assert engine.control_events == []
+    assert engine.control_events == [
+        (
+            "job_barrier_integrity_failure",
+            {"failures": ["ledger_unreadable_after_action_batch"]},
+        )
+    ]
 
 
 def test_a_run_that_never_detached_anything_sweeps_and_finds_nothing(forced_engine):  # noqa: F811
     """The common case: one glob `cat` that matches no file."""
-    orchestrator = Orchestrator()
-    orchestrator.filesystem.files.pop(f"{OBLIGATION_DIR}/{JOB}.json")
+    # No writer ran, so both the container ledger and the host expected set
+    # are genuinely empty. Deleting a previously published record is a
+    # completeness violation and belongs in a separate fail-closed test.
+    orchestrator = Orchestrator(create_obligation=False)
     engine = _engine(forced_engine, orchestrator)
 
     engine._sweep_job_obligations()

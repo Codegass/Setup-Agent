@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "legacy_mode": "legacy-v1-forensic",
+  "campaigns": [
+    {
+      "campaign_id": "2026-07-27",
+      "verdict_rows": [
+        {"project": "tomcat-jakartaee-migration", "verdict": "success"},
+        {"project": "commons-dbcp", "verdict": "success"},
+        {"project": "lucene", "verdict": "partial"},
+        {"project": "geode", "verdict": "partial"},
+        {"project": "cayenne", "verdict": "partial"},
+        {"project": "cassandra-java-driver", "verdict": "partial"},
+        {"project": "samza", "verdict": "partial"},
+        {"project": "freemarker", "verdict": "partial"},
+        {"project": "httpcomponents-client", "verdict": "partial"},
+        {"project": "kafka", "verdict": "partial"},
+        {"project": "spark-kubernetes-operator", "verdict": "partial"},
+        {"project": "kogito-examples", "verdict": "partial"},
+        {"project": "jackrabbit", "verdict": "partial"},
+        {"project": "ignite", "verdict": "partial"},
+        {"project": "camel-quarkus", "verdict": "partial"},
+        {"project": "gora", "verdict": "partial"},
+        {"project": "tapestry-5", "verdict": "failed"},
+        {"project": "camel", "verdict": "failed"},
+        {"project": "polaris", "verdict": "failed"},
+        {"project": "seatunnel-web", "verdict": "failed"},
+        {"project": "samza-hello-samza", "verdict": "failed"},
+        {"project": "rocketmq-externals", "verdict": "failed"},
+        {"project": "ofbiz-plugins", "verdict": "failed"}
+      ],
+      "count_components": {
+        "canonical_unique": [
+          {"source_ref": "audited-primary-block-a", "count": 30000},
+          {"source_ref": "audited-primary-block-b", "count": 14983}
+        ],
+        "primary_raw": [
+          {"source_ref": "canonical-unique", "count": 44983},
+          {"source_ref": "audited-retry-delta", "count": 440}
+        ],
+        "auxiliary": [
+          {"source_ref": "jackrabbit-unattributed", "count": 6667},
+          {"source_ref": "kafka-cached-observations", "count": 4686},
+          {"source_ref": "other-audited-observations", "count": 2154}
+        ]
+      }
+    },
+    {
+      "campaign_id": "2026-08-08",
+      "verdict_rows": [
+        {"project": "camel", "verdict": "partial"},
+        {"project": "camel-quarkus", "verdict": "partial"},
+        {"project": "cassandra-java-driver", "verdict": "failed"},
+        {"project": "cayenne", "verdict": "partial"},
+        {"project": "commons-dbcp", "verdict": "success"},
+        {"project": "freemarker", "verdict": "partial"},
+        {"project": "geode", "verdict": "partial"},
+        {"project": "gora", "verdict": "partial"},
+        {"project": "httpcomponents-client", "verdict": "failed"},
+        {"project": "ignite", "verdict": "partial"},
+        {"project": "jackrabbit", "verdict": "partial"},
+        {"project": "kafka", "verdict": "partial"},
+        {"project": "kogito-examples", "verdict": "partial"},
+        {"project": "lucene", "verdict": "partial"},
+        {"project": "ofbiz-plugins", "verdict": "failed"},
+        {"project": "polaris", "verdict": "partial"},
+        {"project": "rocketmq-externals", "verdict": "failed"},
+        {"project": "samza", "verdict": "partial"},
+        {"project": "samza-hello-samza", "verdict": "failed"},
+        {"project": "seatunnel-web", "verdict": "partial"},
+        {"project": "spark-kubernetes-operator", "verdict": "partial"},
+        {"project": "tapestry-5", "verdict": "partial"},
+        {"project": "tomcat-jakartaee-migration", "verdict": "success"}
+      ],
+      "count_components": {
+        "canonical_unique": [
+          {"source_ref": "audited-project-ledger", "count": 15322}
+        ],
+        "primary_raw": [
+          {"source_ref": "canonical-unique", "count": 15322},
+          {"source_ref": "audited-physical-retry-delta", "count": 2758}
+        ],
+        "auxiliary": [
+          {"source_ref": "camel", "count": 22151},
+          {"source_ref": "cassandra-java-driver", "count": 4458},
+          {"source_ref": "cayenne", "count": 4586},
+          {"source_ref": "geode", "count": 10448},
+          {"source_ref": "ignite", "count": 2887},
+          {"source_ref": "lucene", "count": 18831},
+          {"source_ref": "samza", "count": 2415}
+        ]
+      }
+    }
+  ]
+}

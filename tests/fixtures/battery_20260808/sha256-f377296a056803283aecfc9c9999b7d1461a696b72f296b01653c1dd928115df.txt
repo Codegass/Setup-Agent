@@ -1,0 +1,8 @@
+distributionSha256Sum=0d7125e8c91097b36edb990ea5934e6c68b4440eef4ea96510a0f6815e7eeadb
+distributionType=only-script
+distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.11/apache-maven-3.9.11-bin.zip
+wrapperVersion=3.3.2
+--- bootstrap output ---
+[toolchain] using the project's own ./mvnw (pins Maven 3.9.11)
+Error: Failed to validate Maven distribution SHA-256, your Maven distribution might be compromised.
+If you updated your Maven version, you need to update the specified distributionSha256Sum property.

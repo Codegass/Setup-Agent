@@ -1,0 +1,6 @@
+[INFO] BUILD FAILURE
+[ERROR] Failed to execute goal org.l2x6.cq:cq-maven-plugin:4.24.2:flatten-bom (flatten-bom) on project camel-quarkus-bom:
+[ERROR] The plugin org.l2x6.cq:cq-maven-plugin:4.24.2 has unmet prerequisites:
+[ERROR] Required Java version 17 is not met by current version: 11.0.31
+[ERROR] Failed to execute goal net.revelc.code.formatter:formatter-maven-plugin:2.29.0:format (format) on project camel-quarkus-build-parent:
+[ERROR] Required Java version 17 is not met by current version: 11.0.31

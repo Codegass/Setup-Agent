@@ -1,8 +1,7 @@
 # tests/test_advisor_guarantees.py
-"""The three mechanical guarantees (spec §3.2): consult-at-entry,
-before-giving-up, when-stuck.
+"""The two live advisor guarantees: consult-at-entry and when-stuck.
 
-Guarantees 2 and 3 are engine-level PRE-EXECUTION redirects: the call never
+The when-stuck guarantee is an engine-level PRE-EXECUTION redirect: the call never
 reaches the tool, and the model gets a tool result naming the one concrete next
 action (`advisor()`). Redirects travel the same evidence-recording path as the
 Plan-2 refusals, so the pairing invariant and the audit trail hold.
@@ -25,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sag.agent.action_intents import ActionIntent, action_fingerprint, canonical_params
 from sag.agent.loop_memory import ActionKey, LoopDecision, OutcomeKey, RelevantStateVector
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import ReActStep, StepType
@@ -110,6 +110,7 @@ def _engine(
     engine.emit = lambda *a, **k: None
     engine.run_evidence_state = None
     engine.phase_machine = SimpleNamespace(current_phase=phase)
+    engine.successful_states = {}
     engine.phase_handoff = None
     engine.physical_validator = None
     engine.loop_memory = None
@@ -118,8 +119,10 @@ def _engine(
     engine.llm_client = _ScriptedAdvisorClient()
     engine.executed_calls = []
     engine.emitted_tool_results = []
+    engine.emitted_action_intents = []
 
     def fake_execute_tool_call(call):
+        call.action_intent = engine._mint_model_action_intent(call, call.raw_params)
         engine.executed_calls.append(call)
         return SimpleNamespace(
             call=call,
@@ -148,7 +151,29 @@ def _engine(
         "execution-1",
         [],
     )
-    engine._emit_control_action_envelope = lambda tool, params: None
+
+    def fake_emit_control_action_envelope(tool, params, *, intent):
+        validated = ActionIntent.model_validate(intent.model_dump(mode="python", round_trip=True))
+        expected_params = canonical_params(params)
+        assert validated.source == "model"
+        assert validated.intent_id
+        assert validated.tool == tool
+        assert validated.domain_id == engine._action_domain_id(params)
+        assert validated.canonical_params == expected_params
+        assert validated.action_fingerprint == action_fingerprint(
+            domain_id=validated.domain_id,
+            tool=tool,
+            params=expected_params,
+        )
+        assert (
+            validated.trigger_assessment_id,
+            validated.repair_context_id,
+            validated.repair_context_sha256,
+        ) == (None, None, None)
+        engine.emitted_action_intents.append(validated)
+        return None
+
+    engine._emit_control_action_envelope = fake_emit_control_action_envelope
     engine._emit_control_tool_result = lambda **kwargs: engine.emitted_tool_results.append(kwargs)
     engine._apply_tool_execution_loop_effects = lambda execution: loop_decision
     engine._close_phase_for_loop = lambda decision, execution: False
@@ -224,7 +249,7 @@ def test_no_redirect_fires_in_the_test_phase_before_the_first_consult_either():
     assert engine._advisor_redirect_for_call(_call("build", {"action": "test"})) is None
 
 
-# --- (b) before-giving-up --------------------------------------------------
+# --- (b) terminal claims reach the physical judge -------------------------
 
 
 @pytest.mark.parametrize(
@@ -234,22 +259,17 @@ def test_no_redirect_fires_in_the_test_phase_before_the_first_consult_either():
         {"action": "done", "outcome": "failed"},
     ],
 )
-def test_closing_a_phase_after_a_failure_is_redirected(params):
+def test_closing_a_phase_after_a_failure_is_not_prejudged_by_advisor(params):
     engine = _engine(phase="build", outcome="failed")
-    # A real failed execution arms the rule.
     engine.consult_advisor()
     engine._execute_action_step(_step("build", {"action": "compile"}))
-    assert engine._had_failure_since_consult is True
 
     engine._execute_action_step(_step("phase", params, call_id="call_2"))
 
-    assert [call.name for call in engine.executed_calls] == ["build"]
+    assert [call.name for call in engine.executed_calls] == ["build", "phase"]
     observation = _observations(engine)[1].content
-    assert "A failure occurred since your last advisor consult" in observation
-    assert "This claim was not evaluated." in observation
-    assert (
-        engine.emitted_tool_results[1]["result"].metadata["advisor_redirect"] == "before-giving-up"
-    )
+    assert observation == "[phase] executed"
+    assert "advisor_redirect" not in engine.emitted_tool_results[1]["result"].metadata
 
 
 def test_a_successful_phase_done_is_never_redirected():
@@ -322,7 +342,6 @@ def test_consulting_the_advisor_disarms_the_recurrence_rule():
 
 def test_advisor_mode_off_makes_every_rule_inert():
     engine = _engine(phase="build", advisor_mode="off", outcome="failed")
-    engine._had_failure_since_consult = True
     engine._advisor_redirect_armed = True
 
     assert (
@@ -341,7 +360,6 @@ def test_an_exhausted_phase_cap_makes_every_rule_inert():
     engine = _engine(phase="build", advisor_phase_cap=1)
     engine.consult_advisor()
     assert engine.consult_advisor().metadata["advisor"] == "cap"
-    engine._had_failure_since_consult = True
     engine._advisor_redirect_armed = True
 
     assert (
@@ -388,7 +406,6 @@ def test_the_advisor_is_never_refused_even_after_evidence_seals():
 
 def test_the_advisor_tool_itself_is_never_redirected():
     engine = _engine(phase="build")
-    engine._had_failure_since_consult = True
     engine._advisor_redirect_armed = True
 
     assert engine._advisor_redirect_for_call(_call("advisor")) is None
@@ -441,13 +458,15 @@ def test_read_only_reconnaissance_is_never_redirected_by_the_recurrence_rule():
 # --- timing surfaces -------------------------------------------------------
 
 
-def test_the_system_prompt_teaches_when_to_consult():
+def test_the_system_prompt_describes_the_non_authoritative_advisor_boundary():
     guidance = load_react_engine_prompts().get("initial_system.advisor_guidance")
 
     assert "advisor()" in guidance
-    for cue in ("before substantive work", "when stuck", "before closing a phase"):
-        assert cue in guidance, f"the timing block must name the '{cue}' trigger"
-    assert "adapt" in guidance
+    assert "records its consultation before substantive work" in guidance
+    assert "non-authoritative guidance" in guidance
+    assert "terminal claims go directly" in guidance
+    assert "repeated actions are stuck" not in guidance
+    assert "pre-judge" not in guidance
 
 
 def test_the_advisor_guidance_key_is_required():

@@ -11,13 +11,13 @@ execution receipts govern control flow; physical artifacts govern verdicts.
 
 from __future__ import annotations
 
-import json
 import posixpath
+import re
 import shlex
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import read_live_build_requirements
 
 from .evidence_state import RunEvidenceState, ToolObservation
 from .forced_build_graph import (
@@ -30,6 +30,15 @@ CandidateResolutionStatus = Literal[
     "manifest_unreadable",
     "coordinates_missing",
     "unsafe_coordinates",
+]
+
+ReceiptBindingStatus = Literal[
+    "available",
+    "run_id_missing",
+    "project_root_missing",
+    "run_pin_unreadable",
+    "run_pin_run_mismatch",
+    "target_sha_missing",
 ]
 
 
@@ -146,9 +155,7 @@ class TestCandidateResolution:
             )
             primary_system = _normalized_system(primary_item.get("system"))
             if primary_root is None or primary_system is None:
-                raise ValueError(
-                    "test-candidate snapshot primary requires valid root and system"
-                )
+                raise ValueError("test-candidate snapshot primary requires valid root and system")
             primary = next(
                 (
                     candidate
@@ -158,15 +165,31 @@ class TestCandidateResolution:
                 None,
             )
             if primary is None:
-                raise ValueError(
-                    "test-candidate snapshot primary must be one of its candidates"
-                )
+                raise ValueError("test-candidate snapshot primary must be one of its candidates")
         return cls(
             status=status,  # type: ignore[arg-type]
             candidates=tuple(candidates),
             project_root=project_root,
             workspace_root=workspace_root,
             primary=primary,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentBuildReceiptScope:
+    """The immutable pins a build receipt must match to affect this run."""
+
+    status: ReceiptBindingStatus
+    run_id: str
+    target_sha: str | None = None
+    project_root: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return (
+            self.status == "available"
+            and self.target_sha is not None
+            and self.project_root is not None
         )
 
 
@@ -253,14 +276,12 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
     if workspace_root is None:
         return TestCandidateResolution(status="manifest_unreadable")
     try:
-        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
-        if not isinstance(result, Mapping) or not result.get("success"):
-            return TestCandidateResolution(status="manifest_unreadable")
-        manifest = json.loads(str(result.get("output") or ""))
+        live = read_live_build_requirements(orchestrator)
     except Exception:
         return TestCandidateResolution(status="manifest_unreadable")
-    if not isinstance(manifest, Mapping):
+    if not live.complete or live.conflict is not None or live.payload is None:
         return TestCandidateResolution(status="manifest_unreadable")
+    manifest = live.payload
 
     survey = manifest.get("survey") or {}
     if not isinstance(survey, Mapping):
@@ -738,6 +759,22 @@ _LOCAL_PREREQUISITE_SIGNATURES = (
 )
 
 _BUILD_RUNNER_TOOLS = frozenset({"build", "maven", "gradle", "python"})
+_DURABLE_RECEIPT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+_TERMINAL_RECEIPT_OUTCOMES = frozenset({"completed", "failed"})
+_PRODUCTION_BUILD_ACTION_PREFIXES = (
+    "assemble",
+    "build",
+    "check",
+    "compile",
+    "install",
+    "jar",
+    "native",
+    "package",
+    "test",
+    "verify",
+    "war",
+    "wheel",
+)
 
 
 def local_prerequisite_signature(text: str) -> str | None:
@@ -750,36 +787,70 @@ def local_prerequisite_signature(text: str) -> str | None:
 
 
 def has_build_attempt_receipt(
-    state: RunEvidenceState | None, *, attempt_id: str | None
+    state: RunEvidenceState | None,
+    *,
+    attempt_id: str | None,
+    orchestrator: Any,
+    manifest: Mapping[str, Any] | None,
 ) -> bool:
-    """One real build-runner dispatch in this build attempt (terminal or not)."""
-    if state is None or not attempt_id:
+    """One current-run durable production receipt in this build attempt."""
+    if state is None or not attempt_id or orchestrator is None:
         return False
-    for observation in state.tool_observations:
-        if observation.source_phase != "build":
-            continue
-        if observation.source_attempt_id != attempt_id:
-            continue
-        if observation.tool_name not in _BUILD_RUNNER_TOOLS:
-            continue
-        metadata = observation.result.metadata or {}
-        if metadata.get("runner_dispatched") is True and str(
-            metadata.get("command") or ""
-        ).strip():
-            return True
-    return False
+    scope = resolve_current_build_receipt_scope(
+        orchestrator,
+        run_id=state.run_id,
+        manifest=manifest,
+    )
+    from .evidence_assessments import read_receipt
+
+    execute = getattr(orchestrator, "execute_command", None)
+    if not callable(execute):
+        return False
+    return bool(
+        build_attempt_directories(
+            state,
+            receipt_loader=lambda receipt_id: read_receipt(execute, receipt_id),
+            scope=scope,
+            attempt_id=attempt_id,
+        )
+    )
 
 
 def _read_requirements_manifest(orchestrator: Any) -> Mapping[str, Any] | None:
-    """Read the survey manifest; ``None`` when absent, unreadable, or malformed."""
-    manifest: Any = None
+    """Read the current host-authorized survey manifest, or ``None``."""
     try:
-        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
-        if isinstance(result, Mapping) and result.get("success"):
-            manifest = json.loads(str(result.get("output") or ""))
+        live = read_live_build_requirements(orchestrator)
     except Exception:
-        manifest = None
-    return manifest if isinstance(manifest, Mapping) else None
+        return None
+    if not live.complete or live.conflict is not None or live.payload is None:
+        return None
+    return live.payload
+
+
+@dataclass(frozen=True, slots=True)
+class BuildAttemptRequirement:
+    """Mechanical fact that no real build receipt exists for this attempt."""
+
+    manifest_status: str
+    build_system: str | None = None
+    build_islands: tuple[tuple[str, str | None], ...] = ()
+    receipt_binding_status: ReceiptBindingStatus | None = None
+
+    def to_metadata(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "reason_code": "build_attempt_missing",
+            "terminal_build_receipts": 0,
+            "manifest_status": self.manifest_status,
+        }
+        if self.build_system:
+            payload["build_system"] = self.build_system
+        if self.build_islands:
+            payload["build_islands"] = [
+                {"root": root, "system": system} for root, system in self.build_islands
+            ]
+        if self.receipt_binding_status is not None:
+            payload["receipt_binding_status"] = self.receipt_binding_status
+        return payload
 
 
 def build_attempt_requirement(
@@ -788,16 +859,21 @@ def build_attempt_requirement(
     *,
     phase: str | None,
     attempt_id: str | None,
-) -> str | None:
+) -> BuildAttemptRequirement | None:
     """Reject build closure without one real build attempt (spec §3.4-7).
 
     Fail-closed: an unreadable survey manifest never proves a no-target
     project, so it still requires an attempt."""
     if state is None or phase != "build":
         return None
-    if has_build_attempt_receipt(state, attempt_id=attempt_id):
-        return None
     manifest = _read_requirements_manifest(orchestrator)
+    if has_build_attempt_receipt(
+        state,
+        attempt_id=attempt_id,
+        orchestrator=orchestrator,
+        manifest=manifest,
+    ):
+        return None
     if manifest:
         islands = manifest.get("build_islands") or ()
         build_system = manifest.get("build_system") or (
@@ -805,12 +881,22 @@ def build_attempt_requirement(
         )
         if not islands and not build_system:
             return None  # survey-proven no-target project
-    return (
-        "Build phase cannot terminate before one real build attempt receipt. "
-        "NEXT REQUIRED ACTION: build(action='compile') at the surveyed build "
-        "root, or build(action='deps') when dependencies are the failure. "
-        "Missing OS packages or venv modules are local repairable "
-        "prerequisites, not external blockers."
+    normalized_islands = _manifest_build_islands(manifest) if manifest else ()
+    system = None
+    if manifest:
+        raw_system = manifest.get("build_system") or (
+            (manifest.get("build_recommendation") or {}).get("build_system")
+        )
+        system = str(raw_system or "").strip().lower() or None
+    return BuildAttemptRequirement(
+        manifest_status="read" if manifest is not None else "unavailable",
+        build_system=system,
+        build_islands=normalized_islands,
+        receipt_binding_status=resolve_current_build_receipt_scope(
+            orchestrator,
+            run_id=state.run_id,
+            manifest=manifest,
+        ).status,
     )
 
 
@@ -845,12 +931,7 @@ class UntriedIslandsRequirement:
     # these untried roots. Empty means "the caller supplied no edge info",
     # which is not the same as "the islands are independent" — see message().
     edges: tuple[IncompatibleDomainEdge, ...] = ()
-
-    def action_text(self, index: int = 0) -> str:
-        return f"build(action='compile', working_directory={self.roots[index]!r})"
-
-    def suggestions(self) -> list[str]:
-        return [self.action_text(index) for index in range(len(self.roots))]
+    receipt_binding_status: ReceiptBindingStatus = "available"
 
     def blocker_lines(self) -> tuple[str, ...]:
         lines: list[str] = []
@@ -879,11 +960,16 @@ class UntriedIslandsRequirement:
             if blockers
             else ""
         )
+        binding_text = (
+            f"Current receipt binding is unknown ({self.receipt_binding_status}); "
+            if self.receipt_binding_status != "available"
+            else ""
+        )
         return (
             f"Build phase cannot close while {len(self.roots)} surveyed build "
             f"island{plural} carry no build attempt receipt: "
             f"{', '.join(self.roots)}. "
-            f"NEXT REQUIRED ACTION: {self.action_text()}. "
+            f"{binding_text}"
             f"{graph_text}"
             "Closure needs receipts: a failed attempt is a receipt, an "
             "untried island is not."
@@ -892,12 +978,17 @@ class UntriedIslandsRequirement:
     def to_metadata(self) -> dict[str, Any]:
         return {
             "reason_code": "untried_build_islands",
+            "receipt_binding_status": self.receipt_binding_status,
             "untried_island_roots": list(self.roots),
             "untried_island_systems": list(self.systems),
-            "required_action": {
-                "tool": "build",
-                "params": {"action": "compile", "working_directory": self.roots[0]},
-            },
+            "incompatible_edges": [
+                {
+                    "consumer": edge.consumer,
+                    "producer": edge.producer,
+                    "detail": edge.detail,
+                }
+                for edge in self.edges
+            ],
         }
 
 
@@ -930,6 +1021,120 @@ def _manifest_build_islands(
         seen.add(root)
         islands.append((root, str(item.get("system") or "").strip().lower() or None))
     return tuple(islands)
+
+
+def resolve_current_build_receipt_scope(
+    orchestrator: Any,
+    *,
+    run_id: str,
+    manifest: Mapping[str, Any] | None = None,
+    workspace_root: str = "/workspace",
+    project_root: str | None = None,
+) -> CurrentBuildReceiptScope:
+    """Resolve the run/checkout/root pins shared by gates and judges.
+
+    A same-run receipt from a changed checkout is historical evidence just as
+    surely as a receipt from another run.  Therefore a missing or mismatched
+    run pin is an explicit unavailable scope, never permission to omit the
+    target check.
+    """
+
+    expected_run = str(run_id or "").strip()
+    if not expected_run:
+        return CurrentBuildReceiptScope(status="run_id_missing", run_id="")
+
+    normalized_workspace = _normalized_absolute_path(workspace_root)
+    normalized_project = _normalized_absolute_path(project_root)
+    if normalized_project is None and isinstance(manifest, Mapping):
+        survey = manifest.get("survey")
+        if isinstance(survey, Mapping):
+            normalized_project = _normalized_absolute_path(survey.get("project_path"))
+        if normalized_project is None:
+            roots = tuple(root for root, _ in _manifest_build_islands(manifest))
+            if roots:
+                try:
+                    normalized_project = _normalized_absolute_path(posixpath.commonpath(roots))
+                except ValueError:
+                    normalized_project = None
+    if (
+        normalized_project is None
+        or normalized_workspace is None
+        or not _is_contained(normalized_project, normalized_workspace)
+    ):
+        return CurrentBuildReceiptScope(
+            status="project_root_missing",
+            run_id=expected_run,
+        )
+
+    pin_path = f"{normalized_workspace.rstrip('/')}/.setup_agent/run-pin.json"
+    try:
+        from sag.agent.control_events import RunPin
+        from sag.agent.evidence_publications import RUN_PIN_LOGICAL_ARTIFACT_ID
+        from sag.agent.evidence_records import (
+            EvidencePublicationBinding,
+            read_live_published_mutable_json_object,
+        )
+
+        def validate_run_pin(payload: Mapping[str, Any], _expected_id: str) -> Mapping[str, Any]:
+            return RunPin.model_validate(payload).model_dump(mode="json")
+
+        def classify_run_pin(
+            payload: Mapping[str, Any], current_run_id: str | None
+        ) -> Literal["current", "foreign", "forensic"]:
+            try:
+                candidate = RunPin.model_validate(payload)
+            except (TypeError, ValueError):
+                return "current"
+            if candidate.run_id is None:
+                return "forensic"
+            return "current" if candidate.run_id == current_run_id else "foreign"
+
+        pin_read = read_live_published_mutable_json_object(
+            orchestrator,
+            pin_path,
+            record_kind="run_pin",
+            record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            validator=validate_run_pin,
+            publication_binding=lambda payload: EvidencePublicationBinding(
+                run_id=str(payload["run_id"]),
+                logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            ),
+            record_scope=classify_run_pin,
+        )
+        if not pin_read.complete or pin_read.conflict is not None or pin_read.payload is None:
+            raise ValueError(pin_read.conflict or "current run pin is absent")
+        pin = pin_read.payload
+    except Exception:
+        return CurrentBuildReceiptScope(
+            status="run_pin_unreadable",
+            run_id=expected_run,
+            project_root=normalized_project,
+        )
+    if not isinstance(pin, Mapping):
+        return CurrentBuildReceiptScope(
+            status="run_pin_unreadable",
+            run_id=expected_run,
+            project_root=normalized_project,
+        )
+    if str(pin.get("run_id") or "").strip() != expected_run:
+        return CurrentBuildReceiptScope(
+            status="run_pin_run_mismatch",
+            run_id=expected_run,
+            project_root=normalized_project,
+        )
+    target_sha = str(pin.get("target_repo_sha") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,64}", target_sha):
+        return CurrentBuildReceiptScope(
+            status="target_sha_missing",
+            run_id=expected_run,
+            project_root=normalized_project,
+        )
+    return CurrentBuildReceiptScope(
+        status="available",
+        run_id=expected_run,
+        target_sha=target_sha,
+        project_root=normalized_project,
+    )
 
 
 def _manifest_incompatible_edges(
@@ -970,29 +1175,137 @@ def _manifest_incompatible_edges(
     return tuple(edges)
 
 
-def _build_attempt_directories(state: RunEvidenceState) -> tuple[str, ...]:
-    """Resolved working directories of every real build-runner dispatch.
+def _production_build_receipt(receipt: Mapping[str, Any]) -> bool:
+    """Whether one terminal receipt describes artifact/test-producing work.
 
-    The receipt shape is ``has_build_attempt_receipt``'s (dispatched runner
-    plus a rendered command), so a pre-dispatch refusal never counts as an
-    attempted island.  The RESOLVED directory is read from result metadata
-    first: a bare ``build(action='compile')`` carries no ``working_directory``
-    parameter, and only the envelope knows where it actually ran.  Attempts
-    are read across phases and attempts because cross-phase repair is legal
-    (spec §3.5) — the question is whether the island was ever tried at all.
+    Dependency resolution is useful evidence but it does not try an island's
+    compile/test surface.  The effective action is what physically ran; the
+    requested action is only a fallback for legacy receipts that predate it.
     """
+
+    action = str(receipt.get("effective_action") or receipt.get("requested_action") or "").lower()
+    tokens = tuple(token for token in re.split(r"[^a-z0-9_-]+", action) if token)
+    return any(
+        token.startswith(prefix) for token in tokens for prefix in _PRODUCTION_BUILD_ACTION_PREFIXES
+    )
+
+
+def current_run_durable_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    receipt_id: str,
+    run_id: str,
+    target_sha: str,
+    project_root: str,
+) -> bool:
+    """Whether a durable receipt matches this run, checkout, and root.
+
+    Target/root constraints are mandatory: omitting a pin cannot weaken the
+    binding law. A producer-specific consumer may add its own tool/action
+    predicate after this common epoch and containment check.
+
+    ``outcome`` is the terminal ToolResult outcome.  A runner whose lifecycle
+    ended abnormally may still carry ``outcome=failed``; consumers that care
+    whether it ended on its own must additionally inspect ``dispatch_terminated``.
+    """
+
+    expected_id = str(receipt_id or "").strip()
+    expected_run = str(run_id or "").strip()
+    if not _DURABLE_RECEIPT_ID.fullmatch(expected_id) or not expected_run:
+        return False
+    if str(receipt.get("receipt_id") or "").strip() != expected_id:
+        return False
+    if str(receipt.get("run_id") or "").strip() != expected_run:
+        return False
+    if str(receipt.get("outcome") or "").strip().lower() not in _TERMINAL_RECEIPT_OUTCOMES:
+        return False
+    expected_target = str(target_sha or "").strip().lower()
+    if (
+        not expected_target
+        or str(receipt.get("target_sha") or "").strip().lower() != expected_target
+    ):
+        return False
+
+    normalized_project = _normalized_absolute_path(project_root)
+    if normalized_project is None:
+        return False
+    actual_cwd = _normalized_absolute_path(
+        receipt.get("actual_cwd") or receipt.get("working_directory")
+    )
+    if actual_cwd is None or not _is_contained(actual_cwd, normalized_project):
+        return False
+    domain_id = str(receipt.get("domain_id") or "").strip()
+    if domain_id:
+        normalized_domain = _normalized_absolute_path(domain_id)
+        if normalized_domain is None or not _is_contained(normalized_domain, normalized_project):
+            return False
+    return True
+
+
+def current_run_production_build_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    receipt_id: str,
+    run_id: str,
+    target_sha: str,
+    project_root: str,
+) -> bool:
+    """Whether a current durable receipt tried artifact/test-producing work."""
+
+    return bool(
+        current_run_durable_receipt(
+            receipt,
+            receipt_id=receipt_id,
+            run_id=run_id,
+            target_sha=target_sha,
+            project_root=project_root,
+        )
+        and str(receipt.get("tool") or "").strip().lower() in _BUILD_RUNNER_TOOLS
+        and _production_build_receipt(receipt)
+    )
+
+
+def build_attempt_directories(
+    state: RunEvidenceState,
+    *,
+    receipt_loader: Callable[[str], Mapping[str, Any] | None],
+    scope: CurrentBuildReceiptScope,
+    attempt_id: str | None = None,
+) -> tuple[str, ...]:
+    """Actual cwd of current-run durable production-build receipts.
+
+    This is the single binding law shared by the closure gate and the
+    model-visible untried-island projection.  Observation metadata supplies
+    only the receipt identifier.  The persisted receipt supplies run epoch,
+    terminal outcome, effective action, and actual cwd; raw call parameters and
+    a self-reported ``runner_dispatched`` bit have zero authority.
+    """
+
+    if not scope.available:
+        return ()
     directories: list[str] = []
     for observation in state.tool_observations:
+        if attempt_id is not None and (
+            observation.source_phase != "build" or observation.source_attempt_id != attempt_id
+        ):
+            continue
         if observation.tool_name not in _BUILD_RUNNER_TOOLS:
             continue
         metadata = getattr(observation.result, "metadata", None) or {}
-        if metadata.get("runner_dispatched") is not True:
+        receipt_id = str(metadata.get("receipt_id") or "").strip()
+        receipt = receipt_loader(receipt_id)
+        if not isinstance(receipt, Mapping):
             continue
-        if not str(metadata.get("command") or "").strip():
+        if not current_run_production_build_receipt(
+            receipt,
+            receipt_id=receipt_id,
+            run_id=state.run_id,
+            target_sha=scope.target_sha or "",
+            project_root=scope.project_root or "",
+        ):
             continue
         directory = _normalized_absolute_path(
-            metadata.get("working_directory")
-            or (observation.params or {}).get("working_directory")
+            receipt.get("actual_cwd") or receipt.get("working_directory")
         )
         if directory is not None:
             directories.append(directory)
@@ -1054,7 +1367,23 @@ def untried_islands_requirement(
     islands = _manifest_build_islands(manifest)
     if not islands:
         return None
-    attempted = _build_attempt_directories(state)
+    scope = resolve_current_build_receipt_scope(
+        orchestrator,
+        run_id=state.run_id,
+        manifest=manifest,
+    )
+    from .evidence_assessments import read_receipt
+
+    execute = getattr(orchestrator, "execute_command", None)
+    attempted: tuple[str, ...]
+    if not callable(execute):
+        attempted = ()
+    else:
+        attempted = build_attempt_directories(
+            state,
+            receipt_loader=lambda receipt_id: read_receipt(execute, receipt_id),
+            scope=scope,
+        )
     untried = tuple(
         (root, system)
         for root, system in islands
@@ -1067,19 +1396,26 @@ def untried_islands_requirement(
         roots=roots,
         systems=tuple(system for _, system in untried),
         edges=_manifest_incompatible_edges(manifest, roots),
+        receipt_binding_status=scope.status,
     )
 
 
 __all__ = [
     "CandidateResolutionStatus",
+    "CurrentBuildReceiptScope",
     "IncompatibleDomainEdge",
+    "ReceiptBindingStatus",
     "TestAttemptRequirement",
     "TestCandidateResolution",
     "UntriedIslandsRequirement",
+    "build_attempt_directories",
     "build_attempt_requirement",
+    "current_run_production_build_receipt",
+    "current_run_durable_receipt",
     "has_build_attempt_receipt",
     "local_prerequisite_signature",
     "required_test_attempt",
+    "resolve_current_build_receipt_scope",
     "has_test_candidate_refresh_receipt",
     "forced_test_refusal_receipts",
     "resolve_survey_test_candidates",

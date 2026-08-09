@@ -149,7 +149,11 @@ def test_package_or_install_stats_are_one_build_and_test_observation(tmp_path, t
     assert snapshot.test_stats.passed == 10
 
 
-def test_facade_jdk_retry_preserves_two_maven_actual_executions(tmp_path, monkeypatch):
+def test_facade_jdk_retry_preserves_two_maven_actual_executions(
+    tmp_path,
+    monkeypatch,
+    exact_build_facade_authority,
+):
     _patch_provision(monkeypatch)
     backend = ScriptedBackendTool(
         ToolResult.completed_failure(
@@ -193,8 +197,9 @@ def test_facade_jdk_retry_preserves_two_maven_actual_executions(tmp_path, monkey
 
     engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=lambda ignored: execution)
     _prepare_action_execution(engine)
-    execute_action_steps(engine, 
-        [_action_step("build", {"action": "compile", "working_directory": "/workspace/proj"})]
+    execute_action_steps(
+        engine,
+        [_action_step("build", {"action": "compile", "working_directory": "/workspace/proj"})],
     )
 
     observations = engine.run_evidence_state.tool_observations

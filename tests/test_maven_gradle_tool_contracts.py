@@ -1,12 +1,19 @@
+import pytest
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.evidence import EvidenceAssessment
 from sag.evidence import InvocationStatus
 from sag.tools.base import ToolResult
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
 from sag.tools.internal.toolchain_manager import (
     ResolvedToolExecutable,
     ToolExecutableCandidate,
 )
+
+pytestmark = pytest.mark.usefixtures("facade_contract_authority", "exact_internal_runner_authority")
 
 
 class FakeBuildToolOrchestrator:
@@ -18,9 +25,22 @@ class FakeBuildToolOrchestrator:
         self.commands = []
         self.monitored_commands = []
         self.project_name = None
+        self.evidence = ContainerFS()
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload={},
+        )
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
+
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command, workdir=workdir, timeout=timeout)
 
         if command == "which mvn":
             return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
@@ -149,6 +169,8 @@ class SequencedToolchainManager:
 class VersionCommandOrchestrator(FakeBuildToolOrchestrator):
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command, workdir=workdir, timeout=timeout)
         if "pom.xml" in command:
             raise AssertionError("Maven version diagnostics must not require pom.xml")
         if command.endswith("mvn -version"):
@@ -740,7 +762,8 @@ def test_java_enforcer_failure_does_not_persist_or_block_maven_runtime():
     output = (
         "[ERROR] BUILD FAILURE\n"
         "[ERROR] Rule 0: RequireJavaVersion failed: Detected JDK Version: "
-        "11.0.2 is not in the allowed range [17,)."
+        "11.0.2 is not in the allowed range [17,).\n"
+        "[INFO] " + "x" * 900
     )
     orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 1})
     tool = MavenTool(
@@ -751,6 +774,7 @@ def test_java_enforcer_failure_does_not_persist_or_block_maven_runtime():
             source="system",
         ),
     )
+    tool.output_storage = FakeOutputStorage("output_java_enforcer_failure")
     tool._record_test_summary = lambda *args, **kwargs: None
 
     result = tool.execute(command="compile", working_directory="/workspace/project")
@@ -759,6 +783,22 @@ def test_java_enforcer_failure_does_not_persist_or_block_maven_runtime():
     assert result.error_code == "JAVA_VERSION_ERROR"
     assert "maven_version_requirement" not in result.metadata
     assert "runtime_contract_persisted" not in result.metadata
+    assert result.evidence_refs == ["output_java_enforcer_failure"]
+    assert result.metadata["output_ref_id"] == "output_java_enforcer_failure"
+    assert "recovery_actions" not in result.metadata
+    assert "diagnostic_commands" not in result.metadata
+    rendered = "\n".join(result.suggestions)
+    assert "Observed active Java version: 11.0.2" in rendered
+    assert "Project-declared Java requirement: 17" in rendered
+    assert all(
+        exact_call not in rendered
+        for exact_call in (
+            "bash(command=",
+            "build(action=",
+            "maven(command=",
+            "project(action=",
+        )
+    )
     # Persistence, not traffic. The pre-flight now READS the overlay to compare
     # the java runtime this dispatch runs with the one that was registered; what
     # a JAVA version failure must never do is WRITE Maven evidence into it, so
@@ -826,11 +866,12 @@ def test_maven_failed_result_metadata_includes_runtime_facts_for_version_error()
     }
 
 
-def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidance():
+def test_maven_failure_preserves_version_facts_without_a_harness_authored_repair_call():
     output = (
         "[ERROR] BUILD FAILURE\n"
         "Rule 0: org.apache.maven.enforcer.rules.version.RequireMavenVersion failed\n"
-        "Detected Maven Version: 3.8.7 is not in the allowed range [3.9,)."
+        "Detected Maven Version: 3.8.7 is not in the allowed range [3.9,).\n"
+        "[INFO] " + "x" * 900
     )
     orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 1})
     tool = MavenTool(
@@ -841,6 +882,7 @@ def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidan
             source="system",
         ),
     )
+    tool.output_storage = FakeOutputStorage("output_maven_version_failure")
     tool._record_test_summary = lambda *args, **kwargs: None
 
     result = tool.execute(
@@ -863,10 +905,50 @@ def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidan
         "version": "3.8.7",
         "source": "system",
     }
-    assert any("project(action='env'" in suggestion for suggestion in result.suggestions)
-    assert any(
-        "bash" in suggestion and "download" in suggestion for suggestion in result.suggestions
+    assert result.evidence_refs == ["output_maven_version_failure"]
+    assert result.metadata["output_ref_id"] == "output_maven_version_failure"
+    assert "recovery_actions" not in result.metadata
+    assert "diagnostic_commands" not in result.metadata
+    rendered = "\n".join(result.suggestions)
+    assert "[3.9,)" in rendered
+    assert "/usr/bin/mvn" in rendered
+    assert "3.8.7" in rendered
+    for exact_call in (
+        "bash(command=",
+        "build(action=",
+        "maven(command=",
+        "project(action=",
+    ):
+        assert exact_call not in rendered
+
+
+def test_maven_java_failure_does_not_guess_a_runtime_or_emit_a_repair_call():
+    output = (
+        "[ERROR] BUILD FAILURE\n"
+        "java.lang.UnsupportedClassVersionError: unsupported major.minor version"
     )
+    orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 1})
+    tool = MavenTool(orchestrator)
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(command="compile", working_directory="/workspace/project")
+
+    assert result.succeeded is False
+    assert result.error_code == "JAVA_VERSION_ERROR"
+    assert result.metadata["maven_runtime"]["executable"] == "/usr/bin/mvn"
+    assert "recovery_actions" not in result.metadata
+    assert "diagnostic_commands" not in result.metadata
+    rendered = "\n".join(result.suggestions)
+    assert "does not prove the required major" in rendered
+    assert "Java 17" not in rendered
+    assert "Java 21" not in rendered
+    for exact_call in (
+        "bash(command=",
+        "build(action=",
+        "maven(command=",
+        "project(action=",
+    ):
+        assert exact_call not in rendered
 
 
 def test_maven_tool_runs_version_command_as_diagnostic_without_pom_validation():

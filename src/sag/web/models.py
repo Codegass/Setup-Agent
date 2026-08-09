@@ -75,6 +75,241 @@ class BuildSummary(WebModel):
         return "" if value is None else value
 
 
+class EvidenceCountSummary(WebModel):
+    """One metrics-v2 grain. Null counts mean the grain was unavailable."""
+
+    executed: int | None = None
+    passed: int | None = None
+    failed: int | None = None
+    errors: int | None = None
+    skipped: int | None = None
+    availability: Literal["available", "unavailable"] | None = None
+    reason: str | None = None
+    basis: str | None = None
+
+
+class ObservationCountSummary(EvidenceCountSummary):
+    report_file_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("report_file_count", "reportFileCount"),
+        serialization_alias="reportFileCount",
+    )
+    reason_counts: dict[str, int] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reason_counts", "reasonCounts"),
+        serialization_alias="reasonCounts",
+    )
+
+
+class ClaimedTestLayers(WebModel):
+    latest_subjects: EvidenceCountSummary = Field(
+        validation_alias=AliasChoices("latest_subjects", "latestSubjects"),
+        serialization_alias="latestSubjects",
+    )
+    latest_cases: EvidenceCountSummary = Field(
+        validation_alias=AliasChoices("latest_cases", "latestCases"),
+        serialization_alias="latestCases",
+    )
+    receipt_executions: EvidenceCountSummary = Field(
+        validation_alias=AliasChoices("receipt_executions", "receiptExecutions"),
+        serialization_alias="receiptExecutions",
+    )
+
+
+class TestEvidenceLayers(WebModel):
+    claimed: ClaimedTestLayers
+    quarantined_observations: ObservationCountSummary = Field(
+        validation_alias=AliasChoices("quarantined_observations", "quarantinedObservations"),
+        serialization_alias="quarantinedObservations",
+    )
+    unattributed_observations: ObservationCountSummary = Field(
+        validation_alias=AliasChoices("unattributed_observations", "unattributedObservations"),
+        serialization_alias="unattributedObservations",
+    )
+    stale_observations: ObservationCountSummary = Field(
+        validation_alias=AliasChoices("stale_observations", "staleObservations"),
+        serialization_alias="staleObservations",
+    )
+    retried_cases: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("retried_cases", "retriedCases"),
+        serialization_alias="retriedCases",
+    )
+    flaky_cases: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("flaky_cases", "flakyCases"),
+        serialization_alias="flakyCases",
+    )
+
+
+class MetricsV2RunSummary(WebModel):
+    run_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("run_id", "runId"),
+        serialization_alias="runId",
+    )
+    target_sha: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("target_sha", "targetSha"),
+        serialization_alias="targetSha",
+    )
+    sag_sha: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("sag_sha", "sagSha"),
+        serialization_alias="sagSha",
+    )
+    prompt_hash: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("prompt_hash", "promptHash"),
+        serialization_alias="promptHash",
+    )
+    control_bundle_hash: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("control_bundle_hash", "controlBundleHash"),
+        serialization_alias="controlBundleHash",
+    )
+    image_digest: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("image_digest", "imageDigest"),
+        serialization_alias="imageDigest",
+    )
+    model_pin: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("model_pin", "modelPin"),
+        serialization_alias="modelPin",
+    )
+    run_order_index: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("run_order_index", "runOrderIndex"),
+        serialization_alias="runOrderIndex",
+    )
+    pin_status: Literal["complete", "incomplete"] = Field(
+        validation_alias=AliasChoices("pin_status", "pinStatus"),
+        serialization_alias="pinStatus",
+    )
+    missing_pins: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("missing_pins", "missingPins"),
+        serialization_alias="missingPins",
+    )
+
+
+class MetricsV2OutcomeSummary(WebModel):
+    verdict: Literal["success", "partial", "failed", "unknown"]
+    build_state: str = Field(
+        validation_alias=AliasChoices("build_state", "buildState"),
+        serialization_alias="buildState",
+    )
+    test_state: str = Field(
+        validation_alias=AliasChoices("test_state", "testState"),
+        serialization_alias="testState",
+    )
+    terminal_reason: str = Field(
+        validation_alias=AliasChoices("terminal_reason", "terminalReason"),
+        serialization_alias="terminalReason",
+    )
+
+
+class MetricsV2EvidenceSummary(WebModel):
+    integrity: Literal["complete", "degraded", "failed", "unavailable"]
+    receipts_expected: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("receipts_expected", "receiptsExpected"),
+        serialization_alias="receiptsExpected",
+    )
+    receipts_persisted: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("receipts_persisted", "receiptsPersisted"),
+        serialization_alias="receiptsPersisted",
+    )
+    terminal_receipts_unpersisted: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "terminal_receipts_unpersisted", "terminalReceiptsUnpersisted"
+        ),
+        serialization_alias="terminalReceiptsUnpersisted",
+    )
+    conflict_count: int = Field(
+        default=0,
+        validation_alias=AliasChoices("conflict_count", "conflictCount"),
+        serialization_alias="conflictCount",
+    )
+
+
+class MetricsV2CoverageSummary(WebModel):
+    domains_discovered: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("domains_discovered", "domainsDiscovered"),
+        serialization_alias="domainsDiscovered",
+    )
+    domains_attempted: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("domains_attempted", "domainsAttempted"),
+        serialization_alias="domainsAttempted",
+    )
+    domains_terminal: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("domains_terminal", "domainsTerminal"),
+        serialization_alias="domainsTerminal",
+    )
+    domains_with_claimed_tests: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("domains_with_claimed_tests", "domainsWithClaimedTests"),
+        serialization_alias="domainsWithClaimedTests",
+    )
+
+
+class MetricsV2ControlSummary(WebModel):
+    terminal_refusal_recurrences: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("terminal_refusal_recurrences", "terminalRefusalRecurrences"),
+        serialization_alias="terminalRefusalRecurrences",
+    )
+    unsettled_jobs: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("unsettled_jobs", "unsettledJobs"),
+        serialization_alias="unsettledJobs",
+    )
+    cleanup_escalations: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("cleanup_escalations", "cleanupEscalations"),
+        serialization_alias="cleanupEscalations",
+    )
+    midrun_human_approvals: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("midrun_human_approvals", "midrunHumanApprovals"),
+        serialization_alias="midrunHumanApprovals",
+    )
+
+
+class MetricsV2Summary(WebModel):
+    schema_version: Literal[2] = Field(
+        validation_alias=AliasChoices("schema_version", "schemaVersion"),
+        serialization_alias="schemaVersion",
+    )
+    identity_version: Literal["module-qualified-v1"] = Field(
+        validation_alias=AliasChoices("identity_version", "identityVersion"),
+        serialization_alias="identityVersion",
+    )
+    run: MetricsV2RunSummary
+    outcome: MetricsV2OutcomeSummary
+    evidence: MetricsV2EvidenceSummary
+    tests: TestEvidenceLayers
+    coverage: MetricsV2CoverageSummary
+    control: MetricsV2ControlSummary
+
+
+class EvidenceLayerProjectionSummary(WebModel):
+    """Display-only fallback; intentionally not a metrics-v2 campaign row."""
+
+    projection_status: Literal["metrics-v2-artifact-unavailable"] = Field(
+        validation_alias=AliasChoices("projection_status", "projectionStatus"),
+        serialization_alias="projectionStatus",
+    )
+    tests: TestEvidenceLayers
+    evidence: MetricsV2EvidenceSummary
+
+
 class TestSummary(WebModel):
     state: str = "none"
     pass_count: int = Field(default=0, serialization_alias="pass")
@@ -153,6 +388,11 @@ class TestSummary(WebModel):
         default_factory=list,
         validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
         serialization_alias="evidenceRefs",
+    )
+    evidence_layers: MetricsV2Summary | EvidenceLayerProjectionSummary | None = Field(
+        default=None,
+        validation_alias=AliasChoices("evidence_layers", "evidenceLayers"),
+        serialization_alias="evidenceLayers",
     )
 
 

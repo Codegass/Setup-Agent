@@ -91,23 +91,27 @@ def test_maven_clone_installs_no_jdk():
     assert mutations == [], f"clone must not provision anything, ran: {mutations}"
 
 
-def test_clone_output_names_the_explicit_provisioning_actions():
+def test_clone_output_reports_checkout_facts_without_prescribing_next_actions():
     orchestrator = CloneOrchestrator(marker="pyproject.toml")
     output = _clone(orchestrator).output
 
     assert "Installing dependencies automatically" not in output
-    assert "build(action='deps')" in output
-    assert "project(action='provision'" in output
+    assert "Project Type: python" in output
+    assert "Build Files: /workspace/proj/pyproject.toml" in output
+    assert "build(action=" not in output
+    assert "project(action=" not in output
 
 
-def test_maven_clone_output_names_provision_for_the_jdk():
+def test_maven_clone_output_reports_jdk_fact_without_prescribing_provisioning():
     orchestrator = CloneOrchestrator(marker="pom.xml")
     result = _clone(orchestrator)
 
-    # Java version detection is READ-ONLY and stays: it tells the model which
-    # JDK to ask for, it does not install one.
+    # Java version detection is READ-ONLY and stays as an observed constraint;
+    # clone neither installs a JDK nor selects the model's next action.
     assert result.metadata["java_version_required"] == "17"
-    assert "project(action='provision', java_version='17')" in result.output
+    assert "Java Version Required: 17" in result.output
+    assert "project(action=" not in result.output
+    assert "build(action=" not in result.output
     assert "Installing dependencies automatically" not in result.output
 
 

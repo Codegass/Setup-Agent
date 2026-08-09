@@ -14,6 +14,7 @@ COMPILEALL_METRICS_UNAVAILABLE_CONFLICT = "compileall_metrics_unavailable"
 # used by compileall. That makes importlib.util.cache_from_source authoritative
 # for the active cache tag without requiring SAG to be installed in the target.
 COMPILEALL_METRICS_SCRIPT = """\
+import hashlib
 import importlib.util
 import json
 import os
@@ -36,6 +37,13 @@ for raw_root in sys.argv[1:]:
         continue
     seen_roots.add(root)
     roots.append(root)
+
+def contained(path, root):
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 sources = set()
 pycs = set()
@@ -62,6 +70,8 @@ for root in roots:
             if excluded(relative_path):
                 continue
             path = candidate.resolve()
+            if not contained(path, root):
+                continue
             if filename.endswith(".py"):
                 sources.add(path)
             elif filename.endswith(".pyc"):
@@ -91,14 +101,41 @@ for pyc in pycs:
     if source is not None:
         mapped_pycs[pyc] = source
 
-compiled_sources = {
-    source for expected_pyc, source in expected.items() if expected_pyc.is_file()
+compiled_pyc_pairs = {
+    expected_pyc: source
+    for expected_pyc, source in expected.items()
+    if expected_pyc.is_file()
 }
-compiled_sources.update(mapped_pycs.values())
+compiled_pyc_pairs.update(mapped_pycs)
+compiled_sources = set(compiled_pyc_pairs.values())
 foreign_pycs = sorted(pycs - set(mapped_pycs))
 missing_sources = sorted(sources - compiled_sources)
 source_count = len(sources)
 compiled_source_count = len(compiled_sources)
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+def basis_sha256(entries):
+    body = json.dumps(entries, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
+
+source_basis = [
+    {"path": str(path), "sha256": file_sha256(path)}
+    for path in sorted(sources)
+]
+pyc_basis = [
+    {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "source": str(compiled_pyc_pairs[path]),
+    }
+    for path in sorted(compiled_pyc_pairs)
+]
 
 if foreign_pycs:
     status = "invalid"
@@ -121,6 +158,10 @@ payload = {
     "foreign_pyc_count": len(foreign_pycs),
     "coverage": coverage,
     "cache_tag": cache_tag,
+    "source_basis_sha256": basis_sha256(source_basis),
+    "pyc_basis_sha256": basis_sha256(pyc_basis),
+    "source_basis_entry_count": len(source_basis),
+    "pyc_basis_entry_count": len(pyc_basis),
     "conflicts": conflicts,
     "missing_sources": [str(path) for path in missing_sources[:20]],
     "foreign_pycs": [str(path) for path in foreign_pycs[:20]],
@@ -138,6 +179,10 @@ class CompileallMetrics:
     foreign_pyc_count: int
     coverage: float | None
     cache_tag: str
+    source_basis_sha256: str
+    pyc_basis_sha256: str
+    source_basis_entry_count: int
+    pyc_basis_entry_count: int
     conflicts: tuple[str, ...] = ()
     missing_sources: tuple[str, ...] = ()
     foreign_pycs: tuple[str, ...] = ()
@@ -206,6 +251,26 @@ def parse_compileall_metrics(output: str) -> CompileallMetrics:
     if status == "unavailable" and source_count:
         raise ValueError("unavailable compileall metrics cannot hide source files")
 
+    basis_digests = (
+        payload.get("source_basis_sha256"),
+        payload.get("pyc_basis_sha256"),
+    )
+    if any(
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+        for digest in basis_digests
+    ):
+        raise ValueError("compileall basis digest must be a SHA-256")
+    basis_counts = (
+        payload.get("source_basis_entry_count"),
+        payload.get("pyc_basis_entry_count"),
+    )
+    if any(type(count) is not int or count < 0 for count in basis_counts):
+        raise ValueError("compileall basis entry counts must be non-negative integers")
+    if basis_counts[0] != source_count or basis_counts[1] < compiled_source_count:
+        raise ValueError("compileall basis entry counts disagree with source mapping")
+
     conflicts = tuple(str(item) for item in payload.get("conflicts") or ())
     if status == "invalid" and COMPILEALL_METRICS_CONFLICT not in conflicts:
         raise ValueError("invalid compileall metrics require metrics_conflict")
@@ -218,6 +283,10 @@ def parse_compileall_metrics(output: str) -> CompileallMetrics:
         foreign_pyc_count=payload["foreign_pyc_count"],
         coverage=coverage,
         cache_tag=str(payload.get("cache_tag") or ""),
+        source_basis_sha256=basis_digests[0],
+        pyc_basis_sha256=basis_digests[1],
+        source_basis_entry_count=basis_counts[0],
+        pyc_basis_entry_count=basis_counts[1],
         conflicts=conflicts,
         missing_sources=tuple(str(item) for item in payload.get("missing_sources") or ()),
         foreign_pycs=tuple(str(item) for item in payload.get("foreign_pycs") or ()),

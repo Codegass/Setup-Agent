@@ -29,12 +29,20 @@ import hashlib
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 
 import pytest
 
 from sag.agent.attempt_policy import TestAttemptRequirement as AttemptRequirement
 from sag.agent.attempt_policy import TestCandidateResolution as CandidateResolution
+from sag.agent.evidence_assessments import ReceiptAssessment, validate_assessment_v2
+from sag.agent.evidence_publications import publish_evidence_bytes
+from sag.agent.evidence_records import (
+    frame_json_record_stream,
+    frame_named_json_record_stream,
+)
+from sag.agent.invocation_receipts import build_receipt, validate_receipt_v2
 from sag.agent.phase_gates import check_phase_claim, check_phase_done
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.agent.physical_validator import PhysicalValidator
@@ -65,7 +73,7 @@ def _sha256(path: Path) -> str:
 
 
 def _receipt(receipt_id: str, working_directory: Path, new=(), changed=(), cached=()) -> dict:
-    """One schema-v1 invocation receipt (exact cross-lane contract)."""
+    """One strict current v2 invocation receipt."""
     report_delta = {}
     if new:
         report_delta["new"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in new]
@@ -73,18 +81,19 @@ def _receipt(receipt_id: str, working_directory: Path, new=(), changed=(), cache
         report_delta["changed"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in changed]
     if cached:
         report_delta["cached"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in cached]
-    return {
-        "schema_version": 1,
-        "receipt_id": receipt_id,
-        "tool": "maven",
-        "requested_action": "test",
-        "effective_action": "test",
-        "argv": "mvn -B test",
-        "working_directory": str(working_directory),
-        "exit_code": 0,
-        "outcome": "completed",
-        "report_delta": report_delta,
-    }
+    receipt = build_receipt(
+        receipt_id=receipt_id,
+        tool="maven",
+        requested_action="test",
+        effective_action="test",
+        argv="mvn -B test",
+        working_directory=str(working_directory),
+        exit_code=0,
+        before={},
+        after={},
+    )
+    receipt["report_delta"] = {"new": [], "changed": [], **report_delta}
+    return validate_receipt_v2(receipt, expected_id=receipt_id)
 
 
 class ReceiptWorkspace:
@@ -96,6 +105,7 @@ class ReceiptWorkspace:
         self.primary_root = self.project / "bigtop-data-generators"
         self.auxiliary_root = self.project / "bigtop-tests" / "test-framework"
         self.receipts_dir = self.workspace / ".setup_agent" / "invocation_receipts"
+        self.assessments_dir = self.workspace / ".setup_agent" / "evidence_assessments"
         self.project.mkdir(parents=True, exist_ok=True)
 
     # -- reports ---------------------------------------------------------
@@ -124,6 +134,12 @@ class ReceiptWorkspace:
         path.write_text(text, encoding="utf-8")
         return path
 
+    def write_assessment(self, payload: dict) -> Path:
+        self.assessments_dir.mkdir(parents=True, exist_ok=True)
+        path = self.assessments_dir / f"{payload['assessment_id']}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
 
 class ReceiptOrchestrator:
     """Runs the emitted compact parser locally; every other probe is silent."""
@@ -131,12 +147,65 @@ class ReceiptOrchestrator:
     def __init__(self, workspace: ReceiptWorkspace):
         self.workspace = workspace
         self.commands: list[str] = []
+        if workspace.receipts_dir.is_dir():
+            for path in sorted(workspace.receipts_dir.glob("*.json")):
+                try:
+                    payload = validate_receipt_v2(
+                        json.loads(path.read_text(encoding="utf-8")),
+                        expected_id=path.stem,
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                publication = publish_evidence_bytes(
+                    self,
+                    record_kind="invocation_receipt",
+                    record_id=payload["receipt_id"],
+                    raw=path.read_bytes(),
+                    contract_id=payload.get("contract_id"),
+                    contract_hash=payload.get("contract_hash"),
+                )
+                assert publication.published
+        if workspace.assessments_dir.is_dir():
+            for path in sorted(workspace.assessments_dir.glob("*.json")):
+                try:
+                    payload = validate_assessment_v2(
+                        json.loads(path.read_text(encoding="utf-8")),
+                        expected_id=path.stem,
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                publication = publish_evidence_bytes(
+                    self,
+                    record_kind="receipt_assessment",
+                    record_id=payload["assessment_id"],
+                    raw=path.read_bytes(),
+                )
+                assert publication.published
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         text = command.strip()
         if "SAG_COMPACT_TEST_REPORT_PARSER" in text:
             return self._run_compact_parser(command)
+        if "SAG_NAMED_JSON_RECORD_V1" in text and text.startswith("for file in "):
+            target = shlex.split(text.partition(" in ")[2].partition("; do")[0])[0]
+            directory = Path(target[: -len("/*.json")])
+            records = (
+                [(path.name, path.read_bytes()) for path in sorted(directory.glob("*.json"))]
+                if directory.is_dir()
+                else []
+            )
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream(records),
+            }
+        if "job_obligations" in text and "SAG_JSON_RECORD_END_V1" in text:
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_json_record_stream([]),
+            }
         if text.startswith("test -d "):
             path = text[len("test -d ") :].split()[0].strip("'\"")
             exists = os.path.isdir(path)
@@ -363,7 +432,69 @@ def test_corrupt_receipt_fails_closed_with_the_file_named(bigtop, monkeypatch):
     result = validator.parse_test_reports(str(bigtop.project))
 
     assert result["valid"] is False
-    assert str(corrupt) in result["receipt_error"]
+    assert result["receipt_error"] == (
+        "invocation receipt ledger is not host-authorized and complete"
+    )
+    assert result["total_tests"] == 0
+
+
+@pytest.mark.parametrize("mutation", ("tamper", "delete"))
+def test_host_published_receipt_must_still_exist_with_exact_bytes(
+    bigtop, monkeypatch, mutation
+):
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    path = bigtop.write_receipt(
+        _receipt(
+            "inv-test-1-0001",
+            bigtop.primary_root,
+            new=sorted((bigtop.primary_root / "target" / "surefire-reports").glob("*.xml")),
+        )
+    )
+    validator, _ = _validator(bigtop)
+    if mutation == "tamper":
+        # Same JSON meaning, different physical bytes: exact host publication
+        # is the live authority, not reparsing a container-controlled body.
+        path.write_bytes(path.read_bytes() + b"\n")
+    else:
+        path.unlink()
+
+    result = validator.parse_test_reports(str(bigtop.project))
+
+    assert result["valid"] is False
+    assert result["receipt_error"] == (
+        "invocation receipt ledger is not host-authorized and complete"
+    )
+    assert result["total_tests"] == 0
+
+
+@pytest.mark.parametrize("mutation", ("tamper", "delete"))
+def test_host_published_assessment_ledger_is_complete_and_exact(
+    bigtop, monkeypatch, mutation
+):
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    receipt = _receipt(
+        "inv-test-1-0001",
+        bigtop.primary_root,
+        new=sorted((bigtop.primary_root / "target" / "surefire-reports").glob("*.xml")),
+    )
+    bigtop.write_receipt(receipt)
+    assessment = ReceiptAssessment(
+        receipt_id=receipt["receipt_id"],
+        typed_code="expectation_met",
+    ).payload()
+    path = bigtop.write_assessment(assessment)
+    validator, _ = _validator(bigtop)
+    if mutation == "tamper":
+        path.write_bytes(path.read_bytes() + b"\n")
+    else:
+        path.unlink()
+
+    result = validator.parse_test_reports(str(bigtop.project))
+
+    assert result["valid"] is False
+    assert result["receipt_error"] == (
+        "evidence assessment ledger is not host-authorized and complete"
+    )
     assert result["total_tests"] == 0
 
 
@@ -385,7 +516,7 @@ def test_corrupt_receipt_blocks_phase_closure(bigtop, monkeypatch):
             "bigtop",
         )
         assert gate.accepted is False, claimed
-        assert "inv-test-1-0001.json" in gate.reason
+        assert "receipt ledger" in gate.reason
 
 
 def test_unavailable_container_parser_refuses_an_unscoped_rollup(bigtop, monkeypatch):
@@ -444,7 +575,7 @@ def test_receipt_missing_required_schema_fields_is_corrupt(bigtop, monkeypatch):
     result = validator.parse_test_reports(str(bigtop.project))
 
     assert result["valid"] is False
-    assert "inv-test-1-0003.json" in result["receipt_error"]
+    assert "receipt ledger" in result["receipt_error"]
 
 
 # ---------------------------------------------------------------------------

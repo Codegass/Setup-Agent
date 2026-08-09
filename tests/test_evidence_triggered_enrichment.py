@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sag.agent.action_intents import ActionIntent, action_fingerprint, canonical_params
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import ReActStep, StepType
 
@@ -67,6 +68,7 @@ def enrichment_engine():
         # decline to refuse, so calls reach the scripted executor.
         engine.run_evidence_state = None
         engine.phase_machine = None
+        engine.successful_states = {}
         engine.loop_memory = None
         engine.output_storage = None
         engine.command_tracker = None
@@ -74,6 +76,7 @@ def enrichment_engine():
             validate_build_artifacts=lambda project_name=None: dict(PHYSICAL_STATE)
         )
         engine.executed_calls = []
+        engine.emitted_action_intents = []
         engine.probed = []
         engine.next_observation_text = "observed"
 
@@ -86,6 +89,7 @@ def enrichment_engine():
         engine._get_physical_validation_state = spying_probe
 
         def fake_execute_tool_call(call):
+            call.action_intent = engine._mint_model_action_intent(call, call.raw_params)
             engine.executed_calls.append(call)
             return SimpleNamespace(
                 call=call,
@@ -105,7 +109,31 @@ def enrichment_engine():
             "execution-1",
             [],
         )
-        engine._emit_control_action_envelope = lambda tool, params: None
+
+        def fake_emit_control_action_envelope(tool, params, *, intent):
+            validated = ActionIntent.model_validate(
+                intent.model_dump(mode="python", round_trip=True)
+            )
+            expected_params = canonical_params(params)
+            assert validated.source == "model"
+            assert validated.intent_id
+            assert validated.tool == tool
+            assert validated.domain_id == engine._action_domain_id(params)
+            assert validated.canonical_params == expected_params
+            assert validated.action_fingerprint == action_fingerprint(
+                domain_id=validated.domain_id,
+                tool=tool,
+                params=expected_params,
+            )
+            assert (
+                validated.trigger_assessment_id,
+                validated.repair_context_id,
+                validated.repair_context_sha256,
+            ) == (None, None, None)
+            engine.emitted_action_intents.append(validated)
+            return None
+
+        engine._emit_control_action_envelope = fake_emit_control_action_envelope
         engine._emit_control_tool_result = lambda **kwargs: None
         engine._apply_tool_execution_loop_effects = lambda execution: None
         engine._missing_required_test_attempt = lambda: None
@@ -194,3 +222,38 @@ def test_the_probe_itself_no_longer_screens_the_observation_text(enrichment_engi
     engine = enrichment_engine()
 
     assert engine._get_physical_validation_state("the requested action finished") == PHYSICAL_STATE
+
+
+@pytest.mark.parametrize(
+    "observation",
+    (
+        "BUILD SUCCESS",
+        "BUILD FAILURE",
+        "build success: package installed",
+        "build failed after compilation",
+    ),
+)
+def test_build_status_words_never_replay_the_tracked_command(enrichment_engine, observation):
+    """Artifact enrichment is read-only even when runner output contains the
+    old replay trigger.  A second execution would have no ActionIntent,
+    InvocationContract, or receipt and could repeat arbitrary side effects."""
+
+    engine = enrichment_engine()
+
+    class ReplayTrapTracker:
+        def get_last_build_command(self):
+            raise AssertionError("physical enrichment must not consult command history")
+
+    engine.command_tracker = ReplayTrapTracker()
+    state = engine._get_physical_validation_state(observation)
+
+    assert state == PHYSICAL_STATE
+    assert "build_replay" not in state
+
+
+def test_physical_validator_exposes_no_command_replay_helpers():
+    from sag.agent.physical_validator import PhysicalValidator
+
+    assert not hasattr(PhysicalValidator, "replay_last_build_command")
+    assert not hasattr(PhysicalValidator, "replay_all_test_commands")
+    assert not hasattr(PhysicalValidator, "validate_project_completely")

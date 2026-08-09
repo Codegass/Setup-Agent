@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "job_settlement_shape",
+  "job_obligation": {
+    "job_id": "f79138aaafbb",
+    "tool": "maven",
+    "requested_action": "verify",
+    "effective_action": "verify",
+    "working_directory": "/workspace/camel",
+    "argv": "/workspace/camel/mvnw --fail-at-end -Dmaven.test.failure.ignore=true verify",
+    "exit_code_path": "/tmp/sag_jobs/f79138aaafbb.log.exit",
+    "settled_receipt_id": null
+  },
+  "terminal_observation": {
+    "exit_marker_present": true,
+    "exit_code": 137,
+    "report_file_count": 7360,
+    "physical_counts": {
+      "executed": 22151,
+      "passed": 20128,
+      "failed": 1,
+      "errors": 1,
+      "skipped": 2021
+    }
+  },
+  "persistence_observation": {
+    "receipt_terminal": false,
+    "settled_receipt_id": null,
+    "legacy_conflict": "job_unsettled:f79138aaafbb"
+  }
+}

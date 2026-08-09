@@ -1,5 +1,4 @@
-import json
-
+from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.internal.env_tool import EnvTool
 from sag.tools.internal.toolchain_manager import (
     ToolchainManager,
@@ -28,6 +27,13 @@ class FakeOverlayOrchestrator:
         if command.startswith("test -x /opt/missing-maven/bin/mvn"):
             return {"exit_code": 0, "output": "MISSING"}
         return {"exit_code": 0, "output": ""}
+
+    def read_file(self, path):
+        return self.files.get(path)
+
+    def write_file(self, path, content):
+        self.files[path] = content
+        return {"success": True, "exit_code": 0, "output": ""}
 
 
 class FakeToolchainOrchestrator:
@@ -103,21 +109,19 @@ def test_a_refused_executable_names_what_is_already_registered():
     only that the path does not exist. What the overlay already knows is the
     cheapest correction available, so it is stated."""
     orchestrator = FakeOverlayOrchestrator()
-    orchestrator.files["/workspace/.setup_agent/env_overlay.json"] = json.dumps(
-        {
-            "tools": {
-                "java": {
-                    "active": "/usr/lib/jvm/java-11-openjdk-arm64/bin/java",
-                    "blocked": [],
-                    "candidates": {
-                        "/usr/lib/jvm/java-11-openjdk-arm64/bin/java": {"version": "11"},
-                        "/usr/lib/jvm/java-17-openjdk-arm64/bin/java": {"version": "17"},
-                    },
-                }
-            }
-        }
+    store = EnvOverlayStore(orchestrator)
+    store.register(
+        "java",
+        "/usr/lib/jvm/java-11-openjdk-arm64/bin/java",
+        version="11",
+        activate=True,
     )
-    tool = EnvTool(orchestrator)
+    store.register(
+        "java",
+        "/usr/lib/jvm/java-17-openjdk-arm64/bin/java",
+        version="17",
+    )
+    tool = EnvTool(orchestrator, store=store)
 
     result = tool.execute(
         action="register",
@@ -134,21 +138,15 @@ def test_a_refused_executable_names_what_is_already_registered():
 
 def test_a_blocked_candidate_is_never_offered_as_a_correction():
     orchestrator = FakeOverlayOrchestrator()
-    orchestrator.files["/workspace/.setup_agent/env_overlay.json"] = json.dumps(
-        {
-            "tools": {
-                "maven": {
-                    "active": None,
-                    "blocked": [{"executable": "/usr/share/maven/bin/mvn", "version": "3.8.7"}],
-                    "candidates": {
-                        "/usr/share/maven/bin/mvn": {"version": "3.8.7"},
-                        "/opt/maven/bin/mvn": {"version": "3.9.9"},
-                    },
-                }
-            }
-        }
+    store = EnvOverlayStore(orchestrator)
+    store.register("maven", "/usr/share/maven/bin/mvn", version="3.8.7")
+    store.register("maven", "/opt/maven/bin/mvn", version="3.9.9")
+    store.block(
+        "maven",
+        "/usr/share/maven/bin/mvn",
+        version="3.8.7",
     )
-    tool = EnvTool(orchestrator)
+    tool = EnvTool(orchestrator, store=store)
 
     assert tool._registered_candidates("maven") == ["/opt/maven/bin/mvn"]
 

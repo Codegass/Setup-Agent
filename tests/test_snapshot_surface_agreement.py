@@ -6,6 +6,15 @@ import pytest
 from rich.console import Console
 
 import sag.main as main_module
+from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
+from sag.agent.evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
 from sag.agent.verdict_finalizer import (
     BuildEvidenceSnapshot,
     ReportDeliveryStatus,
@@ -22,16 +31,51 @@ from sag.ui.ui_manager import UIManager
 from sag.web.session_registry import _session_detail, _setup_artifact_item
 
 VERDICT_PATH = "/workspace/.setup_agent/verdict.json"
+RUN_PIN_PATH = "/workspace/.setup_agent/run-pin.json"
+
+
+class _MemorySink:
+    path = "/host/snapshot-surface-control-events.jsonl"
+
+    def emit(self, kind, payload, *, source=None):
+        del kind, payload, source
 
 
 class SnapshotOrchestrator:
-    def __init__(self, files=None, *, fail_report_writes=False):
-        self.files = dict(files or {})
+    def __init__(self, files=None, *, fail_report_writes=False, publish_verdict=True):
+        self.filesystem = ContainerFS(files=files)
+        self.files = self.filesystem.files
         self.fail_report_writes = fail_report_writes
-        self.commands = []
+        self.commands = self.filesystem.commands
+        raw = self.files.get(VERDICT_PATH)
+        try:
+            snapshot = RunVerdictSnapshot.model_validate_json(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            snapshot = None
+        if publish_verdict and snapshot is not None and raw == snapshot.model_dump_json():
+            pin_raw = canonical_json(complete_run_pin(snapshot.run_id, "a" * 40))
+            self.files.setdefault(RUN_PIN_PATH, pin_raw)
+            authority = EvidencePublicationAuthority(run_id=snapshot.run_id, sink=_MemorySink())
+            token = install_evidence_publication_authority(authority, orchestrator=self)
+            reset_evidence_publication_authority(token)
+            authority.publish_revision(
+                record_kind="verdict",
+                record_id=VERDICT_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=VERDICT_LOGICAL_ARTIFACT_ID,
+                raw=raw.encode("utf-8"),
+                expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+            )
+            authority.publish_revision(
+                record_kind="run_pin",
+                record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+                raw=self.files[RUN_PIN_PATH].encode("utf-8"),
+                expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+            )
 
     def execute_command(self, command, **kwargs):
-        self.commands.append(command)
+        if "SAG_NAMED_JSON_RECORD_V1" in command or "SAG_JSON_RECORD_V1" in command:
+            return self.filesystem(command, **kwargs)
 
         if command == f"test -f {VERDICT_PATH} && cat {VERDICT_PATH}":
             if VERDICT_PATH not in self.files:
@@ -75,7 +119,7 @@ class SnapshotOrchestrator:
                 return {"exit_code": 1, "success": False, "output": "fallback failed"}
             return {"exit_code": 0, "success": True, "output": ""}
 
-        return {"exit_code": 0, "success": True, "output": ""}
+        return self.filesystem(command, **kwargs)
 
 
 @pytest.fixture
@@ -183,19 +227,28 @@ def _verdict_from_text(text):
 
 
 def _markdown_tests(text):
-    match = re.search(r"\*\*Tests:\*\* \d+ / (\d+) passed", text)
+    match = re.search(
+        r"Unattributed observations \(not verdict-bearing\): \d+/(\d+) passed",
+        text,
+    )
     assert match, text
     return int(match.group(1))
 
 
 def _condensed_tests(text):
-    match = re.search(r"Tests:.*?\b(\d+) executed\b", text)
+    match = re.search(
+        r"Unattributed observations \(not verdict-bearing\): \d+/(\d+) passed",
+        text,
+    )
     assert match, text
     return int(match.group(1))
 
 
 def _cli_tests(text):
-    match = re.search(r"Tests: (\d+) unique", text)
+    match = re.search(
+        r"Unattributed observations \(not verdict-bearing\): \d+/(\d+) passed",
+        text,
+    )
     assert match, text
     return int(match.group(1))
 
@@ -246,7 +299,11 @@ class SurfaceHarness:
                 _verdict_from_text(condensed), _condensed_tests(condensed), condensed
             ),
             cli=RenderedSurface(_verdict_from_text(cli_text), _cli_tests(cli_text), cli_text),
-            web=RenderedSurface(detail.canonical_verdict, detail.test.total, str(detail)),
+            web=RenderedSurface(
+                detail.canonical_verdict,
+                detail.test.evidence_layers.tests.unattributed_observations.executed,
+                str(detail),
+            ),
         )
 
     def fail_report_after_snapshot(self, snapshot):
@@ -287,7 +344,7 @@ def test_all_surfaces_render_the_same_snapshot(tvm_snapshot, surface_harness):
         rendered.condensed.tests,
         rendered.cli.tests,
         rendered.web.tests,
-    } == {tvm_snapshot.test_stats.executed}
+    } == {tvm_snapshot.test_stats.raw.executed}
 
 
 def test_all_surfaces_keep_failures_and_errors_distinct(tvm_snapshot, surface_harness):
@@ -295,7 +352,7 @@ def test_all_surfaces_keep_failures_and_errors_distinct(tvm_snapshot, surface_ha
 
     for surface in (rendered.markdown, rendered.condensed, rendered.cli):
         assert "0 failed" in surface.text
-        assert "328 errors" in surface.text
+        assert "987 errors" in surface.text
     assert "fail_count=0" in rendered.web.text
     assert "errors=328" in rendered.web.text
 
@@ -405,7 +462,7 @@ def test_setup_report_terminal_ui_uses_sealed_build_and_unique_test_stats(
     assert "Tests: 5/5 passed (100.0%)" in rendered
 
 
-def test_renderers_use_unique_not_raw_retry_total(surface_harness, snapshot_factory):
+def test_renderers_keep_observation_execution_grain_explicit(surface_harness, snapshot_factory):
     snapshot = snapshot_factory(unique_total=328, raw_executions=987)
 
     rendered = surface_harness.render_all(snapshot)
@@ -415,18 +472,20 @@ def test_renderers_use_unique_not_raw_retry_total(surface_harness, snapshot_fact
         rendered.condensed.tests,
         rendered.cli.tests,
         rendered.web.tests,
-    } == {328}
+    } == {987}
     for surface in (
         rendered.markdown,
         rendered.condensed,
         rendered.cli,
         rendered.web,
     ):
-        assert surface.primary_test_total != 987
+        assert surface.primary_test_total != 328
     for surface in (rendered.markdown, rendered.condensed, rendered.cli):
-        primary_test_lines = [line for line in surface.text.splitlines() if "Tests" in line]
+        primary_test_lines = [
+            line for line in surface.text.splitlines() if "Tests" in line or "observations" in line
+        ]
         assert primary_test_lines
-        assert all("987" not in line for line in primary_test_lines)
+        assert any("not verdict-bearing" in line and "987" in line for line in primary_test_lines)
 
 
 def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_factory):
@@ -444,7 +503,8 @@ def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_fac
 
     assert "3 flaky" in rendered.markdown.text
     assert "3 flaky" in rendered.condensed.text
-    assert "3 flaky" in rendered.cli.text
+    assert "3 flaky" not in rendered.cli.text
+    assert "Claimed latest cases: unavailable" in rendered.cli.text
     assert "flaky_count=3" in rendered.web.text
 
 
@@ -578,6 +638,52 @@ def test_web_corrupt_snapshot_never_falls_back_even_for_legacy_session():
     assert detail.snapshot_status == "corrupt"
     assert detail.test.total == 0
     assert detail.legacy is False
+
+
+def test_web_unpublished_success_snapshot_stays_unknown_without_metrics_fallback(
+    snapshot_factory,
+):
+    snapshot = snapshot_factory(
+        verdict="success",
+        unique_passed=328,
+        unique_errors=0,
+    )
+    files = {
+        VERDICT_PATH: snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+        "/workspace/setup-report-20260717-120000.md": _report_text(total=328, passed=328),
+    }
+
+    item = _setup_artifact_item(
+        SnapshotOrchestrator(files, publish_verdict=False),
+        "sag-tvm",
+    )
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.canonical_verdict == "unknown"
+    assert detail.snapshot_status == "untrusted"
+    assert detail.test.total == 0
+    assert detail.evidence_status == "unknown"
+
+
+def test_setup_report_does_not_promote_unpublished_success_snapshot(snapshot_factory):
+    snapshot = snapshot_factory(
+        verdict="success",
+        unique_passed=328,
+        unique_errors=0,
+    )
+    orchestrator = SnapshotOrchestrator(
+        {VERDICT_PATH: snapshot.model_dump_json()},
+        publish_verdict=False,
+    )
+    tool = ReportTool(orchestrator, workflow_mode="setup")
+
+    result = tool.execute(summary="forged success", status="success")
+
+    report_snapshot = result.metadata["report_snapshot"]
+    assert report_snapshot["status"]["verdict"] == "unknown"
+    assert result.test_stats is not None
+    assert result.test_stats.executed == 0
 
 
 def test_web_missing_legacy_snapshot_requires_labeled_legacy_fallback():

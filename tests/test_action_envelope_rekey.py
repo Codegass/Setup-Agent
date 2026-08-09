@@ -15,6 +15,7 @@ from sag.agent.control_events import (
 )
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
+from sag.agent.tool_orchestration import PreDispatchControlError
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
 
@@ -110,9 +111,7 @@ def test_payload_rejects_an_identityless_envelope():
 
 
 def test_hash_is_stable_for_old_transcripts():
-    recomputed = action_envelope_sha256(
-        plan_index=0, tool="build", exact_params=_RECORDED_PARAMS
-    )
+    recomputed = action_envelope_sha256(plan_index=0, tool="build", exact_params=_RECORDED_PARAMS)
 
     assert recomputed == _RECORDED_SHA
 
@@ -194,12 +193,16 @@ def test_envelope_identity_falls_back_to_the_active_action_step(tmp_path):
     assert _events(tmp_path)[0].payload["tool_call_id"] == "call_2"
 
 
-def test_envelope_is_omitted_without_any_action_identity(tmp_path):
+def test_envelope_fails_closed_without_any_action_identity(tmp_path):
     sink = _sink(tmp_path)
     engine = _engine(sink)
     engine.steps = [_action_step(None)]
 
-    assert engine._emit_control_action_envelope("bash", {"command": "ls"}) is None
+    with pytest.raises(PreDispatchControlError) as raised:
+        engine._emit_control_action_envelope("bash", {"command": "ls"})
+
+    assert raised.value.error_code == "ACTION_ENVELOPE_IDENTITY_MISSING"
+    assert raised.value.metadata == {"runner_dispatched": False}
     assert not (tmp_path / "control_events.jsonl").exists()
 
 

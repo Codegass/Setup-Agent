@@ -27,15 +27,19 @@ def test_legacy_maven_call_aliases_to_build():
 
     class FakeBuild:
         def _get_parameters_schema(self):
-            return {"type": "object", "properties": {"action": {}, "args": {},
-                                                     "working_directory": {}, "timeout": {}}}
+            return {
+                "type": "object",
+                "properties": {"action": {}, "args": {}, "working_directory": {}, "timeout": {}},
+            }
 
     mgr = ToolParameterNormalizer(
         tools={"build": FakeBuild()},
         successful_states={},
         repository_url=None,
         logger=SimpleNamespace(
-            warning=lambda *a, **k: None, info=lambda *a, **k: None, error=lambda *a, **k: None,
+            warning=lambda *a, **k: None,
+            info=lambda *a, **k: None,
+            error=lambda *a, **k: None,
         ),
     )
     name, params = mgr.resolve_legacy_alias("maven", {"command": "test", "working_directory": "/w"})
@@ -108,7 +112,7 @@ def test_legacy_maven_canonical_command_wins_over_goals_alias():
     )
 
     assert name == "build"
-    assert params["action"] == "package"
+    assert params["action"] == "test"
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +159,10 @@ def _agent_for_registration(phase_machine=None):
         project_name="demo",
         execute_command=lambda command, **kwargs: {"exit_code": 0, "output": ""},
     )
-    agent.context_manager = SimpleNamespace(
-        contexts_dir=Path("/workspace/.setup_agent/contexts")
-    )
+    agent.context_manager = SimpleNamespace(contexts_dir=Path("/workspace/.setup_agent/contexts"))
     agent.phase_machine = phase_machine
     agent.context_journal = None
+    agent.control_event_sink = None
     agent.project_name = "demo"
     return agent
 

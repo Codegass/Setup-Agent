@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
+from sag.agent.action_intents import ActionIntent
 from sag.agent.project_fact_projection import (
     render_project_analysis_error,
     render_project_fact_sheet,
@@ -38,16 +39,12 @@ ToolExecutionStatus = Literal[
     "failure",
     "missing_tool",
     "validation_failed",
-    "recovery_attempted",
-    "recovered",
-    "recovery_failed",
     "exception",
 ]
 ToolLifecycleEventType = Literal[
     "tool_start",
     "tool_parameters_fixed",
     "tool_result",
-    "tool_recovery",
     "tool_error",
 ]
 ToolLifecycleLevel = Literal["debug", "info", "warning", "error", "success"]
@@ -73,6 +70,26 @@ class ToolCall:
     raw_action_text: Optional[str] = None
     source_step_index: Optional[int] = None
     model_used: Optional[str] = None
+    # The engine assigns executable identity after public-parameter
+    # validation and before dispatch.  A repair submission is model data; the
+    # resulting ActionIntent provenance/id/fingerprint are never model-owned.
+    action_intent: Optional[ActionIntent] = None
+    repair_intent_submission: Any = None
+
+
+class PreDispatchControlError(RuntimeError):
+    """Typed fail-closed refusal raised by the engine's pre-dispatch hook."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = str(error_code or "PRE_DISPATCH_CONTROL_FAILED")
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,17 +98,6 @@ class ToolExecutionRecord:
     invocation_status: InvocationStatus
     operation_outcome: OperationOutcome
     timestamp: str
-
-
-@dataclass(slots=True)
-class RecoveryDecision:
-    should_recover: bool
-    strategy: Optional[str] = None
-    guidance: Optional[str] = None
-    replacement_result: Optional[ToolResult] = None
-    replacement_params: Optional[Dict[str, Any]] = None
-    replacement_tool_name: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -104,8 +110,6 @@ class ToolExecution:
     executed_params: Optional[Dict[str, Any]] = None
     duration_ms: Optional[float] = None
     observation_text: str = ""
-    recovery_applied: bool = False
-    recovery_strategy: Optional[str] = None
     attempted_execution: bool = False
     actual_executions: list[ActualToolExecution] = field(default_factory=list)
     parameter_fixes: list[ParameterFix] = field(default_factory=list)
@@ -141,16 +145,6 @@ def _format_maven_version_contract(result: ToolResult) -> str:
 
     if metadata.get("compatible_maven_candidate") is None:
         lines.append("Compatible Maven candidate: none")
-
-    raw_requirement = requirement.get("raw")
-    if raw_requirement:
-        lines.append(
-            "Next action: provide, register, and activate a Maven executable that satisfies "
-            f"{raw_requirement} via project(action='env', tool='maven', executable=..., "
-            f"requirement='{raw_requirement}'), then retry the build with "
-            f"maven_version_requirement='{raw_requirement}'; a successful project env result "
-            "confirms the measured executable is active"
-        )
 
     return "\n".join(lines)
 
@@ -202,10 +196,13 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
             if result.metadata.get("dispatch_status") == "liveness_unknown_detached":
                 formatted = (
                     f"⏳ {tool_name} dispatched — command liveness is unknown; "
-                    f"poll existing job {result.poll_ref}"
+                    f"the controller owns reconciliation for existing job {result.poll_ref}"
                 )
             else:
-                formatted = f"⏳ {tool_name} dispatched — command still running in background"
+                formatted = (
+                    f"⏳ {tool_name} dispatched — controller job barrier active; "
+                    "command still running"
+                )
         elif result.succeeded:
             formatted = f"✅ {tool_name} executed successfully"
         else:
@@ -245,7 +242,8 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
                 formatted += f"\n📏 Output truncated: {original_len} → {truncated_len} chars"
 
     else:
-        # For failed results, show error and suggestions
+        # Failed results expose error evidence. Tool-authored suggestions stay
+        # in historical/UI records and never enter the model transcript.
         error_msg = (
             project_error_projection.get("message") or result.error or "Unknown error occurred"
         )
@@ -265,11 +263,11 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         if tool_name in ("maven", "build"):
             formatted += _format_maven_version_contract(result)
 
-        suggestions = project_error_projection.get("suggestions") or result.suggestions
-        if suggestions:
-            formatted += f"\n\nSuggestions:\n" + "\n".join(
-                f"• {suggestion}" for suggestion in suggestions[:3]
-            )
+        # A tool result is evidence, not a harness-authored repair plan.  The
+        # public schemas in the system prompt teach neutral syntax; after a
+        # rejected claim, RepairContext exposes facts, constraints, and action
+        # kinds.  Result.suggestions remain in historical/UI records, but no
+        # tool class may smuggle a selected next call into the model transcript.
 
         if result.error_code:
             formatted += f"\nError code: {result.error_code}"
@@ -311,7 +309,6 @@ class ToolOrchestrator:
         logger: Any = None,
     ):
         from sag.agent.tool_parameters import ToolParameterNormalizer
-        from sag.agent.tool_recovery import ToolRecoveryHandler
 
         self.tools = tools
         self.context_manager = context_manager
@@ -332,15 +329,6 @@ class ToolOrchestrator:
             successful_states=self.successful_states,
             repository_url=self.repository_url,
             repository_ref=self.repository_ref,
-            logger=self.logger,
-        )
-        self.recovery_handler = ToolRecoveryHandler(
-            tools=self.tools,
-            context_manager=self.context_manager,
-            successful_states=self.successful_states,
-            repository_url=self.repository_url,
-            repository_ref=self.repository_ref,
-            add_system_guidance=self.add_system_guidance,
             logger=self.logger,
         )
 
@@ -386,24 +374,6 @@ class ToolOrchestrator:
             )
         return flattened
 
-    def _recommended_workdir(self, action: str) -> Optional[str]:
-        """Analyzer's recommended reactor root for a build/test call, or None.
-
-        Turns the build_recommendation (env summary) from advisory prose into the
-        enforced working_directory default when the model omits one — test_root for
-        the test phase, else build_root. Best-effort: any failure yields None so the
-        caller keeps the existing /workspace default.
-        """
-        try:
-            trunk = self.context_manager.load_trunk_context()
-            rec = (getattr(trunk, "environment_summary", None) or {}).get("build_recommendation")
-        except Exception:
-            return None
-        if not rec:
-            return None
-        root = rec.get("test_root") if action == "test" else rec.get("build_root")
-        return root or None
-
     def execute(self, call: ToolCall) -> ToolExecution:
         if self.output_storage is None:
             return self._execute(call)
@@ -418,18 +388,6 @@ class ToolOrchestrator:
     def _execute(self, call: ToolCall) -> ToolExecution:
         started_at = time.perf_counter()
         raw_params = call.raw_params or {}
-        workdir_fields = (
-            "working_directory",
-            "cwd",
-            "workdir",
-            "working_dir",
-            "work_dir",
-            "dir",
-            "directory",
-        )
-        model_omitted_workdir = not any(
-            str(raw_params.get(field) or "").strip() for field in workdir_fields
-        )
         if call.name not in self.tools:
             # Legacy tool names (model drift) map onto their stage-1 successors
             # before any lookup, so old names execute instead of failing.
@@ -489,32 +447,10 @@ class ToolOrchestrator:
                     "status": execution.status,
                     "raw_params": call.raw_params,
                     "execution_signature": start_signature,
-                    **self._tool_error_metadata(
-                        result, recovery_attempted=False, category="validation"
-                    ),
+                    **self._tool_error_metadata(result, category="validation"),
                 },
             )
             return execution
-
-        if call.name == "build" and model_omitted_workdir:
-            action = str((call.raw_params or {}).get("action") or "").strip().lower()
-            recommended_workdir = self._recommended_workdir(action)
-            if recommended_workdir:
-                before = (call.raw_params or {}).get("working_directory")
-                call.raw_params = {
-                    **(call.raw_params or {}),
-                    "working_directory": recommended_workdir,
-                }
-                call.parameter_fixes = [
-                    *call.parameter_fixes,
-                    ParameterFix(
-                        field="working_directory",
-                        before=before,
-                        after=recommended_workdir,
-                        reason="analyzer-recommended reactor root (model omitted working_directory)",
-                        source="state_injection",
-                    ),
-                ]
 
         parameter_fixes = call.parameter_fixes
         if call.validated_params is None:
@@ -559,7 +495,7 @@ class ToolOrchestrator:
                         "status": execution.status,
                         "raw_params": call.raw_params,
                         "execution_signature": start_signature,
-                        **self._tool_error_metadata(result, recovery_attempted=False),
+                        **self._tool_error_metadata(result),
                     },
                 )
                 return execution
@@ -590,7 +526,62 @@ class ToolOrchestrator:
             try:
                 control_envelope_id = self.before_tool_execute(call, validated_params)
             except Exception as exc:
-                self.logger.warning(f"Before-execute hook failed for {call.name}: {exc}")
+                # Intent identity and authority are part of the dispatch
+                # boundary.  Continuing after this refusal would execute an
+                # unowned call and let a schema-invalid repair masquerade as
+                # material progress.
+                control_error = (
+                    exc
+                    if isinstance(exc, PreDispatchControlError)
+                    else PreDispatchControlError(
+                        f"Pre-dispatch control failed: {type(exc).__name__}",
+                        error_code="PRE_DISPATCH_CONTROL_FAILED",
+                        metadata={"exception_type": type(exc).__name__},
+                    )
+                )
+                result = ToolResult.completed_failure(
+                    output="",
+                    error=str(control_error),
+                    error_code=control_error.error_code,
+                    metadata={
+                        "failure_category": "control",
+                        "runner_dispatched": False,
+                        **control_error.metadata,
+                    },
+                )
+                duration_ms = self._duration_since(started_at)
+                observation_text = format_tool_result(call.name, result)
+                execution = ToolExecution(
+                    call=call,
+                    result=result,
+                    status="validation_failed",
+                    raw_params=call.raw_params,
+                    validated_params=validated_params,
+                    executed_params=None,
+                    duration_ms=duration_ms,
+                    observation_text=observation_text,
+                    attempted_execution=False,
+                    parameter_fixes=parameter_fixes,
+                    metadata={
+                        "execution_signature": signature,
+                        "pre_dispatch_refusal": control_error.error_code,
+                    },
+                )
+                self._emit(
+                    "tool_error",
+                    call,
+                    message=observation_text,
+                    level="error",
+                    metadata={
+                        "status": execution.status,
+                        "execution_signature": signature,
+                        **self._tool_error_metadata(
+                            result,
+                            category="validation",
+                        ),
+                    },
+                )
+                return execution
 
         escaped_exception_result: Optional[ToolResult] = None
         try:
@@ -616,80 +607,11 @@ class ToolOrchestrator:
             result,
         )
         executed_params = validated_params
-        recovery_applied = False
-        recovery_strategy: Optional[str] = None
-        recovery_metadata: Optional[Dict[str, Any]] = None
         status = (
             "exception"
             if escaped_exception_result is not None
             else self._result_execution_status(result)
         )
-
-        if result.is_terminal and result.operation_outcome is OperationOutcome.FAILED:
-            try:
-                decision = self.recovery_handler.recover(call.name, validated_params, result)
-            except OutputPersistenceError as exc:
-                raise exc.attach_actual_executions(actual_executions)
-            recovery_metadata = dict(decision.metadata)
-            recovery_metadata.setdefault("attempted", decision.should_recover)
-            recovery_metadata.setdefault("success", False)
-            recovery_metadata.setdefault("message", decision.guidance)
-            recovery_metadata.setdefault("strategy", decision.strategy)
-
-            if decision.should_recover:
-                replacement_success = (
-                    decision.replacement_result.succeeded
-                    if decision.replacement_result is not None
-                    else False
-                )
-                recovery_params = decision.replacement_params or validated_params
-                self._emit(
-                    "tool_recovery",
-                    call,
-                    message=decision.guidance or "Tool recovery attempted",
-                    level="success" if replacement_success else "error",
-                    metadata={
-                        "recovery_strategy": decision.strategy,
-                        "attempted": True,
-                        "success": replacement_success,
-                        "guidance": decision.guidance,
-                        "replacement_result_succeeded": (
-                            decision.replacement_result.succeeded
-                            if decision.replacement_result is not None
-                            else None
-                        ),
-                        "recovery_params": recovery_params,
-                        "parameter_diff": self._parameter_diff(validated_params, recovery_params),
-                    },
-                )
-
-                recovery_strategy = decision.strategy
-                if decision.replacement_result is not None:
-                    result = decision.replacement_result
-                    executed_params = recovery_params
-                    guidance_only = bool(recovery_metadata.get("guidance_only"))
-                    if guidance_only:
-                        status = "recovery_attempted"
-                    else:
-                        actual_executions.extend(
-                            self._flatten_actual_execution(
-                                decision.replacement_tool_name or call.name,
-                                recovery_params,
-                                result,
-                                _seen_executions={
-                                    actual.execution_id: actual for actual in actual_executions
-                                },
-                            )
-                        )
-                        status = (
-                            "recovered"
-                            if result.operation_outcome is OperationOutcome.SUCCESS
-                            else "recovery_failed"
-                        )
-                    recovery_applied = True
-                    recovery_metadata["success"] = result.succeeded
-                else:
-                    status = "recovery_attempted"
 
         self._track_tool_execution(signature, result)
         if result.succeeded:
@@ -700,11 +622,6 @@ class ToolOrchestrator:
         execution_metadata: Dict[str, Any] = {"execution_signature": signature}
         if control_envelope_id is not None:
             execution_metadata["control_envelope_id"] = control_envelope_id
-        if recovery_metadata is not None:
-            execution_metadata["recovery"] = recovery_metadata
-        if recovery_strategy:
-            execution_metadata["recovery_strategy"] = recovery_strategy
-
         execution = ToolExecution(
             call=call,
             result=result,
@@ -714,8 +631,6 @@ class ToolOrchestrator:
             executed_params=executed_params,
             duration_ms=duration_ms,
             observation_text=observation_text,
-            recovery_applied=recovery_applied,
-            recovery_strategy=recovery_strategy,
             attempted_execution=True,
             actual_executions=actual_executions,
             parameter_fixes=call.parameter_fixes,
@@ -740,14 +655,9 @@ class ToolOrchestrator:
             "duration_ms": duration_ms,
             "error_code": result.error_code,
             "executed_params": executed_params,
-            "recovery_applied": recovery_applied,
             "execution_signature": signature,
             **self._result_lifecycle_metadata(result),
         }
-        if recovery_strategy:
-            event_metadata["recovery_strategy"] = recovery_strategy
-        if recovery_metadata is not None:
-            event_metadata["recovery"] = recovery_metadata
         if execution.metadata.get("force_thinking_next"):
             event_metadata["force_thinking_next"] = True
         if execution.metadata.get("invalidate_trunk_cache"):
@@ -764,9 +674,6 @@ class ToolOrchestrator:
                     "execution_signature": signature,
                     **self._tool_error_metadata(
                         escaped_exception_result,
-                        recovery_attempted=bool(
-                            recovery_metadata and recovery_metadata.get("attempted")
-                        ),
                     ),
                 },
             )
@@ -790,7 +697,6 @@ class ToolOrchestrator:
         self,
         result: ToolResult,
         *,
-        recovery_attempted: bool,
         category: Optional[str] = None,
     ) -> Dict[str, Any]:
         return {
@@ -799,7 +705,6 @@ class ToolOrchestrator:
             "category": category or result.metadata.get("failure_category") or "execution",
             "suggestions": list(result.suggestions),
             "original_error": result.error,
-            "recovery_attempted": recovery_attempted,
         }
 
     def _unknown_tool_suggestions(self, requested_tool: str) -> list[str]:
@@ -812,17 +717,6 @@ class ToolOrchestrator:
         if close_matches:
             suggestions.insert(0, f"Did you mean: {', '.join(close_matches)}")
         return suggestions
-
-    def _parameter_diff(
-        self, before: Dict[str, Any], after: Dict[str, Any]
-    ) -> Dict[str, Dict[str, Any]]:
-        diff = {}
-        for key in sorted(set(before) | set(after)):
-            before_value = before.get(key)
-            after_value = after.get(key)
-            if before_value != after_value:
-                diff[key] = {"before": before_value, "after": after_value}
-        return diff
 
     @staticmethod
     def _is_dispatch_poll_signature(signature: str) -> bool:

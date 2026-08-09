@@ -31,24 +31,41 @@ import json
 import shlex
 
 import pytest
+from test_container_io import FakeContainer
+from test_invocation_receipts import receipts_written as atomic_receipts_written
 
+from sag.agent.action_intents import action_fingerprint
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.evidence_assessments import (
     ASSESSMENT_DIR,
-    ASSESSMENT_HEREDOC,
     BLOCKED_CLASS_CODES,
     CAPABILITY_PATTERNS,
     CAPABILITY_PREFIX,
+    CONTROL_STAGES,
     FALSIFIER_PREFIX,
+    ControlAssessment,
     ReceiptAssessment,
     assess_dispatch,
     assess_receipt,
     assessment_id,
     capability_absences,
+    read_assessments,
+    read_live_assessment_ledger,
     read_receipt,
+    validate_assessment_v2,
+    write_assessment,
+)
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    evidence_publication_authority_for,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+    unavailable_evidence_publication_authority,
 )
 from sag.agent.invocation_contracts import (
+    ARGV_EXECUTION_BINDING,
     CONTRACT_DIR,
-    CONTRACT_HEREDOC,
     DIRECT_FALSIFIERS,
     action_context,
     build_contract,
@@ -58,50 +75,116 @@ from sag.agent.invocation_contracts import (
     expected_observations,
     freeze_contract,
 )
-from sag.agent.invocation_receipts import RECEIPT_DIR, RECEIPT_HEREDOC, record_invocation
+from sag.agent.invocation_receipts import RECEIPT_DIR, record_invocation, write_receipt_result
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 SHA = "9f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
 OTHER_SHA = "0a1b2c3d4e5f60718293a4b5c6d7e8f901112131"
-CURRENT = {"target_sha": SHA, "config_fingerprint": "cfg-7"}
+CURRENT = {
+    "target_sha": SHA,
+    "survey_fingerprint": "survey-7",
+    "config_fingerprint": "cfg-7",
+    "document_map_fingerprint": "map-7",
+    "domain_id": "/workspace/proj",
+    "fact_epoch": 7,
+}
 FALSIFIED = f"{FALSIFIER_PREFIX}empty_delta_despite_success"
+WIRED_REQUIREMENTS = {
+    "survey": {
+        "survey_fingerprint": "survey-7",
+        "config_fingerprint": "cfg-7",
+        "document_map_fingerprint": "map-7",
+    },
+    "build_domains": [{"root": "/workspace/proj"}],
+    "domain_facts": [
+        {
+            "domain_id": "dom-proj",
+            "root": "/workspace/proj",
+            "fact_epoch": 7,
+        }
+    ],
+}
 
 # Marks a key the fixture must LEAVE OUT, so a test can state "the receipt
 # knows nothing about this" instead of "it knows None".
 ABSENT = object()
 
 
+def _atomic_write_tokens(command):
+    """The shared writer's bounded command shape, or ``None`` otherwise."""
+    tokens = (
+        shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
+    )
+    if (
+        tokens[:3] == ["mkdir", "-p", "--"]
+        or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
+        or tokens[:2] == ["base64", "--decode"]
+        or tokens[:3] == ["mv", "-f", "--"]
+        or (
+            tokens[:2] == ["python3", "-c"]
+            and (
+                "hashlib.sha256" in tokens[2]
+                or "json.load" in tokens[2]
+                or "fcntl.flock" in tokens[2]
+            )
+        )
+    ):
+        return tokens
+    return None
+
+
 def contract_for(action="test", **overrides):
     """One frozen contract for `action`, with the Stage C typed expectations."""
-    contract = build_contract(
-        envelope_id="envelope-000001",
-        tool="build",
-        params={"action": action, "working_directory": "/workspace/proj"},
-        effective_action=action,
-        expected_cwd="/workspace/proj",
-        expected_argv="--fail-at-end verify",
-        target_sha=SHA,
-        config_fingerprint="cfg-7",
-        expected_observations=expected_observations(action),
-        direct_falsifiers=direct_falsifiers(action),
-    )
+    params = {"action": action, "working_directory": "/workspace/proj"}
+    domain_id = "test:/workspace/proj"
+    values = {
+        "run_id": "run-pytest",
+        "envelope_id": "envelope-000001",
+        "tool": "build",
+        "params": params,
+        "effective_tool": "maven",
+        "effective_action": action,
+        "expected_cwd": "/workspace/proj",
+        "expected_argv": "--fail-at-end verify",
+        "execution_binding": ARGV_EXECUTION_BINDING,
+        "intent_source": "model",
+        "intent_id": f"intent-receipt-assessor-{action}",
+        "intent_domain_id": domain_id,
+        "intent_exact_params": params,
+        "action_fingerprint": action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+        "target_sha": SHA,
+        "survey_fingerprint": "survey-7",
+        "config_fingerprint": "cfg-7",
+        "document_map_fingerprint": "map-7",
+        "domain_id": "/workspace/proj",
+        "fact_epoch": 7,
+        "expected_observations": expected_observations(action),
+        "direct_falsifiers": direct_falsifiers(action),
+    }
     for key, value in overrides.items():
         if value is ABSENT:
-            contract.pop(key, None)
+            values.pop(key, None)
         else:
-            contract[key] = value
-    return contract
+            values[key] = value
+    return build_contract(**values)
 
 
-def receipt_for(**overrides):
+def receipt_for(*, action="test", **overrides):
     """One finalized receipt: exit 0, no report delta, compliant, fresh."""
+    contract = contract_for(action)
     receipt = {
         "schema_version": 2,
         "receipt_id": "inv-maven-1-0001",
+        "run_id": contract["run_id"],
         "tool": "maven",
-        "requested_action": "test",
-        "effective_action": "verify",
+        "requested_action": action,
+        "effective_action": action,
         "argv": "mvn --fail-at-end verify",
         "working_directory": "/workspace/proj",
         "actual_cwd": "/workspace/proj",
@@ -109,7 +192,14 @@ def receipt_for(**overrides):
         "outcome": "completed",
         "report_delta": {"new": [], "changed": []},
         "target_sha": SHA,
+        "survey_fingerprint": "survey-7",
         "config_fingerprint": "cfg-7",
+        "document_map_fingerprint": "map-7",
+        "domain_id": "/workspace/proj",
+        "fact_epoch": 7,
+        "contract_id": contract["contract_id"],
+        "contract_hash": contract["contract_hash"],
+        "execution_binding": ARGV_EXECUTION_BINDING,
         "compliance": "exact",
     }
     for key, value in overrides.items():
@@ -118,6 +208,23 @@ def receipt_for(**overrides):
         else:
             receipt[key] = value
     return receipt
+
+
+def build_action_context(envelope_id, *, action):
+    params = {"action": action, "working_directory": "/workspace/proj"}
+    domain_id = "test:/workspace/proj"
+    return action_context(
+        envelope_id=envelope_id,
+        intent_source="model",
+        intent_id=f"intent-{envelope_id}",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+    )
 
 
 def wrote_reports(paths=("/workspace/proj/target/surefire-reports/TEST-a.xml",)):
@@ -129,27 +236,209 @@ def skipped(reason, node_id="suite#case"):
     return {"testcase_outcomes": {"nodes": [node]}}
 
 
-def _written(commands, directory, heredoc):
+def _written(commands, directory):
+    filesystem = FakeContainer()
     payloads = []
     for command in commands:
-        if directory not in command or heredoc not in command:
+        tokens = _atomic_write_tokens(command)
+        if tokens is None:
             continue
-        _, _, rest = command.partition("\n")
-        body, _, _ = rest.partition(f"\n{heredoc}")
-        payloads.append(json.loads(body))
+        filesystem.execute_command(command)
+        if tokens[:3] == ["mv", "-f", "--"] and tokens[4].startswith(f"{directory}/"):
+            payloads.append(json.loads(filesystem.files[tokens[4]]))
     return payloads
 
 
+def test_gate_is_a_typed_control_assessment_stage():
+    assessment = ControlAssessment(
+        event_or_intent_id="ctl-phase-claim-0001",
+        stage="gate",
+        typed_code="phase_claim_refused",
+    )
+
+    assert "gate" in CONTROL_STAGES
+    assert assessment.payload()["stage"] == "gate"
+    assert write_assessment(ContainerFS(), assessment) is True
+
+
+def test_assessment_writer_requires_host_publication_and_replay_repairs_it(
+    bind_host_evidence_publication_authority,
+):
+    execute = ContainerFS()
+    assessment = ReceiptAssessment(
+        receipt_id="inv-maven-host-publication-0001",
+        typed_code="expectation_unobserved",
+    )
+    token = install_evidence_publication_authority(
+        unavailable_evidence_publication_authority("publication probe")
+    )
+    try:
+        assert write_assessment(execute, assessment) is False
+    finally:
+        reset_evidence_publication_authority(token)
+
+    identifier = assessment.assessment_id
+    body = json.dumps(assessment.payload(), sort_keys=True)
+    assert execute.files[f"{ASSESSMENT_DIR}/{identifier}.json"] == body
+    assert write_assessment(execute, assessment) is True
+    assert bind_host_evidence_publication_authority.verify_bytes(
+        record_kind="receipt_assessment",
+        record_id=identifier,
+        raw=body.encode("utf-8"),
+    ).authorized
+
+
+@pytest.mark.parametrize(
+    "existing_body",
+    (
+        lambda payload: json.dumps(payload, indent=2, sort_keys=True),
+        lambda payload: json.dumps(payload, sort_keys=True)[:-1]
+        + ',"typed_code":"expectation_unobserved"}',
+    ),
+)
+def test_assessment_replay_never_publishes_noncanonical_equal_semantics(
+    existing_body,
+    bind_host_evidence_publication_authority,
+):
+    assessment = ReceiptAssessment(
+        receipt_id="inv-maven-noncanonical-assessment-0001",
+        typed_code="expectation_unobserved",
+    )
+    payload = assessment.payload()
+    body = existing_body(payload)
+    execute = ContainerFS(
+        {f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json": body}
+    )
+
+    assert write_assessment(execute, assessment) is False
+    assert not bind_host_evidence_publication_authority.verify_bytes(
+        record_kind="receipt_assessment",
+        record_id=assessment.assessment_id,
+        raw=body.encode("utf-8"),
+    ).authorized
+
+
+def test_persisted_assessment_union_recomputes_identity_shape_and_filename():
+    receipt = ReceiptAssessment(
+        receipt_id="inv-maven-strict-assessment-0001",
+        typed_code="expectation_unobserved",
+        detail="typed evidence missing",
+    ).payload()
+    control = ControlAssessment(
+        event_or_intent_id="gate-strict-assessment-0001",
+        stage="gate",
+        typed_code="phase_claim_refused",
+        blocker_owner="harness",
+        observed_facts={"receipt_count": 0},
+        evidence_refs=("control-gate-0001",),
+    ).payload()
+
+    assert validate_assessment_v2(
+        receipt,
+        expected_id=receipt["assessment_id"],
+    ) == receipt
+    # A gate may carry more precise ownership than the generic typed-code
+    # fallback; reconstruction must preserve that closed-enum value exactly.
+    assert validate_assessment_v2(
+        control,
+        expected_id=control["assessment_id"],
+    ) == control
+
+    invalid = []
+    for mutation in (
+        lambda body: body.update(schema_version=1),
+        lambda body: body.update(assessment_id="asm-forged-00000000"),
+        lambda body: body.update(blocker_owner="operator"),
+        lambda body: body.update(extra="unknown"),
+        lambda body: body.update(event_or_intent_id="gate-mixed-union"),
+        lambda body: body.update(detail=" typed evidence missing "),
+    ):
+        body = json.loads(json.dumps(receipt))
+        mutation(body)
+        invalid.append(body)
+    bad_control_stage = json.loads(json.dumps(control))
+    bad_control_stage["stage"] = "future-stage"
+    invalid.append(bad_control_stage)
+    duplicate_refs = json.loads(json.dumps(control))
+    duplicate_refs["evidence_refs"] = ["control-gate-0001", "control-gate-0001"]
+    invalid.append(duplicate_refs)
+
+    for body in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            validate_assessment_v2(body)
+    with pytest.raises(ValueError, match="filename"):
+        validate_assessment_v2(receipt, expected_id="asm-other-00000000")
+
+
+def test_live_assessment_reader_requires_exact_host_publication_and_complete_set(
+    bind_host_evidence_publication_authority,
+):
+    execute = ContainerFS()
+    assessment = ReceiptAssessment(
+        receipt_id="inv-maven-live-assessment-0001",
+        typed_code="expectation_unobserved",
+    )
+    assert write_assessment(execute, assessment) is True
+    expected = assessment.payload()
+
+    ledger = read_live_assessment_ledger(execute)
+    assert ledger.complete is True
+    assert ledger.conflict is None
+    assert [record.payload for record in ledger.records] == [expected]
+    assert read_assessments(execute) == [expected]
+
+    path = f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json"
+    exact = execute.files[path]
+    execute.files[path] = exact.replace("expectation_unobserved", "expectation_unmet")
+    tampered = read_live_assessment_ledger(execute)
+    assert tampered.complete is False
+    assert tampered.conflict is not None
+    assert read_assessments(execute) == []
+
+    execute.files[path] = exact
+    del execute.files[path]
+    deleted = read_live_assessment_ledger(execute)
+    assert deleted.complete is False
+    assert deleted.conflict is not None
+    assert read_assessments(execute) == []
+
+
+def test_runtime_postcondition_is_a_typed_control_assessment_stage():
+    assessment = ControlAssessment(
+        event_or_intent_id="ctl-jdk-runtime-0001",
+        stage="postcondition",
+        typed_code="java_runtime_requirement_conflict",
+    )
+
+    assert "postcondition" in CONTROL_STAGES
+    assert assessment.payload()["stage"] == "postcondition"
+    assert write_assessment(ContainerFS(), assessment) is True
+
+
+def test_gate_control_assessment_persists_observed_facts_and_provenance():
+    assessment = ControlAssessment(
+        event_or_intent_id="gate-build-1",
+        stage="gate",
+        typed_code="BUILD_ATTEMPT_REQUIRED",
+        blocker_owner="unknown",
+        observed_facts={"terminal_build_receipts": 0},
+        evidence_refs=("control:gate:build-1:BUILD_ATTEMPT_REQUIRED",),
+    )
+
+    assert assessment.payload()["observed_facts"] == {"terminal_build_receipts": 0}
+    assert assessment.payload()["evidence_refs"] == ["control:gate:build-1:BUILD_ATTEMPT_REQUIRED"]
+
+
 def assessments_written(commands):
-    return _written(commands, ASSESSMENT_DIR, ASSESSMENT_HEREDOC)
+    return _written(commands, ASSESSMENT_DIR)
 
 
 def contracts_written(commands):
-    return _written(commands, CONTRACT_DIR, CONTRACT_HEREDOC)
+    return _written(commands, CONTRACT_DIR)
 
 
 def receipts_written(commands):
-    return _written(commands, RECEIPT_DIR, RECEIPT_HEREDOC)
+    return atomic_receipts_written(commands)
 
 
 class ContainerFS:
@@ -166,12 +455,43 @@ class ContainerFS:
         self.sha = sha
         self.markers = set(markers)
         self.commands = []
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
 
     def __call__(self, command, **kwargs):
         return self.execute_command(command, **kwargs)
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            target = shlex.split(command.partition(";")[0][len("file=") :])[0]
+            records = (
+                [(target.rsplit("/", 1)[-1], self.files[target])]
+                if target in self.files
+                else []
+            )
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
+        if command.startswith("for file in ") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            quoted_glob = command.partition(" in ")[2].partition("; do")[0]
+            target = shlex.split(quoted_glob)[0]
+            prefix = target[: -len("*.json")]
+            records = [
+                (path.rsplit("/", 1)[-1], body)
+                for path, body in sorted(self.files.items())
+                if path.startswith(prefix) and path.endswith(".json")
+            ]
+            return {"success": True, "exit_code": 0, "output": frame_named_json_record_stream(records)}
+        if "__SAG_FILE_MISSING__" in command:
+            return {"success": False, "exit_code": 44, "output": "__SAG_FILE_MISSING__"}
+        tokens = _atomic_write_tokens(command)
+        if tokens is not None:
+            if not self.writable and tokens[:2] != ["rm", "-f"]:
+                return {"success": False, "exit_code": 1, "output": "Read-only file system"}
+            return self.atomic.execute_command(command)
         if "test -f" in command:
             tokens = shlex.split(command)
             probed = tokens[tokens.index("-f") + 1] if "-f" in tokens else ""
@@ -248,16 +568,29 @@ def test_a_contract_states_no_expectation_it_does_not_have():
 
 def test_the_freeze_derives_the_expectations_from_the_public_verb():
     orchestrator = ContainerFS()
+    params = {"action": "test", "working_directory": "/workspace/proj"}
+    domain_id = "test:/workspace/proj"
 
     contract = freeze_contract(
         orchestrator.execute_command,
+        run_id="run-pytest",
         envelope_id="envelope-000004",
         tool="build",
-        params={"action": "test", "working_directory": "/workspace/proj"},
+        params=params,
+        effective_tool="maven",
         effective_action="verify",
         expected_cwd="/workspace/proj",
         expected_argv="--fail-at-end verify",
+        execution_binding=ARGV_EXECUTION_BINDING,
         intent_source="model",
+        intent_id="intent-receipt-assessor-freeze",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
         requirements={},
     )
 
@@ -361,38 +694,144 @@ def test_a_blocked_dispatch_never_contradicts_even_with_an_empty_delta():
 def test_a_contract_pinned_to_a_tree_the_harness_moved_past_is_stale():
     assessment = assess_receipt(
         contract_for(),
-        receipt_for(target_sha=OTHER_SHA),
-        current_fingerprints={"target_sha": OTHER_SHA, "config_fingerprint": "cfg-7"},
+        receipt_for(),
+        current_fingerprints={**CURRENT, "target_sha": OTHER_SHA},
     )
 
     assert assessment.typed_code == "stale_fingerprint"
     assert assessment.fingerprints["target_sha"] == SHA
 
 
-def test_a_pin_only_one_side_states_is_unknown_and_never_a_mismatch():
-    """Absent on either side is UNKNOWN; calling that stale would invent a
-    fact the harness never held."""
+def test_a_pin_only_one_side_states_an_unknown_contract_binding():
+    """A partial pin tuple cannot be current execution authority."""
     assessment = assess_receipt(
         contract_for(document_map_fingerprint="map-9"),
         receipt_for(report_delta=wrote_reports()),
-        current_fingerprints={"target_sha": SHA},
+        current_fingerprints=CURRENT,
     )
 
-    assert assessment.typed_code == "expectation_met"
+    assert assessment.typed_code == "contract_binding_unknown"
 
 
 def test_a_stale_contract_cannot_contradict():
     assessment = assess_receipt(
-        contract_for(), receipt_for(), current_fingerprints={"target_sha": OTHER_SHA}
+        contract_for(), receipt_for(), current_fingerprints={**CURRENT, "target_sha": OTHER_SHA}
     )
 
     assert assessment.typed_code == "stale_fingerprint"
 
 
+def test_fact_epoch_is_an_absent_preserving_contract_receipt_pin():
+    assessment = assess_receipt(
+        contract_for(),
+        receipt_for(fact_epoch=8),
+        current_fingerprints=CURRENT,
+    )
+
+    assert assessment.typed_code == "contract_binding_unknown"
+
+
+def test_model_project_authority_requires_every_current_pin():
+    current = dict(CURRENT)
+    current.pop("fact_epoch")
+
+    assessment = assess_receipt(
+        contract_for(),
+        receipt_for(report_delta=wrote_reports()),
+        current_fingerprints=current,
+    )
+
+    assert assessment.typed_code == "contract_binding_unknown"
+    assert "current fact_epoch" in assessment.detail
+
+
+def test_changed_current_fact_epoch_is_stale_not_current_authority():
+    assessment = assess_receipt(
+        contract_for(),
+        receipt_for(report_delta=wrote_reports()),
+        current_fingerprints={**CURRENT, "fact_epoch": 8},
+    )
+
+    assert assessment.typed_code == "stale_fingerprint"
+    assert assessment.fingerprints["fact_epoch"] == "7"
+
+
+def test_explicit_controller_bash_contract_needs_no_project_pin_tuple():
+    params = {"action": "test", "working_directory": "/workspace/proj"}
+    domain_id = "controller:/workspace/proj"
+    contract = build_contract(
+        run_id="run-controller-bash",
+        envelope_id="envelope-controller-bash",
+        tool="build",
+        params=params,
+        effective_tool="bash",
+        effective_action="test",
+        expected_cwd="/workspace/proj",
+        expected_argv="-lc true",
+        execution_binding=ARGV_EXECUTION_BINDING,
+        intent_source="controller",
+        intent_id="intent-controller-bash",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+    )
+    receipt = {
+        "schema_version": 2,
+        "receipt_id": "inv-bash-test-0001",
+        "run_id": contract["run_id"],
+        "tool": "bash",
+        "requested_action": "test",
+        "effective_action": "test",
+        "argv": "bash -lc true",
+        "working_directory": "/workspace/proj",
+        "actual_cwd": "/workspace/proj",
+        "exit_code": 0,
+        "outcome": "completed",
+        "report_delta": wrote_reports(),
+        "contract_id": contract["contract_id"],
+        "contract_hash": contract["contract_hash"],
+        "execution_binding": ARGV_EXECUTION_BINDING,
+        "compliance": "exact",
+    }
+
+    assert assess_receipt(contract, receipt).typed_code == "expectation_met"
+
+
+def test_build_tool_projects_the_complete_current_authority_tuple():
+    requirements = {
+        "survey": {
+            "survey_fingerprint": "survey-7",
+            "config_fingerprint": "cfg-7",
+            "document_map_fingerprint": "map-7",
+        },
+        "build_domains": [{"root": "/workspace/proj"}],
+        "domain_facts": [
+            {
+                "domain_id": "dom-proj",
+                "root": "/workspace/proj",
+                "fact_epoch": 7,
+            }
+        ],
+    }
+
+    assert BuildTool._current_fingerprints(
+        requirements,
+        {"target_sha": SHA, "actual_cwd": "/workspace/proj/sub"},
+    ) == CURRENT
+
+
 def test_a_dispatch_that_left_the_frozen_vector_is_a_deviated_receipt():
     assessment = assess_receipt(
         contract_for(),
-        receipt_for(compliance="deviated", report_delta=wrote_reports()),
+        receipt_for(
+            argv="mvn --fail-at-end package",
+            compliance="deviated",
+            report_delta=wrote_reports(),
+        ),
         current_fingerprints=CURRENT,
     )
 
@@ -403,7 +842,9 @@ def test_a_deviated_receipt_can_never_contradict_the_contract_it_ignored():
     """Every falsifier precondition except compliance holds. A dispatch that
     did not honour the contract cannot be evidence against it (spec §C5)."""
     assessment = assess_receipt(
-        contract_for(), receipt_for(compliance="deviated"), current_fingerprints=CURRENT
+        contract_for(),
+        receipt_for(argv="mvn --fail-at-end package", compliance="deviated"),
+        current_fingerprints=CURRENT,
     )
 
     assert assessment.typed_code == "deviated_receipt"
@@ -423,7 +864,12 @@ def test_an_exit_zero_test_run_that_wrote_no_report_is_falsified():
 
 def test_an_equivalent_dispatch_may_also_falsify():
     assessment = assess_receipt(
-        contract_for("test"), receipt_for(compliance="equivalent"), current_fingerprints=CURRENT
+        contract_for("test"),
+        receipt_for(
+            argv="mvn --batch-mode --fail-at-end verify",
+            compliance="equivalent",
+        ),
+        current_fingerprints=CURRENT,
     )
 
     assert assessment.typed_code == FALSIFIED
@@ -458,21 +904,21 @@ def test_an_unknowable_compliance_never_contradicts():
     assert assessment.typed_code != FALSIFIED
 
 
-def test_a_green_compile_is_never_contradicted_for_lacking_a_test_report():
+def test_exit_zero_compile_without_positive_artifact_evidence_is_unobserved():
     """A build contract expects an artifact OR a report delta, and a schema-v2
     receipt states nothing about artifacts. Unknown artifacts are not absent
     artifacts, so the predicate is not established (spec §C5)."""
     assessment = assess_receipt(
-        contract_for("compile"), receipt_for(), current_fingerprints=CURRENT
+        contract_for("compile"), receipt_for(action="compile"), current_fingerprints=CURRENT
     )
 
-    assert assessment.typed_code == "expectation_met"
+    assert assessment.typed_code == "expectation_unobserved"
 
 
 def test_a_build_that_states_it_produced_nothing_at_all_is_falsified():
     assessment = assess_receipt(
         contract_for("compile"),
-        receipt_for(artifact_delta={"new": [], "changed": []}),
+        receipt_for(action="compile", artifact_delta={"new": [], "changed": []}),
         current_fingerprints=CURRENT,
     )
 
@@ -483,6 +929,7 @@ def test_a_build_that_states_an_artifact_is_not_falsified():
     assessment = assess_receipt(
         contract_for("compile"),
         receipt_for(
+            action="compile",
             artifact_delta={"new": [{"path": "/workspace/proj/target/a.jar"}], "changed": []}
         ),
         current_fingerprints=CURRENT,
@@ -492,7 +939,9 @@ def test_a_build_that_states_an_artifact_is_not_falsified():
 
 
 def test_a_contract_that_named_no_falsifier_cannot_be_falsified():
-    assessment = assess_receipt(contract_for("deps"), receipt_for(), current_fingerprints=CURRENT)
+    assessment = assess_receipt(
+        contract_for("deps"), receipt_for(action="deps"), current_fingerprints=CURRENT
+    )
 
     assert assessment.typed_code == "expectation_met"
 
@@ -654,13 +1103,78 @@ def test_a_failed_write_is_reported_rather_than_raised():
 
 def test_read_receipt_returns_the_persisted_receipt():
     receipt = receipt_for()
-    execute = ContainerFS(
-        files={f"{RECEIPT_DIR}/inv-maven-1-0001.json": json.dumps(receipt, sort_keys=True)}
-    )
+    execute = ContainerFS()
+    assert write_receipt_result(execute, receipt).persisted is True
 
     assert read_receipt(execute, "inv-maven-1-0001") == receipt
     assert read_receipt(execute, "inv-maven-1-9999") is None
     assert read_receipt(execute, "") is None
+
+
+def test_live_receipt_reader_ignores_only_strict_foreign_and_historical_siblings():
+    current = receipt_for()
+    foreign = {
+        **receipt_for(),
+        "receipt_id": "inv-maven-1-0099",
+        "run_id": "run-previous",
+    }
+    historical = {
+        "schema_version": 1,
+        "receipt_id": "inv-maven-1-0000",
+        "tool": "maven",
+        "requested_action": "test",
+        "effective_action": "test",
+        "argv": "mvn --fail-at-end verify",
+        "working_directory": "/workspace/proj",
+        "exit_code": 0,
+        "outcome": "completed",
+        "report_delta": {"new": [], "changed": []},
+    }
+    execute = ContainerFS()
+    assert write_receipt_result(execute, current).persisted is True
+    execute.files[f"{RECEIPT_DIR}/{foreign['receipt_id']}.json"] = json.dumps(
+        foreign,
+        sort_keys=True,
+    )
+    execute.files[f"{RECEIPT_DIR}/{historical['receipt_id']}.json"] = json.dumps(
+        historical,
+        sort_keys=True,
+    )
+
+    assert read_receipt(execute, current["receipt_id"]) == current
+    assert read_receipt(execute, foreign["receipt_id"]) is None
+
+    unknown = {**foreign, "schema_version": 3}
+    execute.files[f"{RECEIPT_DIR}/{foreign['receipt_id']}.json"] = json.dumps(
+        unknown,
+        sort_keys=True,
+    )
+    assert read_receipt(execute, current["receipt_id"]) is None
+
+
+def test_historical_receipt_scope_rejects_unknown_v1_shape():
+    current = receipt_for()
+    forged_v1 = {
+        "schema_version": 1,
+        "receipt_id": "inv-maven-1-0000",
+        "tool": "maven",
+        "requested_action": "test",
+        "effective_action": "test",
+        "argv": "mvn --fail-at-end verify",
+        "working_directory": "/workspace/proj",
+        "exit_code": 0,
+        "outcome": "completed",
+        "report_delta": {"new": [], "changed": []},
+        "future_claim": "must not be classified forensic",
+    }
+    execute = ContainerFS()
+    assert write_receipt_result(execute, current).persisted is True
+    execute.files[f"{RECEIPT_DIR}/{forged_v1['receipt_id']}.json"] = json.dumps(
+        forged_v1,
+        sort_keys=True,
+    )
+
+    assert read_receipt(execute, current["receipt_id"]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +1205,7 @@ class ReceiptWritingMavenTool:
             exit_code=self.exit_code,
             before={},
             after=self.after,
+            requirements=WIRED_REQUIREMENTS,
             **contract_receipt_fields(argv),
         )
         result = (
@@ -704,14 +1219,31 @@ class ReceiptWritingMavenTool:
 
 def _wired_build_tool(orchestrator=None, **runner):
     orchestrator = orchestrator or ContainerFS(markers={"pom.xml"})
+    _publish_requirements(orchestrator)
     maven_tool = ReceiptWritingMavenTool(orchestrator, **runner)
     return BuildTool(orchestrator, maven_tool=maven_tool), orchestrator
+
+
+def _publish_requirements(orchestrator):
+    raw = json.dumps(WIRED_REQUIREMENTS, sort_keys=True, separators=(",", ":"))
+    orchestrator.files[REQUIREMENTS_PATH] = raw
+    authority = evidence_publication_authority_for(orchestrator)
+    prior = authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
+    authority.publish_revision(
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        raw=raw.encode("utf-8"),
+        expected_previous_raw_sha256=(
+            prior.raw_sha256 if prior else EVIDENCE_PUBLICATION_GENESIS_SHA256
+        ),
+    )
 
 
 def test_the_facade_assesses_the_receipt_its_own_dispatch_minted():
     tool, orchestrator = _wired_build_tool()
 
-    with action_context(envelope_id="envelope-000031"):
+    with build_action_context("envelope-000031", action="test"):
         result = tool.execute(action="test", working_directory="/workspace/proj")
 
     (contract,) = contracts_written(orchestrator.commands)
@@ -734,7 +1266,7 @@ def test_the_facade_records_a_capability_absence_the_receipt_carries():
     )
     tool, orchestrator = _wired_build_tool(orchestrator, after={report: "c" * 64})
 
-    with action_context(envelope_id="envelope-000032"):
+    with build_action_context("envelope-000032", action="test"):
         tool.execute(action="test", working_directory="/workspace/proj")
 
     codes = [payload["typed_code"] for payload in assessments_written(orchestrator.commands)]
@@ -752,8 +1284,9 @@ def test_a_dispatch_that_minted_no_receipt_is_assessed_as_nothing():
             self.calls.append(kwargs)
             return ToolResult.completed_success(output="BUILD SUCCESS")
 
+    _publish_requirements(orchestrator)
     tool = BuildTool(orchestrator, maven_tool=SilentTool())
-    with action_context(envelope_id="envelope-000033"):
+    with build_action_context("envelope-000033", action="compile"):
         result = tool.execute(action="compile", working_directory="/workspace/proj")
 
     assert result.succeeded
@@ -765,13 +1298,15 @@ def test_an_assessment_failure_never_breaks_the_result():
 
     class ExplodingReader(ContainerFS):
         def execute_command(self, command, **kwargs):
-            if command.startswith("cat ") and RECEIPT_DIR in command:
+            if RECEIPT_DIR in command and (
+                command.startswith("cat ") or "SAG_NAMED_JSON_RECORD_V1" in command
+            ):
                 raise RuntimeError("container is gone")
             return super().execute_command(command, **kwargs)
 
     tool, orchestrator = _wired_build_tool(ExplodingReader(markers={"pom.xml"}))
 
-    with action_context(envelope_id="envelope-000034"):
+    with build_action_context("envelope-000034", action="test"):
         result = tool.execute(action="test", working_directory="/workspace/proj")
 
     assert result.succeeded
@@ -782,7 +1317,7 @@ def test_the_assessment_is_never_a_receipt_rewrite():
     """Spec §C4: the receipt is finalized once. The assessor writes NEXT to it."""
     tool, orchestrator = _wired_build_tool()
 
-    with action_context(envelope_id="envelope-000035"):
+    with build_action_context("envelope-000035", action="test"):
         tool.execute(action="test", working_directory="/workspace/proj")
 
     assert len(receipts_written(orchestrator.commands)) == 1
@@ -792,51 +1327,91 @@ def test_the_assessment_is_never_a_receipt_rewrite():
     )
 
 
-def test_backstop_assesses_a_facade_external_receipt_once():
-    """Live p6v-bigtop-r3: the recovery delegate's dispatch had a fallback
-    contract and no verdict — the backstop owes it exactly one."""
+def test_backstop_assesses_a_facade_external_receipt_once(
+    bind_host_evidence_publication_authority,
+):
+    """A valid facade-external receipt with no verdict gets one backstop."""
     import json as _json
 
     from sag.agent.evidence_assessments import ensure_receipt_assessed
+    from sag.agent.invocation_contracts import build_contract
+
+    params = {
+        "action": "compile",
+        "working_directory": "/workspace/bigtop/bigtop-data-generators",
+    }
+    domain_id = "test:/workspace/bigtop/bigtop-data-generators"
+    contract = build_contract(
+        run_id="run-pytest",
+        envelope_id="envelope-000009",
+        tool="build",
+        params=params,
+        effective_tool="gradle",
+        effective_action="compileJava",
+        expected_cwd="/workspace/bigtop/bigtop-data-generators",
+        expected_argv="--build-cache compileJava",
+        execution_binding=ARGV_EXECUTION_BINDING,
+        intent_source="controller",
+        intent_id="intent-backstop-gradle",
+        intent_domain_id=domain_id,
+        intent_exact_params=params,
+        action_fingerprint=action_fingerprint(
+            domain_id=domain_id,
+            tool="build",
+            params=params,
+        ),
+        expected_observations=["artifact_or_report_delta"],
+        direct_falsifiers=[
+            {
+                "predicate_id": "empty_delta_despite_success",
+                "kind": "delta_empty_on_exit0",
+            }
+        ],
+    )
 
     store = {
         "/workspace/.setup_agent/invocation_receipts/inv-gradle-1-0004.json": _json.dumps(
             {
                 "schema_version": 2,
                 "receipt_id": "inv-gradle-1-0004",
-                "contract_id": "ic-b5204a1e70cd",
+                "run_id": contract["run_id"],
+                "contract_id": contract["contract_id"],
+                "contract_hash": contract["contract_hash"],
+                "execution_binding": ARGV_EXECUTION_BINDING,
                 "tool": "gradle",
                 "requested_action": "compileJava",
                 "effective_action": "compileJava",
                 "argv": "/workspace/bigtop/gradlew --build-cache compileJava",
                 "working_directory": "/workspace/bigtop/bigtop-data-generators",
+                "actual_cwd": "/workspace/bigtop/bigtop-data-generators",
                 "exit_code": 0,
                 "outcome": "completed",
                 "compliance": "exact",
                 "report_delta": {"new": [{"path": "/r.xml", "sha256": "ab" * 32}], "changed": []},
             }
         ),
-        "/workspace/.setup_agent/invocation_contracts/ic-b5204a1e70cd.json": _json.dumps(
-            {
-                "schema_version": 1,
-                "contract_id": "ic-b5204a1e70cd",
-                "contract_hash": "x",
-                "envelope_id": "envelope-000009",
-                "requested_call": {"tool": "build", "params": {"action": "compileJava"}},
-                "effective_action": "compileJava",
-                "expected_cwd": "/workspace/bigtop/bigtop-data-generators",
-                "expected_argv": "--build-cache compileJava",
-                "intent_source": "controller",
-                "expected_observations": ["artifact_or_report_delta"],
-                "direct_falsifiers": [
-                    {"predicate_id": "empty_delta_despite_success", "kind": "delta_empty_on_exit0"}
-                ],
-            }
+        f"/workspace/.setup_agent/invocation_contracts/{contract['contract_id']}.json": _json.dumps(
+            contract
         ),
     }
     written = {}
+    atomic = FakeContainer()
 
     def execute(command, **_kwargs):
+        if command.startswith("for file in ") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            quoted_glob = command.partition(" in ")[2].partition("; do")[0]
+            target = shlex.split(quoted_glob)[0]
+            prefix = target[: -len("*.json")]
+            records = [
+                (path.rsplit("/", 1)[-1], body)
+                for path, body in sorted(store.items())
+                if path.startswith(prefix) and path.endswith(".json")
+            ]
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
         if command.startswith("ls "):
             return {"success": True, "exit_code": 0, "output": "\n".join(written)}
         if command.startswith("cat "):
@@ -844,17 +1419,43 @@ def test_backstop_assesses_a_facade_external_receipt_once():
                 if path in command:
                     return {"success": True, "exit_code": 0, "output": body}
             return {"success": False, "exit_code": 1, "output": ""}
-        if "evidence_assessments" in command and "mv -f" in command:
-            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
-            payload = _json.loads(body)
-            written[payload["assessment_id"] + ".json"] = body
-            return {"success": True, "exit_code": 0, "output": ""}
+        tokens = _atomic_write_tokens(command)
+        if tokens is not None:
+            result = atomic.execute_command(command)
+            if tokens[:3] == ["mv", "-f", "--"]:
+                body = atomic.files[tokens[4]]
+                payload = _json.loads(body)
+                written[payload["assessment_id"] + ".json"] = body
+            return result
         return {"success": True, "exit_code": 0, "output": ""}
+
+    contract_raw = store[
+        f"/workspace/.setup_agent/invocation_contracts/{contract['contract_id']}.json"
+    ].encode("utf-8")
+    receipt_raw = store[
+        "/workspace/.setup_agent/invocation_receipts/inv-gradle-1-0004.json"
+    ].encode("utf-8")
+    bind_host_evidence_publication_authority.publish_bytes(
+        record_kind="invocation_contract",
+        record_id=contract["contract_id"],
+        raw=contract_raw,
+        contract_id=contract["contract_id"],
+        contract_hash=contract["contract_hash"],
+    )
+    bind_host_evidence_publication_authority.publish_bytes(
+        record_kind="invocation_receipt",
+        record_id="inv-gradle-1-0004",
+        raw=receipt_raw,
+        contract_id=contract["contract_id"],
+        contract_hash=contract["contract_hash"],
+    )
 
     assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is True
     assert len(written) == 1
     body = _json.loads(next(iter(written.values())))
-    assert body["typed_code"] == "expectation_met"
+    # A facade-external project receipt has no harness-current pin tuple at
+    # this backstop seam. Preserve it as evidence, but never promote it green.
+    assert body["typed_code"] == "contract_binding_unknown"
 
     # second pass: already assessed => no-op
     assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is False

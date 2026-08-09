@@ -10,7 +10,11 @@ from test_python_tool import MANIFEST as PYTHON_MANIFEST
 from test_python_tool import Orch as PythonOrchestrator
 from test_python_tool import fail as command_fail
 from test_python_tool import ok as command_ok
-from test_verdict_finalizer import VERDICT_PATH, FakeVerdictOrchestrator
+from test_verdict_finalizer import (
+    VERDICT_PATH,
+    FakeVerdictOrchestrator,
+    bind_verdict_authority,
+)
 
 import sag.agent.agent as agent_module
 import sag.agent.react_engine as react_engine_module
@@ -23,7 +27,6 @@ from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import (
-    RecoveryDecision,
     ToolCall,
     ToolExecution,
     ToolOrchestrator,
@@ -44,6 +47,11 @@ from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_out
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.context_tool import ContextTool
 from sag.tools.internal.python_tool import PYTEST_REPORT_DIR, PythonTool
+
+pytestmark = pytest.mark.usefixtures(
+    "exact_build_facade_authority",
+    "exact_python_runner_authority",
+)
 
 
 class _ContainerJUnitOrchestrator(PythonOrchestrator):
@@ -110,14 +118,14 @@ class _ContainerJUnitOrchestrator(PythonOrchestrator):
 class _FailFirstAtomicWriteOrchestrator(FakeVerdictOrchestrator):
     def __init__(self):
         super().__init__()
-        self._fail_next_trim = True
+        self._fail_next_compare_publish = True
 
-    def execute_command(self, command):
-        if command.startswith("truncate -s -1 ") and self._fail_next_trim:
+    def execute_command(self, command, **kwargs):
+        if "fcntl.flock" in command and self._fail_next_compare_publish:
             self.commands.append(command)
-            self._fail_next_trim = False
+            self._fail_next_compare_publish = False
             return {"success": False, "exit_code": 1, "output": "transient failure"}
-        return super().execute_command(command)
+        return super().execute_command(command, **kwargs)
 
 
 def _engine(tmp_path, *, phase="provision"):
@@ -129,6 +137,7 @@ def _engine(tmp_path, *, phase="provision"):
     engine = ReActEngine.__new__(ReActEngine)
     engine.phase_machine = machine
     engine.run_evidence_state = RunEvidenceState(run_id="session-engine")
+    bind_verdict_authority(orchestrator, engine.run_evidence_state.run_id)
     for record in machine.records:
         engine.run_evidence_state.record_phase_record(record)
     engine.verdict_finalizer = VerdictFinalizer(orchestrator)
@@ -363,239 +372,6 @@ def test_execute_steps_calls_the_single_ingestion_boundary_once(tmp_path):
     assert len(engine.run_evidence_state.tool_observations) == 1
     assert len(engine.run_evidence_state.action_attempts) == 1
     assert step.tool_result.output_ref.startswith("output_")
-
-
-def test_recovery_ingests_original_and_replacement_under_their_actual_scopes(tmp_path, monkeypatch):
-    class RecoveringBuildTool(BaseTool):
-        def __init__(self):
-            super().__init__("build", "test recovery evidence")
-            self.actions = []
-
-        def execute(self, action: str) -> ToolResult:
-            self.actions.append(action)
-            if action == "test":
-                return ToolResult.completed_failure(
-                    output="one test failed",
-                    error="one test failed",
-                    error_code="TEST_FAILED",
-                    test_stats=TestStats(
-                        discovered=1,
-                        executed=1,
-                        passed=0,
-                        failed=1,
-                        skipped=0,
-                    ),
-                )
-            return ToolResult.completed_success(
-                output="compile recovered",
-                facts={"build_success": True},
-            )
-
-    engine, _ = _engine(tmp_path, phase="test")
-    tool = RecoveringBuildTool()
-    orchestrator = ToolOrchestrator(
-        tools={"build": tool},
-        context_manager=engine.context_manager,
-        recent_tool_executions=[],
-        successful_states={},
-        repository_url=None,
-        track_tool_execution=lambda *args: None,
-        update_successful_states=lambda *args: None,
-        add_system_guidance=lambda *args, **kwargs: None,
-        get_timestamp=lambda: "ts",
-        output_storage=engine.output_storage,
-    )
-
-    def recover(tool_name, params, failed_result):
-        replacement = tool.safe_execute(action="compile")
-        return RecoveryDecision(
-            should_recover=True,
-            strategy="compile_after_test_failure",
-            replacement_result=replacement,
-            replacement_params={"action": "compile"},
-        )
-
-    monkeypatch.setattr(orchestrator.recovery_handler, "recover", recover)
-    engine._get_tool_orchestrator = lambda: orchestrator
-    _prepare_action_execution(engine)
-    step = _action_step("build", {"action": "test"})
-
-    execute_action_steps(engine, [step])
-
-    assert tool.actions == ["test", "compile"]
-    assert step.tool_result.succeeded is True
-    observations = engine.run_evidence_state.tool_observations
-    assert [observation.scope for observation in observations] == [
-        StateScope.TEST_RUNTIME,
-        StateScope.ARTIFACTS,
-    ]
-    assert observations[0].result.test_stats.failed == 1
-    assert observations[1].result.facts["build_success"] is True
-    snapshot = engine.verdict_finalizer.finalize(
-        engine.run_evidence_state,
-        EvidenceCloseReason.ABORTED,
-    )
-    assert snapshot.test_stats.failed == 1
-    assert snapshot.verdict == "failed"
-
-
-@pytest.mark.parametrize(
-    ("tool_name", "operation_params", "error_code"),
-    [
-        ("maven", {"command": "test"}, "BUILD_FAILED"),
-        ("gradle", {"tasks": ["clean", ":app:test"]}, "BUILD_FILE_NOT_FOUND"),
-    ],
-)
-def test_backend_test_recovery_keeps_both_attempts_in_test_scope(
-    tmp_path, tool_name, operation_params, error_code
-):
-    class RecoveringBackendTool(BaseTool):
-        def __init__(self):
-            super().__init__(tool_name, "backend recovery evidence")
-            self._parameter_schema = {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "task": {"type": "string"},
-                    "tasks": {"type": ["string", "array"], "items": {"type": "string"}},
-                    "working_directory": {"type": "string"},
-                },
-                "required": [],
-            }
-            self.calls = []
-            self.results = [
-                ToolResult.completed_failure(
-                    output="tests failed because the working directory was not found",
-                    error="working directory not found",
-                    error_code=error_code,
-                    test_stats=TestStats(
-                        discovered=5,
-                        executed=5,
-                        passed=3,
-                        failed=2,
-                        skipped=0,
-                    ),
-                ),
-                ToolResult.completed_success(
-                    output="all tests passed from the recovered working directory",
-                    test_stats=TestStats(
-                        discovered=5,
-                        executed=5,
-                        passed=5,
-                        failed=0,
-                        skipped=0,
-                    ),
-                ),
-            ]
-
-        def execute(self, **params) -> ToolResult:
-            self.calls.append(dict(params))
-            return self.results.pop(0)
-
-    engine, _ = _engine(tmp_path, phase="test")
-    _green_build(engine)
-    tool = RecoveringBackendTool()
-    orchestrator = ToolOrchestrator(
-        tools={tool_name: tool},
-        context_manager=engine.context_manager,
-        recent_tool_executions=[],
-        successful_states={"working_directory": "/workspace/app"},
-        repository_url=None,
-        track_tool_execution=lambda *args: None,
-        update_successful_states=lambda *args: None,
-        add_system_guidance=lambda *args, **kwargs: None,
-        get_timestamp=lambda: "ts",
-        output_storage=engine.output_storage,
-    )
-    engine._get_tool_orchestrator = lambda: orchestrator
-    _prepare_action_execution(engine)
-    step = _action_step(tool_name, operation_params)
-
-    execute_action_steps(engine, [step])
-
-    assert len(tool.calls) == 2
-    for field, value in operation_params.items():
-        assert [call[field] for call in tool.calls] == [value, value]
-    assert tool.calls[-1]["working_directory"] == "/workspace/app"
-    assert step.tool_result.succeeded is True
-    observations = [
-        observation
-        for observation in engine.run_evidence_state.tool_observations
-        if observation.tool_name == tool_name
-    ]
-    assert len(observations) == 2
-    assert [observation.scope for observation in observations] == [
-        StateScope.TEST_RUNTIME,
-        StateScope.TEST_RUNTIME,
-    ]
-    assert [observation.result.test_stats.failed for observation in observations] == [2, 0]
-
-    snapshot = engine.verdict_finalizer.finalize(
-        engine.run_evidence_state,
-        EvidenceCloseReason.TEST_TERMINATED,
-    )
-
-    assert snapshot.verdict == "success"
-    assert snapshot.test_stats.executed == 5
-    assert snapshot.test_stats.passed == 5
-    assert snapshot.test_stats.failed == 0
-    assert snapshot.test_stats.raw.executed == 10
-    assert snapshot.test_stats.raw.passed == 8
-    assert snapshot.test_stats.raw.failed == 2
-
-
-def test_guidance_only_recovery_does_not_fabricate_an_execution(tmp_path, monkeypatch):
-    class FailingBuildTool(BaseTool):
-        def __init__(self):
-            super().__init__("build", "guidance-only recovery evidence")
-
-        def execute(self, action: str) -> ToolResult:
-            return ToolResult.completed_failure(
-                output="compile actually failed",
-                error="compile actually failed",
-                error_code="ORIGINAL_COMPILE_FAILED",
-            )
-
-    engine, _ = _engine(tmp_path, phase="build")
-    tool = FailingBuildTool()
-    orchestrator = ToolOrchestrator(
-        tools={"build": tool},
-        context_manager=engine.context_manager,
-        recent_tool_executions=[],
-        successful_states={},
-        repository_url=None,
-        track_tool_execution=lambda *args: None,
-        update_successful_states=lambda *args: None,
-        add_system_guidance=lambda *args, **kwargs: None,
-        get_timestamp=lambda: "ts",
-        output_storage=engine.output_storage,
-    )
-
-    def recover(tool_name, params, failed_result):
-        guidance = ToolResult.completed_failure(
-            output="try a different compiler next",
-            error="recovery guidance only",
-            error_code="GUIDANCE_ONLY",
-        )
-        return RecoveryDecision(
-            should_recover=True,
-            strategy="compile_guidance",
-            replacement_result=guidance,
-            replacement_params={"action": "compile"},
-            metadata={"guidance_only": True},
-        )
-
-    monkeypatch.setattr(orchestrator.recovery_handler, "recover", recover)
-    engine._get_tool_orchestrator = lambda: orchestrator
-    _prepare_action_execution(engine)
-    step = _action_step("build", {"action": "compile"})
-
-    execute_action_steps(engine, [step])
-
-    assert step.tool_result.error_code == "GUIDANCE_ONLY"
-    observations = engine.run_evidence_state.tool_observations
-    assert len(observations) == 1
-    assert observations[0].result.error_code == "ORIGINAL_COMPILE_FAILED"
 
 
 def test_large_pytest_junit_is_reduced_to_bounded_counts_inside_container(tmp_path):
@@ -905,11 +681,6 @@ def test_error_only_failure_uses_one_source_through_construction_and_ingestion(
         get_timestamp=lambda: "ts",
         output_storage=engine.output_storage,
     )
-    monkeypatch.setattr(
-        orchestrator.recovery_handler,
-        "recover",
-        lambda *args: RecoveryDecision(should_recover=False),
-    )
     engine._get_tool_orchestrator = lambda: orchestrator
     _prepare_action_execution(engine)
     step = _action_step("build", {"action": "compile"})
@@ -1179,9 +950,10 @@ def test_abort_mid_build_seals_available_evidence_once(tmp_path):
     assert first.termination is RunTerminationStatus.ABORTED
     assert first.snapshot_ref.endswith("verdict.json")
     assert first.model_dump_json() == second.model_dump_json()
-    assert orchestrator.commands[len(commands_after_first) :] == [
-        f"test -f {VERDICT_PATH} && cat {VERDICT_PATH}"
-    ]
+    replay_commands = orchestrator.commands[len(commands_after_first) :]
+    assert replay_commands
+    assert all("SAG_NAMED_JSON_RECORD_V1" in command for command in replay_commands)
+    assert not any("fcntl.flock" in command for command in replay_commands)
     assert read_verdict_snapshot(orchestrator).verdict in {"unknown", "partial", "failed"}
     assert len(engine.run_evidence_state.phase_records) == 3
 
@@ -1205,10 +977,11 @@ def test_conflicting_close_termination_is_rejected_after_seal(tmp_path):
 def test_flow_close_retries_persistence_for_an_already_sealed_state(tmp_path):
     engine, _ = _engine(tmp_path, phase="build")
     orchestrator = _FailFirstAtomicWriteOrchestrator()
+    bind_verdict_authority(orchestrator, engine.run_evidence_state.run_id)
     engine.verdict_finalizer = VerdictFinalizer(orchestrator)
     _green_build(engine)
 
-    with pytest.raises(OSError, match="temporary file"):
+    with pytest.raises(OSError, match="compare-and-publish"):
         engine._finalize_evidence(EvidenceCloseReason.ABORTED)
 
     assert engine.run_evidence_state.sealed is True
@@ -1651,6 +1424,7 @@ def test_pre_engine_exception_seals_without_fabricating_phase_evidence():
     orchestrator = FakeVerdictOrchestrator()
     agent = object.__new__(SetupAgent)
     agent.run_evidence_state = RunEvidenceState(run_id="pre-engine")
+    bind_verdict_authority(orchestrator, agent.run_evidence_state.run_id)
     agent.verdict_finalizer = VerdictFinalizer(orchestrator)
     agent.phase_machine = PhaseMachine()
     agent.react_engine = None

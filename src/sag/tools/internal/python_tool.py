@@ -11,10 +11,13 @@ never re-run on test failures. The wheel build is extra evidence, never
 required for a green verdict.
 """
 
+import hashlib
 import json
 import posixpath
 import re
 import shlex
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -25,11 +28,20 @@ from sag.agent.evidence_assessments import (
     write_assessment,
 )
 from sag.agent.invocation_contracts import (
+    CONTRACT_AUTHORITY_MISSING,
     contract_receipt_fields,
+    current_contract,
     dispatch_contract,
     ensure_dispatch_contract,
+    python_facade_dispatch_matches,
 )
-from sag.agent.invocation_receipts import record_invocation, snapshot_reports
+from sag.agent.invocation_receipts import (
+    producer_observations_sha256,
+    python_import_targets,
+    record_invocation,
+    snapshot_reports,
+)
+from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.evidence import TestStats
 from sag.testcases.compileall_metrics import (
     COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
@@ -54,7 +66,11 @@ from .build_preflight import (
     PythonPreflight,
     active_python_version,
     classify_python_version_error,
-    read_build_requirements,
+    read_live_build_requirements,
+)
+from .build_utils import (
+    DETACHED_HANDOFF_STATUSES,
+    detached_handoff_tool_result,
 )
 from .python_env import (
     detect_installer,
@@ -77,20 +93,87 @@ NATIVE_SMOKE_RECEIPT_JSON = "/workspace/.setup_agent/native_smoke_receipt.json"
 _PYTEST_NOTHING_RAN_CODES = frozenset(
     {"PYTEST_COLLECTION_ERROR", "PYTEST_NO_TESTS", "PYTEST_USAGE_ERROR", "PYTEST_MISSING"}
 )
+BUILD_REQUIREMENTS_UNAVAILABLE = "BUILD_REQUIREMENTS_UNAVAILABLE"
 
 # The pip rung a failed poetry/pipenv install falls back to (narrated).
 # Module form (bug #12): plain uv venvs ship no {venv}/bin/pip binary.
 _PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
+
+_PYTHON_IMPORT_PROBE_SCRIPT = """\
+# SAG_PYTHON_IMPORT_PROBE
+import contextlib
+import importlib
+import json
+import os
+import sys
+
+targets = json.loads(sys.argv[1])
+importable = []
+failures = []
+with open(os.devnull, "w") as sink:
+    for target in targets:
+        try:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                importlib.import_module(target)
+        except BaseException as exc:
+            failures.append({"target": target, "error_type": type(exc).__name__})
+        else:
+            importable.append(target)
+print(json.dumps(
+    {"targets": targets, "importable": importable, "failures": failures},
+    separators=(",", ":"),
+    sort_keys=True,
+))
+"""
+
+_WHEEL_SNAPSHOT_PREFIX = "SAG_WHEEL_SNAPSHOT"
+_PYTHON_IMPORT_TARGET_CAP = 64
+_PYTHON_IMPORT_FAILURE_SAMPLE_CAP = 20
+
+
+@dataclass
+class _ProducerStep:
+    ordinal: int
+    role: str
+    mechanical: bool
+    argv: str
+    result: Dict[str, Any]
+
+
+@dataclass
+class _ProducerTrace:
+    operation: str
+    steps: List[_ProducerStep] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def record(self, role: str, mechanical: bool, argv: str, result: Dict[str, Any]) -> None:
+        self.steps.append(
+            _ProducerStep(
+                ordinal=len(self.steps) + 1,
+                role=role,
+                mechanical=mechanical,
+                argv=argv,
+                result=dict(result or {}),
+            )
+        )
+
+
+class _ProducerDetached(RuntimeError):
+    def __init__(self, command: str, result: Dict[str, Any]):
+        super().__init__("python producer dispatch handed off")
+        self.command = command
+        self.result = result
+
+
+_ACTIVE_PRODUCER_TRACE: ContextVar[Optional[_ProducerTrace]] = ContextVar(
+    "sag_python_producer_trace", default=None
+)
 # The rung after a successful local-provider install whose root retry re-fails
 # on the provider's OWN distribution: the in-repo build resolves BELOW the
 # declared floor (PEP 440 orders 0.1.13.dev47 < 0.1.13), so resolution can
 # never succeed. Install the root project without resolving, then the declared
 # dependencies the provider does not supply.
 _PIP_NO_DEPS = "{venv}/bin/python -m pip install -e . --no-deps"
-# The exact-pin rung: a `deps` args install the facade already proved a stored
-# dependency claim states. The pin is shell-quoted for transport only; it
-# reached here as a literal from a project document, never from a parameter.
-_PIP_PIN = "{venv}/bin/python -m pip install {pin}"
 # The resolver's package install, in the house form (`project_setup_tool`'s JDK
 # install): refresh first, then a non-interactive install so a live run cannot
 # hang on a prompt. Every token outside `{packages}` is harness-owned, and
@@ -620,6 +703,7 @@ class PythonTool(BaseTool):
         self.orchestrator = orchestrator
         self.command_tracker = command_tracker
         self._test_attempt_counter = 0
+        self._producer_attempt_counter = 0
 
     def execute(
         self,
@@ -637,7 +721,57 @@ class PythonTool(BaseTool):
                 error_code="UNKNOWN_PYTHON_OPERATION",
                 suggestions=[f"Valid operations: {', '.join(_OPERATIONS)}"],
             )
-        requirements = read_build_requirements(self.orchestrator)
+        contract = current_contract()
+        internal_params: Dict[str, Any] = {
+            "operation": op,
+            "working_directory": working_directory,
+            "timeout": timeout,
+        }
+        if args is not None:
+            internal_params["args"] = args
+        if native is not None:
+            internal_params["native"] = dict(native)
+        if contract is None or not python_facade_dispatch_matches(
+            contract,
+            operation=op,
+            working_directory=working_directory,
+            internal_params=internal_params,
+        ):
+            return ToolResult.completed_failure(
+                output=(
+                    "[contract] Python was not dispatched: the active facade contract "
+                    "does not exactly bind this operation and parameter set."
+                ),
+                error="invocation contract authority missing or mismatched",
+                error_code=CONTRACT_AUTHORITY_MISSING,
+                metadata={"runner_dispatched": False, "tool": "python", "operation": op},
+            )
+        manifest_read = read_live_build_requirements(self.orchestrator)
+        if (
+            not manifest_read.complete
+            or manifest_read.conflict is not None
+            or manifest_read.payload is None
+        ):
+            return ToolResult.completed_failure(
+                output=(
+                    "[evidence] Python was not dispatched: build requirements are not "
+                    "a complete current host-published revision."
+                ),
+                error="live build requirements unavailable",
+                error_code=BUILD_REQUIREMENTS_UNAVAILABLE,
+                facts={
+                    "operation": op,
+                    "working_directory": working_directory,
+                    "build_requirements_status": manifest_read.conflict or "absent",
+                },
+                metadata={
+                    "runner_dispatched": False,
+                    "tool": "python",
+                    "operation": op,
+                    "blocker_owner": "harness",
+                },
+            )
+        requirements = dict(manifest_read.payload)
         venv = requirements.get("python_venv") or f"{working_directory.rstrip('/')}/.venv"
         if op == "native":
             return self._native(working_directory, timeout, requirements, venv, native)
@@ -647,7 +781,204 @@ class PythonTool(BaseTool):
             "build": self._build_wheel,
             "compile": self._compileall,
         }[op]
+        if op in {"setup_env", "build", "compile"}:
+            return self._execute_producer(
+                op,
+                handler,
+                working_directory,
+                args,
+                timeout,
+                requirements,
+                venv,
+            )
         return handler(working_directory, args, timeout, requirements, venv)
+
+    def _execute_producer(
+        self,
+        operation: str,
+        handler: Callable[..., ToolResult],
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
+    ) -> ToolResult:
+        """Run one contract-owned Python action and finalize one receipt.
+
+        The step list is deliberately named ``recorded_*``: `_run` owns these
+        project/mechanical commands, while PythonPreflight and the venv repair
+        ladder still own their own probes.  A partial trace is never described
+        as every physical command the action executed.
+        """
+
+        self._producer_attempt_counter += 1
+        attempt = self._producer_attempt_counter
+        trace = _ProducerTrace(operation=operation)
+        token = _ACTIVE_PRODUCER_TRACE.set(trace)
+        handoff: Optional[_ProducerDetached] = None
+        result: Optional[ToolResult] = None
+        try:
+            result = handler(working_directory, args, timeout, requirements, venv)
+        except _ProducerDetached as detached:
+            handoff = detached
+        finally:
+            _ACTIVE_PRODUCER_TRACE.reset(token)
+
+        if handoff is not None:
+            obligation = record_dispatch_obligation_result(
+                self.orchestrator.execute_command,
+                result=handoff.result,
+                tool="python",
+                attempt=attempt,
+                requested_action=operation,
+                effective_action=operation,
+                argv=handoff.command,
+                working_directory=working_directory,
+                before={},
+                requirements=requirements,
+            )
+            handoff.result.update(obligation.metadata())
+            pending = detached_handoff_tool_result("python", handoff.command, handoff.result)
+            pending.metadata.update(
+                {
+                    "operation": operation,
+                    "producer_observations_status": "pending",
+                }
+            )
+            return pending
+
+        assert result is not None
+        if not trace.steps:
+            result.metadata.setdefault("runner_dispatched", False)
+            return result
+
+        observations = self._producer_observations(
+            trace,
+            result=result,
+            requirements=requirements,
+            working_directory=working_directory,
+            venv=venv,
+        )
+        argv = " && ".join(step.argv for step in trace.steps)
+        receipt_metadata = record_invocation(
+            self.orchestrator.execute_command,
+            tool="python",
+            attempt=attempt,
+            requested_action=operation,
+            effective_action=operation,
+            argv=argv,
+            working_directory=working_directory,
+            exit_code=self._producer_exit_code(trace, result),
+            before={},
+            after={},
+            lifecycle_state=(result.metadata or {}).get("lifecycle_state"),
+            termination_reason=(result.metadata or {}).get("termination_reason"),
+            output=result.raw_output or result.output,
+            requirements=requirements,
+            producer_observations=observations,
+            **contract_receipt_fields(argv),
+        )
+        result.metadata.update(receipt_metadata)
+        result.metadata["runner_dispatched"] = True
+        return result
+
+    @staticmethod
+    def _producer_exit_code(trace: _ProducerTrace, result: ToolResult) -> int:
+        metadata_exit = (result.metadata or {}).get("exit_code")
+        if type(metadata_exit) is int:
+            return metadata_exit
+        failed = [
+            step.result.get("exit_code")
+            for step in trace.steps
+            if not step.result.get("success") and type(step.result.get("exit_code")) is int
+        ]
+        if failed:
+            return failed[-1]
+        terminal = trace.steps[-1].result.get("exit_code")
+        if type(terminal) is int:
+            return terminal if result.succeeded else (terminal or 1)
+        return 0 if result.succeeded else 1
+
+    @staticmethod
+    def _producer_step_observation(step: _ProducerStep) -> Dict[str, Any]:
+        output = str(step.result.get("full_output") or step.result.get("output") or "")
+        observation: Dict[str, Any] = {
+            "ordinal": step.ordinal,
+            "role": step.role,
+            "argv_sha256": hashlib.sha256(step.argv.encode("utf-8", "replace")).hexdigest(),
+            "outcome": "completed" if step.result.get("success") else "failed",
+            "output_sha256": hashlib.sha256(output.encode("utf-8", "replace")).hexdigest(),
+        }
+        exit_code = step.result.get("exit_code")
+        if type(exit_code) is int:
+            observation["exit_code"] = exit_code
+        for key in ("lifecycle_state", "termination_reason"):
+            value = str(step.result.get(key) or "").strip()
+            if value:
+                observation[key] = value
+        semantic_failure = str(step.result.get("semantic_failure") or "").strip()
+        if semantic_failure:
+            observation["semantic_failure"] = semantic_failure
+        return observation
+
+    @staticmethod
+    def _mark_latest_install_signature_failure() -> None:
+        """Record a lying-zero installer failure without forging its exit.
+
+        Some wrappers return success/0 while their output contains an
+        authoritative installation-error signature. ``_setup_env`` already
+        treats that as a semantic failure. Bind the same fact into the latest
+        dependency step while preserving its real exit code and output bytes.
+        """
+
+        trace = _ACTIVE_PRODUCER_TRACE.get()
+        if trace is None:
+            return
+        for step in reversed(trace.steps):
+            if step.role != "dependency_install":
+                continue
+            if step.result.get("success") is True and step.result.get("exit_code") == 0:
+                step.result["success"] = False
+                step.result["semantic_failure"] = "install_error_signature"
+            return
+
+    def _producer_observations(
+        self,
+        trace: _ProducerTrace,
+        *,
+        result: ToolResult,
+        requirements: Dict[str, Any],
+        working_directory: str,
+        venv: str,
+    ) -> Dict[str, Any]:
+        project_steps = [
+            self._producer_step_observation(step) for step in trace.steps if not step.mechanical
+        ]
+        mechanical_steps = [
+            self._producer_step_observation(step) for step in trace.steps if step.mechanical
+        ]
+        observations: Dict[str, Any] = {
+            "schema_version": 1,
+            "ecosystem": "python",
+            "operation": trace.operation,
+            "recorded_project_steps": project_steps,
+        }
+        if mechanical_steps:
+            observations["recorded_mechanical_steps"] = mechanical_steps
+
+        if trace.operation == "setup_env":
+            setup = dict(trace.details.get("setup") or {})
+            setup.setdefault("venv", venv)
+            setup.setdefault("installer", str(requirements.get("python_installer") or "pip"))
+            setup.setdefault("install_outcome", "success" if result.succeeded else "failed")
+            observations["setup"] = setup
+        elif trace.operation == "build":
+            observations["build"] = dict(
+                trace.details.get("build") or {"artifact_status": "probe_failed", "artifacts": []}
+            )
+        else:
+            observations["compile"] = dict(trace.details.get("compile") or {})
+        return observations
 
     # ------------------------------------------------------------------
     # native (spec §C8 — the resolved capability, then the same deps ladder)
@@ -685,6 +1016,7 @@ class PythonTool(BaseTool):
         preamble: List[str] = []
         commands: List[str] = []
         observations: List[Dict[str, str]] = []
+        probes_green = True
 
         packages: List[str] = []
         for feature in features:
@@ -713,10 +1045,15 @@ class PythonTool(BaseTool):
                 "",
             )
             observation: Dict[str, str] = {"feature": feature, "probe": probe}
+            probe_exit = probed.get("exit_code")
+            if type(probe_exit) is int:
+                observation["probe_exit_code"] = str(probe_exit)
             if line:
                 # Absent facts stay absent: a probe that answered nothing states
                 # no version, and inventing "unknown" would be a fact nobody saw.
                 observation["observation"] = line
+            if not probed.get("success") or probe_exit != 0 or not line:
+                probes_green = False
             observations.append(observation)
             preamble.append(f"[native] {probe} -> {line or 'no output'}")
 
@@ -733,7 +1070,7 @@ class PythonTool(BaseTool):
             for command in (rebuilt.metadata or {}).get("install_commands") or ()
         )
 
-        succeeded = bool(installed.get("success")) and rebuilt.succeeded
+        succeeded = bool(installed.get("success")) and probes_green and rebuilt.succeeded
         receipt_metadata = record_invocation(
             self.orchestrator.execute_command,
             tool="python",
@@ -774,7 +1111,14 @@ class PythonTool(BaseTool):
                 error=(
                     None
                     if succeeded
-                    else (rebuilt.error or f"the {', '.join(packages)} install reported a failure")
+                    else (
+                        rebuilt.error
+                        or (
+                            "a native capability probe failed or returned no observation"
+                            if not probes_green
+                            else f"the {', '.join(packages)} install reported a failure"
+                        )
+                    )
                 ),
                 error_code=None if succeeded else (rebuilt.error_code or "NATIVE_BUILD_FAILED"),
                 metadata=metadata,
@@ -816,7 +1160,9 @@ class PythonTool(BaseTool):
                 output="",
                 error="the native bundle is not an allowlisted feature/definition set",
                 error_code="NATIVE_BUNDLE_REJECTED",
-                suggestions=["Call build(action='native') so the facade validates the intent"],
+                suggestions=[
+                    "Constraint: native features and definitions must match the public allowlist"
+                ],
                 metadata={"operation": "native"},
             ),
         )
@@ -851,6 +1197,7 @@ class PythonTool(BaseTool):
             requirements.get("python_version"),
             constraint=requirements.get("python_constraint"),
             source=requirements.get("python_version_source") or "requires-python",
+            venv_path=venv,
         )
         if outcome.narration:
             preamble.append(outcome.narration)
@@ -858,7 +1205,13 @@ class PythonTool(BaseTool):
         # Venv on the pre-flight's interpreter. A provisioning pre-flight has
         # already created the venv (uv venv / pythonX.Y -m venv).
         if not outcome.provisioned and not self._venv_exists(venv):
-            made = self._run(f"python3 -m venv {venv}", working_directory, timeout)
+            made = self._run(
+                f"python3 -m venv {venv}",
+                working_directory,
+                timeout,
+                producer_role="venv_create",
+                mechanical=True,
+            )
             if not made.get("success"):
                 return self._finish(
                     ToolResult.completed_failure(
@@ -883,17 +1236,13 @@ class PythonTool(BaseTool):
 
         installer = requirements.get("python_installer") or "pip"
         note = requirements.get("python_install_note")
-        pin = str(args or "").strip()
-        commands = (
-            [_PIP_PIN.replace("{venv}", venv).replace("{pin}", shlex.quote(pin))]
-            if pin
-            else [
-                c.replace("{venv}", venv).replace("{dir}", working_directory)
-                for c in (requirements.get("python_install_commands") or [])
-            ]
-        )
-        if pin:
-            preamble.append(f"[setup] installing the claim-backed exact pin {pin}")
+        # The facade contract forbids every direct deps target. This operation
+        # consumes only surveyed project-owned install commands; retaining a
+        # hidden pin rung here would create a second authority path.
+        commands = [
+            c.replace("{venv}", venv).replace("{dir}", working_directory)
+            for c in (requirements.get("python_install_commands") or [])
+        ]
         if not commands:
             # Bug #13 defect 4: self-healing deps — an empty manifest (the
             # agent skipped project analyze) must not no-op green; the marker
@@ -919,9 +1268,8 @@ class PythonTool(BaseTool):
                         ),
                         error_code="PYTHON_NO_INSTALLER_DETECTED",
                         suggestions=[
-                            "Run project(action='analyze') to (re)generate the "
-                            "build-requirements manifest",
-                            "Check that working_directory points at the project root",
+                            "Observed fact: no installer declaration was found at the submitted root",
+                            "Relevant constraints: current survey epoch and submitted working directory",
                         ],
                         metadata={"operation": "setup_env", "venv": venv},
                     ),
@@ -947,7 +1295,13 @@ class PythonTool(BaseTool):
         )
         for cmd in commands:
             result_already_recorded = False
-            result = self._run(cmd, working_directory, install_timeout, env_overlay)
+            result = self._run(
+                cmd,
+                working_directory,
+                install_timeout,
+                env_overlay,
+                producer_role="dependency_install",
+            )
             install_failed = self._effective_install_failure(result)
 
             # Bounded retry (spec: exactly once): pip's Requires-Python
@@ -958,7 +1312,9 @@ class PythonTool(BaseTool):
                 if needed and needed != active:
                     retried = True
                     retry_outcome = PythonPreflight(self.orchestrator).run(
-                        needed, source="install-error"
+                        needed,
+                        source="install-error",
+                        venv_path=venv,
                     )
                     if retry_outcome.provisioned:
                         preamble.append(
@@ -966,7 +1322,13 @@ class PythonTool(BaseTool):
                             f"re-provisioned, retry 1/1"
                         )
                         retry_meta = {"from": active or "unknown", "to": needed}
-                        result = self._run(cmd, working_directory, install_timeout, env_overlay)
+                        result = self._run(
+                            cmd,
+                            working_directory,
+                            install_timeout,
+                            env_overlay,
+                            producer_role="dependency_install",
+                        )
                         install_failed = self._effective_install_failure(result)
 
             if install_failed and not provider_recovery_attempted:
@@ -993,7 +1355,13 @@ class PythonTool(BaseTool):
                     preamble.append(recovery["narration"])
                     provider_failed = self._effective_install_failure(recovery["provider_result"])
                     if not provider_failed:
-                        result = self._run(cmd, working_directory, install_timeout, env_overlay)
+                        result = self._run(
+                            cmd,
+                            working_directory,
+                            install_timeout,
+                            env_overlay,
+                            producer_role="dependency_install",
+                        )
                         provider_recovery_meta["root_retry"] = True
                     else:
                         result = recovery["provider_result"]
@@ -1048,7 +1416,13 @@ class PythonTool(BaseTool):
                     f"{self._tail(result.get('output') or '')}"
                 )
                 cmd = _PIP_FALLBACK.replace("{venv}", venv)
-                result = self._run(cmd, working_directory, timeout, env_overlay)
+                result = self._run(
+                    cmd,
+                    working_directory,
+                    timeout,
+                    env_overlay,
+                    producer_role="dependency_install",
+                )
                 result_already_recorded = False
                 install_failed = self._effective_install_failure(result)
 
@@ -1063,10 +1437,51 @@ class PythonTool(BaseTool):
             # and the observation leads with it instead of burying it.
             masked = self._install_error_line(result.get("output") or "")
             if install_failed:
+                if masked:
+                    self._mark_latest_install_signature_failure()
                 overall_ok = False
                 failure_detail = masked or self._failure_tail_line(result)
                 preamble.insert(0, f"[setup] dependency install FAILED — {failure_detail}")
                 break
+
+        trace = _ACTIVE_PRODUCER_TRACE.get()
+        setup_observation: Dict[str, Any] = {
+            "venv": venv,
+            "installer": installer,
+            "install_outcome": "success" if overall_ok else "failed",
+        }
+        # Only the facade's setup_env action owns these postconditions.  A
+        # native action calls this dependency ladder internally and finalizes
+        # its own aggregate native receipt; running unreceipted pip/import
+        # probes inside that nested call would create a second evidence lane.
+        if overall_ok and trace is not None:
+            postcondition_timeout = min(max(int(timeout), 1), 120)
+            pip_check = self._run(
+                f"{venv}/bin/python -m pip check",
+                working_directory,
+                postcondition_timeout,
+                env_overlay,
+                producer_role="pip_check",
+                monitor_floor=1,
+            )
+            pip_output = str(pip_check.get("full_output") or pip_check.get("output") or "")
+            pip_exit = pip_check.get("exit_code")
+            if type(pip_exit) is not int:
+                pip_exit = 0 if pip_check.get("success") else 1
+            setup_observation["pip_check"] = {
+                "status": "clean" if pip_check.get("success") and pip_exit == 0 else "broken",
+                "exit_code": pip_exit,
+                "output_sha256": hashlib.sha256(pip_output.encode("utf-8", "replace")).hexdigest(),
+            }
+            setup_observation["imports"] = self._python_import_observation(
+                working_directory=working_directory,
+                timeout=postcondition_timeout,
+                requirements=requirements,
+                venv=venv,
+                env_overlay=env_overlay,
+            )
+        if trace is not None:
+            trace.details["setup"] = setup_observation
 
         return self._finish(
             ToolResult.completed(
@@ -1097,6 +1512,100 @@ class PythonTool(BaseTool):
             ),
             preamble,
         )
+
+    @staticmethod
+    def _survey_import_targets(requirements: Dict[str, Any]) -> Optional[List[str]]:
+        """Exact survey-derived import targets; None means the survey was unsafe.
+
+        No package is discovered or guessed here.  Facts-v8 package mappings
+        own the primary list; the older surveyed package list is the explicit
+        compatibility fallback.
+        """
+
+        return python_import_targets(requirements)
+
+    def _python_import_observation(
+        self,
+        *,
+        working_directory: str,
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
+        env_overlay: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        targets = self._survey_import_targets(requirements)
+        if targets is None:
+            return {"status": "unavailable", "reason_code": "invalid_survey_targets"}
+        if not targets:
+            return {"status": "unavailable", "reason_code": "no_survey_targets"}
+        target_json = json.dumps(targets, separators=(",", ":"), ensure_ascii=False)
+        command = (
+            f"{venv}/bin/python -c {shlex.quote(_PYTHON_IMPORT_PROBE_SCRIPT)} "
+            f"{shlex.quote(target_json)}"
+        )
+        result = self._run(
+            command,
+            working_directory,
+            timeout,
+            env_overlay,
+            producer_role="import_probe",
+            monitor_floor=1,
+        )
+        if not result.get("success"):
+            return {"status": "unavailable", "reason_code": "probe_failed"}
+        output = str(result.get("full_output") or result.get("output") or "")
+        try:
+            payload = json.loads(output.strip())
+            if not isinstance(payload, dict) or set(payload) != {
+                "targets",
+                "importable",
+                "failures",
+            }:
+                raise ValueError("invalid import probe shape")
+            if payload["targets"] != targets:
+                raise ValueError("import probe target drift")
+            importable = payload["importable"]
+            failures = payload["failures"]
+            if not isinstance(importable, list) or not isinstance(failures, list):
+                raise ValueError("invalid import probe collections")
+            if any(target not in targets for target in importable) or len(set(importable)) != len(
+                importable
+            ):
+                raise ValueError("invalid imported targets")
+            normalized_failures: List[Dict[str, str]] = []
+            failed_targets: List[str] = []
+            for raw_failure in failures:
+                if not isinstance(raw_failure, dict) or set(raw_failure) != {
+                    "target",
+                    "error_type",
+                }:
+                    raise ValueError("invalid import failure")
+                target = str(raw_failure.get("target") or "").strip()
+                error_type = str(raw_failure.get("error_type") or "").strip()
+                if target not in targets or target in failed_targets or not error_type:
+                    raise ValueError("invalid import failure identity")
+                failed_targets.append(target)
+                if len(normalized_failures) < _PYTHON_IMPORT_FAILURE_SAMPLE_CAP:
+                    normalized_failures.append({"target": target, "error_type": error_type[:128]})
+            if set(importable) | set(failed_targets) != set(targets) or set(importable) & set(
+                failed_targets
+            ):
+                raise ValueError("import probe did not account for every target")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"status": "unavailable", "reason_code": "invalid_probe_output"}
+        observation: Dict[str, Any] = {
+            "status": "complete",
+            "targets": targets,
+            "targets_sha256": producer_observations_sha256(targets),
+            "target_count": len(targets),
+            "importable_count": len(importable),
+            "failed_count": len(failed_targets),
+            "failures": normalized_failures,
+            "output_sha256": hashlib.sha256(output.encode("utf-8", "replace")).hexdigest(),
+        }
+        if len(normalized_failures) < len(failed_targets):
+            observation["truncated"] = True
+        return observation
 
     @staticmethod
     def _normalized_distribution_name(value: str) -> str:
@@ -1146,7 +1655,13 @@ class PythonTool(BaseTool):
         failure — the caller renders it as an honest failure, rung narrated."""
         transcript: List[str] = []
         no_deps_command = _PIP_NO_DEPS.replace("{venv}", venv)
-        result = self._run(no_deps_command, working_directory, timeout, env_overlay)
+        result = self._run(
+            no_deps_command,
+            working_directory,
+            timeout,
+            env_overlay,
+            producer_role="dependency_install",
+        )
         transcript.append(
             f"$ {self._with_env(no_deps_command, env_overlay)}\n"
             f"{self._tail(result.get('output') or '')}"
@@ -1159,7 +1674,13 @@ class PythonTool(BaseTool):
                 deps_command = f"{venv}/bin/python -m pip install " + " ".join(
                     shlex.quote(item) for item in remaining
                 )
-                result = self._run(deps_command, working_directory, timeout, env_overlay)
+                result = self._run(
+                    deps_command,
+                    working_directory,
+                    timeout,
+                    env_overlay,
+                    producer_role="dependency_install",
+                )
                 transcript.append(
                     f"$ {self._with_env(deps_command, env_overlay)}\n"
                     f"{self._tail(result.get('output') or '')}"
@@ -1239,7 +1760,13 @@ class PythonTool(BaseTool):
             return None
 
         provider_command = f"{venv}/bin/python -m pip install -e {shlex.quote(provider_root)}"
-        provider_result = self._run(provider_command, working_directory, timeout, env_overlay)
+        provider_result = self._run(
+            provider_command,
+            working_directory,
+            timeout,
+            env_overlay,
+            producer_role="dependency_install",
+        )
         return {
             "provider_command": provider_command,
             "provider_result": provider_result,
@@ -1377,25 +1904,11 @@ class PythonTool(BaseTool):
                 required_smoke_boundary=(native_smoke["absolute_path"] if native_smoke else None),
             )
             if rejection:
-                replacement_args = native_smoke["args"] if native_smoke else None
-                # §3.3: name the concrete repair. Without a capability receipt
-                # the only accepted next command IS the surveyed bounded smoke,
-                # so the refusal spells it out instead of hinting at breadth.
-                smoke_first = (
-                    (
-                        "Run the verified bounded smoke first: "
-                        f"build(action='test', args={replacement_args!r}) — the "
-                        "full suite unlocks only after that smoke executes and "
-                        "writes its capability receipt"
-                    )
-                    if native_bounded and replacement_args
-                    else None
-                )
                 rejection_lines = [f"[test] rejected args {raw_args!r} — {rejection}"]
-                if smoke_first and native_smoke:
+                if native_bounded and native_smoke:
                     rejection_lines.append(
                         f"[test] no native smoke receipt for {native_project_root} — "
-                        f"the bounded smoke {native_smoke['path']} must execute first"
+                        "a bounded, project-owned smoke observation is required before a full sweep"
                     )
                 self._record_control_assessment("PYTEST_ARGS_REJECTED", rejection)
                 return ToolResult.completed_failure(
@@ -1405,24 +1918,13 @@ class PythonTool(BaseTool):
                     failure_signature="pytest_args_rejected:invalid_selector",
                     suggestions=[
                         _PYTEST_USAGE_HINT,
-                        *(
-                            [smoke_first]
-                            if smoke_first
-                            else (
-                                [
-                                    "Use the verified native smoke instead: "
-                                    f"build(action='test', args={replacement_args!r})"
-                                ]
-                                if replacement_args
-                                else []
-                            )
-                        ),
-                        "For make targets or shell commands use the bash tool instead",
+                        "Constraint: a native-unready project may not expand to a full-suite selector",
+                        "Neutral affordances: build test or shell execution",
                     ],
                     metadata={
                         "operation": "test",
                         "rejected_args": raw_args,
-                        **({"replacement_args": replacement_args} if replacement_args else {}),
+                        "surveyed_native_smoke_available": native_smoke is not None,
                         **gate_metadata,
                     },
                 )
@@ -1445,8 +1947,8 @@ class PythonTool(BaseTool):
                         error=unavailable,
                         error_code="NATIVE_SMOKE_UNAVAILABLE",
                         suggestions=[
-                            "Rerun project(action='analyze') to refresh verified smoke targets",
-                            "Build the native root, then retry bare build(action='test')",
+                            "Observed fact: no current project-owned native smoke candidate is available",
+                            "Constraint: the runner refuses an unbounded native-unready test sweep",
                         ],
                         metadata={
                             "operation": "test",
@@ -1539,8 +2041,8 @@ class PythonTool(BaseTool):
                     error=f"{detail} — test execution was not started",
                     error_code=code,
                     suggestions=[
-                        "Refresh the survey or provide a narrower existing pytest selector",
-                        "Build the native root before attempting a broader suite",
+                        "Observed fact: collection produced no admissible executable test items",
+                        "Relevant constraints: current survey coordinates and native capability evidence",
                     ],
                     metadata={
                         "operation": "test",
@@ -1580,16 +2082,40 @@ class PythonTool(BaseTool):
         # attempt's JUnit output is attributable to this attempt alone —
         # a rerun overwriting the same path is a content change, not a
         # second report.
-        # §C3: a dispatch the facade never froze (recovery/delegate paths)
-        # freezes its OWN contract before running.
-        pytest_contract, _created = ensure_dispatch_contract(
+        # Revalidate the facade's semantic contract against the exact test
+        # operation immediately before the test runner. Internal Python code
+        # never freezes fallback authority of its own.
+        pytest_contract, _ = ensure_dispatch_contract(
             self.orchestrator.execute_command,
             tool="python",
             effective_action="test",
             expected_cwd=working_directory,
             expected_argv=command,
             requirements=requirements,
+            internal_params={
+                "operation": "test",
+                "working_directory": working_directory,
+                "args": args,
+                "timeout": timeout,
+            },
         )
+        if pytest_contract is None:
+            return self._finish(
+                ToolResult.completed_failure(
+                    output=(
+                        "[contract] Python tests were not dispatched: the active "
+                        "facade contract no longer matches the test operation."
+                    ),
+                    error="invocation contract authority missing or mismatched",
+                    error_code=CONTRACT_AUTHORITY_MISSING,
+                    metadata={
+                        "runner_dispatched": False,
+                        "tool": "python",
+                        "operation": "test",
+                    },
+                ),
+                preamble,
+            )
         reports_before = snapshot_reports(
             self.orchestrator.execute_command,
             [working_directory, PYTEST_REPORT_DIR],
@@ -1626,9 +2152,9 @@ class PythonTool(BaseTool):
                 ),
                 output=result.get("full_output") or output,
                 requirements=requirements,
-                # Plan 6 Stage B: bind this dispatch back to the contract the
-                # build facade froze for it — or the fallback frozen above.
-                # `compliance` is the argv comparison's verdict.
+                # Bind this dispatch to the semantic contract the build facade
+                # froze. Python semantic receipts intentionally carry no argv
+                # compliance claim.
                 **contract_receipt_fields(command),
             )
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
@@ -2145,35 +2671,16 @@ class PythonTool(BaseTool):
         return ((result.get("output") or "").strip()) or None
 
     def _native_smoke_receipt(self, project_root: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The capability receipt for THIS project root, or None.
+        """Return typed live capability authority once that schema exists.
 
-        A receipt from another checkout never unlocks this one, and an
-        unreadable/garbled receipt is no receipt — the bounded smoke runs again.
-        P0-E: a receipt without a recorded non-skipped pass proves no
-        capability (the live TVM one recorded 3 executed / 3 skipped), and a
-        receipt bound to a different target SHA was earned on different
-        sources; both are inert. An unverifiable binding is a failed binding.
+        ``native_smoke_receipt.json`` is retained only as a forensic mirror.
+        It is container-writable and therefore cannot unlock a broader runner
+        dispatch.  InvocationReceipt v2 does not yet freeze the bounded
+        selector/count/pass tuple needed to validate that capability, so the
+        only safe live answer is absent and the next attempt stays bounded.
         """
-        if not project_root:
-            return None
-        result = self.orchestrator.execute_command(f"cat {shlex.quote(NATIVE_SMOKE_RECEIPT_JSON)}")
-        if not result.get("success"):
-            return None
-        try:
-            payload = json.loads((result.get("output") or "").strip())
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        if str(payload.get("project_root") or "").rstrip("/") != project_root.rstrip("/"):
-            return None
-        stats = payload.get("stats")
-        passed = stats.get("passed") if isinstance(stats, dict) else None
-        if not isinstance(passed, int) or isinstance(passed, bool) or passed < 1:
-            return None
-        if "target_sha" in payload and payload["target_sha"] != self._target_sha(project_root):
-            return None
-        return payload
+        del project_root
+        return None
 
     def _write_native_smoke_receipt(
         self,
@@ -2183,6 +2690,7 @@ class PythonTool(BaseTool):
         stats: Dict[str, Any],
         attempt: int,
     ) -> None:
+        """Write a forensic smoke summary; never live dispatch authority."""
         target_sha = self._target_sha(project_root)
         body = json.dumps(
             {
@@ -2219,8 +2727,47 @@ class PythonTool(BaseTool):
         requirements: Dict[str, Any],
         venv: str,
     ) -> ToolResult:
-        self._run(f"{venv}/bin/python -m pip install build", working_directory, timeout)
-        result = self._run(f"{venv}/bin/python -m build --wheel", working_directory, timeout)
+        before_wheels = self._wheel_snapshot(working_directory)
+        self._run(
+            f"{venv}/bin/python -m pip install build",
+            working_directory,
+            timeout,
+            producer_role="build_prerequisite",
+            mechanical=True,
+        )
+        result = self._run(
+            f"{venv}/bin/python -m build --wheel",
+            working_directory,
+            timeout,
+            producer_role="wheel_build",
+        )
+        after_wheels = self._wheel_snapshot(working_directory)
+        trace = _ACTIVE_PRODUCER_TRACE.get()
+        if before_wheels is None or after_wheels is None:
+            build_observation = {"artifact_status": "probe_failed", "artifacts": []}
+        else:
+            artifacts = []
+            for path in sorted(after_wheels):
+                digest, size = after_wheels[path]
+                previous = before_wheels.get(path)
+                if previous == (digest, size):
+                    continue
+                artifacts.append(
+                    {
+                        "path": posixpath.relpath(path, working_directory.rstrip("/")),
+                        "sha256": digest,
+                        "size_bytes": size,
+                        "change": "new" if previous is None else "changed",
+                    }
+                )
+            build_observation = {
+                "artifact_status": (
+                    "produced" if artifacts else ("stale_only" if after_wheels else "missing")
+                ),
+                "artifacts": artifacts,
+            }
+        if trace is not None:
+            trace.details["build"] = build_observation
         success = bool(result.get("success"))
         metadata = {
             "operation": "build",
@@ -2244,6 +2791,49 @@ class PythonTool(BaseTool):
             metadata=metadata,
         )
 
+    def _wheel_snapshot(self, working_directory: str) -> Optional[Dict[str, Tuple[str, int]]]:
+        """Bounded content/size snapshot of wheels directly under this root's dist/."""
+
+        root = working_directory.rstrip("/")
+        dist = f"{root}/dist"
+        script = (
+            "for file do "
+            "digest=$(sha256sum -- \"$file\" | cut -d' ' -f1) || exit 1; "
+            'size=$(wc -c < "$file") || exit 1; '
+            f"printf '{_WHEEL_SNAPSHOT_PREFIX}\\t%s\\t%s\\t%s\\n' "
+            '"$size" "$digest" "$file"; '
+            "done"
+        )
+        command = (
+            f"find {shlex.quote(dist)} -maxdepth 1 -type f -name '*.whl' "
+            f"-exec sh -c {shlex.quote(script)} sh {{}} + 2>/dev/null | sort | head -n 33"
+        )
+        result = self.orchestrator.execute_command(command, workdir=working_directory) or {}
+        if not result.get("success"):
+            return None
+        lines = [line for line in str(result.get("output") or "").splitlines() if line.strip()]
+        if len(lines) > 32:
+            return None
+        snapshot: Dict[str, Tuple[str, int]] = {}
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) != 4 or fields[0] != _WHEEL_SNAPSHOT_PREFIX:
+                return None
+            _, raw_size, digest, path = fields
+            raw_size = raw_size.strip()
+            digest = digest.strip().lower()
+            normalized = posixpath.normpath(path)
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not raw_size.isdigit()
+                or not normalized.startswith(dist + "/")
+                or "/" in normalized[len(dist) + 1 :]
+                or not re.fullmatch(r"[A-Za-z0-9_.+!-]+\.whl", posixpath.basename(normalized))
+            ):
+                return None
+            snapshot[normalized] = (digest, int(raw_size))
+        return snapshot
+
     # ------------------------------------------------------------------
     # compile (the compileall evidence generator)
     # ------------------------------------------------------------------
@@ -2259,12 +2849,16 @@ class PythonTool(BaseTool):
         dirs = self._package_dirs(working_directory, requirements)
         target = " ".join(shlex.quote(directory) for directory in dirs)
         result = self._run(
-            f"{venv}/bin/python -m compileall -q {target}", working_directory, timeout
+            f"{venv}/bin/python -m compileall -q {target}",
+            working_directory,
+            timeout,
+            producer_role="compileall",
         )
         metric_result = self._run(
             compileall_metrics_command(f"{venv}/bin/python", dirs),
             working_directory,
             timeout,
+            producer_role="compile_metrics",
         )
         metric = None
         metric_error = None
@@ -2293,6 +2887,91 @@ class PythonTool(BaseTool):
             metric_conflicts = [COMPILEALL_METRICS_UNAVAILABLE_CONFLICT]
             foreign_pyc_count = None
             cache_tag = None
+
+        root = working_directory.rstrip("/")
+
+        def relative(path: str, *, allow_dot: bool = False) -> Optional[str]:
+            normalized = posixpath.normpath(str(path or ""))
+            if normalized != root and not normalized.startswith(root + "/"):
+                return None
+            value = posixpath.relpath(normalized, root)
+            if value == "." and not allow_dot:
+                return None
+            return value
+
+        relative_roots = [relative(directory, allow_dot=True) for directory in dirs]
+        trace = _ACTIVE_PRODUCER_TRACE.get()
+        if any(path is None for path in relative_roots):
+            compile_observation: Dict[str, Any] = {
+                "status": "unavailable",
+                "roots": [path for path in relative_roots if path is not None] or ["."],
+                "roots_sha256": producer_observations_sha256(
+                    [path for path in relative_roots if path is not None] or ["."]
+                ),
+                "reason_code": "basis_escaped",
+            }
+        elif metric is None:
+            roots = [str(path) for path in relative_roots]
+            compile_observation = {
+                "status": "unavailable",
+                "roots": roots,
+                "roots_sha256": producer_observations_sha256(roots),
+                "reason_code": (
+                    "metrics_command_failed"
+                    if not metric_result.get("success")
+                    else "metrics_output_invalid"
+                ),
+            }
+        elif not result.get("success"):
+            roots = [str(path) for path in relative_roots]
+            compile_observation = {
+                "status": "unavailable",
+                "roots": roots,
+                "roots_sha256": producer_observations_sha256(roots),
+                "reason_code": "compileall_failed",
+            }
+        elif metric.status == "unavailable":
+            roots = [str(path) for path in relative_roots]
+            compile_observation = {
+                "status": "unavailable",
+                "roots": roots,
+                "roots_sha256": producer_observations_sha256(roots),
+                "reason_code": "no_sources",
+            }
+        else:
+            missing_paths = [relative(path) for path in metric.missing_sources]
+            foreign_paths = [relative(path) for path in metric.foreign_pycs]
+            if any(path is None for path in missing_paths + foreign_paths):
+                roots = [str(path) for path in relative_roots]
+                compile_observation = {
+                    "status": "unavailable",
+                    "roots": roots,
+                    "roots_sha256": producer_observations_sha256(roots),
+                    "reason_code": "basis_escaped",
+                }
+            else:
+                roots = [str(path) for path in relative_roots]
+                compile_observation = {
+                    "status": metric.status,
+                    "roots": roots,
+                    "roots_sha256": producer_observations_sha256(roots),
+                    "source_count": metric.source_count,
+                    "compiled_source_count": metric.compiled_source_count,
+                    "missing_source_count": metric.missing_source_count,
+                    "foreign_pyc_count": metric.foreign_pyc_count,
+                    "cache_tag": metric.cache_tag,
+                    "source_basis_sha256": metric.source_basis_sha256,
+                    "pyc_basis_sha256": metric.pyc_basis_sha256,
+                    "source_basis_entry_count": metric.source_basis_entry_count,
+                    "pyc_basis_entry_count": metric.pyc_basis_entry_count,
+                    "missing_sources": [str(path) for path in missing_paths],
+                    "foreign_pycs": [str(path) for path in foreign_paths],
+                    "conflicts": list(metric.conflicts),
+                }
+                if metric.coverage is not None:
+                    compile_observation["coverage"] = metric.coverage
+        if trace is not None:
+            trace.details["compile"] = compile_observation
 
         if metric_status == "unavailable" and py_count == 0:
             # Bug #13 defect 8: 0/0 compiled is VACUOUS evidence — say so
@@ -2376,6 +3055,10 @@ class PythonTool(BaseTool):
         workdir: str,
         timeout: int,
         env_overlay: Optional[Dict[str, str]] = None,
+        *,
+        producer_role: Optional[str] = None,
+        mechanical: bool = False,
+        monitor_floor: int = 600,
     ) -> Dict[str, Any]:
         """One container command; monitored path when the orchestrator has it
         (installs and test runs are long), plain execute_command otherwise.
@@ -2384,15 +3067,27 @@ class PythonTool(BaseTool):
         exported: it applies to THIS command and cannot leak into the next one.
         """
         command = self._with_env(command, env_overlay)
+        trace = _ACTIVE_PRODUCER_TRACE.get()
+        if trace is not None and not producer_role:
+            raise RuntimeError(
+                f"contract-owned python {trace.operation} command has no producer role"
+            )
         if hasattr(self.orchestrator, "execute_command_with_monitoring"):
-            return self.orchestrator.execute_command_with_monitoring(
+            result = self.orchestrator.execute_command_with_monitoring(
                 command,
                 workdir=workdir,
-                silent_timeout=max(timeout, 600),
-                absolute_timeout=max(timeout, 600),
+                silent_timeout=max(timeout, monitor_floor),
+                absolute_timeout=max(timeout, monitor_floor),
                 optimize_for_maven=False,
             )
-        return self.orchestrator.execute_command(command, workdir=workdir)
+        else:
+            result = self.orchestrator.execute_command(command, workdir=workdir)
+        normalized = dict(result or {})
+        if trace is not None:
+            trace.record(str(producer_role), mechanical, command, normalized)
+            if normalized.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
+                raise _ProducerDetached(command, normalized)
+        return normalized
 
     def _venv_exists(self, venv: str) -> bool:
         probe = self.orchestrator.execute_command(

@@ -1,6 +1,6 @@
 import pytest
 
-from sag.agent.loop_memory import LoopEvent, LoopMemory
+from sag.agent.loop_memory import CompletionClaimEvent, LoopEvent, LoopMemory
 from sag.agent.phase_transitions import RepairRequest
 
 
@@ -416,3 +416,118 @@ def test_repair_guard_rejects_same_request_without_progress(loop_memory):
 
     assert loop_memory.check(request, vector) is None
     assert loop_memory.check(request, vector) == "repair_without_progress"
+
+
+def completion_claim(**overrides):
+    body = {
+        "phase_attempt_id": "test-1",
+        "claim_kind": "done",
+        "judge_disposition": "repair_required",
+        "blocker_id": "tests_failed",
+        "mechanical_evidence_digest": "evidence-v1",
+        "assessment_fingerprints": ("assessment-b", "assessment-a"),
+        "open_job_fingerprints": (),
+        "target_fingerprint": "sha-1",
+        "config_fingerprint": "config-1",
+        "fact_fingerprint": "facts-1",
+        "evidence_refs": ("ref-b", "ref-a"),
+        "prose": "I think this is done",
+    }
+    body.update(overrides)
+    return CompletionClaimEvent(**body)
+
+
+def test_third_no_op_completion_claim_converges_as_agent_no_progress(loop_memory):
+    decisions = [loop_memory.observe_completion_claim(completion_claim()) for _ in range(3)]
+
+    assert [decision.decision for decision in decisions] == [
+        "continue",
+        "continue",
+        "agent_no_progress",
+    ]
+    assert decisions[-1].recurrence_count == 3
+    assert decisions[-1].close_phase is True
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 3
+
+
+def test_done_blocked_prose_and_ref_order_cannot_evade_completion_chain(loop_memory):
+    first = completion_claim()
+    second = completion_claim(
+        claim_kind="blocked",
+        prose="a wholly different rationale",
+        evidence_refs=("ref-a", "ref-b"),
+        assessment_fingerprints=("assessment-a", "assessment-b"),
+    )
+
+    assert loop_memory.observe_completion_claim(first).recurrence_count == 1
+    decision = loop_memory.observe_completion_claim(second)
+
+    assert decision.recurrence_count == 2
+    assert decision.key.canonical_claim == "completion"
+
+
+def test_invalid_or_identical_action_does_not_reset_completion_chain(loop_memory):
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 1
+    assert loop_memory.observe_material_action("act-a", schema_valid=False) is False
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 2
+
+    assert loop_memory.observe_material_action("act-a") is True
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 1
+    assert loop_memory.observe_material_action("act-a") is False
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 2
+
+
+def test_new_material_action_resets_even_when_the_later_execution_failed(loop_memory):
+    loop_memory.observe_completion_claim(completion_claim())
+    loop_memory.observe_completion_claim(completion_claim())
+
+    # LoopMemory needs dispatch identity, not a success claim.  A failed run is
+    # still a real experiment from which the model can revise its hypothesis.
+    assert loop_memory.observe_material_action({"action_fingerprint": "act-repair-b"}) is True
+
+    decision = loop_memory.observe_completion_claim(completion_claim())
+    assert decision.recurrence_count == 1
+    assert loop_memory.epochs.material_action == 1
+
+
+def test_new_fact_resets_but_duplicate_fact_fingerprint_does_not(loop_memory):
+    loop_memory.observe_completion_claim(completion_claim())
+    assert loop_memory.observe_evidence("fact-content-a") is True
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 1
+    assert loop_memory.observe_evidence("fact-content-a") is False
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 2
+
+
+def test_job_transition_resets_but_unchanged_poll_does_not(loop_memory):
+    loop_memory.observe_completion_claim(completion_claim())
+    assert loop_memory.observe_job_transition("job-1", "running", progress_fingerprint="10")
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 1
+    assert not loop_memory.observe_job_transition("job-1", "running", progress_fingerprint="10")
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 2
+    assert loop_memory.observe_job_transition("job-1", "settled", progress_fingerprint="20")
+    assert loop_memory.observe_completion_claim(completion_claim()).recurrence_count == 1
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [
+        "wait_required",
+        "harness_recovery_required",
+        "terminal_claimable",
+        "terminal_blocked",
+    ],
+)
+def test_non_repair_dispositions_never_spend_completion_budget(loop_memory, disposition):
+    first = loop_memory.observe_completion_claim(completion_claim())
+    ignored = loop_memory.observe_completion_claim(completion_claim(judge_disposition=disposition))
+    after = loop_memory.observe_completion_claim(completion_claim())
+
+    assert first.recurrence_count == 1
+    assert ignored.decision == "not_counted"
+    assert ignored.recurrence_count == 0
+    assert after.recurrence_count == 2
+
+
+def test_completion_claim_cap_must_be_positive():
+    with pytest.raises(ValueError, match="completion claim cap"):
+        LoopMemory(completion_claim_cap=0)

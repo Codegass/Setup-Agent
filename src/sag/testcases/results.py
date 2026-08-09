@@ -49,6 +49,15 @@ def _name_and_param_id(value: str) -> tuple[str, str]:
         return "", ""
 
     param_id = ""
+    # JUnit 4 parameterized reports commonly append the test class after the
+    # invocation id: ``works[0](pkg.ExampleTest)``.  Capture the bracket before
+    # removing that signature; otherwise ``[0]`` becomes part of the method
+    # name and every parameterized case collapses to an unparameterized one.
+    junit4 = re.match(r"^(.*?)\[([^\]]*)\]\([^()]*\)\s*$", name)
+    if junit4:
+        name = junit4.group(1).rstrip()
+        param_id = junit4.group(2).strip()
+
     bracket = re.search(r"\[([^\]]*)\]\s*$", name)
     if bracket:
         param_id = bracket.group(1).strip()

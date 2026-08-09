@@ -17,76 +17,116 @@ never extends the cap, never runs during aborts, and never waits on a ledger
 it cannot read.
 """
 
-import json
+from container_evidence_fakes import ContainerFS
 
-from sag.agent.job_obligations import OBLIGATION_DIR, write_obligation
+from sag.agent.job_obligations import build_obligation, write_obligation
 from sag.agent.react_engine import ReActEngine
 from sag.agent.verdict_finalizer import EvidenceCloseReason
 
 JOB = "373f63e5a0a4"
 LOG_PATH = f"/tmp/sag_jobs/{JOB}.log"
 EXIT_PATH = f"{LOG_PATH}.exit"
+TERMINAL_AUTHORITY = "docker_exec_inspect_v1"
+DOCKER_EXEC_ID = "e" * 64
+CONTAINER_ID = "c" * 64
 
 
 def _obligation():
-    return {
-        "schema_version": 1,
-        "job_id": JOB,
-        "tool": "gradle",
-        "attempt": 1,
-        "requested_action": "test",
-        "effective_action": "test",
-        "argv": "/workspace/polaris/gradlew test",
-        "working_directory": "/workspace/polaris",
-        "before": {},
-        "log_path": LOG_PATH,
-        "exit_code_path": EXIT_PATH,
-        "settled_receipt_id": None,
-        "dispatch_sequence": 1,
-    }
+    return build_obligation(
+        job_id=JOB,
+        tool="gradle",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="/workspace/polaris/gradlew test",
+        working_directory="/workspace/polaris",
+        before={},
+        log_path=LOG_PATH,
+        exit_code_path=EXIT_PATH,
+        terminal_authority=TERMINAL_AUTHORITY,
+        docker_exec_id=DOCKER_EXEC_ID,
+        container_id=CONTAINER_ID,
+        start_accepted=True,
+        startup_identity_verified=True,
+        runner_dispatch_state="accepted",
+        pid=4711,
+        pgid=4711,
+        pid_path=f"/tmp/sag_jobs/{JOB}.pid",
+        pgid_path=f"/tmp/sag_jobs/{JOB}.pgid",
+        identity_path=f"/tmp/sag_jobs/{JOB}.identity",
+        process_identity_token="a" * 64,
+        dispatch_sequence=1,
+    )
 
 
-class WaitingContainer:
-    """A ledger with one open obligation whose exit file appears after
-    `polls_until_exit` existence checks."""
+class WaitingContainer(ContainerFS):
+    """A ledger plus a host-side detached exec that eventually finishes."""
 
     def __init__(self, polls_until_exit=3):
+        super().__init__()
         self.polls_until_exit = polls_until_exit
-        self.exit_checks = 0
-        self.files = {}
-        self.commands = []
+        self.terminal_checks = 0
 
     def execute_command(self, command, **kwargs):
-        self.commands.append(command)
-        if command.startswith("cat ") and "*.json" in command and OBLIGATION_DIR in command:
-            bodies = [
-                body for path, body in sorted(self.files.items())
-                if path.startswith(OBLIGATION_DIR)
-            ]
-            return {"success": True, "exit_code": 0, "output": "\n".join(bodies)}
-        if command.startswith("cat ") and OBLIGATION_DIR in command and "<<" not in command:
-            # single-file precheck: absence must be a real cat failure, or the
-            # writer reads "" as an existing different body and refuses
-            for path, body in self.files.items():
-                if path in command:
-                    return {"success": True, "exit_code": 0, "output": body}
-            return {"success": False, "exit_code": 1, "output": ""}
-        if EXIT_PATH in command and "<<" not in command:
-            self.exit_checks += 1
-            if self.exit_checks >= self.polls_until_exit:
-                return {"success": True, "exit_code": 0, "output": "0\n"}
-            return {"success": False, "exit_code": 1, "output": ""}
-        if "<<" in command and OBLIGATION_DIR in command:
-            # persist obligation writes so the ledger read sees them
-            for line in command.split("\n", 1)[1].splitlines():
-                if line.strip().startswith("{"):
-                    try:
-                        record = json.loads(line)
-                        self.files[f"{OBLIGATION_DIR}/{record['job_id']}.json"] = line
-                    except (ValueError, KeyError):
-                        pass
-            return {"success": True, "exit_code": 0, "output": ""}
-        return {"success": True, "exit_code": 0, "output": ""}
+        return self(command, **kwargs)
+
+    def execute_control_command(self, command, **kwargs):
+        return self(command, **kwargs)
+
+    def __call__(self, command, **kwargs):
+        if command.startswith("set +e; set -o pipefail; tmp=$(mktemp -d /tmp/sag-job-progress"):
+            self.commands.append(command)
+            digest = "b" * 64
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "\n".join(
+                    (
+                        f"JOB_ID:{JOB}",
+                        "PGID:4711",
+                        "PROCESS_STATE:running",
+                        "LOG_SIZE:1",
+                        "CPU_TICKS_DELTA:1",
+                        "PROCESS_COUNT:1",
+                        "CHILD_COUNT:0",
+                        "IDENTITY_COMPLETE:1",
+                        "ARTIFACT_COMPLETE:1",
+                        "REPORT_COMPLETE:1",
+                        f"PROCESS_IDENTITY_SHA256:{digest}",
+                        f"ARTIFACT_SHA256:{digest}",
+                        f"REPORT_SHA256:{digest}",
+                    )
+                ),
+            }
+        return super().__call__(command, **kwargs)
+
+    def inspect_detached_terminal(self, handle):
+        self.terminal_checks += 1
+        if (
+            handle.get("terminal_authority") != TERMINAL_AUTHORITY
+            or handle.get("docker_exec_id") != DOCKER_EXEC_ID
+            or handle.get("container_id") != CONTAINER_ID
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "probe_error": "terminal_identity_mismatch",
+            }
+        if self.terminal_checks < self.polls_until_exit:
+            return {
+                "probe_success": True,
+                "state": "running",
+                "running": True,
+                "finished": False,
+                "exit_code": None,
+            }
+        return {
+            "probe_success": True,
+            "state": "finished",
+            "running": False,
+            "finished": True,
+            "exit_code": 0,
+        }
 
 
 def _engine(container, *, started_at=1000.0, cap=7200, now=2000.0):
@@ -115,7 +155,7 @@ def test_the_close_waits_for_a_running_job_and_the_exit_arrives():
 
     _wait(engine)
 
-    assert container.exit_checks >= 3
+    assert container.terminal_checks >= 3
     assert len(engine._sleeps) == 2  # slept between the three exit checks
 
 
@@ -149,15 +189,17 @@ def test_no_open_obligations_means_no_wait():
     _wait(engine)
 
     assert engine._sleeps == []
-    assert container.exit_checks == 0
+    assert container.terminal_checks == 0
 
 
-def test_an_unreadable_ledger_is_never_waited_on():
-    """The gate already caps on an unreadable ledger (§6.8 fence 1); waiting
-    on a ledger we cannot read would be waiting on a guess."""
+def test_an_unreadable_ledger_gets_one_bounded_controller_retry_not_a_model_turn():
+    """Harness evidence failure is retried mechanically, then closes honestly."""
 
     class Unreadable:
         def execute_command(self, command, **kwargs):
+            raise AssertionError("normal runner must not be used for control reads")
+
+        def execute_control_command(self, command, **kwargs):
             return {
                 "success": False,
                 "exit_code": -1,
@@ -169,7 +211,7 @@ def test_an_unreadable_ledger_is_never_waited_on():
 
     _wait(engine)
 
-    assert engine._sleeps == []
+    assert engine._sleeps == [1.0]
 
 
 def test_a_missing_run_clock_means_no_wait():
@@ -195,14 +237,18 @@ def test_finalize_evidence_waits_before_it_sweeps():
     calls = []
     engine._await_open_obligations = lambda reason, **kw: calls.append(reason)
     engine._sweep_job_obligations = lambda: calls.append("sweep")
-    engine._record_unsettled_job_conflicts = lambda: calls.append("conflicts")
+    engine._record_unsettled_job_conflicts = lambda reason: calls.append(("conflicts", reason))
     engine._emit_control_event = lambda *a, **k: None
     engine.run_evidence_state = SimpleNamespace(sealed=False)
     engine.verdict_finalizer = SimpleNamespace(finalize=lambda state, reason: "snapshot")
 
     engine._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
 
-    assert calls == [EvidenceCloseReason.TEST_TERMINATED, "sweep", "conflicts"]
+    assert calls == [
+        EvidenceCloseReason.TEST_TERMINATED,
+        "sweep",
+        ("conflicts", EvidenceCloseReason.TEST_TERMINATED),
+    ]
 
 
 def test_a_sealed_state_never_reaches_the_wait():

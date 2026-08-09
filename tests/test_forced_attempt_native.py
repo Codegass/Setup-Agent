@@ -138,6 +138,9 @@ def test_forced_attempt_still_emits_the_forced_action_event(forced_engine):
     assert payload["policy"] == "test_attempt_required"
     assert payload["trigger"] == "terminal_metadata"
     assert payload["tool"] == "build"
+    assert payload["intent_source"] == "controller"
+    assert payload["intent_id"].startswith("intent-")
+    assert payload["action_fingerprint"].startswith("act-")
     assert payload["action_sha256"]
 
 

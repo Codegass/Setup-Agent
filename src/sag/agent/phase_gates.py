@@ -6,15 +6,16 @@ selects the next phase; routing belongs to ``PhaseTransitionPolicy``.
 
 from __future__ import annotations
 
-import json
 import shlex
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional
 
 from loguru import logger
 
-from .invocation_receipts import RECEIPT_DIR
+from .control_ownership import BlockerOwner
+from .evidence_records import EvidencePublicationBinding, read_live_published_json_records
+from .invocation_receipts import RECEIPT_DIR, validate_receipt_v2
 from .phase_machine import PhaseClaim, PhaseOutcome
 
 
@@ -31,6 +32,22 @@ class ClaimDisposition(str, Enum):
     PESSIMISTIC = "pessimistic"
     UNVERIFIABLE = "unverifiable"
     REFINED = "refined"
+
+
+class GateControlDisposition(str, Enum):
+    """What the controller may do after this gate observation.
+
+    This is deliberately orthogonal to :class:`ClaimDisposition`.  The latter
+    compares a model claim with project evidence; a running controller-owned
+    job or a broken evidence transport is not project evidence and must not be
+    encoded as a new kind of claim contradiction.
+    """
+
+    TERMINAL_CLAIMABLE = "terminal_claimable"
+    WAIT_REQUIRED = "wait_required"
+    HARNESS_RECOVERY_REQUIRED = "harness_recovery_required"
+    REPAIR_REQUIRED = "repair_required"
+    TERMINAL_BLOCKED = "terminal_blocked"
 
 
 _VALIDATED_OUTCOMES = {
@@ -60,10 +77,9 @@ _CLAIM_VALIDATOR_STATE = {
 # these states has NOT closed, so no gate may refine a claim upward past it.
 _UNCLOSED_DOMAIN_STATES = frozenset({"failed", "blocked", "untried"})
 
-# Append-only evidence assessments (Plan 6 Stage 0, spec §C4). Lane z1 owns the
-# writer; this is the documented cross-lane storage path — the sibling of
-# ``RECEIPT_DIR`` under the same ``.setup_agent`` root, one single-line JSON
-# file per assessment, named by its ``assessment_id``.
+# Stable storage-path compatibility for historical/forensic tooling.  Live
+# gate reads import the strict assessment-ledger API rather than trusting this
+# container directory directly.
 ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 
 # Plan 8 §3.2/§3.3: the job ids of every obligation the ledger still has open
@@ -72,6 +88,13 @@ ASSESSMENT_DIR = "/workspace/.setup_agent/evidence_assessments"
 # recorded before Plan 8 carries no such key, which is why the cap below reads
 # the fact rather than the container (replay must reproduce a gate offline).
 OPEN_OBLIGATIONS_FACT = "run.open_job_obligations"
+# Schema-v2 lifecycle facts.  ``OPEN_OBLIGATIONS_FACT`` remains the compact
+# compatibility cap/replay basis; these orthogonal facts say WHY a job has no
+# durable terminal receipt so control never confuses waiting, harness recovery,
+# and project repair.
+JOB_BARRIER_FACT = "run.job_controller_barrier"
+TERMINAL_UNPERSISTED_FACT = "run.job_terminal_unpersisted"
+JOB_INTEGRITY_FACT = "run.job_integrity_failures"
 # The state the PHYSICAL inspection returned, recorded beside the obligations
 # that cap it. The cap rewrites the validator state, so the gate result alone
 # cannot say whether a PARTIAL came from the physical oracle or from the cap on
@@ -86,6 +109,7 @@ PHYSICAL_STATE_FACT = "run.physical_validator_state"
 # sealed run settles nothing (§3.2), so an obligation it names can never be
 # discharged; see `settled_validator_state`.
 EVIDENCE_SEALED_FACT = "run.evidence_sealed"
+ANALYSIS_RECOVERY_FACT = "run.analysis_recovery"
 # How many job ids a capped reason spells out before it says "+N more". The
 # count itself is never dropped: a bound on a message is not a bound on a fact.
 _MAX_NAMED_JOBS = 3
@@ -94,7 +118,6 @@ _MAX_NAMED_JOBS = 3
 # ``schema_version`` guarantee beyond the constant 1 and v2 only ADDS keys, so
 # both derive identically; an unknown FUTURE version is skipped rather than
 # coerced (spec §C4: no silent coercion).
-_SUPPORTED_RECORD_VERSIONS = frozenset({1, 2})
 
 # Failure-class typed codes (spec §C4/§C5). ONLY these turn a receipt
 # semantically failed, overriding its own exit 0. Deliberately small and
@@ -115,20 +138,25 @@ _FAILURE_CLASS_ASSESSMENT_CODES = frozenset(
 _ANALYSIS_STATUS_PROJECTIONS = {
     "analysis_trunk_missing": (
         "Project survey facts are not persisted on the trunk.",
-        ("Run project(action='analyze') before closing the analyze phase.",),
+        (),
     ),
     "analysis_static_count_missing": (
         "Project survey facts exist, but no static test-count fact was observed.",
-        (
-            "Continue as partial when the project has no observable static denominator, "
-            "or rerun project(action='analyze') after the checkout changes.",
-        ),
+        (),
     ),
     "analysis_facts_missing": (
         "No persisted project survey facts were observed.",
-        ("Run project(action='analyze') before closing the analyze phase.",),
+        (),
     ),
 }
+_ANALYSIS_HARNESS_FAILURE_CODES = frozenset(
+    {
+        "analysis_trunk_missing",
+        "analysis_facts_missing",
+        "analysis_unavailable",
+    }
+)
+ANALYSIS_FACTS_RECOVERY_CODES = frozenset({"analysis_trunk_missing", "analysis_facts_missing"})
 
 
 @dataclass(frozen=True)
@@ -137,6 +165,8 @@ class GateResult:
     validated_outcome: PhaseOutcome | str
     claim_disposition: ClaimDisposition | str
     validator_state: ValidatorState | str
+    control_disposition: GateControlDisposition | str = GateControlDisposition.TERMINAL_CLAIMABLE
+    blocker_owner: BlockerOwner | str = BlockerOwner.NONE
     reason: str = ""
     evidence_refs: tuple[str, ...] = ()
     suggestions: tuple[str, ...] = ()
@@ -150,9 +180,13 @@ class GateResult:
         validated_outcome = PhaseOutcome(self.validated_outcome)
         claim_disposition = ClaimDisposition(self.claim_disposition)
         validator_state = ValidatorState(self.validator_state)
+        control_disposition = GateControlDisposition(self.control_disposition)
+        blocker_owner = BlockerOwner(self.blocker_owner)
         object.__setattr__(self, "validated_outcome", validated_outcome)
         object.__setattr__(self, "claim_disposition", claim_disposition)
         object.__setattr__(self, "validator_state", validator_state)
+        object.__setattr__(self, "control_disposition", control_disposition)
+        object.__setattr__(self, "blocker_owner", blocker_owner)
         if validated_outcome is not _VALIDATED_OUTCOMES[validator_state]:
             raise ValueError("validated outcome must match the validator state")
         expected_accepted = claim_disposition is not ClaimDisposition.CONTRADICTED
@@ -179,6 +213,8 @@ class GateResult:
             "validated_outcome": PhaseOutcome(self.validated_outcome).value,
             "claim_disposition": ClaimDisposition(self.claim_disposition).value,
             "validator_state": ValidatorState(self.validator_state).value,
+            "control_disposition": GateControlDisposition(self.control_disposition).value,
+            "blocker_owner": BlockerOwner(self.blocker_owner).value,
             "reason": self.reason,
             "evidence_refs": list(self.evidence_refs),
             "suggestions": list(self.suggestions),
@@ -206,6 +242,10 @@ class GateResult:
             validated_outcome=value.get("validated_outcome", PhaseOutcome.UNKNOWN),
             claim_disposition=value.get("claim_disposition", ClaimDisposition.UNVERIFIABLE),
             validator_state=value.get("validator_state", ValidatorState.UNAVAILABLE),
+            control_disposition=value.get(
+                "control_disposition", GateControlDisposition.TERMINAL_CLAIMABLE
+            ),
+            blocker_owner=value.get("blocker_owner", BlockerOwner.NONE),
             reason=str(value.get("reason") or ""),
             evidence_refs=tuple(value.get("evidence_refs") or ()),
             suggestions=tuple(value.get("suggestions") or ()),
@@ -252,7 +292,45 @@ def _open_obligations(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(item).strip() for item in raw if str(item or "").strip()))
 
 
-def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
+def _structured_fact_entries(
+    validated_facts: Mapping[str, Any], key: str
+) -> tuple[Mapping[str, Any], ...]:
+    raw = validated_facts.get(key)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict(item) for item in raw if isinstance(item, Mapping))
+
+
+def _barrier_job_ids(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(item.get("job_id") or "").strip()
+            for item in _structured_fact_entries(validated_facts, JOB_BARRIER_FACT)
+            if str(item.get("job_id") or "").strip()
+        )
+    )
+
+
+def _terminal_unpersisted_job_ids(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(item.get("job_id") or "").strip()
+            for item in _structured_fact_entries(validated_facts, TERMINAL_UNPERSISTED_FACT)
+            if str(item.get("job_id") or "").strip()
+        )
+    )
+
+
+def _job_integrity_failures(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = validated_facts.get(JOB_INTEGRITY_FACT)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict.fromkeys(str(item).strip() for item in raw if str(item or "").strip()))
+
+
+def _unsettled_clause(
+    open_jobs: tuple[str, ...], *, terminal_unpersisted: tuple[str, ...] = ()
+) -> str:
     """`job <id>` / `jobs <id>, <id>` — bounded, and the count is never lost."""
     from .job_obligations import LEDGER_UNREADABLE
 
@@ -261,6 +339,15 @@ def _unsettled_clause(open_jobs: tuple[str, ...]) -> str:
         # because a named job is open — say that, or the model hunts for a job
         # id that does not exist.
         return "the job obligations ledger could not be read"
+    if terminal_unpersisted:
+        named = terminal_unpersisted[:_MAX_NAMED_JOBS]
+        subject = "job" if len(terminal_unpersisted) == 1 else "jobs"
+        listed = ", ".join(named)
+        if len(terminal_unpersisted) > len(named):
+            listed += f" (+{len(terminal_unpersisted) - len(named)} more)"
+        if len(terminal_unpersisted) == 1:
+            return f"{subject} {listed} is terminal but its receipt was not persisted"
+        return f"{subject} {listed} are terminal but their receipts were not persisted"
     named = open_jobs[:_MAX_NAMED_JOBS]
     subject = "job" if len(open_jobs) == 1 else "jobs"
     listed = ", ".join(named)
@@ -333,7 +420,13 @@ def settled_observation(
     capped = settled_validator_state(state, facts)
     if capped is state:
         return state, reason
-    clause = f"{_unsettled_clause(_open_obligations(facts))} — success requires settled books"
+    terminal_unpersisted = _terminal_unpersisted_job_ids(facts)
+    clause = _unsettled_clause(_open_obligations(facts), terminal_unpersisted=terminal_unpersisted)
+    clause += (
+        " — success requires durable terminal evidence"
+        if terminal_unpersisted
+        else " — success requires settled books"
+    )
     return capped, " · ".join(part for part in (reason, clause) if part)
 
 
@@ -384,6 +477,61 @@ class _ValidatorObservation:
     suggestions: tuple[str, ...] = ()
     code: str = ""
     validated_facts: Mapping[str, Any] = field(default_factory=dict)
+    control_disposition: GateControlDisposition = GateControlDisposition.TERMINAL_CLAIMABLE
+    blocker_owner: BlockerOwner = BlockerOwner.NONE
+
+
+@dataclass(frozen=True)
+class _JobLedgerObservation:
+    """The control-relevant result of reconciling the obligation ledger."""
+
+    running_job_ids: tuple[str, ...] = ()
+    settlement_pending_job_ids: tuple[str, ...] = ()
+    terminal_unpersisted: tuple[Mapping[str, Any], ...] = ()
+    integrity_failures: tuple[str, ...] = ()
+
+    @property
+    def barrier_entries(self) -> tuple[Mapping[str, str], ...]:
+        entries = [{"job_id": job_id, "state": "running"} for job_id in self.running_job_ids]
+        entries.extend(
+            {"job_id": job_id, "state": "settlement_pending"}
+            for job_id in self.settlement_pending_job_ids
+        )
+        return tuple(entries)
+
+    @property
+    def terminal_unpersisted_job_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                str(item.get("job_id") or "").strip()
+                for item in self.terminal_unpersisted
+                if str(item.get("job_id") or "").strip()
+            )
+        )
+
+    @property
+    def open_job_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *self.running_job_ids,
+                    *self.settlement_pending_job_ids,
+                    *self.terminal_unpersisted_job_ids,
+                )
+            )
+        )
+
+    def validated_facts(self) -> dict[str, Any]:
+        facts: dict[str, Any] = {}
+        if self.open_job_ids:
+            facts[OPEN_OBLIGATIONS_FACT] = list(self.open_job_ids)
+        if self.barrier_entries:
+            facts[JOB_BARRIER_FACT] = [dict(item) for item in self.barrier_entries]
+        if self.terminal_unpersisted:
+            facts[TERMINAL_UNPERSISTED_FACT] = [dict(item) for item in self.terminal_unpersisted]
+        if self.integrity_failures:
+            facts[JOB_INTEGRITY_FACT] = list(self.integrity_failures)
+        return facts
 
 
 def validate_phase_claim(
@@ -395,6 +543,8 @@ def validate_phase_claim(
     suggestions: Iterable[str] = (),
     code: str = "",
     validated_facts: Mapping[str, Any] | None = None,
+    control_disposition: GateControlDisposition | str = (GateControlDisposition.TERMINAL_CLAIMABLE),
+    blocker_owner: BlockerOwner | str | None = None,
 ) -> GateResult:
     """Compare a claim with validator evidence without routing or mutation."""
     state = ValidatorState(validator_state)
@@ -404,6 +554,119 @@ def validate_phase_claim(
         phase_claim = PhaseClaim(phase="", claimed_outcome=PhaseOutcome(claim))
     claimed = PhaseOutcome(phase_claim.claimed_outcome)
     validated = _VALIDATED_OUTCOMES[state]
+    facts = dict(validated_facts or {})
+    control = GateControlDisposition(control_disposition)
+    owner = BlockerOwner(blocker_owner) if blocker_owner is not None else BlockerOwner.NONE
+
+    # These states belong to the controller, not the project oracle.  Do not
+    # run the ordinary claim matrix and accidentally turn an unreadable marker
+    # or a still-running job into a project-level failed/partial outcome.  The
+    # ClaimDisposition remains the legacy-compatible rejection shape while the
+    # orthogonal control disposition states the actual owner and next action.
+    integrity_failures = _job_integrity_failures(facts)
+    barrier_jobs = _barrier_job_ids(facts)
+    if integrity_failures:
+        control = GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+        owner = BlockerOwner.HARNESS
+        details = ", ".join(integrity_failures[:_MAX_NAMED_JOBS])
+        if len(integrity_failures) > _MAX_NAMED_JOBS:
+            details += f" (+{len(integrity_failures) - _MAX_NAMED_JOBS} more)"
+        integrity_reason = (
+            "job evidence reconciliation requires harness recovery before the "
+            f"project claim can be graded: {details}"
+        )
+        return GateResult(
+            accepted=False,
+            validated_outcome=PhaseOutcome.UNKNOWN,
+            claim_disposition=ClaimDisposition.CONTRADICTED,
+            validator_state=ValidatorState.UNAVAILABLE,
+            control_disposition=control,
+            blocker_owner=owner,
+            reason=" · ".join(part for part in (reason, integrity_reason) if part),
+            evidence_refs=tuple(evidence_refs),
+            suggestions=(
+                "The harness must restore readable lifecycle evidence and reconcile the job; "
+                "do not infer a project failure or rerun the project action from this state.",
+            ),
+            code="job_evidence_integrity",
+            validated_facts=facts,
+            claim=phase_claim,
+        )
+    if barrier_jobs:
+        control = GateControlDisposition.WAIT_REQUIRED
+        owner = BlockerOwner.HARNESS
+        barrier_reason = (
+            "controller job barrier remains active for "
+            f"{', '.join(barrier_jobs[:_MAX_NAMED_JOBS])}; no project claim was graded"
+        )
+        return GateResult(
+            accepted=False,
+            validated_outcome=PhaseOutcome.UNKNOWN,
+            claim_disposition=ClaimDisposition.CONTRADICTED,
+            validator_state=ValidatorState.UNAVAILABLE,
+            control_disposition=control,
+            blocker_owner=owner,
+            reason=" · ".join(part for part in (reason, barrier_reason) if part),
+            evidence_refs=tuple(evidence_refs),
+            suggestions=(
+                "The controller must keep polling and settle every running or pending job; "
+                "the model must not dispatch unrelated work.",
+            ),
+            code="job_controller_barrier",
+            validated_facts=facts,
+            claim=phase_claim,
+        )
+
+    terminal_unpersisted = _terminal_unpersisted_job_ids(facts)
+    if terminal_unpersisted:
+        control = GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+        owner = BlockerOwner.HARNESS
+
+    # A controller failure is not a pessimistic project claim.  In particular,
+    # ``done+failed`` must not close an analyze phase merely because the survey
+    # manifest could not be read.  The sole closable harness-owned state is a
+    # durable terminal-unpersisted job whose underlying physical observation
+    # was itself gradable; the missing receipt caps that observation but does
+    # not erase it.  Replay receives the post-cap state, so accept either the
+    # recorded physical state or its deterministic settled projection here.
+    physical_raw = str(facts.get(PHYSICAL_STATE_FACT) or "").strip().lower()
+    physical_state = None
+    try:
+        physical_state = ValidatorState(physical_raw)
+    except ValueError:
+        pass
+    terminal_unpersisted_is_gradable = bool(
+        terminal_unpersisted
+        and physical_state
+        in {
+            ValidatorState.GREEN,
+            ValidatorState.PARTIAL,
+            ValidatorState.RED,
+        }
+        and state
+        in {
+            physical_state,
+            settled_validator_state(physical_state, facts),
+        }
+    )
+    if (
+        control is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+        and not terminal_unpersisted_is_gradable
+    ):
+        return GateResult(
+            accepted=False,
+            validated_outcome=PhaseOutcome.UNKNOWN,
+            claim_disposition=ClaimDisposition.CONTRADICTED,
+            validator_state=ValidatorState.UNAVAILABLE,
+            control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
+            reason=reason or "harness evidence recovery is required before this claim can close",
+            evidence_refs=tuple(evidence_refs),
+            suggestions=(),
+            code=code or "harness_recovery_required",
+            validated_facts=facts,
+            claim=phase_claim,
+        )
 
     # Domain truth table (Plan 5 Stage C, P0-F). Ground-truth review 2026-07-26
     # (§"Partial claims are upgraded"): a global artifact-presence check turned
@@ -421,7 +684,6 @@ def validate_phase_claim(
     # The cap did not fire because polaris's survey reads no Kotlin settings,
     # so its domain list was empty — and an empty domain graph is not evidence
     # that nothing is unfinished. An unsettled obligation is.
-    facts = dict(validated_facts or {})
     blocking_domains = _unclosed_domains(facts)
     open_jobs = _open_obligations(facts)
     if (
@@ -443,7 +705,8 @@ def validate_phase_claim(
                     else ""
                 ),
                 (
-                    f"{_unsettled_clause(open_jobs)} — the claim is confirmable at most"
+                    f"{_unsettled_clause(open_jobs, terminal_unpersisted=terminal_unpersisted)} "
+                    "— the claim is confirmable at most"
                     if open_jobs
                     else ""
                 ),
@@ -463,17 +726,22 @@ def validate_phase_claim(
     if capped is not state:
         state = capped
         validated = _VALIDATED_OUTCOMES[state]
-        # A refusal states the move it leaves. This one was a bare sentence: the
-        # model learned success was unavailable and nothing about what was, which
-        # on the report phase (whose objective is literally "claim success") is a
-        # dead end dressed as a check.
-        suggestions = (
-            *tuple(suggestions),
-            (
-                f"claim phase(action='done', outcome='{validated.value}') on the evidence "
-                f"in hand, or wait for the terminal result of {_unsettled_clause(open_jobs)}"
-            ),
-        )
+        # The judge reports the evidence bound without selecting the model's
+        # next terminal call. Controller-owned persistence failures expose no
+        # project-level recovery action.
+        if terminal_unpersisted:
+            # This is a harness-owned evidence persistence failure.  Giving
+            # the model an exact phase invocation is both a prescription leak
+            # and a false recovery action: no model call can restore the
+            # missing receipt.  Keep only the typed owner/outcome in the gate
+            # result and expose no action suggestion.
+            suggestions = ()
+        else:
+            next_step = (
+                f"validated outcome is capped at '{validated.value}' while "
+                f"{_unsettled_clause(open_jobs)}; terminal evidence remains unsettled"
+            )
+            suggestions = (*tuple(suggestions), next_step)
 
     if claimed is PhaseOutcome.UNKNOWN:
         disposition = (
@@ -499,15 +767,27 @@ def validate_phase_claim(
         disposition = ClaimDisposition.CONTRADICTED
         accepted = False
 
+    if control is GateControlDisposition.TERMINAL_CLAIMABLE:
+        if state is ValidatorState.GREEN:
+            owner = BlockerOwner.NONE
+        elif state in {ValidatorState.RED, ValidatorState.PARTIAL}:
+            owner = BlockerOwner.PROJECT
+        else:
+            owner = BlockerOwner.UNKNOWN
+        if not accepted:
+            control = GateControlDisposition.REPAIR_REQUIRED
+
     return GateResult(
         accepted=accepted,
         validated_outcome=validated,
         claim_disposition=disposition,
         validator_state=state,
+        control_disposition=control,
+        blocker_owner=owner,
         reason=reason,
         evidence_refs=tuple(evidence_refs),
         suggestions=tuple(suggestions),
-        code=code,
+        code="evidence_unpersisted" if terminal_unpersisted else code,
         validated_facts=facts,
         claim=phase_claim,
     )
@@ -539,6 +819,8 @@ def check_phase_claim(
         suggestions=observation.suggestions,
         code=observation.code,
         validated_facts=observation.validated_facts,
+        control_disposition=observation.control_disposition,
+        blocker_owner=observation.blocker_owner,
     )
 
 
@@ -575,14 +857,105 @@ def check_phase_done(
         "reason": reason,
         "suggestions": list(observation.suggestions),
         "validator_state": state.value,
+        "control_disposition": observation.control_disposition.value,
+        "blocker_owner": observation.blocker_owner.value,
         "evidence_refs": list(observation.evidence_refs),
         "code": observation.code,
         "validated_facts": dict(observation.validated_facts),
     }
 
 
-def _settle_before_grading(orchestrator, *, sealed: bool = False) -> tuple[str, ...]:
-    """Settle the job ledger, then name whatever is still open. Never raises.
+def _terminal_unpersisted_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Stable gate fact for an already-terminal obligation with no receipt."""
+    from .job_obligations import OBLIGATION_DIR
+
+    job_id = str(record.get("job_id") or "").strip()
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        "exit_code": record.get("terminal_exit_code"),
+        "attempted_receipt_id": str(record.get("attempted_receipt_id") or ""),
+        "persistence_code": str(record.get("receipt_persistence_code") or ""),
+        "attempt_count": record.get("settlement_attempts"),
+        "obligation_ref": f"{OBLIGATION_DIR}/{job_id}.json",
+        "log_ref": str(record.get("log_path") or ""),
+    }
+    contract_id = str(record.get("contract_id") or "").strip()
+    if contract_id:
+        payload["contract_id"] = contract_id
+    return payload
+
+
+def _classify_sealed_obligations(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    execute,
+) -> _JobLedgerObservation:
+    """Classify without writing: evidence-close never resumes settlement."""
+    from .job_obligations import (
+        PROCESS_TERMINAL,
+        SETTLEMENT_SETTLED,
+        is_terminal_unpersisted,
+        process_is_live,
+        settled_receipt_integrity_failure,
+        settlement_attempts_integrity_failure,
+        settlement_is_pending,
+    )
+
+    running: list[str] = []
+    pending: list[str] = []
+    unpersisted: list[Mapping[str, Any]] = []
+    integrity: list[str] = []
+    for record in records:
+        job_id = str(record.get("job_id") or "").strip()
+        if not job_id:
+            integrity.append("obligation_missing_job_id")
+            continue
+        attempt_failure = settlement_attempts_integrity_failure(record)
+        if attempt_failure:
+            integrity.append(attempt_failure)
+            continue
+        if is_terminal_unpersisted(record):
+            unpersisted.append(_terminal_unpersisted_record(record))
+        elif settlement_is_pending(record):
+            pending.append(job_id)
+        elif process_is_live(record):
+            # Schema-v1 records have no process state.  An unsettled one stays
+            # conservatively live until a marker is reconciled in an unsealed
+            # run; a sealed gate may observe but never mutate it.
+            running.append(job_id)
+        elif str(record.get("settled_receipt_id") or "").strip():
+            failure = settled_receipt_integrity_failure(
+                execute,
+                record,
+                receipt_ledger_readable=callable(execute),
+            )
+            if failure:
+                integrity.append(failure)
+        elif (
+            str(record.get("process_state") or "").strip() == PROCESS_TERMINAL
+            and str(record.get("settlement_state") or "").strip() == SETTLEMENT_SETTLED
+        ):
+            failure = settled_receipt_integrity_failure(
+                execute,
+                record,
+                receipt_ledger_readable=callable(execute),
+            )
+            if failure:
+                integrity.append(failure)
+        else:
+            integrity.append(f"{job_id}:illegal_lifecycle_state")
+    return _JobLedgerObservation(
+        running_job_ids=tuple(sorted(set(running))),
+        settlement_pending_job_ids=tuple(sorted(set(pending))),
+        terminal_unpersisted=tuple(
+            sorted(unpersisted, key=lambda item: str(item.get("job_id") or ""))
+        ),
+        integrity_failures=tuple(dict.fromkeys(integrity)),
+    )
+
+
+def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerObservation:
+    """Settle the job ledger, then classify its control state. Never raises.
 
     Plan 8 §3.2 trigger 2. The polaris build gate (p7d,
     `session_20260729_111737_22356`) graded a compile job that was still
@@ -591,75 +964,125 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> tuple[str, 
     the physical inspection — the receipts it writes are the evidence the
     inspection is about to read.
 
-    A SEALED run settles nothing. The report phase still checks gates after
-    evidence-close (the mid-phase nudge, and a report claim of its own), and
-    settling in that window would write a receipt, an assessment and a repair
-    proposal for a job the sealed verdict has already recorded as
-    `job_unsettled` — evidence the run can no longer state. Refusing to settle
-    is not refusing to LOOK: the obligation the ledger still holds open is
-    returned exactly as before, so the §3.3 cap keeps applying to any claim made
-    in that window and the gate cannot grade green on the very books the verdict
-    calls unsettled.
+    A SEALED run settles nothing. It classifies the durable lifecycle as-is;
+    any stale live/pending record remains a controller barrier and any durable
+    terminal-unpersisted record remains an evidence-integrity cap.
 
     A run that never detached anything costs one glob `cat` that matches no
     file, and states no fact.
     """
     if orchestrator is None:
-        return ()
+        return _JobLedgerObservation()
     from .job_obligations import (
-        LEDGER_UNREADABLE,
-        is_open,
+        is_terminal_unpersisted,
         read_obligations,
-        settle_open_obligations,
+        reconcile_job_obligations,
     )
 
     try:
         records = read_obligations(orchestrator)
         if records is None:
-            # §6.8 fence 1 / P4: a ledger that could not be read once parsed
-            # as "no obligations" and LIFTED the cap — the round-four review's
-            # four removals (delete, corrupt, failed cat, failed settle) each
-            # upgraded a contradicted success into a confirmed one. The
-            # sentinel keeps the cap held on a stated inability instead.
-            return (LEDGER_UNREADABLE,)
+            # Missing evidence is not evidence of an empty ledger. Keep the
+            # failure typed and controller-owned instead of grading a project.
+            return _JobLedgerObservation(integrity_failures=("ledger_unreadable",))
         if not records:
-            return ()
-        settled: set[str] = set()
-        if not sealed:
-            settled = {
-                settlement.job_id
-                for settlement in settle_open_obligations(orchestrator, obligations=records)
-            }
-        return tuple(
-            str(record.get("job_id") or "").strip()
+            return _JobLedgerObservation()
+        if sealed:
+            execute = getattr(orchestrator, "execute_command", None)
+            if not callable(execute) and callable(orchestrator):
+                execute = orchestrator
+            return _classify_sealed_obligations(records, execute=execute)
+
+        existing_unpersisted = {
+            str(record.get("job_id") or "").strip(): _terminal_unpersisted_record(record)
             for record in records
-            if is_open(record) and str(record.get("job_id") or "").strip() not in settled
+            if is_terminal_unpersisted(record)
+        }
+        reconciliation = reconcile_job_obligations(orchestrator, obligations=records)
+        for terminal in reconciliation.terminal_unpersisted:
+            existing_unpersisted[terminal.job_id] = terminal.event_payload()
+        return _JobLedgerObservation(
+            running_job_ids=tuple(reconciliation.running_job_ids),
+            settlement_pending_job_ids=tuple(reconciliation.settlement_pending_job_ids),
+            terminal_unpersisted=tuple(
+                existing_unpersisted[job_id] for job_id in sorted(existing_unpersisted)
+            ),
+            integrity_failures=tuple(reconciliation.integrity_failures),
         )
-    except Exception as exc:  # the ledger never breaks a phase claim outright
+    except Exception as exc:  # the ledger never becomes a project failure
         logger.warning(f"job obligations were not settled before grading: {exc}")
-        return (LEDGER_UNREADABLE,)
+        return _JobLedgerObservation(
+            integrity_failures=(f"ledger_reconciliation_{type(exc).__name__}",)
+        )
 
 
 def _inspect_phase(
     phase, validator, orchestrator, project_name, *, sealed: bool = False
 ) -> _ValidatorObservation:
-    open_jobs = _settle_before_grading(orchestrator, sealed=sealed)
+    jobs = _settle_before_grading(orchestrator, sealed=sealed)
+    lifecycle_facts = jobs.validated_facts()
+    if jobs.integrity_failures:
+        return _ValidatorObservation(
+            ValidatorState.UNAVAILABLE,
+            reason="job evidence lifecycle requires harness recovery; project evidence was not inspected",
+            code="job_evidence_integrity",
+            validated_facts=lifecycle_facts,
+            control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
+        )
+    if jobs.barrier_entries:
+        return _ValidatorObservation(
+            ValidatorState.UNAVAILABLE,
+            reason="controller job barrier is active; project evidence was not inspected",
+            code="job_controller_barrier",
+            validated_facts=lifecycle_facts,
+            control_disposition=GateControlDisposition.WAIT_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
+        )
+
     observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
-    if not open_jobs:
+    if not jobs.terminal_unpersisted:
         return observation
-    # The three facts the §3.3 cap is a function of, stated together at the one
-    # place that knows all three: which jobs are open, what the PHYSICAL oracle
-    # said before anything capped it, and whether the run can still settle
-    # anything. Replay re-grades this claim offline from these facts alone, so a
-    # cap that read the container instead would grade a different world.
+
+    # A missing receipt may cap a physical observation only when that
+    # observation exists.  Never let the lifecycle wrapper rename an analysis
+    # survey failure (or any other ungradable harness observation) to the
+    # closable ``evidence_unpersisted`` state.
+    gradable = ValidatorState(observation.state) in {
+        ValidatorState.GREEN,
+        ValidatorState.PARTIAL,
+        ValidatorState.RED,
+    } and observation.control_disposition not in {
+        GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+        GateControlDisposition.WAIT_REQUIRED,
+    }
+    if not gradable:
+        return replace(
+            observation,
+            validated_facts={
+                **dict(observation.validated_facts),
+                **lifecycle_facts,
+                EVIDENCE_SEALED_FACT: bool(sealed),
+            },
+            control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
+        )
+
+    # Terminal-unpersisted is no longer a wait: the process result is known and
+    # the model may close honestly as partial/failed/unknown.  It is still an
+    # evidence-integrity cap, so success is unavailable and replay receives the
+    # physical basis plus the exact persistence disposition.
     return replace(
         observation,
+        code="evidence_unpersisted",
         validated_facts={
             **dict(observation.validated_facts),
-            OPEN_OBLIGATIONS_FACT: list(open_jobs),
+            **lifecycle_facts,
             PHYSICAL_STATE_FACT: ValidatorState(observation.state).value,
             EVIDENCE_SEALED_FACT: bool(sealed),
         },
+        control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+        blocker_owner=BlockerOwner.HARNESS,
     )
 
 
@@ -679,6 +1102,8 @@ def _inspect_phase_evidence(phase, validator, orchestrator, project_name) -> _Va
             ValidatorState.UNAVAILABLE,
             reason=f"unknown phase: {phase}",
             code="unknown_phase",
+            control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
         )
     except Exception as exc:
         logger.warning(f"Phase gate '{phase}' evidence unavailable (probe error): {exc}")
@@ -686,6 +1111,8 @@ def _inspect_phase_evidence(phase, validator, orchestrator, project_name) -> _Va
             ValidatorState.UNAVAILABLE,
             reason=f"validator probe unavailable: {exc}",
             code="validator_unavailable",
+            control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
         )
 
 
@@ -705,8 +1132,7 @@ def _inspect_provision(orchestrator, project_name) -> _ValidatorObservation:
             evidence_refs=(workdir,),
             validated_facts={"provision.workspace_ready": False},
             suggestions=(
-                "Clone first: project(action='clone', repo_url=...)",
-                "If the repo cloned elsewhere, verify with bash ls /workspace",
+                "The expected workspace is absent; no repository evidence can be graded.",
             ),
             code="workspace_missing",
         )
@@ -942,83 +1368,61 @@ def _receipt_order(receipt: Mapping[str, Any]) -> tuple[int, str]:
     return (sequence, receipt_id)
 
 
-def _record_version(payload: Mapping[str, Any]) -> int | None:
-    """A record's schema version, or ``None`` when it is not a version we read.
-
-    An absent ``schema_version`` is v1 (receipts written before the key was a
-    stated contract). ``True``/``False`` are not versions.
-    """
-    raw = payload.get("schema_version", 1)
-    if isinstance(raw, bool) or not isinstance(raw, int):
-        return None
-    return raw if raw in _SUPPORTED_RECORD_VERSIONS else None
-
-
-def _read_json_records(orchestrator, directory: str) -> list[Mapping[str, Any]]:
-    """Every single-line JSON record in ``directory``, one shell round-trip.
-
-    The writers persist single-line JSON per file, so one ``cat`` of the
-    directory yields one record per line; the glob is ``*.json``, so an atomic
-    writer's ``<id>.json.tmp`` temp file is invisible here exactly as it is in
-    the container — a partially written record is absent, never half-read.
-
-    Evidence collection never breaks a gate: unreadable transport yields no
-    records (absent facts stay absent) and the caller degrades rather than
-    guessing.
-    """
-    if orchestrator is None:
-        return []
-    try:
-        probe = orchestrator.execute_command(
-            f"cat {shlex.quote(directory)}/*.json 2>/dev/null",
-            workdir=None,
-            timeout=30,
-        )
-    except Exception as exc:
-        logger.debug(f"{directory} unavailable at the gate: {exc}")
-        return []
-    records: list[Mapping[str, Any]] = []
-    for line in str((probe or {}).get("output") or "").splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("{"):
-            continue
-        try:
-            payload = json.loads(stripped)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, Mapping):
-            records.append(payload)
-    return records
-
-
 def _read_invocation_receipts(
     orchestrator,
 ) -> tuple[tuple[Mapping[str, Any], ...], tuple[str, ...]]:
-    """Every readable Stage B invocation receipt, plus named read conflicts.
+    """Every current host-authorized v2 receipt, or one fail-closed conflict.
 
-    Version-gated (spec §C4): v1 and v2 are both derived, an unknown future
-    version is SKIPPED with a named conflict. Failing closed on the file rather
-    than the run keeps one unreadable receipt from erasing the domains whose
-    receipts we do understand — the skipped domain simply stays untried, which
-    the truth table already forbids from closing green.
+    Container files are forensic mirrors, not authority.  Historical v1
+    records and fully valid foreign-run v2 records may remain in a reused
+    container, but an unknown/future/malformed current shape cannot be skipped:
+    it may be the later failure that caps any surveyed domain.
     """
-    receipts: list[Mapping[str, Any]] = []
-    conflicts: list[str] = []
-    for payload in _read_json_records(orchestrator, RECEIPT_DIR):
-        # Version FIRST: a future receipt may name its fields differently, so
-        # checking the payload's keys before its version would drop it silently
-        # — which is the one outcome version gating exists to prevent.
-        if _record_version(payload) is None:
-            logger.warning(
-                f"invocation receipt {payload.get('receipt_id')!r} has unsupported "
-                f"schema_version {payload.get('schema_version')!r} and was skipped"
+    if orchestrator is None:
+        return (), ()
+
+    def scope(
+        payload: Mapping[str, Any], current_run_id: str | None
+    ) -> Literal["current", "foreign", "forensic"]:
+        version = payload.get("schema_version", 1)
+        if version == 1 and not isinstance(version, bool):
+            return "forensic"
+        if version != 2 or isinstance(version, bool):
+            return "current"
+        try:
+            normalized = validate_receipt_v2(
+                payload,
+                expected_id=str(payload.get("receipt_id") or ""),
             )
-            conflicts.append("receipt_schema_unsupported")
-            continue
-        if not payload.get("working_directory"):
-            continue
-        receipts.append(payload)
-    return tuple(receipts), tuple(dict.fromkeys(conflicts))
+        except (TypeError, ValueError):
+            return "current"
+        return (
+            "foreign"
+            if current_run_id and normalized.get("run_id") != current_run_id
+            else "current"
+        )
+
+    read = read_live_published_json_records(
+        orchestrator,
+        RECEIPT_DIR,
+        record_kind="invocation_receipt",
+        validator=lambda payload, expected_id: validate_receipt_v2(
+            payload,
+            expected_id=expected_id,
+        ),
+        publication_binding=lambda payload: EvidencePublicationBinding(
+            run_id=str(payload["run_id"]),
+            contract_id=payload.get("contract_id"),
+            contract_hash=payload.get("contract_hash"),
+        ),
+        record_scope=scope,
+    )
+    if not read.complete or read.conflict is not None:
+        return (), (f"receipt_{read.conflict or 'stream_unreadable'}",)
+    receipts = tuple(
+        dict(record.payload) for record in read.records if record.payload.get("working_directory")
+    )
+    return receipts, ()
 
 
 def _read_evidence_assessments(
@@ -1030,22 +1434,20 @@ def _read_evidence_assessments(
     (``{assessment_id, receipt_id, typed_code, detail}``). Records that name no
     receipt or no typed code carry no interpretation and are not evidence.
     """
-    assessments: list[Mapping[str, Any]] = []
-    conflicts: list[str] = []
-    for payload in _read_json_records(orchestrator, ASSESSMENT_DIR):
-        if _record_version(payload) is None:
-            logger.warning(
-                f"evidence assessment {payload.get('assessment_id')!r} has unsupported "
-                f"schema_version {payload.get('schema_version')!r} and was skipped"
-            )
-            conflicts.append("assessment_schema_unsupported")
-            continue
-        if not str(payload.get("receipt_id") or "").strip():
-            continue
-        if not str(payload.get("typed_code") or "").strip():
-            continue
-        assessments.append(payload)
-    return tuple(assessments), tuple(dict.fromkeys(conflicts))
+    if orchestrator is None:
+        return (), ()
+    from .evidence_assessments import read_live_assessment_ledger
+
+    read = read_live_assessment_ledger(orchestrator)
+    if not read.complete or read.conflict is not None:
+        return (), (f"assessment_{read.conflict or 'stream_unreadable'}",)
+    assessments = tuple(
+        dict(record.payload)
+        for record in read.records
+        if str(record.payload.get("receipt_id") or "").strip()
+        and str(record.payload.get("typed_code") or "").strip()
+    )
+    return assessments, ()
 
 
 @dataclass(frozen=True)
@@ -1169,7 +1571,13 @@ def _domain_states(
             continue
         if str(receipt.get("receipt_id") or "").strip() in condemned:
             outcome = "failed"
-        directory = _normalized_domain_root(receipt.get("working_directory"))
+        # ``working_directory`` is the requested coordinate.  A receipt's
+        # authoritative physical binding is ``actual_cwd`` when present (the
+        # same field current-run validation already checks); using the request
+        # here can credit the wrong island after a legitimate runner redirect.
+        directory = _normalized_domain_root(
+            receipt.get("actual_cwd") or receipt.get("working_directory")
+        )
         if not directory:
             continue
         containing = [
@@ -1203,6 +1611,8 @@ def _domain_states(
 def _gate_domain_states(
     orchestrator,
     requirements: Mapping[str, Any] | None = None,
+    *,
+    receipt_scope: Any = None,
 ) -> _DomainDerivation:
     """Domain states for one gate pass; never raises, never blocks the gate.
 
@@ -1216,22 +1626,108 @@ def _gate_domain_states(
     if orchestrator is None:
         return _DomainDerivation()
     try:
+        manifest_conflicts: list[str] = []
         if requirements is None:
-            from sag.tools.internal.build_preflight import read_build_requirements
+            from sag.tools.internal.build_preflight import read_live_build_requirements
 
-            requirements = read_build_requirements(orchestrator) or {}
+            manifest_read = read_live_build_requirements(orchestrator)
+            if not manifest_read.complete or manifest_read.conflict is not None:
+                manifest_conflicts.append(
+                    f"build_requirements_{manifest_read.conflict or 'stream_unreadable'}"
+                )
+                requirements = {}
+            else:
+                requirements = manifest_read.payload or {}
         receipts, receipt_conflicts = _read_invocation_receipts(orchestrator)
         assessments, assessment_conflicts = _read_evidence_assessments(orchestrator)
+        conflicts = [*manifest_conflicts, *receipt_conflicts, *assessment_conflicts]
+
+        # Live callers pass an immutable run/checkout/root scope.  Historical
+        # pure-derivation callers omit it and retain the schema-v1 replay
+        # contract.  A foreign receipt is known historical evidence; an
+        # assessment naming it is therefore ignored rather than mislabeled as
+        # a dangling current-run reference.
+        if receipt_scope is not None:
+            from sag.agent.attempt_policy import current_run_production_build_receipt
+
+            if not bool(getattr(receipt_scope, "available", False)):
+                status = str(getattr(receipt_scope, "status", "unavailable") or "unavailable")
+                conflicts.append(f"receipt_binding_{status}")
+                receipts = ()
+                assessments = ()
+            else:
+                all_receipt_ids = {
+                    str(receipt.get("receipt_id") or "").strip() for receipt in receipts
+                }
+                current_receipts = tuple(
+                    receipt
+                    for receipt in receipts
+                    if current_run_production_build_receipt(
+                        receipt,
+                        receipt_id=str(receipt.get("receipt_id") or "").strip(),
+                        run_id=str(getattr(receipt_scope, "run_id", "") or ""),
+                        target_sha=str(getattr(receipt_scope, "target_sha", "") or ""),
+                        project_root=str(getattr(receipt_scope, "project_root", "") or ""),
+                    )
+                )
+                current_ids = {
+                    str(receipt.get("receipt_id") or "").strip() for receipt in current_receipts
+                }
+                historical_ids = all_receipt_ids - current_ids
+                receipts = current_receipts
+                assessments = tuple(
+                    record
+                    for record in assessments
+                    if str(record.get("receipt_id") or "").strip() not in historical_ids
+                )
+
+        # A corrupt assessment could be the failure interpretation of an
+        # otherwise green receipt; a corrupt receipt could be a later failure
+        # at the same root.  Using the readable prefix would therefore invent
+        # success.  Keep surveyed domains visible but derive every one as
+        # untried until the evidence stream is readable again.
+        hard_conflicts = {
+            "receipt_stream_unreadable",
+            "receipt_record_malformed",
+            "receipt_schema_unsupported",
+            "assessment_stream_unreadable",
+            "assessment_record_malformed",
+            "assessment_schema_unsupported",
+        }
+        if hard_conflicts.intersection(conflicts):
+            receipts = ()
+            assessments = ()
         derived = _domain_states(requirements, receipts, assessments)
         return replace(
             derived,
-            conflicts=tuple(
-                dict.fromkeys((*receipt_conflicts, *assessment_conflicts, *derived.conflicts))
-            ),
+            conflicts=tuple(dict.fromkeys((*conflicts, *derived.conflicts))),
         )
     except Exception as exc:
         logger.debug(f"domain states unavailable at the gate: {exc}")
         return _DomainDerivation()
+
+
+def _live_receipt_scope(validator, orchestrator, requirements=None):
+    """Return the validator's explicit live run scope, or ``None`` for replay.
+
+    Pure/historical callers deliberately omit ``receipt_run_id`` and retain
+    the schema-v1 derivation contract.  Production validators are bound to the
+    setup run at construction, so their domain rollups may consume only
+    receipts that match the container run pin, checkout and surveyed root.
+    """
+
+    run_id = str(getattr(validator, "receipt_run_id", "") or "").strip()
+    if not run_id or orchestrator is None:
+        return None
+    from sag.agent.attempt_policy import resolve_current_build_receipt_scope
+
+    workspace_root = str(getattr(validator, "project_path", "") or "/workspace").strip()
+    return resolve_current_build_receipt_scope(
+        orchestrator,
+        run_id=run_id,
+        manifest=requirements,
+        workspace_root=workspace_root,
+    )
 
 
 def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
@@ -1241,11 +1737,22 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
             ValidatorState.UNAVAILABLE,
             reason="project analysis evidence is unavailable",
             code="analysis_unavailable",
+            control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+            blocker_owner=BlockerOwner.HARNESS,
         )
     status = method(project_name)
     analysis_code = str(status.get("analysis_status_code") or "")
     state = _state_from_evidence_status(status.get("evidence_status") or status.get("status"))
-    if state is ValidatorState.UNAVAILABLE:
+    if analysis_code in _ANALYSIS_HARNESS_FAILURE_CODES:
+        # Category 1 makes survey persistence an engine guarantee. Missing or
+        # unreadable survey state therefore indicts the harness, not the
+        # project and not the model's choice of another analyze invocation.
+        state = ValidatorState.UNAVAILABLE
+    elif analysis_code == "analysis_static_count_missing":
+        # A denominator can be physically absent.  That is an honest partial
+        # survey, not a failed survey and not a reason to prescribe a rerun.
+        state = ValidatorState.PARTIAL
+    elif state is ValidatorState.UNAVAILABLE:
         if status.get("analyzed") and status.get("has_static_test_count"):
             state = ValidatorState.GREEN
         elif status.get("analyzed"):
@@ -1261,6 +1768,7 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
     analysis_status_facts = status.get("analysis_status_facts")
     if not isinstance(analysis_status_facts, Mapping):
         analysis_status_facts = {}
+    harness_failure = analysis_code in _ANALYSIS_HARNESS_FAILURE_CODES
     return _ValidatorObservation(
         state,
         reason=projected_reason
@@ -1274,6 +1782,12 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
             "analysis.status_code": analysis_code or None,
             "analysis.status_facts": dict(analysis_status_facts),
         },
+        control_disposition=(
+            GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+            if harness_failure
+            else GateControlDisposition.TERMINAL_CLAIMABLE
+        ),
+        blocker_owner=BlockerOwner.HARNESS if harness_failure else BlockerOwner.NONE,
     )
 
 
@@ -1293,8 +1807,10 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
-            "Run build(action='compile') and validate the resulting artifacts",
-            "If an external impediment prevents progress, claim blocked with its evidence refs",
+            "Build evidence is not green; artifact and module-coverage facts identify "
+            "the unresolved scope.",
+            "An external impediment requires evidence references; project failures "
+            "remain project-owned.",
         )
 
     # Agent-facing coverage checklist (live 2026-07-18: one bigtop run gave up
@@ -1313,10 +1829,12 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     islands = None
     if orchestrator is not None:
         try:
-            from sag.tools.internal.build_preflight import read_build_requirements
+            from sag.tools.internal.build_preflight import read_live_build_requirements
 
-            requirements = read_build_requirements(orchestrator) or {}
-            islands = requirements.get("build_islands")
+            manifest_read = read_live_build_requirements(orchestrator)
+            if manifest_read.complete and manifest_read.conflict is None:
+                requirements = manifest_read.payload or {}
+                islands = requirements.get("build_islands")
         except Exception:
             requirements = None
             islands = None
@@ -1328,9 +1846,8 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         if "no output yet" in checklist or "remaining:" in checklist:
             suggestions = (
                 *suggestions,
-                "Modules without build output remain (see the coverage line) — build "
-                "each remaining island, or end the phase honestly with "
-                "outcome='partial' naming what was left and why",
+                "Modules without build output remain (see the coverage line); they "
+                "cannot be counted as green terminal evidence.",
             )
     explicit_ready = status.get("test_entry_ready")
     evidence = status.get("evidence") or {}
@@ -1359,7 +1876,11 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     # Plan 5 Task C2 (P0-B/P0-F): per-domain outcomes ride WITH the build
     # rollup they scope. Absent when no build domains were surveyed, so
     # single-domain projects seal the pre-Stage-C shape byte-identically.
-    derived = _gate_domain_states(orchestrator, requirements)
+    derived = _gate_domain_states(
+        orchestrator,
+        requirements,
+        receipt_scope=_live_receipt_scope(validator, orchestrator, requirements),
+    )
     if derived.states is not None:
         validated_facts["build.domain_states"] = derived.states
     if derived.conflicts:
@@ -1367,13 +1888,30 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         # dropped. Absent when the read was clean, so single-domain and
         # recorded-replay runs seal the pre-Plan-6 fact set byte-identically.
         validated_facts["build.evidence_conflicts"] = list(derived.conflicts)
+    evidence_integrity_failure = any(
+        conflict.startswith(("build_requirements_", "receipt_", "assessment_"))
+        for conflict in derived.conflicts
+    )
+    if evidence_integrity_failure:
+        state = ValidatorState.UNAVAILABLE
+        reason = "build evidence ledger integrity is unavailable: " + ", ".join(derived.conflicts)
     return _ValidatorObservation(
         state,
         reason=reason,
         evidence_refs=_status_refs(status),
         suggestions=suggestions,
-        code=f"build_{state.value}",
+        code=(
+            "build_evidence_ledger_unavailable"
+            if evidence_integrity_failure
+            else f"build_{state.value}"
+        ),
         validated_facts=validated_facts,
+        control_disposition=(
+            GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+            if evidence_integrity_failure
+            else GateControlDisposition.TERMINAL_CLAIMABLE
+        ),
+        blocker_owner=(BlockerOwner.HARNESS if evidence_integrity_failure else BlockerOwner.NONE),
     )
 
 
@@ -1392,8 +1930,8 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             reason=f"invocation-receipt evidence is unreadable: {receipt_error}",
             evidence_refs=tuple(str(ref) for ref in status.get("receipt_error_files") or ()),
             suggestions=(
-                "Re-run the test invocation so it writes a readable receipt, then re-claim",
-                "Inspect the named receipt file; a truncated or partial write blocks closure",
+                "The named receipt is unreadable; a truncated or partial write blocks "
+                "test closure.",
             ),
             code="test_receipt_unreadable",
             validated_facts={},
@@ -1425,15 +1963,31 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
     suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
-            "Run build(action='test') and preserve the generated test reports",
-            "If an external impediment prevents tests, claim blocked with evidence refs",
+            "Test execution or report evidence is not green; the recorded counts and "
+            "evidence references define the unresolved scope.",
+            "An external impediment requires evidence references; project failures "
+            "remain project-owned.",
         )
     rollup = _validated_test_rollup(status)
     if rollup is not None:
         # Plan 5 Task C2: the domain decomposition scopes the test rollup the
         # same way it scopes the build one. Key absent when no domains were
         # surveyed (established absent-when-inapplicable pattern above).
-        derived = _gate_domain_states(orchestrator)
+        requirements: Mapping[str, Any] | None = None
+        if orchestrator is not None:
+            try:
+                from sag.tools.internal.build_preflight import read_live_build_requirements
+
+                manifest_read = read_live_build_requirements(orchestrator)
+                if manifest_read.complete and manifest_read.conflict is None:
+                    requirements = manifest_read.payload or {}
+            except Exception:
+                requirements = None
+        derived = _gate_domain_states(
+            orchestrator,
+            requirements,
+            receipt_scope=_live_receipt_scope(validator, orchestrator, requirements),
+        )
         if derived.states is not None:
             rollup["domain_states"] = derived.states
         if derived.conflicts:
@@ -1442,6 +1996,18 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             rollup["conflicts"] = list(
                 dict.fromkeys([*(rollup.get("conflicts") or ()), *derived.conflicts])
             )
+        evidence_integrity_failure = any(
+            conflict.startswith(("build_requirements_", "receipt_", "assessment_"))
+            for conflict in derived.conflicts
+        )
+        if evidence_integrity_failure:
+            state = ValidatorState.UNAVAILABLE
+            code = "test_evidence_ledger_unavailable"
+            reason = "test evidence ledger integrity is unavailable: " + ", ".join(
+                derived.conflicts
+            )
+    else:
+        evidence_integrity_failure = False
     return _ValidatorObservation(
         state,
         reason=reason,
@@ -1449,6 +2015,12 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
         suggestions=suggestions,
         code=code,
         validated_facts={"test.stats": rollup} if rollup is not None else {},
+        control_disposition=(
+            GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+            if evidence_integrity_failure
+            else GateControlDisposition.TERMINAL_CLAIMABLE
+        ),
+        blocker_owner=(BlockerOwner.HARNESS if evidence_integrity_failure else BlockerOwner.NONE),
     )
 
 
@@ -1465,7 +2037,7 @@ def _inspect_report(orchestrator) -> _ValidatorObservation:
         return _ValidatorObservation(
             ValidatorState.RED,
             reason="report phase has no setup-report-*.md artifact",
-            suggestions=("Generate it with the report tool, then re-claim",),
+            suggestions=("A persisted setup-report artifact is required for closure.",),
             code="report_missing",
         )
     return _ValidatorObservation(

@@ -11,12 +11,12 @@ A. A run whose sealed verdict was ``failed`` still printed
    sealed evidence itself: the verdict outcome, the failing phase, and that
    phase's recorded failure signature.
 
-B. The recommendations section printed generic ecosystem prose
+B. The former recommendations section printed generic ecosystem prose
    (``pip install -e . && pytest`` / ``mvn clean test -DskipTests=false``)
-   that contradicted the coordinates the survey actually recorded. When
-   surveyed facts exist the report must quote them; when a survey source is
-   reachable but recorded nothing, the report must name that evidence gap
-   instead of inventing commands.
+   that contradicted the coordinates the survey actually recorded. The report
+   may identify surveyed text as an observation, but it must not turn either
+   surveyed or inferred data into a next command. When a survey source is
+   reachable but recorded nothing, the report names that evidence gap.
 
 C. (SAG v2 Plan 4, Task 3 — 2026-07-26 post-acceptance audit) The TVM
    report presented 28 pytest *collection* error nodes plus their 28 paired
@@ -32,29 +32,35 @@ C. (SAG v2 Plan 4, Task 3 — 2026-07-26 post-acceptance audit) The TVM
 import json
 import re
 
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.report_tool import ReportTool
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 # ---------------------------------------------------------------------------
 # House fixtures
 # ---------------------------------------------------------------------------
 
 
-class FakeOrch:
+class FakeOrch(ContainerFS):
     """In-memory container FS (house pattern from tests/test_build_preflight.py)."""
 
     def __init__(self, manifest=None):
-        self.files = {}
+        super().__init__()
         if manifest is not None:
-            self.files[REQUIREMENTS_PATH] = json.dumps(manifest)
+            add_published_mutable_json(
+                self,
+                self,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=manifest,
+            )
 
     def execute_command(self, cmd, workdir=None):
-        if cmd.startswith("cat "):
-            path = cmd.split("cat ", 1)[1].strip()
-            if path in self.files:
-                return {"success": True, "exit_code": 0, "output": self.files[path]}
-            return {"success": False, "exit_code": 1, "output": "No such file"}
-        return {"success": True, "exit_code": 0, "output": ""}
+        del workdir
+        return self(cmd)
 
 
 class _Trunk:
@@ -274,7 +280,30 @@ def test_recommendations_without_survey_facts_name_the_evidence_gap():
     assert "pip install -e . && pytest" not in text
     assert "mvn clean test" not in text
     assert "no surveyed" in text.lower()
-    assert "project(action='analyze')" in text
+    assert "project(action='analyze')" not in text
+    assert "no reproduction or repair command can be inferred" in text
+
+
+def test_execution_details_render_only_the_recorded_command():
+    tool = _tool()
+    lines = tool._render_execution_details_simplified(
+        {
+            "last_command": {
+                "tool": "python",
+                "command": "python -m pytest tests/unit/test_one.py",
+                "workdir": "/workspace/project",
+            }
+        },
+        None,
+    )
+    text = "\n".join(lines)
+
+    assert "Last Recorded Tool" in text
+    assert "python -m pytest tests/unit/test_one.py" in text
+    assert "/workspace/project" in text
+    assert "mvn clean install" not in text
+    assert "mvn test" not in text
+    assert "-DskipTests" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -386,15 +415,20 @@ def test_collection_failure_derives_a_blocker_quoting_the_structured_error():
     assert TVM_COLLECTION_ROOT_CAUSE in matching[0]
 
 
-def test_report_names_the_latest_test_attempt_scope_and_command():
-    """The report names the scope/command of the attempt it is describing."""
+def test_report_names_only_the_sealed_latest_test_attempt_scope_and_command():
+    """A raw collect sidecar cannot replace the attempt the seal selected."""
     from sag.tools.internal.python_tool import COLLECTED_JSON
 
     orch = FakeOrch()
     orch.files[COLLECTED_JSON] = json.dumps(
-        {"collected": 11702, "scope": "full", "selected": 11702}
+        {"collected": 1, "scope": "forged-container-sidecar", "selected": 1}
     )
     snapshot = _collection_failure_snapshot()
+    snapshot["latest_test_attempt"] = {
+        "collected": 11702,
+        "scope": "full",
+        "selected": 11702,
+    }
     snapshot["last_command"] = {
         "command": "/workspace/.venv/bin/python -m pytest --junitxml=/workspace/"
         ".setup_agent/pytest-reports/pytest-attempt-000001.xml",
@@ -406,7 +440,9 @@ def test_report_names_the_latest_test_attempt_scope_and_command():
 
     assert "scope=full" in text
     assert "collected=11702" in text
+    assert "forged-container-sidecar" not in text
     assert "/workspace/.venv/bin/python -m pytest" in text
+    assert not any(COLLECTED_JSON in command for command in orch.commands)
 
 
 def test_collection_facts_are_read_from_the_evidence_result_projection():
@@ -443,5 +479,8 @@ def test_run_without_collection_errors_renders_the_ordinary_test_section():
 
 
 def test_no_tests_and_no_collection_facts_renders_no_test_section():
-    """Regression lock: silence stays silence when there is nothing to say."""
-    assert _tool()._render_detailed_test_analysis(_sealed_snapshot(verdict="failed")) == []
+    """No observations still renders the explicit metrics-v2 availability layer."""
+    lines = _tool()._render_detailed_test_analysis(_sealed_snapshot(verdict="failed"))
+    assert lines[0] == "## 🧾 Metrics-v2 Evidence Layers"
+    assert any("Claimed latest subjects: unavailable" in line for line in lines)
+    assert "## 🧪 Snapshot Test Diagnostics" not in lines

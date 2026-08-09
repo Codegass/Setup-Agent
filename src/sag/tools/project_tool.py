@@ -180,7 +180,6 @@ class ProjectTool(BaseTool):
                 "activate": {
                     "type": "boolean",
                     "enum": [True],
-                    "default": True,
                     "description": (
                         "env: must be true; a successful public env call atomically "
                         "activates the validated executable"
@@ -195,6 +194,20 @@ class ProjectTool(BaseTool):
                 },
             },
             "required": ["action"],
+            # Activation is a semantic default only for the env branch. Keep
+            # it conditional so clone/provision/analyze intents are not
+            # polluted with an irrelevant field before they are frozen.
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"action": {"const": "env"}},
+                        "required": ["action"],
+                    },
+                    "then": {
+                        "properties": {"activate": {"default": True}},
+                    },
+                }
+            ],
             # The delegates accept more than the documented surface
             # (target_directory, update_context, version, activate,
             # path_prepend, ...); pass everything through to them.

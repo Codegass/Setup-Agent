@@ -3,15 +3,29 @@ import json
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+from test_container_io import FakeContainer as AtomicContainerFS
 
+from sag.agent.control_events import ControlEventSink
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
 from sag.runtime.env_overlay import (
     DEFAULT_OVERLAY_JSON,
     DEFAULT_OVERLAY_SCRIPT,
+    RUNTIME_REQUIREMENT_CONFLICT,
     EnvOverlayStore,
+    EnvOverlayUnavailableError,
 )
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.env_tool import EnvTool
 from sag.tools.internal.maven_tool import MavenTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.toolchain_manager import ToolchainManager, ToolchainSpec
 from sag.tools.project_tool import ProjectTool
 
@@ -70,6 +84,143 @@ def test_register_activate_writes_json_and_shell_script():
     )
 
 
+def test_published_overlay_derives_environment_across_cwd_without_executing_shell(
+    bind_host_evidence_publication_authority,
+):
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+    store.register(
+        "java",
+        "/opt/jdk-21/bin/java",
+        env={"JAVA_HOME": "/opt/jdk-21"},
+        path_prepend=["/opt/shared/bin"],
+        activate=True,
+    )
+    orchestrator.files[DEFAULT_OVERLAY_SCRIPT] = (
+        "base64() { printf forged; }; find() { printf forged; }; "
+        "sha256sum() { printf forged; }; printf() { command printf forged; };\n"
+    )
+
+    first = store.authorized_environment({"CUSTOM": "1"})
+    second = EnvOverlayStore(orchestrator).authorized_environment({"CUSTOM": "1"})
+
+    assert first == second
+    assert first["JAVA_HOME"] == "/opt/jdk-21"
+    assert first["PATH"].startswith("/opt/jdk-21/bin:/opt/shared/bin:")
+    assert first["CUSTOM"] == "1"
+    head = bind_host_evidence_publication_authority.latest_head(ENV_OVERLAY_LOGICAL_ARTIFACT_ID)
+    assert head is not None
+    assert head.record_kind == "env_overlay"
+
+
+def test_tamper_delete_rollback_and_extra_fields_make_overlay_unavailable():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+    store.register("java", "/opt/jdk-17/bin/java", activate=True)
+    first = orchestrator.files[DEFAULT_OVERLAY_JSON]
+    store.register("java", "/opt/jdk-21/bin/java", activate=True)
+    latest = orchestrator.files[DEFAULT_OVERLAY_JSON]
+
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = latest.replace(
+        '"version": 1', '"unexpected": true,\n  "version": 1'
+    )
+    with pytest.raises(EnvOverlayUnavailableError):
+        EnvOverlayStore(orchestrator).authorized_environment()
+
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = first
+    with pytest.raises(EnvOverlayUnavailableError):
+        EnvOverlayStore(orchestrator).authorized_environment()
+
+    del orchestrator.files[DEFAULT_OVERLAY_JSON]
+    with pytest.raises(EnvOverlayUnavailableError):
+        EnvOverlayStore(orchestrator).authorized_environment()
+
+
+def test_mirror_only_overlay_never_affects_runner_environment():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+        {"version": 1, "tools": {}}, indent=2, sort_keys=True
+    )
+
+    with pytest.raises(EnvOverlayUnavailableError):
+        EnvOverlayStore(orchestrator).authorized_environment()
+
+
+@pytest.mark.parametrize("key", ["PATH", "BASH_ENV", "ENV", "CDPATH", "SHELLOPTS"])
+def test_overlay_rejects_shell_control_environment_keys(key):
+    orchestrator = FakeEnvOverlayOrchestrator()
+
+    with pytest.raises(ValueError, match="shell control state"):
+        EnvOverlayStore(orchestrator).register(
+            "java",
+            "/opt/jdk-21/bin/java",
+            env={key: "/workspace/attacker"},
+            activate=True,
+        )
+
+    assert DEFAULT_OVERLAY_JSON not in orchestrator.files
+
+
+def test_publication_failure_leaves_container_overlay_forensic_only(tmp_path):
+    class FailingSink:
+        path = tmp_path / "unwritten-control-events.jsonl"
+
+        def emit(self, kind, *_args, **_kwargs):
+            if kind == "evidence_store_bound":
+                return None
+            raise OSError("host sink unavailable")
+
+    orchestrator = FakeEnvOverlayOrchestrator()
+    authority = EvidencePublicationAuthority(run_id="run-overlay-failure", sink=FailingSink())
+    token = install_evidence_publication_authority(authority, orchestrator=orchestrator)
+    try:
+        with pytest.raises(EnvOverlayUnavailableError, match="host publication failed"):
+            EnvOverlayStore(orchestrator).register("java", "/opt/jdk-21/bin/java", activate=True)
+        assert DEFAULT_OVERLAY_JSON in orchestrator.files
+        with pytest.raises(EnvOverlayUnavailableError):
+            EnvOverlayStore(orchestrator).authorized_environment()
+    finally:
+        reset_evidence_publication_authority(token)
+
+
+def test_overlay_authority_recovers_from_host_stream_after_restart(tmp_path):
+    orchestrator = FakeEnvOverlayOrchestrator()
+    sink = ControlEventSink(tmp_path / "control-events.jsonl")
+    first_authority = EvidencePublicationAuthority.for_live_run(
+        run_id="run-overlay-restart",
+        sink=sink,
+    )
+    first_token = install_evidence_publication_authority(
+        first_authority,
+        orchestrator=orchestrator,
+    )
+    try:
+        EnvOverlayStore(orchestrator).register(
+            "java",
+            "/opt/jdk-21/bin/java",
+            env={"JAVA_HOME": "/opt/jdk-21"},
+            activate=True,
+        )
+    finally:
+        reset_evidence_publication_authority(first_token)
+
+    recovered = EvidencePublicationAuthority.for_live_run(
+        run_id="run-overlay-restart",
+        sink=sink,
+    )
+    second_token = install_evidence_publication_authority(
+        recovered,
+        orchestrator=orchestrator,
+    )
+    try:
+        environment = EnvOverlayStore(orchestrator).authorized_environment()
+    finally:
+        reset_evidence_publication_authority(second_token)
+
+    assert environment["JAVA_HOME"] == "/opt/jdk-21"
+    assert environment["PATH"].startswith("/opt/jdk-21/bin:")
+
+
 def test_block_records_exact_executable_without_blocking_other_versions():
     orchestrator = FakeEnvOverlayOrchestrator()
     store = EnvOverlayStore(orchestrator)
@@ -88,7 +239,7 @@ def test_block_records_exact_executable_without_blocking_other_versions():
     assert store.is_blocked("maven", "/opt/apache-maven-3.9.9/bin/mvn") is False
 
 
-def test_invalid_overlay_json_recovers_to_empty_state():
+def test_invalid_overlay_json_is_visible_but_cannot_become_runtime_authority():
     orchestrator = FakeEnvOverlayOrchestrator()
     orchestrator.files[DEFAULT_OVERLAY_JSON] = "{not valid json"
     store = EnvOverlayStore(orchestrator)
@@ -98,15 +249,10 @@ def test_invalid_overlay_json_recovers_to_empty_state():
     assert inspected["tools"] == {}
     assert inspected["warnings"]
 
-    store.register("maven", "/opt/apache-maven-3.9.9/bin/mvn", version="3.9.9")
+    with pytest.raises(EnvOverlayUnavailableError):
+        store.register("maven", "/opt/apache-maven-3.9.9/bin/mvn", version="3.9.9")
 
-    stored = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
-    assert stored["version"] == 1
-    assert (
-        stored["tools"]["maven"]["candidates"]["/opt/apache-maven-3.9.9/bin/mvn"]["version"]
-        == "3.9.9"
-    )
-    assert "warnings" not in stored
+    assert orchestrator.files[DEFAULT_OVERLAY_JSON] == "{not valid json"
 
 
 def test_env_tool_register_activate_inspect():
@@ -162,7 +308,7 @@ def test_env_tool_register_with_activate_confirms_exact_active_candidate():
 
 
 class ReadLimitedEnvOverlayOrchestrator(FakeEnvOverlayOrchestrator):
-    """Fail any read after the register transaction's own verified readback."""
+    """Fail any read after the register transaction's exact snapshot."""
 
     def __init__(self):
         super().__init__()
@@ -170,9 +316,9 @@ class ReadLimitedEnvOverlayOrchestrator(FakeEnvOverlayOrchestrator):
 
     def read_file(self, path):
         self.read_calls += 1
-        if self.read_calls > 6:
+        if self.read_calls > 5:
             # The tripwire, deliberately a FAILURE and not absence: under the
-            # §3.9 contract a seventh read raises out of the exact path, so a
+            # §3.9 contract a sixth read raises out of the exact path, so a
             # transaction that re-reads past its own verified snapshot cannot
             # quietly see an empty overlay — it fails loudly.
             return {
@@ -204,7 +350,7 @@ def test_register_activation_uses_same_transaction_readback_snapshot():
 
     assert result.succeeded is True
     assert result.raw_data["active_candidate"]["executable"] == ("/opt/apache-maven-3.9.9/bin/mvn")
-    assert orchestrator.read_calls == 6
+    assert orchestrator.read_calls == 5
 
 
 def test_project_env_facade_replaces_stale_active_runtime_atomically():
@@ -297,7 +443,7 @@ def test_fallback_writer_uses_base64_decode_not_raw_heredoc():
     assert any("base64 -d" in command for command in write_commands)
 
 
-def test_inspect_skips_malformed_persisted_candidate_fields():
+def test_inspect_rejects_entire_unpublished_malformed_overlay():
     orchestrator = FakeEnvOverlayOrchestrator()
     orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
         {
@@ -324,7 +470,7 @@ def test_inspect_skips_malformed_persisted_candidate_fields():
 
     inspected = store.inspect()
 
-    assert inspected["tools"]["maven"]["candidates"] == {}
+    assert inspected["tools"] == {}
     assert inspected["warnings"]
 
 
@@ -453,14 +599,14 @@ class FailAfterMutatingWriteOrchestrator(FakeEnvOverlayOrchestrator):
         return {"success": True, "output": "", "exit_code": 0}
 
 
-def test_overlay_second_write_failure_rolls_back_json_and_shell_as_one_pair():
+def test_overlay_mutating_write_failure_leaves_new_json_forensic_only():
     orchestrator = FailAfterMutatingWriteOrchestrator()
     store = EnvOverlayStore(orchestrator)
     store.register("maven", "/usr/bin/mvn", version="3.8.7", activate=True)
     before = dict(orchestrator.files)
     orchestrator.fail_path = DEFAULT_OVERLAY_JSON
 
-    with pytest.raises(RuntimeError, match="prior JSON/shell pair restored"):
+    with pytest.raises(RuntimeError, match="forensic shell restored"):
         store.register(
             "maven",
             "/opt/apache-maven-3.9.9/bin/mvn",
@@ -468,9 +614,10 @@ def test_overlay_second_write_failure_rolls_back_json_and_shell_as_one_pair():
             activate=True,
         )
 
-    assert orchestrator.files[DEFAULT_OVERLAY_JSON] == before[DEFAULT_OVERLAY_JSON]
+    assert orchestrator.files[DEFAULT_OVERLAY_JSON] != before[DEFAULT_OVERLAY_JSON]
     assert orchestrator.files[DEFAULT_OVERLAY_SCRIPT] == before[DEFAULT_OVERLAY_SCRIPT]
-    assert store.active_candidate("maven")["executable"] == "/usr/bin/mvn"
+    assert store.active_candidate("maven") is None
+    assert EnvOverlayStore(orchestrator).inspect()["warnings"]
 
 
 class CommandOnlyFailingOverlayOrchestrator:
@@ -528,11 +675,11 @@ class CommandOnlyFailingOverlayOrchestrator:
         raise AssertionError(f"unexpected command: {command}")
 
 
-def test_initial_fallback_write_failure_restores_missing_overlay_pair():
+def test_command_only_fake_without_atomic_cas_fails_closed():
     orchestrator = CommandOnlyFailingOverlayOrchestrator()
     store = EnvOverlayStore(orchestrator)
 
-    with pytest.raises(RuntimeError, match="prior JSON/shell pair restored"):
+    with pytest.raises(RuntimeError, match="forensic shell restored"):
         store.register(
             "maven",
             "/opt/apache-maven-3.9.9/bin/mvn",
@@ -547,12 +694,11 @@ class ProductionStrippingOverlayOrchestrator:
     """Mirror DockerOrchestrator's text `.strip()` while supporting raw transport."""
 
     def __init__(self):
-        self.storage = {}
+        self.atomic = AtomicContainerFS()
+        self.storage = self.atomic.files
 
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=True):
         del workdir, timeout, truncate_output
-        if command.startswith("mkdir -p "):
-            return {"success": True, "output": "", "exit_code": 0}
         if command.startswith("cat "):
             path = shlex.split(command)[1]
             if path not in self.storage:
@@ -584,11 +730,7 @@ class ProductionStrippingOverlayOrchestrator:
             path = tokens[-1]
             self.storage[path] = base64.b64decode(tokens[2]).decode("utf-8")
             return {"success": True, "output": "", "exit_code": 0}
-        if command.startswith("rm -f "):
-            path = shlex.split(command)[2]
-            self.storage.pop(path, None)
-            return {"success": True, "output": "", "exit_code": 0}
-        raise AssertionError(f"unexpected command: {command}")
+        return self.atomic.execute_command(command)
 
 
 def test_command_fallback_readback_preserves_terminal_newline_byte_for_byte():
@@ -641,6 +783,190 @@ def test_requirement_failure_atomically_records_constraint_and_exact_block():
         "source": "build_error",
     }
     assert store.observed_requirement("maven")["raw"] == "[3.9,)"
+
+
+def test_dynamic_java_requirement_is_persisted_with_exact_runtime_scope():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+
+    overlay = store.record_runtime_requirement(
+        "java",
+        target_sha="a" * 40,
+        domain_id="dom-camel-quarkus",
+        domain_root="/workspace/camel-quarkus/integration-tests",
+        required_major="17",
+        source_ref="inv-maven-compile-0001",
+        observed_at="2026-08-08T12:00:00Z",
+        observed_runtime={"major": "11", "executable": "/usr/bin/java"},
+    )
+
+    assert overlay["tools"]["java"]["runtime_requirements"] == [
+        {
+            "target_sha": "a" * 40,
+            "domain_id": "dom-camel-quarkus",
+            "domain_root": "/workspace/camel-quarkus/integration-tests",
+            "required_major": "17",
+            "source_ref": "inv-maven-compile-0001",
+            "observed_sequence": 1,
+            "observed_at": "2026-08-08T12:00:00Z",
+            "observed_runtime": {"major": "11", "executable": "/usr/bin/java"},
+        }
+    ]
+
+
+def test_corrupt_overlay_is_unknown_not_absent_for_dynamic_runtime_authority():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = "{not valid json"
+    store = EnvOverlayStore(orchestrator)
+
+    with pytest.raises(RuntimeError, match="dynamic runtime state is not trustworthy"):
+        store.resolve_runtime_requirement(
+            "java",
+            target_sha="a" * 40,
+            domain_id="dom-a",
+            domain_root="/workspace/project/a",
+            static_major="11",
+            static_source="survey",
+        )
+
+    assert orchestrator.files[DEFAULT_OVERLAY_JSON] == "{not valid json"
+
+
+def test_persisted_dynamic_runtime_outranks_static_survey_for_same_scope():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+    store.record_runtime_requirement(
+        "java",
+        target_sha="b" * 40,
+        domain_id="dom-it",
+        domain_root="/workspace/project/it",
+        required_major="17",
+        source_ref="output_abc",
+        observed_at="2026-08-08T12:00:00Z",
+    )
+
+    resolved = store.resolve_runtime_requirement(
+        "java",
+        target_sha="b" * 40,
+        domain_id="dom-it",
+        domain_root="/workspace/project/it",
+        static_major="11",
+        static_source="maven-compiler",
+    )
+
+    assert resolved["required_major"] == "17"
+    assert resolved["authority"] == "persisted_dynamic"
+    assert resolved["provenance"]["source_ref"] == "output_abc"
+
+
+def test_dynamic_runtime_requirement_does_not_leak_to_sibling_or_other_sha():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+    store.record_runtime_requirement(
+        "java",
+        target_sha="c" * 40,
+        domain_id="dom-a",
+        domain_root="/workspace/project/a",
+        required_major="17",
+        source_ref="inv-a",
+        observed_at="2026-08-08T12:00:00Z",
+    )
+
+    sibling = store.resolve_runtime_requirement(
+        "java",
+        target_sha="c" * 40,
+        domain_id="dom-b",
+        domain_root="/workspace/project/b",
+        static_major="11",
+        static_source="survey",
+    )
+    newer_tree = store.resolve_runtime_requirement(
+        "java",
+        target_sha="d" * 40,
+        domain_id="dom-a",
+        domain_root="/workspace/project/a",
+        static_major="11",
+        static_source="survey",
+    )
+
+    assert sibling == {
+        "required_major": "11",
+        "authority": "static_survey",
+        "provenance": {"source": "survey"},
+    }
+    assert newer_tree == sibling
+
+
+def test_same_scope_dynamic_runtime_disagreement_is_typed_not_latest_wins():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+    scope = {
+        "target_sha": "e" * 40,
+        "domain_id": "dom-a",
+        "domain_root": "/workspace/project/a",
+    }
+    store.record_runtime_requirement(
+        "java",
+        **scope,
+        required_major="17",
+        source_ref="inv-1",
+        observed_at="2026-08-08T12:00:00Z",
+    )
+    store.record_runtime_requirement(
+        "java",
+        **scope,
+        required_major="21",
+        source_ref="inv-2",
+        observed_at="2026-08-08T12:01:00Z",
+    )
+
+    resolved = store.resolve_runtime_requirement(
+        "java",
+        **scope,
+        static_major="11",
+        static_source="survey",
+    )
+
+    assert "required_major" not in resolved
+    assert resolved["conflict"] == {
+        "typed_code": RUNTIME_REQUIREMENT_CONFLICT,
+        "required_majors": ["17", "21"],
+        "source_refs": ["inv-1", "inv-2"],
+    }
+
+
+def test_confirmed_runtime_records_the_postcondition_without_rewriting_observation():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+    scope = {
+        "target_sha": "f" * 40,
+        "domain_id": "dom-a",
+        "domain_root": "/workspace/project/a",
+    }
+    store.record_runtime_requirement(
+        "java",
+        **scope,
+        required_major="17",
+        source_ref="inv-1",
+        observed_at="2026-08-08T12:00:00Z",
+        observed_runtime={"major": "11"},
+    )
+
+    overlay = store.confirm_runtime_requirement(
+        "java",
+        **scope,
+        source_ref="inv-1",
+        active_runtime={"major": "17", "executable": "/opt/jdk-17/bin/java"},
+        activated_at="2026-08-08T12:00:30Z",
+    )
+
+    (record,) = overlay["tools"]["java"]["runtime_requirements"]
+    assert record["observed_runtime"] == {"major": "11"}
+    assert record["active_runtime"] == {
+        "major": "17",
+        "executable": "/opt/jdk-17/bin/java",
+    }
+    assert record["activated_at"] == "2026-08-08T12:00:30Z"
 
 
 def test_scoped_requirement_history_is_append_only_and_cannot_be_weakened():
@@ -834,7 +1160,7 @@ def test_public_maven_registration_rejects_canonical_target_not_named_mvn():
     assert DEFAULT_OVERLAY_JSON not in orchestrator.files
 
 
-def test_legacy_mvn_overlay_normalizes_to_one_maven_key_and_remains_resolvable():
+def test_legacy_unpublished_mvn_overlay_is_forensic_only():
     executable = "/opt/apache-maven-3.9.9/bin/mvn"
     orchestrator = FakeEnvOverlayOrchestrator()
     orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
@@ -870,16 +1196,10 @@ def test_legacy_mvn_overlay_normalizes_to_one_maven_key_and_remains_resolvable()
         working_directory="/workspace/other-project",
     )
 
-    assert set(inspected["tools"]) == {"maven"}
-    assert inspected["tools"]["maven"]["active"] == executable
-    assert inspected["tools"]["maven"]["candidates"][executable]["path_prepend"] == [
-        "/opt/apache-maven-3.9.9/bin",
-        "/stale/bin",
-    ]
-    assert store.observed_requirements("mvn")[0]["raw"] == "[3.9,)"
-    assert resolved is not None
-    assert resolved.candidate.path == executable
-    assert resolved.candidate.source == "env_overlay"
+    assert inspected["tools"] == {}
+    assert inspected["warnings"]
+    assert store.observed_requirements("mvn") == []
+    assert resolved is None
 
 
 def test_mvn_alias_covers_negative_evidence_requirements_and_clear_without_double_key():
@@ -920,6 +1240,16 @@ class MavenContractE2EOrchestrator:
             },
             {"success": True, "exit_code": 0, "output": "[INFO] BUILD SUCCESS"},
         ]
+        self.requirements_store = ContainerFS()
+        add_published_mutable_json(
+            self,
+            self.requirements_store,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=complete_build_requirements_v1(project_root="/workspace/project"),
+        )
 
     def read_file(self, path):
         if path not in self.files:
@@ -935,6 +1265,8 @@ class MavenContractE2EOrchestrator:
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.requirements_store(command)
         if command.startswith("realpath -e -- "):
             requested = shlex.split(command)[-1]
             return {
@@ -1023,6 +1355,11 @@ class CanonicalMavenFacadeE2EOrchestrator(MavenContractE2EOrchestrator):
         return super().execute_command(command, workdir=workdir, timeout=timeout)
 
 
+@pytest.mark.usefixtures(
+    "facade_contract_authority",
+    "exact_build_facade_authority",
+    "exact_internal_runner_authority",
+)
 def test_public_mvn_env_pins_canonical_maven_for_shell_and_cross_workdir_build():
     orchestrator = CanonicalMavenFacadeE2EOrchestrator()
     orchestrator.executables["/stale/bin/mvn"] = "Apache Maven 3.8.7"
@@ -1067,6 +1404,11 @@ def test_public_mvn_env_pins_canonical_maven_for_shell_and_cross_workdir_build()
     assert orchestrator.monitored_commands[-1][1]["workdir"] == ("/workspace/unrelated/module")
 
 
+@pytest.mark.usefixtures(
+    "facade_contract_authority",
+    "exact_build_facade_authority",
+    "exact_internal_runner_authority",
+)
 def test_maven_failure_contract_survives_weak_model_omissions_end_to_end():
     orchestrator = MavenContractE2EOrchestrator()
     maven = MavenTool(orchestrator)

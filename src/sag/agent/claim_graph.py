@@ -38,14 +38,14 @@ reads it back — a fresh `load()` takes the events and the claim files only.
 
 import hashlib
 import json
-import posixpath
-import shlex
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
 from sag.agent.claim_records import CLAIM_DIR, EVIDENCE_STATUSES
 from sag.agent.control_events import canonical_json
+from sag.agent.evidence_records import decode_json_record_stream, execute_json_record_stream
+from sag.utils.container_io import write_container_text_atomic
 
 CLAIM_GRAPH_SCHEMA_VERSION = 1
 CLAIM_GRAPH_PATH = "/workspace/.setup_agent/claim_graph.json"
@@ -309,20 +309,17 @@ class ClaimGraph:
         except (TypeError, ValueError) as exc:
             logger.debug(f"claim graph is not serializable: {exc}")
             return False
-        temp = f"{CLAIM_GRAPH_PATH}.tmp"
-        directory = posixpath.dirname(CLAIM_GRAPH_PATH)
-        command = (
-            f"mkdir -p {shlex.quote(directory)} && "
-            f"cat > {shlex.quote(temp)} <<'{CLAIM_GRAPH_HEREDOC}' && "
-            f"mv -f {shlex.quote(temp)} {shlex.quote(CLAIM_GRAPH_PATH)}\n"
-            f"{body}\n{CLAIM_GRAPH_HEREDOC}"
-        )
         try:
-            result = execute(command) or {}
+            result = write_container_text_atomic(
+                execute,
+                CLAIM_GRAPH_PATH,
+                body,
+                validate_json=True,
+            )
         except Exception as exc:
             logger.debug(f"claim graph not materialized: {exc}")
             return False
-        return _succeeded(result)
+        return result.persisted
 
     # -- internals ---------------------------------------------------------
 
@@ -467,30 +464,24 @@ def read_claim_files(
 ) -> List[Dict[str, Any]]:
     """Every persisted claim body, ordered by id so two reads agree.
 
-    One bounded glob `cat` — the same read `repair_contracts.read_records`
-    performs over the same directory. It is restated here rather than imported
-    for the reason `materialize` takes the same argument: this module's
-    transport is an `execute` CALLABLE, and reaching for the Stage C3 reader
-    would make the C1 graph depend on the C3 repair layer to read its own
-    subjects. The equivalence is asserted by test rather than assumed.
+    One bounded shell loop emits one length/hash/base64 frame after each atomic
+    file. Source JSON may be compact or pretty printed; neither can leak a
+    transport boundary into its neighbour.
 
-    A line that does not parse is skipped rather than failing the read: a
+    A framed file whose payload does not parse is skipped rather than failing the read: a
     corrupt neighbour must not hide the claims we do understand.
     """
     try:
-        probe = execute(f"cat {shlex.quote(CLAIM_DIR)}/*.json 2>/dev/null") or {}
+        probe = execute_json_record_stream(execute, CLAIM_DIR) or {}
     except Exception as exc:  # an unreadable directory is an absent fact
         logger.debug(f"claim files unavailable for the graph: {exc}")
         return []
+    decoded = decode_json_record_stream(probe)
+    if not decoded.complete:
+        logger.debug(f"claim files unavailable for the graph: incomplete record stream")
+        return []
     claims: Dict[str, Dict[str, Any]] = {}
-    for line in str(probe.get("output") or "").splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("{"):
-            continue
-        try:
-            payload = json.loads(stripped)
-        except (TypeError, ValueError):
-            continue
+    for payload in decoded.records:
         identifier = _text(payload.get("claim_id")) if isinstance(payload, Mapping) else ""
         if identifier:
             claims[identifier] = dict(payload)
@@ -506,67 +497,16 @@ def commit_assessment_transitions(
     emit: Callable[[str, Mapping[str, Any]], Any],
     fact_epoch: Optional[int] = None,
 ) -> Tuple[str, ...]:
-    """Move the claims one assessment settled, as ONE event group (note (a)).
+    """Do not infer claim subjects from contract authorization citations.
 
-    A contract cites the stored claims that authorized it, so a verdict on its
-    receipt is also a verdict on those claims: `expectation_met` CONFIRMS them,
-    and a typed `falsifier_*` CONTRADICTS them and retracts whatever rested on
-    them. Every other typed code moves nothing — a compiler error is a real
-    fact about the run and falsifies nothing a document states (spec §C5).
-
-    The subjects are the claim FILES, so a claim that never reached disk is
-    skipped by name: a contract citing an unpersisted claim is a conflict to
-    record, not a crash. Events are handed to `emit` in order and the terminal
-    record closes the group, so a run that dies mid-commit leaves a group
-    replay reads as absent rather than half-applied.
-
-    Returns the ids that moved. Never raises.
+    ``supporting_claim_ids`` answer only why a dispatch was allowed. They do
+    not state the predicate the runner tested, so neither expectation_met nor
+    a generic falsifier may confirm/contradict them. A future explicit
+    predicate-to-claim record can open a transition group at this seam; until
+    then the only causally correct result is no movement.
     """
-    trigger = _text(assessment_id)
-    code = _text(typed_code)
-    subjects = [value for value in (_text(item) for item in claim_ids or ()) if value]
-    if not trigger or not subjects:
-        return ()
-    if code == CONFIRMING_CODE:
-        status = CONFIRMED_STATUS
-    elif code.startswith(CONTRADICTING_PREFIX):
-        status = CONTRADICTED_STATUS
-    else:
-        return ()
-
-    try:
-        graph = load((), read_claim_files(execute), fact_epoch=fact_epoch)
-        group = group_identity(trigger)
-        moved: List[str] = []
-        for claim_id in subjects:
-            try:
-                graph.transition(claim_id, status, trigger, group, fact_epoch=fact_epoch)
-            except UnknownClaimError:
-                logger.warning(
-                    f"contract claim {claim_id!r} has no claim file; {trigger} moved "
-                    "nothing for it and the citation stays an open conflict"
-                )
-                continue
-            except ClaimGraphError as exc:
-                logger.debug(f"{trigger} could not move {claim_id!r}: {exc}")
-                continue
-            moved.append(claim_id)
-            if status == CONTRADICTED_STATUS:
-                moved.extend(
-                    graph.invalidate_dependents(
-                        claim_id, group_id=group, cause_assessment_id=trigger
-                    )
-                )
-        if not moved:
-            return ()
-        graph.commit_group(group)
-        for payload in graph.pending_events():
-            emit("claim_transition", payload)
-        graph.materialize(execute)
-        return tuple(moved)
-    except Exception as exc:  # the graph never breaks the run that fed it
-        logger.debug(f"claim transitions for {trigger} were not committed: {exc}")
-        return ()
+    del execute, assessment_id, typed_code, claim_ids, emit, fact_epoch
+    return ()
 
 
 # ---------------------------------------------------------------------------
@@ -627,14 +567,6 @@ def _epoch(value: Any) -> Optional[int]:
 
 def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
-
-
-def _succeeded(result: Mapping[str, Any]) -> bool:
-    """Container results state either `success` or an exit code; accept both."""
-    success = (result or {}).get("success")
-    if success is None:
-        success = (result or {}).get("exit_code") == 0
-    return bool(success)
 
 
 __all__ = [

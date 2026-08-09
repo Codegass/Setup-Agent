@@ -10,7 +10,7 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
-from .build_preflight import PythonPreflight, read_build_requirements
+from .build_preflight import PythonPreflight, read_live_build_requirements
 from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
 from .python_env import detect_installer, ensure_venv_pip, venv_repair_note
 
@@ -359,9 +359,8 @@ class ProjectSetupTool(BaseTool):
             raise ToolError(
                 message="repository_url is required for clone action",
                 suggestions=[
-                    "Provide a repository URL: project(action='clone', repo_url='https://github.com/user/repo.git')",
-                    "Ensure the URL is accessible and correct",
-                    "Use HTTPS URLs for public repositories",
+                    "Constraint: clone requires a non-empty repository URL",
+                    "Constraint: the repository must be reachable with the container's credentials",
                 ],
                 error_code="MISSING_REPOSITORY_URL",
             )
@@ -382,9 +381,8 @@ class ProjectSetupTool(BaseTool):
             raise ToolError(
                 message="Git is not installed in the container",
                 suggestions=[
-                    "Install Git first: bash(command='apt update && apt install -y git')",
-                    "Verify Git installation: bash(command='git --version')",
-                    "Check if the container has package management tools",
+                    "Observed capability: no Git executable is available",
+                    "Constraint: cloning requires a working Git executable",
                 ],
                 documentation_links=[
                     "https://git-scm.com/book/en/v2/Getting-Started-Installing-Git"
@@ -411,9 +409,8 @@ class ProjectSetupTool(BaseTool):
             raise ToolError(
                 message="Repository clone verification failed",
                 suggestions=[
-                    "Check if the repository was cloned correctly",
-                    "Verify disk space and permissions",
-                    "Try cloning manually with bash tool",
+                    "Observed fact: the expected clone directory could not be listed",
+                    "Relevant constraints: target path, disk space, and permissions",
                 ],
                 error_code="CLONE_VERIFICATION_FAILED",
             )
@@ -478,31 +475,9 @@ class ProjectSetupTool(BaseTool):
             metadata["branch"] = legacy_branch
 
         # Clone is side-effect free (spec §3.4-1): fetch, submodules, detect,
-        # stop. No venv/pip/apt/JDK rides along — provisioning happens only when
-        # it is asked for by name, so its cost and its failures are attributed to
-        # the call that caused them instead of being buried in a clone warning.
-        output += f"\n📝 Suggested next steps:\n"
-        if project_type["type"] in ("maven", "gradle"):
-            if java_version_required:
-                output += (
-                    f"• Install the required JDK: "
-                    f"project(action='provision', java_version='{java_version_required}')\n"
-                )
-            else:
-                output += f"• Install the toolchain: project(action='provision', java_version=...)\n"
-            output += f"• Resolve dependencies: build(action='deps')\n"
-            output += f"• Compile: build(action='compile')\n"
-        elif project_type["type"] == "npm":
-            output += f"• Install the toolchain if node is missing: project(action='provision', packages=['nodejs', 'npm'])\n"
-            output += f"• Install dependencies: build(action='deps')\n"
-        elif project_type["type"] == "python":
-            output += f"• Install dependencies into ./.venv: build(action='deps')\n"
-            output += f"• Install any missing system toolchain: project(action='provision', packages=[...])\n"
-            output += f"• Run tests: build(action='test')\n"
-        else:
-            output += f"• Analyze project structure: project(action='analyze')\n"
-            output += f"• Install anything missing: project(action='provision', ...)\n"
-            output += f"• Use bash tool for custom setup commands\n"
+        # stop.  The result ends with observed project facts.  Phase policy and
+        # the model choose any later action; clone does not append a generated
+        # setup plan or an exact provision/build call.
 
         return ToolResult.completed_success(output=output, metadata=metadata)
 
@@ -605,9 +580,8 @@ class ProjectSetupTool(BaseTool):
             error=f"Failed to check out repository ref '{requested_ref}'",
             error_code=error_code,
             suggestions=[
-                "Verify the ref exists as a branch, tag, release tag, or commit in the repository",
-                "For short commit hashes, provide at least enough characters for Git to resolve uniquely",
-                "Try checking the available refs with bash before retrying setup",
+                "Constraint: the requested ref must resolve to a branch, tag, or commit",
+                "Constraint: abbreviated commit ids must be unambiguous",
             ],
             raw_output=output,
             metadata={
@@ -1146,7 +1120,21 @@ class ProjectSetupTool(BaseTool):
         overlay. The ladder strings live ONLY in python_env.detect_installer;
         this method never invents install commands."""
         directory = directory.rstrip("/")
-        requirements = read_build_requirements(self.orchestrator)
+        manifest_read = read_live_build_requirements(self.orchestrator)
+        if (
+            not manifest_read.complete
+            or manifest_read.conflict is not None
+            or manifest_read.payload is None
+        ):
+            return {
+                "success": False,
+                "error": "live build requirements unavailable",
+                "error_code": "BUILD_REQUIREMENTS_UNAVAILABLE",
+                "blocker_owner": "harness",
+                "build_requirements_status": manifest_read.conflict or "absent",
+            }
+        requirements = dict(manifest_read.payload)
+        venv = requirements.get("python_venv") or f"{directory}/.venv"
 
         # Pre-flight FIRST (same pattern as python_tool.setup_env): satisfied
         # or absent requirement is a no-op; a mismatch provisions and narrates.
@@ -1154,11 +1142,10 @@ class ProjectSetupTool(BaseTool):
             requirements.get("python_version"),
             constraint=requirements.get("python_constraint"),
             source=requirements.get("python_version_source") or "requires-python",
+            venv_path=venv,
         )
         if outcome.narration:
             logger.info(outcome.narration)
-
-        venv = requirements.get("python_venv") or f"{directory}/.venv"
 
         # Venv next. A provisioning pre-flight already created it (uv/apt).
         creation_failure: Optional[Dict[str, Any]] = None
@@ -1584,10 +1571,8 @@ class ProjectSetupTool(BaseTool):
                 error_code = "DIRECTORY_EXISTS"
                 error_suggestions.extend(
                     [
-                        f"Directory '{target_directory}' already exists and contains conflicting content",
-                        "Use a different target directory name",
-                        "Remove the existing directory first: bash(command='rm -rf {target_directory}')",
-                        "Or retry project(action='clone') with a different target_directory parameter",
+                        f"Observed fact: directory '{target_directory}' already contains conflicting content",
+                        "Constraint: the clone target must be absent or an already-compatible checkout",
                     ]
                 )
 
@@ -1595,10 +1580,8 @@ class ProjectSetupTool(BaseTool):
             error_code = "REPOSITORY_NOT_FOUND"
             error_suggestions.extend(
                 [
-                    "Verify the repository URL is correct",
-                    "Check if the repository exists and is accessible",
-                    "Ensure you have permission to access the repository",
-                    "Try the repository URL in a browser to verify it exists",
+                    "Observed category: repository was not found",
+                    "Relevant constraints: repository identity, existence, visibility, and credentials",
                 ]
             )
 
@@ -1606,10 +1589,8 @@ class ProjectSetupTool(BaseTool):
             error_code = "CONNECTION_ERROR"
             error_suggestions.extend(
                 [
-                    "Check network connectivity from the container",
-                    "Verify DNS resolution is working",
-                    "Try using HTTPS instead of SSH URLs",
-                    "Check if firewall is blocking the connection",
+                    "Observed category: repository transport connection failed",
+                    "Relevant constraints: container network, DNS, protocol access, and firewall policy",
                 ]
             )
 
@@ -1617,18 +1598,15 @@ class ProjectSetupTool(BaseTool):
             error_code = "PERMISSION_ERROR"
             error_suggestions.extend(
                 [
-                    "Check if you have write permissions to the target directory",
-                    "Use sudo if necessary (though not recommended in containers)",
-                    "Check directory ownership and permissions",
+                    "Observed category: permission denied",
+                    "Constraint: the clone process requires write access to the target directory",
                 ]
             )
 
         else:
             error_suggestions = [
-                "Check the git clone output for specific error details",
-                "Verify the repository URL format",
-                "Try cloning manually with bash tool for more control",
-                "Check if git is properly installed and configured",
+                "Observed fact: Git returned a non-zero clone result",
+                "Relevant constraints: repository URL, credentials, network, target path, and Git capability",
             ]
 
         return ToolResult.completed_failure(

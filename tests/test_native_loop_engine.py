@@ -11,7 +11,7 @@ risk 5), so the renderer's repair pass must never have anything to do."""
 from types import SimpleNamespace
 
 import pytest
-from test_verdict_finalizer import FakeVerdictOrchestrator
+from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authority
 
 import sag.agent.native_messages as native_messages
 from sag.agent.evidence_state import RunEvidenceState
@@ -122,7 +122,9 @@ def _engine(turns, *, max_iterations=12):
     engine.phase_machine = machine
     engine.max_iterations = max_iterations
     engine.run_evidence_state = RunEvidenceState(run_id="native-loop")
-    engine.verdict_finalizer = VerdictFinalizer(FakeVerdictOrchestrator())
+    verdict_orchestrator = FakeVerdictOrchestrator()
+    bind_verdict_authority(verdict_orchestrator, engine.run_evidence_state.run_id)
+    engine.verdict_finalizer = VerdictFinalizer(verdict_orchestrator)
     engine.transition_policy = PhaseTransitionPolicy()
     engine._repair_global_remaining = 2
     engine._repair_phase_remaining = {"build": 1, "test": 1}

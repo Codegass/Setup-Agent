@@ -11,23 +11,45 @@ on disk; and the survey must run BEFORE the phase objective is selected, or a
 Python repo gets the Java objective in the same intro as Python guidance.
 """
 
+import json
 import shlex
 from types import SimpleNamespace
 
+from build_requirements_fakes import complete_build_requirements_v1
+from test_container_io import FakeContainer
+
+from sag.agent.evidence_records import frame_named_json_record_stream
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    evidence_publication_authority_for,
+)
 from sag.agent.physical_survey import validate_and_discover_project_path
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION, ProjectAnalyzerTool
 from sag.tools.internal.python_env import LAYOUT_SCAN_SENTINEL
 
+_ATOMIC_WRITE_PREFIXES = (
+    "mkdir -p -- ",
+    ": > ",
+    "printf '%s' ",
+    "base64 --decode ",
+    "python3 -c ",
+    "rm -f -- ",
+    "mv -f -- ",
+)
+
 
 class SurveyOrch:
-    """Minimal python-shaped repo: answers probes, captures the manifest write."""
+    """Minimal python-shaped repo: answers probes, captures the atomic manifest."""
 
     def __init__(self, *, drop_manifest_writes=False):
         self.files = {}
         self.commands = []
         self.manifest_writes = 0
         self.drop_manifest_writes = drop_manifest_writes
+        self.atomic = FakeContainer()
+        self.atomic.files = self.files
         # The container probe digests config content (seed below); the
         # package layout reaches the fingerprint through the REAL shared
         # discovery scan — this fake answers those find probes from
@@ -37,15 +59,62 @@ class SurveyOrch:
         self.layout_probe_broken = False  # no sentinel: probe never executed
         self.layout_find_fails = False  # shell ran; find died mid-scan
         self.reverse_layout = False  # find order is unspecified — flip it
+        self.target_sha = "a" * 40
+
+    def publish_existing_manifest(self):
+        raw = self.files[REQUIREMENTS_PATH].encode("utf-8")
+        authority = evidence_publication_authority_for(self)
+        prior = authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
+        authority.publish_revision(
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            raw=raw,
+            expected_previous_raw_sha256=(
+                prior.raw_sha256 if prior is not None else EVIDENCE_PUBLICATION_GENESIS_SHA256
+            ),
+        )
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
+        if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
+            assignment = command.partition(";")[0]
+            target = shlex.split(assignment[len("file=") :])[0]
+            records = (
+                [(target.rsplit("/", 1)[-1], self.files[target])] if target in self.files else []
+            )
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
+        if command.startswith(_ATOMIC_WRITE_PREFIXES):
+            tokens = shlex.split(command)
+            if (
+                tokens[:2] == ["python3", "-c"]
+                and "fcntl.flock" in tokens[2]
+                and tokens[3] == REQUIREMENTS_PATH
+            ):
+                self.manifest_writes += 1
+                if self.drop_manifest_writes:
+                    self.atomic.files.pop(tokens[4], None)
+                    return {"success": True, "exit_code": 0, "output": ""}
+            if tokens[:3] == ["mv", "-f", "--"] and tokens[-1] == REQUIREMENTS_PATH:
+                self.manifest_writes += 1
+                if self.drop_manifest_writes:
+                    self.atomic.files.pop(tokens[3], None)
+                    return {"success": True, "exit_code": 0, "output": ""}
+            return self.atomic.execute_command(command, **kwargs)
         if command.startswith("realpath -m -- "):
             return {
                 "success": True,
                 "exit_code": 0,
                 "output": "\n".join(shlex.split(command)[3:]),
             }
+        if command == "git -C /workspace/proj rev-parse HEAD":
+            if not self.target_sha:
+                return {"success": False, "exit_code": 1, "output": ""}
+            return {"success": True, "exit_code": 0, "output": self.target_sha}
         if "| cksum" in command:
             if not self.config_seed:  # empty seed simulates a broken probe
                 return {"success": False, "exit_code": 1, "output": ""}
@@ -193,18 +262,19 @@ def test_present_when_manifest_exists_and_no_reanalysis_happens():
     assert len(orch.commands) - before <= 30
 
 
-def test_agent_written_manifest_without_stamp_counts_as_present():
-    """Zero behavior change when the agent DID call analyze (pre-stamp
-    manifests stay authoritative)."""
+def test_agent_written_manifest_without_v1_stamp_is_not_live_authority():
+    """A host-published v0 body remains forensic, never current control."""
     orch = SurveyOrch()
     orch.files[REQUIREMENTS_PATH] = '{"java_version": "17"}'
-    assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "present"
+    orch.publish_existing_manifest()
+    assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "failed"
 
 
-def test_stale_analyzer_version_triggers_resurvey():
+def test_stale_schema_cannot_be_laundered_by_resurvey():
     orch = SurveyOrch()
     orch.files[REQUIREMENTS_PATH] = '{"survey": {"analyzer_version": 0}}'
-    assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "created"
+    orch.publish_existing_manifest()
+    assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "failed"
 
 
 def test_never_raises_on_broken_container():
@@ -249,8 +319,9 @@ def test_survey_runs_before_objective_selection(monkeypatch):
     intro = engine._phase_intro_step().content
     assert "framework survey ran" in intro
     # the objective must be the PYTHON one, selected AFTER the survey
-    assert "Never run mvn/gradle via bash" not in intro  # java objective marker
-    assert "build(action='deps')" in intro
+    assert "registered interpreter" in intro
+    assert "dependency readiness" in intro
+    assert "build(action=" not in intro
 
 
 def test_no_trace_line_and_no_behavior_change_when_survey_present(monkeypatch):
@@ -276,6 +347,21 @@ def test_test_phase_intro_also_runs_the_guarantee(monkeypatch):
     assert calls
 
 
+def test_analyze_phase_intro_runs_the_guarantee_and_projects_each_state(monkeypatch):
+    from sag.agent.react_engine import ReActEngine
+
+    for state in ("created", "present", "failed"):
+        calls = []
+        monkeypatch.setattr(
+            ReActEngine,
+            "_ensure_project_facts",
+            lambda self, state=state: calls.append(state) or state,
+        )
+        intro = _mutable_engine(1, {})._phase_intro_step().content
+        assert calls == [state]
+        assert f"Engine survey status: {state}" in intro
+
+
 def test_stale_manifest_with_dropped_rewrite_is_failed_not_created():
     """Re-review P1: the old stale file keeps the readback non-empty when the
     replacement write is dropped — 'created' must verify THIS survey's stamp."""
@@ -287,10 +373,11 @@ def test_stale_manifest_with_dropped_rewrite_is_failed_not_created():
 def test_same_version_manifest_for_another_project_resurveys():
     """Re-review P2: version match alone must not pass — project identity too."""
     orch = SurveyOrch()
-    orch.files[REQUIREMENTS_PATH] = (
-        '{"survey": {"analyzer_version": %d, "project_path": "/workspace/other"}}'
-        % SURVEY_FACTS_VERSION
+    orch.files[REQUIREMENTS_PATH] = json.dumps(
+        complete_build_requirements_v1(project_root="/workspace/other"),
+        sort_keys=True,
     )
+    orch.publish_existing_manifest()
     assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "created"
     assert '"/workspace/proj"' in orch.files[REQUIREMENTS_PATH]
 
@@ -308,6 +395,42 @@ def test_config_edit_invalidates_the_fast_path_and_resurveys():
     assert orch.manifest_writes == 2  # a real re-survey with fresh facts
 
     # Unchanged config afterwards: back to the fast path.
+    assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_checkout_change_invalidates_the_fast_path_even_when_config_is_identical():
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.target_sha = "b" * 40
+    assert tool.ensure_facts("/workspace/proj") == "created"
+    assert orch.manifest_writes == 2
+    assert json.loads(orch.files[REQUIREMENTS_PATH])["survey"]["target_sha"] == "b" * 40
+
+    assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_unreadable_checkout_sha_is_cannot_compare_not_resurvey_thrash():
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.target_sha = ""
+    assert tool.ensure_facts("/workspace/proj") == "present"
+    assert orch.manifest_writes == 1
+
+
+def test_a_newly_readable_checkout_sha_repairs_an_unpinned_survey_once():
+    orch = SurveyOrch()
+    orch.target_sha = ""
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.target_sha = "a" * 40
+    assert tool.ensure_facts("/workspace/proj") == "created"
+    assert orch.manifest_writes == 2
+    assert json.loads(orch.files[REQUIREMENTS_PATH])["survey"]["target_sha"] == "a" * 40
     assert tool.ensure_facts("/workspace/proj") == "present"
 
 
@@ -645,6 +768,33 @@ def test_integration_skipped_analyze_run_ends_with_facts_and_python_objective():
     assert "Never run mvn/gradle via bash" not in intro
 
 
+def test_analyze_intro_creates_facts_before_any_model_analyze_call():
+    """Clone/provision completion enters analyze with a usable fact sheet.
+
+    No model tool call occurs in this test: the phase intro itself runs the
+    Category-1 guarantee, persists the manifest/trunk facts, and exposes a
+    fact-backed status from which the analyze phase can make its claim.
+    """
+    from test_python_phase_guidance import _engine_at
+
+    cm = IntegrationCM()
+    orch = StrictSurveyOrch()
+    engine = _engine_at(1, cm.trunk.environment_summary)  # analyze phase
+    engine.context_manager = cm
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orch)
+
+    intro = engine._phase_intro_step().content
+
+    assert "→ current: analyze" in intro
+    assert "Engine survey status: created" in intro
+    assert REQUIREMENTS_PATH in orch.files
+    assert cm.saves >= 1
+    recommendation = cm.trunk.environment_summary.get("build_recommendation")
+    assert recommendation and recommendation["build_system"] == "python"
+    assert "framework survey computed and persisted the project fact sheet" in intro
+    assert "project(action='analyze')" not in intro
+
+
 class StoreCM(IntegrationCM):
     """A trunk store with real persistence semantics: load returns the last
     SAVED state, not the shared in-memory object — a dropped save must not
@@ -690,8 +840,6 @@ def test_config_edit_with_failed_trunk_save_does_not_serve_stale_trunk():
 
     assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
     # Recovery leaves BOTH ends stamped with the SAME (new) fingerprint.
-    import json
-
     manifest_stamp = json.loads(orch.files[REQUIREMENTS_PATH])["survey"]
     trunk_stamp = cm._saved_env["survey"]
     assert trunk_stamp["config_fingerprint"] == manifest_stamp["config_fingerprint"] is not None

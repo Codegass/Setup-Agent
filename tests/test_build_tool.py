@@ -10,9 +10,17 @@ import json
 import shlex
 from types import SimpleNamespace
 
+import pytest
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+
+pytestmark = pytest.mark.usefixtures(
+    "facade_contract_authority", "exact_build_facade_authority"
+)
 
 
 class FakeBackendTool:
@@ -31,9 +39,23 @@ class FakeBackendTool:
 class MarkerOrchestrator:
     """Answers build-marker probes: which marker files exist."""
 
-    def __init__(self, markers, files=None):
+    def __init__(self, markers, files=None, *, publish_manifest=True):
         self.markers = set(markers)
         self.files = dict(files or {})
+        self.commands = []
+        self.evidence = ContainerFS()
+        if publish_manifest:
+            raw = self.files.get(REQUIREMENTS_PATH)
+            payload = json.loads(raw) if raw is not None else {}
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=payload,
+            )
 
     def read_file(self, path):
         if path not in self.files:
@@ -44,6 +66,9 @@ class MarkerOrchestrator:
         return {"success": True, "content": self.files[path], "exit_code": 0}
 
     def execute_command(self, command, **kwargs):
+        self.commands.append(command)
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command, **kwargs)
         for m in self.markers:
             if m in command:
                 return {"success": True, "output": "exists", "exit_code": 0}
@@ -56,9 +81,21 @@ class ShellParsingMarkerOrchestrator:
     def __init__(self, existing_paths):
         self.existing_paths = set(existing_paths)
         self.commands = []
+        self.evidence = ContainerFS()
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload={},
+        )
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        if REQUIREMENTS_PATH in command and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command, **kwargs)
         tokens = shlex.split(command)
         try:
             path = tokens[tokens.index("-f") + 1]
@@ -109,13 +146,24 @@ def test_gradle_kts_project_routes_test_to_gradle_backend():
     assert result.facts["system"] == "gradle"
 
 
-def test_deps_verb_maps_per_ecosystem():
-    maven, gradle = FakeBackendTool(), FakeBackendTool()
-    _tool({"pom.xml"}, maven=maven).execute(action="deps", working_directory="/w")
-    _tool({"settings.gradle"}, gradle=gradle).execute(action="deps", working_directory="/w")
+@pytest.mark.parametrize(
+    ("marker", "backend_name", "expected_key", "expected_value"),
+    (
+        ("pom.xml", "maven", "command", "dependency:resolve"),
+        ("settings.gradle", "gradle", "tasks", "dependencies"),
+    ),
+)
+def test_deps_verb_maps_per_ecosystem(
+    marker, backend_name, expected_key, expected_value
+):
+    backend = FakeBackendTool()
+    kwargs = {f"{backend_name}_tool": backend}
 
-    assert maven.calls[0]["command"] == "dependency:resolve"
-    assert gradle.calls[0]["tasks"] == "dependencies"
+    BuildTool(MarkerOrchestrator({marker}), **kwargs).execute(
+        action="deps", working_directory="/w"
+    )
+
+    assert backend.calls[0][expected_key] == expected_value
 
 
 def test_unknown_system_returns_unknown_with_evidence():
@@ -125,6 +173,70 @@ def test_unknown_system_returns_unknown_with_evidence():
     assert result.operation_outcome.value == "unknown"
     assert "checked" in result.facts
     assert result.facts["checked"], "must list the markers probed"
+
+
+def test_unpublished_manifest_cannot_route_or_freeze_a_build_call():
+    orchestrator = MarkerOrchestrator(
+        {"pom.xml"},
+        files={REQUIREMENTS_PATH: json.dumps({"build_system": "maven"})},
+        publish_manifest=False,
+    )
+    maven = FakeBackendTool()
+
+    result = BuildTool(orchestrator, maven_tool=maven).execute(
+        action="compile",
+        working_directory="/workspace/p",
+    )
+
+    assert result.error_code == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert result.metadata["runner_dispatched"] is False
+    assert result.metadata["blocker_owner"] == "harness"
+    assert maven.calls == []
+    assert not any("/workspace/p/pom.xml" in command for command in orchestrator.commands)
+
+
+@pytest.mark.parametrize(
+    "invalid_params",
+    [
+        {"timeout": 0},
+        {"timeout": True},
+        {"args": ""},
+        {"args": "   "},
+        {"features": []},
+        {"definitions": {}},
+    ],
+)
+def test_invalid_or_unconsumed_public_params_are_refused_before_marker_probe(
+    invalid_params,
+):
+    orchestrator = MarkerOrchestrator({"pom.xml"})
+    maven = FakeBackendTool()
+
+    result = BuildTool(orchestrator, maven_tool=maven).execute(
+        action="compile",
+        working_directory="/workspace/p",
+        **invalid_params,
+    )
+
+    assert result.error_code == "BUILD_PARAMETER_INVALID"
+    assert orchestrator.markers == {"pom.xml"}
+    assert maven.calls == []
+
+
+@pytest.mark.parametrize("system", ["gradle", "python"])
+def test_maven_requirement_is_refused_for_wrong_ecosystem(system):
+    marker = "build.gradle" if system == "gradle" else "pyproject.toml"
+    backend = FakeBackendTool()
+    kwargs = {f"{system}_tool": backend}
+
+    result = BuildTool(MarkerOrchestrator({marker}), **kwargs).execute(
+        action="compile",
+        working_directory="/workspace/p",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert result.error_code == "BUILD_PARAMETER_INVALID"
+    assert backend.calls == []
 
 
 def test_test_stats_surface_in_facts():

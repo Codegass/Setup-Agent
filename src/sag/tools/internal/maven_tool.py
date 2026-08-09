@@ -11,22 +11,26 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.invocation_contracts import (
+    CONTRACT_AUTHORITY_MISSING,
     contract_receipt_fields,
+    current_contract,
     dispatch_contract,
     ensure_dispatch_contract,
 )
 from sag.agent.invocation_receipts import record_invocation, snapshot_reports
-from sag.agent.job_obligations import record_dispatch_obligation
+from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.env_overlay import EnvOverlayStore
+from sag.utils.container_io import write_container_text_atomic
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
     JdkPreflight,
     active_java_major,
     classify_version_error,
-    read_build_requirements,
+    read_live_build_requirements,
 )
 from .build_utils import (
     DETACHED_HANDOFF_STATUSES,
@@ -38,7 +42,6 @@ from .build_utils import (
 from .command_tracker import CommandTracker
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
-
 # The reactor summary Maven prints at the end of every multi-module build:
 #   [INFO] camel-core ......................... SUCCESS [ 12.345 s]
 #   [INFO] camel-jms .......................... FAILURE [  3.210 s]
@@ -46,9 +49,7 @@ from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequi
 # It is the build system's own record of what THIS invocation attempted. A
 # single-module build prints none, which is the honest absence: there is one
 # module and the exit code already speaks for it.
-_REACTOR_ROW = re.compile(
-    r"\[INFO\]\s+([^\.\[]+?)\s+\.{2,}\s+(SUCCESS|FAILURE|SKIPPED)\b"
-)
+_REACTOR_ROW = re.compile(r"\[INFO\]\s+([^\.\[]+?)\s+\.{2,}\s+(SUCCESS|FAILURE|SKIPPED)\b")
 
 
 def _reactor_module_outcomes(output: Optional[str]) -> List[Dict[str, str]]:
@@ -98,24 +99,6 @@ class MavenTool(BaseTool):
             return self._extract_maven_key_info(output)
         return output
 
-    @staticmethod
-    def _suggested_build_action(command: str) -> str:
-        """Map a raw Maven command onto a valid build(action=...) verb.
-
-        Failure suggestions surface build(action='...') calls; interpolating
-        the raw command produces actions the build tool's enum rejects.
-        """
-        normalized = (command or "").strip().lower()
-        if normalized in ("deps", "compile", "test", "package"):
-            return normalized
-        if normalized.startswith("dependency:"):
-            return "deps"
-        if "test" in normalized:
-            return "test"
-        if any(phase in normalized for phase in ("install", "verify", "package", "deploy")):
-            return "package"
-        return "compile"
-
     def execute(
         self,
         command: str,
@@ -156,10 +139,7 @@ class MavenTool(BaseTool):
                         Example: maven(command='test', fail_at_end=True)
 
             properties: Maven properties as comma-separated key=value pairs.
-                       Examples:
-                       - 'skipTests=true' - Skip test execution
-                       - 'maven.test.skip=true' - Skip test compilation and execution
-                       - 'maven.compiler.source=17,maven.compiler.target=17' - Set Java version
+                       Example: 'maven.compiler.source=17,maven.compiler.target=17'
 
             goals: Additional goals to append after the main command (rarely needed)
                   Example: goals='dependency:tree' to add dependency analysis
@@ -186,67 +166,24 @@ class MavenTool(BaseTool):
 
         self._pending_invocation_receipt = None
         self._pending_runner_choice = None
+        if current_contract() is None:
+            return ToolResult.completed_failure(
+                output="[contract] Maven was not dispatched: no facade-frozen contract is active.",
+                error="invocation contract authority missing",
+                error_code=CONTRACT_AUTHORITY_MISSING,
+                metadata={"runner_dispatched": False, "tool": "maven"},
+            )
 
         # Whether the agent explicitly scoped this invocation. The
         # orchestration layer (PR #12) owns working-directory injection, so
         # this never re-targets; explicitness only gates the [scope] warning.
         explicitly_scoped = working_directory not in (None, "/workspace")
 
-        # Deterministic working directory fallback (do not override user intent unless certain)
-        try:
-            if working_directory in (None, "/workspace") and self.orchestrator:
-                project_name = getattr(self.orchestrator, "project_name", None)
-                # 1) Prefer /workspace/<project_name> if it has pom.xml
-                if project_name:
-                    probe_dir = f"/workspace/{project_name}"
-                    probe_cmd = f"test -f {probe_dir}/pom.xml && echo EXISTS || echo MISSING"
-                    probe_res = self.orchestrator.execute_command(probe_cmd)
-                    if probe_res.get("exit_code") == 0 and "EXISTS" in (
-                        probe_res.get("output") or ""
-                    ):
-                        if working_directory != probe_dir:
-                            logger.info(
-                                f"🔧 Auto-selected project directory for Maven: {probe_dir}"
-                            )
-                            working_directory = probe_dir
-                # 2) If still /workspace, detect single candidate pom up to depth 2
-                if working_directory == "/workspace":
-                    find_cmd = (
-                        "find /workspace -maxdepth 2 -type f -name pom.xml 2>/dev/null | head -3"
-                    )
-                    find_res = self.orchestrator.execute_command(find_cmd)
-                    if find_res.get("exit_code") == 0:
-                        candidates = [
-                            p.strip()
-                            for p in (find_res.get("output") or "").split("\n")
-                            if p.strip()
-                        ]
-                        if len(candidates) == 1:
-                            import os
-
-                            cand_dir = os.path.dirname(candidates[0])
-                            logger.info(
-                                f"🔧 Auto-selected Maven directory by single pom.xml candidate: {cand_dir}"
-                            )
-                            working_directory = cand_dir
-                        elif len(candidates) > 1 and project_name:
-                            preferred = f"/workspace/{project_name}/pom.xml"
-                            if preferred in candidates:
-                                import os
-
-                                cand_dir = os.path.dirname(preferred)
-                                logger.info(
-                                    f"🔧 Auto-selected Maven directory by preferred project: {cand_dir}"
-                                )
-                                working_directory = cand_dir
-        except Exception as _e:
-            logger.debug(f"Working directory fallback skipped: {_e}")
-
         # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
         # Single-ownership rule: the consolidated build facade (BuildTool)
         # runs the pre-flight, the bounded retry and the [scope] narration on
-        # its path and passes _env_preflight=False; only direct callers (e.g.
-        # tool_recovery's delegate path) keep the guarantee here. Exactly one
+        # its path and passes _env_preflight=False; only callers that invoke the
+        # internal tool directly keep the guarantee here. Exactly one
         # layer probes the container — and reruns — per build.
         preamble_lines: List[str] = []
         outcome = None
@@ -256,7 +193,30 @@ class MavenTool(BaseTool):
         # pins it can see and omits the ones it cannot.
         requirements: Dict[str, Any] = {}
         if _env_preflight:
-            requirements = read_build_requirements(self.orchestrator)
+            manifest_read = read_live_build_requirements(self.orchestrator)
+            if (
+                not manifest_read.complete
+                or manifest_read.conflict is not None
+                or manifest_read.payload is None
+            ):
+                return ToolResult.completed_failure(
+                    output=(
+                        "[evidence] Maven was not dispatched: build requirements are "
+                        "not a complete current host-published revision."
+                    ),
+                    error="live build requirements unavailable",
+                    error_code="BUILD_REQUIREMENTS_UNAVAILABLE",
+                    facts={
+                        "working_directory": working_directory,
+                        "build_requirements_status": manifest_read.conflict or "absent",
+                    },
+                    metadata={
+                        "runner_dispatched": False,
+                        "tool": "maven",
+                        "blocker_owner": "harness",
+                    },
+                )
+            requirements = dict(manifest_read.payload)
             outcome = JdkPreflight(self.orchestrator).run(
                 requirements.get("java_version"),
                 source=requirements.get("java_version_source") or "unknown",
@@ -286,7 +246,12 @@ class MavenTool(BaseTool):
         # Which Maven runs: the project's own wrapper when the checkout ships a
         # usable one, the registered Maven otherwise — and the reason, on the
         # record either way (spec Plan 7 §A1).
-        prefer_wrapper, runner_choice, runner_narration = self._choose_maven_runner(
+        (
+            prefer_wrapper,
+            runner_choice,
+            runner_narration,
+            wrapper_prerequisite_failure,
+        ) = self._choose_maven_runner(
             working_directory,
             use_wrapper,
             requirements,
@@ -294,7 +259,6 @@ class MavenTool(BaseTool):
         self._pending_runner_choice = runner_choice
         if runner_narration:
             preamble_lines.append(runner_narration)
-        preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         requested_version = ToolVersionRequirement.from_raw(
             maven_version_requirement, source="tool_parameter"
@@ -322,10 +286,52 @@ class MavenTool(BaseTool):
             prefer_wrapper=prefer_wrapper,
         )
 
+        # A wrapper prerequisite failure is decided before any runner starts.
+        # Registered Maven is allowed only when the project itself proves that
+        # substitution mechanically compatible: an exact match with the
+        # wrapper pin, or an explicit POM-declared version range.  A generic
+        # "both are Maven 3" is not proof, and this path never provisions a
+        # different Maven behind the project's back.
+        if wrapper_prerequisite_failure:
+            compatible, fallback_reason = self._wrapper_fallback_proof(
+                resolved_maven,
+                runner_choice,
+                working_directory,
+            )
+            if not compatible:
+                runner_choice = {
+                    **runner_choice,
+                    "runner": "unavailable",
+                    "reason": "the wrapper prerequisite is unavailable",
+                    "fallback_reason": fallback_reason,
+                }
+                self._pending_runner_choice = runner_choice
+                preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
+                return self._finalize_main_result(
+                    self._maven_wrapper_prerequisite_failure_result(
+                        wrapper_prerequisite_failure,
+                        working_directory,
+                    ),
+                    preamble,
+                )
+            runner_choice = {
+                **runner_choice,
+                "runner": "registered",
+                "reason": fallback_reason,
+                "fallback_reason": fallback_reason,
+            }
+            self._pending_runner_choice = runner_choice
+            preamble_lines.append(f"[toolchain] {fallback_reason}; using registered Maven")
+
+        preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
+
         if contract_requirement and not resolved_maven:
-            return self._maven_version_not_resolved_result(
-                required_version=contract_requirement,
-                working_directory=working_directory,
+            return self._finalize_main_result(
+                self._maven_version_not_resolved_result(
+                    required_version=contract_requirement,
+                    working_directory=working_directory,
+                ),
+                preamble,
             )
 
         # Default Maven fallback installs once, then requires the manager to resolve a path.
@@ -333,18 +339,21 @@ class MavenTool(BaseTool):
             if self.toolchain_manager:
                 install_result = self._install_maven()
                 if not install_result.succeeded:
-                    return install_result
+                    return self._finalize_main_result(install_result, preamble)
                 resolved_maven = self._resolve_maven_executable(
                     working_directory=working_directory,
                     version_requirement=resolution_requirement,
                     prefer_wrapper=prefer_wrapper,
                 )
                 if not resolved_maven:
-                    return self._maven_executable_not_resolved_result(working_directory)
+                    return self._finalize_main_result(
+                        self._maven_executable_not_resolved_result(working_directory),
+                        preamble,
+                    )
             elif not self._is_maven_installed():
                 install_result = self._install_maven()
                 if not install_result.succeeded:
-                    return install_result
+                    return self._finalize_main_result(install_result, preamble)
 
         maven_executable = (
             resolved_maven.candidate.path
@@ -383,25 +392,28 @@ class MavenTool(BaseTool):
                 maven_executable=maven_executable,
             )
             result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
-            return ToolResult.completed(
-                operation_outcome=("success" if result.get("exit_code") == 0 else "failed"),
-                output=result.get("output", ""),
-                raw_output=result.get("output", ""),
-                error=None if result.get("exit_code") == 0 else result.get("output", ""),
-                error_code=None if result.get("exit_code") == 0 else "MAVEN_VERSION_FAILED",
-                metadata={
-                    "command": maven_cmd,
-                    "requested_command": command,
-                    "exit_code": result.get("exit_code"),
-                    "tool_type": "maven",
-                    "diagnostic": "version",
-                    "maven_runtime": maven_runtime,
-                    **(
-                        {"maven_version_requirement": requested_requirement_metadata}
-                        if requested_requirement_metadata
-                        else {}
-                    ),
-                },
+            return self._finalize_main_result(
+                ToolResult.completed(
+                    operation_outcome=("success" if result.get("exit_code") == 0 else "failed"),
+                    output=result.get("output", ""),
+                    raw_output=result.get("output", ""),
+                    error=(None if result.get("exit_code") == 0 else result.get("output", "")),
+                    error_code=(None if result.get("exit_code") == 0 else "MAVEN_VERSION_FAILED"),
+                    metadata={
+                        "command": maven_cmd,
+                        "requested_command": command,
+                        "exit_code": result.get("exit_code"),
+                        "tool_type": "maven",
+                        "diagnostic": "version",
+                        "maven_runtime": maven_runtime,
+                        **(
+                            {"maven_version_requirement": requested_requirement_metadata}
+                            if requested_requirement_metadata
+                            else {}
+                        ),
+                    },
+                ),
+                preamble,
             )
 
         # Handle ignore_test_failures by adding to properties
@@ -463,15 +475,12 @@ class MavenTool(BaseTool):
                 logger.warning(
                     f"📦 Found {modules_info.get('module_count', 'multiple')} modules: {', '.join(modules_info.get('modules', [])[:5])}"
                 )
-                logger.info(
-                    "💡 RECOMMENDED: maven(command='test', fail_at_end=True) to test ALL modules"
-                )
-                logger.info(f"💡 Current approach will only test modules until first failure!")
-                # Add a warning to the result that will be seen by the agent
+                logger.info("This invocation may stop test coverage at the first failed module")
+                # Add the physical coverage limitation to the returned evidence.
                 self._multi_module_warning = (
                     f"WARNING: Multi-module project with {modules_info.get('module_count', 'multiple')} modules. "
-                    f"Without fail-at-end, only partial modules will be tested. "
-                    f"Use build(action='test') to test all modules (fail-at-end is automatic)."
+                    "This invocation has no fail-at-end behavior, so test coverage may stop at "
+                    "the first failed module and must not be treated as full-reactor evidence."
                 )
 
         # Execute the command
@@ -529,20 +538,32 @@ class MavenTool(BaseTool):
                 # Use regular version for quick commands like help, version, etc.
                 return self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
 
+            # A live v2 contract is not a bearer token: it authorizes one exact
+            # executor/action/cwd/vector. Refuse a cross-ecosystem or drifted
+            # scope before report probes and, critically, before `_run_build`.
+            contract, _created = ensure_dispatch_contract(
+                self.orchestrator.execute_command,
+                tool="maven",
+                effective_action=str(effective_action or requested_action or "build"),
+                expected_cwd=working_directory,
+                expected_argv=maven_cmd,
+                requirements=requirements,
+            )
+            if contract is None:
+                return ToolResult.completed_failure(
+                    output=(
+                        "[contract] Maven was not dispatched: the active contract does "
+                        "not match this executor, action, cwd, and argv."
+                    ),
+                    error="invocation contract authority mismatch",
+                    error_code=CONTRACT_AUTHORITY_MISSING,
+                    metadata={"runner_dispatched": False, "tool": "maven"},
+                )
+
             def _run_build_with_receipt(attempt: int):
                 # P0-A: bracket the physical dispatch with report-XML content
                 # hashes so the reports THIS invocation wrote are attributable,
                 # instead of being inferred from a later global scan.
-                # §C3: a dispatch the facade never froze (tool-recovery's
-                # delegate path) freezes its OWN contract before running.
-                contract, _created = ensure_dispatch_contract(
-                    self.orchestrator.execute_command,
-                    tool="maven",
-                    effective_action=str(effective_action or requested_action or "build"),
-                    expected_cwd=working_directory,
-                    expected_argv=maven_cmd,
-                    requirements=requirements,
-                )
                 with dispatch_contract(contract):
                     before = snapshot_reports(
                         self.orchestrator.execute_command, [working_directory]
@@ -571,65 +592,6 @@ class MavenTool(BaseTool):
                 result,
                 duration=time.monotonic() - _build_t0,
             )
-
-            # A wrapper that never became a Maven process must not cost the
-            # build: re-resolve without it and rerun ONCE, with the reason on
-            # the record (spec Plan 7 §A1). A wrapper that ran and reported a
-            # build failure is Maven speaking and is left alone.
-            if (
-                wrapper_is_runner
-                and not result.get("dispatch_status")
-                and not result.get("termination_reason")
-            ):
-                start_failure = self._maven_wrapper_start_failure(result)
-                fallback = (
-                    self._resolve_maven_executable(
-                        working_directory=working_directory,
-                        version_requirement=resolution_requirement,
-                        prefer_wrapper=False,
-                    )
-                    if start_failure
-                    else None
-                )
-                if fallback and fallback.candidate.path != maven_executable:
-                    wrapper_path = runner_choice.get("wrapper_path") or maven_executable
-                    wrapper_is_runner = False
-                    runner_choice = {
-                        **runner_choice,
-                        "runner": "registered",
-                        "reason": f"{wrapper_path} failed to start ({start_failure})",
-                    }
-                    self._pending_runner_choice = runner_choice
-                    preamble += (
-                        f"[toolchain] ./mvnw failed to start ({start_failure}) — "
-                        f"falling back to {fallback.candidate.path}\n"
-                    )
-                    maven_executable = fallback.candidate.path
-                    maven_runtime = self._maven_runtime_metadata(fallback, maven_executable)
-                    maven_cmd = self._build_maven_command(
-                        command,
-                        goals,
-                        profiles,
-                        properties,
-                        pom_file,
-                        fail_at_end,
-                        use_wrapper=False,
-                        extra_args=extra_args,
-                        maven_executable=maven_executable,
-                    )
-                    attempt += 1
-                    fallback_t0 = time.monotonic()
-                    result = _run_build_with_receipt(attempt)
-                    self._record_execution_receipt(
-                        command,
-                        maven_cmd,
-                        working_directory,
-                        result,
-                        duration=time.monotonic() - fallback_t0,
-                    )
-                    runner_dispatched_any = (
-                        runner_dispatched_any or result.get("runner_dispatched") is True
-                    )
 
             # Bounded retry: a version-shaped failure means the requirement in
             # the error text is authoritative; re-provision from it and rerun
@@ -729,6 +691,7 @@ class MavenTool(BaseTool):
                     result.get("exit_code"),
                     str(result.get("output") or ""),
                     ref_id,
+                    runner="maven",
                     full_output=str(full_output),
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
@@ -779,9 +742,7 @@ class MavenTool(BaseTool):
                             detached_analysis,
                             maven_runtime,
                             runner_dispatched=result.get("runner_dispatched") is True,
-                            final_runner_dispatched=(
-                                result.get("final_runner_dispatched") is True
-                            ),
+                            final_runner_dispatched=(result.get("final_runner_dispatched") is True),
                             output_ref_id=ref_id,
                             working_directory=working_directory,
                             poll_ref=detached_result.poll_ref,
@@ -1075,7 +1036,7 @@ class MavenTool(BaseTool):
         """
         self._pending_invocation_receipt = None
         if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
-            record_dispatch_obligation(
+            obligation = record_dispatch_obligation_result(
                 self.orchestrator.execute_command,
                 result=result,
                 tool="maven",
@@ -1087,6 +1048,7 @@ class MavenTool(BaseTool):
                 before=before,
                 requirements=requirements,
             )
+            result.update(obligation.metadata())
             return
         after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
         self._pending_invocation_receipt = record_invocation(
@@ -1280,24 +1242,57 @@ class MavenTool(BaseTool):
     # ------------------------------------------------------------------
 
     WRAPPER_PROPERTIES = ".mvn/wrapper/maven-wrapper.properties"
+    WRAPPER_ARCHIVE_PREREQUISITES = {
+        "zip": {"executable": "unzip", "package": "unzip"},
+        "tar.gz": {"executable": "tar", "package": "tar"},
+    }
+    WRAPPER_PREREQUISITE_STATE = {
+        executable: f"/workspace/.setup_agent/maven_wrapper_prerequisites/{executable}.json"
+        for executable in ("unzip", "tar")
+    }
 
-    # A wrapper that never became a Maven process. Every marker below is the
-    # launcher failing, not Maven reporting a build result: a wrapper that
-    # downloads its distribution needs network, and losing the network must not
-    # lose the build. Maven's own failures ([ERROR] ... BUILD FAILURE) are
-    # deliberately absent — those are answers, not a missing runner.
-    WRAPPER_START_FAILURE_MARKERS = (
-        "could not find or load main class org.apache.maven.wrapper",
-        "error: could not find or load main class",
-        "cannot download",
-        "could not download",
-        "failed to download",
-        "error downloading",
-        "unable to download",
-        "no such file or directory",
-        "permission denied",
-    )
-    WRAPPER_START_FAILURE_EXIT_CODES = (126, 127)
+    @staticmethod
+    def _maven_wrapper_property(properties_text: str, wanted: str) -> Optional[str]:
+        """Return one active Java-properties value without interpreting it.
+
+        Maven Wrapper commonly escapes the URL's colon as ``\\:``.  Unescaping
+        that spelling is normalization, not a URL rewrite; the checkout file
+        is never modified.
+        """
+        for line in (properties_text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", "!")):
+                continue
+            key, separator, value = stripped.partition("=")
+            if separator and key.strip() == wanted:
+                return value.strip().replace("\\:", ":")
+        return None
+
+    @classmethod
+    def _maven_wrapper_distribution_facts(cls, properties_text: str) -> Dict[str, str]:
+        """Describe the exact distribution/checksum domain named by the repo."""
+        url = cls._maven_wrapper_property(properties_text, "distributionUrl")
+        if not url:
+            return {}
+        archive_path = url.lower().split("?", 1)[0].split("#", 1)[0]
+        if archive_path.endswith(".tar.gz") or archive_path.endswith(".tgz"):
+            archive_type = "tar.gz"
+        elif archive_path.endswith(".zip"):
+            archive_type = "zip"
+        else:
+            archive_type = "unknown"
+        facts = {
+            "archive_type": archive_type,
+            "checksum_domain": f"distribution_url:{archive_type}",
+            "distribution_url": url,
+        }
+        checksum = cls._maven_wrapper_property(
+            properties_text,
+            "distributionSha256Sum",
+        )
+        if checksum:
+            facts["distribution_sha256"] = checksum
+        return facts
 
     @staticmethod
     def _maven_wrapper_pinned_version(properties_text: str) -> Optional[str]:
@@ -1308,15 +1303,8 @@ class MavenTool(BaseTool):
         (a `latest` alias, a private mirror) pins nothing, and an absent fact
         stays an absent key.
         """
-        for line in (properties_text or "").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#") or stripped.startswith("!"):
-                continue
-            key, separator, value = stripped.partition("=")
-            if not separator or key.strip() != "distributionUrl":
-                continue
-            # .properties escapes `:` as `\:`; the URL is the same URL.
-            url = value.strip().replace("\\", "")
+        url = MavenTool._maven_wrapper_property(properties_text, "distributionUrl")
+        if url:
             match = re.search(r"apache-maven-(\d[\w.\-]*?)-(?:bin|src)\.", url)
             if match:
                 return match.group(1)
@@ -1347,21 +1335,143 @@ class MavenTool(BaseTool):
         facts: Dict[str, Any] = {
             "wrapper_path": wrapper,
             "executable": "EXECUTABLE" in marker,
+            "root": root,
         }
         properties = self.orchestrator.execute_command(
             f"cat {shlex.quote(f'{root}/{self.WRAPPER_PROPERTIES}')} 2>/dev/null"
         )
-        pinned = self._maven_wrapper_pinned_version(properties.get("output") or "")
+        if properties.get("exit_code") != 0 or properties.get("success") is False:
+            facts["properties_status"] = "unreadable"
+            return facts
+        facts["properties_status"] = "available"
+        properties_text = properties.get("output") or ""
+        pinned = self._maven_wrapper_pinned_version(properties_text)
         if pinned:
             facts["pinned_version"] = pinned
+        facts.update(self._maven_wrapper_distribution_facts(properties_text))
         return facts
+
+    def _probe_wrapper_prerequisite(self, executable: str) -> bool:
+        result = self.orchestrator.execute_command(f"command -v {shlex.quote(executable)}")
+        return bool(result.get("exit_code") == 0 and (result.get("output") or "").strip())
+
+    def _read_wrapper_prerequisite_state(
+        self,
+        executable: str,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        path = self.WRAPPER_PREREQUISITE_STATE[executable]
+        try:
+            content = read_container_text(
+                self.orchestrator,
+                path,
+                exact_bytes=True,
+            )
+        except ContainerFileReadError:
+            return "unreadable", None
+        if content is None:
+            return "absent", None
+        try:
+            state = json.loads(content)
+        except (TypeError, ValueError):
+            return "corrupt", None
+        if not isinstance(state, dict) or state.get("executable") != executable:
+            return "corrupt", None
+        return "present", state
+
+    def _write_wrapper_prerequisite_state(
+        self,
+        executable: str,
+        package: str,
+        status: str,
+    ) -> bool:
+        state = {
+            "executable": executable,
+            "install_attempted": True,
+            "package": package,
+            "schema_version": 1,
+            "status": status,
+        }
+        result = write_container_text_atomic(
+            self.orchestrator,
+            self.WRAPPER_PREREQUISITE_STATE[executable],
+            json.dumps(state, sort_keys=True, separators=(",", ":")),
+            validate_json=True,
+        )
+        return result.persisted
+
+    def _ensure_wrapper_prerequisite(self, archive_type: str) -> Dict[str, Any]:
+        """Mechanically close one allowlisted extractor before dispatch.
+
+        The idempotence file is a provisioning fact only.  It is deliberately
+        not loop/progress authority.  We persist ``attempting`` before apt so a
+        crash cannot turn one approved mechanical attempt into an unbounded
+        retry series.
+        """
+        prerequisite = self.WRAPPER_ARCHIVE_PREREQUISITES[archive_type]
+        executable = prerequisite["executable"]
+        package = prerequisite["package"]
+        base = {
+            "executable": executable,
+            "package": package,
+        }
+        if self._probe_wrapper_prerequisite(executable):
+            return {
+                **base,
+                "provision_attempted": False,
+                "status": "available",
+            }
+
+        state_status, state = self._read_wrapper_prerequisite_state(executable)
+        if state_status in {"unreadable", "corrupt"}:
+            return {
+                **base,
+                "provision_attempted": False,
+                "status": f"state_{state_status}",
+            }
+        if state and state.get("install_attempted") is True:
+            return {
+                **base,
+                "provision_attempted": True,
+                "status": "install_failed",
+            }
+
+        if not self._write_wrapper_prerequisite_state(
+            executable,
+            package,
+            "attempting",
+        ):
+            return {
+                **base,
+                "provision_attempted": False,
+                "status": "state_unpersisted",
+            }
+
+        # This is harness-owned run-start policy.  Package and executable come
+        # only from WRAPPER_ARCHIVE_PREREQUISITES; no model text enters either
+        # command and no human approval is requested mid-run.
+        self.orchestrator.execute_command("DEBIAN_FRONTEND=noninteractive apt-get update -qq")
+        self.orchestrator.execute_command(
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y {package}"
+        )
+        available = self._probe_wrapper_prerequisite(executable)
+        final_status = "provisioned" if available else "failed"
+        self._write_wrapper_prerequisite_state(
+            executable,
+            package,
+            final_status,
+        )
+        return {
+            **base,
+            "provision_attempted": True,
+            "status": "provisioned" if available else "install_failed",
+        }
 
     def _choose_maven_runner(
         self,
         working_directory: str,
         use_wrapper: Optional[bool],
         requirements: Optional[Dict[str, Any]] = None,
-    ) -> tuple[bool, Dict[str, Any], Optional[str]]:
+    ) -> tuple[bool, Dict[str, Any], Optional[str], Optional[Dict[str, str]]]:
         """Whether to prefer the wrapper, which Maven that makes the runner, why.
 
         The project's own wrapper wins when the checkout ships an executable
@@ -1378,7 +1488,17 @@ class MavenTool(BaseTool):
         if use_wrapper is False:
             return (
                 False,
-                {"runner": "registered", "reason": "the caller passed use_wrapper=False"},
+                {
+                    "archive_type": None,
+                    "fallback_reason": None,
+                    "prerequisite": {
+                        "provision_attempted": False,
+                        "status": "not_applicable",
+                    },
+                    "runner": "registered",
+                    "reason": "the caller passed use_wrapper=False",
+                },
+                None,
                 None,
             )
         forced = use_wrapper is True
@@ -1402,65 +1522,254 @@ class MavenTool(BaseTool):
             return (
                 forced,
                 {
+                    "archive_type": None,
+                    "fallback_reason": None,
+                    "prerequisite": {
+                        "provision_attempted": False,
+                        "status": "not_applicable",
+                    },
                     "runner": "registered",
                     "reason": f"no ./mvnw in {' or '.join(searched)}",
                 },
+                None,
                 None,
             )
 
         wrapper_path = facts["wrapper_path"]
         pinned = facts.get("pinned_version")
-        pin_fact = {"pinned_version": pinned} if pinned else {}
+        pin_fact: Dict[str, Any] = {"pinned_version": pinned} if pinned else {}
+        distribution_facts: Dict[str, Any] = {
+            key: facts[key]
+            for key in (
+                "archive_type",
+                "checksum_domain",
+                "distribution_sha256",
+                "distribution_url",
+                "properties_status",
+            )
+            if key in facts
+        }
         if not facts["executable"]:
             return (
                 forced,
                 {
+                    **distribution_facts,
+                    "archive_type": facts.get("archive_type"),
+                    "fallback_reason": f"{wrapper_path} is not executable",
+                    "prerequisite": {
+                        "provision_attempted": False,
+                        "status": "not_checked",
+                    },
                     "runner": "registered",
                     "reason": f"{wrapper_path} is not executable",
                     "wrapper_path": wrapper_path,
+                    "wrapper_root": facts["root"],
                     **pin_fact,
                 },
                 "[toolchain] ./mvnw is present but not executable — using the registered Maven",
+                None,
+            )
+
+        archive_type = facts.get("archive_type")
+        prerequisite_result: Dict[str, Any]
+        failure: Optional[Dict[str, str]]
+        if facts.get("properties_status") == "unreadable":
+            prerequisite_result = {
+                "provision_attempted": False,
+                "status": "properties_unreadable",
+            }
+            failure = {
+                "code": "wrapper_properties_unreadable",
+                "executable": "archive_extractor",
+            }
+        elif archive_type == "unknown":
+            prerequisite_result = {
+                "provision_attempted": False,
+                "status": "unsupported_archive",
+            }
+            failure = {
+                "code": "wrapper_archive_type_unsupported",
+                "executable": "archive_extractor",
+            }
+        elif archive_type in self.WRAPPER_ARCHIVE_PREREQUISITES:
+            prerequisite_result = self._ensure_wrapper_prerequisite(archive_type)
+            failure = (
+                None
+                if prerequisite_result["status"] in {"available", "provisioned"}
+                else {
+                    "code": (
+                        f"prerequisite_executable_missing:{prerequisite_result['executable']}"
+                    ),
+                    "executable": prerequisite_result["executable"],
+                }
+            )
+        else:
+            # Legacy/script-only test wrappers may omit distributionUrl.  There
+            # is then no stated archive whose extractor the harness can check.
+            prerequisite_result = {
+                "provision_attempted": False,
+                "status": "not_declared",
+            }
+            failure = None
+
+        choice = {
+            **distribution_facts,
+            "archive_type": archive_type,
+            "fallback_reason": None,
+            "prerequisite": prerequisite_result,
+            "runner": "wrapper" if failure is None else "unavailable",
+            "reason": (
+                f"the checkout ships an executable {wrapper_path}"
+                if failure is None
+                else f"{wrapper_path} prerequisite is unavailable"
+            ),
+            "wrapper_path": wrapper_path,
+            "wrapper_root": facts["root"],
+            **pin_fact,
+        }
+        if failure is not None:
+            return (
+                False,
+                choice,
+                (f"[toolchain] {wrapper_path} was not dispatched: " f"{failure['code']}"),
+                failure,
             )
 
         return (
             True,
-            {
-                "runner": "wrapper",
-                "reason": f"the checkout ships an executable {wrapper_path}",
-                "wrapper_path": wrapper_path,
-                **pin_fact,
-            },
+            choice,
             "[toolchain] using the project's own ./mvnw"
             + (f" (pins Maven {pinned})" if pinned else ""),
+            None,
         )
 
-    def _maven_wrapper_start_failure(self, result: Dict[str, Any]) -> Optional[str]:
-        """Why ./mvnw never became a Maven process, when it never did.
-
-        A Maven that ran at all announces itself — `[INFO]` lines, the
-        `Apache Maven <version>` banner. Output carrying either is Maven
-        reporting a build result, however it failed, and is never second-guessed:
-        the launcher markers below would otherwise fire on a genuine build error
-        whose text happens to mention a missing file.
-        """
-        exit_code = result.get("exit_code")
-        if exit_code in (0, None):
+    def _project_maven_version_range(
+        self,
+        working_directory: str,
+    ) -> Optional[ToolVersionRequirement]:
+        """Return an explicit POM requireMavenVersion range, and only a range."""
+        root = (working_directory or "/workspace").rstrip("/") or "/"
+        result = self.orchestrator.execute_command(f"cat {shlex.quote(f'{root}/pom.xml')}")
+        if result.get("exit_code") != 0:
             return None
-        text = str(result.get("full_output") or result.get("output") or "").lower()
-        if "[info]" in text or "apache maven" in text:
+        active_pom = re.sub(
+            r"<!--.*?-->",
+            "",
+            result.get("output") or "",
+            flags=re.DOTALL,
+        )
+        match = re.search(
+            r"<requireMavenVersion\b[^>]*>.*?<version\b[^>]*>\s*([^<]+?)\s*"
+            r"</version>.*?</requireMavenVersion>",
+            active_pom,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not match:
             return None
-        if exit_code in self.WRAPPER_START_FAILURE_EXIT_CODES:
-            return f"exit code {exit_code}"
-        for marker in self.WRAPPER_START_FAILURE_MARKERS:
-            if marker in text:
-                return marker
+        requirement = ToolVersionRequirement.from_raw(
+            match.group(1),
+            source="project_metadata",
+        )
+        if requirement and requirement.kind in {"range", "minimum", "maximum"}:
+            return requirement
         return None
+
+    def _candidate_matches_requirement(
+        self,
+        version: Optional[str],
+        requirement: ToolVersionRequirement,
+    ) -> bool:
+        comparator = getattr(self.toolchain_manager, "matches_requirement", None)
+        if callable(comparator):
+            try:
+                return bool(comparator(version, requirement))
+            except Exception:
+                return False
+        # Without the resolver's comparator, only byte-identical exact versions
+        # are proof.  Reimplementing Maven range semantics here would let the
+        # selection and fallback policies disagree.
+        return bool(
+            version
+            and requirement.kind == "exact"
+            and str(version).strip() == requirement.raw.strip()
+        )
+
+    def _wrapper_fallback_proof(
+        self,
+        resolved_maven,
+        runner_choice: Dict[str, Any],
+        working_directory: str,
+    ) -> tuple[bool, str]:
+        if (
+            not resolved_maven
+            or resolved_maven.candidate.source == "wrapper"
+            or resolved_maven.candidate.path == runner_choice.get("wrapper_path")
+        ):
+            return False, "no registered Maven candidate is available"
+        candidate = resolved_maven.candidate
+        version = candidate.version
+        if not version:
+            return False, "the registered Maven version is unknown"
+
+        pinned = runner_choice.get("pinned_version")
+        if pinned:
+            exact = ToolVersionRequirement.from_raw(
+                str(pinned),
+                source="project_metadata",
+            )
+            if exact and self._candidate_matches_requirement(version, exact):
+                return (
+                    True,
+                    (
+                        f"{runner_choice['prerequisite']['executable']} provisioning failed; "
+                        f"registered Maven {version} exactly matches wrapper Maven {pinned}"
+                    ),
+                )
+
+        project_range = self._project_maven_version_range(
+            str(runner_choice.get("wrapper_root") or working_directory)
+        )
+        if project_range and self._candidate_matches_requirement(version, project_range):
+            return (
+                True,
+                (
+                    f"{runner_choice['prerequisite']['executable']} provisioning failed; "
+                    f"registered Maven {version} satisfies project-declared range "
+                    f"{project_range.raw}"
+                ),
+            )
+        return (
+            False,
+            (
+                f"registered Maven {version} neither exactly matches wrapper Maven "
+                f"{pinned or 'unknown'} nor satisfies an explicit project Maven range"
+            ),
+        )
+
+    def _maven_wrapper_prerequisite_failure_result(
+        self,
+        failure: Dict[str, str],
+        working_directory: str,
+    ) -> ToolResult:
+        executable = failure["executable"]
+        return ToolResult.completed_failure(
+            output=(
+                f"Harness runner prerequisite {executable!r} is unavailable; "
+                "the Maven wrapper was not dispatched."
+            ),
+            error=failure["code"],
+            error_code=failure["code"],
+            suggestions=[],
+            metadata={
+                "runner_dispatched": False,
+                "working_directory": working_directory,
+            },
+        )
 
     def _resolve_maven_executable(
         self,
         working_directory: str,
-        version_requirement: ToolVersionRequirement = None,
+        version_requirement: Optional[ToolVersionRequirement] = None,
         prefer_wrapper: bool = False,
     ):
         if not self.toolchain_manager:
@@ -1526,18 +1835,9 @@ class MavenTool(BaseTool):
             error=f"No Maven executable satisfies requested version {required_version.raw}",
             error_code="MAVEN_VERSION_NOT_RESOLVED",
             suggestions=[
-                (
-                    "Install or register a Maven executable that satisfies "
-                    f"{required_version.raw}, then retry with the same maven_version_requirement."
-                ),
-                (
-                    "Use bash to inspect candidates: "
-                    "find /workspace /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
-                ),
-                (
-                    "Keep the same maven_version_requirement on every retry; do not fall back "
-                    "to an unverified system Maven."
-                ),
+                f"No observed executable/version pair satisfies {required_version.raw}",
+                "A subsequent model-owned action must establish a matching executable and version fact",
+                "The same Maven requirement remains binding on any retry",
             ],
             metadata={
                 "working_directory": working_directory,
@@ -1555,9 +1855,9 @@ class MavenTool(BaseTool):
             error="No Maven executable could be resolved by the toolchain manager",
             error_code="MAVEN_EXECUTABLE_NOT_RESOLVED",
             suggestions=[
-                "Register a Maven executable with the toolchain manager",
-                "Commit and use the project Maven wrapper",
-                "Check whether the active environment overlay blocks the available Maven executable",
+                "No project wrapper or registered Maven executable was resolved",
+                "The active environment overlay and project wrapper evidence constrain runtime selection",
+                "A Maven retry requires a model-owned action that first establishes an executable/version fact",
             ],
             metadata={"working_directory": working_directory},
         )
@@ -1812,41 +2112,30 @@ class MavenTool(BaseTool):
             return {"exists": False, "error": str(e)}
 
     def _handle_missing_pom(self, validation_result: dict, working_directory: str) -> ToolResult:
-        """Handle the case when pom.xml is not found."""
+        """Return observed repository-layout facts when the selected POM is absent."""
         suggestions = [
-            f"📍 Current directory: {working_directory}",
-            "⚠️ This directory doesn't contain a pom.xml file",
+            f"Selected working directory: {working_directory}",
+            "No pom.xml was observed in that directory",
         ]
 
-        # If we found alternative pom.xml files, suggest them
+        # Report candidates found by the bounded probe without choosing the
+        # model's next working directory or authoring its next tool call.
         if validation_result.get("found_alternatives"):
-            suggestions.append("\n🔍 Found pom.xml in these locations:")
+            suggestions.append("POM files observed by the repository-layout probe:")
 
-            # Highlight root pom.xml if found
             suggested_root = validation_result.get("suggested_root")
             if suggested_root:
-                root_dir = suggested_root.replace("/pom.xml", "")
-                suggestions.append(
-                    f"\n🎯 RECOMMENDED: build(action='...', working_directory='{root_dir}')"
-                )
-                if "<modules>" in suggested_root:
-                    suggestions.append("   ^ This is the root of a multi-module project")
+                suggestions.append(f"POM with a <modules> declaration: {suggested_root}")
 
-            # Show other alternatives
             for pom_path in validation_result["found_alternatives"][:3]:
-                if pom_path != suggested_root:  # Don't duplicate the root pom
-                    pom_dir = pom_path.replace("/pom.xml", "")
-                    suggestions.append(
-                        f"\n• Alternative: build(action='...', working_directory='{pom_dir}')"
-                    )
+                if pom_path != suggested_root:
+                    suggestions.append(f"Other observed POM: {pom_path}")
+            suggestions.append(
+                "The model must choose the intended reactor from project/document evidence before retrying"
+            )
         else:
-            suggestions.extend(
-                [
-                    "\n🔍 To find pom.xml files:",
-                    "bash(command='find /workspace -name pom.xml')",
-                    "\n📂 To list current directory:",
-                    "bash(command='ls -la', working_directory='/workspace')",
-                ]
+            suggestions.append(
+                "The bounded repository-layout probe observed no alternative pom.xml"
             )
 
         return ToolResult.completed_failure(
@@ -1895,9 +2184,9 @@ class MavenTool(BaseTool):
                     error="Failed to install Maven automatically",
                     error_code="MAVEN_INSTALL_FAILED",
                     suggestions=[
-                        "Check network connectivity",
-                        "Try running: apt-get update && apt-get install -y maven",
-                        "Verify package repositories are accessible",
+                        "The harness package-manager attempt failed; its output is preserved above",
+                        "Repository connectivity and container package authority constrain any next action",
+                        "No Maven executable/version fact was established",
                     ],
                     documentation_links=["https://maven.apache.org/install.html"],
                 )
@@ -1907,9 +2196,9 @@ class MavenTool(BaseTool):
                 error=f"Failed to install Maven: {str(e)}",
                 error_code="MAVEN_INSTALL_ERROR",
                 suggestions=[
-                    "Check Docker container permissions",
-                    "Verify apt-get is available",
-                    "Try manual installation",
+                    "The harness package-manager attempt raised the recorded exception",
+                    "Container permissions and package-manager availability constrain any next action",
+                    "No Maven executable/version fact was established",
                 ],
             )
 
@@ -2373,32 +2662,41 @@ class MavenTool(BaseTool):
         working_directory: Optional[str] = None,
         poll_ref: Optional[str] = None,
     ) -> ToolResult:
-        """Enhanced error handling with specific suggestions based on error type."""
-        """Handle Maven build errors with detailed analysis."""
+        """Return observed Maven failure facts and retry admissibility constraints.
+
+        The harness does not author the next tool call.  A later model turn owns
+        the ordinary ``ActionIntent`` after inspecting these facts, the stored
+        output, and applicable project documentation.
+        """
 
         error_suggestions = []
         documentation_links = []
         error_code = "MAVEN_BUILD_ERROR"
 
-        # Analyze specific error types
+        # Summarize observed error types.  These strings deliberately avoid
+        # executable call syntax: they are evidence for the next model turn,
+        # not a harness-authored repair proposal.
         if analysis.get("java_version_error"):
-            # Java version mismatch detected
             java_error = analysis["java_version_error"]
             error_code = "JAVA_VERSION_MISMATCH"
-            current = java_error.get("current", "unknown")
-            required = java_error.get("required", "unknown")
-
-            error_suggestions.extend(
-                [
-                    f"Java version mismatch: Current version is {current}, but {required} is required",
-                    f"Install Java {required} using: project(action='provision', java_version='{required}')",
-                    f"Or manually: bash(command='apt-get update && apt-get install -y openjdk-{required}-jdk')",
-                    f"After installation, retry the Maven command",
-                ]
-            )
+            current = java_error.get("current")
+            required = java_error.get("required")
+            if current:
+                error_suggestions.append(f"Observed active Java version: {current}")
+            if required:
+                error_suggestions.extend(
+                    [
+                        f"Project-declared Java requirement: {required}",
+                        f"Retry constraint: active Java must satisfy major {required} before Maven runs again",
+                    ]
+                )
+            else:
+                error_suggestions.append(
+                    "The required Java major is not proven by this output; do not guess one"
+                )
 
             if java_error.get("error_type") == "maven_enforcer":
-                error_suggestions.insert(1, "This requirement is enforced by Maven Enforcer plugin")
+                error_suggestions.append("The Maven Enforcer plugin reported this constraint")
                 documentation_links.append(
                     "https://maven.apache.org/enforcer/maven-enforcer-plugin/"
                 )
@@ -2407,39 +2705,36 @@ class MavenTool(BaseTool):
             error_code = "BUILD_VALIDATION_ERROR"
             error_suggestions.extend(
                 [
-                    "Build claims success but artifacts are missing",
-                    "Check if the build actually completed",
-                    "Look for hidden errors in build output with raw_output=true",
-                    "Try running 'maven clean compile' to force a full rebuild",
+                    "Maven output claimed success, but the expected artifacts are absent",
+                    "The stored full output is the evidence source for any hidden failure",
                     f"Expected artifacts: {', '.join(analysis.get('missing_artifacts', []))}",
+                    "A retry is admissible only after the model identifies a materially different action or runtime condition",
                 ]
             )
             documentation_links.append(
                 "https://maven.apache.org/guides/getting-started/compile.html"
             )
 
-        if analysis["compilation_errors"]:
+        if analysis.get("compilation_errors"):
             error_code = "COMPILATION_ERROR"
             error_suggestions.extend(
                 [
-                    "Fix compilation errors in your Java source files",
-                    "Check for missing imports and typos",
-                    "Ensure all dependencies are available",
-                    "Use 'maven compile' with raw_output=true to see detailed compilation errors",
+                    f"Maven reported {len(analysis['compilation_errors'])} compilation error line(s)",
+                    "The compilation diagnostics in the stored full output are the source of truth",
+                    "Any next action must address the reported source, dependency, or runtime cause before retrying Maven",
                 ]
             )
             documentation_links.append(
                 "https://maven.apache.org/guides/getting-started/compile.html"
             )
 
-        if analysis["dependency_issues"]:
+        if analysis.get("dependency_issues"):
             error_code = "DEPENDENCY_ERROR"
             error_suggestions.extend(
                 [
-                    "Check your pom.xml dependencies for correctness",
-                    "Verify dependency versions are compatible",
-                    "Try running 'maven dependency:resolve' to debug dependency issues",
-                    "Check if Maven repositories are accessible",
+                    f"Maven reported {len(analysis['dependency_issues'])} dependency-resolution issue(s)",
+                    "The POM declarations, repository configuration, and stored transfer errors constrain the next action",
+                    "A retry without changed dependency or repository evidence is not materially different",
                 ]
             )
             documentation_links.append(
@@ -2468,9 +2763,12 @@ class MavenTool(BaseTool):
             error_code = "TEST_FAILURE"
             error_suggestions.extend(
                 [
-                    "Fix the failing tests; the Surefire reports above carry the full failure context",
-                    "Run 'maven test' with raw_output=true to see detailed test failure information",
-                    "Check test logs for specific failure reasons",
+                    (
+                        f"Maven reported {analysis.get('test_failure_count', 0)} test failure(s) "
+                        f"and {analysis.get('test_error_count', 0)} test error(s)"
+                    ),
+                    "The Surefire/Failsafe reports and stored full output carry the failure evidence",
+                    "Skipping or excluding the failing tests would not satisfy the test obligation",
                 ]
             )
             documentation_links.append("https://maven.apache.org/guides/getting-started/test.html")
@@ -2479,9 +2777,9 @@ class MavenTool(BaseTool):
             error_code = "MAVEN_NOT_FOUND"
             error_suggestions.extend(
                 [
-                    "Install Maven in the container",
-                    "Use bash tool to run: 'apt update && apt install -y maven'",
-                    "Verify Maven installation with 'mvn --version'",
+                    "No Maven executable was available to this invocation",
+                    "A later Maven action requires a runtime selection that proves an executable and version",
+                    "The model owns the ordinary action used to establish that runtime fact",
                 ]
             )
             documentation_links.append("https://maven.apache.org/install.html")
@@ -2493,10 +2791,9 @@ class MavenTool(BaseTool):
             error_code = "NO_POM_XML"
             error_suggestions.extend(
                 [
-                    "Ensure you're in a directory containing a pom.xml file",
-                    "Change to the correct project directory",
-                    "Use bash to find pom.xml: bash(command='find /workspace -name pom.xml')",
-                    "List current directory: bash(command='ls -la', working_directory='/workspace')",
+                    f"No pom.xml was observed at the selected working directory: {working_directory or 'unknown'}",
+                    "The next Maven action must target the intended reactor directory containing its pom.xml",
+                    "Repository layout evidence, not a harness-selected path, determines that directory",
                 ]
             )
             documentation_links.append(
@@ -2506,13 +2803,15 @@ class MavenTool(BaseTool):
         # Check for POM parsing errors
         if "Non-parseable POM" in output:
             error_code = "POM_PARSE_ERROR"
+            pom_error = analysis.get("pom_parse_error") or {}
+            pom_location = pom_error.get("file") or "the reported POM"
+            if pom_error.get("line"):
+                pom_location = f"{pom_location}:{pom_error['line']}"
             error_suggestions.extend(
                 [
-                    "POM file has XML syntax errors - check the error message for the specific line and tag",
-                    "Use bash to examine the problematic line in the POM file",
-                    "Common issues: orphaned tags, missing closing tags, tags outside proper parent elements",
-                    "Try: bash(command='xmllint --noout /path/to/pom.xml') to validate XML structure",
-                    "Repair the POM syntax at the reported line, then rerun the same build action",
+                    f"Maven reported malformed XML at {pom_location}",
+                    "The stored parser diagnostic supplies the offending tag, line, and column when available",
+                    "Any model-owned edit must preserve the intended project POM and be validated before Maven retries",
                 ]
             )
             documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
@@ -2534,25 +2833,15 @@ class MavenTool(BaseTool):
             error_suggestions.extend(
                 [
                     (
-                        f"Maven version requirement detected: {raw_requirement}; "
-                        f"current {runtime_executable} reports {runtime_version}"
+                        f"Project-declared Maven requirement: {raw_requirement}; "
+                        f"observed executable {runtime_executable} reports {runtime_version}"
                     ),
                     (
-                        "Use bash to download or unpack a Maven distribution that satisfies "
-                        f"{raw_requirement}; apt may only provide an older distro package"
+                        f"Retry constraint: the selected Maven executable must satisfy {raw_requirement}"
                     ),
                     (
-                        "Register the new executable on the runtime overlay, e.g. "
-                        "project(action='env', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
-                        f"requirement='{raw_requirement}')"
-                    ),
-                    (
-                        f"Retry with build(action='{command}', "
-                        f"maven_version_requirement='{raw_requirement}')"
-                    ),
-                    (
-                        "If an exact Maven executable is proven incompatible, note that "
-                        "executable/version finding and register a compatible one instead"
+                        "A subsequent model-owned action must establish the executable/version fact; "
+                        "Maven may retry only after that runtime selection changes"
                     ),
                 ]
             )
@@ -2567,19 +2856,18 @@ class MavenTool(BaseTool):
         ):
             error_code = "JAVA_VERSION_ERROR"
 
-            # Try to extract required Java version from different error patterns
+            # Only report a version the project/runtime output actually proves.
+            # The previous fallback guessed Java 17/21 from the current runtime,
+            # which turned a failed observation into a harness-authored policy.
             java_version = None
 
-            # Pattern 1: Maven Enforcer plugin - "not in the allowed range [17,)"
             enforcer_match = re.search(r"allowed range \[(\d+),", output)
             if enforcer_match:
                 java_version = enforcer_match.group(1)
 
-            # Pattern 2: Traditional version error - "version 55.0" maps to Java versions
             version_match = re.search(r"version (\d+\.\d+)", output)
             if not java_version and version_match:
                 class_version = float(version_match.group(1))
-                # Map class file version to Java version
                 version_map = {
                     52.0: "8",
                     53.0: "9",
@@ -2598,38 +2886,29 @@ class MavenTool(BaseTool):
                 }
                 java_version = version_map.get(class_version, str(int(class_version - 44)))
 
-            # Pattern 3: Extract current vs required from enforcer message
-            current_match = re.search(r"version (\d+(?:\.\d+)*) which is not", output)
-            if current_match and not java_version:
-                # If we see current version is too low, suggest next LTS
-                current = int(current_match.group(1).split(".")[0])
-                if current < 17:
-                    java_version = "17"  # Suggest Java 17 LTS
-                elif current < 21:
-                    java_version = "21"  # Suggest Java 21 LTS
-
-            if not java_version:
-                java_version = "17"  # Default to Java 17 LTS if can't determine
-
-            error_suggestions.extend(
-                [
-                    f"Java version mismatch detected - Java {java_version} or higher is required",
-                    f"Install Java {java_version}: bash(command='apt-get update && apt-get install -y openjdk-{java_version}-jdk')",
-                    f"Set JAVA_HOME: bash(command='export JAVA_HOME=/usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)')",
-                    f"Update alternatives: bash(command='update-alternatives --set java /usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
-                    "Verify installation: bash(command='java -version && javac -version')",
-                ]
-            )
+            if java_version:
+                error_suggestions.append(
+                    f"The Maven/class-file diagnostic proves a Java {java_version}+ runtime constraint"
+                )
+                error_suggestions.append(
+                    f"Retry constraint: active Java and javac must report a runtime satisfying major {java_version}"
+                )
+            else:
+                error_suggestions.append(
+                    "The output proves a Java mismatch but does not prove the required major; do not guess one"
+                )
+                error_suggestions.append(
+                    "A subsequent model-owned action must establish the required and active Java runtime facts before Maven retries"
+                )
 
         # Check for missing compiler
         if "No compiler is provided" in output or "Unable to locate the Javac Compiler" in output:
             error_code = "NO_JAVA_COMPILER"
             error_suggestions.extend(
                 [
-                    "Java Development Kit (JDK) not found, only JRE is installed",
-                    "Install JDK: bash(command='apt-get update && apt-get install -y default-jdk')",
-                    "Or install specific version: bash(command='apt-get install -y openjdk-11-jdk')",
-                    "Verify javac installation: bash(command='javac -version')",
+                    "Maven reported that no Java compiler is available to the active runtime",
+                    "A later compile action requires a JDK whose javac executable is proven active",
+                    "The model owns the ordinary runtime action; Maven may retry only after the compiler fact changes",
                 ]
             )
 
@@ -2638,10 +2917,9 @@ class MavenTool(BaseTool):
             error_code = "OUT_OF_MEMORY"
             error_suggestions.extend(
                 [
-                    "Increase JVM memory allocation",
-                    "Try: build(action='compile', args='-Dmaven.compiler.fork=true -Dmaven.compiler.meminitial=256m -Dmaven.compiler.maxmem=1024m')",
-                    "Or set MAVEN_OPTS: bash(command='export MAVEN_OPTS=\"-Xmx2048m -XX:MaxPermSize=512m\"')",
-                    "Consider building modules separately if project is large",
+                    "The Maven JVM exhausted its memory envelope",
+                    "A retry is materially different only if the model changes the runtime memory envelope or justified build scope",
+                    "The next result must still account for every required module and test obligation",
                 ]
             )
 
@@ -2654,25 +2932,23 @@ class MavenTool(BaseTool):
             error_code = "NETWORK_ERROR"
             error_suggestions.extend(
                 [
-                    "Network connectivity issue detected",
-                    "Check Maven repository accessibility: bash(command='curl -I https://repo.maven.apache.org/maven2/')",
-                    "Try with offline mode if dependencies are cached: build(action='compile', args='--offline')",
-                    "Configure proxy if behind firewall (update ~/.m2/settings.xml)",
+                    "Maven reported repository transport failure",
+                    "Connectivity, proxy configuration, or a proven local cache must change before the same resolution attempt is admissible",
+                    "The stored transfer error identifies the repository endpoint and artifact involved",
                 ]
             )
 
         # Default suggestions if no specific error type identified
         if not error_suggestions:
             error_suggestions = [
-                "Check the full Maven output for detailed error information",
-                "Try running with -X flag for debug output: maven command='clean compile -X'",
-                "Verify your pom.xml file is valid",
-                "Check if all required dependencies are available",
+                "The stored full Maven output is the source of truth for the failure",
+                "The project POM, dependency declarations, and runtime facts constrain the next action",
+                "A retry requires a model-owned ActionIntent justified by new evidence or a material state change",
             ]
 
         error_message = f"Maven build failed with exit code {exit_code}"
 
-        if analysis["compilation_errors"]:
+        if analysis.get("compilation_errors"):
             error_message += f"\nCompilation errors found: {len(analysis['compilation_errors'])}"
 
         if analysis.get("test_failure_count", 0) > 0 or analysis.get("test_error_count", 0) > 0:
@@ -2692,8 +2968,6 @@ class MavenTool(BaseTool):
             "analysis": analysis,
             "key_errors_extracted": True,
             "error_type": error_code,
-            "recovery_actions": self._generate_recovery_actions(error_code, analysis),
-            "diagnostic_commands": self._get_diagnostic_commands(error_code),
         }
         if maven_runtime:
             metadata["maven_runtime"] = maven_runtime
@@ -2984,203 +3258,6 @@ class MavenTool(BaseTool):
 
         return result
 
-    def _generate_recovery_actions(self, error_code: str, analysis: Dict[str, Any]) -> list:
-        """Generate specific recovery actions based on error type."""
-        recovery_actions = []
-
-        if error_code == "COMPILATION_ERROR":
-            recovery_actions.extend(
-                [
-                    {
-                        "action": "view_errors",
-                        "command": "maven(command='compile', raw_output=true)",
-                    },
-                    {"action": "check_syntax", "description": "Review Java syntax in source files"},
-                    {
-                        "action": "verify_imports",
-                        "description": "Check all import statements are correct",
-                    },
-                ]
-            )
-        elif error_code == "DEPENDENCY_ERROR":
-            recovery_actions.extend(
-                [
-                    {"action": "resolve_deps", "command": "maven(command='dependency:resolve')"},
-                    {"action": "show_tree", "command": "maven(command='dependency:tree')"},
-                    {
-                        "action": "force_update",
-                        "command": "maven(command='clean', properties='U=true')",
-                    },
-                ]
-            )
-        elif error_code == "TEST_FAILURE":
-            test_info = analysis.get("tests_run", {})
-            recovery_actions.extend(
-                [
-                    {
-                        "action": "skip_tests",
-                        "command": "maven(command='package', properties='skipTests=true')",
-                    },
-                    {
-                        "action": "run_specific_test",
-                        "description": "Run individual test class to isolate issue",
-                    },
-                    {
-                        "action": "view_test_reports",
-                        "command": "bash(command='find /workspace/target/surefire-reports -name *.txt | head -5 | xargs cat')",
-                    },
-                ]
-            )
-        elif error_code == "NO_POM_XML":
-            recovery_actions.extend(
-                [
-                    {
-                        "action": "find_pom",
-                        "command": "bash(command='find /workspace -name pom.xml -type f')",
-                    },
-                    {"action": "list_dirs", "command": "bash(command='ls -la /workspace')"},
-                    {
-                        "action": "check_structure",
-                        "command": "bash(command='tree -L 2 /workspace 2>/dev/null || find /workspace -maxdepth 2 -type d')",
-                    },
-                ]
-            )
-        elif error_code == "JAVA_VERSION_ERROR":
-            # Extract Java version from error analysis if available
-            required_version = "17"  # Default to Java 17 LTS
-            if analysis and analysis.get("java_version_error"):
-                java_error = analysis["java_version_error"]
-                if java_error.get("required"):
-                    required_version = str(java_error["required"])
-
-            recovery_actions.extend(
-                [
-                    {
-                        "action": "check_current",
-                        "command": "bash(command='java -version 2>&1 && echo \"---\" && javac -version 2>&1')",
-                    },
-                    {
-                        "action": "list_available",
-                        "command": "bash(command='apt-cache search openjdk | grep -E \"openjdk-[0-9]+-jdk\" | sort -V')",
-                    },
-                    {
-                        "action": "install_required",
-                        "command": f"bash(command='apt-get update && apt-get install -y openjdk-{required_version}-jdk')",
-                    },
-                    {
-                        "action": "set_java_home",
-                        "command": f"bash(command='export JAVA_HOME=/usr/lib/jvm/java-{required_version}-openjdk-$(dpkg --print-architecture) && echo $JAVA_HOME')",
-                    },
-                    {
-                        "action": "update_alternatives",
-                        "command": f"bash(command='update-alternatives --set java /usr/lib/jvm/java-{required_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
-                    },
-                    {
-                        "action": "verify_install",
-                        "command": "bash(command='java -version && mvn -version')",
-                    },
-                ]
-            )
-        elif error_code == "OUT_OF_MEMORY":
-            recovery_actions.extend(
-                [
-                    {
-                        "action": "increase_memory",
-                        "command": "bash(command='export MAVEN_OPTS=\"-Xmx2048m\"')",
-                    },
-                    {"action": "build_modules", "description": "Build project modules separately"},
-                    {"action": "clean_target", "command": "maven(command='clean')"},
-                ]
-            )
-        elif error_code == "POM_PARSE_ERROR":
-            # Get POM parsing error details
-            pom_error = analysis.get("pom_parse_error", {})
-            pom_file = pom_error.get("file", "pom.xml")
-            tag = pom_error.get("tag", "unknown")
-            line = pom_error.get("line", 0)
-
-            recovery_actions.extend(
-                [
-                    {
-                        "action": "examine_pom",
-                        "command": f"bash(command='cat {pom_file} | head -n {line + 5} | tail -n 10')",
-                    },
-                    {
-                        "action": "validate_xml",
-                        "command": f"bash(command='xmllint --noout {pom_file} 2>&1 || echo \"XML validation failed\"')",
-                    },
-                    {
-                        "action": "find_orphaned_tags",
-                        "command": f"bash(command='grep -n \"<{tag}>\" {pom_file}')",
-                    },
-                    {
-                        "action": "fix_orphaned_tag",
-                        "description": f"Remove orphaned <{tag}> tag at line {line} that's outside proper XML structure",
-                    },
-                    {
-                        "action": "backup_and_fix",
-                        "command": f"bash(command='cp {pom_file} {pom_file}.backup && sed -i \"{line}d\" {pom_file}')",
-                    },
-                    {
-                        "action": "check_parent_pom",
-                        "command": "bash(command='if [ -f ../pom.xml ]; then grep -A 5 -B 5 \"<modules>\" ../pom.xml; fi')",
-                    },
-                    {
-                        "action": "skip_module",
-                        "description": f"If POM cannot be fixed, consider excluding this module from parent POM (last resort)",
-                    },
-                ]
-            )
-
-        return recovery_actions
-
-    def _get_diagnostic_commands(self, error_code: str) -> list:
-        """Get diagnostic commands to help debug the specific error."""
-        diagnostics = []
-
-        if error_code == "COMPILATION_ERROR":
-            diagnostics.extend(
-                [
-                    "maven(command='compile', properties='maven.compiler.verbose=true')",
-                    "bash(command='find /workspace/src -name *.java | head -5 | xargs head -20')",
-                ]
-            )
-        elif error_code == "DEPENDENCY_ERROR":
-            diagnostics.extend(
-                [
-                    "maven(command='dependency:analyze')",
-                    "bash(command='cat /workspace/pom.xml | grep -A 5 -B 5 dependency')",
-                ]
-            )
-        elif error_code == "TEST_FAILURE":
-            diagnostics.extend(
-                [
-                    "maven(command='test', properties='maven.surefire.debug=true')",
-                    "bash(command='ls -la /workspace/target/surefire-reports/')",
-                ]
-            )
-        elif error_code == "JAVA_VERSION_ERROR":
-            diagnostics.extend(
-                ["bash(command='echo $JAVA_HOME')", "bash(command='which java && which javac')"]
-            )
-        elif error_code == "NETWORK_ERROR":
-            diagnostics.extend(
-                [
-                    "bash(command='ping -c 3 repo.maven.apache.org 2>/dev/null || echo Network unreachable')",
-                    "bash(command='cat ~/.m2/settings.xml 2>/dev/null || echo No settings.xml')",
-                ]
-            )
-        elif error_code == "POM_PARSE_ERROR":
-            diagnostics.extend(
-                [
-                    "bash(command='find /workspace -name pom.xml -type f | xargs -I {} xmllint --noout {} 2>&1')",
-                    "maven(command='validate', raw_output=true)",
-                    'bash(command=\'grep -r "<groupId>" --include="pom.xml" /workspace | head -20\')',
-                ]
-            )
-
-        return diagnostics
-
     def _validate_build_artifacts_in_container(
         self, working_directory: str, command: str
     ) -> Dict[str, Any]:
@@ -3285,7 +3362,6 @@ Maven Tool Usage Examples:
   # With it, all 2,711 tests run instead of just 326
 
 🔧 COMMON SCENARIOS:
-• Skip tests: maven(command="install", properties="skipTests=true")
 • Debug failures: maven(command="test", raw_output=True)
 • Clean build: maven(command="clean compile")
 • With profiles: maven(command="package", profiles="production")
@@ -3318,7 +3394,7 @@ Maven Tool Usage Examples:
                 },
                 "properties": {
                     "type": "string",
-                    "description": "Maven properties as 'key=value,key2=value2'. Common: 'skipTests=true' to skip tests.",
+                    "description": "Maven properties as 'key=value,key2=value2'.",
                     "default": None,
                 },
                 "raw_output": {

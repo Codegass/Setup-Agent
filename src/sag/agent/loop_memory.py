@@ -8,7 +8,7 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 _STATE_SCOPES = (
     "environment",
@@ -98,6 +98,7 @@ class ActionKey:
     def from_event(cls, event: "LoopEvent") -> "ActionKey":
         tool = _normalize_text(event.tool_name)
         args = dict(event.args)
+        target: tuple[str, ...]
         if tool == "repair":
             target = (
                 _normalize_text(args.get("source_phase")),
@@ -260,12 +261,135 @@ class LoopDecision:
         }
 
 
+CompletionClaimKind = Literal["done", "blocked"]
+CompletionDisposition = Literal[
+    "wait_required",
+    "repair_required",
+    "harness_recovery_required",
+    "terminal_claimable",
+    "terminal_blocked",
+]
+CompletionClaimDecisionKind = Literal["continue", "agent_no_progress", "not_counted"]
+
+
+def _canonical_string_set(values: Sequence[Any] | Any) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)):
+        values = (values,)
+    return tuple(sorted({str(value).strip() for value in values if str(value).strip()}))
+
+
+def _set_hash(values: Sequence[Any] | Any) -> str:
+    canonical = _canonical_string_set(values)
+    return hashlib.sha256("\n".join(canonical).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class LoopEpochs:
+    """The three material-progress clocks owned by this LoopMemory."""
+
+    material_action: int = 0
+    evidence: int = 0
+    job: int = 0
+
+
+@dataclass(frozen=True)
+class CompletionClaimEvent:
+    """One completion claim after the judge has assigned control ownership.
+
+    ``prose`` and ``evidence_refs`` are retained for diagnostics only.  The
+    recurrence key uses mechanical digests/fingerprints, never wording or the
+    order in which equivalent references reached the model.
+    """
+
+    phase_attempt_id: str
+    claim_kind: CompletionClaimKind
+    judge_disposition: CompletionDisposition
+    blocker_id: str = ""
+    mechanical_evidence_digest: str = ""
+    assessment_fingerprints: tuple[str, ...] = ()
+    open_job_fingerprints: tuple[str, ...] = ()
+    target_fingerprint: str = ""
+    config_fingerprint: str = ""
+    fact_fingerprint: str = ""
+    evidence_refs: tuple[str, ...] = ()
+    prose: str = ""
+
+
+@dataclass(frozen=True, order=True)
+class CompletionClaimKey:
+    phase_attempt_id: str
+    canonical_claim: str
+    judge_disposition: str
+    blocker_id: str
+    mechanical_evidence_digest: str
+    assessment_set_hash: str
+    open_job_set_hash: str
+    target_fingerprint: str
+    config_fingerprint: str
+    fact_fingerprint: str
+    material_action_epoch: int
+    evidence_epoch: int
+    job_epoch: int
+
+
+@dataclass(frozen=True)
+class CompletionClaimRecord:
+    key: CompletionClaimKey
+    claim_kind: CompletionClaimKind
+    evidence_refs: tuple[str, ...]
+    occurrence_count: int
+    decision: CompletionClaimDecisionKind
+    reason_code: str
+
+
+@dataclass(frozen=True)
+class CompletionClaimDecision:
+    decision: CompletionClaimDecisionKind
+    recurrence_count: int
+    reason_code: str
+    key: CompletionClaimKey | None = None
+    close_phase: bool = False
+
+    def to_metadata(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "decision": self.decision,
+            "recurrence_count": self.recurrence_count,
+            "reason_code": self.reason_code,
+            "close_phase": self.close_phase,
+        }
+        if self.key is not None:
+            metadata["key"] = {
+                "phase_attempt_id": self.key.phase_attempt_id,
+                "canonical_claim": self.key.canonical_claim,
+                "judge_disposition": self.key.judge_disposition,
+                "blocker_id": self.key.blocker_id,
+                "mechanical_evidence_digest": self.key.mechanical_evidence_digest,
+                "assessment_set_hash": self.key.assessment_set_hash,
+                "open_job_set_hash": self.key.open_job_set_hash,
+                "target_fingerprint": self.key.target_fingerprint,
+                "config_fingerprint": self.key.config_fingerprint,
+                "fact_fingerprint": self.key.fact_fingerprint,
+                "material_action_epoch": self.key.material_action_epoch,
+                "evidence_epoch": self.key.evidence_epoch,
+                "job_epoch": self.key.job_epoch,
+            }
+        return metadata
+
+
 @dataclass
 class _RecurrenceChain:
     vector: RelevantStateVector
     count: int = 1
     records: list[RecurrenceRecord] = field(default_factory=list)
     force_break_armed: bool = False
+
+
+@dataclass
+class _CompletionClaimChain:
+    key: CompletionClaimKey
+    count: int = 0
 
 
 def _relevant_scopes(event: LoopEvent) -> tuple[str, ...]:
@@ -323,20 +447,207 @@ def _is_recurrence_candidate(event: LoopEvent, outcome: OutcomeKey) -> bool:
 class LoopMemory:
     """Detect recurrence only when the action outcome and relevant state agree."""
 
-    def __init__(self, *, diversity_threshold: int = 16) -> None:
+    def __init__(self, *, diversity_threshold: int = 16, completion_claim_cap: int = 3) -> None:
         self.diversity_threshold = int(diversity_threshold)
         if self.diversity_threshold <= 0:
             raise ValueError("diversity threshold must be positive")
+        self.completion_claim_cap = int(completion_claim_cap)
+        if self.completion_claim_cap <= 0:
+            raise ValueError("completion claim cap must be positive")
         self._chains: dict[tuple[ActionKey, OutcomeKey], _RecurrenceChain] = {}
         self._history: list[RecurrenceRecord] = []
         self._diversity: dict[tuple[str, str], set[ActionKey]] = {}
         self._poll_tokens: dict[ActionKey, tuple[str, str, str]] = {}
         self._active_blockers: dict[str, tuple[ActionKey, RelevantStateVector]] = {}
         self._armed_key: tuple[ActionKey, OutcomeKey] | None = None
+        self._material_action_epoch = 0
+        self._evidence_epoch = 0
+        self._job_epoch = 0
+        self._last_material_action_fingerprint = ""
+        self._last_evidence_token: tuple[str, str] | None = None
+        self._job_tokens: dict[str, tuple[str, str]] = {}
+        self._completion_chain: _CompletionClaimChain | None = None
+        self._completion_history: list[CompletionClaimRecord] = []
 
     @property
     def records(self) -> tuple[RecurrenceRecord, ...]:
         return tuple(self._history)
+
+    @property
+    def completion_records(self) -> tuple[CompletionClaimRecord, ...]:
+        return tuple(self._completion_history)
+
+    @property
+    def epochs(self) -> LoopEpochs:
+        return LoopEpochs(
+            material_action=self._material_action_epoch,
+            evidence=self._evidence_epoch,
+            job=self._job_epoch,
+        )
+
+    def _reset_completion_chain(self) -> None:
+        self._completion_chain = None
+
+    @staticmethod
+    def _action_fingerprint(value: Any) -> str:
+        if isinstance(value, Mapping):
+            value = value.get("action_fingerprint")
+        elif not isinstance(value, str):
+            value = getattr(value, "action_fingerprint", "")
+        return str(value or "").strip()
+
+    def observe_material_action(
+        self,
+        action: Any,
+        *,
+        schema_valid: bool = True,
+        passed_freeze: bool = True,
+        dispatched: bool = True,
+    ) -> bool:
+        """Advance only for a differently fingerprinted dispatched action.
+
+        Failed execution is still material.  Schema-invalid/refused actions
+        and an identical normalized retry do not buy another completion-claim
+        budget merely by producing a new tool-call id.
+        """
+
+        fingerprint = self._action_fingerprint(action)
+        if not schema_valid or not passed_freeze or not dispatched or not fingerprint:
+            return False
+        if fingerprint == self._last_material_action_fingerprint:
+            return False
+        self._last_material_action_fingerprint = fingerprint
+        self._material_action_epoch += 1
+        self._reset_completion_chain()
+        return True
+
+    def observe_evidence(
+        self,
+        evidence_fingerprint: Any,
+        *,
+        kind: str = "fact",
+        material: bool = True,
+    ) -> bool:
+        """Advance for a changed mechanical fact/assessment digest.
+
+        Callers pass a content fingerprint, not a receipt id.  This keeps a
+        duplicate persistence/replay event from masquerading as new evidence.
+        """
+
+        fingerprint = str(evidence_fingerprint or "").strip()
+        token = (_normalize_text(kind) or "fact", fingerprint)
+        if not material or not fingerprint or token == self._last_evidence_token:
+            return False
+        self._last_evidence_token = token
+        self._evidence_epoch += 1
+        self._reset_completion_chain()
+        return True
+
+    def observe_job_transition(
+        self,
+        job_id: Any,
+        lifecycle_state: Any,
+        *,
+        progress_fingerprint: Any = "",
+    ) -> bool:
+        """Advance for registration/progress/settlement, not unchanged polls."""
+
+        identifier = str(job_id or "").strip()
+        state = _normalize_text(lifecycle_state)
+        if not identifier or not state:
+            return False
+        token = (state, str(progress_fingerprint or "").strip())
+        if self._job_tokens.get(identifier) == token:
+            return False
+        self._job_tokens[identifier] = token
+        self._job_epoch += 1
+        self._reset_completion_chain()
+        return True
+
+    def _completion_key(self, event: CompletionClaimEvent) -> CompletionClaimKey:
+        return CompletionClaimKey(
+            phase_attempt_id=str(event.phase_attempt_id or "").strip(),
+            # Done and blocked are both attempts to end the current phase.
+            # Alternating the verbs therefore cannot evade convergence.
+            canonical_claim="completion",
+            judge_disposition=_enum_text(event.judge_disposition),
+            blocker_id=_normalize_text(event.blocker_id),
+            mechanical_evidence_digest=str(event.mechanical_evidence_digest or "").strip(),
+            assessment_set_hash=_set_hash(event.assessment_fingerprints),
+            open_job_set_hash=_set_hash(event.open_job_fingerprints),
+            target_fingerprint=str(event.target_fingerprint or "").strip(),
+            config_fingerprint=str(event.config_fingerprint or "").strip(),
+            fact_fingerprint=str(event.fact_fingerprint or "").strip(),
+            material_action_epoch=self._material_action_epoch,
+            evidence_epoch=self._evidence_epoch,
+            job_epoch=self._job_epoch,
+        )
+
+    def observe_completion_claim(
+        self,
+        event: CompletionClaimEvent,
+    ) -> CompletionClaimDecision:
+        """Bound only repeated no-op claims rejected for model-owned repair."""
+
+        if not isinstance(event, CompletionClaimEvent):
+            raise TypeError("LoopMemory.observe_completion_claim requires CompletionClaimEvent")
+        claim_kind = _enum_text(event.claim_kind)
+        if claim_kind not in {"done", "blocked"}:
+            raise ValueError("completion claim kind must be done or blocked")
+        disposition = _enum_text(event.judge_disposition)
+        valid_dispositions = {
+            "wait_required",
+            "repair_required",
+            "harness_recovery_required",
+            "terminal_claimable",
+            "terminal_blocked",
+        }
+        if disposition not in valid_dispositions:
+            raise ValueError("unknown completion-claim disposition")
+        if not str(event.phase_attempt_id or "").strip():
+            raise ValueError("phase_attempt_id is required")
+
+        if disposition != "repair_required":
+            reasons = {
+                "wait_required": "wait_owned_by_harness",
+                "harness_recovery_required": "recovery_owned_by_harness",
+                "terminal_claimable": "terminal_claim_supported",
+                "terminal_blocked": "terminal_blocked_supported",
+            }
+            return CompletionClaimDecision(
+                decision="not_counted",
+                recurrence_count=0,
+                reason_code=reasons[disposition],
+            )
+
+        key = self._completion_key(event)
+        if self._completion_chain is None or self._completion_chain.key != key:
+            self._completion_chain = _CompletionClaimChain(key=key, count=1)
+        else:
+            self._completion_chain.count = min(
+                self.completion_claim_cap,
+                self._completion_chain.count + 1,
+            )
+        count = self._completion_chain.count
+        at_cap = count >= self.completion_claim_cap
+        decision = CompletionClaimDecision(
+            decision="agent_no_progress" if at_cap else "continue",
+            recurrence_count=count,
+            reason_code="agent_no_progress" if at_cap else "completion_claim_without_action",
+            key=key,
+            close_phase=at_cap,
+        )
+        self._completion_history.append(
+            CompletionClaimRecord(
+                key=key,
+                claim_kind=claim_kind,  # type: ignore[arg-type]
+                evidence_refs=_canonical_string_set(event.evidence_refs),
+                occurrence_count=count,
+                decision=decision.decision,
+                reason_code=decision.reason_code,
+            )
+        )
+        return decision
 
     @staticmethod
     def _blocker_signature(

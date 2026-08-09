@@ -7,40 +7,250 @@ overlay (/workspace/.setup_agent/).
 """
 
 import json
+import re
 
+from test_container_io import FakeContainer
+
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.tools.internal.build_preflight import (
+    BUILD_REQUIREMENTS_DOMAIN_CAP,
+    BUILD_REQUIREMENTS_SCHEMA_VERSION,
     REQUIREMENTS_PATH,
     read_build_requirements,
+    read_live_build_requirements,
+    validate_build_requirements_v1,
     write_build_requirements,
 )
 
 
 class FakeOrch:
-    """In-memory container FS: supports the cat/mkdir/heredoc commands used."""
+    """In-memory container FS supporting lossless reads and atomic writes."""
 
-    def __init__(self):
-        self.files = {}
+    def __init__(self, *, fail_on=None):
+        self._container = FakeContainer(fail_on=fail_on)
+        self.files = self._container.files
+        self.commands = []
 
     def execute_command(self, cmd, workdir=None):
-        if cmd.startswith("mkdir -p"):
-            return {"success": True, "exit_code": 0, "output": ""}
-        if "<<" in cmd and REQUIREMENTS_PATH in cmd:  # heredoc write ("cat > ... <<'SAGEOF'")
-            body = cmd.split("<<'SAGEOF'\n", 1)[1].rsplit("\nSAGEOF", 1)[0]
-            self.files[REQUIREMENTS_PATH] = body
-            return {"success": True, "exit_code": 0, "output": ""}
-        if cmd.startswith("cat "):
-            path = cmd.split("cat ", 1)[1].strip()
-            if path in self.files:
-                return {"success": True, "exit_code": 0, "output": self.files[path]}
-            return {"success": False, "exit_code": 1, "output": "No such file"}
-        return {"success": True, "exit_code": 0, "output": ""}
+        self.commands.append(cmd)
+        if cmd.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in cmd:
+            records = (
+                [(REQUIREMENTS_PATH.rsplit("/", 1)[-1], self.files[REQUIREMENTS_PATH])]
+                if REQUIREMENTS_PATH in self.files
+                else []
+            )
+            return {"exit_code": 0, "output": frame_named_json_record_stream(records)}
+        return self._execute_command(cmd, workdir)
+
+    def _execute_command(self, cmd, workdir=None):
+        return self._container.execute_command(cmd)
+
+
+def current_manifest(**overrides):
+    manifest = {
+        "schema_version": BUILD_REQUIREMENTS_SCHEMA_VERSION,
+        "survey": {
+            "project_path": "/workspace/p",
+            "analyzer_version": 12,
+            "config_fingerprint": None,
+            "target_sha": None,
+            "document_map_fingerprint": None,
+        },
+        "java_version": "17",
+        "java_version_source": "maven-compiler",
+        "java_version_enforced": False,
+        "root_shape": "single_module",
+        "build_root": "/workspace/p",
+        "fail_at_end": False,
+        "test_root": "/workspace/p",
+        "test_system": "maven",
+        "test_fail_at_end": False,
+        "build_islands": [],
+        "test_islands": [],
+    }
+    manifest.update(overrides)
+    return manifest
 
 
 def test_write_then_read_round_trips():
     orch = FakeOrch()
-    data = {"java_version": "17", "root_shape": "healthy_reactor", "build_root": "/workspace/p"}
+    data = current_manifest(
+        root_shape="healthy_reactor",
+        fail_at_end=True,
+        test_fail_at_end=True,
+    )
     assert write_build_requirements(orch, data) is True
     assert read_build_requirements(orch) == data
+
+
+def test_live_read_requires_the_exact_current_host_revision():
+    orch = FakeOrch()
+    data = current_manifest()
+    assert write_build_requirements(orch, data) is True
+
+    current = read_live_build_requirements(orch)
+    orch.files[REQUIREMENTS_PATH] = json.dumps({**data, "java_version": "11"}, sort_keys=True)
+    tampered = read_live_build_requirements(orch)
+    del orch.files[REQUIREMENTS_PATH]
+    deleted = read_live_build_requirements(orch)
+
+    assert current.complete is True
+    assert current.conflict is None
+    assert current.payload == data
+    assert tampered.complete is False
+    assert tampered.conflict == "publication_set_mismatch"
+    assert deleted.complete is False
+    assert deleted.conflict == "publication_set_mismatch"
+
+
+def test_unpublished_container_manifest_has_no_live_authority():
+    orch = FakeOrch()
+    orch.files[REQUIREMENTS_PATH] = json.dumps(current_manifest(), sort_keys=True)
+
+    read = read_live_build_requirements(orch)
+
+    assert read.complete is False
+    assert read.conflict == "publication_set_mismatch"
+
+
+def test_write_large_manifest_streams_with_bounded_commands_and_no_temp_leak():
+    orch = FakeOrch()
+    dependencies = [f"dep-{index}-" + "x" * 220 for index in range(400)]
+    data = current_manifest(
+        python_version="3.11",
+        python_constraint=">=3.11",
+        python_constraint_source="pyproject.toml",
+        python_installer="pip",
+        python_install_commands=["{venv}/bin/python -m pip install -e ."],
+        python_install_note=None,
+        python_install_source="pyproject.toml",
+        python_packages=["project"],
+        python_distribution_name="project",
+        python_build_backend="setuptools.build_meta",
+        python_declared_dependencies=dependencies,
+        python_package_paths=[],
+        python_local_providers=[],
+        python_smoke_candidates=[],
+        python_venv="/workspace/p/.venv",
+        python_root="/workspace/p",
+        has_c_extensions=False,
+        has_native_build=False,
+        native_build_mode=None,
+        native_artifact_roots=[],
+        test_hints={"pytest_args": None, "test_deps": []},
+    )
+
+    assert write_build_requirements(orch, data) is True
+
+    assert read_build_requirements(orch) == data
+    assert any(command.startswith("printf '%s'") for command in orch.commands)
+    assert max(map(len, orch.commands)) <= 60_200
+    assert not any(path.endswith(".tmp") for path in orch.files)
+
+
+def test_failed_publish_preserves_existing_manifest():
+    orch = FakeOrch(fail_on="mv -f --")
+    original = '{"java_version":"11"}'
+    orch.files[REQUIREMENTS_PATH] = original
+
+    assert write_build_requirements(orch, current_manifest()) is False
+
+    assert orch.files[REQUIREMENTS_PATH] == original
+    assert not any(path.endswith(".tmp") for path in orch.files)
+
+
+def test_current_schema_is_closed_strict_and_bounded():
+    valid = current_manifest()
+    assert validate_build_requirements_v1(valid) == valid
+
+    invalid = [
+        {**valid, "schema_version": True},
+        {**valid, "schema_version": BUILD_REQUIREMENTS_SCHEMA_VERSION + 1},
+        {**valid, "future_authority": "yes"},
+        {**valid, "fail_at_end": 1},
+        {**valid, "build_root": "/workspace/p/../escape"},
+        {**valid, "build_islands": [{"root": "/workspace/p/m", "system": "maven"}] * 2},
+    ]
+    for payload in invalid:
+        try:
+            validate_build_requirements_v1(payload)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - each mutation names a distinct contract edge
+            raise AssertionError(f"accepted invalid manifest: {payload}")
+
+
+def test_current_schema_requires_exact_survey_pins_and_containment():
+    valid = current_manifest()
+    mutations = [
+        {**valid, "survey": {**valid["survey"], "analyzer_version": True}},
+        {**valid, "survey": {**valid["survey"], "analyzer_version": 11}},
+        {**valid, "survey": {**valid["survey"], "target_sha": "not-a-sha"}},
+        {
+            **valid,
+            "survey": {**valid["survey"], "document_map_fingerprint": "short"},
+        },
+        {**valid, "test_root": "/workspace/other"},
+    ]
+    for payload in mutations:
+        try:
+            validate_build_requirements_v1(payload)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f"accepted invalid manifest: {payload}")
+
+
+def test_current_schema_rejects_nested_extras_partial_groups_and_overflow():
+    valid = current_manifest()
+    too_many_islands = [
+        {"root": f"/workspace/p/m{index}", "system": "maven", "goal": "install"}
+        for index in range(BUILD_REQUIREMENTS_DOMAIN_CAP + 1)
+    ]
+    partial_python = {**valid, "python_installer": "pip"}
+    bad_structure = {
+        **valid,
+        "module_structure": {
+            "schema_version": 2,
+            "provenance": "inv-maven-1-0001",
+            "modules": ["Core"],
+            "keys": ["forged"],
+        },
+    }
+    invalid = [
+        {**valid, "survey": {**valid["survey"], "extra": None}},
+        {**valid, "build_islands": too_many_islands},
+        partial_python,
+        bad_structure,
+    ]
+    for payload in invalid:
+        try:
+            validate_build_requirements_v1(payload)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f"accepted invalid manifest: {payload}")
+
+
+def test_writer_refuses_invalid_current_body_before_touching_the_container():
+    orch = FakeOrch()
+
+    assert write_build_requirements(orch, {**current_manifest(), "unknown": []}) is False
+
+    assert REQUIREMENTS_PATH not in orch.files
+    assert orch.commands == []
+
+
+def test_live_reader_rejects_a_host_published_body_with_invalid_schema():
+    orch = FakeOrch()
+    assert write_build_requirements(orch, current_manifest()) is True
+    poisoned = {**current_manifest(), "schema_version": 99}
+    orch.files[REQUIREMENTS_PATH] = json.dumps(poisoned, sort_keys=True)
+
+    read = read_live_build_requirements(orch)
+
+    assert read.complete is False
+    assert read.conflict == "record_schema_invalid"
 
 
 def test_read_missing_manifest_returns_empty_dict():
@@ -59,29 +269,46 @@ from sag.tools.internal.build_preflight import JdkPreflight, active_java_major
 class ProvisionOrch(FakeOrch):
     """Scriptable orchestrator: maps command substrings to canned results."""
 
-    def __init__(self, java_version_output, apt_ok=True, temurin_ok=True):
+    def __init__(
+        self,
+        java_version_output,
+        apt_ok=True,
+        temurin_ok=True,
+        activate_installed_java=True,
+    ):
         super().__init__()
         self.java_output = java_version_output
         self.apt_ok = apt_ok
         self.temurin_ok = temurin_ok
-        self.commands = []
+        self.activate_installed_java = activate_installed_java
 
     def execute_command(self, cmd, workdir=None):
         self.commands.append(cmd)
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": self.java_output}
         if "apt-get install -y openjdk" in cmd:
-            return {"success": self.apt_ok, "exit_code": 0 if self.apt_ok else 100,
-                    "output": "" if self.apt_ok else "E: Unable to locate package"}
+            return {
+                "success": self.apt_ok,
+                "exit_code": 0 if self.apt_ok else 100,
+                "output": "" if self.apt_ok else "E: Unable to locate package",
+            }
         # Must precede the "temurin" check: the real JAVA_HOME lookup globs
         # both /usr/lib/jvm/java-N-openjdk-* and /usr/lib/jvm/temurin-N-jdk*.
         if cmd.startswith("ls -d /usr/lib/jvm"):
-            return {"success": True, "exit_code": 0,
-                    "output": "/usr/lib/jvm/java-17-openjdk-arm64"}
+            return {"success": True, "exit_code": 0, "output": "/usr/lib/jvm/java-17-openjdk-arm64"}
         if "temurin" in cmd:
-            return {"success": self.temurin_ok, "exit_code": 0 if self.temurin_ok else 1,
-                    "output": ""}
-        return super().execute_command(cmd, workdir)
+            return {
+                "success": self.temurin_ok,
+                "exit_code": 0 if self.temurin_ok else 1,
+                "output": "",
+            }
+        if "update-alternatives --install /usr/bin/java" in cmd:
+            if self.activate_installed_java:
+                match = re.search(r"/java-(\d+)-", cmd)
+                if match:
+                    self.java_output = f'openjdk version "{match.group(1)}.0.1"'
+            return {"success": True, "exit_code": 0, "output": ""}
+        return self._execute_command(cmd, workdir)
 
 
 def test_matching_jdk_is_a_noop():
@@ -102,6 +329,7 @@ def test_mismatch_provisions_and_narrates(monkeypatch):
     orch = ProvisionOrch('openjdk version "11.0.2"')
     # Overlay registration talks to the container too; stub it out.
     import sag.tools.internal.build_preflight as bp
+
     monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: True)
     outcome = JdkPreflight(orch).run("17", source="maven-enforcer")
     assert outcome.provisioned is True
@@ -124,13 +352,31 @@ def test_jdk_install_without_durable_overlay_is_not_reported_as_provisioned(monk
     assert "overlay registered" not in outcome.narration
 
 
+def test_jdk_install_without_same_dispatch_postcondition_is_not_provisioned(monkeypatch):
+    orch = ProvisionOrch(
+        'openjdk version "11.0.2"',
+        activate_installed_java=False,
+    )
+    import sag.tools.internal.build_preflight as bp
+
+    monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: True)
+
+    outcome = JdkPreflight(orch).run("17", source="runner-observed")
+
+    assert outcome.provisioned is False
+    assert outcome.mismatch is True
+    assert outcome.active_version == "11"
+    assert "postcondition" in outcome.narration
+
+
 def test_unprovisionable_degrades_to_mismatch_note_never_raises(monkeypatch):
     orch = ProvisionOrch('openjdk version "11.0.2"', apt_ok=False, temurin_ok=False)
     import sag.tools.internal.build_preflight as bp
+
     monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: True)
     outcome = JdkPreflight(orch).run("8", source="maven-compiler")
     assert outcome.provisioned is False
-    assert outcome.mismatch is True          # verifier picks this up (Task 8)
+    assert outcome.mismatch is True  # verifier picks this up (Task 8)
     assert "could not provision" in outcome.narration
 
 
@@ -144,20 +390,36 @@ from sag.tools.internal.build_preflight import classify_version_error
 
 
 def test_enforcer_message_yields_version():
-    out = ("[ERROR] Rule 0: org.apache.maven.plugins.enforcer.RequireJavaVersion failed "
-           "with message:\nDetected JDK Version: 11.0.2 is not in the allowed range [17,).")
+    out = (
+        "[ERROR] Rule 0: org.apache.maven.plugins.enforcer.RequireJavaVersion failed "
+        "with message:\nDetected JDK Version: 11.0.2 is not in the allowed range [17,)."
+    )
     assert classify_version_error(out) == "17"
+
+
+def test_real_maven_required_java_wording_yields_version():
+    assert (
+        classify_version_error(
+            "[ERROR] Required Java version 17 is not met by current version 11.0.27"
+        )
+        == "17"
+    )
 
 
 def test_unsupported_class_version_maps_bytecode_to_jdk():
     # class file version 61.0 = JDK 17 (44 + major)
-    out = ("java.lang.UnsupportedClassVersionError: com/foo/Bar has been compiled by a "
-           "more recent version of the Java Runtime (class file version 61.0)")
+    out = (
+        "java.lang.UnsupportedClassVersionError: com/foo/Bar has been compiled by a "
+        "more recent version of the Java Runtime (class file version 61.0)"
+    )
     assert classify_version_error(out) == "17"
 
 
 def test_invalid_target_release():
-    assert classify_version_error("[ERROR] Fatal error compiling: error: invalid target release: 21") == "21"
+    assert (
+        classify_version_error("[ERROR] Fatal error compiling: error: invalid target release: 21")
+        == "21"
+    )
     assert classify_version_error("error: release version 17 not supported") == "17"
 
 

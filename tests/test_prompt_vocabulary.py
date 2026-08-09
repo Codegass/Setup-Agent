@@ -5,9 +5,8 @@ Model-facing vocabulary must teach the consolidated tool surface
 report) instead of the legacy maven / gradle / project_setup /
 project_analyzer / web_search / output_search / system / env names.
 
-react_engine.yaml section-start line numbers are referenced from
-react_prompt_builder.py `# Prompt:` comments — the sweep must keep
-those line numbers stable.
+react_prompt_builder.py records stable prompt keys rather than brittle YAML
+line numbers; this sweep verifies every referenced key exists.
 """
 
 import re
@@ -28,6 +27,7 @@ from sag.tools.context_tool import ContextTool
 REPO_SRC = Path(__file__).resolve().parents[1] / "src" / "sag"
 YAML_PATH = REPO_SRC / "config" / "prompts" / "react_engine.yaml"
 BUILDER_PATH = REPO_SRC / "agent" / "react_prompt_builder.py"
+REACT_ENGINE_PATH = REPO_SRC / "agent" / "react_engine.py"
 AGENT_PATH = REPO_SRC / "agent" / "agent.py"
 
 # Legacy tool-invocation vocabulary that must no longer be taught to the model.
@@ -60,17 +60,14 @@ def test_react_engine_yaml_teaches_consolidated_tools():
     assert "web:" in text and "search" in text
 
 
-def test_react_engine_yaml_section_line_references_stay_valid():
-    """The sweep must not shift the yaml lines referenced from the builder."""
-    yaml_lines = YAML_PATH.read_text().splitlines()
-    refs = re.findall(r"react_engine\.yaml:(\d+) [\w]+\.([\w]+)", BUILDER_PATH.read_text())
-    assert refs, "expected # Prompt: react_engine.yaml:<line> comments in builder"
-    for line_number, key in refs:
-        line = yaml_lines[int(line_number) - 1]
-        assert line.lstrip().startswith(f"{key}:"), (
-            f"react_engine.yaml:{line_number} expected to start section '{key}:' "
-            f"but found: {line!r}"
-        )
+def test_react_prompt_builder_key_references_stay_valid():
+    """Prompt ownership is keyed by YAML path, never by movable line number."""
+    prompt_sources = BUILDER_PATH.read_text() + "\n" + REACT_ENGINE_PATH.read_text()
+    refs = re.findall(r"Prompt key: ([\w.]+)", prompt_sources)
+    assert refs, "expected stable prompt-key comments in builder"
+    sections = _prompt_sections()
+    assert sorted(set(refs) - set(sections)) == []
+    assert "react_engine.yaml:" not in prompt_sources
 
 
 def test_default_task_templates_use_consolidated_names():
@@ -79,10 +76,14 @@ def test_default_task_templates_use_consolidated_names():
     assert "use project_analyzer tool" not in source
     assert "MUST use project_analyzer tool" not in source
     assert "use maven/gradle tools" not in source
-    # Stage 2: the default trunk templates are the phase objectives; the setup
-    # prompt prescribes the consolidated build/project facades.
-    assert "build(action=" in source
-    assert "project(action=" in source
+    # The default trunk templates are engine-owned outcome contracts. Neutral
+    # facade syntax remains in the tool surface, not in a generated phase plan.
+    assert "kickoff_phase_objectives()" in source
+    assert "When cloning, pass ref=" not in source
+    assert "project(action='clone'/'provision'/'analyze'/'env')" not in source
+    assert "build(action='deps'/'compile'/'test'/'package')" not in source
+    assert "current phase facts, coordinates, constraints, and unresolved evidence" in source
+    assert "durable report artifact reflects the sealed evidence" in source
 
 
 class _BranchHistory:
@@ -431,7 +432,7 @@ def _prompt_sections():
         # top-level brief for a different consumer (the advisor consult, not
         # the executor's system prompt). It still faces the sweep below.
         if isinstance(value, str):
-            sections[f"{group}.{group}"] = value
+            sections[group] = value
             continue
         for name, text in value.items():
             sections[f"{group}.{name}"] = text
@@ -442,7 +443,7 @@ def test_setup_yaml_sections_drop_task_ceremony():
     offenders = {
         key: [pattern for pattern in SETUP_FORBIDDEN_CEREMONY if pattern in text]
         for key, text in _prompt_sections().items()
-        if not key.split(".", 1)[1].startswith("run_task_")
+        if not key.partition(".")[2].startswith("run_task_")
         and any(pattern in text for pattern in SETUP_FORBIDDEN_CEREMONY)
     }
     assert offenders == {}, f"setup-mode sections still teach task ceremony: {offenders}"
@@ -453,7 +454,9 @@ def test_setup_yaml_sections_teach_phase_verbs():
     lifecycle = sections["initial_system.context_management"]
     assert 'phase(action="done"' in lifecycle or "phase(action='done'" in lifecycle
     assert 'phase(action="blocked"' in lifecycle or "phase(action='blocked'" in lifecycle
-    assert 'phase(action="repair"' in lifecycle or "phase(action='repair'" in lifecycle
+    assert 'phase(action="repair"' not in lifecycle
+    assert "RepairContext" in lifecycle
+    assert "repair_intent" in lifecycle
     assert "outcome=" in lifecycle
     assert (
         "provision" in lifecycle and "report" in lifecycle
@@ -465,7 +468,7 @@ def test_run_task_yaml_sections_keep_manage_context_and_no_phase_tool():
     assert "manage_context" in sections["initial_system.run_task_context_management"]
     assert "manage_context" in sections["initial_system.run_task_tool_clarification"]
     run_task_text = "\n".join(
-        text for key, text in sections.items() if key.split(".", 1)[1].startswith("run_task_")
+        text for key, text in sections.items() if key.partition(".")[2].startswith("run_task_")
     )
     assert "phase(action=" not in run_task_text
 
@@ -478,7 +481,7 @@ class _PromptCM:
         return None
 
 
-def _initial_prompt(workflow_mode):
+def _initial_prompt(workflow_mode, repository_ref=None):
     builder = ReActPromptBuilder(
         prompts=load_react_engine_prompts(),
         context_manager=_PromptCM(),
@@ -486,7 +489,7 @@ def _initial_prompt(workflow_mode):
     )
     return builder.build_initial_system_prompt(
         repository_url="https://example.test/repo.git",
-        repository_ref=None,
+        repository_ref=repository_ref,
         workflow_mode=workflow_mode,
     )
 
@@ -495,11 +498,40 @@ def test_setup_prompt_teaches_phase_verbs_not_task_ceremony():
     prompt = _initial_prompt("setup")
     assert 'phase(action="done"' in prompt or "phase(action='done'" in prompt
     assert 'phase(action="blocked"' in prompt or "phase(action='blocked'" in prompt
-    assert 'phase(action="repair"' in prompt or "phase(action='repair'" in prompt
+    assert 'phase(action="repair"' not in prompt
+    assert "RepairContext" in prompt
+    assert "repair_intent" in prompt
     assert "outcome=" in prompt
     assert "complete_with_results" not in prompt
     assert "manage_context" not in prompt
     assert "start_task" not in prompt
+
+
+def test_setup_prompt_has_no_fixed_post_clone_analysis_or_maven_repair_playbook():
+    prompt = _initial_prompt("setup")
+    forbidden = (
+        "Handling Maven POM Parsing Errors",
+        "Handling Multi-Module Maven Test Execution",
+        "-Dmaven.test.failure.ignore=true",
+        "-pl !module-name",
+        "IMMEDIATELY after clone",
+        "MUST be called immediately after every successful clone",
+        "AUTOMATIC TRIGGER RULE",
+    )
+    assert [phrase for phrase in forbidden if phrase in prompt] == []
+    assert "engine mechanically creates the initial project survey/fact sheet" in prompt
+    assert "not a fixed post-clone step" in prompt
+
+
+def test_setup_repository_notice_is_an_evidence_coordinate_not_a_selected_clone_call():
+    prompt = _initial_prompt("setup", repository_ref="v1.2.3")
+    assert "TARGET REPOSITORY COORDINATE" in prompt
+    assert "Repository ref: v1.2.3" in prompt
+    assert "checkout must resolve exactly this ref" in prompt
+    assert "Your first action should" not in prompt
+    assert "Use this URL when cloning" not in prompt
+    assert 'project(action="clone", repo_url=' not in prompt
+    assert "project_setup" not in prompt
 
 
 def test_run_task_prompt_keeps_manage_context_surface():

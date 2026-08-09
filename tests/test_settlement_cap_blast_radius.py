@@ -31,17 +31,33 @@ validated SUCCESS) stays dead in every state below.
 """
 
 import json
+import shlex
 from types import SimpleNamespace
 
-from test_job_settlement import JobContainer, _obligation
-from test_job_settlement import AFTER, EXIT_PATH, JOB, LOG_PATH, POLARIS_LOG
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import add_published_mutable_json
+from test_job_settlement import (
+    AFTER,
+    CONTAINER_ID,
+    DOCKER_EXEC_ID,
+    JOB,
+    LOG_PATH,
+    POLARIS_LOG,
+    TERMINAL_AUTHORITY,
+    TERMINAL_IDENTITY,
+    JobContainer,
+    _obligation,
+)
 
 from sag.agent import phase_gates
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.job_obligations import write_obligation
 from sag.agent.phase_gates import (
+    JOB_BARRIER_FACT,
     OPEN_OBLIGATIONS_FACT,
     ClaimDisposition,
+    GateControlDisposition,
     ValidatorState,
     _ValidatorObservation,
     check_phase_claim,
@@ -61,30 +77,110 @@ REASON = "Built 100% of expected classes (>= 100% threshold)"
 class Container(JobContainer):
     """The ledger AND the survey manifest, on one container read surface."""
 
-    def __init__(self, *, terminated, manifest=None):
+    def __init__(self, *, manifest=None):
         files = {LOG_PATH: POLARIS_LOG}
-        if terminated:
-            files[EXIT_PATH] = "0\n"
         if manifest is not None:
             files[BUILD_REQUIREMENTS_PATH] = json.dumps(manifest)
         super().__init__(files=files, reports=AFTER)
 
+    def __call__(self, command, **kwargs):
+        tokens = shlex.split(command) if "\n" not in command else []
+        if len(tokens) == 3 and tokens[:2] == ["cat", "--"]:
+            self.commands.append(command)
+            path = tokens[2]
+            if path in self.files:
+                return {"success": True, "exit_code": 0, "output": self.files[path]}
+            return {
+                "success": False,
+                "exit_code": 1,
+                "output": f"cat: {path}: No such file or directory",
+            }
+        return super().__call__(command, **kwargs)
+
 
 class Orchestrator:
     def __init__(self, *, terminated=False, manifest=None):
-        self.filesystem = Container(terminated=terminated, manifest=manifest)
-        write_obligation(self.execute_command, _obligation())
+        self.filesystem = Container(manifest=manifest)
+        terminal_state = "finished" if terminated else "running"
+        terminal_exit_code = 0 if terminated else None
+        self.detached_terminal_states = {
+            DOCKER_EXEC_ID: (terminal_state, terminal_exit_code),
+        }
+        self.terminal_inspections = []
+        self.detached_handle = {
+            **TERMINAL_IDENTITY,
+            "terminal_authority": TERMINAL_AUTHORITY,
+            "docker_exec_id": DOCKER_EXEC_ID,
+            "container_id": CONTAINER_ID,
+        }
+        if manifest is not None:
+            add_published_mutable_json(
+                self,
+                self.filesystem,
+                path=BUILD_REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=manifest,
+            )
+        assert write_obligation(self.execute_control_command, _obligation())
 
     def execute_command(self, command, **kwargs):
         return self.filesystem(command, **kwargs)
 
+    def execute_control_command(self, command, **kwargs):
+        return self.filesystem(command, **kwargs)
+
+    def set_detached_terminal_state(self, exec_id, state, exit_code=None):
+        self.detached_terminal_states[exec_id] = (state, exit_code)
+
+    def inspect_detached_terminal(self, handle):
+        self.terminal_inspections.append(dict(handle))
+        if (
+            handle.get("terminal_authority") != TERMINAL_AUTHORITY
+            or handle.get("container_id") != CONTAINER_ID
+        ):
+            return {
+                "probe_success": False,
+                "state": "unknown",
+                "probe_error": "terminal_identity_mismatch",
+            }
+        state, exit_code = self.detached_terminal_states.get(
+            handle.get("docker_exec_id"),
+            ("unknown", None),
+        )
+        if state == "running":
+            return {
+                "probe_success": True,
+                "state": "running",
+                "running": True,
+                "finished": False,
+                "exit_code": None,
+            }
+        if state == "finished":
+            return {
+                "probe_success": True,
+                "state": "finished",
+                "running": False,
+                "finished": True,
+                "exit_code": exit_code,
+            }
+        return {
+            "probe_success": False,
+            "state": "unknown",
+            "probe_error": "terminal_state_unknown",
+        }
+
 
 def _manifest():
-    return {
-        "survey": {"project_path": POLARIS},
-        "build_system": "gradle",
-        "build_islands": [{"root": root, "system": system} for root, system in ISLANDS],
-    }
+    islands = [{"root": root, "system": system} for root, system in ISLANDS]
+    return complete_build_requirements_v1(
+        project_root=POLARIS,
+        build_system="gradle",
+        root_shape="pathological_aggregator",
+        build_root=ISLANDS[0][0],
+        build_islands=islands,
+    )
 
 
 def _inspect(monkeypatch, state=ValidatorState.GREEN, facts=None):
@@ -112,8 +208,7 @@ def _claim(outcome, phase="build", signal="done"):
 
 
 def test_the_probe_the_nudge_reads_is_the_state_the_gate_grades(monkeypatch):
-    """P3. `check_phase_done` answers "would the gate pass"; the gate answers
-    "does it pass". One question, so one computation — the cap included."""
+    """Both read the same controller-owned wait disposition."""
     _inspect(monkeypatch)
     orchestrator = Orchestrator(terminated=False)
 
@@ -121,20 +216,21 @@ def test_the_probe_the_nudge_reads_is_the_state_the_gate_grades(monkeypatch):
     gate = check_phase_claim("build", _claim("success"), None, orchestrator, "polaris")
 
     assert probe["validated_facts"][OPEN_OBLIGATIONS_FACT] == [JOB]
-    assert probe["validator_state"] == gate.validator_state.value == "partial"
+    assert probe["validator_state"] == gate.validator_state.value == "unavailable"
     assert probe["ok"] is False
     assert gate.disposition is ClaimDisposition.CONTRADICTED
+    assert probe["control_disposition"] == "wait_required"
+    assert gate.control_disposition is GateControlDisposition.WAIT_REQUIRED
 
 
 def test_the_capped_probe_names_the_job_that_capped_it(monkeypatch):
-    """The reason the floor and the nudge read has to carry the evidence too —
-    a state without its sentence is the same two computations again."""
+    """The wait projection names its controller state without project prose."""
     _inspect(monkeypatch)
 
     probe = check_phase_done("build", None, Orchestrator(terminated=False), "polaris")
 
-    assert probe["reason"].startswith(REASON)
-    assert f"job {JOB} has no terminal receipt — success requires settled books" in probe["reason"]
+    assert probe["reason"] == "controller job barrier is active; project evidence was not inspected"
+    assert probe["validated_facts"][JOB_BARRIER_FACT] == [{"job_id": JOB, "state": "running"}]
 
 
 def test_settled_books_leave_the_probe_green(monkeypatch):
@@ -253,28 +349,20 @@ def _available_claims(tool):
     return accepted, refused
 
 
-def test_an_untried_island_and_an_open_job_still_leave_one_honest_claim(monkeypatch):
-    """The state with no exit: success is exempted by the island rule and then
-    contradicted by the cap; every other claim is refused by the island rule.
-    The claim the gate itself validates on this evidence is `partial`, and that
-    is the one the island rule may not refuse — its own stated ground is that
-    the physical gate below checks it."""
+def test_an_untried_island_and_an_open_job_leave_no_model_terminal_claim(monkeypatch):
+    """While the controller barrier is active the model may not close a phase."""
     _inspect(monkeypatch)
     tool = _phase_tool(Orchestrator(terminated=False, manifest=_manifest()))
 
     accepted, refused = _available_claims(tool)
 
-    assert accepted == ["done/partial"]
-    # success is refused by the cap, and the two refusals no longer disagree:
-    # the claim the cap leaves is the one the island rule lets through.
-    assert "success requires settled books" in refused["done/success"].output
-    assert refused["done/failed"].error_code == "ISLAND_ATTEMPT_REQUIRED"
-    assert refused["blocked/failed"].error_code == "ISLAND_ATTEMPT_REQUIRED"
+    assert accepted == []
+    assert refused["done/success"].error_code == "job_controller_barrier"
+    assert refused["done/failed"].error_code == "job_controller_barrier"
+    assert refused["blocked/failed"].error_code == "job_controller_barrier"
 
 
-def test_the_accepted_claim_is_the_outcome_the_gate_validates(monkeypatch):
-    """Not a concession: `partial` IS the gate's determination on this evidence,
-    so the claim is CONFIRMED and the phase records what the evidence says."""
+def test_partial_cannot_bypass_the_island_rule_during_controller_wait(monkeypatch):
     _inspect(monkeypatch)
     tool = _phase_tool(Orchestrator(terminated=False, manifest=_manifest()))
 
@@ -285,16 +373,18 @@ def test_the_accepted_claim_is_the_outcome_the_gate_validates(monkeypatch):
         evidence=["file:///workspace/polaris/build.log"],
     )
 
-    gate = result.metadata["gate_result"]
-    assert result.succeeded is True
-    assert gate["validated_outcome"] == "partial"
-    assert gate["claim_disposition"] == "confirmed"
-    assert gate["validated_facts"][OPEN_OBLIGATIONS_FACT] == [JOB]
+    assert result.succeeded is False
+    assert result.error_code == "job_controller_barrier"
+    assert "phase_signal" not in result.metadata
 
 
-def test_settled_books_leave_the_island_rule_exactly_as_it_was(monkeypatch):
-    """With nothing open the only exempt claim is `done/success`, as it has
-    always been: a giving-up closure may not abandon an untried island."""
+def test_settled_books_remove_only_the_controller_barrier(monkeypatch):
+    """Settlement removes only the controller barrier.
+
+    The in-memory ``runner_dispatched`` observation is not a durable invocation
+    receipt: a partial closure still owes the untried island, while a failed
+    closure first owes one mechanically proven build attempt.
+    """
     _inspect(monkeypatch)
     tool = _phase_tool(Orchestrator(terminated=True, manifest=_manifest()))
 
@@ -302,7 +392,8 @@ def test_settled_books_leave_the_island_rule_exactly_as_it_was(monkeypatch):
 
     assert accepted == ["done/success"]
     assert refused["done/partial"].error_code == "ISLAND_ATTEMPT_REQUIRED"
-    assert refused["done/failed"].error_code == "ISLAND_ATTEMPT_REQUIRED"
+    assert refused["done/failed"].error_code == "BUILD_ATTEMPT_REQUIRED"
+    assert "build_attempt_requirement" in refused["done/failed"].facts
 
 
 def test_a_failed_build_never_rides_an_open_job_out_of_the_island_rule(monkeypatch):
@@ -315,8 +406,8 @@ def test_a_failed_build_never_rides_an_open_job_out_of_the_island_rule(monkeypat
     accepted, refused = _available_claims(tool)
 
     assert accepted == []
-    assert refused["done/failed"].error_code == "ISLAND_ATTEMPT_REQUIRED"
-    assert refused["done/partial"].error_code == "ISLAND_ATTEMPT_REQUIRED"
+    assert refused["done/failed"].error_code == "job_controller_barrier"
+    assert refused["done/partial"].error_code == "job_controller_barrier"
 
 
 def test_a_partial_build_still_owes_the_island_an_attempt(monkeypatch):
@@ -327,13 +418,11 @@ def test_a_partial_build_still_owes_the_island_an_attempt(monkeypatch):
 
     _, refused = _available_claims(tool)
 
-    assert refused["done/partial"].error_code == "ISLAND_ATTEMPT_REQUIRED"
+    assert refused["done/partial"].error_code == "job_controller_barrier"
 
 
 def test_a_blocked_claim_on_green_evidence_is_refused_while_a_job_is_open(monkeypatch):
-    """The other consumer that keyed on `success`: `blocked` is reserved for
-    external impediments and green evidence contradicts it. That guard read the
-    CAPPED outcome, so an open obligation disarmed it."""
+    """Controller wait wins before any project-level blocked classification."""
     _inspect(monkeypatch)
     tool = _phase_tool(Orchestrator(terminated=False))  # no islands surveyed
 
@@ -345,7 +434,8 @@ def test_a_blocked_claim_on_green_evidence_is_refused_while_a_job_is_open(monkey
     )
 
     assert result.succeeded is False
-    assert result.error_code == "blocked_contradicted_by_green_evidence"
+    assert result.error_code == "job_controller_barrier"
+    assert result.metadata["control_disposition"] == "wait_required"
 
 
 # ---------------------------------------------------------------------------
@@ -353,11 +443,7 @@ def test_a_blocked_claim_on_green_evidence_is_refused_while_a_job_is_open(monkey
 # ---------------------------------------------------------------------------
 
 
-def test_a_sealed_run_does_not_cap_a_report_claim_on_books_it_cannot_settle(monkeypatch):
-    """After evidence-close the run settles nothing (§3.2), so the obligation the
-    ledger still names can never be discharged. The report was delivered; the
-    claim is confirmed, and the unsettled job stands on the verdict as the
-    `job_unsettled` conflict recorded before the close."""
+def test_a_sealed_run_cannot_grade_past_a_live_job(monkeypatch):
     _inspect(monkeypatch, facts={"report.delivered": True})
 
     gate = check_phase_claim(
@@ -369,15 +455,13 @@ def test_a_sealed_run_does_not_cap_a_report_claim_on_books_it_cannot_settle(monk
         sealed=True,
     )
 
-    assert gate.validated_outcome is PhaseOutcome.SUCCESS
-    assert gate.disposition is ClaimDisposition.CONFIRMED
+    assert gate.validated_outcome is PhaseOutcome.UNKNOWN
+    assert gate.accepted is False
+    assert gate.control_disposition is GateControlDisposition.WAIT_REQUIRED
     assert gate.validated_facts[OPEN_OBLIGATIONS_FACT] == [JOB]
 
 
-def test_a_job_that_terminated_before_the_report_claim_is_no_longer_a_partial(monkeypatch):
-    """The second half: the exit file is on disk, so the books COULD close — but
-    a sealed run may not settle them, and naming them open then recorded the
-    report phase `partial` on evidence that was complete."""
+def test_a_sealed_gate_does_not_mutate_a_stale_running_record(monkeypatch):
     _inspect(monkeypatch, facts={"report.delivered": True})
 
     gate = check_phase_claim(
@@ -389,13 +473,12 @@ def test_a_job_that_terminated_before_the_report_claim_is_no_longer_a_partial(mo
         sealed=True,
     )
 
-    assert gate.validated_outcome is PhaseOutcome.SUCCESS
+    assert gate.validated_outcome is PhaseOutcome.UNKNOWN
+    assert gate.control_disposition is GateControlDisposition.WAIT_REQUIRED
     assert gate.validated_facts[OPEN_OBLIGATIONS_FACT] == [JOB]
 
 
-def test_an_unsealed_claim_is_still_capped_and_says_what_can_be_claimed(monkeypatch):
-    """Before the close the cap is dischargeable — the job can still terminate
-    and settle — so it stays, and the refusal now carries a move."""
+def test_an_unsealed_live_job_returns_controller_wait(monkeypatch):
     _inspect(monkeypatch, facts={"report.delivered": True})
 
     gate = check_phase_claim(
@@ -409,14 +492,12 @@ def test_an_unsealed_claim_is_still_capped_and_says_what_can_be_claimed(monkeypa
 
     assert gate.disposition is ClaimDisposition.CONTRADICTED
     assert gate.suggestions
-    assert any("partial" in suggestion for suggestion in gate.suggestions)
-    assert any(JOB in suggestion for suggestion in gate.suggestions)
+    assert gate.control_disposition is GateControlDisposition.WAIT_REQUIRED
+    assert gate.code == "job_controller_barrier"
+    assert any("controller" in suggestion.lower() for suggestion in gate.suggestions)
 
 
-def test_the_polaris_upgrade_stays_dead_on_a_sealed_run(monkeypatch):
-    """The anchor, re-checked in the state where the cap no longer fires: the
-    OTHER half of §3.3 — no refinement above the claim while an obligation is
-    open — is not scoped by the seal, and it is what stops the upgrade."""
+def test_the_polaris_upgrade_stays_dead_behind_a_sealed_barrier(monkeypatch):
     _inspect(monkeypatch)
 
     gate = check_phase_claim(
@@ -428,6 +509,7 @@ def test_the_polaris_upgrade_stays_dead_on_a_sealed_run(monkeypatch):
         sealed=True,
     )
 
-    assert gate.validated_outcome is PhaseOutcome.PARTIAL
-    assert gate.disposition is ClaimDisposition.CONFIRMED
-    assert f"job {JOB} has no terminal receipt — the claim is confirmable at most" in gate.reason
+    assert gate.validated_outcome is PhaseOutcome.UNKNOWN
+    assert gate.disposition is ClaimDisposition.CONTRADICTED
+    assert gate.control_disposition is GateControlDisposition.WAIT_REQUIRED
+    assert JOB in gate.reason

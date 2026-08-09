@@ -29,7 +29,6 @@ import pytest
 from test_receipt_v2_and_assessments import ContainerFS
 
 from sag.agent.claim_graph import (
-    CLAIM_GRAPH_HEREDOC,
     CLAIM_GRAPH_PATH,
     CLAIM_GRAPH_SCHEMA_VERSION,
     ClaimGraph,
@@ -51,6 +50,7 @@ from sag.agent.control_events import (
     CONTROL_EVENT_KINDS,
     ClaimTransitionPayload,
     ControlEvent,
+    action_envelope_sha256,
 )
 
 HASH = "b" * 64
@@ -149,7 +149,11 @@ def test_existing_event_kinds_stay_byte_stable():
             "plan_index": 0,
             "tool": "build",
             "exact_params": {"action": "test"},
-            "envelope_sha256": HASH,
+            "envelope_sha256": action_envelope_sha256(
+                plan_index=0,
+                tool="build",
+                exact_params={"action": "test"},
+            ),
         },
     )
 
@@ -625,8 +629,10 @@ def test_materialize_writes_the_snapshot_atomically():
     assert graph.materialize(container) is True
 
     write = container.writes()[-1]
-    assert f"mv -f {CLAIM_GRAPH_PATH}.tmp {CLAIM_GRAPH_PATH}" in write
-    assert CLAIM_GRAPH_HEREDOC in write
+    assert write.startswith("mv -f -- ")
+    assert write.endswith(f" {CLAIM_GRAPH_PATH}")
+    assert sum("json.load" in command for command in container.commands) == 1
+    assert not any(path.endswith(".tmp") for path in container.files)
 
     body = json.loads(container.files[CLAIM_GRAPH_PATH])
     assert body["schema_version"] == CLAIM_GRAPH_SCHEMA_VERSION
@@ -661,6 +667,37 @@ def test_materialize_reports_a_failed_write():
     claims, events, _ = committed_history()
 
     assert load(events, claims).materialize(ContainerFS(writable=False)) is False
+
+
+def test_materialize_streams_a_large_snapshot_with_bounded_commands():
+    graph = ClaimGraph(fact_epoch=3)
+    for index in range(2_000):
+        graph.add_claim(
+            {
+                "claim_id": f"claim-{index:05d}",
+                "evidence_status": "untested",
+                "source_status": "current",
+            }
+        )
+    container = ContainerFS()
+
+    assert graph.materialize(container) is True
+
+    assert json.loads(container.files[CLAIM_GRAPH_PATH]) == graph.snapshot()
+    assert max(map(len, container.commands)) <= 60_200
+    assert not any(path.endswith(".tmp") for path in container.files)
+
+
+def test_materialize_failure_preserves_the_final_and_cleans_temps():
+    claims, events, _ = committed_history()
+    old_body = '{"schema_version":1,"claims":[]}'
+    container = ContainerFS(files={CLAIM_GRAPH_PATH: old_body})
+    container.atomic.fail_on = "mv -f --"
+
+    assert load(events, claims).materialize(container) is False
+
+    assert container.files[CLAIM_GRAPH_PATH] == old_body
+    assert not any(path != CLAIM_GRAPH_PATH and path.endswith(".tmp") for path in container.files)
 
 
 def test_a_fresh_load_ignores_the_materialized_file():

@@ -6,6 +6,7 @@ across maven_tool.py, gradle_tool.py, and docker_orch/orch.py.
 """
 
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,7 +16,9 @@ from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 
 from ..base import ToolResult, require_persisted_output_storage_ref
 
-DETACHED_HANDOFF_STATUSES = frozenset({"running_detached", "liveness_unknown_detached"})
+DETACHED_HANDOFF_STATUSES = frozenset(
+    {"running_detached", "liveness_unknown_detached", "dispatch_unknown"}
+)
 
 
 def detached_poll_ref(result: Dict[str, Any]) -> str:
@@ -113,9 +116,7 @@ def dispatch_hold_policy(system: str, argv: str) -> str:
         if _maven_skips_tests(tokens):
             return "progress"
         goals = [
-            token
-            for token in tokens
-            if not _is_hold_launcher(token) and not token.startswith("-")
+            token for token in tokens if not _is_hold_launcher(token) and not token.startswith("-")
         ]
         if goals and all(goal in _MAVEN_SAFE_GOALS for goal in goals):
             return "progress"
@@ -169,16 +170,50 @@ def detached_handoff_tool_result(
         refs=[poll_ref],
         metadata={
             "dispatch_status": result.get("dispatch_status", "running_detached"),
-            "runner_dispatched": result.get("runner_dispatched") is True,
+            # Preserve dispatch tri-state. ``None`` means Docker created an
+            # exec record but the host never proved that exec_start was
+            # accepted; collapsing it to False would erase the controller
+            # barrier, while collapsing it to True could launder an unstarted
+            # record into terminal success.
+            "runner_dispatched": (
+                dispatch.get("runner_dispatched")
+                if "runner_dispatched" in dispatch
+                else result.get("runner_dispatched")
+            ),
+            "runner_dispatch_state": (
+                dispatch.get("runner_dispatch_state")
+                if "runner_dispatch_state" in dispatch
+                else result.get("runner_dispatch_state")
+            ),
             "tool": tool_name,
             "command": command,
             "job_id": job_id,
             "pid": dispatch.get("pid"),
+            "pgid": dispatch.get("pgid"),
+            "process_identity_token": dispatch.get("process_identity_token"),
             "pid_path": dispatch.get("pid_path"),
+            "pgid_path": dispatch.get("pgid_path"),
+            "identity_path": dispatch.get("identity_path"),
+            "terminal_authority": dispatch.get("terminal_authority"),
+            "docker_exec_id": dispatch.get("docker_exec_id"),
+            "container_id": dispatch.get("container_id"),
+            "start_accepted": dispatch.get("start_accepted"),
+            "startup_identity_verified": dispatch.get("startup_identity_verified"),
+            "started": dispatch.get("started"),
             "log_path": log_path,
             "exit_code_path": dispatch.get("exit_code_path"),
             "soft_timeout": dispatch.get("soft_timeout"),
             "handoff_reason": result.get("handoff_reason"),
+            **(
+                {
+                    "job_obligation_persisted": result.get("job_obligation_persisted"),
+                    "job_obligation_persistence_code": result.get(
+                        "job_obligation_persistence_code"
+                    ),
+                }
+                if "job_obligation_persisted" in result
+                else {}
+            ),
         },
     )
 
@@ -188,18 +223,35 @@ def classify_detached_completion(
     tail: str,
     full_output_ref: str | None = None,
     *,
+    runner: str | None = None,
     full_output: str | None = None,
     poll_ref: str | None = None,
     output_ref_storage: Any = None,
     invocation_status: InvocationStatus | str = InvocationStatus.COMPLETED,
     terminal_observation: bool = False,
 ) -> ToolResult:
-    """Classify a terminal detached observation, preferring fatal evidence."""
+    """Classify one detached result in the ecosystem that actually ran.
+
+    A real non-zero process exit is authoritative.  With a known runner, only
+    that runner's native terminal vocabulary may refine a zero/missing exit;
+    another ecosystem's lexical marker has no standing.  Generic fatal
+    markers are a fallback only when the runner is unknown or the exit marker
+    itself is missing.
+    """
     terminal_status = InvocationStatus(invocation_status)
-    analyses = [
-        BuildAnalyzer.detect_build_status(tail, command)
-        for command in ("mvn", "gradle", "npm", "pytest", "make")
-    ]
+    normalized_runner = _normalize_detached_runner(runner)
+    runner_command = {
+        "maven": "mvn",
+        "gradle": "gradle",
+        "npm": "npm",
+        "python": "pytest",
+        "make": "make",
+    }.get(normalized_runner)
+    native_analysis = (
+        BuildAnalyzer.detect_build_status(tail, runner_command)
+        if runner_command is not None
+        else {"success": None, "tool": "unknown", "markers_found": []}
+    )
     fatal_markers = (
         r"\bCMake Error\b",
         r"\bconfiguration failed\b",
@@ -209,21 +261,35 @@ def classify_detached_completion(
         r"\bsegmentation fault\b",
         r"\bfatal error\b",
     )
-    fatal_tail = any(analysis["success"] is False for analysis in analyses) or any(
-        re.search(pattern, tail, flags=re.IGNORECASE) for pattern in fatal_markers
+    generic_fatal = any(re.search(pattern, tail, flags=re.IGNORECASE) for pattern in fatal_markers)
+    failed = bool(
+        (exit_code is not None and exit_code != 0)
+        or native_analysis["success"] is False
+        or (
+            native_analysis["success"] is None
+            and (normalized_runner is None or exit_code is None)
+            and generic_fatal
+        )
     )
-    failed = (exit_code is not None and exit_code != 0) or fatal_tail
+
+    def with_runner(result: ToolResult) -> ToolResult:
+        if normalized_runner is not None:
+            result.metadata["runner"] = normalized_runner
+        return result
+
     if failed:
-        return ToolResult.terminal_failure(
-            invocation_status=terminal_status,
-            output=tail,
-            error="Detached operation failed",
-            error_code="DETACHED_OPERATION_FAILED",
-            raw_output=full_output or tail,
-            error_tail_preview=tail[-400:],
-            output_ref=full_output_ref,
-            output_ref_storage=output_ref_storage,
-            poll_ref=poll_ref,
+        return with_runner(
+            ToolResult.terminal_failure(
+                invocation_status=terminal_status,
+                output=tail,
+                error="Detached operation failed",
+                error_code="DETACHED_OPERATION_FAILED",
+                raw_output=full_output or tail,
+                error_tail_preview=tail[-400:],
+                output_ref=full_output_ref,
+                output_ref_storage=output_ref_storage,
+                poll_ref=poll_ref,
+            )
         )
     if full_output_ref is not None:
         require_persisted_output_storage_ref(
@@ -232,34 +298,77 @@ def classify_detached_completion(
         )
     if exit_code is None:
         if terminal_observation:
-            return ToolResult(
-                invocation_status=terminal_status,
+            return with_runner(
+                ToolResult(
+                    invocation_status=terminal_status,
+                    operation_outcome=OperationOutcome.UNKNOWN,
+                    evidence_status=EvidenceStatus.UNKNOWN,
+                    poll_ref=poll_ref,
+                    output=tail,
+                    raw_output=full_output or tail,
+                    error="Detached operation ended without a recorded exit status",
+                    error_code="DETACHED_EXIT_STATUS_MISSING",
+                    output_ref=full_output_ref,
+                    refs=[poll_ref] if poll_ref else [],
+                )
+            )
+        if not poll_ref:
+            raise ValueError("inconclusive detached completion requires a stable poll_ref")
+        return with_runner(
+            ToolResult(
+                invocation_status=InvocationStatus.PENDING,
                 operation_outcome=OperationOutcome.UNKNOWN,
                 evidence_status=EvidenceStatus.UNKNOWN,
                 poll_ref=poll_ref,
                 output=tail,
-                raw_output=full_output or tail,
-                error="Detached operation ended without a recorded exit status",
-                error_code="DETACHED_EXIT_STATUS_MISSING",
                 output_ref=full_output_ref,
-                refs=[poll_ref] if poll_ref else [],
+                refs=[poll_ref],
             )
-        if not poll_ref:
-            raise ValueError("inconclusive detached completion requires a stable poll_ref")
-        return ToolResult(
-            invocation_status=InvocationStatus.PENDING,
-            operation_outcome=OperationOutcome.UNKNOWN,
-            evidence_status=EvidenceStatus.UNKNOWN,
-            poll_ref=poll_ref,
+        )
+    return with_runner(
+        ToolResult.completed_success(
             output=tail,
             output_ref=full_output_ref,
-            refs=[poll_ref],
+            poll_ref=poll_ref,
         )
-    return ToolResult.completed_success(
-        output=tail,
-        output_ref=full_output_ref,
-        poll_ref=poll_ref,
     )
+
+
+def _normalize_detached_runner(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "maven": "maven",
+        "mvn": "maven",
+        "mvnw": "maven",
+        "gradle": "gradle",
+        "gradlew": "gradle",
+        "npm": "npm",
+        "yarn": "npm",
+        "pnpm": "npm",
+        "python": "python",
+        "pytest": "python",
+        "make": "make",
+        "gmake": "make",
+    }
+    return aliases.get(text)
+
+
+def detached_runner_from_command(command: Any) -> str | None:
+    """Identify a simple direct runner command; composites stay unknown."""
+    try:
+        tokens = shlex.split(str(command or ""))
+    except ValueError:
+        return None
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    executable = Path(tokens[0]).name.lower()
+    if executable == "env":
+        return None
+    if executable in {"python", "python3"}:
+        return "python" if len(tokens) > 2 and tokens[1:3] == ["-m", "pytest"] else None
+    return _normalize_detached_runner(executable)
 
 
 class BuildAnalyzer:
@@ -352,10 +461,16 @@ class BuildAnalyzer:
         elif "make" in command_lower:
             result["tool"] = "make"
 
-            if "Error" in output or "*** [" in output:
+            if re.search(
+                r"(?mi)^make(?:\[\d+\])?:\s+\*\*\*\s+.+\s+(?:Error|Killed)\s+\d+\s*$",
+                output,
+            ):
                 result["success"] = False
                 result["markers_found"].append("Make error")
-            elif "make: Nothing to be done" in output or not re.search(r"make.*Error", output):
+            elif re.search(
+                r"(?mi)^make(?:\[\d+\])?:\s+(?:Nothing to be done|.+ is up to date)",
+                output,
+            ):
                 result["success"] = True
                 result["markers_found"].append("Make completed")
 

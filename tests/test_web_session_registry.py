@@ -860,6 +860,7 @@ def test_same_second_setup_sessions_resolve_to_their_own_workspace():
 def test_build_payload_surfaces_time_note_artifact():
     payload = _build_payload_from_metrics(
         {
+            "version": 1,
             "build": {
                 "state": "success",
                 "system": "maven",
@@ -869,7 +870,7 @@ def test_build_payload_surfaces_time_note_artifact():
                 "time": "47.2s",
                 "note": "clean package",
                 "artifact": "target/x.jar",
-            }
+            },
         }
     )
     assert payload is not None
@@ -879,7 +880,9 @@ def test_build_payload_surfaces_time_note_artifact():
 
 
 def test_build_payload_time_falls_back_to_dash():
-    payload = _build_payload_from_metrics({"build": {"state": "success", "tool": "maven"}})
+    payload = _build_payload_from_metrics(
+        {"version": 1, "build": {"state": "success", "tool": "maven"}}
+    )
     assert payload is not None
     assert payload["time"] == "—"
     assert payload.get("note") in (None, "", "—")

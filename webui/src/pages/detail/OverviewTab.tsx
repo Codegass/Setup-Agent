@@ -1,4 +1,4 @@
-import type { ExecutionSessionDetail } from "@/api/types"
+import type { EvidenceCountSummary, ExecutionSessionDetail, ObservationCountSummary } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
 import { NeedsAttention } from "@/components/session/NeedsAttention"
 import { cn } from "@/lib/utils"
@@ -9,6 +9,32 @@ function pct1(n: number): string {
 
 function passRate(pass: number, total: number): string | null {
   return total > 0 ? pct1((pass / total) * 100) : null
+}
+
+function completeCounts(counts: EvidenceCountSummary | undefined): counts is EvidenceCountSummary & {
+  executed: number
+  passed: number
+  failed: number
+  errors: number
+  skipped: number
+} {
+  return !!counts
+    && counts.availability !== "unavailable"
+    && [counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped]
+      .every((value) => typeof value === "number" && Number.isFinite(value))
+}
+
+function observationNote(
+  label: string,
+  counts: ObservationCountSummary,
+): string | null {
+  if (typeof counts.executed === "number" && counts.executed > 0) {
+    return `${counts.executed.toLocaleString()} ${label} observations · not verdict-bearing`
+  }
+  if (typeof counts.reportFileCount === "number" && counts.reportFileCount > 0) {
+    return `${counts.reportFileCount.toLocaleString()} ${label} report files · not verdict-bearing`
+  }
+  return null
 }
 
 function progressText(progress: Record<string, number> | undefined): string | null {
@@ -58,19 +84,51 @@ export function OverviewTab({
   const ms = detail.moduleSummary
   const modules = detail.modules ?? []
   const singleModule = ms?.singleModule ?? modules.length <= 1
+  const layers = test.evidenceLayers?.tests
+  const claimedSubjects = layers?.claimed.latestSubjects
+  const claimedAvailable = completeCounts(claimedSubjects)
+  const claimedNonSkip = claimedAvailable
+    ? claimedSubjects.passed + claimedSubjects.failed + claimedSubjects.errors
+    : 0
 
-  const rate = passRate(test.pass, test.total)
-  const passSub = [
-    test.pass ? `${test.pass.toLocaleString()} passed` : null,
-    test.skip ? `${test.skip.toLocaleString()} skipped` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ")
+  const rate = layers
+    ? claimedAvailable ? passRate(claimedSubjects.passed, claimedNonSkip) : null
+    : passRate(test.pass, test.total)
+  const passSub = layers
+    ? claimedAvailable
+      ? [
+          `${claimedSubjects.passed.toLocaleString()} passed`,
+          claimedSubjects.skipped ? `${claimedSubjects.skipped.toLocaleString()} skipped` : null,
+        ].filter(Boolean).join(" · ")
+      : claimedSubjects?.reason ?? "module-qualified subject metric unavailable"
+    : [
+        test.pass ? `${test.pass.toLocaleString()} passed` : null,
+        test.skip ? `${test.skip.toLocaleString()} skipped` : null,
+      ].filter(Boolean).join(" · ")
+
+  const claimedFailures = claimedAvailable
+    ? claimedSubjects.failed + claimedSubjects.errors
+    : null
+  const observationSub = layers
+    ? [
+        observationNote("quarantined", layers.quarantinedObservations),
+        observationNote("unattributed", layers.unattributedObservations),
+        observationNote("stale", layers.staleObservations),
+      ].filter(Boolean).join(" · ")
+    : null
 
   const failingModules = modules.filter((m) => (m.failingCount ?? 0) > 0).length
-  const failSub = !singleModule && failingModules > 0
-    ? `across ${failingModules} module${failingModules > 1 ? "s" : ""}`
-    : null
+  const failSub = layers
+    ? observationSub || null
+    : !singleModule && failingModules > 0
+      ? `across ${failingModules} module${failingModules > 1 ? "s" : ""}`
+      : null
+  const passValueClass = layers
+    ? claimedFailures === 0 && rate !== null ? "text-status-success" : undefined
+    : "text-status-success"
+  const failureValueClass = (layers ? claimedFailures ?? 0 : test.fail) > 0
+    ? "text-status-failed"
+    : undefined
 
   const goal = detail.context?.trunk.goal
   const progress = progressText(detail.context?.trunk.progress)
@@ -92,16 +150,16 @@ export function OverviewTab({
 
       <div className="grid grid-cols-3 gap-3">
         <Tile
-          label="Pass rate"
+          label={layers ? "Claimed subject pass rate" : "Pass rate"}
           value={rate ?? "—"}
           sub={passSub || null}
-          valueClass="text-status-success"
+          valueClass={passValueClass}
         />
         <Tile
-          label="Failing tests"
-          value={String(test.fail ?? 0)}
+          label={layers ? "Claimed subject failures" : "Failing tests"}
+          value={claimedFailures === null && layers ? "—" : String(layers ? claimedFailures : test.fail ?? 0)}
           sub={failSub}
-          valueClass={test.fail > 0 ? "text-status-failed" : undefined}
+          valueClass={failureValueClass}
         />
         {!singleModule && ms ? (
           <Tile

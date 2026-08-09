@@ -79,7 +79,7 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # document-map fingerprint the contract freeze pins against. A v10 manifest was
 # written by a survey that produced neither, so reusing it would leave a run
 # with no claims to cite and no map to retrieve from.
-SURVEY_FACTS_VERSION = 11
+SURVEY_FACTS_VERSION = 12
 
 
 def _project_recommendation_coordinates(rec):
@@ -145,8 +145,7 @@ class ProjectAnalyzerTool(BaseTool):
         project path AND this survey's config fingerprint — a stale file
         left on disk keeps the readback non-empty when a replacement write
         is dropped, and version+path alone cannot tell two surveys of the
-        same project apart); ``"present"`` for an agent-era
-        stampless manifest, or a current same-project stamp on BOTH persisted
+        same project apart); ``"present"`` for a current same-project v1 stamp on BOTH persisted
         ends (manifest and trunk env-summary — they fail independently, and a
         manifest-only partial survey must retry the trunk save, not skip it);
         ``"failed"`` otherwise. Older-version or other-project stamps
@@ -160,14 +159,13 @@ class ProjectAnalyzerTool(BaseTool):
         if orchestrator is None:
             return "failed"
         try:
-            from .build_preflight import read_build_requirements
+            from .build_preflight import read_live_build_requirements
 
-            existing = read_build_requirements(orchestrator) or {}
+            live_existing = read_live_build_requirements(orchestrator)
+            if not live_existing.complete or live_existing.conflict is not None:
+                return "failed"
+            existing = dict(live_existing.payload or {})
             existing_stamp = (existing.get("survey") or {}) if existing else {}
-            if existing and not existing_stamp:
-                # Agent-era manifest (pre-stamp): still authoritative — the
-                # zero-behavior-change promise when the agent DID analyze.
-                return "present"
 
             validated = self._validate_and_discover_project_path(project_path)
             if not validated:
@@ -175,8 +173,13 @@ class ProjectAnalyzerTool(BaseTool):
             if (
                 existing_stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
                 and existing_stamp.get("project_path") == validated
-                and self._trunk_survey_current(validated, existing_stamp.get("config_fingerprint"))
+                and self._trunk_survey_current(
+                    validated,
+                    existing_stamp.get("config_fingerprint"),
+                    existing_stamp.get("target_sha"),
+                )
                 and not self._config_changed_since(orchestrator, existing_stamp, validated)
+                and not self._target_changed_since(orchestrator, existing_stamp, validated)
             ):
                 # Current survey for THIS project, on BOTH persisted ends,
                 # derived from the config still on disk (re-review 2026-07-19:
@@ -200,11 +203,19 @@ class ProjectAnalyzerTool(BaseTool):
             # carry THIS survey's stamp — a stale file left on disk keeps the
             # readback non-empty even when the replacement write was dropped
             # (re-review 2026-07-19).
-            persisted = (read_build_requirements(orchestrator) or {}).get("survey") or {}
+            live_persisted = read_live_build_requirements(orchestrator)
+            if (
+                not live_persisted.complete
+                or live_persisted.conflict is not None
+                or live_persisted.payload is None
+            ):
+                return "failed"
+            persisted = live_persisted.payload.get("survey") or {}
             if (
                 persisted.get("analyzer_version") != SURVEY_FACTS_VERSION
                 or persisted.get("project_path") != validated
                 or persisted.get("config_fingerprint") != analysis.get("config_fingerprint")
+                or persisted.get("target_sha") != analysis.get("target_sha")
             ):
                 # The fingerprint term is what catches a dropped rewrite after
                 # a CONFIG EDIT: the old manifest matches on version+path (same
@@ -218,7 +229,12 @@ class ProjectAnalyzerTool(BaseTool):
             logger.warning(f"framework survey failed: {exc}")
             return "failed"
 
-    def _trunk_survey_current(self, validated: str, manifest_fingerprint) -> bool:
+    def _trunk_survey_current(
+        self,
+        validated: str,
+        manifest_fingerprint,
+        manifest_target_sha,
+    ) -> bool:
         """Whether the trunk env-summary carries THIS survey's stamp —
         version, project path AND config fingerprint.
 
@@ -239,6 +255,7 @@ class ProjectAnalyzerTool(BaseTool):
             stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
             and stamp.get("project_path") == validated
             and stamp.get("config_fingerprint") == manifest_fingerprint
+            and stamp.get("target_sha") == manifest_target_sha
         )
 
     def _config_changed_since(self, orchestrator, stamp: Dict[str, Any], validated: str) -> bool:
@@ -256,6 +273,24 @@ class ProjectAnalyzerTool(BaseTool):
         if not stored:
             return False
         current = config_fingerprint(orchestrator, validated)
+        return bool(current) and current != stored
+
+    @staticmethod
+    def _target_changed_since(orchestrator, stamp: Dict[str, Any], validated: str) -> bool:
+        """Whether the checkout moved since the stamped survey.
+
+        As with the config fingerprint, an unavailable probe means CANNOT
+        COMPARE rather than mismatch.  A readable different SHA invalidates
+        the fast path even when every surveyed config byte happens to match.
+        """
+
+        from sag.agent.invocation_receipts import target_sha
+
+        stored = str(stamp.get("target_sha") or "").strip()
+        current = target_sha(orchestrator.execute_command, validated)
+        # A newly readable target lets the survey repair a previously unpinned
+        # stamp exactly once.  The opposite direction remains CANNOT COMPARE:
+        # a transiently unavailable probe must not thrash a good pinned survey.
         return bool(current) and current != stored
 
     def execute(
@@ -804,7 +839,6 @@ class ProjectAnalyzerTool(BaseTool):
         from sag.agent.physical_survey import (
             derive_domain_edges,
             enumerate_build_domains,
-            read_policy_claims,
         )
 
         domains = enumerate_build_domains(self.docker_orchestrator, project_path, source_modules)
@@ -815,10 +849,11 @@ class ProjectAnalyzerTool(BaseTool):
         # stay index-aligned for their readers.
         domains.sort(key=lambda d: 0 if d["root"] == preferred_root else 1)
         rec["build_domains"] = domains
-        # Plan 6 Stage A: the persisted policy claims are what can SUPPORT an
-        # edge. Absent claims mean absent support keys — the edges themselves
-        # are still derived from the coordinates alone.
-        edges = derive_domain_edges(domains, claims=read_policy_claims(self.docker_orchestrator))
+        # Coordinate edges are independent of policy claims.  Claim support is
+        # attached only after THIS survey has persisted and host-published its
+        # document-derived claim ledger; reading a reused container here would
+        # let prior/unpublished bytes ride into a fresh manifest.
+        edges = derive_domain_edges(domains, claims=[])
         if edges:
             rec["domain_edges"] = edges
 
@@ -863,10 +898,17 @@ class ProjectAnalyzerTool(BaseTool):
         if fingerprint:
             analysis["document_map_fingerprint"] = fingerprint
 
+        # Ephemeral controller handoff, consumed and removed by
+        # ``_persist_build_requirements``. ``None`` means extraction never
+        # completed; ``[]`` is a proved empty deterministic result.
+        analysis["_current_policy_claim_ids"] = None
         try:
             claims = self._extract_document_claims(execute, project_path, document_map, analysis)
             if claims and not write_claims(execute, claims):
                 raise RuntimeError("not every extracted claim reached the container")
+            analysis["_current_policy_claim_ids"] = sorted(
+                {str(claim.claim_id) for claim in claims}
+            )
         except Exception as exc:
             self._record_survey_conflict(analysis, "claim_extraction_failed", exc)
         return document_map
@@ -886,7 +928,7 @@ class ProjectAnalyzerTool(BaseTool):
         nothing.
         """
         from sag.agent.claim_records import entry_has_extractors, extract_policy_claims
-        from sag.agent.document_map import read_entry_text
+        from sag.agent.document_map import DocumentSourceChangedError, read_entry_text
 
         domain_roots = [
             str(domain.get("root") or "")
@@ -898,7 +940,11 @@ class ProjectAnalyzerTool(BaseTool):
             body = entry.payload() if hasattr(entry, "payload") else dict(entry)
             if not entry_has_extractors(body):
                 continue
-            text = read_entry_text(execute, body)
+            try:
+                text = read_entry_text(execute, body)
+            except DocumentSourceChangedError as exc:
+                self._record_survey_conflict(analysis, "document_source_changed", exc)
+                continue
             if not text:
                 continue
             claims.extend(
@@ -1062,7 +1108,10 @@ class ProjectAnalyzerTool(BaseTool):
           nothing (Bigtop: profile-gated modules).
         - anything else -> ``single_module``.
         """
-        from .build_preflight import write_build_requirements
+        from .build_preflight import (
+            BUILD_REQUIREMENTS_SCHEMA_VERSION,
+            write_build_requirements,
+        )
 
         rec = analysis.get("build_recommendation") or {}
         build_root = rec.get("build_root") or project_path
@@ -1079,6 +1128,7 @@ class ProjectAnalyzerTool(BaseTool):
         # cluster lives elsewhere (Bigtop's Gradle subtree) leave it alone.
         test_fail_at_end = fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
 
+        from sag.agent.invocation_receipts import target_sha
         from sag.agent.physical_survey import config_fingerprint
 
         # Computed once, stamped on BOTH persisted ends: the manifest here and
@@ -1086,8 +1136,13 @@ class ProjectAnalyzerTool(BaseTool):
         # requires agreement — a manifest-only fingerprint let a stale trunk
         # pass on version+path alone).
         analysis["config_fingerprint"] = config_fingerprint(self.docker_orchestrator, project_path)
+        analysis["target_sha"] = target_sha(
+            self.docker_orchestrator.execute_command,
+            project_path,
+        )
 
         data = {
+            "schema_version": BUILD_REQUIREMENTS_SCHEMA_VERSION,
             "survey": {
                 "project_path": project_path,
                 "analyzer_version": SURVEY_FACTS_VERSION,
@@ -1095,6 +1150,13 @@ class ProjectAnalyzerTool(BaseTool):
                 # derived from. None when the probe is unavailable — the fast
                 # path then skips the comparison rather than thrash.
                 "config_fingerprint": analysis["config_fingerprint"],
+                "target_sha": analysis["target_sha"],
+                # The map is a peer publication and may be unavailable.  The
+                # nullable field remains present so absence is typed rather
+                # than confused with an older schema that never knew the pin.
+                "document_map_fingerprint": (
+                    str(analysis.get("document_map_fingerprint") or "") or None
+                ),
             },
             "java_version": analysis.get("java_version"),
             "java_version_source": analysis.get("java_version_source"),
@@ -1113,21 +1175,82 @@ class ProjectAnalyzerTool(BaseTool):
             "test_islands": rec.get("test_islands") or [],
         }
 
+        current_document_map: Optional[Dict[str, Any]] = None
+        if document_map is not None:
+            from sag.agent.document_map import (
+                document_map_payload,
+                read_live_document_map,
+                validate_document_map_v1,
+            )
+
+            expected_map = validate_document_map_v1(document_map_payload(document_map))
+            live_map = read_live_document_map(self.docker_orchestrator)
+            if (
+                not live_map.complete
+                or live_map.conflict is not None
+                or live_map.payload is None
+                or live_map.payload != expected_map
+            ):
+                detail = live_map.detail or live_map.conflict or "body_mismatch"
+                raise RuntimeError(f"document_map_live_unavailable: {detail}")
+            current_document_map = dict(live_map.payload)
+
         # Plan 6 Stage F1: the same staleness contract, one document further —
         # the pre-dispatch freeze pins this fingerprint, so a contract frozen
         # against a map that has since changed is refused as historical rather
         # than applied to current truth (spec §6 "Staleness"). Absent when this
         # survey discovered no map, so a manifest never states a pin it has not
         # observed.
-        document_map_fingerprint = str(analysis.get("document_map_fingerprint") or "")
-        if document_map_fingerprint:
-            data["survey"]["document_map_fingerprint"] = document_map_fingerprint
-
         # P0-B: the typed domains and their coordinate edges ride the SAME
-        # handoff manifest, so every reader downstream judges independence from
-        # the graph instead of the directory layout. Absent — not empty — when
-        # the survey found no multi-domain decomposition, which keeps
-        # single-module and healthy-reactor manifests byte-identical.
+        # handoff manifest. Claim-supported projections are derived only from
+        # the complete, host-authorized ledger written by THIS survey. A loose
+        # container mirror, deleted published record, stale extra file or
+        # malformed neighbour makes the derivation unavailable; it must never
+        # be washed into a newly published requirements manifest.
+        current_policy_claims: List[Dict[str, Any]] = []
+        surveyed_claim_ids = analysis.pop("_current_policy_claim_ids", None)
+        if rec.get("build_domains"):
+            from sag.agent.claim_records import read_live_policy_claim_ledger
+            from sag.agent.physical_survey import derive_domain_edges
+
+            claim_ledger = read_live_policy_claim_ledger(self.docker_orchestrator)
+            if not claim_ledger.complete or claim_ledger.conflict is not None:
+                detail = claim_ledger.detail or claim_ledger.conflict or "unavailable"
+                raise RuntimeError(f"policy_claim_ledger_unavailable: {detail}")
+            published_claims = [dict(record.payload) for record in claim_ledger.records]
+            document_claims = [
+                claim
+                for claim in published_claims
+                if claim.get("source_class") in {"repository_doc", "config"}
+            ]
+            published_document_ids = sorted(
+                str(claim.get("claim_id") or "") for claim in document_claims
+            )
+            if surveyed_claim_ids is None:
+                # Direct callers with a proved-empty host ledger remain valid;
+                # any existing document claim without this survey's exact-set
+                # handoff is historical authority and cannot be reused.
+                if published_document_ids:
+                    raise RuntimeError("policy_claim_current_set_unavailable")
+            elif (
+                not isinstance(surveyed_claim_ids, list)
+                or any(type(item) is not str or not item for item in surveyed_claim_ids)
+                or len(surveyed_claim_ids) != len(set(surveyed_claim_ids))
+                or sorted(surveyed_claim_ids) != published_document_ids
+            ):
+                raise RuntimeError("policy_claim_current_set_mismatch")
+            current_policy_claims = document_claims
+            current_edges = derive_domain_edges(
+                rec["build_domains"],
+                claims=current_policy_claims,
+            )
+            if current_edges:
+                rec["domain_edges"] = current_edges
+            else:
+                rec.pop("domain_edges", None)
+
+        # Absent — not empty — without a multi-domain decomposition, preserving
+        # the historical single-module/healthy-reactor manifest shape.
         for key in ("build_domains", "domain_edges"):
             if rec.get(key):
                 data[key] = rec[key]
@@ -1146,9 +1269,10 @@ class ProjectAnalyzerTool(BaseTool):
                 self.docker_orchestrator,
                 rec["build_domains"],
                 rec.get("domain_edges"),
+                claims=current_policy_claims,
                 # The map this survey just discovered, handed over rather than
                 # read back out of the container.
-                document_map=document_map,
+                document_map=current_document_map,
                 native_artifact_fact=self._survey_native_artifact_fact(project_path, analysis),
             )
             if domain_facts:
@@ -1171,10 +1295,9 @@ class ProjectAnalyzerTool(BaseTool):
                     "python_packages": python_config.get("python_packages") or [],
                     "python_distribution_name": python_config.get("python_distribution_name"),
                     "python_build_backend": python_config.get("python_build_backend"),
-                    "python_declared_dependencies": python_config.get(
-                        "python_declared_dependencies"
-                    )
-                    or [],
+                    "python_declared_dependencies": list(
+                        dict.fromkeys(python_config.get("python_declared_dependencies") or [])
+                    ),
                     "python_package_paths": python_config.get("python_package_paths") or [],
                     "python_local_providers": python_config.get("python_local_providers") or [],
                     "python_smoke_candidates": python_config.get("python_smoke_candidates") or [],
@@ -1254,6 +1377,7 @@ class ProjectAnalyzerTool(BaseTool):
                 # both ends must describe the same survey or the fast path
                 # re-surveys (final Category-2 review P1).
                 "config_fingerprint": analysis.get("config_fingerprint"),
+                "target_sha": analysis.get("target_sha"),
             }
 
         build_recommendation = analysis.get("build_recommendation")

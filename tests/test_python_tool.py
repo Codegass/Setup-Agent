@@ -16,6 +16,7 @@ command recorded. Contract under test:
   callers never redden a verdict on it.
 """
 
+import hashlib
 import importlib.metadata
 import json
 import shlex
@@ -24,9 +25,20 @@ import sys
 import xml.etree.ElementTree as ET
 
 import pytest
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+from test_container_io import FakeContainer
 
 import sag.tools.internal.build_preflight as bp
+import sag.tools.internal.python_tool as python_module
+from sag.agent.action_intents import action_fingerprint
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
+from sag.agent.invocation_contracts import (
+    PYTHON_FACADE_EXECUTION_BINDING,
+    build_contract,
+    dispatch_contract,
+)
 from sag.agent.invocation_receipts import RECEIPT_DIR
+from sag.agent.job_obligations import OBLIGATION_DIR
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.python_tool import (
     _NATIVE_PROJECT_READY_SCRIPT,
@@ -36,6 +48,85 @@ from sag.tools.internal.python_tool import (
     PythonTool,
     verify_project_owned_path,
 )
+
+pytestmark = pytest.mark.usefixtures("facade_contract_authority")
+
+_ORIGINAL_PYTHON_EXECUTE = PythonTool.execute
+
+
+@pytest.fixture(autouse=True)
+def _exact_python_contract_authority(monkeypatch):
+    """Freeze one precise semantic facade contract per direct Python call."""
+
+    public_actions = {
+        "setup_env": "deps",
+        "test": "test",
+        "build": "package",
+        "compile": "compile",
+        "native": "native",
+    }
+
+    def authorized_execute(
+        self,
+        operation,
+        working_directory="/workspace",
+        args=None,
+        timeout=600,
+        native=None,
+    ):
+        op = str(operation or "").strip().lower()
+        if op not in public_actions:
+            return _ORIGINAL_PYTHON_EXECUTE(
+                self,
+                operation,
+                working_directory=working_directory,
+                args=args,
+                timeout=timeout,
+                native=native,
+            )
+        params = {
+            "action": public_actions[op],
+            "working_directory": working_directory,
+        }
+        if args is not None:
+            params["args"] = args
+        if timeout != 600:
+            params["timeout"] = timeout
+        if op == "native" and isinstance(native, dict):
+            params["features"] = list(native.get("features") or ())
+            params["definitions"] = dict(native.get("definitions") or {})
+        domain_id = f"test:{working_directory}"
+        contract = build_contract(
+            run_id="run-python-tool-unit",
+            envelope_id=f"envelope-python-tool-{op}",
+            tool="build",
+            params=params,
+            effective_tool="python",
+            effective_action=op,
+            expected_cwd=working_directory,
+            expected_argv=None,
+            execution_binding=PYTHON_FACADE_EXECUTION_BINDING,
+            intent_source="controller",
+            intent_id=f"intent-python-tool-{op}",
+            intent_domain_id=domain_id,
+            intent_exact_params=params,
+            action_fingerprint=action_fingerprint(
+                domain_id=domain_id,
+                tool="build",
+                params=params,
+            ),
+        )
+        with dispatch_contract(contract):
+            return _ORIGINAL_PYTHON_EXECUTE(
+                self,
+                operation,
+                working_directory=working_directory,
+                args=args,
+                timeout=timeout,
+                native=native,
+            )
+
+    monkeypatch.setattr(PythonTool, "execute", authorized_execute)
 
 
 def pytest_runs(orch):
@@ -82,14 +173,34 @@ class FailThenOk:
 class Orch:
     """Scriptable orchestrator: first matching substring rule wins."""
 
-    def __init__(self, manifest=None, rules=None, python_output="Python 3.12.4"):
+    def __init__(
+        self,
+        manifest=None,
+        rules=None,
+        python_output="Python 3.12.4",
+        *,
+        publish_manifest=True,
+    ):
         self.manifest = manifest
         self.rules = list(rules or [])
         self.python_output = python_output
         self.commands = []
+        self.evidence_store = ContainerFS()
+        if publish_manifest:
+            add_published_mutable_json(
+                self,
+                self.evidence_store,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=dict(manifest or {}),
+            )
 
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
+        if REQUIREMENTS_PATH in cmd and "SAG_NAMED_JSON_RECORD_V1" in cmd:
+            return self.evidence_store(cmd)
         if "python3 --version" in cmd:
             return ok(self.python_output)
         if cmd.startswith("cat ") and REQUIREMENTS_PATH in cmd:
@@ -128,6 +239,24 @@ class MonitoringOrch(Orch):
             }
         )
         return self.execute_command(cmd, workdir=workdir)
+
+
+class ObligationMonitoringOrch(MonitoringOrch):
+    """Monitoring surface with a real exact-byte job-ledger store."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.obligation_store = FakeContainer()
+
+    def execute_command(self, cmd, workdir=None, **kwargs):
+        if OBLIGATION_DIR in cmd:
+            self.commands.append(cmd)
+            result = self.obligation_store.execute_command(cmd, **kwargs)
+            return {
+                "success": result.get("exit_code") == 0,
+                **result,
+            }
+        return super().execute_command(cmd, workdir=workdir, **kwargs)
 
 
 MANIFEST = {
@@ -301,6 +430,10 @@ def compile_metrics(
                 "foreign_pyc_count": foreign_pyc_count,
                 "coverage": coverage,
                 "cache_tag": "cpython-312",
+                "source_basis_sha256": "a" * 64,
+                "pyc_basis_sha256": "b" * 64,
+                "source_basis_entry_count": source_count,
+                "pyc_basis_entry_count": compiled_source_count,
                 "conflicts": ["metrics_conflict"] if status == "invalid" else [],
                 "missing_sources": [],
                 "foreign_pycs": (
@@ -313,9 +446,78 @@ def compile_metrics(
     )
 
 
+def capture_python_receipts(monkeypatch, *, persisted=True):
+    calls = []
+
+    def record(_execute, **kwargs):
+        calls.append(kwargs)
+        if persisted:
+            return {"receipt_id": f"inv-python-{kwargs['effective_action']}-captured"}
+        return {
+            "receipt_persisted": False,
+            "receipt_persistence_code": "transport_write_failed",
+        }
+
+    monkeypatch.setattr(python_module, "record_invocation", record)
+    return calls
+
+
+def import_observation(*targets, failures=()):
+    failed = set(failures)
+    return ok(
+        json.dumps(
+            {
+                "targets": list(targets),
+                "importable": [target for target in targets if target not in failed],
+                "failures": [
+                    {"target": target, "error_type": "ImportError"}
+                    for target in targets
+                    if target in failed
+                ],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def written_python_receipts(commands):
+    container = FakeContainer()
+    for command in commands:
+        container.execute_command(command)
+    return [
+        json.loads(body)
+        for path, body in sorted(container.files.items())
+        if path.startswith(f"{RECEIPT_DIR}/") and path.endswith(".json")
+    ]
+
+
+def written_python_obligations(commands):
+    container = FakeContainer()
+    for command in commands:
+        container.execute_command(command)
+    return [
+        json.loads(body)
+        for path, body in sorted(container.files.items())
+        if path.startswith(f"{OBLIGATION_DIR}/") and path.endswith(".json")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # setup_env
 # ---------------------------------------------------------------------------
+
+
+def test_unpublished_manifest_cannot_dispatch_python_or_freeze_its_parameters():
+    orch = Orch(manifest=dict(MANIFEST), publish_manifest=False)
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+
+    assert result.error_code == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert result.metadata["runner_dispatched"] is False
+    assert result.metadata["blocker_owner"] == "harness"
+    assert not any("python3 --version" in command for command in orch.commands)
+    assert not any("pip install" in command for command in orch.commands)
 
 
 def test_setup_env_runs_preflight_then_install_commands_in_ladder_order():
@@ -446,6 +648,80 @@ def test_version_retry_is_bounded_to_exactly_once(monkeypatch):
     attempts = [c for c in orch.commands if "pip install -e ." in c]
     assert len(attempts) == 2  # never more than one retry, even on repeat failure
     assert result.succeeded is False
+
+
+def test_setup_env_records_one_contract_bound_receipt_with_pip_and_import_postconditions():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("/workspace/proj/.venv/bin/python -m pip check", ok("No broken requirements found")),
+            ("SAG_PYTHON_IMPORT_PROBE", import_observation("proj")),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    receipts = written_python_receipts(orch.commands)
+    assert result.metadata["receipt_id"] == receipts[0]["receipt_id"]
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["requested_action"] == receipt["effective_action"] == "setup_env"
+    assert receipt["contract_id"].startswith("ic-")
+    assert len(receipt["contract_id"]) == 15
+    assert len(receipt["contract_hash"]) == 64
+    observations = receipt["producer_observations"]
+    assert observations["operation"] == "setup_env"
+    assert observations["setup"]["install_outcome"] == "success"
+    assert observations["setup"]["pip_check"]["status"] == "clean"
+    assert observations["setup"]["imports"] == {
+        "status": "complete",
+        "targets": ["proj"],
+        "targets_sha256": hashlib.sha256(b'["proj"]').hexdigest(),
+        "target_count": 1,
+        "importable_count": 1,
+        "failed_count": 0,
+        "failures": [],
+        "output_sha256": hashlib.sha256(
+            json.dumps(
+                {"failures": [], "importable": ["proj"], "targets": ["proj"]},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest(),
+    }
+    assert [step["role"] for step in observations["recorded_project_steps"]] == [
+        "dependency_install",
+        "dependency_install",
+        "pip_check",
+        "import_probe",
+    ]
+
+
+def test_failed_setup_env_still_records_one_honest_terminal_receipt():
+    manifest = {
+        **MANIFEST,
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("pip install -e .", fail("resolution failed", exit_code=2)),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+
+    assert result.succeeded is False
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 1
+    assert receipts[0]["exit_code"] == 2
+    setup = receipts[0]["producer_observations"]["setup"]
+    assert setup["install_outcome"] == "failed"
+    assert "pip_check" not in setup
+    assert "imports" not in setup
 
 
 def test_native_setup_recovers_exact_local_provider_then_retries_root_command():
@@ -656,8 +932,7 @@ def test_native_setup_rejects_provider_symlink_that_resolves_outside_project():
     assert result.succeeded is False
     assert orch.commands.count(TVM_ROOT_INSTALL) == 1
     assert not any(
-        f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml" in command
-        for command in orch.commands
+        f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml" in command for command in orch.commands
     )
     assert TVM_PROVIDER_INSTALL not in orch.commands
 
@@ -679,8 +954,7 @@ def test_native_setup_rejects_provider_when_checkout_root_resolves_outside_works
     assert result.succeeded is False
     assert orch.commands.count(TVM_ROOT_INSTALL) == 1
     assert not any(
-        f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml" in command
-        for command in orch.commands
+        f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml" in command for command in orch.commands
     )
     assert TVM_PROVIDER_INSTALL not in orch.commands
 
@@ -745,6 +1019,57 @@ def test_native_pep517_setup_uses_extended_monitored_timeout():
         "absolute_timeout": 2400,
         "optimize_for_maven": False,
     }
+
+
+def test_first_detached_setup_step_stops_and_records_only_an_obligation(
+    monkeypatch,
+):
+    receipt_calls = capture_python_receipts(monkeypatch)
+    handoff = {
+        "success": True,
+        "exit_code": None,
+        "output": "still running",
+        "dispatch_status": "running_detached",
+        "runner_dispatched": True,
+        "lifecycle_state": "pending",
+        "dispatch": {
+            "started": True,
+            "job_id": "python-setup-1",
+            "pid": 123,
+            "pgid": 123,
+            "process_identity_token": "a" * 64,
+            "pid_path": "/tmp/sag_jobs/python-setup-1.pid",
+            "pgid_path": "/tmp/sag_jobs/python-setup-1.pgid",
+            "identity_path": "/tmp/sag_jobs/python-setup-1.identity",
+            "log_path": "/tmp/sag_jobs/python-setup-1.log",
+            "exit_code_path": "/tmp/sag_jobs/python-setup-1.log.exit",
+        },
+    }
+    orch = ObligationMonitoringOrch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("pip install -r requirements.txt", handoff),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+
+    assert result.is_terminal is False
+    assert result.poll_ref == "job:python-setup-1"
+    installs = [command for command in orch.commands if "pip install -r" in command]
+    assert installs == ["/workspace/proj/.venv/bin/python -m pip install -r requirements.txt"]
+    assert not any("pip check" in command for command in orch.commands)
+    assert not any("SAG_PYTHON_IMPORT_PROBE" in command for command in orch.commands)
+    assert receipt_calls == []
+    assert written_python_receipts(orch.commands) == []
+    (obligation,) = written_python_obligations(orch.commands)
+    assert obligation["argv"] == installs[0]
+    assert obligation["requested_action"] == obligation["effective_action"] == "setup_env"
+    assert obligation["tool"] == "python"
+    assert obligation["contract_id"].startswith("ic-")
+    assert len(obligation["contract_hash"]) == 64
+    assert result.metadata["job_obligation_persisted"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1376,90 @@ def test_build_installs_build_into_the_venv_first():
     assert result.metadata.get("evidence_only") is True
 
 
+def test_build_records_only_new_or_changed_wheels_in_one_receipt():
+    class WheelSnapshots:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _command):
+            self.calls += 1
+            if self.calls == 1:
+                return ok("")
+            return ok(
+                "SAG_WHEEL_SNAPSHOT\t123\t"
+                + "c" * 64
+                + "\t/workspace/proj/dist/demo-1-py3-none-any.whl\n"
+            )
+
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("SAG_WHEEL_SNAPSHOT", WheelSnapshots())],
+    )
+
+    result = PythonTool(orch).execute("build", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 1
+    observations = receipts[0]["producer_observations"]
+    assert [step["role"] for step in observations["recorded_mechanical_steps"]] == [
+        "build_prerequisite"
+    ]
+    assert [step["role"] for step in observations["recorded_project_steps"]] == ["wheel_build"]
+    assert observations["build"] == {
+        "artifact_status": "produced",
+        "artifacts": [
+            {
+                "path": "dist/demo-1-py3-none-any.whl",
+                "sha256": "c" * 64,
+                "size_bytes": 123,
+                "change": "new",
+            }
+        ],
+    }
+
+
+def test_failed_wheel_build_records_a_terminal_receipt_without_inventing_an_artifact():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("-m build --wheel", fail("wheel backend failed", exit_code=7))],
+    )
+
+    result = PythonTool(orch).execute("build", working_directory="/workspace/proj")
+
+    assert result.succeeded is False
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 1
+    assert receipts[0]["exit_code"] == 7
+    assert receipts[0]["producer_observations"]["build"] == {
+        "artifact_status": "missing",
+        "artifacts": [],
+    }
+
+
+def test_receipt_persistence_failure_preserves_the_real_wheel_result():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            (
+                RECEIPT_DIR,
+                fail("read-only receipt directory", exit_code=1),
+            )
+        ],
+    )
+
+    result = PythonTool(orch).execute("build", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    assert result.metadata["receipt_persisted"] is False
+    assert result.metadata["receipt_persistence_code"] in {
+        "transport_write_failed",
+        "directory_create_failed",
+    }
+    assert "receipt_id" not in result.metadata
+    assert written_python_receipts(orch.commands) == []
+
+
 # ---------------------------------------------------------------------------
 # compile (the compileall evidence generator)
 # ---------------------------------------------------------------------------
@@ -1100,6 +1509,61 @@ def test_compile_foreign_pyc_is_invalid_and_never_clamped_to_full_coverage():
     assert result.metadata["compileall_metric_status"] == "invalid"
     assert result.metadata["foreign_pyc_count"] == 1
     assert "metrics_conflict" in result.conflicts
+
+
+def test_compile_records_the_hash_bound_source_and_pyc_basis_once():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -d /workspace/proj/src/proj", ok("EXISTS")),
+            ("importlib.util", compile_metrics(10, 8)),
+        ],
+    )
+
+    result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 1
+    observations = receipts[0]["producer_observations"]
+    assert [step["role"] for step in observations["recorded_project_steps"]] == [
+        "compileall",
+        "compile_metrics",
+    ]
+    compile_observation = observations["compile"]
+    assert compile_observation["status"] == "valid"
+    assert compile_observation["roots"] == ["src/proj"]
+    assert compile_observation["source_basis_sha256"] == "a" * 64
+    assert compile_observation["pyc_basis_sha256"] == "b" * 64
+    assert compile_observation["source_count"] == 10
+    assert compile_observation["compiled_source_count"] == 8
+
+
+def test_failed_compileall_still_records_the_runner_and_metrics_receipt():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -d /workspace/proj/src/proj", ok("EXISTS")),
+            ("-m compileall -q", fail("SyntaxError", exit_code=1)),
+            ("importlib.util", compile_metrics(10, 7)),
+        ],
+    )
+
+    result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
+
+    assert result.succeeded is False
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 1
+    assert receipts[0]["exit_code"] == 1
+    assert [
+        step["outcome"] for step in receipts[0]["producer_observations"]["recorded_project_steps"]
+    ] == ["failed", "completed"]
+    assert receipts[0]["producer_observations"]["compile"] == {
+        "status": "unavailable",
+        "roots": ["src/proj"],
+        "roots_sha256": hashlib.sha256(b'["src/proj"]').hexdigest(),
+        "reason_code": "compileall_failed",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1653,12 @@ def test_deps_install_error_with_zero_exit_is_an_honest_failure():
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     assert result.succeeded is False
     assert "No module named pip" in (result.error or "")
+    receipt = written_python_receipts(orch.commands)[0]
+    install_step = receipt["producer_observations"]["recorded_project_steps"][-1]
+    assert install_step["role"] == "dependency_install"
+    assert install_step["outcome"] == "failed"
+    assert install_step["exit_code"] == 0
+    assert install_step["semantic_failure"] == "install_error_signature"
 
 
 def test_failed_install_observation_leads_with_the_failure():
@@ -1282,7 +1752,7 @@ dev = ["pytest-relaxed>=2", "icecream>=2.1"]
     assert "no test extras declared" not in result.output
 
 
-def test_setup_env_empty_manifest_and_no_markers_fails_with_analyze_guidance():
+def test_setup_env_empty_manifest_and_no_markers_reports_facts_without_repair_call():
     orch = Orch(
         manifest=None,
         rules=[
@@ -1293,7 +1763,9 @@ def test_setup_env_empty_manifest_and_no_markers_fails_with_analyze_guidance():
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     assert result.succeeded is False  # NEVER a vacuous green no-op
     assert result.error_code == "PYTHON_NO_INSTALLER_DETECTED"
-    assert any("project(action='analyze')" in s for s in result.suggestions)
+    rendered = f"{result.error}\n" + "\n".join(result.suggestions)
+    assert "no installer" in rendered.lower()
+    assert "project(action=" not in rendered
     assert not any("pip install" in c for c in orch.commands)
 
 
@@ -1516,17 +1988,17 @@ def test_pytest_own_usage_error_line_is_still_red_when_the_exit_code_lies():
 # ---------------------------------------------------------------------------
 
 
-def test_non_pytest_args_are_rejected_before_anything_runs():
-    for bad in ("make test", "test-python", "-C /workspace/proj test"):
-        orch = Orch(manifest=dict(MANIFEST))
-        result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args=bad)
-        assert result.succeeded is False, bad
-        assert result.error_code == "PYTEST_ARGS_REJECTED", bad
-        assert result.failure_signature == "pytest_args_rejected:invalid_selector", bad
-        # Nothing pytest ran — the bogus args never reach a command line.
-        assert not any("-m pytest" in c for c in orch.commands), bad
-        # The message names the correct usage.
-        assert any("-k" in s for s in result.suggestions), bad
+@pytest.mark.parametrize("bad", ("make test", "test-python", "-C /workspace/proj test"))
+def test_non_pytest_args_are_rejected_before_anything_runs(bad):
+    orch = Orch(manifest=dict(MANIFEST))
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args=bad)
+    assert result.succeeded is False, bad
+    assert result.error_code == "PYTEST_ARGS_REJECTED", bad
+    assert result.failure_signature == "pytest_args_rejected:invalid_selector", bad
+    # Nothing pytest ran — the bogus args never reach a command line.
+    assert not any("-m pytest" in c for c in orch.commands), bad
+    # The message names the correct usage.
+    assert any("-k" in s for s in result.suggestions), bad
 
 
 def test_pytest_plausible_args_pass_through_sanitizing():
@@ -1765,7 +2237,7 @@ def test_native_unready_unsafe_smoke_count_never_starts_test_run(
     assert not any("--junitxml" in command for command in orch.commands)
 
 
-def test_native_unready_invalid_model_path_returns_verified_replacement_without_collect():
+def test_native_unready_invalid_model_path_refuses_without_replacement_or_collect():
     orch = Orch(
         manifest=dict(TVM_NATIVE_TEST_MANIFEST),
         rules=tvm_native_smoke_rules("3 tests collected in 0.2s"),
@@ -1779,7 +2251,9 @@ def test_native_unready_invalid_model_path_returns_verified_replacement_without_
 
     assert result.succeeded is False
     assert result.error_code == "PYTEST_ARGS_REJECTED"
-    assert result.metadata["replacement_args"] == f"{TVM_SMOKE_PATH} --maxfail=1"
+    assert result.metadata["rejected_args"] == "tests/python/unittest/test_runtime.py"
+    assert "replacement_args" not in result.metadata
+    assert TVM_SMOKE_PATH not in f"{result.output}\n" + "\n".join(result.suggestions or [])
     assert not any("--collect-only" in command for command in orch.commands)
     assert not any("--junitxml" in command for command in orch.commands)
 
@@ -1855,7 +2329,9 @@ def test_native_unready_selector_only_explicit_filter_is_rejected_before_collect
     assert result.succeeded is False
     assert result.error_code == "PYTEST_ARGS_REJECTED"
     assert "concrete" in (result.error or "")
-    assert result.metadata["replacement_args"] == f"{TVM_SMOKE_PATH} --maxfail=1"
+    assert result.metadata["rejected_args"] == "-k runtime"
+    assert "replacement_args" not in result.metadata
+    assert TVM_SMOKE_PATH not in f"{result.output}\n" + "\n".join(result.suggestions or [])
     assert not any("--collect-only" in command for command in orch.commands)
     assert not any("--junitxml" in command for command in orch.commands)
 

@@ -40,6 +40,17 @@ def test_canonical_identity_falls_back_to_class_module_without_report_path():
     assert identity.param_id == ""
 
 
+def test_junit4_parameter_before_class_signature_remains_a_case_key():
+    identity = canonical_test_identity(
+        classname="pkg.ExampleTest",
+        name="works[0](pkg.ExampleTest)",
+        file_path=None,
+    )
+
+    assert identity.name == "works"
+    assert identity.param_id == "0"
+
+
 def test_history_orders_by_explicit_attempt_id_not_input_or_source_order():
     identity = canonical_test_identity("tests.test_api", "test_flaky", "tests/test_api.py")
     observations = [

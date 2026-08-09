@@ -4,9 +4,15 @@ jdk_mismatch: required JDK != active at validation time -> PARTIAL cap.
 reactor_scope_narrowed: tests ran in a strict subset of test-bearing modules.
 Both are report-only; they NEVER block execution."""
 
-import json
-
+import pytest
+from sag.agent.control_events import canonical_json
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    publish_evidence_revision,
+)
 from sag.agent.physical_validator import PhysicalValidator
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.module_metrics import assemble_module_metrics
 
@@ -17,14 +23,40 @@ class ConflictOrch:
     def __init__(self, java="11", manifest=None):
         self.java = java
         self.manifest = manifest or {}
+        publication = publish_evidence_revision(
+            self,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            raw=canonical_json(self.manifest).encode("utf-8"),
+            expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+        )
+        assert publication.published
+
+    def read_file(self, path):
+        if path == REQUIREMENTS_PATH:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "content": canonical_json(self.manifest),
+            }
+        return None
 
     def execute_command(self, cmd, workdir=None, **kwargs):
+        if "SAG_NAMED_JSON_RECORD_V1" in cmd and REQUIREMENTS_PATH in cmd:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(
+                    [("build-requirements.json", canonical_json(self.manifest))]
+                ),
+            }
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0,
                     "output": f'openjdk version "{self.java}.0.1"'}
         if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
-                return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
+                return {"success": True, "exit_code": 0, "output": canonical_json(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
         return {"success": True, "exit_code": 0, "output": ""}
 
@@ -37,11 +69,16 @@ def test_collect_jdk_conflict_on_mismatch():
     assert validator._collect_env_conflicts() == ["jdk_mismatch"]
 
 
-def test_no_conflict_when_matching_or_unknown():
+@pytest.mark.parametrize(
+    ("java", "manifest"),
+    [
+        ("17", {"java_version": "17"}),
+        ("11", {}),
+    ],
+)
+def test_no_conflict_when_matching_or_unknown(java, manifest):
     validator = PhysicalValidator.__new__(PhysicalValidator)
-    validator.docker_orchestrator = ConflictOrch(java="17", manifest={"java_version": "17"})
-    assert validator._collect_env_conflicts() == []
-    validator.docker_orchestrator = ConflictOrch(java="11", manifest={})  # no requirement
+    validator.docker_orchestrator = ConflictOrch(java=java, manifest=manifest)
     assert validator._collect_env_conflicts() == []
 
 

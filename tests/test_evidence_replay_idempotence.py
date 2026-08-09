@@ -30,8 +30,24 @@ import os
 from pathlib import Path
 
 import pytest
+from container_evidence_fakes import (
+    add_published_mutable_json,
+    canonical_json,
+    complete_receipt,
+    strict_published_evidence,
+)
 
-from sag.agent.invocation_receipts import RECEIPT_DIR
+from sag.agent.attempt_policy import CurrentBuildReceiptScope
+from sag.agent.evidence_assessments import ReceiptAssessment, validate_assessment_v2
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    evidence_publication_authority_for,
+)
+from sag.agent.evidence_records import (
+    frame_json_record_stream,
+    frame_named_json_record_stream,
+)
+from sag.agent.invocation_receipts import RECEIPT_DIR, build_receipt, validate_receipt_v2
 from sag.agent.phase_gates import (
     ASSESSMENT_DIR,
     _domain_states,
@@ -80,6 +96,7 @@ def receipt_v2(receipt_id, working_directory, outcome="completed"):
     payload = receipt_v1(receipt_id, working_directory, outcome, schema_version=2)
     payload.update(
         {
+            "run_id": "run-current",
             "target_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
             "survey_fingerprint": "survey-7f3a",
             "config_fingerprint": "config-11b2",
@@ -91,16 +108,16 @@ def receipt_v2(receipt_id, working_directory, outcome="completed"):
             "testcase_outcomes": [],
         }
     )
-    return payload
+    return complete_receipt(payload)
 
 
 def assessment(assessment_id, receipt_id, typed_code, detail=NO_SOURCE_DETAIL):
-    return {
-        "assessment_id": assessment_id,
-        "receipt_id": receipt_id,
-        "typed_code": typed_code,
-        "detail": detail,
-    }
+    del assessment_id
+    return ReceiptAssessment(
+        receipt_id=receipt_id,
+        typed_code=typed_code,
+        detail=detail,
+    ).payload()
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +131,7 @@ class EvidenceOrch:
     container instead of by a hand-written special case.
     """
 
-    def __init__(self, tmp_path, *, domains=BUILD_DOMAINS, edges=()):
+    def __init__(self, tmp_path, *, domains=BUILD_DOMAINS, edges=(), run_pin=None):
         self.manifest = {
             "survey": {"project_path": WORKSPACE},
             "build_system": "gradle",
@@ -129,13 +146,62 @@ class EvidenceOrch:
         self.receipts_dir.mkdir(parents=True, exist_ok=True)
         self.assessments_dir.mkdir(parents=True, exist_ok=True)
         self.commands = []
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="run-current",
+            target_sha="a" * 40,
+            run_pin=False if run_pin is None else run_pin,
+        )
+        self.manifest_raw = add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=self.manifest,
+        )
 
     # -- records ---------------------------------------------------------
     def write_receipt(self, payload):
-        return self._write(self.receipts_dir, f"{payload['receipt_id']}.json", payload)
+        candidate = dict(payload)
+        publish = candidate.get("schema_version") == 2
+        if publish:
+            candidate = complete_receipt(candidate)
+        path = self._write(
+            self.receipts_dir,
+            f"{candidate['receipt_id']}.json",
+            candidate,
+        )
+        raw = path.read_bytes()
+        if publish and candidate.get("run_id") == "run-current":
+            evidence_publication_authority_for(self).publish_bytes(
+                record_kind="invocation_receipt",
+                record_id=str(candidate["receipt_id"]),
+                raw=raw,
+            )
+        return path
 
     def write_assessment(self, payload):
-        return self._write(self.assessments_dir, f"{payload['assessment_id']}.json", payload)
+        try:
+            candidate = validate_assessment_v2(payload)
+        except (TypeError, ValueError):
+            return self._write(
+                self.assessments_dir,
+                f"{payload['assessment_id']}.json",
+                payload,
+            )
+        path = self._write(
+            self.assessments_dir,
+            f"{candidate['assessment_id']}.json",
+            candidate,
+        )
+        evidence_publication_authority_for(self).publish_bytes(
+            record_kind="receipt_assessment",
+            record_id=str(candidate["assessment_id"]),
+            raw=path.read_bytes(),
+        )
+        return path
 
     def write_partial_assessment(self, payload):
         """The atomic writer's temp file, before the final ``mv``."""
@@ -145,27 +211,49 @@ class EvidenceOrch:
     def _write(directory, name, payload):
         path = directory / name
         # write_receipt persists ONE line per file; the readers depend on it.
-        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        path.write_text(canonical_json(payload), encoding="utf-8")
         return path
 
     # -- transport -------------------------------------------------------
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=None):
         self.commands.append(command)
+        if "job_obligations" in command:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": (
+                    frame_named_json_record_stream([])
+                    if "SAG_NAMED_JSON_RECORD_V1" in command
+                    else frame_json_record_stream([])
+                ),
+            }
+        if "run-pin.json" in command:
+            return self.evidence(command)
         if REQUIREMENTS_PATH in command:
-            return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
+            if "SAG_NAMED_JSON_RECORD_V1" in command:
+                return self.evidence(command)
+            return {"success": True, "exit_code": 0, "output": self.manifest_raw}
         if ASSESSMENT_DIR in command:
-            return self._cat(self.assessments_dir)
+            return self._cat(self.assessments_dir, command=command)
         if RECEIPT_DIR in command:
-            return self._cat(self.receipts_dir)
+            return self._cat(self.receipts_dir, command=command)
         return {"success": True, "exit_code": 0, "output": ""}
 
     @staticmethod
-    def _cat(directory):
-        bodies = [
-            Path(path).read_text(encoding="utf-8")
+    def _cat(directory, *, command=""):
+        records = [
+            (Path(path).name, Path(path).read_text(encoding="utf-8"))
             for path in sorted(glob.glob(os.path.join(str(directory), "*.json")))
         ]
-        return {"success": True, "exit_code": 0, "output": "".join(bodies)}
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": (
+                frame_named_json_record_stream(records)
+                if "SAG_NAMED_JSON_RECORD_V1" in command
+                else frame_json_record_stream(body for _name, body in records)
+            ),
+        }
 
 
 class GreenValidator:
@@ -197,13 +285,34 @@ def states_of(orch):
     return {root: entry["state"] for root, entry in (derived.states or {}).items()}
 
 
+def current_scope(*, run_id="run-current", target_sha="a" * 40):
+    return CurrentBuildReceiptScope(
+        status="available",
+        run_id=run_id,
+        target_sha=target_sha,
+        project_root=WORKSPACE,
+    )
+
+
+def scoped_receipt(receipt_id, working_directory, outcome="completed", **pins):
+    payload = receipt_v2(receipt_id, working_directory, outcome)
+    payload.update(
+        {
+            "run_id": pins.get("run_id", "run-current"),
+            "target_sha": pins.get("target_sha", "a" * 40),
+            "actual_cwd": working_directory,
+        }
+    )
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # 1. Domain-state derivation: assessments win over a raw exit 0
 # ---------------------------------------------------------------------------
 def test_a_failure_class_assessment_downgrades_an_exit_zero_receipt(tmp_path):
     """Live p5v-bigtop-r1: compileJava exited 0 with every task NO-SOURCE."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch"))
 
     assert states_of(orch)[PRODUCER] == "failed"
@@ -211,7 +320,7 @@ def test_a_failure_class_assessment_downgrades_an_exit_zero_receipt(tmp_path):
 
 def test_a_receipt_without_any_assessment_keeps_its_own_outcome(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
 
     assert states_of(orch)[PRODUCER] == "success"
 
@@ -219,7 +328,7 @@ def test_a_receipt_without_any_assessment_keeps_its_own_outcome(tmp_path):
 def test_a_non_failure_class_assessment_leaves_the_raw_outcome_standing(tmp_path):
     """Spec §C5: a mismatch is NOT automatically a contradiction."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     orch.write_assessment(
         assessment("asm-0001", "inv-gradle-1-0001", "toolchain_unknown", "no javac probe")
     )
@@ -227,9 +336,181 @@ def test_a_non_failure_class_assessment_leaves_the_raw_outcome_standing(tmp_path
     assert states_of(orch)[PRODUCER] == "success"
 
 
+def test_live_domain_derivation_ignores_a_later_receipt_from_another_run(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(scoped_receipt("inv-gradle-current-0001", PRODUCER, "completed"))
+    orch.write_receipt(
+        scoped_receipt(
+            "inv-gradle-foreign-0002",
+            PRODUCER,
+            "failed",
+            run_id="run-foreign",
+        )
+    )
+
+    derived = _gate_domain_states(orch, receipt_scope=current_scope())
+
+    assert derived.states[PRODUCER]["state"] == "success"
+    assert derived.conflicts == ()
+
+
+def test_unpublished_current_v2_receipt_is_inert_with_a_named_conflict(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    payload = scoped_receipt("inv-gradle-forged-0001", PRODUCER, "completed")
+    orch._write(
+        orch.receipts_dir,
+        f"{payload['receipt_id']}.json",
+        payload,
+    )
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "receipt_publication_not_published" in derived.conflicts
+
+
+def test_deleting_a_host_expected_receipt_fails_closed(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    path = orch.write_receipt(scoped_receipt("inv-gradle-current-0001", PRODUCER, "completed"))
+    path.unlink()
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "receipt_publication_set_mismatch" in derived.conflicts
+
+
+def test_unpublished_valid_assessment_is_inert_with_a_named_conflict(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(scoped_receipt("inv-gradle-current-0001", PRODUCER, "completed"))
+    payload = assessment(
+        "ignored",
+        "inv-gradle-current-0001",
+        "compile_no_source_mismatch",
+    )
+    orch._write(
+        orch.assessments_dir,
+        f"{payload['assessment_id']}.json",
+        payload,
+    )
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states[PRODUCER]["state"] == "success"
+    assert "assessment_publication_not_published" in derived.conflicts
+
+
+def test_same_run_wrong_target_and_its_assessment_are_historical_not_current_conflicts(
+    tmp_path,
+):
+    orch = EvidenceOrch(tmp_path)
+    foreign = scoped_receipt(
+        "inv-gradle-wrong-target-0001",
+        PRODUCER,
+        "completed",
+        target_sha="b" * 40,
+    )
+    orch.write_receipt(foreign)
+    orch.write_assessment(
+        assessment(
+            "asm-foreign-target",
+            foreign["receipt_id"],
+            "compile_no_source_mismatch",
+        )
+    )
+
+    derived = _gate_domain_states(orch, receipt_scope=current_scope())
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "assessment_receipt_missing" not in derived.conflicts
+
+
+def test_domain_credit_uses_the_receipts_actual_cwd_not_the_requested_directory(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    payload = scoped_receipt("inv-gradle-current-0001", PRODUCER, "completed")
+    payload["actual_cwd"] = CONSUMER
+    payload["domain_id"] = CONSUMER
+    orch.write_receipt(payload)
+
+    derived = _gate_domain_states(orch, receipt_scope=current_scope())
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert derived.states[CONSUMER]["state"] == "success"
+
+
+def test_unavailable_live_receipt_scope_cannot_promote_a_domain(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(scoped_receipt("inv-gradle-current-0001", PRODUCER))
+    unavailable = CurrentBuildReceiptScope(
+        status="run_pin_unreadable",
+        run_id="run-current",
+        project_root=WORKSPACE,
+    )
+
+    derived = _gate_domain_states(orch, receipt_scope=unavailable)
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "receipt_binding_run_pin_unreadable" in derived.conflicts
+
+
+def test_live_build_gate_binds_domain_receipts_to_the_validators_run_pin(tmp_path):
+    orch = EvidenceOrch(
+        tmp_path,
+        run_pin={"run_id": "run-current", "target_repo_sha": "a" * 40},
+    )
+    orch.write_receipt(
+        scoped_receipt(
+            "inv-gradle-old-run-0001",
+            PRODUCER,
+            "completed",
+            run_id="run-old",
+        )
+    )
+    validator = GreenValidator()
+    validator.receipt_run_id = "run-current"
+    validator.project_path = "/workspace"
+
+    gate = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=validator,
+        orchestrator=orch,
+        project_name=None,
+    )
+
+    assert gate.validated_facts["build.domain_states"][PRODUCER]["state"] == "untried"
+
+
+def test_live_test_gate_resolves_the_same_manifest_root_before_binding_receipts(tmp_path):
+    orch = EvidenceOrch(
+        tmp_path,
+        run_pin={"run_id": "run-current", "target_repo_sha": "a" * 40},
+    )
+    orch.write_receipt(scoped_receipt("inv-gradle-current-0001", PRODUCER, "completed"))
+    validator = GreenValidator()
+    validator.receipt_run_id = "run-current"
+    validator.project_path = "/workspace"
+
+    gate = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=validator,
+        orchestrator=orch,
+        project_name=None,
+    )
+
+    states = gate.validated_facts["test.stats"]["domain_states"]
+    assert states[PRODUCER]["state"] == "success"
+    assert states[CONSUMER]["state"] == "untried"
+    assert (
+        "receipt_binding_project_root_missing"
+        not in gate.validated_facts["test.stats"]["conflicts"]
+    )
+
+
 def test_an_assessment_can_never_promote_a_failed_receipt(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "failed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "failed"))
     orch.write_assessment(
         assessment("asm-0001", "inv-gradle-1-0001", "toolchain_unknown", "no javac probe")
     )
@@ -240,8 +521,8 @@ def test_an_assessment_can_never_promote_a_failed_receipt(tmp_path):
 def test_the_latest_receipt_still_decides_and_carries_its_own_assessment(tmp_path):
     """Retry semantics are unchanged: the assessment binds to ITS receipt."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "failed"))
-    orch.write_receipt(receipt_v1("inv-gradle-2-0002", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "failed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-2-0002", PRODUCER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch"))
 
     # The condemned receipt is the SUPERSEDED one; attempt 2 stands.
@@ -253,8 +534,8 @@ def test_the_latest_receipt_still_decides_and_carries_its_own_assessment(tmp_pat
 
 def test_an_assessment_binds_to_one_receipt_not_to_every_receipt_at_the_root(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
-    orch.write_receipt(receipt_v1("inv-gradle-1-0002", CONSUMER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0002", CONSUMER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch"))
 
     assert states_of(orch) == {PRODUCER: "failed", CONSUMER: "success"}
@@ -263,8 +544,8 @@ def test_an_assessment_binds_to_one_receipt_not_to_every_receipt_at_the_root(tmp
 def test_the_build_gate_publishes_the_assessment_aware_states(tmp_path):
     """End to end: exit 0 plus a green oracle cannot close an assessed domain."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
-    orch.write_receipt(receipt_v1("inv-gradle-1-0002", CONSUMER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0002", CONSUMER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch"))
 
     gate = check_phase_claim(
@@ -282,20 +563,21 @@ def test_the_build_gate_publishes_the_assessment_aware_states(tmp_path):
 # ---------------------------------------------------------------------------
 # 2. Version-gated receipt reading: v1 and v2, nothing coerced
 # ---------------------------------------------------------------------------
-def test_a_v2_receipt_derives_the_same_state_as_its_v1_twin(tmp_path):
+def test_a_v1_receipt_is_forensic_while_current_v2_is_live(tmp_path):
     v1 = EvidenceOrch(tmp_path / "v1")
     v1.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
     v2 = EvidenceOrch(tmp_path / "v2")
     v2.write_receipt(receipt_v2("inv-gradle-1-0001", PRODUCER, "completed"))
 
-    assert states_of(v2) == states_of(v1)
+    assert states_of(v1)[PRODUCER] == "untried"
+    assert states_of(v2)[PRODUCER] == "success"
 
 
-def test_a_receipt_without_a_schema_version_key_is_read_as_v1(tmp_path):
+def test_a_receipt_without_a_schema_version_key_is_forensic(tmp_path):
     orch = EvidenceOrch(tmp_path)
     orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=None))
 
-    assert states_of(orch)[PRODUCER] == "success"
+    assert states_of(orch)[PRODUCER] == "untried"
 
 
 def test_an_unknown_future_schema_version_is_skipped_with_a_named_conflict(tmp_path):
@@ -305,11 +587,11 @@ def test_an_unknown_future_schema_version_is_skipped_with_a_named_conflict(tmp_p
 
     derived = _gate_domain_states(orch)
 
-    # Fail closed on the FILE: the unreadable receipt buys no state, and the
-    # receipt we do understand still reports its domain.
+    # A future receipt may be the later failure for any root.  Until its schema
+    # is understood, no readable prefix may retain a green domain.
     assert derived.states[PRODUCER]["state"] == "untried"
-    assert derived.states[CONSUMER]["state"] == "success"
-    assert "receipt_schema_unsupported" in derived.conflicts
+    assert derived.states[CONSUMER]["state"] == "untried"
+    assert "receipt_record_schema_invalid" in derived.conflicts
 
 
 def test_a_future_receipt_that_renamed_its_keys_is_still_named(tmp_path):
@@ -320,7 +602,7 @@ def test_a_future_receipt_that_renamed_its_keys_is_still_named(tmp_path):
     payload["actual_working_directory"] = payload.pop("working_directory")
     orch.write_receipt(payload)
 
-    assert "receipt_schema_unsupported" in _gate_domain_states(orch).conflicts
+    assert "receipt_record_schema_invalid" in _gate_domain_states(orch).conflicts
 
 
 def test_a_v1_receipt_without_a_working_directory_is_absent_not_a_conflict(tmp_path):
@@ -336,9 +618,9 @@ def test_a_v1_receipt_without_a_working_directory_is_absent_not_a_conflict(tmp_p
     assert derived.conflicts == ()
 
 
-def test_an_unknown_assessment_schema_version_is_skipped_with_a_named_conflict(tmp_path):
+def test_an_unpublished_future_assessment_is_inert_with_a_named_conflict(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     payload = assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch")
     payload["schema_version"] = 9
     orch.write_assessment(payload)
@@ -346,12 +628,12 @@ def test_an_unknown_assessment_schema_version_is_skipped_with_a_named_conflict(t
     derived = _gate_domain_states(orch)
 
     assert derived.states[PRODUCER]["state"] == "success"
-    assert "assessment_schema_unsupported" in derived.conflicts
+    assert "assessment_record_schema_invalid" in derived.conflicts
 
 
 def test_an_assessment_for_a_missing_receipt_is_a_named_conflict_not_a_crash(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-9-9999", "compile_no_source_mismatch"))
 
     derived = _gate_domain_states(orch)
@@ -372,13 +654,13 @@ def test_derivation_conflicts_reach_the_build_gate_as_a_named_fact(tmp_path):
         project_name=None,
     )
 
-    assert gate.validated_facts["build.evidence_conflicts"] == ["receipt_schema_unsupported"]
+    assert gate.validated_facts["build.evidence_conflicts"] == ["receipt_record_schema_invalid"]
 
 
 def test_a_clean_run_publishes_no_evidence_conflicts_key(tmp_path):
     """Absent facts stay absent keys — recorded fixtures serialize unchanged."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
 
     gate = check_phase_claim(
         "build",
@@ -399,7 +681,7 @@ def test_a_single_domain_project_still_names_its_evidence_conflicts(tmp_path):
     derived = _gate_domain_states(orch)
 
     assert derived.states is None
-    assert "receipt_schema_unsupported" in derived.conflicts
+    assert "receipt_record_schema_invalid" in derived.conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +689,7 @@ def test_a_single_domain_project_still_names_its_evidence_conflicts(tmp_path):
 # ---------------------------------------------------------------------------
 def test_two_reads_of_the_same_directories_are_byte_identical(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     orch.write_receipt(receipt_v2("inv-gradle-1-0002", CONSUMER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch"))
 
@@ -421,7 +703,7 @@ def test_two_reads_of_the_same_directories_are_byte_identical(tmp_path):
 def test_a_partially_written_assessment_is_treated_as_absent(tmp_path):
     """Temp file present, final absent: the transition has not happened yet."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     orch.write_partial_assessment(
         assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch")
     )
@@ -435,7 +717,7 @@ def test_a_partially_written_assessment_is_treated_as_absent(tmp_path):
 def test_the_final_assessment_landing_completes_the_transition(tmp_path):
     """The same temp file, once renamed, IS the transition (boundary check)."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     payload = assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch")
     orch.write_partial_assessment(payload)
     assert states_of(orch)[PRODUCER] == "success"
@@ -448,7 +730,7 @@ def test_the_final_assessment_landing_completes_the_transition(tmp_path):
 def test_double_ingesting_the_same_assessment_is_one_transition(tmp_path):
     """Append-only storage may hold the same verdict twice; state is a set."""
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     once = assessment("asm-0001", "inv-gradle-1-0001", "compile_no_source_mismatch")
     twice = assessment("asm-0002", "inv-gradle-1-0001", "compile_no_source_mismatch")
 
@@ -463,13 +745,77 @@ def test_double_ingesting_the_same_assessment_is_one_transition(tmp_path):
 
 def test_a_repeated_missing_receipt_reference_conflicts_once(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
     orch.write_assessment(assessment("asm-0001", "inv-gradle-9-9999", "compile_no_source_mismatch"))
     orch.write_assessment(assessment("asm-0002", "inv-gradle-9-9999", "compile_no_source_mismatch"))
 
     conflicts = _gate_domain_states(orch).conflicts
 
     assert list(conflicts).count("assessment_receipt_missing") == 1
+
+
+def test_a_malformed_durable_receipt_prevents_a_readable_prefix_from_turning_green(
+    tmp_path,
+):
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
+    (orch.receipts_dir / "inv-gradle-1-0002.json").write_text(
+        '{"receipt_id":"inv-gradle-1-0002","outcome":"failed",',
+        encoding="utf-8",
+    )
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "receipt_record_malformed" in derived.conflicts
+
+
+def test_a_duplicate_key_receipt_prevents_a_readable_prefix_from_turning_green(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+    (orch.receipts_dir / "inv-gradle-1-0002.json").write_text(
+        (
+            '{"schema_version":1,"receipt_id":"inv-gradle-1-0002",'
+            f'"working_directory":"{PRODUCER}","outcome":"completed",'
+            '"outcome":"failed"}'
+        ),
+        encoding="utf-8",
+    )
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "receipt_record_malformed" in derived.conflicts
+
+
+def test_reformatting_a_published_receipt_fails_exact_byte_authority(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    payload = scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed")
+    orch.write_receipt(payload)
+    (orch.receipts_dir / "inv-gradle-1-0001.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+
+    derived = _gate_domain_states(orch)
+
+    assert "receipt_publication_mismatch" in derived.conflicts
+    assert derived.states[PRODUCER]["state"] == "untried"
+
+
+def test_an_unreadable_assessment_stream_cannot_leave_a_receipt_green(tmp_path):
+    class AssessmentReadFails(EvidenceOrch):
+        def execute_command(self, command, **kwargs):
+            if ASSESSMENT_DIR in command:
+                return {"success": False, "exit_code": 70, "output": "partial transport"}
+            return super().execute_command(command, **kwargs)
+
+    orch = AssessmentReadFails(tmp_path)
+    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, "completed"))
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states[PRODUCER]["state"] == "untried"
+    assert "assessment_stream_unreadable" in derived.conflicts
 
 
 def test_the_pure_derivation_is_order_independent(tmp_path):
@@ -539,8 +885,44 @@ class ParserWorkspace:
 class ParserOrchestrator:
     """Runs the emitted compact parser locally; every other probe is silent."""
 
-    def __init__(self):
+    def __init__(self, workspace):
         self.commands = []
+        self.workspace = workspace
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="run-pytest",
+            target_sha="a" * 40,
+            run_pin=False,
+        )
+        authority = evidence_publication_authority_for(self)
+        for path in sorted(workspace.receipts_dir.glob("*.json")):
+            try:
+                payload = validate_receipt_v2(
+                    json.loads(path.read_text(encoding="utf-8")),
+                    expected_id=path.stem,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            authority.publish_bytes(
+                record_kind="invocation_receipt",
+                record_id=payload["receipt_id"],
+                raw=path.read_bytes(),
+                contract_id=payload.get("contract_id"),
+                contract_hash=payload.get("contract_hash"),
+            )
+        for path in sorted(workspace.assessments_dir.glob("*.json")):
+            try:
+                payload = validate_assessment_v2(
+                    json.loads(path.read_text(encoding="utf-8")),
+                    expected_id=path.stem,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            authority.publish_bytes(
+                record_kind="receipt_assessment",
+                record_id=payload["assessment_id"],
+                raw=path.read_bytes(),
+            )
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
@@ -551,6 +933,29 @@ class ParserOrchestrator:
             with contextlib.redirect_stdout(buffer):
                 exec(compile(body, "<compact-parser>", "exec"), {})
             return {"exit_code": 0, "success": True, "output": buffer.getvalue()}
+        if "SAG_NAMED_JSON_RECORD_V1" in text and text.startswith("for file in "):
+            target = text.partition(" in ")[2].partition("; do")[0].strip("'\"")
+            directory = Path(target[: -len("/*.json")])
+            records = [
+                (path.name, path.read_bytes()) for path in sorted(directory.glob("*.json"))
+            ]
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream(records),
+            }
+        if "job_obligations" in text:
+            # A successful empty atomic-record stream means this local parser
+            # fixture has no detached controller work.
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": (
+                    frame_named_json_record_stream([])
+                    if "SAG_NAMED_JSON_RECORD_V1" in text
+                    else frame_json_record_stream([])
+                ),
+            }
         if text.startswith("test -d "):
             path = text[len("test -d ") :].split()[0].strip("'\"")
             exists = os.path.isdir(path)
@@ -567,26 +972,29 @@ def parser_workspace(tmp_path, monkeypatch):
     """One receipted primary coordinate with three passing tests."""
     workspace = ParserWorkspace(tmp_path)
     report = workspace.report("TEST-core.AlphaTest.xml", "core.AlphaTest", ["a", "b", "c"])
+    receipt = build_receipt(
+        receipt_id="inv-maven-1-0001",
+        run_id="run-pytest",
+        tool="maven",
+        requested_action="test",
+        effective_action="test",
+        argv="mvn -B test",
+        working_directory=str(workspace.primary_root),
+        exit_code=0,
+        before={},
+        after={},
+    )
+    receipt["report_delta"] = {
+        "new": [
+            {
+                "path": str(report),
+                "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+            }
+        ],
+        "changed": [],
+    }
     workspace.write_receipt(
-        {
-            "schema_version": 1,
-            "receipt_id": "inv-maven-1-0001",
-            "tool": "maven",
-            "requested_action": "test",
-            "effective_action": "test",
-            "argv": "mvn -B test",
-            "working_directory": str(workspace.primary_root),
-            "exit_code": 0,
-            "outcome": "completed",
-            "report_delta": {
-                "new": [
-                    {
-                        "path": str(report),
-                        "sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
-                    }
-                ]
-            },
-        }
+        validate_receipt_v2(receipt, expected_id=receipt["receipt_id"])
     )
 
     import sag.agent.attempt_policy as attempt_policy
@@ -613,8 +1021,9 @@ def parser_workspace(tmp_path, monkeypatch):
 
 
 def _parse(workspace):
+    orchestrator = ParserOrchestrator(workspace)
     validator = PhysicalValidator(
-        docker_orchestrator=ParserOrchestrator(), project_path=str(workspace.workspace)
+        docker_orchestrator=orchestrator, project_path=str(workspace.workspace)
     )
     return validator, validator.parse_test_reports(str(workspace.project))
 
@@ -639,32 +1048,37 @@ def test_a_well_formed_assessment_does_not_disturb_the_rollup(parser_workspace):
 
 
 def test_a_corrupt_assessment_blocks_evidence_closure_and_names_the_file(parser_workspace):
-    corrupt = parser_workspace.write_raw_assessment(
+    parser_workspace.write_raw_assessment(
         "asm-0001.json", '{"assessment_id": "asm-0001", "receipt'
     )
 
     _validator, result = _parse(parser_workspace)
 
     assert result["valid"] is False
-    assert str(corrupt) in result["receipt_error"]
+    assert result["receipt_error"] == (
+        "evidence assessment ledger is not host-authorized and complete"
+    )
     assert result["total_tests"] == 0
 
 
 def test_an_assessment_missing_its_required_keys_is_corrupt(parser_workspace):
-    corrupt = parser_workspace.write_raw_assessment(
+    parser_workspace.write_raw_assessment(
         "asm-0001.json", json.dumps({"assessment_id": "asm-0001"})
     )
 
     _validator, result = _parse(parser_workspace)
 
     assert result["valid"] is False
-    assert str(corrupt) in result["receipt_error"]
+    assert result["receipt_error"] == (
+        "evidence assessment ledger is not host-authorized and complete"
+    )
 
 
 def test_a_corrupt_assessment_blocks_the_phase_gate(parser_workspace):
-    corrupt = parser_workspace.write_raw_assessment("asm-0001.json", "not json at all")
+    parser_workspace.write_raw_assessment("asm-0001.json", "not json at all")
+    orchestrator = ParserOrchestrator(parser_workspace)
     validator = PhysicalValidator(
-        docker_orchestrator=ParserOrchestrator(),
+        docker_orchestrator=orchestrator,
         project_path=str(parser_workspace.workspace),
     )
 
@@ -676,11 +1090,11 @@ def test_a_corrupt_assessment_blocks_the_phase_gate(parser_workspace):
         "test",
         PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
         validator,
-        ParserOrchestrator(),
+        orchestrator,
         "project",
     )
     assert gate.accepted is False
-    assert str(corrupt) in gate.reason
+    assert "assessment ledger" in gate.reason
 
 
 def test_a_partially_written_assessment_never_blocks_closure(parser_workspace):
@@ -697,14 +1111,27 @@ def test_a_partially_written_assessment_never_blocks_closure(parser_workspace):
 def test_the_compact_parser_accepts_a_v2_receipt(parser_workspace):
     """v2 adds keys; the v1 scoping contract it inherits must still hold."""
     report = next((parser_workspace.primary_root / "target" / "surefire-reports").glob("*.xml"))
-    payload = receipt_v2("inv-maven-2-0002", str(parser_workspace.primary_root))
-    payload["tool"] = "maven"
+    payload = build_receipt(
+        receipt_id="inv-maven-2-0002",
+        run_id="run-pytest",
+        tool="maven",
+        requested_action="test",
+        effective_action="test",
+        argv="mvn -B test",
+        working_directory=str(parser_workspace.primary_root),
+        exit_code=0,
+        before={},
+        after={},
+    )
     payload["report_delta"] = {
+        "new": [],
         "changed": [
             {"path": str(report), "sha256": hashlib.sha256(report.read_bytes()).hexdigest()}
         ]
     }
-    parser_workspace.write_receipt(payload)
+    parser_workspace.write_receipt(
+        validate_receipt_v2(payload, expected_id=payload["receipt_id"])
+    )
 
     _validator, result = _parse(parser_workspace)
 
@@ -716,12 +1143,14 @@ def test_the_compact_parser_accepts_a_v2_receipt(parser_workspace):
 def test_an_unsupported_receipt_version_still_fails_closed_in_the_rollup(parser_workspace):
     payload = receipt_v1("inv-maven-3-0003", str(parser_workspace.primary_root))
     payload["schema_version"] = 3
-    corrupt = parser_workspace.write_receipt(payload)
+    parser_workspace.write_receipt(payload)
 
     _validator, result = _parse(parser_workspace)
 
     assert result["valid"] is False
-    assert str(corrupt) in result["receipt_error"]
+    assert result["receipt_error"] == (
+        "invocation receipt ledger is not host-authorized and complete"
+    )
 
 
 def test_an_empty_assessment_directory_changes_nothing(parser_workspace):
@@ -781,7 +1210,7 @@ def write_verifier_session(tmp_path, receipts=(), *, recorded_hashes=None, raw=(
 
 
 def run_receipts_immutable(session):
-    verifier = load_verifier_module().Verifier(str(session))
+    verifier = load_verifier_module().Verifier(str(session), forensic=True)
     verifier.assert_receipts_immutable()
     return verifier
 
@@ -875,7 +1304,7 @@ def test_recorded_plan5_sessions_grade_without_failures(profile, name):
     if not os.path.isdir(session):
         pytest.skip(f"recorded session {name} not present")
     module = load_verifier_module()
-    verifier = module.Verifier(session)
+    verifier = module.Verifier(session, forensic=True)
     verifier.assert_pairing_and_hashes()
     verifier.assert_receipts_immutable()
     getattr(verifier, f"assert_{profile}")()

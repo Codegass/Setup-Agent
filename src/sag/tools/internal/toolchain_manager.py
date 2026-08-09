@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from loguru import logger
 
 from sag.runtime.env_overlay import EnvOverlayStore
-from sag.tools.internal.build_preflight import read_build_requirements
+from sag.tools.internal.build_preflight import read_live_build_requirements
 
 RequirementSource = Literal[
     "tool_parameter",
@@ -30,9 +30,8 @@ CandidateSource = Literal[
     "system",
 ]
 
-# The registry is the toolchain state a dispatch's identity is taken over
-# (`sag.agent.retry_authority.TOOLCHAIN_REGISTRY_PATH`). Registering a runtime
-# and dispatching a build must therefore read the same file.
+# The registry is durable runtime inventory consumed by tool resolution and
+# audit/reporting. Registration and resolution must read the same file.
 TOOLCHAIN_REGISTRY_PATH = "/workspace/.setup_agent/toolchains.json"
 
 # Which rule chose one executable out of an overlay that offered several. The
@@ -121,12 +120,10 @@ def record_registered_runtime(
     """Record one registered runtime in the toolchain registry.
 
     Live polaris (`logs/session_20260727_065557_97847`): Java 21 was installed,
-    registered and activated, and the compile that was meant to inherit it was
-    refused three times as an identical retry — the same `retry_key` before and
-    after the registration. The retry identity's toolchain component hashes the
-    REGISTRY; every real registration wrote only the env OVERLAY, and no session
-    of the 23-project campaign produced a registry file at all. The two stores
-    were disconnected, so the registered runtime could not reach a dispatch.
+    registered and activated, but every real registration wrote only the env
+    overlay and no session in the 23-project campaign produced a registry file.
+    The two stores were disconnected, so durable runtime inventory and fallback
+    resolution could not observe the registration.
 
     Registration writes both from here: the overlay stays the execution
     consumer (it is what the dispatch shell sources) and the registry states
@@ -269,8 +266,8 @@ class ToolchainManager:
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
         }
-        # A registry the dispatch identity is hashed over must state the
-        # toolchain, not how many times a model asked for it: re-registering
+        # The registry states the toolchain, not how many times a model asked
+        # for it: re-registering
         # the same executable with the same facts leaves the file byte-stable,
         # so only a genuinely new registration is material progress. The head
         # entry is the only one that can be re-stated without moving a byte —
@@ -318,9 +315,7 @@ class ToolchainManager:
             if spec.executable == "mvn":
                 wrapper = f"{working_directory.rstrip('/')}/mvnw"
                 if self._is_executable(wrapper):
-                    candidates.append(
-                        self._candidate_from_path(spec, wrapper, source="wrapper")
-                    )
+                    candidates.append(self._candidate_from_path(spec, wrapper, source="wrapper"))
             elif spec.executable == "gradle":
                 gradle_wrapper = self._checkout_gradle_wrapper(working_directory)
                 if gradle_wrapper:
@@ -392,23 +387,16 @@ class ToolchainManager:
             self.orchestrator.execute_command(command)
 
     def _registered_candidates(self, spec: ToolchainSpec) -> List[ToolExecutableCandidate]:
-        registry = self._load_registry()
-        entries = registry.get(spec.name, {}).get(spec.executable, [])
-        candidates = []
-        for entry in entries:
-            path = entry.get("path")
-            if not path or not self._is_executable(path):
-                continue
-            candidates.append(
-                ToolExecutableCandidate(
-                    name=entry.get("name", spec.name),
-                    executable=entry.get("executable", spec.executable),
-                    path=path,
-                    version=entry.get("version") or self._probe_version(path),
-                    source="registered",
-                )
-            )
-        return candidates
+        """No live candidates from the container-authored registry.
+
+        ``toolchains.json`` remains a forensic inventory written alongside the
+        environment overlay, but it has no host publication authority. A
+        project can overwrite it, so resolution is limited to the activated
+        overlay and mechanical wrapper/standalone/PATH probes until the
+        registry gains its own host-authorized revision chain.
+        """
+        del spec
+        return []
 
     def _env_overlay_snapshot(self) -> Optional[Dict[str, Any]]:
         if self.env_overlay is None:
@@ -557,9 +545,7 @@ class ToolchainManager:
         return result.get("exit_code") == 0 and "EXISTS" in (result.get("output") or "")
 
     def _realpath(self, path: str) -> Optional[str]:
-        result = self.orchestrator.execute_command(
-            f"realpath -e -- {shlex.quote(path)}"
-        )
+        result = self.orchestrator.execute_command(f"realpath -e -- {shlex.quote(path)}")
         resolved = (result.get("output") or "").strip().splitlines()
         if result.get("exit_code") != 0 or not resolved:
             return None
@@ -582,7 +568,18 @@ class ToolchainManager:
         Without a survey stamp, discovery is intentionally limited to the
         working directory itself.
         """
-        manifest = read_build_requirements(self.orchestrator) or {}
+        manifest_read = read_live_build_requirements(self.orchestrator)
+        if (
+            not manifest_read.complete
+            or manifest_read.conflict is not None
+            or manifest_read.payload is None
+        ):
+            logger.warning(
+                "Gradle wrapper discovery skipped: live build requirements "
+                f"unavailable ({manifest_read.conflict or 'absent'})"
+            )
+            return None
+        manifest = dict(manifest_read.payload)
         survey_root = str((manifest.get("survey") or {}).get("project_path") or "").strip()
         lexical_root = survey_root or working_directory
         root = self._realpath(lexical_root)

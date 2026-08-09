@@ -1,7 +1,8 @@
 # Build Contract Loop — SAG v2 Plan 6 Design
 
 **Date:** 2026-07-26
-**Status:** revised after design review; design-only, implementation not started
+**Status:** revised after design and implementation review; InvocationContract
+v2 authority amendment adopted
 **Author:** Chenhao (design), formalized against the Plan 5 codebase
 **Compatibility:** preserves the executed Category-3 facts-only boundary in
 `2026-07-19-analyzer-diet.md`; it does not restore an analyzer-authored plan,
@@ -33,7 +34,7 @@ Two extremes both fail a weak model:
 
 ```mermaid
 flowchart LR
-    A["bounded DocumentMap + DomainFacts"] --> B["one ActionIntent<br/>source: model | controller | accepted repair"]
+    A["bounded DocumentMap + DomainFacts"] --> B["one ActionIntent<br/>source: model | controller"]
     B --> C["harness freezes InvocationContract"]
     C --> D["facade materializes and validates"]
     D -- "pre-dispatch rejection" --> K["immutable ControlAssessment<br/>no runner receipt"]
@@ -44,8 +45,8 @@ flowchart LR
     F -- "goal advanced" --> G["new local intent<br/>predecessor link"]
     F -- "typed failure or capability gap" --> H["targeted retrieval"]
     K -- "typed control or environment gap" --> H
-    H --> I["reactive RepairContract"]
-    I -- "accept or modify" --> B
+    H --> I["RepairContext<br/>assessment + constraints + affordances"]
+    I -- "model chooses next action" --> B
     F -- "direct contradiction" --> J["claim transition + dependent invalidation"]
 ```
 
@@ -211,8 +212,9 @@ The model submits **one canonical public tool call**, never backend argv:
 ```text
 ActionIntent:
   intent_id
-  source               # model | controller | accepted_repair
-  repair_id             # required when source=accepted_repair
+  source               # model | controller
+  trigger_assessment_id # optional; set for an evidence-triggered model action
+  repair_context_id     # optional; identifies facts/constraints, not a proposal
   domain_id
   tool
   canonical_params
@@ -221,59 +223,133 @@ ActionIntent:
 
 The facade then performs the atomic pre-dispatch sequence:
 
-1. freeze `fact_epoch`, target/config/document-map fingerprints and active
-   conflicts;
+1. freeze `run_id`, `fact_epoch`, target/config/document-map fingerprints and
+   active conflicts;
 2. validate the intent against domain edges, phase gates, containment and
    the tool's semantic contract;
-3. materialize requested call → effective action → exact cwd/argv without
-   dispatching;
-4. persist and content-hash an immutable `InvocationContract`;
-5. place its ID and hash on the action envelope;
-6. dispatch only if the persisted contract and envelope agree.
+3. materialize requested call → effective tool/action → exact cwd and an
+   explicit execution binding without dispatching;
+4. build and content-hash an immutable schema-v2 `InvocationContract`;
+5. compare-publish it append-only: create when absent, accept byte-identical
+   replay, and refuse an existing different body;
+6. place its ID and hash on the action envelope;
+7. dispatch only if the persisted contract and envelope agree.
 
 ```text
 InvocationContract:
-  schema_version
+  schema_version        # 2 for live authority
+  run_id
   contract_id
   contract_hash
+  envelope_id
   target_sha
-  survey_fingerprint
+  survey_fingerprint    # required v2 pin before D0; writer work pending
   config_fingerprint
   document_map_fingerprint
   fact_epoch
   domain_id
   intent_id
+  intent_domain_id
   intent_source
+  action_fingerprint
   requested_call
+  effective_tool        # registered executor; currently maven|gradle|python|bash
   effective_action
   expected_cwd
-  expected_argv
-  semantic_effects
-  required_preconditions
+  execution_binding     # argv_v1 | python_facade_v1
+  expected_argv         # required only for argv_v1
   expected_observations
   direct_falsifiers
   supporting_claim_ids
   blocking_conflict_ids
   predecessor_contract_id
-  supersedes_contract_id
 ```
 
-`predecessor_contract_id` means normal successful progression.
-`supersedes_contract_id` is used only to correct the same unfinished intent.
-A successful compile followed by a test is not a revision of the compile.
+The earlier design candidates `semantic_effects`, `required_preconditions` and
+`supersedes_contract_id` are not fields in the live schema-v2 writer and grant
+no dispatch authority. They remain future/reserved concepts outside the live
+contract block; adopting any of them requires an explicit schema revision,
+identity projection, strict writer/reader support and negative controls. The
+`survey_fingerprint` pin above is different: it is an accepted v2 requirement
+whose writer plumbing must be complete before D0.
+
+`contract_id` is schema-v2 run/content identity. Its canonical identity
+projection includes `run_id`, envelope and intent/domain identity, the exact
+public call, effective tool/action, cwd, execution binding, and every
+binding-specific execution commitment (including argv or effective runtime).
+Changing the run or any execution-relevant content therefore changes the ID;
+`contract_hash` covers the complete canonical contract payload. Reusing one ID
+for different bytes is an integrity failure, not an update. Contract
+publication is absent-or-identical under one compare-and-publish operation;
+no live path may overwrite a previously published final.
+
+The execution binding is explicit rather than inferred from a missing field:
+
+- `argv_v1` requires a non-empty frozen argv. The receipt must recompute
+  `exact | equivalent | deviated` against that argv.
+- `python_facade_v1` is restricted to the public `build` facade and deliberately
+  has no `expected_argv`: a Python operation is a bounded multi-command
+  transaction. The explicit marker, exact public params, effective tool/action
+  and typed producer observations are its authority; absent argv by itself is
+  never authority.
+
+The only Python public-to-operation mapping is frozen and shared by the
+facade, producer, read-only judge and assessor:
+
+```text
+deps     -> setup_env
+compile  -> compile
+test     -> test
+package  -> build
+install  -> build
+native   -> native
+```
+
+`effective_tool` is selected from a versioned registered-executor allowlist,
+not a closed three-value ecosystem enum and not an arbitrary string. The
+current live set is `maven | gradle | python | bash`; `bash` covers authorized
+controller-owned direct jobs such as deterministic terminal, large-evidence
+and multi-job probes. A future executor (for example, search/project plumbing)
+must be registered with its own binding validation before it gains live
+authority.
+
+For either binding, the receipt's `effective_tool` must strictly equal the
+contract's effective ecosystem tool before assessment; the public
+`requested_call.tool` is intent provenance and cannot substitute for that
+internal cross-ecosystem check.
+
+Each operation has its own typed positive and negative predicates. In
+particular, setup evidence binds dependency installation and any recorded
+package/import checks. The current live binding rejects every non-empty Python
+`deps` argument: no mechanical pin-to-claim producer exists yet, so accepting
+an opaque claim ID would be false authority. A future exact-pin exception must
+first specify and validate that binding. Build evidence binds a completed
+wheel-build role to content-hashed direct `dist/*.whl` outputs. Compile evidence binds compileall
+and compile-metrics roles from the same aggregate receipt and cannot reuse
+metrics after compileall failed. Test evidence must be current-run and match
+the requested test scope. Native evidence must cover every requested feature
+and bind the frozen definitions, toolchain and build fingerprint. Missing,
+duplicate, contradictory or out-of-order typed roles fail closed. Public
+parameters the selected operation does not consume are rejected before
+dispatch instead of being silently ignored.
+
+`predecessor_contract_id` is the only live schema-v2 contract-lineage field.
+Every correction is a separately frozen ActionIntent/contract linked through
+the supported predecessor chain; no live contract mutates or supersedes an
+earlier contract. A successful compile followed by a test is likewise a new
+predecessor-linked commitment, not a revision of the compile.
 
 A documented command retains its original cwd and argv. If the facade
 normalizes a repository-root `-f module/pom.xml` command to module cwd, the
 contract records the original call, normalized call and proven semantic
 equivalence. Public params, effective action and actual argv remain separate.
 
-There is no post-hoc "deviation by stated reason." A `RepairContract` is only
-a proposal. Accepting it creates an `ActionIntent(source=accepted_repair)`;
-modifying it creates a different ActionIntent that records the same
-`repair_id` and the modified canonical params. The harness then validates and
-freezes that intent as a separate `InvocationContract` before dispatch. A
-prose reason is evidence for review, not authorization. Critical safety,
-scope and capability fields are not model-deviatable.
+There is no post-hoc "deviation by stated reason." After a typed assessment,
+the model may submit a new ActionIntent linked to its `RepairContext`; the
+harness does not pre-fill a public call for the model to accept. The facade
+validates and freezes that intent as a separate `InvocationContract` before
+dispatch. A prose reason is evidence for review, not authorization. Critical
+safety, scope and capability fields are not model-deviatable.
 
 ### C4 — Immutable InvocationReceipt versus evidence claims
 
@@ -311,6 +387,7 @@ Receipt schema v2 is a prerequisite of the loop:
 ```text
 InvocationReceipt:
   schema_version
+  run_id
   receipt_id
   contract_id
   contract_hash
@@ -320,10 +397,12 @@ InvocationReceipt:
   survey/config/document_map/build fingerprints
   domain_id
   requested_call
+  effective_tool
   effective_action
+  execution_binding
   actual_cwd
   actual_argv
-  compliance           # exact | equivalent | deviated
+  compliance           # argv binding; Python uses typed semantic predicates
   environment/toolchain/user-permission fingerprints
   started_at / finished_at
   exit_status
@@ -346,6 +425,40 @@ cannot mint positive correctness or capability evidence merely because it
 ran. `InvocationReceipt`, `CapabilityClaim` and final verdict are distinct
 objects.
 
+#### Evidence-store trust boundary
+
+The evidence directory is the durable handoff boundary, not a source of
+implicit trust. A filename, directory listing, producer prose or JSON object
+that merely exists grants no live authority. Every live reader applies a
+bounded read, requires exactly one RFC-valid object, rejects duplicate keys and
+unknown/future schemas, and recomputes the contract ID/hash and receipt binding.
+It also checks current `run_id`, run-pin target, manifest target/config, exact
+root/domain, requested/effective action, cwd and binding-specific compliance
+before evidence can affect the current run. A producer may report observations;
+it may not declare that its own contract was satisfied.
+
+The container copy is only an evidence mirror. After an atomic container write
+succeeds, the controller synchronously seals the exact raw bytes in the
+host-owned control stream with an `evidence_publication` event; a host event
+without the file or a file without that event is unavailable live evidence.
+Immutable ledgers require the complete set of current-run filenames to equal
+the host publication set, so deleting a later failure cannot refine a verdict
+or release a job barrier. Mutable artifacts use one cross-writer logical ID and
+a host-ordered revision/predecessor chain. Only the latest head is live; an old
+previously published body, a missing head, an extra body, or a body restored
+after a tombstone fails closed. Writers that update the same physical file
+share that logical ID even when their semantic producer differs.
+One evidence epoch binds one container store. A deterministic campaign that
+compares multiple fresh containers assigns each container its own run ID and
+host control stream, then aggregates them under the campaign lock; it never
+shares one publication expected-set across stores.
+
+Schema-v1 contracts remain readable only through a forensic/display path.
+Their historical envelope-plus-argv identity lacks the schema-v2 run/content
+boundary, so they can never authorize live dispatch, assessment, repair,
+claim transition or verdict closure. A future schema in current-run scope is
+an integrity conflict; a stale or foreign-run record remains labeled history.
+
 ### C5 — Causal ReceiptAssessment and ClaimGraph
 
 The assessor compares a fresh, contract-bound receipt with the contract's
@@ -353,7 +466,7 @@ typed expectations:
 
 ```text
 contract preconditions
-  → compliance and actual argv
+  → execution-binding compliance (argv or typed Python operation)
   → dispatch/exit state
   → report/artifact/capability deltas
   → direct falsifier predicates
@@ -379,10 +492,23 @@ A mismatch is **not automatically a contradiction**:
 - a stale fingerprint changes `source_status` to `stale`;
 - a deviated receipt may add an observation or conflict but cannot falsify
   the original contract;
-- only an `exact`/`equivalent`, fresh, scope-complete receipt satisfying all
+- only a binding-compliant, fresh, scope-complete receipt satisfying all
   required preconditions and a typed direct-falsifier predicate may mark a
   claim `contradicted`;
 - success confirms only the claims named by satisfied positive predicates.
+
+`supporting_claim_ids` record provenance and pre-dispatch authorization only.
+They are not a list of claims tested by the invocation, and neither
+`expectation_met` nor a generic failure may transition them automatically. A
+claim changes only when an operation-specific positive predicate or direct
+falsifier explicitly names that claim and the fresh receipt satisfies the
+predicate's complete scope.
+
+This design does not invent that predicate-to-claim producer as part of the
+contract-v2 migration. Until a separately specified mechanical producer can
+name and validate such a binding, the live transition seam remains a
+fail-closed no-op for both generic positive assessments and falsifiers. In
+particular, `supporting_claim_ids` must never be reused as a substitute binding.
 
 Claim dependencies use stable IDs, explicit AND/OR support sets, target and
 fact epochs. Cycles are rejected. Contradicting a claim or staling its source
@@ -398,7 +524,7 @@ fingerprints still match.
 The weak model is never required to notice that an earlier assumption was
 wrong. The assessor performs bounded, causal retraction.
 
-### C6 — Typed targeted retrieval and reactive RepairContract
+### C6 — Typed targeted retrieval and model-owned reactive action
 
 Targeted retrieval begins only after a current evidence assessment emits a
 typed error or capability code. For a dispatched runner this is a
@@ -420,30 +546,37 @@ It does not re-read the whole repository unless the document-map fingerprint
 changed. A changed map triggers a bounded incremental re-index, not a stale
 repair.
 
-Only now may the harness present one bounded corrective proposal:
+Only now may the policy layer assemble one bounded, non-prescriptive repair
+context:
 
 ```text
-RepairContract:
-  repair_id
+RepairContext:
+  repair_context_id
   trigger_assessment_id
   trigger_receipt_id    # required for ReceiptAssessment; absent for any
                         # receiptless ControlAssessment, including dispatch
   target/domain/fact fingerprints
   typed_failure_or_capability
-  required_preconditions
-  proposed_public_call
-  permitted_semantic_envelope
-  expected_observations
+  observed_fact_refs
+  constraint_set
+  allowed_tool_affordances
+  admissible_observation_types
   supporting_claim_ids
   open_conflicts
 ```
 
-The repair is reactive and source-backed, so it stays within the Category-3
-allowance for evidence-triggered operational safeguards. It never dispatches
-directly: acceptance or modification first creates a new
-`ActionIntent(source=accepted_repair, repair_id=...)`, and only the normal C3
-pre-dispatch sequence may freeze that intent into an `InvocationContract`.
-Provenance is looked up by stored claim ID; the model cannot self-attest it.
+The context is reactive and source-backed, but contains no recommended command,
+argv, ordered steps or `proposed_public_call`. The model uses it to revise its
+own reasoning and submit one new `ActionIntent(source=model,
+repair_context_id=...)`, or an honest DoneIntent consistent with the judge's
+maximum supported outcome. Only the normal C3 pre-dispatch sequence may freeze
+an ActionIntent into an `InvocationContract`. Provenance is looked up by stored
+claim ID; the model cannot self-attest it.
+
+Controller-owned mandatory lanes remain separate: wait/poll, settlement,
+transport recovery and already-authorized phase-floor safeguards may create
+`ActionIntent(source=controller)`. They use the same contract/receipt chain and
+cannot become project-specific repair recommendations.
 
 ### C7 — Material-progress retry law
 
@@ -468,14 +601,15 @@ The controller, using the authoritative `LoopMemory`, signs a pre-dispatch
 retry authorization. The facade validates that token; it does not maintain a
 second unsynchronized recurrence state.
 
-### C8 — Native repair rides the reactive contract
+### C8 — Native repair rides the model-owned reactive path
 
 The typed native affordance is available only through a validated
 `InvocationContract`. Before failure it is a neutral tool capability, not a
 native-first prompt block. After a receipt proves a named capability absent,
-a `RepairContract` may propose the following public call; an accepted or
-modified ActionIntent must still pass the normal contract-freeze path before
-it can run:
+the RepairContext may expose the native affordance and its constraints. The
+model may then choose the following public call as its ActionIntent; the
+harness does not propose it, and the intent must pass the normal
+contract-freeze path before it can run:
 
 ```text
 build(
@@ -518,14 +652,24 @@ collection.
 4. **Retraction is causal, not global.** A claim changes only through a typed
    positive predicate, direct falsifier, staleness rule or explicit
    supersession.
-5. **Normal progress and correction have different lineage.** `predecessor`
-   advances the workflow; `supersedes` replaces the same unfinished intent.
+5. **Live lineage is append-only.** `predecessor_contract_id` links separate
+   commitments; no live field mutates or supersedes an earlier contract.
 6. **Handoffs carry stable facts and open conflicts only.** Contracts,
-   repair proposals and old plan conclusions do not ride phase handoffs.
+   RepairContexts and old plan conclusions do not ride phase handoffs.
 7. **All state is fingerprint-bound and replayable.** Stale maps, contracts
    and late receipts remain history and cannot silently become current truth.
 8. **Project text is untrusted.** Provenance is necessary for a repair but is
    never sufficient to bypass facade safety or user authority.
+9. **Live contracts are schema-v2 and run/content-bound.** Historical v1
+   remains display-only and cannot be promoted into dispatch authority.
+10. **Contract publication is append-only.** Absent creates, identical replay
+    succeeds, and a same-ID different body fails closed without overwrite.
+11. **Authorization is not evidence.** Supporting claim IDs may permit a call,
+    but only named, satisfied predicates may change claim state.
+12. **Container evidence is a host-published mirror.** Live readers require
+    strict semantics, exact host-sealed bytes and complete current-run set/head
+    agreement; deletion, rollback, tampering and mirror-only records fail
+    closed.
 
 ## 5. Expected anchor state machines
 
@@ -540,7 +684,7 @@ branches.
    compatible runtime through the normal contract/receipt path. On the
    locked image this selects Maven 3.9.9.
 3. The model proposes local compile/test intents; each produces a separate
-   contract linked by `predecessor`, never `supersedes`.
+   contract linked by the live `predecessor_contract_id` chain.
 4. No further document retrieval occurs once the relevant constraints are
    satisfied.
 
@@ -595,20 +739,20 @@ preserve that causal sequence instead of using hindsight:
    required LLVM testcase's structured outcome and project predicate (or a
    direct runtime probe). Aggregate `all skipped` or absence of any positive
    test alone is not enough; the other smoke nodes are classified separately.
-3. **R1 → I1 → IC1 — LLVM repair chain:** targeted retrieval creates LLVM
-   `RepairContract R1`. Acceptance/modification creates `ActionIntent I1`;
-   normal pre-dispatch validation freezes `InvocationContract IC1`. Project
+3. **RC1 → I1 → IC1 — LLVM repair chain:** targeted retrieval creates LLVM
+   `RepairContext RC1`. The model chooses `ActionIntent I1`; normal
+   pre-dispatch validation freezes `InvocationContract IC1`. Project
    claims establish the LLVM version/definitions; the platform resolver
    separately selects and verifies the allowlisted LLVM runtime. IC1's native
    rebuild receipt binds the exact definitions, toolchain and build
    fingerprint.
 4. **S2 — IC1 assessed evidence:** LLVM execution is real, and only now the
    NumPy 2.x dtype failure emits its distinct typed failure. It was not
-   repaired during R1.
-5. **R2 → I2 → IC2 — NumPy repair chain:** targeted retrieval creates NumPy
-   `RepairContract R2` from the applicable project-owned Ubuntu/source-test
-   dependency policy. Acceptance/modification creates I2 and IC2 through the
-   same pre-dispatch sequence. The claims record why NumPy 1.26 is more
+   repaired during RC1.
+5. **RC2 → I2 → IC2 — NumPy repair chain:** targeted retrieval creates NumPy
+   `RepairContext RC2` from the applicable project-owned Ubuntu/source-test
+   dependency policy. The model chooses I2, which reaches IC2 through the same
+   pre-dispatch sequence. The claims record why NumPy 1.26 is more
    applicable than unconstrained generic metadata; any equal-applicability
    conflict remains open.
 6. **S3 — IC2 assessed capability proof:** the required
@@ -625,6 +769,11 @@ resolved.
 ## 6. Acceptance additions
 
 Acceptance is machine-asserted and negative-controlled before anchor runs.
+Before D0 begins, the exact source-tree hash, static prompt hash and runtime
+control-bundle hash are frozen together. Every D0/D1/D2 row carries that same
+triple; a change starts a new campaign and no result is compared across hash
+boundaries. D0 remains no-model, but its prompt pin is still recorded so the
+campaign has one predeclared configuration boundary.
 
 ### Architecture and causal safety
 
@@ -633,15 +782,21 @@ Acceptance is machine-asserted and negative-controlled before anchor runs.
 | Category-3 boundary | first analyze output, phase intro, metadata and handoff contain no goal, recommended call, failure-probe sequence or project-brief reference |
 | Claim union | each source class validates only with its typed source-ref variant; untrusted prose interpretation cannot enter ClaimGraph |
 | Pre-dispatch ordering | contract is atomically persisted before dispatch; envelope and receipt carry the same contract ID/hash |
-| Lineage | successful next actions use `predecessor`; only correction of the same unfinished intent uses `supersedes` |
-| Repair acceptance | accepted/modified RepairContract always creates a new repair-linked ActionIntent before InvocationContract freeze |
+| Contract v2 identity | `run_id` and complete execution commitment determine identity; changing run, public call, effective tool/action, cwd, binding, argv/runtime or exact params changes the ID |
+| Contract append-only | absent publish and byte-identical replay succeed; same-ID/different-body races and retries fail closed without replacing the winner |
+| Binding taxonomy | `argv_v1` requires argv compliance; `python_facade_v1` requires the exact public→operation mapping and operation-specific typed predicates; an absent argv never implies semantic authority |
+| Effective-tool registry | current `maven`, `gradle`, `python` and controller-direct `bash` contracts validate; unregistered executors and contract/receipt cross-ecosystem mismatches fail closed |
+| Evidence-store boundary | malformed, duplicate-key, future-schema, foreign-run, stale-pin or contract/receipt-mismatched records cannot influence live truth; v1 is forensic-display only |
+| Lineage | every next action or correction is a separately frozen contract linked through `predecessor_contract_id`; no unimplemented supersession field can authorize or rewrite a live contract |
+| Repair ownership | RepairContext contains facts, constraints and affordances but no proposed call; only a new model ActionIntent or a mandatory controller ActionIntent can reach InvocationContract freeze |
 | Deviation | a materially different intent has its own validated contract before dispatch; post-hoc prose cannot authorize it |
 | Receipt immutability | finalized receipt bytes never change; semantic downgrade is an append-only assessment |
 | Receipt taxonomy | an all-skipped runner creates an invocation receipt but no positive capability claim |
 | Control assessment | pre-dispatch/dispatch failure creates one immutable idempotent typed assessment, replays identically, creates no runner receipt and cannot contradict a project claim |
 | Missing receipt | dispatch without a persisted receipt, or receipt persistence failure, prevents evidence closure |
 | Causal contradiction | non-dispatch, network, timeout, permission and unmet-precondition cases cannot contradict doc/config claims |
-| Direct falsifier | a fresh exact/equivalent scope-complete receipt can contradict only claims named by satisfied falsifier predicates |
+| Direct falsifier | a fresh, binding-compliant, scope-complete receipt can contradict only claims named by satisfied falsifier predicates |
+| Supporting claims | authorization-only `supporting_claim_ids` never transition merely because the generic assessment is success/failure |
 | Claim graph | AND/OR support, cycle rejection, cross-domain invalidation and alternate surviving support replay deterministically |
 | Staleness | target/config/document-map/fact-epoch mismatch prevents stale contracts or late receipts from mutating current truth |
 | Targeted retrieval | typed code selects bounded applicable sections; no match yields unknown; a changed map uses bounded incremental re-index |
@@ -668,7 +823,7 @@ Acceptance is machine-asserted and negative-controlled before anchor runs.
 | Bigtop command | contract preserves the documented repository-root cwd and all three lifecycle flags, or records a proven equivalent normalization |
 | Bigtop graph | exact 3.7→3.5/3.6 mismatches; both consumers receive zero runner calls and no alias |
 | Bigtop evidence | test-framework artifacts present; primary receipt alone is `50/50`; auxiliary reports remain separate |
-| TVM sequence | LLVM and NumPy have distinct typed failures and distinct R1/R2 repair chains; no ahead-of-evidence NumPy pin |
+| TVM sequence | LLVM and NumPy have distinct typed failures and distinct RC1/RC2 repair contexts; no ahead-of-evidence NumPy pin |
 | TVM capability | required LLVM node passes with bound build/definition/toolchain fingerprints; two skips are pre-classified not-applicable; no failed/error/collection error |
 | Scope unlock | positive capability evidence unlocks only its declared bounded successor scope, never a repository-wide collect |
 | Metamorphic names | renamed project roots, modules, GAVs and versions produce equivalent contracts/edge behavior |
@@ -682,9 +837,9 @@ This design does not restore a pre-hoc prescription:
 - `DocumentMap`, `PolicyClaim` and `DomainFacts` are survey facts;
 - an `InvocationContract` freezes an already-submitted model/controller
   intent and cannot tell the model what to do before that intent exists;
-- a `RepairContract` is legal only after a concrete receipt assessment
-  or typed ControlAssessment identifies a concrete failure/capability gap,
-  and it must produce a new ActionIntent before any InvocationContract;
+- a `RepairContext` is legal only after a concrete receipt assessment or typed
+  ControlAssessment identifies a concrete failure/capability gap; it contains
+  no proposed call, and the model owns the next project action;
 - initial objectives remain facts-only, and the analyzer never emits
   `execution_plan`, recommendation prose or `project_brief`;
 - safety defaults and dependency locks are controller policy, not natural-
@@ -698,8 +853,9 @@ separately pre-registered causal panel. It is outside this spec.
 
 - No change to the physical validator's independent judge role or sealed
   verdict ownership.
-- No model-authored multi-step plan and no requirement that a weak model
-  search the repository or choose a document.
+- No persisted analyzer/harness-authored execution plan. The model may revise
+  its own reasoning but exposes only one next ActionIntent; it is not required
+  to search the repository or choose a document.
 - No general-purpose execution of repository CI or documentation commands.
 - No claim that project-owned documentation is current, safe or applicable
   merely because it is committed at the target SHA.
@@ -715,16 +871,17 @@ Implementation planning follows a second design review. Required order:
    closure and replay/idempotence.
 2. **Stage A — bounded survey:** DocumentMap, deterministic PolicyClaim
    extractors, applicability/conflict rules and neutral DomainFacts.
-3. **Stage B — execution binding:** ActionIntent, facade dry
-   materialization, pre-dispatch InvocationContract, envelope/hash binding,
-   dependency-edge execution law and untrusted-input policy.
+3. **Stage B — execution binding:** ActionIntent, facade dry materialization,
+   live-only schema-v2 InvocationContract, `argv_v1`/`python_facade_v1`,
+   run/content identity, absent-or-identical publication, envelope/hash
+   binding, dependency-edge execution law and untrusted-input policy.
 4. **Stage C — causal loop:** ClaimGraph, typed assessment predicates,
-   targeted retrieval, incremental re-index and RepairContract.
+   targeted retrieval, incremental re-index and RepairContext.
 5. **Stage D — retry authority:** scoped material-progress tokens integrated
    with authoritative LoopMemory, including transient and polling exceptions.
 6. **Stage E — native affordance:** safe native schema/resolver and the
    explicit TVM
-   S0→S1→R1→I1→IC1→S2→R2→I2→IC2→S3 battery.
+   S0→S1→RC1→I1→IC1→S2→RC2→I2→IC2→S3 battery.
 7. **Stage F — proof:** negative controls, three anchors, renamed metamorphic
    fixtures and held-out full regression battery.
 

@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "fixture_set": "battery_20260808",
+  "content_address": "sha256",
+  "objects": [
+    {
+      "role": "legacy_v1_audited_baseline",
+      "path": "sha256-99a3c7d799c26d1c3ac6d0d184d84d584874d46e8f3ff919e94f466047ecd473.json",
+      "media_type": "application/json",
+      "sha256": "99a3c7d799c26d1c3ac6d0d184d84d584874d46e8f3ff919e94f466047ecd473",
+      "bytes": 4278,
+      "sources": [
+        {
+          "path": "docs/superpowers/reports/2026-08-08-sag-performance-attribution-audit.md",
+          "sha256": "432f5bc4be4222d51fef94714d55b5193fe54452ed66d47dab1258d21e05e093",
+          "locator": "lines 44-52 and audited 8/8 result ledger"
+        }
+      ]
+    },
+    {
+      "role": "metrics_v2_identity_records",
+      "path": "sha256-c6bccc88a0c977193682f6b3e7c62a81e5f01dd90fc0f51710ea8445bb2287ae.json",
+      "media_type": "application/json",
+      "sha256": "c6bccc88a0c977193682f6b3e7c62a81e5f01dd90fc0f51710ea8445bb2287ae",
+      "bytes": 4636,
+      "sources": [
+        {
+          "path": "docs/superpowers/plans/2026-08-08-sag-evidence-control-repair-plan.md",
+          "sha256": "3401000aaf3afe8133d1624b738eaa94e00edf6a013f3affcfa16f8b9e277f83",
+          "locator": "WS0 Task 0.3 synthetic contract fixture"
+        }
+      ]
+    },
+    {
+      "role": "lucene_large_report_delta_seed",
+      "path": "sha256-093b84ce22ab6063312528f064b9b26a7298423f769958b4eddeb257eba5e477.json",
+      "media_type": "application/json",
+      "sha256": "093b84ce22ab6063312528f064b9b26a7298423f769958b4eddeb257eba5e477",
+      "bytes": 842,
+      "sources": [
+        {
+          "path": "logs/battery-20260808/console-lucene.log",
+          "sha256": "68241b59628312c9c2518ea526c0125dd1037afb0a92f8e2f804aa43a5d267b7",
+          "locator": "line 12151, inv-gradle-1-0002; 1683 new paths plus terminal metadata"
+        }
+      ]
+    },
+    {
+      "role": "camel_settlement_shape",
+      "path": "sha256-540c80f4dfb64080ea36adb5b70ebfe05781189319a180e571152fd113db577f.json",
+      "media_type": "application/json",
+      "sha256": "540c80f4dfb64080ea36adb5b70ebfe05781189319a180e571152fd113db577f",
+      "bytes": 851,
+      "sources": [
+        {
+          "path": "logs/session_20260808_005754_72276/.setup_agent/job_obligations/f79138aaafbb.json",
+          "sha256": "ce19053f2e2414636946e8dacc13b2f83d42b2965a8a99ff2e02472d4a50da76",
+          "locator": "whole job obligation"
+        },
+        {
+          "path": "logs/battery-20260808/console-camel.log",
+          "sha256": "d691a688d35655f4aec92f965b24893ef044bb480e449ac76ca931d9a6079ea1",
+          "locator": "terminal exit 137 and audited report observations"
+        }
+      ]
+    },
+    {
+      "role": "http_maven_wrapper_bootstrap",
+      "path": "sha256-f377296a056803283aecfc9c9999b7d1461a696b72f296b01653c1dd928115df.txt",
+      "media_type": "text/plain",
+      "sha256": "f377296a056803283aecfc9c9999b7d1461a696b72f296b01653c1dd928115df",
+      "bytes": 543,
+      "sources": [
+        {
+          "path": "logs/session_20260808_030801_75194/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "d8a00a7f70558724099b5118036081bcd5e27faaae4429cd63ff33edb4a05691",
+          "locator": "output_397fbb33f9f1 and output_93a4bdf647eb"
+        }
+      ]
+    },
+    {
+      "role": "camel_quarkus_java_version_failure",
+      "path": "sha256-65fdfc783c298efafd55a1c05646af40fee9d5d4f9ea433b282c6dbdd6504d9b.txt",
+      "media_type": "text/plain",
+      "sha256": "65fdfc783c298efafd55a1c05646af40fee9d5d4f9ea433b282c6dbdd6504d9b",
+      "bytes": 508,
+      "sources": [
+        {
+          "path": "logs/session_20260808_014058_73255/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "16cced98e569fb23d0f502dd74e79a5be97527ff73ab820a1c03f5f868a4d170",
+          "locator": "output_7b28a74954fe failure tail"
+        }
+      ]
+    },
+    {
+      "role": "gradle_success_tail",
+      "path": "sha256-49884ada42c5ae31f09d496facc947a098e5aca2ee2106094df2339eb6e0688e.txt",
+      "media_type": "text/plain",
+      "sha256": "49884ada42c5ae31f09d496facc947a098e5aca2ee2106094df2339eb6e0688e",
+      "bytes": 279,
+      "sources": [
+        {
+          "path": "logs/session_20260808_025932_75021/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "45efff9f7ac3cc170dfa5d47f03f2d86442062dc45462c7c858d75852ed675b2",
+          "locator": "output_e199a86eff4c first task and terminal tail"
+        }
+      ]
+    },
+    {
+      "role": "gate_refusal_no_progress_sequence",
+      "path": "sha256-aecb0ea760f1f204403a986877775e47bb0fcdb247b81cc0befc0821c896b829.json",
+      "media_type": "application/json",
+      "sha256": "aecb0ea760f1f204403a986877775e47bb0fcdb247b81cc0befc0821c896b829",
+      "bytes": 912,
+      "sources": [
+        {
+          "path": "logs/session_20260808_030801_75194/.setup_agent/contexts/phase_build.json",
+          "sha256": "c451aed6c39b0a6756a61bb0b58d3f53ac09baabcf31d82c8005e22ff4581e72",
+          "locator": "repeated build_red terminal claims with unchanged wrapper evidence"
+        }
+      ]
+    }
+  ]
+}
