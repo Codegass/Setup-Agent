@@ -31,6 +31,7 @@ import json
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from test_container_io import FakeContainer
 from test_invocation_receipts import receipts_written as atomic_receipts_written
 
@@ -91,21 +92,16 @@ CURRENT = {
     "fact_epoch": 7,
 }
 FALSIFIED = f"{FALSIFIER_PREFIX}empty_delta_despite_success"
-WIRED_REQUIREMENTS = {
-    "survey": {
-        "survey_fingerprint": "survey-7",
-        "config_fingerprint": "cfg-7",
-        "document_map_fingerprint": "map-7",
-    },
-    "build_domains": [{"root": "/workspace/proj"}],
-    "domain_facts": [
-        {
-            "domain_id": "dom-proj",
-            "root": "/workspace/proj",
-            "fact_epoch": 7,
-        }
-    ],
-}
+# The wired facade path reads only the strict host-published v1 record, so the
+# wired fixture is the complete schema rather than the legacy pin sketch; the
+# same record feeds the contract, the receipt, and the current pins, keeping
+# every stated pin consistent by construction.
+WIRED_REQUIREMENTS = complete_build_requirements_v1(
+    project_root="/workspace/proj",
+    build_system="maven",
+    target_sha=SHA,
+    config_fingerprint="cfg-7",
+)
 
 # Marks a key the fixture must LEAVE OUT, so a test can state "the receipt
 # knows nothing about this" instead of "it knows None".
@@ -461,6 +457,10 @@ class ContainerFS:
     def __call__(self, command, **kwargs):
         return self.execute_command(command, **kwargs)
 
+    def execute_control_command(self, command, **kwargs):
+        # Evidence writers require the explicit clean host-control channel.
+        return self.execute_command(command, **kwargs)
+
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
@@ -475,7 +475,7 @@ class ContainerFS:
                 "exit_code": 0,
                 "output": frame_named_json_record_stream(records),
             }
-        if command.startswith("for file in ") and "SAG_NAMED_JSON_RECORD_V1" in command:
+        if "for file in " in command and "SAG_NAMED_JSON_RECORD_V1" in command:
             quoted_glob = command.partition(" in ")[2].partition("; do")[0]
             target = shlex.split(quoted_glob)[0]
             prefix = target[: -len("*.json")]
@@ -1253,7 +1253,6 @@ def test_the_facade_assesses_the_receipt_its_own_dispatch_minted():
     assert contract["expected_observations"] == ["report_delta"]
     assert receipt["contract_id"] == contract["contract_id"]
     assert assessment["receipt_id"] == receipt["receipt_id"]
-    # exit 0 with no report delta is exactly the falsifier this contract named.
     assert assessment["typed_code"] == FALSIFIED
     assert f"{ASSESSMENT_DIR}/{assessment['assessment_id']}.json" in orchestrator.files
 
@@ -1396,9 +1395,16 @@ def test_backstop_assesses_a_facade_external_receipt_once(
     }
     written = {}
     atomic = FakeContainer()
+    # Publication requires the run's one durable store binding first; the
+    # atomic file layer is this test's container store.
+    token = install_evidence_publication_authority(
+        bind_host_evidence_publication_authority,
+        orchestrator=atomic,
+    )
+    reset_evidence_publication_authority(token)
 
     def execute(command, **_kwargs):
-        if command.startswith("for file in ") and "SAG_NAMED_JSON_RECORD_V1" in command:
+        if "for file in " in command and "SAG_NAMED_JSON_RECORD_V1" in command:
             quoted_glob = command.partition(" in ")[2].partition("; do")[0]
             target = shlex.split(quoted_glob)[0]
             prefix = target[: -len("*.json")]

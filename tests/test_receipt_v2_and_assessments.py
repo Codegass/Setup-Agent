@@ -26,6 +26,11 @@ import hashlib
 import json
 import shlex
 
+from build_requirements_fakes import (
+    complete_build_requirements_v1,
+    complete_python_build_requirements_v1,
+)
+from container_evidence_fakes import canonical_json
 from test_container_io import FakeContainer
 from test_invocation_receipts import (
     HASH_A,
@@ -65,6 +70,11 @@ from sag.agent.invocation_receipts import (
     survey_pins,
     target_sha,
     toolchain_fingerprint,
+)
+from sag.agent.evidence_publications import (
+    current_evidence_publication_authority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
 )
 from sag.agent.invocation_contracts import (
     ARGV_EXECUTION_BINDING,
@@ -259,6 +269,72 @@ class ContainerFS:
 
     def writes(self):
         return [command for command in self.commands if "mv -f " in command]
+
+
+def bound_container_fs(**kwargs):
+    """A file-layer fake bound to this test's host publication authority.
+
+    Persisted assessments are live evidence only once host-published; binding
+    the fake as the run's one container store lets `write_assessment` publish
+    through the ambient authority instead of failing closed as an unbound
+    writer.
+    """
+
+    execute = ContainerFS(**kwargs)
+    token = install_evidence_publication_authority(
+        current_evidence_publication_authority(),
+        orchestrator=execute,
+    )
+    reset_evidence_publication_authority(token)
+    return execute
+
+
+def live_python_requirements(manifest, project_root):
+    """Complete live v1 build-requirements retaining a shared fixture's facts.
+
+    Live derivation reads only the strict schema-complete record the host
+    published; the legacy partial manifests are completed here and any partial
+    survey stamp is replaced by the complete one the strict reader requires.
+    """
+
+    overrides = {key: value for key, value in dict(manifest).items() if key != "survey"}
+    venv = overrides.get("python_venv")
+    if venv and overrides.get("python_install_commands"):
+        # The strict grammar pins the venv placeholder, not a spelled-out path.
+        overrides["python_install_commands"] = [
+            command.replace(f"{venv}/bin/python", "{venv}/bin/python", 1)
+            for command in overrides["python_install_commands"]
+        ]
+    declared = list(overrides.get("python_declared_dependencies") or ())
+    completed_providers = []
+    for provider in overrides.get("python_local_providers") or ():
+        record = {"build_backend": None, **dict(provider)}
+        if "requirement" not in record:
+            # The provider satisfies exactly the declared dependency it names.
+            record["requirement"] = next(
+                (
+                    dependency
+                    for dependency in declared
+                    if dependency.startswith(str(record["distribution_name"]))
+                ),
+                str(record["distribution_name"]),
+            )
+        completed_providers.append(record)
+    if completed_providers:
+        overrides["python_local_providers"] = completed_providers
+    return complete_python_build_requirements_v1(project_root=project_root, **overrides)
+
+
+class ControlOrch(Orch):
+    """Legacy scripted python orchestrator plus the strict host-control channel.
+
+    Evidence writers refuse a bound plain ``execute_command`` whose owner does
+    not expose ``execute_control_command``; the fake must state the clean
+    channel explicitly, exactly like the production orchestrator.
+    """
+
+    def execute_control_command(self, cmd, workdir=None, **kwargs):
+        return self.execute_command(cmd, workdir=workdir, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +944,7 @@ def test_control_assessment_payload_names_the_stage_that_refused():
 
 
 def test_write_assessment_persists_atomically_under_the_assessment_dir():
-    execute = ContainerFS()
+    execute = bound_container_fs()
     assessment = ReceiptAssessment(
         receipt_id="inv-gradle-1-0001",
         typed_code="compile_no_source_mismatch",
@@ -892,7 +968,7 @@ def test_write_assessment_persists_atomically_under_the_assessment_dir():
 
 
 def test_large_assessment_streams_without_an_oversized_shell_command():
-    execute = ContainerFS()
+    execute = bound_container_fs()
     assessment = ReceiptAssessment(
         receipt_id="inv-gradle-1-0001",
         typed_code="expectation_unmet",
@@ -908,7 +984,7 @@ def test_large_assessment_streams_without_an_oversized_shell_command():
 
 
 def test_write_assessment_is_idempotent_for_the_same_body():
-    execute = ContainerFS()
+    execute = bound_container_fs()
     assessment = ReceiptAssessment(receipt_id="inv-gradle-1-0001", typed_code="x", detail="d")
 
     assert write_assessment(execute, assessment) is True
@@ -922,7 +998,7 @@ def test_write_assessment_is_idempotent_for_the_same_body():
 def test_write_assessment_never_overwrites_a_different_body_under_one_id():
     """Append-only: an id already on disk with different content is an error,
     and the persisted bytes do not move."""
-    execute = ContainerFS()
+    execute = bound_container_fs()
     first = ReceiptAssessment(receipt_id="inv-gradle-1-0001", typed_code="x", detail="first")
     second = ReceiptAssessment(receipt_id="inv-gradle-1-0001", typed_code="x", detail="second")
     assert write_assessment(execute, first) is True
@@ -981,7 +1057,12 @@ def test_gradle_no_source_appends_an_assessment_and_writes_the_receipt_once(
 ):
     from test_semantic_action_conservation import SelfProbingGradleOrchestrator
 
-    orchestrator = SelfProbingGradleOrchestrator(
+    class ControlGradleOrchestrator(SelfProbingGradleOrchestrator):
+        # Evidence writers require the explicit clean host-control channel.
+        def execute_control_command(self, command, workdir=None, timeout=None, **kwargs):
+            return self.execute_command(command, workdir=workdir, timeout=timeout, **kwargs)
+
+    orchestrator = ControlGradleOrchestrator(
         "> Task :compileJava NO-SOURCE\nBUILD SUCCESSFUL in 3s\n"
     )
     from sag.tools.internal.gradle_tool import GradleTool
@@ -1030,7 +1111,7 @@ def test_rejected_pytest_args_write_a_precondition_control_assessment(
 ):
     from sag.tools.internal.python_tool import PythonTool
 
-    orch = Orch(manifest=dict(MANIFEST))
+    orch = ControlOrch(manifest=live_python_requirements(MANIFEST, "/workspace/proj"))
 
     with python_test_authority("/workspace/proj", args="make test"):
         result = PythonTool(orch).execute(
@@ -1052,8 +1133,8 @@ def test_unavailable_native_smoke_writes_a_precondition_control_assessment(
 ):
     from sag.tools.internal.python_tool import PythonTool
 
-    orch = Orch(
-        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+    orch = ControlOrch(
+        manifest=live_python_requirements(TVM_NATIVE_TEST_MANIFEST, "/workspace/tvm"),
         rules=tvm_native_smoke_rules("3 tests collected in 0.2s", target_exists=False),
     )
 
@@ -1072,7 +1153,7 @@ def test_two_distinct_refusals_are_two_distinct_control_assessments(
 ):
     from sag.tools.internal.python_tool import PythonTool
 
-    orch = Orch(manifest=dict(MANIFEST))
+    orch = ControlOrch(manifest=live_python_requirements(MANIFEST, "/workspace/proj"))
     tool = PythonTool(orch)
 
     with python_test_authority("/workspace/proj", args="make test"):

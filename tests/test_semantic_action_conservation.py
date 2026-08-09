@@ -20,6 +20,7 @@ import json
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from test_container_io import FakeContainer
 
 from sag.agent.control_events import canonical_json
@@ -77,7 +78,13 @@ class ProbeOrchestrator:
         self.project_name = project_name
         self.commands = []
         raw_manifest = self.files.get(REQUIREMENTS_PATH)
-        self.manifest_raw = raw_manifest if raw_manifest is not None else canonical_json({})
+        # Live readers only accept a complete host-published v1 manifest; the
+        # old empty-dict placeholder now fails closed before any dispatch.
+        self.manifest_raw = (
+            raw_manifest
+            if raw_manifest is not None
+            else canonical_json(complete_build_requirements_v1(project_root="/workspace"))
+        )
 
     def read_file(self, path):
         if path in self.files:
@@ -134,7 +141,14 @@ class GradleLogOrchestrator:
         self.monitored = {"output": output, "exit_code": exit_code}
         self.project_name = None
         self.commands = []
-        self.manifest_raw = canonical_json({})
+        # GradleTool's direct path requires a live host-published v1 manifest.
+        self.manifest_raw = canonical_json(
+            complete_build_requirements_v1(project_root="/workspace/p")
+        )
+
+    def execute_control_command(self, command, **kwargs):
+        # The strict evidence transport only accepts a clean control channel.
+        return self.execute_command(command, **kwargs)
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append(command)
@@ -422,11 +436,14 @@ def test_gradle_compile_and_test_verbs_keep_the_test_task():
 # 4) Visible semantic delta: the mutation leads the observation.
 # --------------------------------------------------------------------------- #
 def _island_manifest(root, island, system, goal):
-    return {
-        "survey": {"project_path": root},
-        "root_shape": "pathological_aggregator",
-        "build_islands": [{"root": island, "system": system, "goal": goal}],
-    }
+    # The v1 schema requires a complete manifest; a pathological aggregator's
+    # selected build root is its first island.
+    return complete_build_requirements_v1(
+        project_root=root,
+        root_shape="pathological_aggregator",
+        build_root=island,
+        build_islands=[{"root": island, "system": system, "goal": goal}],
+    )
 
 
 def test_delta_line_leads_the_output_on_a_compile_to_install_promotion():

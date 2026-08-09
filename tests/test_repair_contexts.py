@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 import sag.agent.repair_contexts as repair_contexts_module
-from container_evidence_fakes import ContainerFS
+from container_evidence_fakes import ContainerFS, ScriptedOrchestrator
 from sag.agent.control_events import ControlEventSink
 from sag.agent.evidence_publications import (
     EvidencePublicationAuthority,
@@ -161,7 +161,9 @@ def test_write_repair_context_uses_atomic_validated_engine_owned_path(monkeypatc
         return ContainerWriteResult(True, "persisted", len(content.encode()), "a" * 64)
 
     monkeypatch.setattr(repair_contexts_module, "write_container_text_atomic", atomic_write)
-    execute = object()
+    # A persisted context must also host-publish, so the writer's source is an
+    # orchestrator-shaped store the run authority can bind, not a bare object.
+    execute = ScriptedOrchestrator()
 
     result = write_repair_context(execute, context)
 
@@ -281,6 +283,8 @@ def test_read_repair_context_accepts_callable_and_rejects_non_engine_id():
 def _published_context_store(context, authority):
     raw = repair_context_canonical_json(context)
     store = ContainerFS({repair_context_path(context.repair_context_id): raw})
+    # evidence_store_bound must precede every evidence_publication.
+    authority.bind_store(store)
     authority.publish_bytes(
         record_kind="repair_context",
         record_id=context.repair_context_id,
@@ -320,10 +324,15 @@ def test_live_repair_context_requires_exact_host_published_ledger(
     )
 
 
-def test_live_repair_context_rejects_container_mirror_without_host_publication():
+def test_live_repair_context_rejects_container_mirror_without_host_publication(
+    bind_host_evidence_publication_authority,
+):
     context = RepairContext.model_validate(context_payload())
     raw = repair_context_canonical_json(context)
     store = ContainerFS({repair_context_path(context.repair_context_id): raw})
+    # The store is bound (so the authority can answer) but the bytes were
+    # never host-published: the mirror alone stays forensic.
+    bind_host_evidence_publication_authority.bind_store(store)
 
     ledger = read_live_repair_context_ledger(store)
     selected = read_live_repair_context(store, context.repair_context_id)
@@ -398,6 +407,7 @@ def test_live_repair_context_rejects_host_published_malformed_bytes(
 ):
     identifier = repair_context_identity("asm-1")
     store = ContainerFS({repair_context_path(identifier): raw})
+    bind_host_evidence_publication_authority.bind_store(store)
     bind_host_evidence_publication_authority.publish_bytes(
         record_kind="repair_context",
         record_id=identifier,
@@ -418,6 +428,7 @@ def test_live_repair_context_rejects_host_published_future_schema(
     payload["schema_version"] = 2
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     store = ContainerFS({repair_context_path(context.repair_context_id): raw})
+    bind_host_evidence_publication_authority.bind_store(store)
     bind_host_evidence_publication_authority.publish_bytes(
         record_kind="repair_context",
         record_id=context.repair_context_id,
@@ -477,6 +488,9 @@ def test_restart_authority_recovers_exact_repair_context_bytes(tmp_path):
     store = ContainerFS({repair_context_path(context.repair_context_id): raw})
     sink = ControlEventSink(tmp_path / "host-control-events.jsonl")
     live = EvidencePublicationAuthority.for_live_run(run_id="run-repair-restart", sink=sink)
+    # The durable evidence_store_bound row precedes the publication, and the
+    # restarted authority recovers both from the same host stream.
+    live.bind_store(store)
     live.publish_bytes(
         record_kind="repair_context",
         record_id=context.repair_context_id,

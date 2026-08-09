@@ -37,9 +37,14 @@ names which one it used.
 import json
 
 import pytest
-from container_evidence_fakes import strict_published_evidence
+from container_evidence_fakes import canonical_json, strict_published_evidence
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
 
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    evidence_publication_authority_for,
+)
 from sag.agent.evidence_records import frame_json_record_stream
 from sag.agent.invocation_receipts import RECEIPT_DIR
 from sag.agent.module_coverage import ModuleBasis, module_basis
@@ -317,11 +322,21 @@ class ReceiptFilesystem(FakeBuildOrchestrator):
         self, files=(), *, receipts=(), corrupt=(), cat_raises=False, present_raises=False
     ):
         super().__init__(files=files)
+        # `strict_published_evidence` installs THIS store's own host authority
+        # (replacing the per-fake one the base class bound), so the survey
+        # manifest the base class serves must be re-published on it.
         self.evidence = strict_published_evidence(
             self,
             run_id=_CURRENT_RECEIPT_RUN,
             target_sha=_CURRENT_TARGET_SHA,
             receipts=tuple(receipts),
+        )
+        evidence_publication_authority_for(self).publish_revision(
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            raw=canonical_json(self.requirements).encode("utf-8"),
+            expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
         )
         self.receipt_paths = sorted(
             path for path in self.evidence.files if path.startswith(f"{RECEIPT_DIR}/")
@@ -347,7 +362,9 @@ class ReceiptFilesystem(FakeBuildOrchestrator):
                     "exit_code": 0,
                     "output": "EXISTS" if self.receipt_paths else "",
                 }
-            if "SAG_JSON_RECORD_V1" in text:
+            # Both the historical anonymous stream and the strict filename-
+            # bound stream the live reader now issues read the same store.
+            if "SAG_JSON_RECORD_V1" in text or "SAG_NAMED_JSON_RECORD_V1" in text:
                 if self.cat_raises:
                     raise RuntimeError("container flake reading the receipts")
                 return self.evidence(command)

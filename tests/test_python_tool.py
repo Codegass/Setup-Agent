@@ -25,6 +25,10 @@ import sys
 import xml.etree.ElementTree as ET
 
 import pytest
+from build_requirements_fakes import (
+    complete_build_requirements_v1,
+    complete_python_build_requirements_v1,
+)
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 from test_container_io import FakeContainer
 
@@ -39,7 +43,7 @@ from sag.agent.invocation_contracts import (
 )
 from sag.agent.invocation_receipts import RECEIPT_DIR
 from sag.agent.job_obligations import OBLIGATION_DIR
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH, survey_facts_fingerprint
 from sag.tools.internal.python_tool import (
     _NATIVE_PROJECT_READY_SCRIPT,
     _PYTEST_ATTEMPT_TAG_SCRIPT,
@@ -186,7 +190,9 @@ class Orch:
         self.python_output = python_output
         self.commands = []
         self.evidence_store = ContainerFS()
-        if publish_manifest:
+        # manifest=None is a genuinely absent artifact: nothing is published,
+        # so the strict reader observes a verified absence (not empty bytes).
+        if publish_manifest and manifest is not None:
             add_published_mutable_json(
                 self,
                 self.evidence_store,
@@ -211,6 +217,10 @@ class Orch:
             if substring in cmd:
                 return result(cmd) if callable(result) else dict(result)
         return ok("")
+
+    def execute_control_command(self, cmd, **kwargs):
+        """Host-owned control channel (production surface for evidence I/O)."""
+        return self.execute_command(cmd, **kwargs)
 
 
 class MonitoringOrch(Orch):
@@ -259,88 +269,136 @@ class ObligationMonitoringOrch(MonitoringOrch):
         return super().execute_command(cmd, workdir=workdir, **kwargs)
 
 
-MANIFEST = {
-    "python_version": "3.12",
-    "python_constraint": ">=3.9",
-    "python_venv": "/workspace/proj/.venv",
-    "python_installer": "pip",
-    "python_install_commands": [
+def restamped(manifest, **overrides):
+    """Return ``manifest`` with ``overrides`` applied and RE-STAMPED.
+
+    ``survey_facts_fingerprint`` covers the whole manifest body, and the strict
+    v1 reader recomputes it, so a fixture that edits a base document after the
+    helper stamped it would publish a stale pin — refused outright, masking
+    whatever the edit was written to exercise. Every derived fixture below
+    therefore goes through this seam.
+    """
+
+    body = {**manifest, **overrides}
+    body["survey"] = {
+        **body["survey"],
+        "survey_fingerprint": survey_facts_fingerprint(body),
+    }
+    return body
+
+
+# Live-authority migration: every published fixture manifest is a COMPLETE
+# canonical v1 build-requirements document (the strict reader validates it
+# before any Python dispatch); previously-absent optional facts are stated as
+# explicit nulls/empties so the tool observes the same values as before.
+MANIFEST = complete_python_build_requirements_v1(
+    project_root="/workspace/proj",
+    python_version="3.12",
+    python_constraint=">=3.9",
+    python_constraint_source=None,
+    python_install_source=None,
+    python_distribution_name=None,
+    python_build_backend=None,
+    python_install_commands=[
         "{venv}/bin/python -m pip install -r requirements.txt",
         "{venv}/bin/python -m pip install -r requirements-dev.txt",
     ],
-    "python_packages": ["proj"],
-    "test_hints": {"pytest_args": None, "test_deps": []},
-}
+    python_packages=["proj"],
+)
+
+# A survey that ran but recorded no Python group: the honest post-authority
+# stand-in for the legacy "empty manifest" fixtures (an absent manifest now
+# fails closed with BUILD_REQUIREMENTS_UNAVAILABLE before the tool runs).
+EMPTY_PYTHON_MANIFEST = complete_build_requirements_v1(
+    project_root="/workspace/proj",
+    build_system="pytest",
+)
 
 
-TVM_NATIVE_MANIFEST = {
-    **MANIFEST,
-    "python_venv": "/workspace/tvm/.venv",
-    "python_install_commands": [
-        "/workspace/tvm/.venv/bin/python -m pip install -e .",
-    ],
-    "python_distribution_name": "apache-tvm",
-    "python_declared_dependencies": ["apache-tvm-ffi>=0.1.13"],
-    "python_local_providers": [
+TVM_NATIVE_MANIFEST = complete_python_build_requirements_v1(
+    project_root="/workspace/tvm",
+    python_version="3.12",
+    python_constraint=">=3.9",
+    python_constraint_source=None,
+    python_install_source=None,
+    python_build_backend=None,
+    # The installer grammar admits only the {venv} placeholder form; the tool
+    # substitutes the manifest venv, yielding the same concrete command the
+    # legacy fixture spelled out ("/workspace/tvm/.venv/bin/python ...").
+    python_install_commands=["{venv}/bin/python -m pip install -e ."],
+    python_packages=["proj"],
+    python_distribution_name="apache-tvm",
+    python_declared_dependencies=["apache-tvm-ffi>=0.1.13"],
+    python_local_providers=[
         {
             "distribution_name": "apache-tvm-ffi",
             "root": "3rdparty/tvm-ffi",
+            "requirement": "apache-tvm-ffi>=0.1.13",
+            "build_backend": None,
         }
     ],
-    "python_root": "/workspace/tvm",
-    "native_build_mode": "pep517-integrated",
-    "survey": {"project_path": "/workspace/tvm"},
-}
+    # v1 requires has_native_build=true whenever native_build_mode is set;
+    # setup_env consults only native_build_mode, so behavior is unchanged.
+    has_native_build=True,
+    native_build_mode="pep517-integrated",
+)
 
-TVM_NATIVE_TEST_MANIFEST = {
-    **TVM_NATIVE_MANIFEST,
-    "has_native_build": True,
-    "python_packages": ["tvm"],
-    "python_package_paths": [
+TVM_NATIVE_TEST_MANIFEST = restamped(
+    TVM_NATIVE_MANIFEST,
+    python_packages=["tvm"],
+    python_package_paths=[
         {
             "import_name": "tvm",
             "path": "python/tvm",
             "source": "pyproject.toml:tool.scikit-build.wheel.packages",
         }
     ],
-    "native_artifact_roots": ["build", "python/tvm/lib"],
-    "python_smoke_candidates": [
+    native_artifact_roots=["build", "python/tvm/lib"],
+    python_smoke_candidates=[
         {
             "path": "tests/python/all-platform-minimal-test",
             "source": "pyproject.toml:tool.cibuildwheel.test-command",
         }
     ],
-}
+)
 TVM_SMOKE_PATH = "tests/python/all-platform-minimal-test"
 TVM_SMOKE_REALPATH = f"/workspace/tvm/{TVM_SMOKE_PATH}"
 
-SUBDIR_NATIVE_TEST_MANIFEST = {
-    **MANIFEST,
-    "survey": {"project_path": "/workspace/tvm"},
-    "python_root": "/workspace/tvm/python",
-    "python_venv": "/workspace/tvm/python/.venv",
-    "python_distribution_name": "native-pkg",
-    "python_packages": ["native_pkg"],
-    "python_package_paths": [
+SUBDIR_NATIVE_TEST_MANIFEST = complete_python_build_requirements_v1(
+    project_root="/workspace/tvm",
+    python_version="3.12",
+    python_constraint=">=3.9",
+    python_constraint_source=None,
+    python_install_source=None,
+    python_build_backend=None,
+    python_install_commands=[
+        "{venv}/bin/python -m pip install -r requirements.txt",
+        "{venv}/bin/python -m pip install -r requirements-dev.txt",
+    ],
+    python_root="/workspace/tvm/python",
+    python_venv="/workspace/tvm/python/.venv",
+    python_distribution_name="native-pkg",
+    python_packages=["native_pkg"],
+    python_package_paths=[
         {
             "import_name": "native_pkg",
             "path": "src/native_pkg",
             "source": "pyproject.toml:tool.scikit-build.wheel.packages",
         }
     ],
-    "has_native_build": True,
-    "native_build_mode": "pep517-integrated",
-    "native_artifact_roots": [
+    has_native_build=True,
+    native_build_mode="pep517-integrated",
+    native_artifact_roots=[
         "python/_native-build",
         "python/src/native_pkg/lib",
     ],
-    "python_smoke_candidates": [
+    python_smoke_candidates=[
         {
             "path": "python/tests/smoke",
             "source": "pyproject.toml:tool.cibuildwheel.test-command",
         }
     ],
-}
+)
 SUBDIR_SMOKE_PATH = "python/tests/smoke"
 SUBDIR_SMOKE_REALPATH = f"/workspace/tvm/{SUBDIR_SMOKE_PATH}"
 
@@ -562,11 +620,11 @@ def test_setup_env_skips_venv_creation_when_present():
 
 
 def test_setup_env_poetry_failure_falls_back_to_pip_narrated_as_deviation():
-    manifest = {
-        **MANIFEST,
-        "python_installer": "poetry",
-        "python_install_commands": ["poetry install"],
-    }
+    manifest = restamped(
+        MANIFEST,
+        python_installer="poetry",
+        python_install_commands=["poetry install"],
+    )
     orch = Orch(manifest=manifest, rules=[("poetry install", fail("poetry: boom"))])
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     attempted = next(i for i, c in enumerate(orch.commands) if "poetry install" in c)
@@ -587,7 +645,7 @@ def test_setup_env_poetry_failure_falls_back_to_pip_narrated_as_deviation():
 
 def test_setup_env_mismatch_preflight_narration_is_prepended(monkeypatch):
     monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
-    manifest = {**MANIFEST, "python_version": "3.11", "python_constraint": ">=3.11"}
+    manifest = restamped(MANIFEST, python_version="3.11", python_constraint=">=3.11")
     orch = Orch(manifest=manifest, python_output="Python 3.8.10")
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     assert result.output.startswith("[pre-flight] Required: Python 3.11")
@@ -598,12 +656,12 @@ def test_setup_env_mismatch_preflight_narration_is_prepended(monkeypatch):
 
 def test_version_shaped_install_failure_reprovisions_and_reruns_once(monkeypatch):
     monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
-    manifest = {
-        **MANIFEST,
-        "python_version": None,
-        "python_constraint": None,
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-    }
+    manifest = restamped(
+        MANIFEST,
+        python_version=None,
+        python_constraint=None,
+        python_install_commands=["{venv}/bin/python -m pip install -e ."],
+    )
     orch = Orch(
         manifest=manifest,
         rules=[
@@ -626,12 +684,12 @@ def test_version_shaped_install_failure_reprovisions_and_reruns_once(monkeypatch
 
 def test_version_retry_is_bounded_to_exactly_once(monkeypatch):
     monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
-    manifest = {
-        **MANIFEST,
-        "python_version": None,
-        "python_constraint": None,
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-    }
+    manifest = restamped(
+        MANIFEST,
+        python_version=None,
+        python_constraint=None,
+        python_install_commands=["{venv}/bin/python -m pip install -e ."],
+    )
     orch = Orch(
         manifest=manifest,
         rules=[
@@ -700,10 +758,10 @@ def test_setup_env_records_one_contract_bound_receipt_with_pip_and_import_postco
 
 
 def test_failed_setup_env_still_records_one_honest_terminal_receipt():
-    manifest = {
-        **MANIFEST,
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-    }
+    manifest = restamped(
+        MANIFEST,
+        python_install_commands=["{venv}/bin/python -m pip install -e ."],
+    )
     orch = Orch(
         manifest=manifest,
         rules=[
@@ -825,15 +883,17 @@ def test_native_setup_rejects_provider_whose_pyproject_name_does_not_match():
 
 
 def test_native_setup_rejects_manifest_provider_name_mismatch_without_probing():
-    manifest = {
-        **TVM_NATIVE_MANIFEST,
-        "python_local_providers": [
+    manifest = restamped(
+        TVM_NATIVE_MANIFEST,
+        python_local_providers=[
             {
                 "distribution_name": "some-other-ffi",
                 "root": "3rdparty/tvm-ffi",
+                "requirement": "some-other-ffi>=0.1",
+                "build_backend": None,
             }
         ],
-    }
+    )
     orch = Orch(
         manifest=manifest,
         rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
@@ -848,10 +908,7 @@ def test_native_setup_rejects_manifest_provider_name_mismatch_without_probing():
 
 
 def test_native_setup_rejects_provider_not_declared_by_root_project():
-    manifest = {
-        **TVM_NATIVE_MANIFEST,
-        "python_declared_dependencies": ["numpy>=2"],
-    }
+    manifest = restamped(TVM_NATIVE_MANIFEST, python_declared_dependencies=["numpy>=2"])
     orch = Orch(
         manifest=manifest,
         rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
@@ -866,19 +923,23 @@ def test_native_setup_rejects_provider_not_declared_by_root_project():
 
 
 def test_native_setup_rejects_ambiguous_matching_providers_without_probing():
-    manifest = {
-        **TVM_NATIVE_MANIFEST,
-        "python_local_providers": [
+    manifest = restamped(
+        TVM_NATIVE_MANIFEST,
+        python_local_providers=[
             {
                 "distribution_name": "apache-tvm-ffi",
                 "root": "3rdparty/tvm-ffi",
+                "requirement": "apache-tvm-ffi>=0.1.13",
+                "build_backend": None,
             },
             {
                 "distribution_name": "apache_tvm_ffi",
                 "root": "vendor/tvm-ffi",
+                "requirement": "apache-tvm-ffi>=0.1.13",
+                "build_backend": None,
             },
         ],
-    }
+    )
     orch = Orch(
         manifest=manifest,
         rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
@@ -893,15 +954,22 @@ def test_native_setup_rejects_ambiguous_matching_providers_without_probing():
 
 
 def test_native_setup_rejects_provider_path_escape_without_probing():
-    manifest = {
-        **TVM_NATIVE_MANIFEST,
-        "python_local_providers": [
+    # Premise update (live authority): a provider root that escapes the
+    # checkout is no longer merely skipped by the tool — the v1 manifest
+    # validator rejects the whole record at the publication boundary, so the
+    # tool is never dispatched at all. Same contract, enforced one layer
+    # earlier: the escaping path is never probed, resolved, or installed.
+    manifest = restamped(
+        TVM_NATIVE_MANIFEST,
+        python_local_providers=[
             {
                 "distribution_name": "apache-tvm-ffi",
                 "root": "../outside/tvm-ffi",
+                "requirement": "apache-tvm-ffi>=0.1.13",
+                "build_backend": None,
             }
         ],
-    }
+    )
     orch = Orch(
         manifest=manifest,
         rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
@@ -910,7 +978,8 @@ def test_native_setup_rejects_provider_path_escape_without_probing():
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
 
     assert result.succeeded is False
-    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert result.error_code == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 0
     assert not any("realpath -m" in command for command in orch.commands)
     assert not any("outside/tvm-ffi" in command for command in orch.commands)
 
@@ -1033,6 +1102,9 @@ def test_first_detached_setup_step_stops_and_records_only_an_obligation(
         "runner_dispatched": True,
         "lifecycle_state": "pending",
         "dispatch": {
+            # The hardened detached handle (docker_exec_inspect_v1): the
+            # ledger refuses a dispatch whose start/identity facts are not
+            # explicit, so the fixture states the complete accepted shape.
             "started": True,
             "job_id": "python-setup-1",
             "pid": 123,
@@ -1043,6 +1115,12 @@ def test_first_detached_setup_step_stops_and_records_only_an_obligation(
             "identity_path": "/tmp/sag_jobs/python-setup-1.identity",
             "log_path": "/tmp/sag_jobs/python-setup-1.log",
             "exit_code_path": "/tmp/sag_jobs/python-setup-1.log.exit",
+            "terminal_authority": "docker_exec_inspect_v1",
+            "docker_exec_id": "b" * 64,
+            "container_id": "c" * 64,
+            "start_accepted": True,
+            "startup_identity_verified": True,
+            "runner_dispatch_state": "accepted",
         },
     }
     orch = ObligationMonitoringOrch(
@@ -1637,10 +1715,10 @@ def test_setup_env_recreates_venv_when_ensurepip_cannot_restore_pip():
 
 
 def test_deps_install_error_with_zero_exit_is_an_honest_failure():
-    manifest = {
-        **MANIFEST,
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-    }
+    manifest = restamped(
+        MANIFEST,
+        python_install_commands=["{venv}/bin/python -m pip install -e ."],
+    )
     orch = Orch(
         manifest=manifest,
         rules=[
@@ -1686,11 +1764,11 @@ def test_failed_install_observation_leads_with_the_failure():
 
 
 def test_setup_env_narrates_missing_test_extras_note():
-    manifest = {
-        **MANIFEST,
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-        "python_install_note": "no test extras declared — test deps may be missing",
-    }
+    manifest = restamped(
+        MANIFEST,
+        python_install_commands=["{venv}/bin/python -m pip install -e ."],
+        python_install_note="no test extras declared — test deps may be missing",
+    )
     orch = Orch(
         manifest=manifest,
         rules=[("test -x /workspace/proj/.venv/bin/python", ok("EXISTS"))],
@@ -1709,7 +1787,10 @@ def test_setup_env_narrates_missing_test_extras_note():
 
 def test_setup_env_empty_manifest_detects_installer_ladder_inline():
     orch = Orch(
-        manifest=None,  # no build-requirements manifest at all
+        # Premise update (live authority): an absent manifest now fails closed
+        # before dispatch, so "empty" means a published survey with no Python
+        # group — the same self-healing inline-ladder contract as before.
+        manifest=dict(EMPTY_PYTHON_MANIFEST),
         rules=[
             ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
             ("ls -A1 /workspace/proj", ok("pyproject.toml\nsrc\nREADME.md")),
@@ -1737,7 +1818,7 @@ name = "paramiko"
 dev = ["pytest-relaxed>=2", "icecream>=2.1"]
 """
     orch = Orch(
-        manifest=None,
+        manifest=dict(EMPTY_PYTHON_MANIFEST),
         rules=[
             ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
             ("ls -A1 /workspace/proj", ok("pyproject.toml\nparamiko")),
@@ -1754,7 +1835,7 @@ dev = ["pytest-relaxed>=2", "icecream>=2.1"]
 
 def test_setup_env_empty_manifest_and_no_markers_reports_facts_without_repair_call():
     orch = Orch(
-        manifest=None,
+        manifest=dict(EMPTY_PYTHON_MANIFEST),
         rules=[
             ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
             ("ls -A1 /workspace/proj", ok("README.md\nLICENSE")),
@@ -2500,15 +2581,20 @@ def test_native_unready_subdir_dot_is_not_a_concrete_smoke_path():
 
 
 def test_native_unready_unknown_survey_source_is_not_an_executable_coordinate():
-    manifest = {
-        **TVM_NATIVE_TEST_MANIFEST,
-        "python_smoke_candidates": [
+    # Premise update (live authority): the model-authored smoke source is now
+    # rejected by the shared allowlist at the manifest publication boundary,
+    # so the whole manifest is refused before the tool dispatches. The pinned
+    # contract is unchanged — an unknown source never becomes an executable
+    # coordinate: nothing is probed and nothing is collected.
+    manifest = restamped(
+        TVM_NATIVE_TEST_MANIFEST,
+        python_smoke_candidates=[
             {
                 "path": TVM_SMOKE_PATH,
                 "source": "model:guessed-path",
             }
         ],
-    }
+    )
     orch = Orch(
         manifest=manifest,
         rules=[
@@ -2524,7 +2610,7 @@ def test_native_unready_unknown_survey_source_is_not_an_executable_coordinate():
     result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
 
     assert result.succeeded is False
-    assert result.error_code == "NATIVE_SMOKE_UNAVAILABLE"
+    assert result.error_code == "BUILD_REQUIREMENTS_UNAVAILABLE"
     assert not any("realpath -m" in command for command in orch.commands)
     assert not any("--collect-only" in command for command in orch.commands)
 

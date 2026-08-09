@@ -37,6 +37,7 @@ import re
 import shlex
 from types import SimpleNamespace
 
+from build_requirements_fakes import complete_python_build_requirements_v1
 from container_evidence_fakes import (
     ContainerFS,
     add_published_mutable_json,
@@ -532,128 +533,20 @@ def test_plain_python_intro_carries_facts_objective_and_coordinates():
 # ---------------------------------------------------------------------------
 
 
-def _native_manifest(**overrides):
-    data = {
-        "python_version": "3.12",
-        "python_constraint": ">=3.8",
-        "python_installer": "pip",
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-        "python_packages": ["tvm"],
-        "python_venv": "/workspace/tvm/python/.venv",
-        "build_root": "/workspace/tvm/python",
-        "has_c_extensions": False,
-        "has_native_build": True,
-    }
-    data.update(overrides)
-    return data
-
-
-class NativeLadderOrch:
-    """Python evidence-ladder container for a native-core repo: package tvm
-    imports (pure-python parts present), but the native .so may be absent."""
-
-    def __init__(self, *, so_present=False, import_ok=True, manifest=None):
-        self.so_present = so_present
-        self.import_ok = import_ok
-        self.manifest = manifest if manifest is not None else _native_manifest()
-        self.commands = []
-        self.evidence_store = strict_published_evidence(
-            self,
-            run_id="run-pytest",
-            target_sha="a" * 40,
-            run_pin=False,
-        )
-        add_published_mutable_json(
-            self,
-            self.evidence_store,
-            path=REQUIREMENTS_PATH,
-            record_kind="build_requirements",
-            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-            payload=self.manifest,
-        )
-
-    def execute_command(self, cmd, workdir=None, **kwargs):
-        self.commands.append(cmd)
-
-        def res(ok, output=""):
-            return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
-
-        c = cmd.strip()
-        if "SAG_NAMED_JSON_RECORD_V1" in c:
-            return self.evidence_store(cmd, workdir=workdir, **kwargs)
-        if c in (
-            f"cat {REQUIREMENTS_PATH}",
-            f"cat -- {REQUIREMENTS_PATH}",
-        ):
-            return res(True, json.dumps(self.manifest))
-        if "python3 --version" in c:
-            return res(True, "Python 3.12.0")
-        if "java -version" in c:
-            return res(False, "java: command not found")
-        if c.startswith("test -f "):
-            return res("pyproject.toml" in c)
-        if c.startswith("test -d "):
-            path = c.split()[2]
-            if path.endswith("/.venv"):
-                return res(True)
-            if path.endswith("/src/tvm"):
-                return res(False)
-            if path.endswith("/tvm"):
-                return res(True)
-            return res(False)
-        if "pip check" in c:
-            return res(True, "No broken requirements found.")
-        if "import tvm" in c:
-            return res(
-                self.import_ok,
-                "" if self.import_ok else "ImportError: cannot find libtvm.so",
-            )
-        if "cache_from_source" in c:
-            # The validator's scripted metrics probe (compileall_metrics_command
-            # runs an inline python script — the word 'compileall' never appears
-            # in it) expects a JSON payload; the fixture predated the probe and
-            # its empty default parsed as 'metrics unavailable', capping an
-            # all-green ladder below build_complete.
-            return res(
-                True,
-                json.dumps(
-                    {
-                        "status": "valid",
-                        "source_count": 10,
-                        "compiled_source_count": 10,
-                        "missing_source_count": 0,
-                        "foreign_pyc_count": 0,
-                        "coverage": 1.0,
-                        "missing_sources": [],
-                        "foreign_pycs": [],
-                    }
-                ),
-            )
-        if "__pycache__" in c and "wc -l" in c:
-            return res(True, "10")
-        if "-m compileall" in c:
-            return res(True)
-        if "'*.py'" in c and "wc -l" in c:
-            return res(True, "10")
-        if "'*.so'" in c or "'*.dylib'" in c:
-            return res(True, "/workspace/tvm/python/tvm/libtvm.so" if self.so_present else "")
-        if "'*.jar'" in c or "'*.class'" in c:
-            return res(True, "0")
-        return res(True, "")
-
-
-def _validate(orch):
-    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace/tvm/python")
-    return validator.validate_build_status("python")
+# Premise: a live manifest is always the current schema (analyzer_version 12,
+# i.e. facts-v8+ strict), so the legacy runtime-probing ladder is unreachable
+# through host-published authority. The same three contracts — the native cap
+# is PARTIAL and never BLOCKED, a built artifact satisfies only its rung, and
+# no flag means no cap — are re-pinned on the strict read-only ladder below,
+# using the strict fixture defined in section D.
 
 
 def test_native_core_not_built_caps_at_partial():
-    """has_native_build True + NO built .so under the package or build/ -> the
-    build evidence caps at PARTIAL with reason 'native core not built' — never
-    BLOCKED (pure-python parts and tests may still run)."""
-    orch = NativeLadderOrch(so_present=False)
-    result = _validate(orch)
+    """has_native_build True + NO built .so under the declared artifact roots
+    -> the build evidence caps at PARTIAL with reason 'native core not built'
+    — never BLOCKED (pure-python parts and tests may still run)."""
+    orch = StrictNativeLadderOrch(artifact="")
+    result = _validate_strict_native(orch)
     assert result["success"] is True  # never a hard block
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
@@ -663,8 +556,8 @@ def test_native_core_not_built_caps_at_partial():
 def test_native_core_built_satisfies_artifact_rung_but_not_runtime_rungs():
     """A native artifact is read-only physical evidence; absent producer
     receipts keep pip/import/compile facts unknown and the ladder partial."""
-    orch = NativeLadderOrch(so_present=True)
-    result = _validate(orch)
+    orch = StrictNativeLadderOrch(artifact="/workspace/tvm/build/libtvm.so")
+    result = _validate_strict_native(orch)
     assert result["success"] is True
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
@@ -676,8 +569,15 @@ def test_native_core_built_satisfies_artifact_rung_but_not_runtime_rungs():
 def test_native_flag_absent_never_adds_native_cap():
     """Without has_native_build the native cap never fires even if no .so is
     present (a pure-python project has no native core to build)."""
-    orch = NativeLadderOrch(so_present=False, manifest=_native_manifest(has_native_build=False))
-    result = _validate(orch)
+    orch = StrictNativeLadderOrch(
+        artifact="",
+        manifest=_strict_native_manifest(
+            has_native_build=False,
+            native_build_mode=None,
+            native_artifact_roots=[],
+        ),
+    )
+    result = _validate_strict_native(orch)
     assert result["success"] is True
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
@@ -691,17 +591,15 @@ def test_native_flag_absent_never_adds_native_cap():
 
 
 def _strict_native_manifest(**overrides):
+    # Premise: the strict live reader admits only a complete current v1
+    # manifest (analyzer_version is pinned to the current SURVEY_FACTS_VERSION,
+    # which is >= 8, so the facts-v8 strict semantics these tests pin are the
+    # only live semantics). The original TVM facts are preserved verbatim.
     data = {
-        "survey": {
-            "project_path": "/workspace/tvm",
-            "analyzer_version": 8,
-            "config_fingerprint": "fixture",
-        },
         "python_version": "3.12",
         "python_constraint": ">=3.8",
-        "python_installer": "pip",
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
         "python_distribution_name": "apache-tvm",
+        "python_build_backend": "scikit_build_core.build",
         "python_packages": ["tvm"],
         "python_package_paths": [
             {
@@ -716,15 +614,12 @@ def _strict_native_manifest(**overrides):
                 "source": "pyproject.toml:tool.cibuildwheel.test-command",
             }
         ],
-        "native_artifact_roots": ["build", "python/tvm/lib"],
-        "python_venv": "/workspace/tvm/.venv",
-        "python_root": "/workspace/tvm",
-        "build_root": "/workspace/tvm",
-        "has_c_extensions": False,
         "has_native_build": True,
+        "native_build_mode": "pep517-integrated",
+        "native_artifact_roots": ["build", "python/tvm/lib"],
     }
     data.update(overrides)
-    return data
+    return complete_python_build_requirements_v1(project_root="/workspace/tvm", **data)
 
 
 def _record(name, top_level, direct_url):
@@ -1081,6 +976,8 @@ def test_v8_subdir_install_origin_and_package_paths_use_python_root():
         python_venv="/workspace/tvm/python/.venv",
         python_root="/workspace/tvm/python",
         build_root="/workspace/tvm/python",
+        # v1 invariant: a build_root below the surveyed root names its shape.
+        root_shape="pathological_aggregator",
     )
     root_record = {
         "path": (
@@ -1120,6 +1017,8 @@ def test_v8_subdir_install_symlink_cannot_escape_repository_root():
         python_venv="/workspace/tvm/python/.venv",
         python_root="/workspace/tvm/python",
         build_root="/workspace/tvm/python",
+        # v1 invariant: a build_root below the surveyed root names its shape.
+        root_shape="pathological_aggregator",
     )
     root_record = _record(
         "apache_tvm-0.22.dist-info",
@@ -1229,21 +1128,27 @@ def test_v8_missing_distribution_name_with_no_venv_remains_blocked():
 
 
 def test_v8_unknown_smoke_source_is_not_test_ready():
-    manifest = _strict_native_manifest(
-        python_smoke_candidates=[
+    # Premise: the v1 manifest schema now rejects an unknown smoke source at
+    # publication, so it can no longer arrive through a live manifest. The
+    # defense-in-depth allowlist in the validator's smoke seam is still live
+    # authority and keeps the same pin: unknown source, no candidate, no probe.
+    orch = StrictNativeLadderOrch()
+    validator = PhysicalValidator(
+        docker_orchestrator=orch,
+        project_path="/workspace",
+    )
+
+    candidate = validator._verified_smoke_candidate(
+        "/workspace/tvm",
+        [
             {
                 "path": "tests/python/all-platform-minimal-test",
                 "source": "model:guessed-path",
             }
-        ]
+        ],
     )
-    orch = StrictNativeLadderOrch(manifest=manifest)
 
-    result = _validate_strict_native(orch)
-
-    assert result["test_entry_ready"] is False
-    assert result["evidence"]["test_entry_ready"] is False
-    assert result["evidence"].get("test_entry_candidate") is None
+    assert candidate is None
     assert not any(
         "realpath -m -- /workspace/tvm "
         "/workspace/tvm/tests/python/all-platform-minimal-test" in command

@@ -94,6 +94,9 @@ def _artifacts(tmp_path, *, cli_passed=541, cli_flaky=3):
     verdict_path.write_bytes(verdict_raw)
     sink = ControlEventSink(tmp_path / "control_events.jsonl")
     authority = EvidencePublicationAuthority.for_live_run(run_id="surface-run", sink=sink)
+    # Publications may only follow the run's one immutable store binding; the
+    # recovery replay in check_surfaces requires the same ordering.
+    authority.bind_store(object())
     authority.publish_revision(
         record_kind="run_pin",
         record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,

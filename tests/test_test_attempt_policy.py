@@ -2,6 +2,7 @@ import shlex
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from engine_driver import execute_action_steps
 from test_evidence_ingestion import _action_step, _engine, _prepare_action_execution
 
@@ -28,17 +29,19 @@ from sag.agent.react_engine import ReActEngine
 from sag.agent.tool_orchestration import ActualToolExecution, ToolCall, ToolExecution
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH, survey_facts_fingerprint
 from sag.tools.phase_tool import PhaseTool
 
 
 class ManifestOrchestrator:
     def __init__(self):
-        self.manifest = {
-            "survey": {"project_path": "/workspace/bigtop"},
-            "test_root": "/workspace/bigtop/bigtop-data-generators",
-            "test_system": "gradle",
-            "test_islands": [
+        # Live candidate resolution only trusts a complete, host-published
+        # build-requirements v1 manifest; partial legacy shapes fail closed.
+        self.manifest = complete_build_requirements_v1(
+            project_root="/workspace/bigtop",
+            test_root="/workspace/bigtop/bigtop-data-generators",
+            test_system="gradle",
+            test_islands=[
                 {
                     "root": "/workspace/bigtop/bigtop-data-generators",
                     "system": "gradle",
@@ -48,7 +51,7 @@ class ManifestOrchestrator:
                     "system": "gradle",
                 },
             ],
-        }
+        )
         self.realpaths = {}
         self.auto_publish_manifest = True
         self.files = {
@@ -61,6 +64,19 @@ class ManifestOrchestrator:
             target_sha="a" * 40,
         )
         self._publish_manifest()
+
+    def restamp_survey(self):
+        """Re-stamp survey_fingerprint after a fixture edits the manifest body.
+
+        The stamp covers the whole body, so an edit made after construction
+        leaves a stale pin that the strict reader refuses outright — which
+        would mask whatever the edit was actually meant to exercise.
+        """
+
+        self.manifest["survey"] = {
+            **self.manifest["survey"],
+            "survey_fingerprint": survey_facts_fingerprint(self.manifest),
+        }
 
     def _publish_manifest(self):
         add_published_mutable_json(
@@ -189,10 +205,14 @@ def test_candidates_reject_coordinates_outside_the_survey_project():
         0,
         {"root": "/workspace/other-project/tests", "system": "pytest"},
     )
+    orchestrator.restamp_survey()  # the island, not a stale stamp, is on trial
 
-    candidates = survey_test_candidates(orchestrator)
+    resolution = resolve_survey_test_candidates(orchestrator)
 
-    assert all(candidate.root.startswith("/workspace/bigtop/") for candidate in candidates)
+    # Premise: the v1 schema refuses out-of-project islands, so the whole
+    # manifest loses live authority instead of the bad coordinate being skipped.
+    assert resolution.candidates == ()
+    assert resolution.status == "manifest_unreadable"
 
 
 def test_candidates_require_a_current_survey_project_boundary():
@@ -201,7 +221,9 @@ def test_candidates_require_a_current_survey_project_boundary():
 
     resolution = resolve_survey_test_candidates(orchestrator)
 
-    assert resolution.status == "coordinates_missing"
+    # Premise: the v1 schema requires the survey boundary, so a boundary-less
+    # manifest is never live authority and the read fails closed as unreadable.
+    assert resolution.status == "manifest_unreadable"
     assert resolution.candidates == ()
 
 
@@ -1139,6 +1161,7 @@ def test_auxiliary_island_receipt_does_not_discharge_the_primary():
         {"root": "/workspace/bigtop/bigtop-test-framework", "system": "gradle"},
         {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle"},
     ]
+    orchestrator.restamp_survey()
     state = _ready_state()
     _record_gradle_test(
         state, _terminal_gradle_result(), root="/workspace/bigtop/bigtop-test-framework"

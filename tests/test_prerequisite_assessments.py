@@ -36,6 +36,19 @@ def receipt(**overrides):
     return value
 
 
+# A live build dispatch is assessable only when the frozen contract carries
+# the complete current-authority pin tuple; the assessor otherwise reports
+# `contract_binding_unknown` instead of grading the receipt.
+CONTRACT_PINS = {
+    "target_sha": "a" * 40,
+    "survey_fingerprint": "sf-prereq",
+    "config_fingerprint": "cf-prereq",
+    "document_map_fingerprint": "dm-prereq",
+    "domain_id": "/workspace/project",
+    "fact_epoch": 1,
+}
+
+
 def contract():
     params = {
         "action": "test",
@@ -61,7 +74,7 @@ def contract():
             tool="build",
             params=params,
         ),
-        domain_id="/workspace/project",
+        **CONTRACT_PINS,
         expected_observations=("report_delta",),
         direct_falsifiers=(
             {"predicate_id": "empty_delta_despite_success", "kind": "delta_empty_on_exit0"},
@@ -207,12 +220,15 @@ def test_executable_and_service_riders_coexist_without_waiving_the_red_result(mo
         contract_id=frozen["contract_id"],
         contract_hash=frozen["contract_hash"],
         execution_binding=frozen["execution_binding"],
+        # The receipt restates the contract's frozen pin tuple exactly.
+        **{key: value for key, value in CONTRACT_PINS.items() if key != "domain_id"},
     )
 
     landed = assess_dispatch(
         lambda _command: {},
         contract=frozen,
         receipt=observed,
+        current_fingerprints=dict(CONTRACT_PINS),
         output="localhost:9042 refused the connection: Connection refused",
         evidence_ref="output_c001d00d",
     )

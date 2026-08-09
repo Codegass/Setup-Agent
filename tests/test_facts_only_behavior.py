@@ -22,6 +22,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 from test_framework_survey import SurveyOrch
 
@@ -563,9 +564,15 @@ def test_loop_redirect_projects_manifest_coordinates_but_not_goals():
 
     engine = ReActEngine.__new__(ReActEngine)
     orchestrator = SurveyOrch()
+    # The corrective line only descends from a complete host-published v1
+    # manifest now; a bare islands fragment would fail closed as unreadable.
     orchestrator.files[REQUIREMENTS_PATH] = json.dumps(
-        {
-            "build_islands": [
+        complete_build_requirements_v1(
+            project_root="/workspace/demo",
+            build_system="gradle",
+            root_shape="pathological_aggregator",
+            build_root="/workspace/demo/island-a",
+            build_islands=[
                 {
                     "system": "gradle",
                     "root": "/workspace/demo/island-a",
@@ -576,8 +583,8 @@ def test_loop_redirect_projects_manifest_coordinates_but_not_goals():
                     "root": "/workspace/demo/island-b",
                     "goal": "install",
                 },
-            ]
-        }
+            ],
+        )
     )
     orchestrator.publish_existing_manifest()
     engine.physical_validator = SimpleNamespace(docker_orchestrator=orchestrator)
@@ -623,6 +630,11 @@ class _ReceiptBoundLoopOrch:
     def execute_command(self, command, **_kwargs):
         return self.evidence(command)
 
+    def execute_control_command(self, command, **_kwargs):
+        # Strict evidence reads resolve the clean host-control channel; a bare
+        # bound execute_command is deliberately rejected by production.
+        return self.evidence(command)
+
 
 def _receipt_loop_line(
     *,
@@ -639,8 +651,16 @@ def _receipt_loop_line(
         {"system": "maven", "root": "/workspace/demo/a"},
         {"system": "gradle", "root": "/workspace/demo/b"},
     ]
+    # The live reader only grants island authority to a complete v1 manifest.
     orch = _ReceiptBoundLoopOrch(
-        {"build_islands": islands},
+        complete_build_requirements_v1(
+            project_root="/workspace/demo",
+            build_system="maven",
+            target_sha="a" * 40,
+            root_shape="pathological_aggregator",
+            build_root="/workspace/demo/a",
+            build_islands=islands,
+        ),
         [receipt] if receipt else [],
         run_pin=run_pin,
     )

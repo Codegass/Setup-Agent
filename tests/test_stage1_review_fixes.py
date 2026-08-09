@@ -18,13 +18,17 @@ Each section reproduces one confirmed P0/P1 finding:
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.react_engine import ReActEngine
 from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.agent.tool_parameters import ToolParameterNormalizer
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
 from sag.tools.build.build_tool import BuildTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.build_utils import detached_handoff_tool_result
 from sag.tools.project_tool import ProjectTool
 
@@ -349,9 +353,12 @@ class ProjectLayoutOrchestrator:
         self.project_name = project_name
         self.marker = marker
         self.commands = []
+        self.evidence = None
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
+        if self.evidence is not None and "SAG_NAMED_JSON_RECORD_V1" in command:
+            return self.evidence(command)
         if f"/workspace/{self.project_name}/{self.marker}" in command:
             return {"success": True, "output": "exists", "exit_code": 0}
         return {"success": True, "output": "missing", "exit_code": 0}
@@ -362,6 +369,22 @@ def test_build_detection_does_not_probe_or_dispatch_from_project_name_fallback(
 ):
     maven = RecorderTool("maven")
     orchestrator = ProjectLayoutOrchestrator("sample")
+    # Routing descends only from a host-published manifest revision now; a
+    # bare or absent container file fails closed before marker detection.
+    orchestrator.evidence = strict_published_evidence(
+        orchestrator,
+        run_id="run-stage1-build-detection",
+        target_sha="a" * 40,
+    )
+    add_published_mutable_json(
+        orchestrator,
+        orchestrator.evidence,
+        path=REQUIREMENTS_PATH,
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        payload=complete_build_requirements_v1(),
+    )
     tool = BuildTool(orchestrator, maven_tool=maven)
 
     result = tool.execute(action="compile")

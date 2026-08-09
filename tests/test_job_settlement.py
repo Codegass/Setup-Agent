@@ -129,20 +129,28 @@ class JobContainer(ContainerFS):
         self.reports = dict(reports or {})
 
     def __call__(self, command, **kwargs):
+        # The strict snapshot reader accepts only a PROVEN clean transport
+        # (exit_code == 0); a double that omits the code is an incomplete
+        # bracket and would honestly claim nothing.
         if command.startswith("find "):
             self.commands.append(command)
-            return ok(
-                "\n".join(f"{digest}  {path}" for path, digest in sorted(self.reports.items()))
-            )
+            return {
+                **ok(
+                    "\n".join(
+                        f"{digest}  {path}" for path, digest in sorted(self.reports.items())
+                    )
+                ),
+                "exit_code": 0,
+            }
         if command.startswith("git -C "):
             self.commands.append(command)
-            return ok("9f1a2b3c4d5e6f708192a3b4c5d6e7f809111213")
+            return {**ok("9f1a2b3c4d5e6f708192a3b4c5d6e7f809111213"), "exit_code": 0}
         if "SAGTOOLCHAIN" in command:
             self.commands.append(command)
-            return ok(f"{ROOT}/gradlew\nSAGTOOLCHAIN\nGradle 8.7")
+            return {**ok(f"{ROOT}/gradlew\nSAGTOOLCHAIN\nGradle 8.7"), "exit_code": 0}
         if command.startswith("grep -oE") or command.startswith("ls "):
             self.commands.append(command)
-            return ok("")
+            return {**ok(""), "exit_code": 0}
         return super().__call__(command, **kwargs)
 
 

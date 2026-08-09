@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+from container_evidence_fakes import ScriptedOrchestrator
+
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseOutcome
 from sag.tools.phase_tool import PhaseTool
@@ -11,10 +13,13 @@ def _tool(gate_result):
         current_attempt_id="build-1",
         is_complete=False,
     )
+    # A terminal claim is graded only after the job-obligations ledger is
+    # readable; an orchestrator-less tool now fails closed before the gate,
+    # so the fixture serves a host-verified empty ledger.
     return PhaseTool(
         machine=machine,
         validator=None,
-        orchestrator=None,
+        orchestrator=ScriptedOrchestrator(),
         project_name="demo",
         gate_fn=lambda *args, **kwargs: gate_result,
     )

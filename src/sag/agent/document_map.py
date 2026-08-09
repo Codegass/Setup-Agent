@@ -1248,11 +1248,15 @@ def write_document_map(
         return False
     raw = body.encode("utf-8")
     for _attempt in range(3):
-        authority = evidence_publication_authority_for(execute)
-        head = authority.latest_head(DOCUMENT_MAP_LOGICAL_ARTIFACT_ID)
-        expected_publication = latest_publication_raw_sha256(
-            execute, DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
-        )
+        try:
+            authority = evidence_publication_authority_for(execute)
+            head = authority.latest_head(DOCUMENT_MAP_LOGICAL_ARTIFACT_ID)
+            expected_publication = latest_publication_raw_sha256(
+                execute, DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
+            )
+        except Exception as exc:
+            logger.debug(f"document map host authority unavailable: {exc}")
+            return False
         try:
             content = read_container_text(
                 _ExecuteOnly(execute), DOCUMENT_MAP_PATH, exact_bytes=True

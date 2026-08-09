@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_python_build_requirements_v1
 from engine_driver import execute_action_steps, execute_native_like
 from test_python_tool import MANIFEST as PYTHON_MANIFEST
 from test_python_tool import Orch as PythonOrchestrator
@@ -52,6 +53,20 @@ pytestmark = pytest.mark.usefixtures(
     "exact_build_facade_authority",
     "exact_python_runner_authority",
 )
+
+
+def live_python_requirements():
+    """Complete live v1 build-requirements retaining the shared Python facts.
+
+    A bare partial manifest is only a forensic mirror under the host-owned
+    publication authority; live derivation reads the strict v1 record the
+    fixture publishes, so it must be schema-complete.
+    """
+
+    return complete_python_build_requirements_v1(
+        project_root="/workspace/proj",
+        **dict(PYTHON_MANIFEST),
+    )
 
 
 class _ContainerJUnitOrchestrator(PythonOrchestrator):
@@ -393,7 +408,7 @@ def test_large_pytest_junit_is_reduced_to_bounded_counts_inside_container(tmp_pa
     orchestrator = _ContainerJUnitOrchestrator(
         tmp_path / "large-pytest.xml",
         junit,
-        manifest=dict(PYTHON_MANIFEST),
+        manifest=live_python_requirements(),
         rules=[
             ("--collect-only", command_ok("474 tests collected in 0.20s")),
             (
@@ -440,7 +455,7 @@ def test_unavailable_pytest_junit_conflict_reaches_sealed_snapshot(tmp_path, jun
     python_orchestrator = _ContainerJUnitOrchestrator(
         tmp_path / f"{reason}-pytest.xml",
         junit_xml,
-        manifest=dict(PYTHON_MANIFEST),
+        manifest=live_python_requirements(),
         rules=[
             ("pyproject.toml", command_ok("exists")),
             ("--collect-only", command_ok("5 tests collected in 0.02s")),
@@ -488,7 +503,7 @@ def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path
     python_orchestrator = _ContainerJUnitOrchestrator(
         tmp_path / "five-passing.xml",
         junit,
-        manifest=dict(PYTHON_MANIFEST),
+        manifest=live_python_requirements(),
         rules=[
             ("pyproject.toml", command_ok("exists")),
             ("--collect-only", command_ok("5 tests collected in 0.02s")),

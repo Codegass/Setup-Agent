@@ -25,6 +25,7 @@ from tests.test_python_tool import (
     TVM_ROOT_INSTALL,
     fail,
     ok,
+    restamped,
     tvm_provider_rules,
 )
 
@@ -32,15 +33,19 @@ pytestmark = pytest.mark.usefixtures("exact_python_runner_authority")
 
 # The provider builds fine, just below the declared floor: the manifest floor
 # is `>=0.1.13` and the local checkout produces `0.1.13.dev47`.
-TVM_FLOOR_MANIFEST = {
-    **TVM_NATIVE_MANIFEST,
-    "python_declared_dependencies": [
+# Derived through `restamped` (the house seam): survey_fingerprint pins the
+# whole body, so a plain `{**base, ...}` edit would leave the base's stale pin
+# and the strict reader would refuse the manifest — every rung assertion below
+# would then be measuring an unreadable manifest, not the rung.
+TVM_FLOOR_MANIFEST = restamped(
+    TVM_NATIVE_MANIFEST,
+    python_declared_dependencies=[
         "apache-tvm-ffi>=0.1.13",
         "ml_dtypes",
         "numpy",
         "typing_extensions",
     ],
-}
+)
 
 NO_DEPS_INSTALL = f"{TVM_ROOT_INSTALL} --no-deps"
 REMAINING_INSTALL = (
@@ -164,10 +169,10 @@ def test_no_deps_rung_stays_dormant_when_the_retry_fails_on_another_distribution
 
 def test_no_deps_rung_skips_the_follow_up_when_the_provider_is_the_only_declared_dep():
     orch = Orch(
-        manifest={
-            **TVM_FLOOR_MANIFEST,
-            "python_declared_dependencies": ["apache-tvm-ffi>=0.1.13"],
-        },
+        manifest=restamped(
+            TVM_FLOOR_MANIFEST,
+            python_declared_dependencies=["apache-tvm-ffi>=0.1.13"],
+        ),
         rules=floor_rules(),
     )
 

@@ -11,6 +11,7 @@ import shlex
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
@@ -46,7 +47,7 @@ class MarkerOrchestrator:
         self.evidence = ContainerFS()
         if publish_manifest:
             raw = self.files.get(REQUIREMENTS_PATH)
-            payload = json.loads(raw) if raw is not None else {}
+            payload = json.loads(raw) if raw is not None else complete_build_requirements_v1()
             add_published_mutable_json(
                 self,
                 self.evidence,
@@ -89,7 +90,7 @@ class ShellParsingMarkerOrchestrator:
             record_kind="build_requirements",
             record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
             logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-            payload={},
+            payload=complete_build_requirements_v1(),
         )
 
     def execute_command(self, command, **kwargs):
@@ -294,17 +295,22 @@ def test_args_passthrough():
 def test_pathological_gradle_island_promotes_compile_to_manifest_install_goal():
     root = "/workspace/bigtop"
     island = f"{root}/bigtop-data-generators"
-    manifest = {
-        "survey": {"project_path": root},
-        "root_shape": "pathological_aggregator",
-        "build_islands": [
+    # v1 consistency: a pathological aggregator's canonical build target is the
+    # island, so build_root/test_root must name it (build_root != project_root).
+    manifest = complete_build_requirements_v1(
+        project_root=root,
+        build_system="gradle",
+        root_shape="pathological_aggregator",
+        build_root=island,
+        test_root=island,
+        build_islands=[
             {
                 "root": island,
                 "system": "gradle",
                 "goal": "publishToMavenLocal",
             }
         ],
-    }
+    )
     orchestrator = MarkerOrchestrator(
         {"build.gradle"},
         files={
@@ -345,17 +351,20 @@ def test_pathological_island_promotion_never_replaces_test():
         {"build.gradle"},
         files={
             REQUIREMENTS_PATH: json.dumps(
-                {
-                    "survey": {"project_path": root},
-                    "root_shape": "pathological_aggregator",
-                    "build_islands": [
+                complete_build_requirements_v1(
+                    project_root=root,
+                    build_system="gradle",
+                    root_shape="pathological_aggregator",
+                    build_root=island,
+                    test_root=island,
+                    build_islands=[
                         {
                             "root": island,
                             "system": "gradle",
                             "goal": "publishToMavenLocal",
                         }
                     ],
-                }
+                )
             ),
             f"{island}/build.gradle": "apply plugin: 'maven-publish'\n",
         },

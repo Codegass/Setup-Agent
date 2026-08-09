@@ -2,6 +2,7 @@ import json
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 from sag.agent.evidence_publications import (
@@ -163,7 +164,11 @@ def test_nested_gradle_island_prefers_checkout_ancestor_wrapper():
         },
         regular_files={wrapper},
     )
-    orchestrator.publish_manifest({"survey": {"project_path": root}})
+    # Wrapper discovery consumes the LIVE manifest; only a complete published
+    # v1 revision states the survey root the ancestor walk may stop at.
+    orchestrator.publish_manifest(
+        complete_build_requirements_v1(project_root=root, build_system="gradle")
+    )
 
     resolved = ToolchainManager(orchestrator).resolve(
         ToolchainSpec(name="gradle", executable="gradle"),
@@ -221,7 +226,12 @@ def test_gradle_wrapper_discovery_rejects_escape_and_stops_at_survey_root(case):
         realpaths=case["realpaths"],
         regular_files=case["wrappers"],
     )
-    orchestrator.publish_manifest({"survey": {"project_path": root}})
+    # A complete live manifest keeps this a genuine escape-rejection case:
+    # with an unpublishable manifest, discovery would be skipped entirely and
+    # the assertion would pass for the wrong reason.
+    orchestrator.publish_manifest(
+        complete_build_requirements_v1(project_root=root, build_system="gradle")
+    )
 
     resolved = ToolchainManager(orchestrator).resolve(
         ToolchainSpec(name="gradle", executable="gradle"),

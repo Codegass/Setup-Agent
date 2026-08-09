@@ -31,6 +31,7 @@ from sag.tools.base import ToolResult
 from sag.tools.build.backends import PythonBackend
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from tests.build_requirements_fakes import complete_build_requirements_v1
 from tests.container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 
@@ -102,7 +103,13 @@ class ScriptedOrch:
 
     def __init__(self, existing_paths, manifest=None, java="17"):
         self.existing_paths = set(existing_paths)
-        self.manifest = manifest or {}
+        # The strict live reader validates the published head, so legacy
+        # partial fixtures ({} or {"java_version": ...}) become overrides on a
+        # complete v1 manifest for the probed project root.
+        self.manifest = complete_build_requirements_v1(
+            project_root="/workspace/p",
+            **(manifest or {}),
+        )
         self.java = java
         self.commands = []
         self.filesystem = ContainerFS()
@@ -135,6 +142,10 @@ class ScriptedOrch:
             output = "exists" if path in self.existing_paths else "missing"
             return {"success": True, "exit_code": 0, "output": output}
         return self.filesystem(command)
+
+    def execute_control_command(self, command, **kwargs):
+        """Host-owned control channel (production surface for evidence I/O)."""
+        return self.execute_command(command, **kwargs)
 
 
 def _tool(existing_paths, python=None, maven=None, gradle=None, manifest=None):

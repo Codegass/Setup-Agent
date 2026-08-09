@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,6 +67,9 @@ def _publish_current_session(session: Path) -> ControlEventSink:
 
     sink = ControlEventSink(host_events, mirror=mirror)
     authority = EvidencePublicationAuthority.for_live_run(run_id=PIN["run_id"], sink=sink)
+    # A real run seals its container store binding (evidence_store_bound)
+    # before any evidence_publication row; the collector replays both.
+    authority.bind_store(SimpleNamespace(container_id="f" * 64))
     authority.publish_revision(
         record_kind="run_pin",
         record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,

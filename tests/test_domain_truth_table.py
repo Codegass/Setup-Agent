@@ -14,14 +14,14 @@ survey output: this lane must hold the rollup shape even before lane c1's
 producer exists.
 """
 
-import json
-
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 from sag.agent.attempt_policy import (
     IncompatibleDomainEdge,
     UntriedIslandsRequirement,
     untried_islands_requirement,
 )
-from sag.agent.evidence_records import frame_json_record_stream
+from build_requirements_fakes import complete_build_requirements_v1
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.phase_gates import (
     ClaimDisposition,
@@ -35,7 +35,7 @@ from sag.agent.verdict_finalizer import (
     _fold_build_evidence,
     _fold_test_stats,
 )
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH, survey_facts_fingerprint
 
 BIGTOP = "/workspace/bigtop"
 FRAMEWORK = f"{BIGTOP}/bigtop-test-framework"
@@ -76,12 +76,14 @@ DOMAIN_EDGES = [
         "producer": GENERATORS,
         "status": "version_incompatible",
         "detail": SPARK_DETAIL,
+        "edge_id": "edge-00000000000a",
     },
     {
         "consumer": QUEUE,
         "producer": GENERATORS,
         "status": "version_incompatible",
         "detail": QUEUE_DETAIL,
+        "edge_id": "edge-00000000000b",
     },
 ]
 
@@ -95,15 +97,25 @@ BIGTOP_DOMAIN_STATES = {
 }
 
 
+RUN = "domain-truth"
+TARGET_SHA = "b" * 40
+
+
 def _receipt(receipt_id, working_directory, outcome):
+    # Same attempt facts as the legacy v1 fixture; the strict live ledger only
+    # accepts complete current-run v2 receipts, so the run/cwd/sha binding the
+    # reader now demands is stated explicitly.
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "receipt_id": receipt_id,
+        "run_id": RUN,
         "tool": "gradle",
         "requested_action": "compile",
         "effective_action": "build",
         "argv": "./gradlew build",
         "working_directory": working_directory,
+        "actual_cwd": working_directory,
+        "target_sha": TARGET_SHA,
         "exit_code": 0 if outcome == "completed" else 1,
         "outcome": outcome,
         "report_delta": {"new": [], "changed": []},
@@ -118,52 +130,69 @@ BIGTOP_RECEIPTS = (
 
 
 def _manifest(*, domains=BUILD_DOMAINS, edges=DOMAIN_EDGES):
-    manifest = {
-        "survey": {"project_path": BIGTOP},
-        "root_shape": "pathological_aggregator",
-        "build_system": "maven",
-        "build_root": FRAMEWORK,
-        "build_islands": [
-            {"root": domain["root"], "system": domain["system"]} for domain in domains or ()
-        ],
-    }
+    # Only a complete strict v1 manifest can become the host-published live
+    # revision the gate readers follow, so the terse legacy fixture is expanded
+    # through the shared canonical helper. Same bigtop shape as before.
+    manifest = complete_build_requirements_v1(
+        project_root=BIGTOP,
+        build_system="maven",
+        target_sha=TARGET_SHA,
+    )
     if domains is not None:
+        manifest["build_root"] = domains[0]["root"]
+        # root_shape must agree with the canonical build target: a first
+        # domain at the project root is the single-module shape.
+        manifest["root_shape"] = (
+            "single_module" if manifest["build_root"] == BIGTOP else "pathological_aggregator"
+        )
+        manifest["build_islands"] = [
+            {"root": domain["root"], "system": domain["system"]} for domain in domains
+        ]
         manifest["build_domains"] = domains
-    if edges is not None:
-        manifest["domain_edges"] = edges
+        # `domain_edges` requires `build_domains` in the strict schema, so a
+        # single-domain survey (domains=None) publishes no edge key either.
+        if edges is not None:
+            manifest["domain_edges"] = edges
+    # The stamp covers the whole body, so it is applied after the domain/edge
+    # edits above: a body stamped before them would publish a stale pin, the
+    # strict reader would refuse the revision, and every domain-state assertion
+    # below would fail on an unreadable manifest instead of the truth table.
+    manifest["survey"] = {
+        **manifest["survey"],
+        "survey_fingerprint": survey_facts_fingerprint(manifest),
+    }
     return manifest
 
 
 class DomainOrch:
-    """Manifest by lossless file read AND plain `cat` (both readers exist in
-    production: the gate uses `read_build_requirements`, the attempt policy
-    uses a plain `cat`); receipts by one `cat` of the receipt directory."""
+    """One host-published evidence store: the strict readers (manifest revision,
+    receipt ledger) only follow bytes the host authority sealed, so the fixture
+    publishes the manifest head and every receipt instead of scripting reads."""
 
     def __init__(self, manifest=None, receipts=BIGTOP_RECEIPTS):
-        self.manifest = manifest
-        self.files = {} if manifest is None else {REQUIREMENTS_PATH: json.dumps(manifest)}
-        self.receipts = receipts
         self.commands = []
+        self.evidence = strict_published_evidence(
+            self,
+            run_id=RUN,
+            target_sha=TARGET_SHA,
+            receipts=tuple(receipts),
+        )
+        if manifest is not None:
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=manifest,
+            )
 
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=None):
         self.commands.append(command)
-        if command.startswith("for file in ") and any(
-            directory in command
-            for directory in ("invocation_receipts", "evidence_assessments", "job_obligations")
-        ):
-            records = self.receipts if "invocation_receipts" in command else ()
-            return {
-                "success": True,
-                "exit_code": 0,
-                "output": frame_json_record_stream(records),
-            }
-        if REQUIREMENTS_PATH in command:
-            if self.manifest is None:
-                return {"success": False, "exit_code": 1, "output": "No such file"}
-            return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
         if "test -d" in command:
             return {"success": True, "exit_code": 0, "output": "exists"}
-        return {"success": True, "exit_code": 0, "output": ""}
+        return self.evidence(command)
 
 
 class GreenValidator:
@@ -240,7 +269,7 @@ def test_edges_default_to_empty_and_claim_nothing_about_independence():
 def test_manifest_domain_edges_reach_the_requirement():
     """The graph fact the analyzer sealed is the graph fact the model is told."""
     requirement = untried_islands_requirement(
-        RunEvidenceState(run_id="domain-edges"),
+        RunEvidenceState(run_id=RUN),
         DomainOrch(_manifest()),
         phase="build",
         signal="blocked",
@@ -253,7 +282,7 @@ def test_manifest_domain_edges_reach_the_requirement():
 
 def test_a_manifest_without_domain_edges_yields_no_blockers():
     requirement = untried_islands_requirement(
-        RunEvidenceState(run_id="domain-edges"),
+        RunEvidenceState(run_id=RUN),
         DomainOrch(_manifest(edges=None)),
         phase="build",
         signal="blocked",

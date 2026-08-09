@@ -12,8 +12,13 @@ canned results per command shape, every command recorded.
 """
 
 import json
+import shlex
 
 import pytest
+from build_requirements_fakes import (
+    complete_build_requirements_v1,
+    complete_python_build_requirements_v1,
+)
 from container_evidence_fakes import (
     add_published_mutable_json,
     strict_published_evidence,
@@ -42,17 +47,24 @@ from sag.tools.internal.python_tool import COLLECTED_JSON, PYTEST_REPORT_DIR
 
 
 def _manifest(**overrides):
-    data = {
+    # Live-authority migration: the strict reader validates the published
+    # head, so the fixture is a complete v1 manifest; the current facts
+    # version makes distribution ownership exact, so the surveyed
+    # distribution name is stated and LadderOrch answers its record probes.
+    # Overrides are folded into the helper call rather than applied after it:
+    # the survey_fingerprint stamp covers the whole manifest body, so a
+    # post-hoc mutation would leave a stale pin the schema now refuses.
+    facts = {
         "python_version": "3.12",
         "python_constraint": ">=3.9",
-        "python_installer": "pip",
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
+        "python_constraint_source": None,
+        "python_install_source": None,
+        "python_build_backend": None,
         "python_packages": ["foo"],
-        "python_venv": "/workspace/proj/.venv",
-        "has_c_extensions": False,
+        "python_distribution_name": "foo",
     }
-    data.update(overrides)
-    return data
+    facts.update(overrides)
+    return complete_python_build_requirements_v1(project_root="/workspace/proj", **facts)
 
 
 class LadderOrch:
@@ -115,6 +127,19 @@ class LadderOrch:
             return res(True, f"Python {self.active}.0")
         if "java -version" in c:
             return res(False, "java: command not found")
+        # Exact-distribution ownership probes (facts-v8+): the surveyed
+        # distribution's own installed record, read-only.
+        if c.startswith("find") and "dist-info" in c:
+            return res(
+                True,
+                "/workspace/proj/.venv/lib/python3.12/site-packages/foo-1.0.dist-info",
+            )
+        if c.startswith("cat") and "direct_url.json" in c:
+            return res(True, '{"url": "file:///workspace/proj", "dir_info": {"editable": true}}')
+        if c.startswith("cat") and "top_level.txt" in c:
+            return res(True, "foo\n")
+        if c.startswith("realpath -m -- "):
+            return res(True, "\n".join(shlex.split(c)[3:]))
         if c.startswith("test -f "):
             # Build-system detection: this project is python-only.
             return res("pyproject.toml" in c)
@@ -474,7 +499,29 @@ class EnvOrch:
     def __init__(self, python="3.8", java=None, manifest=None):
         self.python = python
         self.java = java
-        self.manifest = manifest or {}
+        # Live-authority migration: overrides are re-expressed on a complete
+        # v1 manifest. The all-or-nothing python group means a lone
+        # python_version override expands to the full python fact set. Every
+        # override — java_version included — goes THROUGH the helper: the
+        # survey_fingerprint stamp is computed over the final body, so a key
+        # written after the helper returned would strand a stale pin.
+        overrides = dict(manifest or {})
+        if any(key.startswith("python_") for key in overrides):
+            overrides.setdefault("python_constraint", None)
+            payload = complete_python_build_requirements_v1(
+                project_root="/workspace/proj",
+                python_constraint_source=None,
+                python_install_source=None,
+                python_build_backend=None,
+                **overrides,
+            )
+        else:
+            payload = complete_build_requirements_v1(
+                project_root="/workspace/proj",
+                build_system="pytest",
+                **overrides,
+            )
+        self.manifest = payload
         publication = publish_evidence_revision(
             self,
             record_kind="build_requirements",
@@ -579,11 +626,21 @@ class CollectedOrch:
 
 
 class PublishedDenominatorOrch:
-    """One current Python test receipt with three complete typed rows."""
+    """One current Python test receipt with three complete typed rows.
+
+    Live-authority migration: the manifest is a complete v1 document, so the
+    contract/receipt pin exactly the fingerprints its survey carries —
+    target_sha + survey_fingerprint (both mandatory now that every manifest is
+    stamped) plus config + document-map; a python project has no build_domains
+    and no fact epoch here, so those pins stay absent on BOTH sides, which the
+    pairwise pin semantics read as agreement rather than a binding hole.
+    """
 
     run_id = "run-pytest"
     target_sha = "a" * 40
     project_root = "/workspace/proj"
+    config_fingerprint = "config-current"
+    document_map_fingerprint = "d" * 64
 
     def __init__(self):
         report_path = "/workspace/.setup_agent/pytest-reports/pytest-attempt-000001.xml"
@@ -615,6 +672,20 @@ class PublishedDenominatorOrch:
             domain_id=self.project_root,
             working_directory=self.project_root,
         )
+        # The manifest is built FIRST: its survey_fingerprint is the value the
+        # frozen contract and its receipt must pin, and the assessor compares
+        # the two sides pairwise.
+        self.manifest = complete_python_build_requirements_v1(
+            project_root=self.project_root,
+            target_sha=self.target_sha,
+            config_fingerprint=self.config_fingerprint,
+            document_map_fingerprint=self.document_map_fingerprint,
+            python_constraint=None,
+            python_constraint_source=None,
+            python_install_source=None,
+            python_build_backend=None,
+        )
+        survey_fingerprint = self.manifest["survey"]["survey_fingerprint"]
         params = {
             "action": "test",
             "args": None,
@@ -644,11 +715,9 @@ class PublishedDenominatorOrch:
                 params=params,
             ),
             target_sha=self.target_sha,
-            survey_fingerprint="survey-current",
-            config_fingerprint="config-current",
-            document_map_fingerprint="documents-current",
-            domain_id=self.project_root,
-            fact_epoch=1,
+            survey_fingerprint=survey_fingerprint,
+            config_fingerprint=self.config_fingerprint,
+            document_map_fingerprint=self.document_map_fingerprint,
         )
         receipt = build_receipt(
             receipt_id=receipt_id,
@@ -663,11 +732,9 @@ class PublishedDenominatorOrch:
             before={},
             after={report_path: report_sha},
             target_sha=self.target_sha,
-            survey_fingerprint="survey-current",
-            config_fingerprint="config-current",
-            document_map_fingerprint="documents-current",
-            domain_id=self.project_root,
-            fact_epoch=1,
+            survey_fingerprint=survey_fingerprint,
+            config_fingerprint=self.config_fingerprint,
+            document_map_fingerprint=self.document_map_fingerprint,
             testcase_execution_rows=rows,
             contract_id=contract["contract_id"],
             contract_hash=contract["contract_hash"],
@@ -699,17 +766,6 @@ class PublishedDenominatorOrch:
             contract_id=contract["contract_id"],
             contract_hash=contract["contract_hash"],
         )
-        self.manifest = {
-            "survey": {
-                "project_path": self.project_root,
-                "target_sha": self.target_sha,
-                "survey_fingerprint": "survey-current",
-                "config_fingerprint": "config-current",
-                "document_map_fingerprint": "documents-current",
-            },
-            "build_domains": [{"root": self.project_root}],
-            "domain_facts": [{"root": self.project_root, "fact_epoch": 1}],
-        }
         add_published_mutable_json(
             self,
             self.filesystem,
@@ -732,6 +788,10 @@ class PublishedDenominatorOrch:
                 "output": "",
             }
         return self.filesystem(command, **kwargs)
+
+    def execute_control_command(self, command, **kwargs):
+        """Host-owned control channel (production surface for evidence I/O)."""
+        return self.execute_command(command, **kwargs)
 
 
 def test_unpublished_collected_json_cannot_feed_static_test_count():

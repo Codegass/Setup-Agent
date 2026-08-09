@@ -50,19 +50,35 @@ class _FakeOrch(DockerOrchestrator):
     def __init__(self):
         pass
 
-    def execute_command(self, command, workdir=None, timeout=None, truncate_output=True):
+    def execute_command(self, command, workdir=None, timeout=None, truncate_output=True, **kwargs):
         return {"success": True, "exit_code": 0, "output": BASH_PARSE_LOG}
 
 
-def test_bash_parse_failure_is_a_distinct_launcher_error(monkeypatch):
+def test_bash_parse_failure_of_the_launcher_never_fabricates_an_exit_code(monkeypatch):
+    # Premise updated for the evidence-control repair: a launcher killed by a
+    # bash parse error is now caught at dispatch acceptance, and a vanished
+    # job without a proven terminal observation fails SAFE (exit_code None,
+    # execution incomplete) instead of synthesizing exit 1 with a
+    # "[launcher error:" label from a post-hoc log grep.
     orch = _FakeOrch()
     monkeypatch.setattr(_FakeOrch, "_detached_poll_state", lambda self, poll: "vanished")
     monkeypatch.setattr(
         _FakeOrch, "_truncate_output_smartly", lambda self, text: text, raising=False
     )
     result = orch.collect_detached_result(
-        {"log_path": "/tmp/sag_jobs/x.log", "job_id": "x", "pid": 1},
+        {
+            "log_path": "/tmp/sag_jobs/x.log",
+            "job_id": "x",
+            "pid": 1,
+            "start_accepted": True,
+            "runner_dispatch_state": "accepted",
+            "runner_dispatched": True,
+        },
         {"exit_code": None},
     )
-    assert result["exit_code"] == 1
-    assert "[launcher error:" in result["full_output"]
+    assert result["success"] is False
+    assert result["exit_code"] is None
+    assert result["dispatch_status"] == "execution_observation_failed"
+    assert result["execution_observation_complete"] is False
+    # The unproven log is never laundered into the terminal result.
+    assert BASH_PARSE_LOG not in result["full_output"]

@@ -37,6 +37,10 @@ import shlex
 from contextlib import contextmanager
 
 import pytest
+from build_requirements_fakes import (
+    complete_build_requirements_v1,
+    complete_python_build_requirements_v1,
+)
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 
 pytestmark = pytest.mark.usefixtures("facade_contract_authority")
@@ -133,7 +137,11 @@ def python_dispatch_scope(*, operation, params):
 
 def _atomic_write_tokens(command):
     """The shared writer's bounded command shape, or ``None`` otherwise."""
-    tokens = shlex.split(command) if "\n" not in command else []
+    # The compare-and-publish commit is a `python3 -c` whose quoted program
+    # spans lines; it is still one bounded writer command, so tokenize it.
+    tokens = (
+        shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
+    )
     if (
         tokens[:3] == ["mkdir", "-p", "--"]
         or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
@@ -237,6 +245,19 @@ class NativeOrchestrator:
 
     def __init__(self, requirements=None, markers=("pyproject.toml",), assessments=(), claims=()):
         self.markers = set(markers)
+        # The strict live reader admits only a complete host-published v1
+        # manifest, so the fixture publishes one matching the marker system.
+        if requirements is None:
+            if "pom.xml" in self.markers:
+                requirements = complete_build_requirements_v1(
+                    project_root=PROJECT, build_system="maven"
+                )
+            elif "gradlew" in self.markers:
+                requirements = complete_build_requirements_v1(
+                    project_root=PROJECT, build_system="gradle"
+                )
+            else:
+                requirements = complete_python_build_requirements_v1(project_root=PROJECT)
         self.commands = []
         self.written = []
         self.records = {
@@ -257,7 +278,7 @@ class NativeOrchestrator:
             record_kind="build_requirements",
             record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
             logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-            payload=dict(requirements or {}),
+            payload=dict(requirements),
         )
         self.files = self.evidence.files
         self.atomic = FakeContainer()
@@ -270,6 +291,11 @@ class NativeOrchestrator:
             # path, because "could not look" is not "looked and found nothing".
             return None
         return {"success": True, "content": self.files[path], "exit_code": 0}
+
+    def execute_control_command(self, command, **kwargs):
+        # Strict evidence writers refuse a bound ordinary executor whose owner
+        # exposes no clean control channel; the fake's channels are one store.
+        return self.execute_command(command, **kwargs)
 
     def _glob_directory(self, command):
         for directory in self.records:
@@ -291,8 +317,17 @@ class NativeOrchestrator:
         atomic_tokens = _atomic_write_tokens(command)
         if atomic_tokens is not None:
             result = self.atomic.execute_command(command)
+            final = None
             if atomic_tokens[:3] == ["mv", "-f", "--"]:
                 final = atomic_tokens[4]
+            elif (
+                atomic_tokens[:2] == ["python3", "-c"]
+                and "fcntl.flock" in atomic_tokens[2]
+                and result.get("exit_code") == 0
+            ):
+                # The compare-and-publish commit replaces the target in-process.
+                final = atomic_tokens[3]
+            if final is not None and final.endswith(".json") and final in self.files:
                 payload = json.loads(self.files[final])
                 if final.startswith(f"{ASSESSMENT_DIR}/"):
                     self.written.append(payload)
@@ -379,20 +414,35 @@ def test_native_is_neither_edge_gated_nor_preflighted():
 
 
 def test_a_locked_domain_edge_does_not_refuse_a_native_call():
+    # Premise: the same locked edge, restated as the complete host-published v1
+    # manifest the strict live reader admits (edges must name their domains).
     result, runner, _ = run_native(
         evidence=AUTHORIZED,
-        requirements={
-            "java_version": "8",
-            "java_version_source": "pom",
-            "domain_edges": [
+        requirements=complete_build_requirements_v1(
+            project_root="/workspace",
+            build_system="maven",
+            java_version="8",
+            java_version_source="maven-compiler",
+            root_shape="pathological_aggregator",
+            build_root=PROJECT,
+            build_islands=[
+                {"root": PROJECT, "system": "maven"},
+                {"root": "/workspace/other", "system": "maven"},
+            ],
+            build_domains=[
+                {"root": PROJECT, "system": "maven"},
+                {"root": "/workspace/other", "system": "maven"},
+            ],
+            domain_edges=[
                 {
                     "consumer": PROJECT,
                     "producer": "/workspace/other",
                     "status": "version_incompatible",
                     "detail": "requires g:a 1.0; producer builds 2.0",
+                    "edge_id": "edge-" + "0" * 12,
                 }
             ],
-        },
+        ),
     )
 
     assert result.error_code == "NATIVE_WITHOUT_PROVENANCE"
@@ -761,6 +811,11 @@ class ScriptedContainer:
             return {"success": False, "output": "", "exit_code": 1}
         return {"success": True, "output": "", "exit_code": 0}
 
+    def execute_control_command(self, command, **kwargs):
+        # Strict evidence writers refuse a bound ordinary executor whose owner
+        # exposes no clean control channel; the fake's channels are one store.
+        return self.execute_command(command, **kwargs)
+
     def issued(self, needle):
         """The command LINES containing `needle`.
 
@@ -772,12 +827,9 @@ class ScriptedContainer:
         return [line for line in lines if needle in line]
 
 
-PYTHON_MANIFEST = {
-    "python_venv": f"{PROJECT}/.venv",
-    "python_installer": "pip",
-    "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-    "survey": {"project_path": PROJECT},
-}
+# The strict live reader admits only a complete v1 manifest; this carries the
+# same venv, installer and install command the legacy partial fixture stated.
+PYTHON_MANIFEST = complete_python_build_requirements_v1(project_root=PROJECT)
 
 
 def python_native(container=None, *, bundle=None, manifest=None):
@@ -876,11 +928,17 @@ def test_the_local_provider_and_no_deps_ladder_still_runs_under_the_overlay():
             "pip install -e .": "ERROR: No matching distribution found for provider-dist>=0.2",
         }
     )
-    manifest = dict(
-        PYTHON_MANIFEST,
-        python_declared_dependencies=["provider-dist>=0.2"],
-        python_local_providers=[{"distribution_name": "provider-dist", "root": "sub"}],
-        python_root=PROJECT,
+    manifest = complete_python_build_requirements_v1(
+        project_root=PROJECT,
+        dependencies=["provider-dist>=0.2"],
+        python_local_providers=[
+            {
+                "distribution_name": "provider-dist",
+                "root": "sub",
+                "requirement": "provider-dist>=0.2",
+                "build_backend": None,
+            }
+        ],
     )
     container.outputs["cat /workspace/proj/sub/pyproject.toml"] = (
         "[project]\nname = 'provider-dist'\n"

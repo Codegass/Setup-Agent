@@ -803,11 +803,20 @@ def _current_contract_binding_problem(
     if not isinstance(requested, Mapping) or _text(requested.get("tool")) != "build":
         return ""
     for key in FINGERPRINT_KEYS:
-        if key not in contract:
+        contract_states = key in contract
+        current_states = isinstance(current, Mapping) and bool(_text(current.get(key)))
+        if not contract_states and not current_states:
+            # A pin NEITHER side states is not a disagreement — document map,
+            # domain, and epoch pins exist only when their peer artifacts do,
+            # and a project without them must still reach the falsifier
+            # taxonomy. Only target_sha and survey_fingerprint are always
+            # producible, so their absence stays an integrity hole.
+            if key in ("target_sha", "survey_fingerprint"):
+                return f"invocation contract has no current-authority {key} pin"
+            continue
+        if not contract_states:
             return f"invocation contract has no current-authority {key} pin"
-        if not isinstance(current, Mapping) or key not in current:
-            return f"current {key} pin is unavailable"
-        if not _text(current.get(key)):
+        if not current_states:
             return f"current {key} pin is unavailable"
     return ""
 

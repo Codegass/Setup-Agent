@@ -5,6 +5,7 @@ reactor_scope_narrowed: tests ran in a strict subset of test-bearing modules.
 Both are report-only; they NEVER block execution."""
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from sag.agent.control_events import canonical_json
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
@@ -22,7 +23,9 @@ class ConflictOrch:
 
     def __init__(self, java="11", manifest=None):
         self.java = java
-        self.manifest = manifest or {}
+        # The live reader only authorizes a complete v1 revision; a bare dict
+        # would read back as build_requirements_unavailable, not as evidence.
+        self.manifest = manifest if manifest is not None else complete_build_requirements_v1()
         publication = publish_evidence_revision(
             self,
             record_kind="build_requirements",
@@ -65,20 +68,26 @@ def test_collect_jdk_conflict_on_mismatch():
     # _collect_env_conflicts is the renamed _collect_jdk_conflicts (it now
     # also covers python); the jdk_mismatch contract is unchanged.
     validator = PhysicalValidator.__new__(PhysicalValidator)
-    validator.docker_orchestrator = ConflictOrch(java="11", manifest={"java_version": "17"})
+    validator.docker_orchestrator = ConflictOrch(
+        java="11",
+        manifest=complete_build_requirements_v1(java_version="17"),
+    )
     assert validator._collect_env_conflicts() == ["jdk_mismatch"]
 
 
 @pytest.mark.parametrize(
-    ("java", "manifest"),
+    ("java", "required_java"),
     [
-        ("17", {"java_version": "17"}),
-        ("11", {}),
+        ("17", "17"),
+        ("11", None),  # a manifest that states no JDK requirement
     ],
 )
-def test_no_conflict_when_matching_or_unknown(java, manifest):
+def test_no_conflict_when_matching_or_unknown(java, required_java):
     validator = PhysicalValidator.__new__(PhysicalValidator)
-    validator.docker_orchestrator = ConflictOrch(java=java, manifest=manifest)
+    validator.docker_orchestrator = ConflictOrch(
+        java=java,
+        manifest=complete_build_requirements_v1(java_version=required_java),
+    )
     assert validator._collect_env_conflicts() == []
 
 

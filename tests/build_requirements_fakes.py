@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from sag.tools.internal.build_preflight import BUILD_REQUIREMENTS_SCHEMA_VERSION
+from sag.tools.internal.build_preflight import (
+    BUILD_REQUIREMENTS_SCHEMA_VERSION,
+    survey_facts_fingerprint,
+)
 from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION
 
 
@@ -47,6 +50,16 @@ def complete_build_requirements_v1(
         "test_islands": [],
     }
     manifest.update(overrides)
+    # The production writer owns this stamp; the fixture mirrors it so a
+    # helper-built manifest is publishable as-is. A caller-supplied survey
+    # block that already states a fingerprint is respected verbatim — that is
+    # how forged/stale-pin negative cases are built.
+    survey = manifest.get("survey")
+    if isinstance(survey, dict) and "survey_fingerprint" not in survey:
+        manifest["survey"] = {
+            **survey,
+            "survey_fingerprint": survey_facts_fingerprint(manifest),
+        }
     return manifest
 
 

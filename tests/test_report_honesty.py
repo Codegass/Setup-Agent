@@ -32,6 +32,7 @@ C. (SAG v2 Plan 4, Task 3 — 2026-07-26 post-acceptance audit) The TVM
 import json
 import re
 
+from build_requirements_fakes import complete_python_build_requirements_v1
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.report_tool import ReportTool
@@ -229,25 +230,29 @@ def test_derived_blockers_do_not_duplicate_attention_blockers():
 
 def test_recommendations_quote_surveyed_install_and_smoke_facts():
     """Surveyed coordinates replace the generic pip/pytest prose."""
+    # The strict live reader serves only complete v1 manifests, whose installer
+    # grammar pins the venv placeholder form — the surveyed install/smoke facts
+    # under test ride the smallest complete Python manifest and are still
+    # quoted VERBATIM, never rewritten into generic ecosystem prose.
     orch = FakeOrch(
-        manifest={
-            "build_root": "/workspace/tvm",
-            "test_root": "/workspace/tvm/tests/python",
-            "python_install_commands": [
-                "/workspace/.venv/bin/python -m pip install -e . --no-deps",
-                "/workspace/.venv/bin/python -m pip install ml_dtypes numpy",
+        manifest=complete_python_build_requirements_v1(
+            project_root="/workspace/tvm",
+            test_root="/workspace/tvm/tests/python",
+            python_install_commands=[
+                "{venv}/bin/python -m pip install -e .",
+                "{venv}/bin/python -m pip install ml_dtypes numpy",
             ],
-            "python_smoke_candidates": [
-                {"path": "tests/python/test_runtime.py", "source": "pytest_ini"}
+            python_smoke_candidates=[
+                {"path": "tests/python/test_runtime.py", "source": "filesystem:test-file"}
             ],
-        }
+        )
     )
     snapshot = _sealed_snapshot(verdict="partial")
     text = _render(_tool(docker_orchestrator=orch), snapshot)
 
     assert "pip install -e . && pytest" not in text
-    assert "/workspace/.venv/bin/python -m pip install -e . --no-deps" in text
-    assert "/workspace/.venv/bin/python -m pip install ml_dtypes numpy" in text
+    assert "{venv}/bin/python -m pip install -e ." in text
+    assert "{venv}/bin/python -m pip install ml_dtypes numpy" in text
     assert "tests/python/test_runtime.py" in text
 
 

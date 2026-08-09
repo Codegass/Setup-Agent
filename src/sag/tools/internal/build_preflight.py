@@ -286,6 +286,26 @@ def _string_list(
     return values
 
 
+def survey_facts_fingerprint(payload: Mapping[str, Any]) -> str:
+    """SHA-256 pin over the DERIVED survey facts, and nothing else.
+
+    The pin answers one question: which survey conclusions authorized a
+    dispatch. Inputs already carry their own pins (config_fingerprint,
+    target_sha, document_map_fingerprint), so the survey stamp itself is
+    excluded; `module_structure` is excluded because it is receipt-owned —
+    only a receipt may replace a receipt, and doing so is not a re-survey,
+    so a structure merge must never flip a frozen contract's binding.
+    """
+
+    facts = {
+        key: value
+        for key, value in dict(payload).items()
+        if key not in ("survey", "module_structure")
+    }
+    body = json.dumps(facts, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def _validate_survey(value: Any) -> Dict[str, Any]:
     survey = _exact_keys(
         value,
@@ -295,6 +315,7 @@ def _validate_survey(value: Any) -> Dict[str, Any]:
             "config_fingerprint",
             "target_sha",
             "document_map_fingerprint",
+            "survey_fingerprint",
         },
         field="survey",
     )
@@ -331,6 +352,12 @@ def _validate_survey(value: Any) -> Dict[str, Any]:
         survey["document_map_fingerprint"],
         "survey.document_map_fingerprint",
         nullable=True,
+        pattern=_SHA256_RE,
+        max_bytes=64,
+    )
+    _text(
+        survey["survey_fingerprint"],
+        "survey.survey_fingerprint",
         pattern=_SHA256_RE,
         max_bytes=64,
     )
@@ -889,6 +916,11 @@ def validate_build_requirements_v1(
     ):  # pragma: no cover
         raise ValueError("build requirements schema is not v1")
     survey = _validate_survey(body["survey"])
+    if survey["survey_fingerprint"] != survey_facts_fingerprint(body):
+        # The pin is a pure function of the derived facts, so a mismatch is
+        # always a forged, stale, or hand-edited stamp — never a merge effect
+        # (module_structure is outside the fingerprint by definition).
+        raise ValueError("survey fingerprint does not match the derived facts")
     project_root = str(survey["project_path"])
     _text(body["java_version"], "java_version", nullable=True, max_bytes=64)
     _text(
@@ -973,6 +1005,16 @@ def write_build_requirements(orchestrator, data: Dict[str, Any]) -> bool:
     from sag.agent.receipt_structure import preserve_receipt_structure
 
     try:
+        # The writer, not the surveyor, owns the survey_fingerprint stamp:
+        # one computation at the one persistence boundary (P3), so every
+        # revision — first survey or rewrite — carries the pin its body earns.
+        data = dict(data)
+        survey_stamp = data.get("survey")
+        if isinstance(survey_stamp, Mapping):
+            data["survey"] = {
+                **survey_stamp,
+                "survey_fingerprint": survey_facts_fingerprint(data),
+            }
         incoming = validate_build_requirements_v1(data)
     except (TypeError, ValueError) as exc:
         logger.warning(f"Refusing invalid build requirements before persistence: {exc}")

@@ -529,6 +529,9 @@ def test_post_loop_finalizer_rehydrates_module_qualified_rows_from_durable_recei
         },
     )
     orch = IdentityMetricsOrchestrator(receipt)
+    # Every evidence_publication now requires the preceding evidence_store_bound
+    # event: one run authorizes exactly one container store.
+    bind_host_evidence_publication_authority.bind_store(orch)
     bind_host_evidence_publication_authority.publish_revision(
         record_kind="run_pin",
         record_id="host-run-pin",

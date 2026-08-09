@@ -13,6 +13,7 @@ carry the checklist. Same algorithm both places, or the in-run guidance and
 the sealed verdict would disagree (the exact split this campaign just fixed).
 """
 
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.module_coverage import (
@@ -417,6 +418,9 @@ def _loop_engine(islands, observed_workdirs, *, receipt=True, tool_name="build")
                 target_sha=target_sha,
                 receipts=tuple(durable_receipts.values()),
             )
+            # The strict live reader serves only a complete v1 manifest; the
+            # islands ride the smallest complete shape (islands[0] is the
+            # selected build root, so a multi-island survey is an aggregator).
             add_published_mutable_json(
                 self,
                 self.evidence,
@@ -424,15 +428,27 @@ def _loop_engine(islands, observed_workdirs, *, receipt=True, tool_name="build")
                 record_kind="build_requirements",
                 record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
                 logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-                payload={
-                    "survey": {"project_path": "/workspace/bigtop"},
-                    "build_islands": islands,
-                },
+                payload=complete_build_requirements_v1(
+                    project_root="/workspace/bigtop",
+                    **(
+                        {
+                            "root_shape": "pathological_aggregator",
+                            "build_root": str(islands[0]["root"]),
+                            "build_islands": islands,
+                        }
+                        if islands
+                        else {}
+                    ),
+                ),
             )
             self.files = self.evidence.files
 
         def execute_command(self, command, **kwargs):
             return self.evidence(command)
+
+        # Strict evidence transport refuses a bound project-runtime executor
+        # and requires the clean host-control channel.
+        execute_control_command = execute_command
 
     engine.physical_validator = SimpleNamespace(docker_orchestrator=ManifestOrch())
     engine.context_manager = SimpleNamespace(load_trunk_context=lambda: None)

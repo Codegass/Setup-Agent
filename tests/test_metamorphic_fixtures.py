@@ -359,6 +359,26 @@ def normalized_orchard(structure):
     return normalized(structure, ORCHARD_TOKENS)
 
 
+SURVEY_PIN_PLACEHOLDER = "<survey-fingerprint>"
+
+
+def _survey_pin_placeheld(manifest):
+    """`manifest` with `survey.survey_fingerprint` replaced by a placeholder.
+
+    The survey pin is a SHA-256 over the manifest's own derived facts, and those
+    facts contain the project's paths and coordinates. So it belongs to the same
+    family as `contract_id` / `contract_hash` / `action_fingerprint`: content-
+    derived, therefore REQUIRED to differ between the two spellings, and asserted
+    to differ separately rather than compared for equality. Placeholding it keeps
+    every other byte of the body under exact comparison.
+    """
+
+    return {
+        **manifest,
+        "survey": {**manifest["survey"], "survey_fingerprint": SURVEY_PIN_PLACEHOLDER},
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 1) The domain graph itself.
 # --------------------------------------------------------------------------- #
@@ -422,7 +442,15 @@ def test_renamed_project_yields_an_isomorphic_persisted_manifest():
     _orch_a, _analysis_a, manifest_a = _analyze_bigtop_stage_a()
     _orch_b, _analysis_b, manifest_b = _analyze_orchard_stage_a()
 
-    assert normalized_bigtop(manifest_a) == normalized_orchard(manifest_b)
+    assert _survey_pin_placeheld(normalized_bigtop(manifest_a)) == _survey_pin_placeheld(
+        normalized_orchard(manifest_b)
+    )
+    # The pin binds the renamed material, so it must differ — and it must be a
+    # real digest on both sides, not an absent or placeheld key.
+    pin_a = manifest_a["survey"]["survey_fingerprint"]
+    pin_b = manifest_b["survey"]["survey_fingerprint"]
+    assert DIGEST_RE.fullmatch(pin_a) and DIGEST_RE.fullmatch(pin_b)
+    assert pin_a != pin_b
 
 
 def test_renamed_project_yields_the_same_domain_fact_shapes():
@@ -604,11 +632,14 @@ def test_freezing_a_renamed_dispatch_yields_an_isomorphic_contract_body():
         # Normalized WITH the manifest so `domain_id`/`blocking_conflict_ids`
         # resolve to the records that define them.
         body = normalized({"contract": contract, "manifest": manifest}, tokens)["contract"]
-        # These three digests bind the renamed material, so they are REQUIRED
-        # to differ — asserted separately below.
+        # These four digests bind the renamed material, so they are REQUIRED
+        # to differ — asserted separately below. The contract pins the survey it
+        # was frozen against, and that pin is a digest over the renamed manifest
+        # facts, so it belongs with the other three.
         body["contract_id"] = "<contract-id>"
         body["contract_hash"] = "<contract-hash>"
         body["action_fingerprint"] = "<action-fingerprint>"
+        body["survey_fingerprint"] = SURVEY_PIN_PLACEHOLDER
         return body
 
     assert canonical(contract_a, manifest_a, BIGTOP_TOKENS) == canonical(
@@ -617,6 +648,11 @@ def test_freezing_a_renamed_dispatch_yields_an_isomorphic_contract_body():
     assert contract_a["contract_id"] != contract_b["contract_id"]
     assert contract_a["contract_hash"] != contract_b["contract_hash"]
     assert contract_a["action_fingerprint"] != contract_b["action_fingerprint"]
+    assert contract_a["survey_fingerprint"] != contract_b["survey_fingerprint"]
+    # The contract pins the manifest it actually froze against, not some other
+    # survey: each side's pin is its own manifest's stamp.
+    assert contract_a["survey_fingerprint"] == manifest_a["survey"]["survey_fingerprint"]
+    assert contract_b["survey_fingerprint"] == manifest_b["survey"]["survey_fingerprint"]
     # The reference really was resolved, not left opaque and equal by accident.
     assert contract_a["blocking_conflict_ids"] != contract_b["blocking_conflict_ids"]
     assert contract_a["domain_id"] != contract_b["domain_id"]

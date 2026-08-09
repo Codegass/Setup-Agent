@@ -24,21 +24,22 @@ consumers pin a stale version) because that is the run this law exists for.
 import importlib.util
 import json
 import os
-import shlex
 
 import pytest
 
 pytestmark = pytest.mark.usefixtures(
     "facade_contract_authority", "exact_build_facade_authority"
 )
-from test_container_io import FakeContainer
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 from sag.agent.control_events import action_envelope_sha256
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
+from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.tool_orchestration import format_tool_result
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH, survey_facts_fingerprint
 
 PRODUCER = "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-data-generator"
 CONSUMER = "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark"
@@ -59,7 +60,15 @@ SEALED_PHRASE = "this consumer is sealed blocked; record the mismatch, do not si
 GATED_VERBS = ("compile", "test", "package", "install")
 
 
-def edge(status, *, consumer=CONSUMER, producer=PRODUCER, detail=None, edge_id="edge-0001"):
+def edge(
+    status,
+    *,
+    consumer=CONSUMER,
+    producer=PRODUCER,
+    detail=None,
+    edge_id="edge-000000000001",
+):
+    # The strict manifest schema pins edge identity to `edge-` + 12 hex chars.
     body = {
         "consumer": consumer,
         "producer": producer,
@@ -72,66 +81,88 @@ def edge(status, *, consumer=CONSUMER, producer=PRODUCER, detail=None, edge_id="
 
 
 def manifest(*edges, **extra):
-    body = dict(extra)
+    """Expand edge fixtures into the one strict live v1 manifest shape.
+
+    Only a complete valid manifest can become the host-published revision the
+    facade routes dispatch by, so the domains the edges name are stated
+    explicitly (an edge endpoint must be a surveyed domain root).
+
+    The survey_fingerprint covers the whole manifest body and the strict reader
+    recomputes it, so the stamp is applied HERE — after the edges and every
+    ``extra`` override have landed. A body stamped before those edits would
+    publish a stale pin, and the facade would refuse the revision outright
+    (BUILD_REQUIREMENTS_UNAVAILABLE) rather than reach the edge law on trial.
+    """
+    body = complete_build_requirements_v1(
+        project_root="/workspace/bigtop",
+        build_system="maven",
+    )
+    body.update(extra)
     if edges:
+        roots = []
+        for item in edges:
+            for role in ("consumer", "producer"):
+                root = item[role]
+                if root not in roots:
+                    roots.append(root)
+        body["build_root"] = roots[0]
+        body["root_shape"] = "pathological_aggregator"
+        body["build_islands"] = [{"root": root, "system": "maven"} for root in roots]
+        body["build_domains"] = [{"root": root, "system": "maven"} for root in roots]
         body["domain_edges"] = list(edges)
+    body["survey"] = {
+        **body["survey"],
+        "survey_fingerprint": survey_facts_fingerprint(body),
+    }
     return body
 
 
 class EdgeOrchestrator:
-    """Marker probes, a build_requirements.json, and a recording assessment sink.
+    """Marker probes, one host-published manifest, and a strict evidence store.
 
-    `read_file` is the container's exact-bytes path, so the manifest never rides
-    the marker-probe branch; every OTHER command is recorded, which is how the
+    The manifest rides the host publication ledger (a bare container file is a
+    forensic mirror, never routing authority), assessments land in the shared
+    atomic evidence store, and every command is recorded, which is how the
     "zero runner invocation" assertions stay honest.
     """
 
     def __init__(self, requirements, markers=("pom.xml",)):
-        self.files = {REQUIREMENTS_PATH: json.dumps(requirements)}
         self.markers = set(markers)
         self.commands = []
-        self.assessments = []
-        self.atomic = FakeContainer()
-        self.atomic.files = self.files
+        # The conftest host authority (run-pytest) binds to this store on the
+        # first publication, so contract/assessment publication and the
+        # manifest revision share ONE authority, exactly like a live run.
+        self.evidence = ContainerFS()
+        if isinstance(requirements, dict):
+            add_published_mutable_json(
+                self,
+                self.evidence,
+                path=REQUIREMENTS_PATH,
+                record_kind="build_requirements",
+                record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                payload=requirements,
+            )
 
-    def read_file(self, path):
-        if path not in self.files:
-            # §3.9 absence protocol: absence is STATED (None), never implied
-            # by an ordinary failure — a failed read now raises on the exact
-            # path, because "could not look" is not "looked and found nothing".
-            return None
-        return {"success": True, "content": self.files[path], "exit_code": 0}
+    @property
+    def assessments(self):
+        return [
+            json.loads(body)
+            for path, body in sorted(self.evidence.files.items())
+            if path.startswith(f"{ASSESSMENT_DIR}/") and path.endswith(".json")
+        ]
+
+    def execute_control_command(self, command, **kwargs):
+        # Production orchestrators expose the clean host-control channel; the
+        # strict evidence transport refuses a bare bound normal executor.
+        return self.execute_command(command, **kwargs)
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
-        tokens = shlex.split(command) if "\n" not in command else []
-        atomic_command = (
-            tokens[:3] == ["mkdir", "-p", "--"]
-            or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
-            or tokens[:2] == ["base64", "--decode"]
-            or tokens[:3] == ["mv", "-f", "--"]
-            or (
-                tokens[:2] == ["python3", "-c"]
-                and ("hashlib.sha256" in tokens[2] or "json.load" in tokens[2])
-            )
-        )
-        if atomic_command:
-            result = self.atomic.execute_command(command)
-            if tokens[:3] == ["mv", "-f", "--"]:
-                self.assessments.append(json.loads(self.files[tokens[4]]))
-            return result
-        if ASSESSMENT_DIR in command:
-            if command.startswith("cat "):
-                path = shlex.split(command)[-1]
-                if path in self.files:
-                    return {"success": True, "output": self.files[path], "exit_code": 0}
-                return {"success": False, "output": "", "exit_code": 1}
-            self.assessments.append(json.loads(command.split("\n")[1]))
-            return {"success": True, "output": "", "exit_code": 0}
-        for marker in self.markers:
-            if marker in command:
-                return {"success": True, "output": "exists", "exit_code": 0}
-        return {"success": True, "output": "missing", "exit_code": 0}
+        if "&& echo exists || echo missing" in command:
+            exists = any(marker in command for marker in self.markers)
+            return {"success": True, "exit_code": 0, "output": "exists" if exists else "missing"}
+        return self.evidence(command)
 
 
 class RecordingBackendTool:
@@ -191,13 +222,20 @@ def test_blocked_refusal_writes_a_typed_precondition_control_assessment():
 def test_blocked_consumer_never_probes_a_runner_or_a_toolchain():
     """The refusal precedes the JDK pre-flight, so nothing is provisioned FOR it."""
     _, _, orchestrator = run(
-        manifest(edge("version_incompatible"), java_version="8", java_version_source="pom")
+        manifest(
+            edge("version_incompatible"),
+            java_version="8",
+            java_version_source="maven-compiler",
+        )
     )
 
+    # Evidence-control reads/writes (the host-published manifest revision and
+    # the typed refusal assessment, all under /workspace/.setup_agent) are the
+    # control plane, not a runner or toolchain probe.
     non_control = [
         command
         for command in orchestrator.commands
-        if ASSESSMENT_DIR not in command and not command.startswith("test -f ")
+        if "/workspace/.setup_agent" not in command and not command.startswith("test -f ")
     ]
     assert non_control == [], f"pre-dispatch refusal ran {non_control}"
 
@@ -288,8 +326,8 @@ def test_unverified_refusal_does_not_borrow_the_sealed_wording():
 def test_a_version_incompatible_edge_outranks_an_unverified_one():
     result, _, _ = run(
         manifest(
-            edge("unverified", detail=UNVERIFIED_DETAIL, edge_id="edge-u"),
-            edge("version_incompatible", edge_id="edge-v"),
+            edge("unverified", detail=UNVERIFIED_DETAIL, edge_id="edge-00000000000a"),
+            edge("version_incompatible", edge_id="edge-00000000000b"),
         )
     )
 
@@ -358,20 +396,38 @@ def test_the_producer_root_itself_is_not_refused():
 
 
 def test_edges_nested_under_build_recommendation_are_read_too():
-    """Same dual read every other recommendation fact gets (attempt_policy)."""
-    result, backend, _ = run(
-        {"build_recommendation": {"domain_edges": [edge("version_incompatible")]}}
-    )
+    """Same dual read every other recommendation fact gets (attempt_policy).
 
-    assert result.error_code == "DOMAIN_EDGE_BLOCKED"
-    assert backend.calls == []
+    The strict live v1 schema has no `build_recommendation` key, so a manifest
+    carrying one can never become the host-published revision the facade
+    dispatches by; the dual read survives at the projection seam that still
+    owns it (pre-projection manifests reach it through other readers).
+    """
+    from sag.tools.build.build_tool import _manifest_domain_edges
+
+    nested = {"build_recommendation": {"domain_edges": [edge("version_incompatible")]}}
+
+    edges = _manifest_domain_edges(nested)
+    assert edges == [edge("version_incompatible")]
+    binding = BuildTool._binding_domain_edge(CONSUMER, nested)
+    assert binding is not None
+    assert binding["status"] == "version_incompatible"
 
 
 def test_a_malformed_edge_list_is_not_a_refusal():
-    result, backend, _ = run({"domain_edges": "not-a-list"})
+    """Anything that is not a list of mappings is no graph, not a broken one.
 
-    assert result.succeeded
-    assert backend.calls
+    A malformed edge list can no longer reach a live dispatch at all (the
+    strict schema refuses it before publication), so the no-refusal law is
+    pinned at the projection seam; the dispatch-level complement — a valid
+    manifest without edges refuses nothing — is the test above.
+    """
+    from sag.tools.build.build_tool import _manifest_domain_edges
+
+    malformed = {"domain_edges": "not-a-list"}
+
+    assert _manifest_domain_edges(malformed) == []
+    assert BuildTool._binding_domain_edge(CONSUMER, malformed) is None
 
 
 # -- 4. verifier: contracts.chain -------------------------------------------

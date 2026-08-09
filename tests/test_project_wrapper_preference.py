@@ -23,6 +23,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 import sag.tools.internal.maven_tool as maven_module
@@ -105,7 +106,7 @@ class WrapperOrchestrator:
             record_kind="build_requirements",
             record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
             logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-            payload={},
+            payload=complete_build_requirements_v1(),
         )
 
     def execute_command(self, command, workdir=None, timeout=None):
@@ -599,7 +600,10 @@ def test_standard_container_environment_includes_unzip_before_any_project_run():
     orchestrator.config = SimpleNamespace(workspace_path="/workspace")
     commands = []
 
-    def execute(command, workdir=None):
+    # Environment setup now runs on the clean control transport; a fake that
+    # cannot accept its call shape (``_clean_control_path`` et al.) fails
+    # closed, so the double takes the full production signature.
+    def execute(command, workdir=None, **kwargs):
         commands.append((command, workdir))
         return {"success": True, "output": "ok", "exit_code": 0}
 

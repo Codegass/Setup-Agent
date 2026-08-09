@@ -147,17 +147,26 @@ class ScriptedOrch:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
         if "test -f" in cmd:  # build-marker probes
-            tokens = shlex.split(cmd)
-            try:
-                path = tokens[tokens.index("-f") + 1]
-            except (ValueError, IndexError):
-                path = ""
-            return {
-                "success": True,
-                "exit_code": 0,
-                "output": "exists" if path in self.markers else "missing",
-            }
+            return self._marker_probe(cmd)
         return {"success": True, "exit_code": 0, "output": ""}
+
+    def execute_control_command(self, cmd, workdir=None, timeout=None, **kwargs):
+        # Contract/evidence writers resolve the clean host-control channel and
+        # fail closed on a bound plain executor; expose it explicitly.
+        del kwargs
+        return self.execute_command(cmd, workdir=workdir, timeout=timeout)
+
+    def _marker_probe(self, cmd):
+        tokens = shlex.split(cmd)
+        try:
+            path = tokens[tokens.index("-f") + 1]
+        except (ValueError, IndexError):
+            path = ""
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": "exists" if path in self.markers else "missing",
+        }
 
 
 class ScriptedBackendTool:
@@ -176,6 +185,12 @@ class ScriptedBackendTool:
 
 class RuntimeScriptedOrch(ScriptedOrch):
     """Adds exact file persistence and a real target SHA for dynamic JDK tests."""
+
+    # This double persists overlay/JDK state in ``files``/``write_file``; the
+    # env overlay store selects that explicit in-memory transport only when no
+    # callable clean control channel is present, so the inherited one is
+    # masked here.
+    execute_control_command = None
 
     def __init__(self, *args, sha="a" * 40, **kwargs):
         super().__init__(*args, **kwargs)

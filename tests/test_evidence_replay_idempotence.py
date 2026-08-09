@@ -27,9 +27,11 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import (
     add_published_mutable_json,
     canonical_json,
@@ -132,15 +134,25 @@ class EvidenceOrch:
     """
 
     def __init__(self, tmp_path, *, domains=BUILD_DOMAINS, edges=(), run_pin=None):
-        self.manifest = {
-            "survey": {"project_path": WORKSPACE},
-            "build_system": "gradle",
-            "build_root": PRODUCER,
-        }
+        # Live derivation reads only the strict host-published v1 record, so
+        # the fixture states the complete schema: the aggregate root builds
+        # from PRODUCER (a pathological aggregator) and islands mirror domains.
+        overrides = {}
         if domains is not None:
-            self.manifest["build_domains"] = list(domains)
-        if edges is not None:
-            self.manifest["domain_edges"] = list(edges)
+            overrides["build_islands"] = [
+                {"root": domain["root"], "system": domain["system"]} for domain in domains
+            ]
+            overrides["build_domains"] = [dict(domain) for domain in domains]
+            if edges is not None:
+                overrides["domain_edges"] = list(edges)
+        self.manifest = complete_build_requirements_v1(
+            project_root=WORKSPACE,
+            build_system="gradle",
+            root_shape="pathological_aggregator",
+            build_root=PRODUCER,
+            test_root=PRODUCER,
+            **overrides,
+        )
         self.receipts_dir = Path(tmp_path) / "invocation_receipts"
         self.assessments_dir = Path(tmp_path) / "evidence_assessments"
         self.receipts_dir.mkdir(parents=True, exist_ok=True)
@@ -933,8 +945,9 @@ class ParserOrchestrator:
             with contextlib.redirect_stdout(buffer):
                 exec(compile(body, "<compact-parser>", "exec"), {})
             return {"exit_code": 0, "success": True, "output": buffer.getvalue()}
-        if "SAG_NAMED_JSON_RECORD_V1" in text and text.startswith("for file in "):
-            target = text.partition(" in ")[2].partition("; do")[0].strip("'\"")
+        if "SAG_NAMED_JSON_RECORD_V1" in text and "for file in " in text:
+            quoted_glob = text.partition(" in ")[2].partition("; do")[0]
+            target = shlex.split(quoted_glob)[0]
             directory = Path(target[: -len("/*.json")])
             records = [
                 (path.name, path.read_bytes()) for path in sorted(directory.glob("*.json"))

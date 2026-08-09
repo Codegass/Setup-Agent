@@ -2138,19 +2138,6 @@ class DockerOrchestrator:
             }
 
         full_output = log_result.get("output") or ""
-        if exit_code is None and state == "vanished":
-            # A vanished process with no exit file is explicit crash evidence.
-            exit_code = 1
-            if re.search(r"bash: -c: line \d+: .*syntax error", full_output):
-                # The launcher itself failed bash parsing — no inner process
-                # ever ran. Keep this distinct from an inner-command crash.
-                full_output += (
-                    "\n[launcher error: the dispatched command failed bash "
-                    "parsing before execution — no inner process ran]"
-                )
-            else:
-                full_output += "\n[detached command ended without recording an exit code]"
-
         inline_output = full_output
         if len(inline_output) > DETACHED_INLINE_OUTPUT_MAX_CHARS:
             inline_output = self._truncate_output_smartly(full_output)

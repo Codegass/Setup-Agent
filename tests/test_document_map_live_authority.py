@@ -41,6 +41,12 @@ class DocumentMapOrchestrator:
     def execute_command(self, command, **kwargs):
         return self.filesystem(command, **kwargs)
 
+    # Strict evidence transport refuses a bound project-runtime executor and
+    # requires the clean host-control channel; delegate so subclasses that
+    # reshape the transport keep doing so on both channels.
+    def execute_control_command(self, command, **kwargs):
+        return self.execute_command(command, **kwargs)
+
 
 class WrongFilenameOrchestrator(DocumentMapOrchestrator):
     """Return the right bytes under a non-canonical framed basename."""

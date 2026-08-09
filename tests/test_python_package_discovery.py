@@ -34,13 +34,15 @@ Scripted-orchestrator house style: tests/test_python_verifier.py.
 
 import json
 
+from build_requirements_fakes import complete_python_build_requirements_v1
+
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.physical_validator import (
     PhysicalValidator,
     _dist_record_matches,
     _normalize_dist_name,
 )
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH, survey_facts_fingerprint
 from sag.tools.internal.python_env import (
     discover_packages,
     package_dir_from_pyproject,
@@ -58,17 +60,32 @@ _TOOLING_NAMES = ("pip", "setuptools", "wheel", "pkg_resources", "_distutils_hac
 
 
 def _manifest(**overrides):
-    """pyyaml-shaped manifest: discovery found NO packages (lib/ layout)."""
-    data = {
-        "python_version": "3.12",
-        "python_constraint": ">=3.8",
-        "python_installer": "pip",
-        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
-        "python_packages": [],
-        "python_venv": "/workspace/pyyaml/.venv",
-        "has_c_extensions": False,
-    }
+    """pyyaml-shaped manifest: discovery found NO packages (lib/ layout).
+
+    Live-authority migration: the strict reader validates the published head,
+    so this is a complete v1 manifest. The current facts version makes
+    distribution ownership exact, so the surveyed distribution name is stated
+    (the record-selection ladders under test are the same read-only probes).
+    """
+    data = complete_python_build_requirements_v1(
+        project_root="/workspace/pyyaml",
+        python_version="3.12",
+        python_constraint=">=3.8",
+        python_constraint_source=None,
+        python_install_source=None,
+        python_build_backend=None,
+        python_packages=[],
+        python_distribution_name="pyyaml",
+    )
     data.update(overrides)
+    # survey_fingerprint is a pin over the whole body, so it is (re)stamped
+    # after the overrides land. A stale pin makes the published head unreadable,
+    # and the validator then reports build requirements unavailable instead of
+    # running the record-selection ladder these tests observe.
+    data["survey"] = {
+        **data["survey"],
+        "survey_fingerprint": survey_facts_fingerprint(data),
+    }
     return data
 
 
@@ -168,6 +185,14 @@ class TopLevelOrch:
             return res(bool(hits), "\n".join(hits))
         if c.startswith("find") and "dist-info" in c:
             return res(True, "\n".join(f"{_SITE}/{d['record']}" for d in self.dists))
+        if c.startswith("cat") and c.split()[1].endswith("/direct_url.json"):
+            record = c.split()[1].rsplit("/", 2)[-2]
+            for d in self.dists:
+                if d["record"] == record and d["direct_url"]:
+                    return res(True, d["direct_url"])
+            return res(False, "")
+        if c.startswith("realpath -m -- "):
+            return res(True, "\n".join(c.split()[3:]))
         if c.startswith("cat") and c.split()[1].endswith("/top_level.txt"):
             record = c.split()[1].rsplit("/", 2)[-2]
             for d in self.dists:
@@ -233,7 +258,13 @@ def test_direct_url_selection_remains_a_read_only_ownership_probe():
         "mylib\n",
         direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
     )
-    orch = TopLevelOrch(dists=_DEP_DISTS + [project] + _TOOLING_DISTS)
+    # Premise update (live authority): exact ownership selects the record by
+    # the SURVEYED distribution name; the PEP 610 direct_url remains the
+    # read-only origin verification for that record.
+    orch = TopLevelOrch(
+        dists=_DEP_DISTS + [project] + _TOOLING_DISTS,
+        manifest=_manifest(python_distribution_name="mylib"),
+    )
 
     result = _validate(orch)
 
@@ -243,7 +274,16 @@ def test_direct_url_selection_remains_a_read_only_ownership_probe():
 
 
 def test_name_matched_egg_info_selection_remains_read_only():
-    project = _dist("PyYAML.egg-info", "yaml\n_yaml\n")
+    # Premise update (live authority): exact ownership additionally requires a
+    # PEP 610 local-origin record — a bare name match no longer suffices — so
+    # the egg-info fixture carries the editable-install origin it would have
+    # in a verified install. The pinned contract is unchanged: the egg-info
+    # record is read as ownership evidence without executing any import.
+    project = _dist(
+        "PyYAML.egg-info",
+        "yaml\n_yaml\n",
+        direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
+    )
     orch = TopLevelOrch(dists=_DEP_DISTS + [project])
 
     _validate(orch)
@@ -261,14 +301,20 @@ def test_top_level_fallback_reads_site_packages_dist_info():
 
 
 def test_installed_record_still_identifies_disjoint_manifest_names_as_junk():
+    # Premise update (live authority): under exact ownership the installed
+    # record REPLACES disjoint survey names outright rather than warning about
+    # them — a name the project's own record does not carry never becomes an
+    # import target, and nothing is executed either way.
     orch = TopLevelOrch(manifest=_manifest(python_packages=["declared"]))
     result = _validate(orch)
     assert _import_commands(orch) == []
     assert any("top_level.txt" in c for c in orch.commands)
-    assert any(
-        "discovered but not installed" in w and "declared" in w
-        for w in result["evidence"]["warnings"]
+    importability_warning = next(
+        w for w in result["evidence"]["warnings"] if "package importability unknown" in w
     )
+    assert "declared" not in importability_warning
+    assert "yaml" in importability_warning
+    assert not any("declared" in command for command in orch.commands)
 
 
 # ---------------------------------------------------------------------------
@@ -277,17 +323,19 @@ def test_installed_record_still_identifies_disjoint_manifest_names_as_junk():
 
 
 def test_nothing_importable_keeps_none_with_visible_warning():
+    # Premise update (live authority): with exact distribution ownership, an
+    # empty site-packages is no longer a silent unknown — the surveyed
+    # distribution's record is REQUIRED, so its absence blocks honestly. The
+    # original core holds: nothing is imported and nothing is invented.
     orch = TopLevelOrch(dists=[])
     result = _validate(orch)
     details = result["evidence"]["fingerprint_details"]
     assert details["imports_ok"] is None
     assert _import_commands(orch) == []
-    assert any(
-        "package importability unknown" in w and "no project-owned names recorded" in w
-        for w in result["evidence"]["warnings"]
-    )
-    # No invented failure: the other rungs still carry the verdict.
-    assert result["success"] is True
+    assert details["distribution_record_ok"] is False
+    assert "not physically verified" in result["reason"]
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
 
 
 def test_only_tooling_top_level_is_treated_as_nothing_importable():
@@ -493,9 +541,15 @@ def test_libcloud_junk_discoveries_warn_without_import_execution():
     # Installed ownership still distinguishes the project's package from
     # survey junk, but the judge does not execute either group. Importability
     # remains unknown until a producer receipt is available.
+    # Premise update (live authority): exact ownership replaces the survey's
+    # junk names with the record's own name set outright, so the junk never
+    # surfaces anywhere — not as an import target, a command, or a warning.
     orch = TopLevelOrch(
         dists=[_LIBCLOUD_DIST] + _DEP_DISTS + _TOOLING_DISTS,
-        manifest=_manifest(python_packages=_LIBCLOUD_JUNK + ["libcloud"]),
+        manifest=_manifest(
+            python_packages=_LIBCLOUD_JUNK + ["libcloud"],
+            python_distribution_name="apache-libcloud",
+        ),
     )
     result = _validate(orch)
     assert _import_commands(orch) == []
@@ -505,16 +559,24 @@ def test_libcloud_junk_discoveries_warn_without_import_execution():
     assert result["success"] is True
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
-    warning = next(w for w in result["evidence"]["warnings"] if "discovered but not installed" in w)
+    importability_warning = next(
+        w for w in result["evidence"]["warnings"] if "package importability unknown" in w
+    )
+    assert "libcloud" in importability_warning  # the real package is the target set
     for name in _LIBCLOUD_JUNK:
-        assert name in warning
-    assert "libcloud," not in warning  # the real package is not junk
+        assert not any(name in warning for warning in result["evidence"]["warnings"])
+        assert not any(name in command for command in orch.commands)
 
 
 def test_all_junk_manifest_uses_installed_names_as_ownership_only():
+    # Premise update (live authority): the surveyed distribution name is the
+    # exact ownership selector for the installed record.
     orch = TopLevelOrch(
         dists=[_LIBCLOUD_DIST] + _DEP_DISTS + _TOOLING_DISTS,
-        manifest=_manifest(python_packages=list(_LIBCLOUD_JUNK)),
+        manifest=_manifest(
+            python_packages=list(_LIBCLOUD_JUNK),
+            python_distribution_name="apache-libcloud",
+        ),
     )
     result = _validate(orch)
     assert _import_commands(orch) == []
@@ -526,6 +588,9 @@ def test_all_junk_manifest_uses_installed_names_as_ownership_only():
 
 
 def test_nothing_installed_keeps_manifest_names_but_does_not_import_them():
+    # Premise update (live authority): with exact ownership, a checkout with
+    # NO installed record for the surveyed distribution blocks honestly — the
+    # manifest names are never promoted to import targets, and nothing runs.
     orch = TopLevelOrch(
         dists=[],
         manifest=_manifest(python_packages=["libcloud"]),
@@ -533,8 +598,9 @@ def test_nothing_installed_keeps_manifest_names_but_does_not_import_them():
     )
     result = _validate(orch)
     assert _import_commands(orch) == []
-    assert result["success"] is True
-    assert result["evidence_status"] == "partial"
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    assert "not physically verified" in result["reason"]
     details = result["evidence"]["fingerprint_details"]
     assert details["imports_ok"] is None
     assert details["import_failures"] == []
@@ -548,7 +614,11 @@ def test_installed_siblings_are_reported_without_runtime_imports():
     )
     orch = TopLevelOrch(
         dists=[project] + _DEP_DISTS + _TOOLING_DISTS,
-        manifest=_manifest(python_packages=["mercurial"]),
+        # Live authority: the surveyed name selects the exact record.
+        manifest=_manifest(
+            python_packages=["mercurial"],
+            python_distribution_name="mercurial",
+        ),
         failing_imports={"hgext"},
     )
     result = _validate(orch)

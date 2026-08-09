@@ -5,6 +5,7 @@ is a local repairable prerequisite, never an external blocker."""
 
 from types import SimpleNamespace
 
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import (
     add_published_mutable_json,
     canonical_json,
@@ -27,14 +28,16 @@ TARGET_SHA = "b" * 40
 
 class BuildManifestOrch:
     def __init__(self, manifest=None, receipts=()):
+        # Live authority requires a complete v1 manifest. v1 has no top-level
+        # `build_system`; the surveyed build_islands carry the coordinates.
         self.manifest = (
             manifest
             if manifest is not None
-            else {
-                "survey": {"project_path": "/workspace/tvm"},
-                "build_system": "python",
-                "test_root": "/workspace/tvm",
-            }
+            else complete_build_requirements_v1(
+                project_root="/workspace/tvm",
+                build_system="pytest",
+                build_islands=[{"root": "/workspace/tvm", "system": None}],
+            )
         )
         self.receipts = {receipt["receipt_id"]: receipt for receipt in receipts}
         self.evidence = strict_published_evidence(
@@ -59,6 +62,10 @@ class BuildManifestOrch:
         if "run-pin.json" in command or RECEIPT_DIR in command:
             return self.evidence(command)
         return {"success": True, "exit_code": 0, "output": canonical_json(self.manifest)}
+
+    def execute_control_command(self, command, **kwargs):
+        # Strict evidence reads only accept the clean host-control channel.
+        return self.execute_command(command)
 
 
 def _state_with_build_receipt(attempt_id="build-1"):
@@ -102,7 +109,10 @@ def test_no_build_attempt_blocks_closure():
     assert requirement is not None
     facts = requirement.to_metadata()
     assert facts["terminal_build_receipts"] == 0
-    assert facts["build_system"] == "python"
+    # Premise: v1 forbids a top-level build_system, so the requirement's
+    # coordinates are the surveyed islands rather than one system name.
+    assert "build_system" not in facts
+    assert facts["build_islands"] == [{"root": "/workspace/tvm", "system": None}]
     assert "required_action" not in facts
 
 

@@ -10,6 +10,7 @@ import pytest
 
 import sag.agent.react_engine as react_engine_module
 from sag.agent.action_intents import ActionIntent, action_fingerprint, canonical_params
+from sag.agent.job_obligations import DETACHED_TERMINAL_AUTHORITY
 from sag.agent.native_messages import render_messages
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
@@ -27,6 +28,26 @@ def _call(index, name="bash", args=None):
         arguments={"command": "ls"} if args is None else args,
         raw_arguments="{}",
     )
+
+
+# Premise: the barrier now accepts a detached handle only with its complete
+# identity envelope (terminal authority, exec/container ids, verified startup
+# identity, accepted runner dispatch); a partial envelope is the deliberate
+# fatal-integrity path pinned by the malformed-result test below.
+def _detached_envelope(**overrides):
+    metadata = {
+        "dispatch_status": "running_detached",
+        "terminal_authority": DETACHED_TERMINAL_AUTHORITY,
+        "docker_exec_id": "a" * 64,
+        "container_id": "b" * 64,
+        "start_accepted": True,
+        "startup_identity_verified": True,
+        "started": True,
+        "runner_dispatch_state": "accepted",
+        "runner_dispatched": True,
+    }
+    metadata.update(overrides)
+    return metadata
 
 
 def _scripted_result(metadata):
@@ -213,14 +234,13 @@ def test_loop_force_break_cancels_the_rest_of_the_batch(native_engine):
 def test_detached_job_barrier_cancels_later_calls_in_the_same_model_turn(native_engine):
     engine = native_engine(
         results={
-            "build": {
-                "dispatch_status": "running_detached",
-                "job_id": "job-123",
-                "job_obligation_persisted": False,
-                "job_obligation_persistence_code": "transport_write_failed",
-                "exit_code_path": "/tmp/sag_jobs/job-123.log.exit",
-                "log_path": "/tmp/sag_jobs/job-123.log",
-            }
+            "build": _detached_envelope(
+                job_id="job-123",
+                job_obligation_persisted=False,
+                job_obligation_persistence_code="transport_write_failed",
+                exit_code_path="/tmp/sag_jobs/job-123.log.exit",
+                log_path="/tmp/sag_jobs/job-123.log",
+            )
         }
     )
 
@@ -240,14 +260,13 @@ def test_detached_job_barrier_cancels_later_calls_in_the_same_model_turn(native_
 def test_persisted_detached_job_immediately_cancels_later_same_turn_calls(native_engine):
     engine = native_engine(
         results={
-            "build": {
-                "dispatch_status": "running_detached",
-                "job_id": "job-persisted-123",
-                "job_obligation_persisted": True,
-                "job_obligation_persistence_code": "persisted",
-                "exit_code_path": "/tmp/sag_jobs/job-persisted-123.log.exit",
-                "log_path": "/tmp/sag_jobs/job-persisted-123.log",
-            }
+            "build": _detached_envelope(
+                job_id="job-persisted-123",
+                job_obligation_persisted=True,
+                job_obligation_persistence_code="persisted",
+                exit_code_path="/tmp/sag_jobs/job-persisted-123.log.exit",
+                log_path="/tmp/sag_jobs/job-persisted-123.log",
+            )
         }
     )
 

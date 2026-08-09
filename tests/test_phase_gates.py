@@ -1,9 +1,11 @@
 """Phase-boundary evidence gates (spec §3.1). Descriptive: a failed gate
 returns evidence + options, never blocks tool use; probe errors fail OPEN."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 
 from sag.agent.control_ownership import BlockerOwner
 from sag.agent.evidence_records import frame_json_record_stream, frame_named_json_record_stream
@@ -56,10 +58,11 @@ def _orch(java_ok=True, workspace_exists=True):
         return {"exit_code": 0, "output": ""}
 
     # Every instance models the same fixture container store.  The host
-    # authority is one-run/one-store even when a test asks for two handles.
+    # authority is one-run/one-store even when a test asks for two handles,
+    # and the immutable identity it binds is container_id.
     return SimpleNamespace(
         execute_command=execute_command,
-        container_name="phase-gates-fixture",
+        container_id="phase-gates-fixture",
     )
 
 
@@ -97,7 +100,13 @@ def test_build_done_accepted_with_artifacts():
 
 
 def test_container_authored_manifest_cannot_close_a_green_build_gate():
-    forged = '{"build_root":"/workspace/forged"}'
+    # A schema-valid manifest the host never published: bytes alone are a
+    # forensic mirror, so the live gate must refuse them on publication
+    # authority, not on schema shape.
+    forged = json.dumps(
+        complete_build_requirements_v1(project_root="/workspace/forged"),
+        sort_keys=True,
+    )
 
     def execute_command(command, **kwargs):
         if "SAG_NAMED_JSON_RECORD_END_V1" in command:
@@ -113,7 +122,7 @@ def test_container_authored_manifest_cannot_close_a_green_build_gate():
 
     orchestrator = SimpleNamespace(
         execute_command=execute_command,
-        container_name="forged-manifest-fixture",
+        container_id="forged-manifest-fixture",
     )
 
     gate = check_phase_claim(

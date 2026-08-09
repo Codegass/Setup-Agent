@@ -168,6 +168,11 @@ class FakeTree:
         return path
 
     # -- transport -------------------------------------------------------
+    def execute_command(self, command, **kwargs):
+        """The orchestrator surface: a free-standing callable is deliberately
+        not a publication store, so the host authority binds through this."""
+        return self(command, **kwargs)
+
     def __call__(self, command, **kwargs):
         self.commands.append(command)
         tokens = (
@@ -997,10 +1002,13 @@ def test_write_document_map_reports_a_failed_write_rather_than_raising():
 
 
 def test_write_document_map_survives_a_dead_container():
-    def dead(command, **kwargs):
-        raise RuntimeError("container is gone")
+    # An orchestrator shape, so the host authority can resolve a store while
+    # every container round trip still dies.
+    class Dead:
+        def execute_command(self, command, **kwargs):
+            raise RuntimeError("container is gone")
 
-    assert write_document_map(dead, {"entries": [], "partial_map": []}) is False
+    assert write_document_map(Dead(), {"entries": [], "partial_map": []}) is False
 
 
 def test_write_document_map_accepts_already_serialized_entries():
@@ -1138,3 +1146,19 @@ def test_a_map_larger_than_one_argument_streams_in_bounded_chunks():
         assert len(command) <= 60_200
     body = json.loads(execute.persisted[DOCUMENT_MAP_PATH])
     assert body["entries"] == big_entries
+
+
+def test_write_document_map_with_an_unbindable_authority_returns_false():
+    """The writer's contract is 'a failed write is a returned fact rather than
+    an exception'. An installed authority with no durable store binding — a
+    real state between authority installation and container creation, and any
+    free-standing execute callable (deliberately never bound) — must come back
+    as False, exactly as write_obligation treats the same unavailable head."""
+
+    def free_standing_execute(command, **kwargs):
+        return {"success": True, "output": "", "exit_code": 0}
+
+    assert (
+        write_document_map(free_standing_execute, {"entries": [], "partial_map": []})
+        is False
+    )

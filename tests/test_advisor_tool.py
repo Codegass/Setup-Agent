@@ -322,6 +322,9 @@ def _registration_agent():
     agent.phase_machine = PhaseMachine()
     agent.context_journal = None
     agent.project_name = "demo"
+    # Production initializes the host-owned sink in __init__; a bare test
+    # agent starts with none, exactly like an agent before control recording.
+    agent.control_event_sink = None
     return agent
 
 
@@ -357,6 +360,11 @@ def test_the_run_pin_carries_advisor_telemetry(tmp_path):
     from sag.agent.control_events import RunPin
 
     agent = object.__new__(SetupAgent)
+    # The pin write now publishes through the host evidence authority; give
+    # the bare agent a store the conftest authority can bind to.
+    agent.orchestrator = SimpleNamespace(
+        execute_command=lambda command, **kwargs: {"exit_code": 0, "output": ""},
+    )
     agent._run_pin_host_path = tmp_path / "run-pin.json"
     agent._run_pin_mirror = None
     agent._run_pin_template = {

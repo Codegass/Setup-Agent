@@ -19,9 +19,19 @@ import re
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 
 from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
-from test_build_tool import FakeBackendTool, _tool
+from test_build_tool import FakeBackendTool, MarkerOrchestrator
+
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+)
+from sag.tools.build.build_tool import BuildTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 # Reusable fakes/helpers from the original suites.
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
@@ -55,10 +65,29 @@ class FakeMavenPomOrchestrator:
         self.dirs = set(dirs or ())
         self.realpaths = dict(realpaths or {})
         self.commands = []
+        # Bind this fake to its own host publication authority: the verdict
+        # denominator only narrows when the live manifest and this run's
+        # (empty) receipt/assessment streams are host-verified readable.
+        self.evidence = strict_published_evidence(
+            self,
+            run_id="run-pytest",
+            target_sha="e" * 40,
+        )
+        add_published_mutable_json(
+            self,
+            self.evidence,
+            path=REQUIREMENTS_PATH,
+            record_kind="build_requirements",
+            record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+            payload=complete_build_requirements_v1(project_root="/workspace/p"),
+        )
 
     def execute_command(self, command):
         self.commands.append(command)
         c = command.strip()
+        if "SAG_NAMED_JSON_RECORD_V1" in c:
+            return self.evidence(command)
         if c.startswith("realpath -e -- "):
             path = shlex.split(c)[-1]
             resolved = self.realpaths.get(path, path)
@@ -1650,20 +1679,58 @@ def test_scan_modules_includes_root_in_multi_module():
 # ===========================================================================
 # 4. --fail-at-end backend wiring (compile/package, not just test)
 # ===========================================================================
+class _HostSink:
+    """Minimal host-owned control sink for per-orchestrator authorities."""
+
+    def emit(self, kind, payload, *, source=None):
+        return None
+
+
+def _isolated_tool(markers, maven=None, gradle=None):
+    """test_build_tool's _tool, but each facade owns its publication authority.
+
+    One evidence run binds exactly one container store, so a test that builds
+    several orchestrators cannot share one context authority. The authority is
+    installed into the context too (the facade's contract writer resolves it
+    there); the conftest fixture's teardown restores the baseline.
+    """
+    orchestrator = MarkerOrchestrator(markers, publish_manifest=False)
+    install_evidence_publication_authority(
+        EvidencePublicationAuthority(run_id="run-pytest", sink=_HostSink()),
+        orchestrator=orchestrator,
+    )
+    add_published_mutable_json(
+        orchestrator,
+        orchestrator.evidence,
+        path=REQUIREMENTS_PATH,
+        record_kind="build_requirements",
+        record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+        payload=complete_build_requirements_v1(),
+    )
+    return BuildTool(
+        orchestrator,
+        maven_tool=maven or FakeBackendTool(),
+        gradle_tool=gradle or FakeBackendTool(),
+    )
+
+
 def test_compile_and_package_pass_fail_at_end_for_whole_reactor(
     exact_build_facade_authority,
 ):
     for action in ("compile", "package"):
         maven, gradle = FakeBackendTool(), FakeBackendTool()
-        _tool({"pom.xml"}, maven=maven).execute(action=action, working_directory="/w")
-        _tool({"build.gradle"}, gradle=gradle).execute(action=action, working_directory="/w")
+        _isolated_tool({"pom.xml"}, maven=maven).execute(action=action, working_directory="/w")
+        _isolated_tool({"build.gradle"}, gradle=gradle).execute(
+            action=action, working_directory="/w"
+        )
         assert maven.calls[0].get("fail_at_end") is True, action
         assert gradle.calls[0].get("fail_at_end") is True, action
 
 
 def test_deps_does_not_pass_fail_at_end(exact_build_facade_authority):
     maven = FakeBackendTool()
-    _tool({"pom.xml"}, maven=maven).execute(action="deps", working_directory="/w")
+    _isolated_tool({"pom.xml"}, maven=maven).execute(action="deps", working_directory="/w")
     assert "fail_at_end" not in maven.calls[0]
 
 

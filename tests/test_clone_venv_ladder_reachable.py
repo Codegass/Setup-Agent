@@ -5,6 +5,7 @@ split; the ladder existed but sat AFTER an early return)."""
 
 from types import SimpleNamespace
 
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 import sag.tools.internal.project_setup_tool as pst
@@ -37,7 +38,13 @@ class CloneVenvOrch:
                 record_kind="build_requirements",
                 record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
                 logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-                payload={},
+                # The strict reader validates the head, so the "no python
+                # facts yet" fixture is a complete v1 survey with no Python
+                # group rather than the legacy bare {}.
+                payload=complete_build_requirements_v1(
+                    project_root="/workspace/tvm",
+                    build_system="pytest",
+                ),
             )
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):

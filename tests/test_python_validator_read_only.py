@@ -5,6 +5,7 @@ import json
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_python_build_requirements_v1
 from container_evidence_fakes import complete_run_pin
 from test_container_io import FakeContainer
 
@@ -37,6 +38,40 @@ from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 
+# The current-manifest fingerprint tuple every fixture pins. A valid v1 survey
+# carries target-sha + survey + config + document-map fingerprints; a python
+# project carries no build_domains/domain_facts, so contracts and receipts pin
+# exactly this tuple and leave domain/epoch pins absent on BOTH sides, which
+# the pairwise pin semantics read as agreement rather than a binding hole.
+_CONFIG_FINGERPRINT = "config-current"
+_DOCUMENT_MAP_FINGERPRINT = "d" * 64
+_SITE = "/workspace/proj/.venv/lib/python3.12/site-packages"
+
+
+def _python_manifest():
+    """One complete, self-stamped v1 manifest — the current-authority side."""
+
+    return complete_python_build_requirements_v1(
+        project_root="/workspace/proj",
+        target_sha="a" * 40,
+        config_fingerprint=_CONFIG_FINGERPRINT,
+        document_map_fingerprint=_DOCUMENT_MAP_FINGERPRINT,
+        python_version="3.12",
+        python_constraint=">=3.9",
+        python_constraint_source=None,
+        python_install_source=None,
+        python_build_backend=None,
+        python_packages=["side_effect_pkg"],
+        python_distribution_name="side_effect_pkg",
+    )
+
+
+# Every live manifest now states a survey_fingerprint, so a contract/receipt
+# that omitted the pin would be one-sided — a binding hole, not agreement.
+# Fixtures therefore pin the manifest's OWN stamp.
+_SURVEY_FINGERPRINT = _python_manifest()["survey"]["survey_fingerprint"]
+
+
 class ProjectExecutionTrap:
     """A Python project whose import would be an observable side effect.
 
@@ -50,16 +85,11 @@ class ProjectExecutionTrap:
         self.project_executions = []
         self._atomic_container = FakeContainer()
         self.files = self._atomic_container.files
-        self.manifest = {
-            "python_version": "3.12",
-            "python_constraint": ">=3.9",
-            "python_packages": ["side_effect_pkg"],
-            "python_venv": "/workspace/proj/.venv",
-            "has_c_extensions": False,
-            "has_native_build": False,
-            "survey": {"target_sha": "a" * 40},
-            "build_domains": [{"root": "/workspace/proj"}],
-        }
+        # Live-authority migration: the published head must be a complete v1
+        # manifest, and exact distribution ownership requires the surveyed
+        # distribution name (its record probes are answered read-only below).
+        # A fresh copy per fixture: tests move the survey's own pins on it.
+        self.manifest = _python_manifest()
         self.publish_manifest_update(initial=True)
 
     def publish_manifest_update(self, *, initial=False):
@@ -168,6 +198,15 @@ class ProjectExecutionTrap:
         if stripped.startswith("test -d "):
             path = stripped.split()[2]
             return result(path in {"/workspace/proj/.venv", "/workspace/proj/side_effect_pkg"})
+        # Exact-distribution ownership probes (read-only; never /.venv/bin/).
+        if stripped.startswith("find") and "site-packages" in stripped and "dist-info" in stripped:
+            return result(True, f"{_SITE}/side_effect_pkg-1.0.dist-info")
+        if stripped.startswith("cat") and stripped.split()[1].endswith("/direct_url.json"):
+            return result(True, '{"url": "file:///workspace/proj", "dir_info": {"editable": true}}')
+        if stripped.startswith("cat") and stripped.split()[1].endswith("/top_level.txt"):
+            return result(True, "side_effect_pkg\n")
+        if stripped.startswith("realpath -m -- "):
+            return result(True, "\n".join(shlex.split(stripped)[3:]))
         if "site-packages" in stripped and ("dist-info" in stripped or "egg-info" in stripped):
             return result(True, "")
         if "'*.jar'" in stripped or "'*.class'" in stripped:
@@ -180,6 +219,10 @@ class ProjectExecutionTrap:
             self.project_executions.append(command)
             raise AssertionError(f"physical judge executed an interpreter: {command}")
         return result(True, "")
+
+    def execute_control_command(self, command, **kwargs):
+        """Host-owned control channel (production surface for evidence I/O)."""
+        return self.execute_command(command, **kwargs)
 
 
 def _validator(orch):
@@ -373,11 +416,13 @@ def _receipt(
     run_id=_RUN_ID,
     target_sha=_TARGET_SHA,
     actual_cwd="/workspace/proj",
-    domain_id="/workspace/proj",
+    # A python v1 manifest carries no build_domains, so receipts state no
+    # domain_id and bind through the exact actual_cwd (absent-preserving).
+    domain_id=None,
     exit_code=0,
-    survey_fingerprint=None,
-    config_fingerprint=None,
-    document_map_fingerprint=None,
+    survey_fingerprint=_SURVEY_FINGERPRINT,
+    config_fingerprint=_CONFIG_FINGERPRINT,
+    document_map_fingerprint=_DOCUMENT_MAP_FINGERPRINT,
     fact_epoch=None,
 ):
     return build_receipt(
@@ -634,13 +679,15 @@ def test_current_bound_producer_receipts_make_python_runtime_rungs_readable_only
 
 
 def test_single_domain_receipt_without_domain_id_uses_exact_actual_cwd_binding():
+    # Premise update (live authority): a python v1 manifest can never carry
+    # build_domains, so the single-domain survey writes no domain_id anywhere;
+    # this pins that the exact actual_cwd binding alone grades completely.
     setup = _receipt("setup_env", _setup_observations(), suffix="1")
     compile_receipt = _receipt("compile", _compile_observations(), suffix="2")
-    setup.pop("domain_id")
-    compile_receipt.pop("domain_id")
+    assert "domain_id" not in setup
+    assert "domain_id" not in compile_receipt
     orch = ProducerReceiptOrch([setup, compile_receipt])
-    orch.manifest.pop("build_domains")
-    orch.publish_manifest_update()
+    assert "build_domains" not in orch.manifest
 
     status = _producer_status(orch)
 
@@ -911,7 +958,8 @@ def test_current_manifest_config_mismatch_invalidates_receipt_and_contract_tuple
         config_fingerprint="old-config",
     )
     orch = ProducerReceiptOrch([receipt])
-    orch.manifest["survey"] = {"config_fingerprint": "current-config"}
+    # The survey stays a complete v1 record; only its config pin moves on.
+    orch.manifest["survey"]["config_fingerprint"] = "current-config"
     orch.publish_manifest_update()
 
     status = _producer_status(orch)
@@ -921,6 +969,10 @@ def test_current_manifest_config_mismatch_invalidates_receipt_and_contract_tuple
 
 
 def test_current_fact_epoch_must_match_contract_and_receipt():
+    # Premise update (live authority): a python v1 manifest cannot carry
+    # domain_facts, so the current fact epoch is ABSENT — a contract/receipt
+    # that pins one anyway is a one-sided epoch pin and stays invalid, the
+    # same must-match contract enforced from the absent side.
     receipt = _receipt(
         "setup_env",
         _setup_observations(),
@@ -928,10 +980,6 @@ def test_current_fact_epoch_must_match_contract_and_receipt():
         fact_epoch=1,
     )
     orch = ProducerReceiptOrch([receipt])
-    orch.manifest["domain_facts"] = [
-        {"domain_id": "dom-proj", "root": "/workspace/proj", "fact_epoch": 2}
-    ]
-    orch.publish_manifest_update()
 
     status = _producer_status(orch)
 
@@ -948,6 +996,10 @@ def test_current_fact_epoch_must_match_contract_and_receipt():
     ),
 )
 def test_current_manifest_survey_tuple_must_match_contract_and_receipt(key, receipt_keyword):
+    # Premise update (stamped surveys): the manifest side of the tuple is what
+    # a v1 survey actually carries — its own recomputed survey_fingerprint and
+    # the current document-map fingerprint. A contract/receipt pinning a
+    # different value is a stale pin and stays invalid either way.
     receipt = _receipt(
         "setup_env",
         _setup_observations(),
@@ -955,8 +1007,6 @@ def test_current_manifest_survey_tuple_must_match_contract_and_receipt(key, rece
         **{receipt_keyword: "frozen-fingerprint"},
     )
     orch = ProducerReceiptOrch([receipt])
-    orch.manifest["survey"].update({key: "current-fingerprint"})
-    orch.publish_manifest_update()
 
     status = _producer_status(orch)
 
@@ -966,6 +1016,9 @@ def test_current_manifest_survey_tuple_must_match_contract_and_receipt(key, rece
 
 @pytest.mark.parametrize("key", ("survey_fingerprint", "document_map_fingerprint"))
 def test_one_sided_contract_receipt_survey_pin_is_invalid(key):
+    # Premise update (live authority): the pin is stripped from the RECEIPT
+    # after publication while the frozen contract keeps it — the one-sided
+    # tuple (and the tampered published bytes) must fail closed.
     receipt = _receipt(
         "setup_env",
         _setup_observations(),
@@ -973,8 +1026,6 @@ def test_one_sided_contract_receipt_survey_pin_is_invalid(key):
         **{key: "same-fingerprint"},
     )
     orch = ProducerReceiptOrch([receipt])
-    orch.manifest["survey"].update({key: "same-fingerprint"})
-    orch.publish_manifest_update()
     receipt.pop(key)
 
     status = _producer_status(orch)

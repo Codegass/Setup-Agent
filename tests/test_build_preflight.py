@@ -18,6 +18,7 @@ from sag.tools.internal.build_preflight import (
     REQUIREMENTS_PATH,
     read_build_requirements,
     read_live_build_requirements,
+    survey_facts_fingerprint,
     validate_build_requirements_v1,
     write_build_requirements,
 )
@@ -55,6 +56,10 @@ def current_manifest(**overrides):
             "config_fingerprint": None,
             "target_sha": None,
             "document_map_fingerprint": None,
+            # survey_fingerprint is stamped below, AFTER overrides land, so a
+            # mutated fixture still carries the pin its body earns and each
+            # invalid-manifest test trips its own contract edge rather than
+            # the fingerprint recompute.
         },
         "java_version": "17",
         "java_version_source": "maven-compiler",
@@ -69,6 +74,12 @@ def current_manifest(**overrides):
         "test_islands": [],
     }
     manifest.update(overrides)
+    survey = manifest.get("survey")
+    if isinstance(survey, dict) and "survey_fingerprint" not in survey:
+        manifest["survey"] = {
+            **survey,
+            "survey_fingerprint": survey_facts_fingerprint(manifest),
+        }
     return manifest
 
 
@@ -89,7 +100,11 @@ def test_live_read_requires_the_exact_current_host_revision():
     assert write_build_requirements(orch, data) is True
 
     current = read_live_build_requirements(orch)
-    orch.files[REQUIREMENTS_PATH] = json.dumps({**data, "java_version": "11"}, sort_keys=True)
+    # The tampered body is schema-valid (restamped), so the PUBLICATION check
+    # is what refuses it — not a fingerprint recompute masking this test.
+    orch.files[REQUIREMENTS_PATH] = json.dumps(
+        current_manifest(java_version="11"), sort_keys=True
+    )
     tampered = read_live_build_requirements(orch)
     del orch.files[REQUIREMENTS_PATH]
     deleted = read_live_build_requirements(orch)
@@ -163,13 +178,17 @@ def test_current_schema_is_closed_strict_and_bounded():
     valid = current_manifest()
     assert validate_build_requirements_v1(valid) == valid
 
+    # Each mutation goes THROUGH the helper so it carries a consistent stamp
+    # and trips its own named edge, not the fingerprint recompute.
     invalid = [
-        {**valid, "schema_version": True},
-        {**valid, "schema_version": BUILD_REQUIREMENTS_SCHEMA_VERSION + 1},
-        {**valid, "future_authority": "yes"},
-        {**valid, "fail_at_end": 1},
-        {**valid, "build_root": "/workspace/p/../escape"},
-        {**valid, "build_islands": [{"root": "/workspace/p/m", "system": "maven"}] * 2},
+        current_manifest(schema_version=True),
+        current_manifest(schema_version=BUILD_REQUIREMENTS_SCHEMA_VERSION + 1),
+        current_manifest(future_authority="yes"),
+        current_manifest(fail_at_end=1),
+        current_manifest(build_root="/workspace/p/../escape"),
+        current_manifest(
+            build_islands=[{"root": "/workspace/p/m", "system": "maven"}] * 2
+        ),
     ]
     for payload in invalid:
         try:
@@ -190,7 +209,9 @@ def test_current_schema_requires_exact_survey_pins_and_containment():
             **valid,
             "survey": {**valid["survey"], "document_map_fingerprint": "short"},
         },
-        {**valid, "test_root": "/workspace/other"},
+        # Restamped so the containment check, not the fingerprint recompute,
+        # is the edge on trial.
+        current_manifest(test_root="/workspace/other"),
     ]
     for payload in mutations:
         try:

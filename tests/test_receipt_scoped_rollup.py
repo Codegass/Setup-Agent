@@ -187,7 +187,7 @@ class ReceiptOrchestrator:
         text = command.strip()
         if "SAG_COMPACT_TEST_REPORT_PARSER" in text:
             return self._run_compact_parser(command)
-        if "SAG_NAMED_JSON_RECORD_V1" in text and text.startswith("for file in "):
+        if "SAG_NAMED_JSON_RECORD_V1" in text and "for file in " in text:
             target = shlex.split(text.partition(" in ")[2].partition("; do")[0])[0]
             directory = Path(target[: -len("/*.json")])
             records = (

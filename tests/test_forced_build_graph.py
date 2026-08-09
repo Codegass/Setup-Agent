@@ -1,6 +1,7 @@
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 
 from sag.agent.attempt_policy import (
     required_test_attempt,
@@ -785,13 +786,13 @@ def test_attempt_policy_subproject_cannot_bypass_parent_gradle_settings():
     project = "/workspace/gradle-root"
     candidate = f"{project}/modules/app"
     orch = ManifestOrchestrator()
-    orch.manifest.update(
-        {
-            "survey": {"project_path": project},
-            "test_root": candidate,
-            "test_system": "gradle",
-            "test_islands": [{"root": candidate, "system": "gradle"}],
-        }
+    # Live authority requires a complete v1 manifest: a partial survey group
+    # would fail closed as unreadable before the graph is ever inspected.
+    orch.manifest = complete_build_requirements_v1(
+        project_root=project,
+        build_system="gradle",
+        test_root=candidate,
+        test_islands=[{"root": candidate, "system": "gradle"}],
     )
     orch.files[f"{project}/settings.gradle"] = (
         'include(":app")\n' 'project(":app").projectDir = file("../outside-app")'
@@ -829,13 +830,13 @@ def test_attempt_policy_rejects_survey_and_build_facade_backend_mismatch(
     project = "/workspace/project"
     candidate = f"{project}/app"
     orch = ManifestOrchestrator()
-    orch.manifest.update(
-        {
-            "survey": {"project_path": project},
-            "test_root": candidate,
-            "test_system": survey_system,
-            "test_islands": [{"root": candidate, "system": survey_system}],
-        }
+    # Live authority requires a complete v1 manifest; only the coordinates
+    # under test are overridden.
+    orch.manifest = complete_build_requirements_v1(
+        project_root=project,
+        build_system=survey_system,
+        test_root=candidate,
+        test_islands=[{"root": candidate, "system": survey_system}],
     )
     orch.files = {
         f"{candidate}/{marker}": _pom() if marker == "pom.xml" else "",
@@ -859,13 +860,13 @@ def test_attempt_policy_rejects_pytest_survey_when_pom_wins_marker_order():
     project = "/workspace/project"
     candidate = f"{project}/app"
     orch = ManifestOrchestrator()
-    orch.manifest.update(
-        {
-            "survey": {"project_path": project},
-            "test_root": candidate,
-            "test_system": "pytest",
-            "test_islands": [{"root": candidate, "system": "pytest"}],
-        }
+    # The v1 island schema admits only maven/gradle/None systems; a pytest
+    # island carries system=None and inherits the manifest-level test_system.
+    orch.manifest = complete_build_requirements_v1(
+        project_root=project,
+        build_system="pytest",
+        test_root=candidate,
+        test_islands=[{"root": candidate, "system": None}],
     )
     orch.files = {
         f"{candidate}/pom.xml": _pom(),
@@ -879,13 +880,19 @@ def test_attempt_policy_rejects_pytest_survey_when_pom_wins_marker_order():
 
 def test_attempt_policy_rejects_unknown_survey_system_without_dispatch():
     orch = ManifestOrchestrator()
-    orch.manifest["test_system"] = "bazel"
+    # Premise: the closed v1 enum cannot publish a foreign system name like
+    # "bazel"; "unknown" is the survey's canonical spelling for one, and the
+    # pinned behavior (no dispatch, analyze required) is unchanged.
+    orch.manifest["test_system"] = "unknown"
     orch.manifest["test_islands"] = [
         {
             "root": orch.manifest["test_root"],
-            "system": "bazel",
+            "system": None,
         }
     ]
+    # The edits above are the trial; re-stamp so the unknown SYSTEM is what the
+    # policy refuses, not the stale survey pin those edits would otherwise leave.
+    orch.restamp_survey()
 
     resolution = resolve_survey_test_candidates(orch)
 
@@ -906,13 +913,13 @@ def test_attempt_policy_allows_pytest_only_when_python_marker_wins():
     project = "/workspace/project"
     candidate = f"{project}/app"
     orch = ManifestOrchestrator()
-    orch.manifest.update(
-        {
-            "survey": {"project_path": project},
-            "test_root": candidate,
-            "test_system": "pytest",
-            "test_islands": [{"root": candidate, "system": "pytest"}],
-        }
+    # The v1 island schema admits only maven/gradle/None systems; a pytest
+    # island carries system=None and inherits the manifest-level test_system.
+    orch.manifest = complete_build_requirements_v1(
+        project_root=project,
+        build_system="pytest",
+        test_root=candidate,
+        test_islands=[{"root": candidate, "system": None}],
     )
     orch.files = {
         f"{candidate}/pyproject.toml": "[project]\nname='example'\n",
@@ -935,6 +942,9 @@ def test_attempt_policy_refuses_unsafe_graph_and_allows_safe_maven_island():
             "test_islands": [{"root": island, "system": "maven"}],
         }
     )
+    # Re-stamp after the island edit: the unsafe POM graph is what must be
+    # refused here, and a stale survey pin would refuse the manifest first.
+    orch.restamp_survey()
     orch.files[f"{island}/pom.xml"] = _pom("../outside")
 
     unsafe = resolve_survey_test_candidates(orch)

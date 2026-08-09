@@ -9,6 +9,7 @@ spec moved that guarantee into the gate; Plan 4 Task 4 implements it."""
 
 from types import SimpleNamespace
 
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
 from sag.agent.attempt_policy import untried_islands_requirement
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
@@ -28,13 +29,14 @@ TARGET_SHA = "a" * 40
 
 
 def _manifest(islands=ISLANDS):
-    return {
-        "survey": {"project_path": BIGTOP},
-        "root_shape": "pathological_aggregator",
-        "build_system": "maven",
-        "build_root": ISLANDS[0][0],
-        "build_islands": [{"root": root, "system": system} for root, system in islands],
-    }
+    # A live manifest must be a complete v1 revision; the legacy partial shape
+    # (and its extra-key `build_system`) is no longer publishable authority.
+    return complete_build_requirements_v1(
+        project_root=BIGTOP,
+        root_shape="pathological_aggregator",
+        build_root=ISLANDS[0][0],
+        build_islands=[{"root": root, "system": system} for root, system in islands],
+    )
 
 
 class ManifestOrch:
@@ -65,6 +67,10 @@ class ManifestOrch:
         if not self.readable:
             return {"success": False, "exit_code": 1, "output": "No such file"}
         return self.evidence(command)
+
+    def execute_control_command(self, command, **kwargs):
+        # Strict evidence reads only accept the clean host-control channel.
+        return self.execute_command(command)
 
 
 def _state_with_island_attempts(*roots, succeeded=False):

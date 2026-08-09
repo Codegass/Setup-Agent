@@ -37,7 +37,7 @@ from sag.agent.claim_graph import CLAIM_GRAPH_PATH, read_claim_files
 from sag.agent.claim_records import CLAIM_DIR, entry_has_extractors
 from sag.agent.document_map import DOCUMENT_MAP_PATH, MAX_FILE_BYTES, entry_id, read_entry_text
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
-from sag.agent.evidence_publications import current_evidence_publication_authority
+from sag.agent.evidence_publications import evidence_publication_authority_for
 from sag.agent.evidence_records import (
     frame_json_record_stream,
     frame_named_json_record_stream,
@@ -212,12 +212,16 @@ class FakeContainer:
             path = shlex.split(assignment[len("file=") :])[0]
             records = [(path.rsplit("/", 1)[-1], self.files[path])] if path in self.files else []
             return ok(frame_named_json_record_stream(records))
-        if command.startswith("for file in ") and "/*.json; do " in command:
-            prefix = command.split("for file in ", 1)[1].split("/*.json; do ", 1)[0]
+        if "for file in " in command and "/*.json; do " in command:
+            # The bounded stream command now carries a byte-budget preamble, so
+            # the glob is located by partition (same as the shared ContainerFS).
+            quoted_glob = command.partition(" in ")[2].partition("; do")[0]
+            target = shlex.split(quoted_glob)[0]
+            prefix = target[: -len("*.json")]
             records = [
                 (path.rsplit("/", 1)[-1], body)
                 for path, body in sorted(self.files.items())
-                if path.startswith(f"{prefix}/") and path.endswith(".json")
+                if path.startswith(prefix) and path.endswith(".json")
             ]
             if "SAG_NAMED_JSON_RECORD_V1" in command:
                 return ok(frame_named_json_record_stream(records))
@@ -239,6 +243,12 @@ class FakeContainer:
 
     def execute_command(self, command, **kwargs):
         return self(command, **kwargs)
+
+    def execute_control_command(self, command, **kwargs):
+        # Strict evidence transport resolves the clean host-control channel;
+        # a bare bound execute_command is deliberately rejected by production.
+        # Route through execute_command so hostile doubles stay hostile.
+        return self.execute_command(command, **kwargs)
 
     # -- assertions ------------------------------------------------------
     def fetches(self):
@@ -484,8 +494,12 @@ def test_a_survey_without_a_map_states_a_typed_null_document_pin():
         "config_fingerprint",
         "target_sha",
         "document_map_fingerprint",
+        "survey_fingerprint",
     }
     assert survey["document_map_fingerprint"] is None
+    from sag.tools.internal.build_preflight import survey_facts_fingerprint
+
+    assert survey["survey_fingerprint"] == survey_facts_fingerprint(manifest)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +649,9 @@ def engine_container(*, assessments=(), claims=(), repairs=(), contract=CONTRACT
         files[f"{LEGACY_REPAIR_DIR}/{body['repair_id']}.json"] = json.dumps(body, sort_keys=True)
     container = FakeContainer({"core/README.md": MODULE_README}, files)
     if contract and contract_raw is not None:
-        current_evidence_publication_authority().publish_bytes(
+        # Publication requires the run's one immutable store binding; resolve
+        # the authority through the container exactly as production writers do.
+        evidence_publication_authority_for(container).publish_bytes(
             record_kind="invocation_contract",
             record_id=contract["contract_id"],
             raw=contract_raw.encode("utf-8"),

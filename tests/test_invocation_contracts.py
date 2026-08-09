@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_container_io import FakeContainer
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 from test_invocation_receipts import receipts_written as atomic_receipts_written
@@ -34,6 +35,7 @@ from sag.agent.evidence_assessments import ASSESSMENT_DIR
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    current_evidence_publication_authority,
     evidence_publication_authority_for,
     install_evidence_publication_authority,
     reset_evidence_publication_authority,
@@ -74,6 +76,9 @@ SHA = "9f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
 FREEZE_DOMAIN = "test:/workspace/proj/core"
 
 # One surveyed manifest carrying the Stage A/§C2 projection the freeze pins.
+# The freeze reads this as the CALLER-HELD mapping (no schema probe), so the
+# fixture keeps every pin the freeze can read — including the accepted
+# `survey_fingerprint` v2 pin the strict persisted stamp does not carry yet.
 MANIFEST = {
     "survey": {
         "survey_fingerprint": "survey-7",
@@ -94,6 +99,24 @@ MANIFEST = {
     ],
 }
 
+# What the facade actually consumes now: only a complete strict v1 manifest can
+# become the host-published live revision BuildTool routes every dispatch by.
+STRICT_MANIFEST = complete_build_requirements_v1(
+    project_root="/workspace/proj",
+    build_system="maven",
+    config_fingerprint="cfg-7",
+)
+
+
+def bind_current_host_store(source):
+    """Bind one fake's stable store identity to this test's host authority."""
+
+    token = install_evidence_publication_authority(
+        current_evidence_publication_authority(),
+        orchestrator=source,
+    )
+    reset_evidence_publication_authority(token)
+
 
 class RecordingOrchestrator:
     """Records every container command in dispatch order.
@@ -110,7 +133,7 @@ class RecordingOrchestrator:
         self.commands = []
         self.manifest_raw = None
 
-    def publish_manifest(self, payload=MANIFEST):
+    def publish_manifest(self, payload=STRICT_MANIFEST):
         if self.manifest_raw is not None:
             return
         self.manifest_raw = canonical_json(payload)
@@ -125,6 +148,11 @@ class RecordingOrchestrator:
                 prior.raw_sha256 if prior else EVIDENCE_PUBLICATION_GENESIS_SHA256
             ),
         )
+
+    def execute_control_command(self, command, **kwargs):
+        # Production orchestrators expose the clean host-control channel; the
+        # strict evidence transport refuses a bare bound normal executor.
+        return self.execute_command(command, **kwargs)
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
@@ -427,6 +455,7 @@ def test_read_contract_rejects_duplicate_json_oversize_and_hash_tamper():
     )
 
     container = ContainerFS()
+    bind_current_host_store(container)
     assert write_contract(container, valid) is True
     path = f"{CONTRACT_DIR}/{valid['contract_id']}.json"
     assert read_frozen_contract(container, valid["contract_id"]) == valid
@@ -487,6 +516,7 @@ def test_live_contract_reader_ignores_only_strict_foreign_and_historical_sibling
     }
     historical["contract_hash"] = contract_hash(historical)
     container = ContainerFS()
+    bind_current_host_store(container)
     assert write_contract(container, current) is True
     container.files[f"{CONTRACT_DIR}/{foreign['contract_id']}.json"] = canonical_json(foreign)
     container.files[f"{CONTRACT_DIR}/{historical['contract_id']}.json"] = canonical_json(
@@ -517,6 +547,7 @@ def test_contract_writer_requires_host_publication_and_replay_repairs_it(
         intent_source="controller",
     )
     container = ContainerFS()
+    bind_current_host_store(container)
     token = install_evidence_publication_authority(
         unavailable_evidence_publication_authority("publication probe")
     )
@@ -1302,7 +1333,16 @@ def test_the_real_maven_dispatch_runs_the_vector_its_contract_froze():
     compliance class moves with it and this fails loudly."""
     from test_build_tool_preflight_integration import EndToEndOrch, _e2e_build_tool
 
-    orch = EndToEndOrch([(True, "BUILD SUCCESS")], java="17", manifest={"java_version": "17"})
+    class ControlEndToEndOrch(EndToEndOrch):
+        # The strict evidence transport needs the clean host-control channel;
+        # commands still flow through execute_command so the drift assertions
+        # below keep reading one recorded stream.
+        def execute_control_command(self, command, **kwargs):
+            return self.execute_command(command, **kwargs)
+
+    orch = ControlEndToEndOrch(
+        [(True, "BUILD SUCCESS")], java="17", manifest={"java_version": "17"}
+    )
 
     with build_action_context(
         "envelope-000099", action="compile", working_directory="/workspace/proj"

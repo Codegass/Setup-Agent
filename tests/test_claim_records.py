@@ -36,6 +36,11 @@ from pydantic import TypeAdapter, ValidationError
 from test_receipt_v2_and_assessments import ContainerFS
 
 from sag.agent import claim_records
+from sag.agent.evidence_publications import (
+    current_evidence_publication_authority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
 from sag.agent.claim_records import (
     CLAIM_DIR,
     CLAIM_SCHEMA_VERSION,
@@ -965,8 +970,25 @@ def test_a_conflict_record_names_every_claim_in_the_group_once():
 # ---------------------------------------------------------------------------
 
 
+def bound_container_fs(**kwargs):
+    """A file-layer fake bound to this test's host publication authority.
+
+    A persisted claim is live only once host-published; binding the fake as
+    the run's one container store lets `write_claims` publish through the
+    ambient authority instead of failing closed as an unbound writer.
+    """
+
+    execute = ContainerFS(**kwargs)
+    token = install_evidence_publication_authority(
+        current_evidence_publication_authority(),
+        orchestrator=execute,
+    )
+    reset_evidence_publication_authority(token)
+    return execute
+
+
 def test_write_claims_persists_each_claim_atomically():
-    execute = ContainerFS()
+    execute = bound_container_fs()
     readme, workflow = conflicting_pair()
 
     assert write_claims(execute, [readme, workflow]) is True
@@ -984,7 +1006,7 @@ def test_write_claims_streams_a_large_payload_with_bounded_commands():
         def payload(self):
             return {"claim_id": "large-claim", "detail": "x" * 180_000}
 
-    execute = ContainerFS()
+    execute = bound_container_fs()
 
     assert write_claims(execute, [LargeClaim()]) is True
 
@@ -1015,7 +1037,7 @@ def test_a_persisted_claim_states_its_schema_and_omits_absent_facts():
 
 
 def test_write_claims_is_idempotent_for_the_same_body():
-    execute = ContainerFS()
+    execute = bound_container_fs()
     claim = policy_claim()
 
     assert write_claims(execute, [claim]) is True
@@ -1025,7 +1047,7 @@ def test_write_claims_is_idempotent_for_the_same_body():
 
 
 def test_write_claims_never_overwrites_a_different_body_under_one_id():
-    execute = ContainerFS()
+    execute = bound_container_fs()
     first = policy_claim()
     second = policy_claim(typed_value={"tool": "maven", "constraint": "3.6"})
     assert first.claim_id == second.claim_id

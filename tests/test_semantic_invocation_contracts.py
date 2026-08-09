@@ -427,6 +427,11 @@ class ContractStore:
     def __init__(self):
         self.fs = FakeContainer()
 
+    def execute_control_command(self, command, **kwargs):
+        # Production orchestrators expose the clean host-control channel; the
+        # strict evidence transport refuses a bare bound normal executor.
+        return self.execute_command(command, **kwargs)
+
     def execute_command(self, command, **_kwargs):
         tokens = shlex.split(command)
         if tokens[:1] == ["cat"]:

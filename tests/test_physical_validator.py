@@ -15,12 +15,16 @@ import os
 import re
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import _MemoryControlSink
 
 from sag.agent.control_events import canonical_json
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
-    publish_evidence_revision,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
 )
 from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import (
@@ -64,16 +68,24 @@ class FakeBuildOrchestrator:
         self.files = set(files)
         self.dirs = set(dirs)
         self.commands = []
-        self.requirements = {}
-        publication = publish_evidence_revision(
-            self,
+        # The strict live reader rejects a bare `{}` manifest as schema-invalid
+        # (which reads as "requirements unavailable" and caps the denominator).
+        # The fixture's original intent — a survey that recorded NO
+        # expectations — is now stated as the smallest complete v1 manifest.
+        self.requirements = complete_build_requirements_v1()
+        # One evidence run binds exactly ONE container store, and tests build
+        # several orchestrators; each fake is therefore its own host-published
+        # store rather than a second store on the shared context authority.
+        authority = EvidencePublicationAuthority(run_id="run-pytest", sink=_MemoryControlSink())
+        token = install_evidence_publication_authority(authority, orchestrator=self)
+        reset_evidence_publication_authority(token)
+        authority.publish_revision(
             record_kind="build_requirements",
             record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
             logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
             raw=canonical_json(self.requirements).encode("utf-8"),
             expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
         )
-        assert publication.published
 
     def read_file(self, path):
         if path == REQUIREMENTS_PATH:

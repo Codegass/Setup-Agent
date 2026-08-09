@@ -99,6 +99,10 @@ class ManifestOrchestrator:
         else:
             self._container.files[BUILD_REQUIREMENTS_PATH] = value
 
+    def execute_control_command(self, command, **kwargs):
+        # Evidence writers require the explicit clean host-control channel.
+        return self.execute_command(command, **kwargs)
+
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         self.calls.append((command, kwargs))

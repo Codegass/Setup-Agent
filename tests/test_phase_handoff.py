@@ -1,11 +1,48 @@
 import json
+import shlex
 
 import pytest
 
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_handoff import PhaseHandoff
 from sag.agent.phase_machine import PhaseAttemptRecord, PhaseOutcome, PhaseTermination
-from test_verdict_finalizer import FakeVerdictOrchestrator
+
+
+class HandoffContainerOrchestrator:
+    """Container double for the handoff writer's exact command shapes.
+
+    The shared evidence-store double (ContainerFS) models the strict evidence
+    transport; the handoff file still travels the trusted internal-path writer
+    (heredoc, newline trim, plain `mv` rename), so this fake models that.
+    """
+
+    def __init__(self):
+        self.commands = []
+        self.files = {}
+
+    def execute_command(self, command, **kwargs):
+        self.commands.append(command)
+        if command.startswith("mkdir -p "):
+            return {"exit_code": 0, "output": ""}
+        if command.startswith("cat > ") and "<<'" in command:
+            header, _, rest = command.partition("\n")
+            target = shlex.split(header.split("<<", 1)[0])[2]
+            marker = header.rsplit("<<'", 1)[1].split("'", 1)[0]
+            body, _, _ = rest.rpartition(f"\n{marker}")
+            self.files[target] = body + "\n"
+            return {"exit_code": 0, "output": ""}
+        if command.startswith("truncate -s -1 "):
+            target = shlex.split(command)[-1]
+            if target in self.files:
+                self.files[target] = self.files[target][:-1]
+            return {"exit_code": 0, "output": ""}
+        if command.startswith("mv ") and "\n" not in command:
+            tokens = shlex.split(command)
+            if len(tokens) == 3 and tokens[1] in self.files:
+                self.files[tokens[2]] = self.files.pop(tokens[1])
+                return {"exit_code": 0, "output": ""}
+            return {"exit_code": 1, "output": "mv: cannot stat source"}
+        return {"exit_code": 0, "output": ""}
 
 
 @pytest.fixture
@@ -132,7 +169,7 @@ def test_complete_materialization_keeps_duplicate_canonical_fact_events(handoff,
 
 
 def test_container_handoff_uses_atomic_workspace_replacement(run_state):
-    orchestrator = FakeVerdictOrchestrator()
+    orchestrator = HandoffContainerOrchestrator()
     PhaseHandoff(run_state, orchestrator=orchestrator)
 
     run_state.register_fact(

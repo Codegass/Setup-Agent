@@ -1,4 +1,5 @@
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
@@ -33,8 +34,15 @@ class FakeBuildToolOrchestrator:
             record_kind="build_requirements",
             record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
             logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-            payload={},
+            payload=complete_build_requirements_v1(),
         )
+
+    def execute_control_command(self, command, workdir=None, timeout=None, **kwargs):
+        # Evidence transports resolve the clean host-control channel and fail
+        # closed on a bound plain executor; the scripted double exposes the
+        # channel explicitly and routes it to the same observable surface.
+        del kwargs
+        return self.execute_command(command, workdir=workdir, timeout=timeout)
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
