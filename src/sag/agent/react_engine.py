@@ -4517,6 +4517,29 @@ class ReActEngine(UIEventEmitter):
         state = getattr(self, "run_evidence_state", None)
         if machine is None or state is None or state.sealed or machine.is_complete:
             return False
+        # The test phase's no-op convergence may not skip the harness-owned
+        # floor: the TEST_ATTEMPT_REQUIRED gate just told the model "the
+        # controller owns and will execute the registered phase-floor action",
+        # and live 2026-08-09 lp-commons-dbcp converged to partial one second
+        # later with the promise unkept. Force the required action ONCE per
+        # attempt: a terminal receipt lets the next claim close on real
+        # evidence; a registered refusal makes the recurrence's honest close
+        # carry the refusal instead of a broken promise.
+        required_attempt = self._missing_required_test_attempt()
+        if required_attempt is not None:
+            floor_key = (str(machine.current_attempt_id), required_attempt.action_text())
+            if getattr(self, "_no_op_convergence_floor_key", None) != floor_key:
+                self._no_op_convergence_floor_key = floor_key
+                if self._force_required_test_attempt(
+                    required_attempt, trigger="no_op_convergence"
+                ):
+                    self._add_system_guidance(
+                        "TEST_ATTEMPT_REQUIRED: no-op completion claims cannot "
+                        "close the test phase before the harness executes the "
+                        f"required action: {required_attempt.action_text()}",
+                        priority=9,
+                    )
+                    return False
         refs = tuple(gate.evidence_refs)
         blocker = state.record_blocker(
             failure_signature=(

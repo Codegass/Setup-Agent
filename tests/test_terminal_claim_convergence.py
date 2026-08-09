@@ -885,3 +885,76 @@ def test_engine_constructor_scopes_physical_validator_to_current_receipt_run(
 
     assert captured["receipt_run_id"] == "receipt-run-current"
     assert context_manager.physical_validator is engine.physical_validator
+
+
+def test_no_op_convergence_in_the_test_phase_forces_the_floor_before_closing():
+    """Live lp-commons-dbcp (2026-08-09): the TEST_ATTEMPT_REQUIRED gate told
+    the model the controller would execute the registered phase-floor action,
+    then the no-op cap closed the phase one second later with the promise
+    unkept and zero tests executed. The convergence close must force the
+    required attempt once; only its receipt or registered refusal may close."""
+
+    from types import SimpleNamespace
+
+    engine = _engine()
+    engine.phase_machine = PhaseMachine(start_phase="test")
+    prepared = None
+    for _ in range(3):
+        prepared = engine._prepare_rejected_completion(_rejected_test())
+    claim, gate, _, decision = prepared
+
+    requirement = SimpleNamespace(action_text=lambda: "build(action='test')")
+    forced = []
+    engine._missing_required_test_attempt = lambda: requirement
+    engine._force_required_test_attempt = (
+        lambda req, *, trigger: forced.append((req, trigger)) or True
+    )
+    engine._add_system_guidance = lambda *_a, **_k: None
+    recorded = {}
+    engine._emit_control_gate = lambda honest_claim, honest_gate: recorded.update(
+        gate=honest_gate
+    )
+    engine._record_gate_facts = lambda phase, honest_gate: None
+    engine._apply_phase_decision = lambda record, route: recorded.update(record=record)
+
+    # First convergence: the floor runs, the phase does NOT close.
+    assert engine._close_phase_for_agent_no_progress(claim, gate, decision) is False
+    assert forced == [(requirement, "no_op_convergence")]
+    assert "record" not in recorded
+
+    # Second convergence with the same starved attempt: one shot spent —
+    # the honest close proceeds instead of looping the promise forever.
+    assert engine._close_phase_for_agent_no_progress(claim, gate, decision) is True
+    assert len(forced) == 1
+    assert recorded["gate"].accepted
+
+
+def _rejected_test(signal="done"):
+    claim = PhaseClaim(
+        phase="test",
+        signal=signal,
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        reason="rewritten model prose",
+        evidence_refs=("output_tests",),
+    )
+    gate = validate_phase_claim(
+        claim,
+        ValidatorState.RED,
+        reason="no terminal test execution receipt",
+        evidence_refs=("output_tests",),
+        code="TEST_ATTEMPT_REQUIRED",
+    )
+    result = ToolResult.completed_failure(
+        output=gate.reason,
+        error=gate.reason,
+        metadata={"phase_claim": claim.to_metadata(), "gate_result": gate.to_metadata()},
+    )
+    call = ToolCall(name="phase", raw_params={"action": signal})
+    return ToolExecution(
+        call=call,
+        result=result,
+        status="failure",
+        raw_params=call.raw_params,
+        attempted_execution=True,
+        observation_text=result.output,
+    )
