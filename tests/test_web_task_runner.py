@@ -29,13 +29,14 @@ class FakeSessionStore:
             }
         )
 
-    def mark_finished(self, *, workspace_id, session_id, success, outcome):
+    def mark_finished(self, *, workspace_id, session_id, success, outcome, evidence_records=None):
         self.finished.append(
             {
                 "workspace_id": workspace_id,
                 "session_id": session_id,
                 "success": success,
                 "outcome": outcome,
+                "evidence_records": evidence_records,
             }
         )
 
@@ -248,6 +249,7 @@ def test_agent_task_launcher_marks_session_finished_after_agent_run(monkeypatch)
             "session_id": "UI-12345678",
             "success": True,
             "outcome": "Task completed: Run formatter tests",
+            "evidence_records": [],
         }
     ]
 

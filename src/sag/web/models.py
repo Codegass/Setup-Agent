@@ -594,14 +594,6 @@ class ExecutionSessionDetail(WebModel):
     )
 
 
-class TerminalConnectionState(WebModel):
-    container: str
-    cwd: str = "/workspace"
-    status: str
-    tty: str = "120 × 32"
-    lines: list[dict[str, str]] = Field(default_factory=list)
-
-
 class DashboardResponse(WebModel):
     docker: DockerSummary
     workspaces: list[WorkspaceSummary]

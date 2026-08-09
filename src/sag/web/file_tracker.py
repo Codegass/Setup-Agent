@@ -16,6 +16,7 @@ from sag.web.models import (
 )
 
 DEFAULT_IGNORE_DIRS = {
+    ".setup_agent",
     ".git",
     ".venv",
     "__pycache__",
@@ -32,6 +33,7 @@ class FileMeta:
     type: Literal["file", "dir", "other"]
     size: int
     mtime_ns: int
+    ctime_ns: int
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,26 @@ class FileChangeTracker:
 
         return FileSnapshot(id=snapshot_id, root=self.root, mode="metadata", files=files)
 
+    @staticmethod
+    def snapshot_from_manifest(snapshot_id: str, root: Path, manifest: str) -> FileSnapshot:
+        """Build a metadata snapshot collected by an execution environment."""
+        files: dict[str, FileMeta] = {}
+        root_text = root.as_posix().rstrip("/")
+        for line in manifest.splitlines():
+            try:
+                kind, size, mtime, ctime, path = line.split("\t", 4)
+                relative = Path(path).relative_to(root_text).as_posix()
+                files[relative] = FileMeta(
+                    path=relative,
+                    type={"f": "file", "d": "dir"}.get(kind, "other"),
+                    size=int(size),
+                    mtime_ns=int(float(mtime) * 1_000_000_000),
+                    ctime_ns=int(float(ctime) * 1_000_000_000),
+                )
+            except (TypeError, ValueError):
+                continue
+        return FileSnapshot(id=snapshot_id, root=root, mode="metadata", files=files)
+
     def diff(self, base: FileSnapshot, head: FileSnapshot) -> FileChangeDigest:
         items: list[FileChangeItem] = []
         base_paths = set(base.files)
@@ -85,6 +107,7 @@ class FileChangeTracker:
             if (
                 before.size != after.size
                 or before.mtime_ns != after.mtime_ns
+                or before.ctime_ns != after.ctime_ns
                 or before.type != after.type
             ):
                 items.append(self._item(after, "modified"))
@@ -127,6 +150,7 @@ class FileChangeTracker:
             type=kind,
             size=path_stat.st_size,
             mtime_ns=path_stat.st_mtime_ns,
+            ctime_ns=path_stat.st_ctime_ns,
         )
 
     def _item(

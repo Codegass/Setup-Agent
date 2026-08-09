@@ -98,6 +98,27 @@ def test_missing_path_skipped(tmp_path):
     assert not (dest / ".sag_last_comment.json").exists()  # NotFound → skipped, no crash
 
 
+def test_extract_artifacts_copies_setup_agent_and_report(tmp_path):
+    session_mirror.extract_artifacts(FakeContainer(ARCHIVES), tmp_path)
+    assert (tmp_path / ".setup_agent" / "sessions" / "index.json").is_file()
+    assert (tmp_path / REPORT).read_text() == "# report"
+    assert not (tmp_path / ".sag_last_comment.json").exists()  # mirror-only file
+
+
+def test_prune_removes_only_stale_sag_mirrors(tmp_path):
+    ensure_mirror(FakeClient(FakeContainer(ARCHIVES)), "sag-dead", running=False, logs_root=tmp_path)
+    ensure_mirror(FakeClient(FakeContainer(ARCHIVES)), "sag-live", running=False, logs_root=tmp_path)
+    (tmp_path / "web_mirror" / "notes").mkdir()  # non-sag dir must survive
+
+    session_mirror.prune_mirrors(tmp_path, {"sag-live"})
+
+    assert not (tmp_path / "web_mirror" / "sag-dead").exists()
+    assert (tmp_path / "web_mirror" / "sag-live").is_dir()
+    assert (tmp_path / "web_mirror" / "notes").is_dir()
+    assert "sag-dead" not in session_mirror._last_fetch
+    session_mirror.prune_mirrors(tmp_path / "nope", set())  # missing root: no crash
+
+
 def test_reader_answers_cat_and_finds(tmp_path):
     dest = ensure_mirror(FakeClient(FakeContainer(ARCHIVES)), "sag-x", running=False, logs_root=tmp_path)
     r = MirrorReader(dest)

@@ -26,6 +26,7 @@ export interface TestSummary {
   skip: number
   total: number
   errors?: number
+  flakyCount?: number | null
   passRate?: number | null
   executionRate?: number | null
   reportFileCount?: number | null

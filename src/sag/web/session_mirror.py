@@ -14,6 +14,7 @@ import fnmatch
 import io
 import re
 import shlex
+import shutil
 import tarfile
 import time
 from pathlib import Path
@@ -21,9 +22,6 @@ from typing import Any, Callable
 
 from loguru import logger
 
-# Result paths mirrored from the container (all under /workspace). `.setup_agent`
-# holds sessions/index.json, contexts/, report_metrics.json, module_metrics.json.
-_ARCHIVE_PATHS = ("/workspace/.setup_agent", "/workspace/.sag_last_comment.json")
 _REPORT_RE = re.compile(r"setup-report-\d{8}-\d{6}\.md")
 RUNNING_TTL_SECONDS = 10.0
 
@@ -57,12 +55,35 @@ def ensure_mirror(
     except Exception:
         return dest if dest.exists() else None
 
-    dest.mkdir(parents=True, exist_ok=True)
-    for path in _ARCHIVE_PATHS:
-        _extract(container, path, dest)
-    _extract_report(container, dest)
+    extract_artifacts(container, dest)
+    _extract(container, "/workspace/.sag_last_comment.json", dest)
     _last_fetch[container_name] = now()
     return dest
+
+
+def extract_artifacts(container: Any, dest: Path) -> None:
+    """Copy /workspace/.setup_agent and the setup report(s) into dest.
+
+    `.setup_agent` holds sessions/index.json, contexts/, report_metrics.json,
+    module_metrics.json. Shared by the web mirror and the CLI's --record save.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    _extract(container, "/workspace/.setup_agent", dest)
+    _extract_report(container, dest)
+
+
+def prune_mirrors(logs_root: Path, live_names: set[str]) -> None:
+    """Delete mirrors of containers that no longer exist. Only sag-* entries are
+    touched, so the __missing__ sentinel and any stray user files survive."""
+    root = mirror_root(logs_root)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and entry.name.startswith("sag-") and entry.name not in live_names:
+            shutil.rmtree(entry, ignore_errors=True)
+            _last_fetch.pop(entry.name, None)
 
 
 class _ChunkReader(io.RawIOBase):

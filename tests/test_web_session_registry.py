@@ -313,6 +313,86 @@ def test_container_session_store_preserves_explicit_evidence_status_on_finish():
     assert payload["sessions"][0]["evidence_status"] == "partial"
 
 
+def test_session_index_accepts_camel_case_extended_test_metrics(tmp_path: Path):
+    sessions = tmp_path / ".setup_agent" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "index.json").write_text(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "UI-metrics",
+                        "test": {
+                            "flakyCount": 2,
+                            "reportFileCount": 3,
+                            "uniqueTotal": 12,
+                            "methodExecutionRate": 0.75,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    row = SessionRegistry().read_index(tmp_path, "sag-commons-cli")[0]
+
+    assert row.test.flaky_count == 2
+    assert row.test.report_file_count == 3
+    assert row.test.unique_total == 12
+    assert row.test.method_execution_rate == 0.75
+
+
+def test_session_detail_reads_persisted_file_and_evidence_artifacts():
+    files = {
+        "/workspace/.setup_agent/sessions/index.json": json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "UI-artifacts",
+                        "workspace": "sag-commons-cli",
+                        "title": "Run tests",
+                        "status": "completed",
+                        "entry": "Web UI",
+                        "start": "2026-06-08T06:30:00",
+                        "duration": "1s",
+                        "build": "none",
+                        "test": {},
+                        "report": "none",
+                        "files": 1,
+                        "evidence": 1,
+                        "outcome": "Tests passed.",
+                        "file_digest": {
+                            "snapshot": {"base": "start", "head": "finish", "mode": "metadata"},
+                            "counts": {"added": 1, "modified": 0, "deleted": 0, "renamed": 0},
+                            "items": [{"path": "result.txt", "change": "added"}],
+                        },
+                        "evidence_records": [
+                            {
+                                "timestamp": "2026-06-08T06:30:01",
+                                "kind": "validation",
+                                "summary": "Tests passed.",
+                                "metadata": {"source": "Test validator", "status": "success"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(workspace_summary(), "UI-artifacts")
+
+    assert detail is not None
+    assert detail.files is not None
+    assert detail.files.items[0].path == "result.txt"
+    assert detail.evidence[0].source == "Test validator"
+    assert detail.evidence[0].status == "success"
+
+
 def test_container_session_registry_falls_back_to_last_comment_without_index():
     files = {
         "/workspace/.sag_last_comment.json": json.dumps(
@@ -631,7 +711,12 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
                 "model": "claude-sonnet-4.5",
                 "total_iterations": 6,
                 "max_iterations": 40,
-                "build": {"state": "partial", "system": "maven", "tool": "Maven"},
+                "build": {
+                    "state": "partial",
+                    "system": "maven",
+                    "tool": "Maven",
+                    "buildTime": "42.3 s",
+                },
                 "test": {
                     "state": "partial",
                     "total": 1205,
@@ -656,6 +741,7 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
             "# Project Setup Report\n\n"
             "**Generated:** 2026-06-18 10:08:01\n"
             "**Result:** PARTIAL\n"
+            "\n| Build | ✅ 240 classes, 4 JARs | Maven |\n"
         ),
     }
     registry = ContainerSessionRegistry(
