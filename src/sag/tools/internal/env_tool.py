@@ -618,11 +618,15 @@ class EnvTool(BaseTool):
                     "description": "Environment variables to export when this candidate is active.",
                 },
                 "path_prepend": {
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
-                    "description": "PATH entries to prepend when this candidate is active.",
+                    # No oneOf: providers reject union schemas (OpenAI's rule
+                    # is top-level, but the wire stays uniform). The execute
+                    # signature still accepts a single string and normalizes.
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "PATH entries to prepend when this candidate is active "
+                        "(a single string is also accepted)."
+                    ),
                 },
                 "activate": {
                     "type": "boolean",

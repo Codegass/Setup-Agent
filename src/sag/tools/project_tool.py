@@ -194,20 +194,11 @@ class ProjectTool(BaseTool):
                 },
             },
             "required": ["action"],
-            # Activation is a semantic default only for the env branch. Keep
-            # it conditional so clone/provision/analyze intents are not
-            # polluted with an irrelevant field before they are frozen.
-            "allOf": [
-                {
-                    "if": {
-                        "properties": {"action": {"const": "env"}},
-                        "required": ["action"],
-                    },
-                    "then": {
-                        "properties": {"activate": {"default": True}},
-                    },
-                }
-            ],
+            # No allOf/if-then here: OpenAI function calling refuses
+            # oneOf/anyOf/allOf/enum/const/not at the schema top level (live
+            # 2026-08-09). The env branch's activation default is enforced in
+            # execute — absent activate is forced True, explicit False refused
+            # — so the wire schema does not need to state it.
             # The delegates accept more than the documented surface
             # (target_directory, update_context, version, activate,
             # path_prepend, ...); pass everything through to them.

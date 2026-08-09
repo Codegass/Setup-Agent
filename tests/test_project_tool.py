@@ -93,14 +93,18 @@ def test_env_facade_safe_execute_cannot_bypass_activation_requirement():
     assert env.calls == []
 
 
-def test_env_schema_describes_atomic_activation_default():
+def test_env_schema_is_wire_clean_and_activation_lives_in_execute():
+    # Premise updated 2026-08-09: providers refuse oneOf/anyOf/allOf/enum/
+    # const/not at the schema top level (the first live model call of
+    # lp-commons-dbcp died on exactly this), so the env branch's conditional
+    # default left the wire. The atomic-activation contract is execute-owned:
+    # absent activate is forced True (asserted by test_env_routes below and
+    # tests/test_wire_schema_openai_constraints.py).
     tool, *_ = _tool()
 
     schema = tool.get_parameter_schema()
 
-    env_branch = schema["allOf"][0]
-    assert env_branch["if"]["properties"]["action"]["const"] == "env"
-    assert env_branch["then"]["properties"]["activate"]["default"] is True
+    assert "allOf" not in schema
     assert "default" not in schema["properties"]["activate"]
     assert schema["properties"]["activate"]["enum"] == [True]
     assert "activate" in schema["properties"]["executable"]["description"]

@@ -303,8 +303,26 @@ def test_project_env_conditional_default_is_frozen_without_polluting_other_actio
         {"action": "clone", "repo_url": "https://example.test/repo.git"},
     )
 
-    assert env_params["activate"] is True
+    # Premise updated 2026-08-09: the conditional wire default (allOf/if-then)
+    # was provider-refused, so normalization no longer stamps activate — the
+    # activation contract moved whole to ProjectTool.execute, which forces
+    # True and refuses an explicit False. Clone stays unpolluted either way.
+    assert "activate" not in env_params
     assert "activate" not in clone_params
+
+    class RecordingEnv:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, **kwargs):
+            self.calls.append(kwargs)
+            from sag.tools.base import ToolResult
+
+            return ToolResult.completed_success(output="ok")
+
+    env = RecordingEnv()
+    ProjectTool(env_tool=env).execute(**env_params)
+    assert env.calls and env.calls[0]["activate"] is True
 
 
 @pytest.mark.parametrize(

@@ -474,15 +474,24 @@ def test_inspect_rejects_entire_unpublished_malformed_overlay():
     assert inspected["warnings"]
 
 
-def test_env_tool_schema_allows_string_or_array_path_prepend():
+def test_env_tool_path_prepend_wire_is_uniform_but_a_string_still_normalizes():
+    # Premise updated 2026-08-09: providers refuse union wire schemas (the
+    # live 'project' facade failure was the top-level cousin), so the wire
+    # states one array shape. The string-or-array CONTRACT moved whole to the
+    # normalization seam: a plain string is still accepted and normalized.
     schema = EnvTool(FakeEnvOverlayOrchestrator()).get_parameter_schema()
 
     path_schema = schema["properties"]["path_prepend"]
+    assert path_schema["type"] == "array"
+    assert path_schema["items"] == {"type": "string"}
+    assert "oneOf" not in path_schema
 
-    assert path_schema["oneOf"] == [
-        {"type": "string"},
-        {"type": "array", "items": {"type": "string"}},
-    ]
+    from sag.runtime.env_overlay import EnvOverlayStore
+
+    normalized = EnvOverlayStore._normalize_path_prepend(
+        None, "/opt/maven/bin", "/opt/maven/bin/mvn"
+    )
+    assert normalized == ["/opt/maven/bin"]
 
 
 def test_maven_registration_uses_measured_version_not_caller_claim():
