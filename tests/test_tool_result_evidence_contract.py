@@ -306,7 +306,8 @@ def test_bash_background_cannot_claim_preexisting_report_without_frozen_boundary
         result.metadata["job_obligation_persistence_code"]
         == "bash_background_evidence_boundary_unavailable"
     )
-    assert orchestrator.command_calls == ["test -d -- /workspace/project"]
+    # POSIX test has no `--` (three args make the middle a binary operator).
+    assert orchestrator.command_calls == ["test -d /workspace/project"]
 
 
 def test_bash_background_unknown_start_is_pending_without_retrying_dispatch():

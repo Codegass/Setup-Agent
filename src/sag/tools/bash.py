@@ -209,8 +209,13 @@ class BashTool(BaseTool):
         if not isinstance(requested_workdir, str) or not requested_workdir.strip():
             return False, "working directory must be a non-empty string"
         try:
+            # POSIX test has no `--` end-of-options: with three args the middle
+            # one must be a binary operator, so `test -d -- /path` is exit 2
+            # for EVERY path (live 2026-08-09: all bash-with-cwd calls were
+            # refused). The two-argument form is unambiguous — $2 is always an
+            # operand, even when the quoted path starts with a dash.
             probe = self.docker_orchestrator.execute_command(
-                f"test -d -- {shlex.quote(requested_workdir)}",
+                f"test -d {shlex.quote(requested_workdir)}",
                 workdir=None,
             )
         except Exception as exc:

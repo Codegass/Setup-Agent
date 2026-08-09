@@ -1461,3 +1461,32 @@ def test_maven_failure_contract_survives_weak_model_omissions_end_to_end():
         "source": "registered_state",
         "kind": "range",
     }
+
+
+def test_env_not_found_with_no_candidates_routes_to_provision():
+    """#19-class: a refusal must name a call that can succeed. With no
+    registered candidate anywhere, re-registering other paths cannot help;
+    the one productive move is installing the tool (live 2026-08-09: the
+    model looped on an absent /usr/bin/mvn with no route out)."""
+    class AbsentExecutableOrchestrator(FakeEnvOverlayOrchestrator):
+        # The shared fake answers every probe optimistically; this one models
+        # a container where the requested executable genuinely is not there.
+        def execute_command(self, command, workdir=None, timeout=None):
+            if command.startswith(("test -x ", "realpath -e -- ")) or command.endswith(
+                " -version"
+            ):
+                return {"success": False, "output": "", "exit_code": 1}
+            return super().execute_command(command, workdir=workdir, timeout=timeout)
+
+    tool = EnvTool(AbsentExecutableOrchestrator())
+
+    result = tool.execute(
+        action="register", tool="maven", executable="/usr/bin/mvn", activate=True
+    )
+
+    assert not result.succeeded
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert any(
+        "project(action='provision', packages=['maven'])" in s
+        for s in (result.suggestions or [])
+    )

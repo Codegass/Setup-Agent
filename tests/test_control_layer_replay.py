@@ -1806,3 +1806,42 @@ def test_run_pin_template_reads_run_order_index_from_env(tmp_path, monkeypatch):
     monkeypatch.delenv("SAG_RUN_ORDER_INDEX", raising=False)
     agent._initialize_run_pin_template()
     assert agent._run_pin_template["run_order_index"] is None
+
+
+def test_the_pin_mirror_writes_the_exact_published_bytes():
+    """Live lp-commons-dbcp (2026-08-09): the run-pin mirror rode
+    write_container_text, whose heredoc always appends a trailing newline —
+    one byte the host publication never hashed. The strict byte-exact reader
+    then reported run_pin_unreadable for the entire run and every receipt
+    binding collapsed. The mirror must produce bytes whose sha256 equals the
+    published raw hash."""
+
+    import hashlib
+    import json
+
+    from test_container_io import FakeContainer
+
+    from sag.agent.agent import SetupAgent
+
+    class Orch:
+        def __init__(self):
+            self._fs = FakeContainer()
+
+        def execute_control_command(self, command, **kwargs):
+            return self._fs.execute_command(command)
+
+        def execute_command(self, command, **kwargs):
+            return self._fs.execute_command(command)
+
+    orch = Orch()
+    payload = json.dumps({"run_id": "run-1", "target_repo_sha": None}, sort_keys=True)
+
+    agent = SetupAgent.__new__(SetupAgent)
+    agent.orchestrator = orch
+    mirror = SetupAgent._make_run_pin_mirror(agent)
+    mirror(payload)
+
+    stored = orch._fs.files["/workspace/.setup_agent/run-pin.json"]
+    assert hashlib.sha256(stored.encode("utf-8")).hexdigest() == hashlib.sha256(
+        payload.encode("utf-8")
+    ).hexdigest(), "mirror bytes must hash exactly like the published payload"

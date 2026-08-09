@@ -29,7 +29,19 @@ class FakeBashOrchestrator:
                 "timeout": timeout,
             }
         )
-        if "test -d /workspace" in command or "test -d -- /workspace" in command:
+        if "test -d -- " in command:
+            # A real POSIX test refuses `--` (three args make the middle a
+            # binary operator): the permissive old fake accepted it, which is
+            # exactly how the live 2026-08-09 all-bash-refused defect passed
+            # its tests. Model the shell, not the hope.
+            return {
+                "success": False,
+                "output": "test: --: unexpected operator",
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": "test: --: unexpected operator",
+            }
+        if "test -d /workspace" in command:
             return {
                 "success": True,
                 "output": "EXISTS",
@@ -285,7 +297,9 @@ def test_bash_missing_cwd_refuses_without_mkdir_or_fallback_dispatch():
         "duration": 0,
     }
     assert len(orchestrator.command_calls) == 1
-    assert orchestrator.command_calls[0]["command"] == "test -d -- /workspace/missing"
+    # Two-argument form only: POSIX test has no `--`, and the three-argument
+    # form is an unconditional exit 2 (see the fake's shell-faithful branch).
+    assert orchestrator.command_calls[0]["command"] == "test -d /workspace/missing"
     assert not orchestrator.monitoring_calls
     assert all("mkdir" not in call["command"] for call in orchestrator.command_calls)
     assert all(

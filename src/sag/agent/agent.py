@@ -258,13 +258,7 @@ class SetupAgent:
             ):
                 raise RuntimeError("container control-event mirror rejected the append")
 
-        def mirror_pin(payload: str) -> None:
-            if not write_container_text(
-                self.orchestrator,
-                f"{container_dir}/run-pin.json",
-                payload,
-            ):
-                raise RuntimeError("container run-pin mirror rejected the write")
+        mirror_pin = self._make_run_pin_mirror()
 
         self.control_event_sink = session_logger.get_control_event_sink(mirror=mirror_event)
         self._run_pin_host_path = session_logger.run_pin_path
@@ -289,6 +283,30 @@ class SetupAgent:
             authority,
             orchestrator=getattr(self, "orchestrator", None),
         )
+
+    def _make_run_pin_mirror(self):
+        """Mirror the run pin with the EXACT published bytes.
+
+        The pin's host publication hashes the payload verbatim, and the strict
+        reader compares container bytes against that hash byte-for-byte.
+        write_container_text always appends a trailing newline (its JSONL
+        contract), which made every live pin mirror one byte off and reported
+        run_pin_unreadable for the whole run (live lp-commons-dbcp 2026-08-09).
+        Only the validated atomic writer preserves exact bytes.
+        """
+        from sag.utils.container_io import write_container_text_atomic
+
+        def mirror_pin(payload: str) -> None:
+            result = write_container_text_atomic(
+                self.orchestrator,
+                "/workspace/.setup_agent/run-pin.json",
+                payload,
+                validate_json=True,
+            )
+            if not result.persisted:
+                raise RuntimeError("container run-pin mirror rejected the write")
+
+        return mirror_pin
 
     @staticmethod
     def _resolve_sag_git_sha() -> str | None:

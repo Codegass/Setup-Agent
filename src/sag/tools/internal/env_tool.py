@@ -419,6 +419,16 @@ class EnvTool(BaseTool):
             suggestions.append(
                 "Already registered and executable: " + ", ".join(registered[:6])
             )
+        elif tool:
+            # No candidate exists anywhere: registering other paths cannot
+            # succeed either. The one productive move is installing the tool
+            # (live 2026-08-09: the model probed absent /usr/bin/mvn in a loop
+            # because nothing named the provision route).
+            suggestions.append(
+                f"No {tool} is registered and this path does not exist — if "
+                f"{tool} is not installed in the container, install it first: "
+                f"project(action='provision', packages=['{tool}'])"
+            )
         suggestions.extend(
             [
                 "Use bash to verify the exact installed executable path before registering it.",
