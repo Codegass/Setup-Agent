@@ -179,6 +179,13 @@ class SetupAgent:
             f"ErrorLogger initialized with workspace: {self.config.workspace_path}"
         )
 
+        # One host-owned stream is mirrored into the container so normal
+        # --record artifact copying captures exactly the same canonical rows.
+        # Installed BEFORE any component touches the container: the project
+        # lane refuses to run without the authority, so every construction-time
+        # container op below depends on this ordering.
+        self._initialize_control_recording()
+
         # Initialize context manager with container-based workspace
         self.context_manager = ContextManager(
             workspace_path=self.config.workspace_path,
@@ -187,10 +194,6 @@ class SetupAgent:
 
         # Initialize tools
         self.tools = self._initialize_tools(workflow_mode=workflow_mode)
-
-        # One host-owned stream is mirrored into the container so normal
-        # --record artifact copying captures exactly the same canonical rows.
-        self._initialize_control_recording()
 
         # Initialize ReAct engine (repository URL will be set later). The phase
         # machine and in-container context journal are None outside setup runs,

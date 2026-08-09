@@ -954,3 +954,32 @@ def test_harness_repair_builder_is_not_a_live_engine_surface():
     from sag.agent.react_engine import ReActEngine
 
     assert not hasattr(ReActEngine, "_create_repair_for")
+
+
+def test_context_manager_bootstrap_uses_the_control_channel():
+    """The live 2026-08-09 lp-commons-dbcp run died in its first container op:
+    ContextManager's constructor mkdir ran on the project lane, which refuses
+    before the run authority is installed — and the authority installs one
+    line later. Bootstrap I/O is control-plane by design (orch.py's channel
+    comment); the constructor must not depend on installation order."""
+
+    class TwoChannelOrch:
+        def __init__(self):
+            self.control_commands = []
+
+        def execute_control_command(self, command, **kwargs):
+            self.control_commands.append(command)
+            return {"success": True, "exit_code": 0, "output": ""}
+
+        def execute_command(self, command, **kwargs):
+            # The project lane before authority install: refuse, exactly as
+            # DockerOrchestrator._default_exec_environment does.
+            raise RuntimeError("runtime environment has no host publication authority")
+
+    from sag.agent.context_manager import ContextManager
+
+    orch = TwoChannelOrch()
+    ContextManager(workspace_path="/workspace", orchestrator=orch)
+
+    assert any("mkdir -p /workspace/.setup_agent" in cmd for cmd in orch.control_commands)
+    assert any(".setup_agent/contexts" in cmd for cmd in orch.control_commands)

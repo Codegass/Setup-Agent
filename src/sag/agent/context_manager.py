@@ -379,6 +379,15 @@ class ContextManager:
         if not self.orchestrator:
             return
 
+        # Bootstrap I/O belongs on the clean control channel: the project lane
+        # refuses to run before the run authority is installed, and directory
+        # creation is not project evidence. The constructor must not depend on
+        # installation order (live 2026-08-09: the first container op of the
+        # run died on exactly that ordering).
+        execute = getattr(self.orchestrator, "execute_control_command", None)
+        if not callable(execute):
+            execute = self.orchestrator.execute_command
+
         # Create the contexts directory in the container
         contexts_path = str(self.contexts_dir)
 
@@ -387,7 +396,7 @@ class ContextManager:
 
         logger.info(f"🔧 Ensuring parent directory exists: {parent_dir}")
         parent_create_cmd = f"mkdir -p {parent_dir} && chmod 755 {parent_dir}"
-        parent_result = self.orchestrator.execute_command(parent_create_cmd, workdir=None)
+        parent_result = execute(parent_create_cmd, workdir=None)
 
         if not (parent_result.get("success") or parent_result.get("exit_code") == 0):
             logger.error(
@@ -400,19 +409,19 @@ class ContextManager:
         # Now create the contexts directory - use workdir=None to avoid dependency on /workspace
         logger.info(f"🔧 Creating contexts directory: {contexts_path}")
         create_cmd = f"mkdir -p {contexts_path} && chmod 755 {contexts_path}"
-        result = self.orchestrator.execute_command(create_cmd, workdir=None)
+        result = execute(create_cmd, workdir=None)
 
         if result.get("success") or result.get("exit_code") == 0:
             logger.info(f"✅ Created contexts directory in container: {contexts_path}")
 
             # Verify the directory exists and is writable - also use workdir=None
             test_cmd = f"test -d {contexts_path} && test -w {contexts_path}"
-            test_result = self.orchestrator.execute_command(test_cmd, workdir=None)
+            test_result = execute(test_cmd, workdir=None)
 
             if not (test_result.get("success") or test_result.get("exit_code") == 0):
                 # Try to fix permissions - use workdir=None
                 chmod_cmd = f"chmod 755 {contexts_path}"
-                self.orchestrator.execute_command(chmod_cmd, workdir=None)
+                execute(chmod_cmd, workdir=None)
                 logger.warning(f"🔧 Fixed permissions for contexts directory: {contexts_path}")
         else:
             logger.error(f"❌ Failed to create contexts directory: {result.get('output', '')}")
