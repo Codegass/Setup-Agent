@@ -486,6 +486,7 @@ def _session_detail(
         steps=_optional_int(item.get("steps")),
         step_budget=_optional_int(item.get("step_budget")),
         canonical_verdict=summary.canonical_verdict,
+        rates=item.get("rates") if isinstance(item.get("rates"), dict) else None,
         snapshot_status=summary.snapshot_status,
         legacy=summary.legacy,
         report_delivery_status=summary.report_delivery_status,
@@ -764,6 +765,7 @@ def _setup_artifact_item(
         evidence_status = snapshot.verdict
         outcome = snapshot.verdict.upper()
         verdict_source = "snapshot"
+        rates = snapshot.rates
     elif legacy:
         test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
         build_payload = _build_payload_from_metrics(metrics) or _build_payload_from_report(
@@ -774,6 +776,7 @@ def _setup_artifact_item(
         outcome = _setup_outcome(trunk_data, report_raw, status)
         verdict_source = "legacy"
         snapshot_status = "legacy"
+        rates = None
     else:
         test = {
             "state": "unknown",
@@ -788,6 +791,7 @@ def _setup_artifact_item(
         evidence_status = "unknown"
         outcome = "UNKNOWN"
         verdict_source = "snapshot"
+        rates = None
 
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     return {
@@ -797,6 +801,7 @@ def _setup_artifact_item(
         "status": status,
         "evidence_status": evidence_status,
         "canonical_verdict": canonical_verdict,
+        "rates": rates,
         "snapshot_status": snapshot_status,
         "legacy": legacy,
         "verdict_source": verdict_source,

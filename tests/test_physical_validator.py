@@ -29,6 +29,7 @@ from sag.agent.evidence_publications import (
 from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import (
     PhysicalValidator,
+    _driven_test_modules_from_receipts,
     _format_build_duration,
     evaluate_run_verdict,
 )
@@ -37,8 +38,8 @@ from sag.config.settings import (
     DEFAULT_TEST_PASS_THRESHOLD,
     Config,
 )
-from sag.tools.report_tool import ReportTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.report_tool import ReportTool
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +763,69 @@ def test_validate_test_status_exposes_raw_unique_and_report_file_counts(monkeypa
     assert result["unique_tests"] == 10
     assert result["report_file_count"] == 3
     assert result["test_stats"]["executed"] == 10
+
+
+def test_validate_test_status_carries_catalog_and_canonical_module_denominators(monkeypatch):
+    """The catalog and receipt-qualified module roots already exist in this
+    validation pass; the sealed rollup must not discard either denominator."""
+    validator = PhysicalValidator(project_path="/workspace")
+    metrics = _metrics(1605, 1596, failed=0, error=0)
+    metrics.update(
+        {
+            "skipped_tests": 9,
+            "catalog_test_count": 1163,
+            "driven_modules": ["/workspace/demo"],
+            "test_modules": ["/workspace/demo"],
+        }
+    )
+    monkeypatch.setattr(
+        validator,
+        "parse_test_reports_with_catalog",
+        lambda project_dir: metrics,
+    )
+
+    result = validator.validate_test_status("demo")
+
+    assert result["static_test_count"] == 1163
+    assert result["test_stats"]["discovered"] == 1163
+    assert result["test_stats"]["driven_modules"] == ["/workspace/demo"]
+    assert result["test_stats"]["test_modules"] == ["/workspace/demo"]
+
+
+def test_driven_test_modules_require_complete_rows_with_a_proven_coordinate():
+    receipts = [
+        {
+            "testcase_execution_rows": {
+                "status": "complete",
+                "rows": [
+                    {
+                        "domain_id": "/workspace/demo",
+                        "module_coordinate": ".",
+                    },
+                    {
+                        "domain_id": "/workspace/demo/io",
+                        "module_coordinate": "io",
+                    },
+                ],
+            }
+        },
+        {
+            "testcase_execution_rows": {
+                "status": "unavailable",
+                "rows": [
+                    {
+                        "domain_id": "/workspace/demo/forged",
+                        "module_coordinate": "forged",
+                    }
+                ],
+            }
+        },
+    ]
+
+    assert _driven_test_modules_from_receipts(
+        receipts,
+        test_modules={"/workspace/demo", "/workspace/demo/io", "/workspace/demo/other"},
+    ) == {"/workspace/demo", "/workspace/demo/io"}
 
 
 # ---------------------------------------------------------------------------

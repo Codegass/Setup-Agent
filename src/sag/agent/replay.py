@@ -105,6 +105,7 @@ from .verdict_finalizer import (
     EvidenceCloseReason,
     RunVerdictSnapshot,
     VerdictFinalizer,
+    _snapshot_verdict,
 )
 
 
@@ -114,6 +115,25 @@ class ReplayValidationError(ValueError):
 
 class ReplayMismatchError(ReplayValidationError):
     """A valid transcript no longer reproduces its frozen expectations."""
+
+
+def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
+    """Project today's replay into the immutable verdict-v3 comparison shape.
+
+    The replay still executes and returns the v4 finalizer result. This view is
+    comparison-only: it preserves old transcript bytes without granting live
+    authority to v3 or rewriting the recorded expectation.
+    """
+
+    payload = snapshot.model_dump(mode="json")
+    payload["schema_version"] = 3
+    payload["verdict"] = _snapshot_verdict(
+        snapshot.build_evidence,
+        snapshot.test_stats,
+        snapshot.conflicts,
+    )
+    payload.pop("rates", None)
+    return payload
 
 
 #: Event kinds the engine stopped emitting when Plan 2 deleted the scheduler.
@@ -2170,6 +2190,8 @@ class ControlReplayRunner:
         digest = canonical_sha256(produced)
         actual_snapshot = snapshot.model_dump(mode="json")
         if self.verify_expected:
+            if header.expected_snapshot.get("schema_version") == 3:
+                actual_snapshot = _legacy_v3_snapshot_projection(snapshot)
             if actual_snapshot != header.expected_snapshot:
                 raise ReplayMismatchError("replayed snapshot differs from frozen expectation")
             if digest != header.expected_event_digest:

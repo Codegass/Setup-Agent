@@ -9,6 +9,11 @@ from sag.main import _render_setup_cli_result
 
 
 def _snapshot(verdict, conflicts=()):
+    build_modules = {
+        "success": {"rate": 100.0, "band": "fully", "numerator": 1, "denominator": 1},
+        "partial": {"rate": 90.0, "band": "most", "numerator": 9, "denominator": 10},
+        "failed": {"rate": 0.0, "band": "none", "numerator": 0, "denominator": 1},
+    }[verdict]
     return RunVerdictSnapshot(
         run_id=f"cli-mirror-{verdict}",
         finalized_at="2026-07-17T12:00:00Z",
@@ -20,6 +25,17 @@ def _snapshot(verdict, conflicts=()):
             passed=284,
             failed=2,
         ),
+        rates={
+            "build": {
+                "modules": build_modules,
+                "classes": {"band": "unavailable", "reason": "fixture class census unavailable"},
+            },
+            "test": {
+                "cases": {"rate": 100.0, "band": "fully", "numerator": 286, "denominator": 286},
+                "modules": {"band": "unavailable", "reason": "fixture test survey unavailable"},
+            },
+            "coverage": {"status": "unavailable", "reason": "coverage pass not run"},
+        },
     )
 
 
@@ -35,7 +51,7 @@ def test_snapshot_partial_is_rendered_literally_without_report_mirror():
 
     output, exit_code = _render_setup_cli_result(snapshot, _termination(), "cayenne")
 
-    assert "Verdict: PARTIAL" in output
+    assert "Verdict (derived): partial" in output
     assert exit_code == 1
 
 
@@ -48,7 +64,7 @@ def test_snapshot_success_cannot_be_demoted_by_report_delivery_failure():
         "demo",
     )
 
-    assert "Verdict: SUCCESS" in output
+    assert "Verdict (derived): success" in output
     assert "report delivery failed" in output.lower()
     assert exit_code == 0
 
@@ -60,5 +76,5 @@ def test_snapshot_failed_cannot_be_promoted_by_completed_flow():
         "demo",
     )
 
-    assert "Verdict: FAILED" in output
+    assert "Verdict (derived): failed" in output
     assert exit_code == 1

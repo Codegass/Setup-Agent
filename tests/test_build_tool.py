@@ -19,9 +19,7 @@ from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
-pytestmark = pytest.mark.usefixtures(
-    "facade_contract_authority", "exact_build_facade_authority"
-)
+pytestmark = pytest.mark.usefixtures("facade_contract_authority", "exact_build_facade_authority")
 
 
 class FakeBackendTool:
@@ -148,21 +146,41 @@ def test_gradle_kts_project_routes_test_to_gradle_backend():
 
 
 @pytest.mark.parametrize(
+    ("marker", "backend_name"),
+    (("pom.xml", "maven"), ("build.gradle.kts", "gradle")),
+)
+def test_facade_passes_its_verified_survey_to_the_receipt_writer(marker, backend_name):
+    manifest = complete_build_requirements_v1(
+        project_root="/workspace/p",
+        build_system=backend_name,
+    )
+    orchestrator = MarkerOrchestrator(
+        {marker},
+        files={REQUIREMENTS_PATH: json.dumps(manifest)},
+    )
+    backend = FakeBackendTool()
+
+    result = BuildTool(
+        orchestrator,
+        **{f"{backend_name}_tool": backend},
+    ).execute(action="test", working_directory="/workspace/p")
+
+    assert result.succeeded
+    assert backend.calls[0]["_requirements"] == manifest
+
+
+@pytest.mark.parametrize(
     ("marker", "backend_name", "expected_key", "expected_value"),
     (
         ("pom.xml", "maven", "command", "dependency:resolve"),
         ("settings.gradle", "gradle", "tasks", "dependencies"),
     ),
 )
-def test_deps_verb_maps_per_ecosystem(
-    marker, backend_name, expected_key, expected_value
-):
+def test_deps_verb_maps_per_ecosystem(marker, backend_name, expected_key, expected_value):
     backend = FakeBackendTool()
     kwargs = {f"{backend_name}_tool": backend}
 
-    BuildTool(MarkerOrchestrator({marker}), **kwargs).execute(
-        action="deps", working_directory="/w"
-    )
+    BuildTool(MarkerOrchestrator({marker}), **kwargs).execute(action="deps", working_directory="/w")
 
     assert backend.calls[0][expected_key] == expected_value
 

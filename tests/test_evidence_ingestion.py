@@ -541,7 +541,10 @@ def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path
     assert snapshot.test_stats.skipped == 0
     assert result.metadata["failed_tests"] == 0
     assert result.metadata["error_tests"] == 0
-    assert snapshot.verdict == "success"
+    # Premise updated 2026-08-10: this unit seam has no module survey, so the
+    # executed cases are fully while the derived compatibility word is partial.
+    assert snapshot.rates["test"]["cases"]["band"] == "fully"
+    assert snapshot.verdict == "partial"
 
 
 def test_non_execution_is_audited_without_polluting_build_evidence(tmp_path):
@@ -1015,7 +1018,8 @@ def test_explicit_cancellation_seals_snapshot_and_returns_cancelled(tmp_path):
 
     assert termination.termination is RunTerminationStatus.CANCELLED
     assert termination.report_delivery_status is ReportDeliveryStatus.SKIPPED
-    assert read_verdict_snapshot(orchestrator).verdict == "unknown"
+    # No invented unknown word: unavailable grains mechanically derive partial.
+    assert read_verdict_snapshot(orchestrator).verdict == "partial"
     assert engine.phase_machine.records[-1].reason == "operator requested cancellation"
 
 
@@ -1243,7 +1247,31 @@ def test_normal_report_phase_flow_close_returns_completed_termination(tmp_path):
     assert engine.phase_machine.is_complete is True
     assert termination.termination is RunTerminationStatus.COMPLETED
     assert termination.report_delivery_status is ReportDeliveryStatus.DELIVERED
-    assert read_verdict_snapshot(orchestrator).verdict == "success"
+    # This flow fixture carries no survey denominator; rates are authoritative.
+    assert read_verdict_snapshot(orchestrator).verdict == "partial"
+
+
+def test_requested_coverage_is_recorded_before_the_verdict_is_sealed(tmp_path):
+    engine, _orchestrator = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    _green_tests(engine)
+    calls = []
+    engine.pre_finalize_evidence_callback = lambda: calls.append("coverage") or {
+        "status": "collected",
+        "line_rate": 87.5,
+        "source": "jacoco-injected",
+    }
+
+    snapshot = engine._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
+    retried = engine._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
+
+    assert calls == ["coverage"]
+    assert snapshot.rates["coverage"] == {
+        "status": "collected",
+        "line_rate": 87.5,
+        "source": "jacoco-injected",
+    }
+    assert retried.model_dump_json() == snapshot.model_dump_json()
 
 
 class _PromptBuilder:

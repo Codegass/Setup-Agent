@@ -1359,7 +1359,7 @@ def _domain_fact(
         return None
     facts = requirements.get("domain_facts")
     if not isinstance(facts, (list, tuple)):
-        return None
+        facts = ()
     best: Optional[Dict[str, Any]] = None
     best_root = ""
     for fact in facts:
@@ -1370,7 +1370,20 @@ def _domain_fact(
             continue
         if len(root) >= len(best_root):
             best, best_root = dict(fact), root
-    return best
+    if best is not None:
+        return best
+
+    recommendation = requirements.get("build_recommendation")
+    nested = recommendation if isinstance(recommendation, Mapping) else {}
+    test_system = _text(requirements.get("test_system") or nested.get("test_system"))
+    test_root = _normalized_root(requirements.get("test_root") or nested.get("test_root"))
+    if (
+        test_system in {"maven", "gradle"}
+        and test_root
+        and (directory == test_root or directory.startswith(f"{test_root}/"))
+    ):
+        return {"root": test_root}
+    return None
 
 
 def _validate_v2_contract_shape(

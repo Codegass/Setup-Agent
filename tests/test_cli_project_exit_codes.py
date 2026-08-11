@@ -1,9 +1,16 @@
 from click.testing import CliRunner
-
 from container_evidence_fakes import ContainerFS
+
 import sag.config as config_module
 import sag.config.logger as logger_module
 import sag.main as main_module
+from sag.agent.evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
+    VERDICT_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
 from sag.agent.verdict_finalizer import (
     ReportDeliveryStatus,
     RunTermination,
@@ -11,13 +18,6 @@ from sag.agent.verdict_finalizer import (
     RunVerdictSnapshot,
     SnapshotTestCounts,
     SnapshotTestStats,
-)
-from sag.agent.evidence_publications import (
-    EVIDENCE_PUBLICATION_GENESIS_SHA256,
-    VERDICT_LOGICAL_ARTIFACT_ID,
-    EvidencePublicationAuthority,
-    install_evidence_publication_authority,
-    reset_evidence_publication_authority,
 )
 
 VERDICT_PATH = "/workspace/.setup_agent/verdict.json"
@@ -29,6 +29,10 @@ def reset_config_state(monkeypatch):
 
 
 def snapshot_for(verdict):
+    build_modules = {
+        "success": {"rate": 100.0, "band": "fully", "numerator": 1, "denominator": 1},
+        "partial": {"rate": 90.0, "band": "most", "numerator": 9, "denominator": 10},
+    }[verdict]
     return RunVerdictSnapshot(
         run_id=f"cli-{verdict}",
         finalized_at="2026-07-17T12:00:00Z",
@@ -44,6 +48,17 @@ def snapshot_for(verdict):
                 failed=0 if verdict == "success" else 2,
             ),
         ),
+        rates={
+            "build": {
+                "modules": build_modules,
+                "classes": {"band": "unavailable", "reason": "fixture class census unavailable"},
+            },
+            "test": {
+                "cases": {"rate": 100.0, "band": "fully", "numerator": 10, "denominator": 10},
+                "modules": {"band": "unavailable", "reason": "fixture test survey unavailable"},
+            },
+            "coverage": {"status": "unavailable", "reason": "coverage pass not run"},
+        },
     )
 
 
@@ -140,7 +155,7 @@ def test_project_command_returns_nonzero_for_partial_snapshot(monkeypatch, tmp_p
     result = invoke_project(monkeypatch, tmp_path, PartialSetupAgent)
 
     assert result.exit_code == 1
-    assert "Verdict: PARTIAL" in result.output
+    assert "Verdict (derived): partial" in result.output
     assert "Claimed latest subjects: unavailable" in result.output
     assert "Unattributed observations (not verdict-bearing): 8/10 passed" in result.output
 
@@ -155,7 +170,7 @@ def test_project_command_success_ignores_report_delivery_failure(monkeypatch, tm
     result = invoke_project(monkeypatch, tmp_path, ReportFailingSuccessfulAgent)
 
     assert result.exit_code == 0
-    assert "Verdict: SUCCESS" in result.output
+    assert "Verdict (derived): success" in result.output
     assert "WARNING" in result.output
     assert "report delivery failed" in result.output.lower()
 
@@ -164,7 +179,7 @@ def test_project_command_never_promotes_unpublished_success_snapshot(monkeypatch
     result = invoke_project(monkeypatch, tmp_path, UnpublishedSuccessfulAgent)
 
     assert result.exit_code == 1
-    assert "Verdict: UNKNOWN" in result.output
+    assert "Verdict (derived): unknown" in result.output
     assert "setup completed" not in result.output.lower()
 
 
@@ -181,6 +196,30 @@ def test_project_command_passes_ref_to_setup_agent(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert RecordingSetupAgent.calls[0]["project_ref"] == "rel/commons-cli-1.11.0"
+
+
+def test_project_coverage_is_threaded_into_the_pre_finalize_hook(monkeypatch, tmp_path):
+    RecordingSetupAgent.calls = []
+    coverage_calls = []
+    monkeypatch.setattr(
+        main_module,
+        "_run_coverage_evidence_pass",
+        lambda orchestrator, project_name, validator=None: coverage_calls.append(project_name)
+        or {"status": "collected", "line_rate": 88.0, "source": "jacoco-injected"},
+    )
+
+    result = invoke_project(monkeypatch, tmp_path, RecordingSetupAgent, "--coverage")
+
+    assert result.exit_code == 0
+    callback = RecordingSetupAgent.calls[0]["pre_finalize_evidence_callback"]
+    assert callable(callback)
+    assert coverage_calls == []
+    assert callback() == {
+        "status": "collected",
+        "line_rate": 88.0,
+        "source": "jacoco-injected",
+    }
+    assert coverage_calls == ["commons-cli"]
 
 
 def test_project_command_initializes_agent_session_logs(monkeypatch, tmp_path):

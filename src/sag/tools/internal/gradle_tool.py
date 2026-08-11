@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from loguru import logger
 
@@ -152,6 +152,7 @@ class GradleTool(BaseTool):
         *,
         _env_preflight: bool = True,
         _compile_source_languages: Optional[List[str]] = None,
+        _requirements: Optional[Mapping[str, Any]] = None,
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.
@@ -207,10 +208,10 @@ class GradleTool(BaseTool):
         preamble_lines: List[str] = []
         outcome = None
         # The manifest the pre-flight already read, kept for the invocation
-        # receipt's survey pins and domain. Empty on the facade path, which
-        # deliberately reads the manifest ONE layer up: the receipt records the
-        # pins it can see and omits the ones it cannot.
-        requirements: Dict[str, Any] = {}
+        # receipt's survey pins and domain. The facade path supplies the exact
+        # host-verified revision it already read so receipt sealing does not
+        # re-read the manifest or discard test-module coordinates.
+        requirements: Dict[str, Any] = dict(_requirements or {})
         if _env_preflight:
             manifest_read = read_live_build_requirements(self.orchestrator)
             if (

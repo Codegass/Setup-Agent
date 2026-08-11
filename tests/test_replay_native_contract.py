@@ -77,7 +77,9 @@ def test_native_tool_call_envelopes_verify_under_the_same_walk(tmp_path):
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
     assert result.executed_envelope_count == 6
-    assert result.snapshot.verdict == "success"
+    # Premise updated 2026-08-10: this archive has no module survey, so the
+    # current rate-derived word is partial rather than the old threshold word.
+    assert result.snapshot.verdict == "partial"
     assert result.unconsumed_events == ()
 
 
@@ -190,7 +192,7 @@ def test_pre_plan2_rows_are_skipped_with_a_counted_notice(tmp_path):
         "scheduler_decision": scheduler_rows,
         "planner_response": planner_rows,
     }
-    assert result.snapshot.verdict == "success"
+    assert result.snapshot.verdict == "partial"
 
 
 def test_a_native_transcript_skips_nothing(tmp_path):
@@ -214,7 +216,7 @@ def test_scheduler_mode_and_reasons_are_no_longer_re_executed(tmp_path):
 
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
-    assert result.snapshot.verdict == "success"
+    assert result.snapshot.verdict == "partial"
 
 
 def test_the_module_documents_the_contract_change():

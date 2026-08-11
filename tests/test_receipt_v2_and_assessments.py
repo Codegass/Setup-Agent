@@ -58,6 +58,17 @@ from sag.agent.evidence_assessments import (
     assessment_id,
     write_assessment,
 )
+from sag.agent.evidence_publications import (
+    current_evidence_publication_authority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+)
+from sag.agent.invocation_contracts import (
+    ARGV_EXECUTION_BINDING,
+    PYTHON_FACADE_EXECUTION_BINDING,
+    build_contract,
+    dispatch_contract,
+)
 from sag.agent.invocation_receipts import (
     RECEIPT_DIR,
     RECEIPT_SCHEMA_VERSION,
@@ -70,17 +81,6 @@ from sag.agent.invocation_receipts import (
     survey_pins,
     target_sha,
     toolchain_fingerprint,
-)
-from sag.agent.evidence_publications import (
-    current_evidence_publication_authority,
-    install_evidence_publication_authority,
-    reset_evidence_publication_authority,
-)
-from sag.agent.invocation_contracts import (
-    ARGV_EXECUTION_BINDING,
-    PYTHON_FACADE_EXECUTION_BINDING,
-    build_contract,
-    dispatch_contract,
 )
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
 
@@ -142,13 +142,19 @@ def argv_contract_authority(*, executor, action, working_directory, expected_arg
     public_action = (
         "test"
         if "test" in lowered or "verify" in lowered
-        else "compile"
-        if "compile" in lowered
-        else "deps"
-        if "depend" in lowered
-        else "install"
-        if "install" in lowered or "publishtomavenlocal" in lowered
-        else "package"
+        else (
+            "compile"
+            if "compile" in lowered
+            else (
+                "deps"
+                if "depend" in lowered
+                else (
+                    "install"
+                    if "install" in lowered or "publishtomavenlocal" in lowered
+                    else "package"
+                )
+            )
+        )
     )
     params = {"action": public_action, "working_directory": working_directory}
     domain_id = f"test:{working_directory}"
@@ -173,6 +179,7 @@ def argv_contract_authority(*, executor, action, working_directory, expected_arg
         ),
     )
     return dispatch_contract(contract)
+
 
 SHA = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809111213"
 
@@ -207,9 +214,7 @@ class ContainerFS:
     def __call__(self, command, **kwargs):
         self.commands.append(command)
         tokens = (
-            shlex.split(command)
-            if "\n" not in command or command.startswith("python3 -c ")
-            else []
+            shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
         )
         if tokens[:2] == ["python3", "-c"] and "fcntl.flock" in tokens[2]:
             target, candidate, _lock_path, expected, expected_bytes, expected_sha = tokens[3:9]
@@ -502,6 +507,18 @@ def test_domain_id_is_absent_when_no_surveyed_domain_contains_the_run():
 
 def test_domain_id_also_reads_the_nested_recommendation_shape():
     manifest = {"build_recommendation": {"build_domains": [{"root": "/workspace/proj"}]}}
+
+    assert nearest_domain_root(manifest, "/workspace/proj") == "/workspace/proj"
+
+
+def test_single_module_test_root_is_a_surveyed_receipt_domain():
+    """A single-module survey has no island list; its test_root is still the
+    exact coordinate that authorizes module-qualified testcase rows."""
+    manifest = {
+        "test_root": "/workspace/proj",
+        "test_system": "maven",
+        "test_islands": [],
+    }
 
     assert nearest_domain_root(manifest, "/workspace/proj") == "/workspace/proj"
 
@@ -959,9 +976,7 @@ def test_write_assessment_persists_atomically_under_the_assessment_dir():
     assert write.startswith("mv -f -- ")
     assert ".candidate." in write
     assert any(
-        command.startswith("python3 -c ")
-        and "fcntl.flock" in command
-        and final in command
+        command.startswith("python3 -c ") and "fcntl.flock" in command and final in command
         for command in execute.commands
     )
     assert json.loads(execute.files[final]) == assessment.payload()

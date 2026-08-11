@@ -13,6 +13,7 @@ from sag.agent.phase_gates import (
     ClaimDisposition,
     GateControlDisposition,
     ValidatorState,
+    _validated_test_rollup,
     check_phase_claim,
     check_phase_done,
     validate_phase_claim,
@@ -78,6 +79,39 @@ def test_build_done_rejected_without_artifacts():
     assert verdict["suggestions"], "must offer options"
 
 
+def test_validated_test_rollup_preserves_rate_denominators_from_the_validator_pass():
+    rollup = _validated_test_rollup(
+        {
+            "has_test_reports": True,
+            "static_test_count": 1163,
+            "unique_tests": 1605,
+            "unique_passed_tests": 1596,
+            "unique_failed_tests": 0,
+            "unique_error_tests": 0,
+            "unique_skipped_tests": 9,
+            "raw_total_tests": 1605,
+            "raw_passed_tests": 1596,
+            "raw_failed_tests": 0,
+            "raw_error_tests": 0,
+            "raw_skipped_tests": 9,
+            "test_stats": {
+                "discovered": 1163,
+                "executed": 1605,
+                "passed": 1596,
+                "failed": 0,
+                "skipped": 9,
+                "driven_modules": ["/workspace/demo"],
+                "test_modules": ["/workspace/demo"],
+            },
+        }
+    )
+
+    assert rollup is not None
+    assert rollup["discovered"] == 1163
+    assert rollup["driven_modules"] == ["/workspace/demo"]
+    assert rollup["test_modules"] == ["/workspace/demo"]
+
+
 def test_build_done_accepted_with_artifacts():
     validator = FakeValidator(build_success=True)
     verdict = check_phase_done(
@@ -137,9 +171,10 @@ def test_container_authored_manifest_cannot_close_a_green_build_gate():
     assert gate.validator_state is ValidatorState.UNAVAILABLE
     assert gate.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
     assert gate.code == "build_evidence_ledger_unavailable"
-    assert "build_requirements_publication_set_mismatch" in gate.validated_facts[
-        "build.evidence_conflicts"
-    ]
+    assert (
+        "build_requirements_publication_set_mismatch"
+        in gate.validated_facts["build.evidence_conflicts"]
+    )
 
 
 def test_project_failure_overclaim_requires_model_repair_but_honest_close_is_claimable():
@@ -218,6 +253,7 @@ def test_phase_gates_preserve_validator_owned_physical_rollups():
                 "unique_skipped_tests": 174,
                 "flaky_count": 3,
                 "metrics_conflicts": [],
+                "receipt_scoped": True,
             }
 
     validator = PhysicalRollups()
@@ -255,6 +291,7 @@ def test_phase_gates_preserve_validator_owned_physical_rollups():
         },
         "flaky_count": 3,
         "conflicts": ["test_errors_detected"],
+        "receipt_scoped": True,
     }
 
 
@@ -455,6 +492,7 @@ def test_all_collection_errors_are_red_even_when_report_exists():
                 "total_tests": 328,
                 "error_tests": 328,
                 "test_stats": {"executed": 328, "discovered": 328},
+                "receipt_scoped": True,
                 "reason": "collection errors",
                 "report_files": ["report://junit"],
             }
@@ -467,10 +505,53 @@ def test_all_collection_errors_are_red_even_when_report_exists():
         project_name="demo",
     )
 
-    assert result.accepted is False
-    assert result.validator_state is ValidatorState.RED
-    assert result.validated_outcome is PhaseOutcome.FAILED
-    assert result.code == "test_collection_failed"
+    # Premise updated 2026-08-10: terminal execution closes even when red;
+    # collection-error counts remain sealed content, not a gate rejection.
+    assert result.accepted is True
+    assert result.validator_state is ValidatorState.GREEN
+    assert result.validated_outcome is PhaseOutcome.SUCCESS
+    assert result.code == "test_execution_observed"
+
+
+def test_red_tests_never_reject_a_test_phase_close():
+    """Execution is what SAG grades. A driven terminal suite with heavy
+    failures closes claimably; red belongs to the project, not the harness."""
+
+    class HeavyRedSuite(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "status": "FAILED",
+                "evidence_status": "failed",
+                "reason": "20 passed, 60 failed, 20 errors",
+                "report_files": ["report://terminal-runner"],
+                "test_stats": {
+                    "discovered": 100,
+                    "executed": 100,
+                    "passed": 20,
+                    "failed": 60,
+                    "errors": 20,
+                    "skipped": 0,
+                },
+                "unique_tests": 100,
+                "unique_passed_tests": 20,
+                "unique_failed_tests": 60,
+                "unique_error_tests": 20,
+                "unique_skipped_tests": 0,
+                "receipt_scoped": True,
+            }
+
+    gate = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=HeavyRedSuite(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert gate.accepted is True
+    assert gate.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
+    assert "test_failures" not in gate.code
 
 
 def test_detected_but_unexecuted_tests_are_red():

@@ -929,6 +929,43 @@ def test_no_op_convergence_in_the_test_phase_forces_the_floor_before_closing():
     assert recorded["gate"].accepted
 
 
+def test_test_attempt_recovery_reaches_the_forced_floor_instead_of_aborting():
+    """Live lp-dbcp-rates (2026-08-10): Maven verify had executed 1605
+    tests, but the test phase still required its own runner receipt.  The
+    rejected terminal claim is the handoff to the controller-owned forced
+    action; it must not be promoted to a fatal harness failure before
+    ``_execute_tool_step`` reaches that action."""
+
+    engine = _engine()
+    engine.phase_machine = PhaseMachine(start_phase="test")
+    execution = _rejected_test()
+    claim = PhaseClaim.from_metadata(execution.result.metadata["phase_claim"])
+    gate = validate_phase_claim(
+        claim,
+        ValidatorState.UNAVAILABLE,
+        reason="one terminal test execution receipt is still required",
+        evidence_refs=("output_verify",),
+        code="TEST_ATTEMPT_REQUIRED",
+        control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+    )
+    execution.result = execution.result.model_copy(
+        update={
+            "error_code": "TEST_ATTEMPT_REQUIRED",
+            "metadata": {
+                **execution.result.metadata,
+                "gate_result": gate.to_metadata(),
+            },
+        }
+    )
+
+    prepared = engine._prepare_rejected_completion(execution)
+
+    assert prepared is not None
+    assert prepared.event.judge_disposition == "harness_recovery_required"
+    assert engine._apply_rejected_completion_control(prepared) is False
+    assert not hasattr(engine, "_fatal_harness_control_failure")
+
+
 def _rejected_test(signal="done"):
     claim = PhaseClaim(
         phase="test",

@@ -74,6 +74,38 @@ def _project(*, run_order_index: int = 0, tests: dict | None = None) -> dict:
             "test_state": "partial",
             "terminal_reason": "fixture_complete",
         },
+        "rates": {
+            "build": {
+                "modules": {
+                    "rate": 100.0,
+                    "band": "fully",
+                    "numerator": 2,
+                    "denominator": 2,
+                },
+                "classes": {
+                    "band": "unavailable",
+                    "reason": "fixture class census unavailable",
+                },
+            },
+            "test": {
+                "cases": {
+                    "rate": 75.0,
+                    "band": "most",
+                    "numerator": 3,
+                    "denominator": 4,
+                },
+                "modules": {
+                    "rate": 50.0,
+                    "band": "half",
+                    "numerator": 1,
+                    "denominator": 2,
+                },
+            },
+            "coverage": {
+                "status": "unavailable",
+                "reason": "coverage pass not run",
+            },
+        },
         "evidence": {
             "integrity": "complete",
             "receipts_expected": 4,
@@ -95,6 +127,42 @@ def _project(*, run_order_index: int = 0, tests: dict | None = None) -> dict:
             "midrun_human_approvals": 0,
         },
     }
+
+
+def test_rates_pass_through_evaluator_rows_without_math_and_v3_is_incomparable():
+    baseline = _project(run_order_index=0)
+    candidate = _project(run_order_index=0)
+    candidate["rates"]["coverage"] = {
+        "status": "unavailable",
+        "reason": "candidate coverage not collected",
+    }
+    exact_rates = copy.deepcopy(baseline["rates"])
+
+    validated = validate_v2_project(baseline)
+    compared = compare_project_metrics(
+        baseline,
+        candidate,
+        baseline_grain="subject",
+        baseline_disposition="claimed",
+    )
+
+    assert validated["rates"] == exact_rates
+    assert compared["rates_comparable"] is True
+    assert compared["rates"] == {
+        "baseline": exact_rates,
+        "candidate": candidate["rates"],
+    }
+
+    legacy_v3 = copy.deepcopy(candidate)
+    legacy_v3.pop("rates")
+    incomparable = compare_project_metrics(
+        baseline,
+        legacy_v3,
+        baseline_grain="subject",
+        baseline_disposition="claimed",
+    )
+    assert incomparable["rates_comparable"] is False
+    assert incomparable["rates"] == {"baseline": exact_rates, "candidate": None}
 
 
 def test_legacy_mode_recomputes_the_two_audited_v1_baselines():

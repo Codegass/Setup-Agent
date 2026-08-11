@@ -33,6 +33,7 @@ _OBLIGATION_RECORDS_UNSET = object()
 _REPORT_METRICS_PUBLICATION_LOCK = threading.RLock()
 from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import ADJUDICATED_CONFLICTS, rescue_blocked_build, run_verdict
+from sag.verdict_rates import render_rate_lines
 
 from .base import BaseTool, ToolResult
 
@@ -800,6 +801,17 @@ class ReportTool(BaseTool, UIEventEmitter):
         if not self._should_render_report_evidence_result(evidence):
             return []
 
+        rate_lines = self._snapshot_rate_lines(snapshot)
+        if rate_lines is not None:
+            lines = [*rate_lines, f"Verdict (derived): {self._report_verdict(snapshot)}"]
+            conflicts = evidence.get("conflicts") or []
+            if conflicts:
+                lines.append(f"Conflicts: {'; '.join(conflicts)}")
+            refs = evidence.get("evidence_refs") or []
+            if refs:
+                lines.append(f"Evidence refs: {'; '.join(refs)}")
+            return lines
+
         # Console Result reads the same kernel verdict as the header — round 6
         # beam printed "Result: SUCCESS" beside a FAILED header.
         lines = [f"Result: {self._report_verdict(snapshot).upper()}"]
@@ -814,6 +826,26 @@ class ReportTool(BaseTool, UIEventEmitter):
         refs = evidence.get("evidence_refs") or []
         if refs:
             lines.append(f"Evidence refs: {'; '.join(refs)}")
+        return lines
+
+    def _snapshot_rate_lines(
+        self, snapshot: Optional[Dict[str, Any]]
+    ) -> List[str] | None:
+        if not isinstance(snapshot, dict):
+            return None
+        if "rates" in snapshot:
+            rates = snapshot.get("rates")
+        else:
+            canonical = snapshot.get("canonical_snapshot")
+            rates = canonical.get("rates") if isinstance(canonical, dict) else None
+        if rates is None:
+            return None
+        lines = render_rate_lines(rates if isinstance(rates, dict) else {})
+        status = snapshot.get("status") or {}
+        failed = int(status.get("tests_failed") or 0) if isinstance(status, dict) else 0
+        errors = int(status.get("tests_errors") or 0) if isinstance(status, dict) else 0
+        if failed or errors:
+            lines[1] += f" — {failed} failed, {errors} errors (project-owned)"
         return lines
 
     def _render_markdown_evidence_details(
@@ -1592,6 +1624,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         ]
         report_snapshot = {
             "mode": "setup",
+            "rates": snapshot.rates,
             "status": status,
             "project": {
                 "type": project_info.get("type", "Unknown"),
@@ -2963,13 +2996,15 @@ class ReportTool(BaseTool, UIEventEmitter):
     ) -> str:
         """Generate console-formatted report rendered from the validated snapshot."""
 
+        setup_snapshot = (report_snapshot or {}).get("mode") == "setup"
         report_lines = [
             "=" * 80,
             "🎯 DETAILED PROJECT SETUP REPORT",
             "=" * 80,
             f"⏰ Generated: {timestamp}",
-            f"📊 Status: {status.upper()}",
         ]
+        if not setup_snapshot:
+            report_lines.append(f"📊 Status: {status.upper()}")
         evidence_lines = self._render_console_evidence_result(report_snapshot)
         if evidence_lines:
             report_lines.extend(evidence_lines)
@@ -4744,6 +4779,18 @@ with open(lock_path,"a+b") as lock:
         lines.append(f"**Generated:** {timestamp}")
 
         evidence_result = (snapshot or {}).get("evidence_result") or {}
+        rate_lines = self._snapshot_rate_lines(snapshot)
+        if rate_lines is not None:
+            lines.extend(f"**{line}**" for line in rate_lines)
+            lines.append(f"**Verdict (derived):** {self._report_verdict(snapshot)}")
+            conflicts = evidence_result.get("conflicts") or []
+            if conflicts:
+                lines.append(f"**Conflicts:** {'; '.join(conflicts)}")
+            refs = evidence_result.get("evidence_refs") or []
+            if refs:
+                lines.append(f"**Evidence refs:** {'; '.join(refs)}")
+            lines.append("")
+            return lines
         if self._should_render_report_evidence_result(evidence_result):
             # The Result line consumes the verdict kernel (spec §6) with the
             # same inputs as the agent's final status — never the raw

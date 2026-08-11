@@ -31,6 +31,7 @@ import json
 import os
 
 import pytest
+from verdict_rate_fakes import complete_verdict_rates
 
 from container_evidence_fakes import canonical_json, complete_run_pin
 from sag.agent.action_intents import action_fingerprint
@@ -170,6 +171,7 @@ def write_authorized_tvm_session(
         run_id=run_id,
         finalized_at="2026-08-09T06:00:00Z",
         verdict="failed",
+        rates=complete_verdict_rates("failed"),
     )
     verdict_raw = snapshot.model_dump_json().encode("utf-8")
     (control / "verdict.json").write_bytes(verdict_raw)

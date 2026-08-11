@@ -825,6 +825,7 @@ class ExecutionSessionDetail(WebModel):
         serialization_alias="stepBudget",
     )
     canonical_verdict: str = Field(default="unknown", serialization_alias="canonicalVerdict")
+    rates: dict[str, Any] | None = None
     snapshot_status: str = Field(default="unavailable", serialization_alias="snapshotStatus")
     legacy: bool = False
     report_delivery_status: str | None = Field(

@@ -51,7 +51,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from loguru import logger
 
 from sag.agent.receipt_structure import promote_structure
-from sag.runtime.container_io import resolve_control_execute
 from sag.agent.receipt_test_rows import (
     TestcaseRowContractError,
     diagnostic_testcase_outcomes,
@@ -60,6 +59,7 @@ from sag.agent.receipt_test_rows import (
     seal_testcase_execution_rows,
     validate_testcase_execution_row,
 )
+from sag.runtime.container_io import resolve_control_execute
 from sag.utils.container_io import (
     WRITE_COMPARE_CONFLICT,
     ContainerWriteResult,
@@ -2313,28 +2313,45 @@ def _tag_attribute(attributes: str, name: str) -> str:
 
 
 def _surveyed_domain_roots(manifest: Optional[Mapping[str, Any]]) -> List[str]:
-    """``build_domains`` roots, read the way every other rec fact is read.
+    """Every surveyed execution root, read without inventing coordinates.
 
     The manifest projects the recommendation's keys at top level; a manifest
     written before that projection existed carries only the nested
-    ``build_recommendation`` (same dual read the phase gate performs).
+    ``build_recommendation`` (same dual read the phase gate performs).  A
+    single-module test survey has no island list, so its explicit ``test_root``
+    is still a surveyed domain; otherwise testcase rows from that exact root
+    lose their module identity at the receipt boundary.
     """
     if not isinstance(manifest, Mapping):
         return []
-    raw = manifest.get("build_domains")
-    if raw is None:
-        recommendation = manifest.get("build_recommendation")
-        if isinstance(recommendation, Mapping):
-            raw = recommendation.get("build_domains")
-    if not isinstance(raw, (list, tuple)):
-        return []
     roots: List[str] = []
-    for item in raw:
-        if not isinstance(item, Mapping):
-            continue
-        root = _normalized_root(item.get("root"))
+
+    def add(value: Any) -> None:
+        root = _normalized_root(value)
         if root and root not in roots:
             roots.append(root)
+
+    recommendation = manifest.get("build_recommendation")
+    nested = recommendation if isinstance(recommendation, Mapping) else {}
+    raw_domains = manifest.get("build_domains")
+    if raw_domains is None:
+        raw_domains = nested.get("build_domains")
+    if isinstance(raw_domains, (list, tuple)):
+        for item in raw_domains:
+            if isinstance(item, Mapping):
+                add(item.get("root"))
+
+    raw_test_islands = manifest.get("test_islands")
+    if raw_test_islands is None:
+        raw_test_islands = nested.get("test_islands")
+    if isinstance(raw_test_islands, (list, tuple)):
+        for item in raw_test_islands:
+            if isinstance(item, Mapping):
+                add(item.get("root"))
+
+    test_system = str(manifest.get("test_system") or nested.get("test_system") or "").strip()
+    if test_system in {"maven", "gradle"}:
+        add(manifest.get("test_root") or nested.get("test_root"))
     return roots
 
 

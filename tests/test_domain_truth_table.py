@@ -215,7 +215,16 @@ class GreenValidator:
             "has_test_reports": self._has_test_reports,
             "evidence_status": "success",
             "reason": "test reports present",
-            "test_stats": {"executed": 50, "passed": 50, "failed": 0, "errors": 0, "skipped": 0},
+            "receipt_scoped": True,
+            # Premise updated 2026-08-10: executed counts close the test gate
+            # only when they are bound to the current receipt ledger.
+            "test_stats": {
+                "executed": 50,
+                "passed": 50,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+            },
             "total_tests": 50,
             "unique_tests": 50,
             "unique_passed_tests": 50,

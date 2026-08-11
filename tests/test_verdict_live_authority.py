@@ -85,10 +85,30 @@ def _bind(orchestrator, run_id: str, *, sink: MemorySink | None = None):
 
 
 def _snapshot(run_id: str, *, verdict: str = "failed") -> RunVerdictSnapshot:
+    if verdict == "success":
+        build_modules = {"rate": 100.0, "band": "fully", "numerator": 1, "denominator": 1}
+        test_cases = {"rate": 100.0, "band": "fully", "numerator": 1, "denominator": 1}
+    elif verdict == "failed":
+        build_modules = {"rate": 0.0, "band": "none", "numerator": 0, "denominator": 1}
+        test_cases = {"rate": 100.0, "band": "fully", "numerator": 1, "denominator": 1}
+    else:
+        build_modules = {"band": "unavailable", "reason": "fixture module scan unavailable"}
+        test_cases = {"rate": 100.0, "band": "fully", "numerator": 1, "denominator": 1}
     return RunVerdictSnapshot(
         run_id=run_id,
         finalized_at="2026-08-09T05:00:00Z",
         verdict=verdict,
+        rates={
+            "build": {
+                "modules": build_modules,
+                "classes": {"band": "unavailable", "reason": "fixture class census unavailable"},
+            },
+            "test": {
+                "cases": test_cases,
+                "modules": {"band": "unavailable", "reason": "fixture test survey unavailable"},
+            },
+            "coverage": {"status": "unavailable", "reason": "coverage pass not run"},
+        },
     )
 
 
@@ -107,6 +127,8 @@ def _publish_raw(authority, raw: str) -> None:
 
 def test_public_v3_validator_is_pure_and_accepts_a_canonical_payload():
     payload = json.loads(_snapshot("schema-run").model_dump_json())
+    payload["schema_version"] = 3
+    payload.pop("rates")
 
     assert validate_verdict_snapshot_v3(payload).run_id == "schema-run"
 
@@ -185,7 +207,11 @@ def test_forensic_read_never_falls_back_to_the_runtime_executor():
 
         def execute_command(self, _command, **_kwargs):
             self.normal_calls += 1
-            return {"success": True, "exit_code": 0, "output": _snapshot("forged").model_dump_json()}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": _snapshot("forged").model_dump_json(),
+            }
 
     orchestrator = FailedCleanRead()
 

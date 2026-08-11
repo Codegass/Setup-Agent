@@ -9,7 +9,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, Mapping, Optional
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -208,6 +208,9 @@ class SetupAgent:
             control_event_sink=self.control_event_sink,
             target_repo_sha_callback=self._record_target_repo_sha,
             orchestrator=self.orchestrator,
+            pre_finalize_evidence_callback=getattr(
+                self, "pre_finalize_evidence_callback", None
+            ),
         )
         # The advisor tool is a client stub until the engine that owns the
         # consult exists; bind it before the first iteration can call it.
@@ -748,6 +751,7 @@ class SetupAgent:
         interactive: bool = False,
         docker_label: Optional[str] = None,
         project_ref: Optional[str] = None,
+        pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> RunTermination:
         """Setup a project from scratch.
 
@@ -759,12 +763,16 @@ class SetupAgent:
             docker_label: Docker container label (from --name flag).
                          If None, defaults to project_name.
             project_ref: Optional Git ref-ish handle to checkout during clone.
+            pre_finalize_evidence_callback: Optional harness callback returning
+                the already-aggregated coverage summary immediately before a
+                normal test evidence-close.
         """
         # Default docker_label to project_name if not provided
         if docker_label is None:
             docker_label = project_name
         self.run_termination = None
         self.workflow_mode = "setup"
+        self.pre_finalize_evidence_callback = pre_finalize_evidence_callback
 
         # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)

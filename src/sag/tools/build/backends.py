@@ -242,6 +242,7 @@ class MavenBackend:
         timeout: Optional[int],
         maven_version_requirement: Optional[str] = None,
         params: Optional[Dict[str, Any]] = None,
+        requirements: Optional[Mapping[str, Any]] = None,
     ) -> ActualToolExecution:
         kwargs = (
             dict(params)
@@ -254,8 +255,11 @@ class MavenBackend:
                 maven_version_requirement=maven_version_requirement,
             )
         )
+        call_kwargs = dict(kwargs)
+        if requirements is not None:
+            call_kwargs["_requirements"] = dict(requirements)
         try:
-            result = self.maven_tool.execute(**kwargs)
+            result = self.maven_tool.execute(**call_kwargs)
         except OutputPersistenceError as exc:
             raise exc.attach_invocation("maven", kwargs)
         return ActualToolExecution("maven", kwargs, result)
@@ -585,14 +589,18 @@ class GradleBackend:
         working_directory: str,
         timeout: Optional[int],
         params: Optional[Dict[str, Any]] = None,
+        requirements: Optional[Mapping[str, Any]] = None,
     ) -> ActualToolExecution:
         kwargs = (
             dict(params)
             if params is not None
             else self.materialize(verb, args, working_directory, timeout)
         )
+        call_kwargs = dict(kwargs)
+        if requirements is not None:
+            call_kwargs["_requirements"] = dict(requirements)
         try:
-            result = self.gradle_tool.execute(**kwargs)
+            result = self.gradle_tool.execute(**call_kwargs)
         except OutputPersistenceError as exc:
             raise exc.attach_invocation("gradle", kwargs)
         return ActualToolExecution("gradle", kwargs, result)

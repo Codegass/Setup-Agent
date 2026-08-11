@@ -308,7 +308,13 @@ def run_coverage(
         return {}
 
 
-def apply_coverage(orchestrator: Any, project_dir: str, build_system: Optional[str] = None) -> bool:
+def apply_coverage(
+    orchestrator: Any,
+    project_dir: str,
+    build_system: Optional[str] = None,
+    *,
+    baseline_metrics: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Run coverage and merge it into module_metrics.json in the container.
     Returns True when coverage was written, False otherwise (best-effort)."""
     try:
@@ -317,9 +323,23 @@ def apply_coverage(orchestrator: Any, project_dir: str, build_system: Optional[s
             MODULE_METRICS_PATH,
             exact_bytes=True,
         )
-        if metrics_raw is None or not metrics_raw.strip():
-            return False
-        metrics = json.loads(metrics_raw)
+        if metrics_raw is None:
+            # Setup coverage runs before ReportTool has emitted
+            # module_metrics.json.  The physical build gate already owns one
+            # cached module scan; use that exact object as the absent-file CAS
+            # baseline instead of scanning again or skipping JaCoCo entirely.
+            if (
+                not isinstance(baseline_metrics, dict)
+                or not isinstance(baseline_metrics.get("module_summary"), dict)
+                or not isinstance(baseline_metrics.get("modules"), list)
+                or not baseline_metrics["modules"]
+            ):
+                return False
+            metrics = json.loads(json.dumps(baseline_metrics))
+        else:
+            if not metrics_raw.strip():
+                return False
+            metrics = json.loads(metrics_raw)
         coverage = run_coverage(orchestrator, project_dir, build_system)
         if not coverage:
             return False

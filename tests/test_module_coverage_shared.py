@@ -626,3 +626,34 @@ def test_checklist_prefers_islands_with_full_roots_and_goals():
 def test_checklist_falls_back_to_modules_without_islands():
     line = coverage_checklist_line(module_coverage(_bigtop_validator(), "bigtop"), islands=[])
     assert "Module coverage:" in line
+
+
+def test_build_grain_rates_read_the_summary_and_the_class_census():
+    from sag.agent.module_coverage import build_grain_rates
+
+    coverage = {"summary": {"modules_total": 14, "modules_built": 12}}
+    grains = build_grain_rates(coverage, compiled_classes=3400, source_files=3412)
+
+    assert grains["modules"].payload() == {
+        "rate": 85.7,
+        "band": "most",
+        "numerator": 12,
+        "denominator": 14,
+    }
+    assert grains["classes"].band == "most"
+    assert grains["classes"].numerator == 3400
+
+
+def test_build_grain_rates_type_their_absences():
+    from sag.agent.module_coverage import build_grain_rates
+
+    grains = build_grain_rates(None, compiled_classes=None, source_files=None)
+
+    assert grains["modules"].payload() == {
+        "band": "unavailable",
+        "reason": "no module scan available",
+    }
+    assert grains["classes"].payload() == {
+        "band": "unavailable",
+        "reason": "class census unavailable",
+    }

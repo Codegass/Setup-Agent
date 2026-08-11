@@ -13,12 +13,12 @@ from typing import Any, Literal, cast
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
-from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import rescue_blocked_build, run_verdict
+from sag.verdict_rates import GrainRate, band_for, demote_heavy_red, derived_verdict_word
 
 from .evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
@@ -31,7 +31,8 @@ from .evidence_records import decode_named_json_record_stream, execute_named_jso
 from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
-VERDICT_SCHEMA_VERSION = 3
+LEGACY_VERDICT_SCHEMA_VERSION = 3
+VERDICT_SCHEMA_VERSION = 4
 _VERDICT_FILENAME = "verdict.json"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
@@ -174,6 +175,7 @@ class BuildEvidenceSnapshot(BaseModel):
     evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
     refs: tuple[str, ...] = ()
     compiled_classes: int | None = None
+    source_files: int | None = None
     # Plan 5 Task C2 (P0-F): per-domain build states, sealed WITH the build
     # evidence they describe — {"<root>": {"state": ..., "blocker": "<detail>"?}}.
     # None = no multi-domain decomposition was surveyed (single-domain
@@ -185,6 +187,8 @@ class BuildEvidenceSnapshot(BaseModel):
         """Absent facts serialize as absent keys, so recorded replay fixtures
         (and their exact-dict assertions) keep verifying unchanged."""
         data = handler(self)
+        if data.get("source_files") is None:
+            data.pop("source_files", None)
         if data.get("domain_states") is None:
             data.pop("domain_states", None)
         return data
@@ -243,8 +247,24 @@ class RunVerdictSnapshot(BaseModel):
     verdict: Literal["success", "partial", "failed", "unknown"]
     build_evidence: BuildEvidenceSnapshot = Field(default_factory=BuildEvidenceSnapshot)
     test_stats: SnapshotTestStats = Field(default_factory=SnapshotTestStats)
+    rates: dict[str, Any] = Field(default_factory=dict)
     conflicts: tuple[str, ...] = ()
     phase_records: tuple[PhaseRecordSnapshot, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _load_historical_rates_additively(cls, value: Any) -> Any:
+        """Historical v3 artifacts remain readable without becoming v4.
+
+        The writer stamps v4 through the field default.  A v3 reader merely
+        supplies the additive empty projection; it never rewrites history.
+        """
+        if not isinstance(value, dict):
+            return value
+        upgraded = dict(value)
+        if upgraded.get("schema_version") == LEGACY_VERDICT_SCHEMA_VERSION:
+            upgraded.setdefault("rates", {})
+        return upgraded
 
     def model_dump_json(self, **kwargs: Any) -> str:
         """The one canonical serializer used for both memory and persistence."""
@@ -489,6 +509,11 @@ def _fold_build_evidence(
         )
         if compiled is None:
             compiled = _nonnegative_int(state.fact_value("build.compiled_classes"))
+        source_files = _nonnegative_int(
+            evidence.get("source_files") if isinstance(evidence, dict) else None
+        )
+        if source_files is None:
+            source_files = _nonnegative_int(state.fact_value("build.source_files"))
         physical_refs = tuple(
             str(ref) for ref in (physical.get("evidence_refs") or ()) if str(ref).strip()
         )
@@ -518,6 +543,7 @@ def _fold_build_evidence(
                 evidence_status=evidence_status,
                 refs=_dedupe([*physical_refs, *observation_refs]),
                 compiled_classes=compiled,
+                source_files=source_files,
                 domain_states=domain_states,
             ),
             conflicts,
@@ -548,6 +574,7 @@ def _fold_build_evidence(
             evidence_status=latest.result.evidence_status,
             refs=observation_refs,
             compiled_classes=_nonnegative_int(state.fact_value("build.compiled_classes")),
+            source_files=_nonnegative_int(state.fact_value("build.source_files")),
             domain_states=domain_states,
         ),
         (),
@@ -628,6 +655,9 @@ def _fold_test_stats(
     *,
     test_pass_threshold: float,
 ) -> tuple[SnapshotTestStats, tuple[str, ...]]:
+    # Kept as a keyword-only compatibility seam for replay/unit callers.  The
+    # 80% policy no longer participates in verdict construction.
+    del test_pass_threshold
     validated_rollup = state.fact_value("test.stats")
     if isinstance(validated_rollup, dict):
         conflicts = _dedupe(validated_rollup.get("conflicts") or ())
@@ -662,16 +692,12 @@ def _fold_test_stats(
             or validated_raw.executed < validated_unique.executed
         ):
             return SnapshotTestStats(), _dedupe([*conflicts, "validated_test_stats_invalid"])
-        validated_judgment: Literal["success", "failed", "unknown"] = "unknown"
-        if validated_unique.executed > 0:
-            validated_judgment = cast(
-                Literal["success", "failed", "unknown"],
-                evaluate_run_verdict(
-                    True,
-                    round((validated_unique.passed / validated_unique.executed) * 100.0, 1),
-                    test_pass_threshold=test_pass_threshold,
-                ),
-            )
+        # Execution, not the project's pass percentage, is the physical fact
+        # this snapshot records.  Red remains visible in the counts and the
+        # heavy-red rate signal; it is not a failed SAG execution.
+        validated_judgment: Literal["success", "failed", "unknown"] = (
+            "success" if validated_unique.executed > 0 else "unknown"
+        )
         return (
             SnapshotTestStats(
                 discovered=_nonnegative_int(validated_rollup.get("discovered")),
@@ -761,16 +787,9 @@ def _fold_test_stats(
         skipped=sum(stats.skipped for stats, _, _ in snapshots),
     )
     conflicts = ("test_stats_basis_incomparable",) if len(frontier) > 1 else ()
-    judgment: Literal["success", "failed", "unknown"] = "unknown"
-    if unique.executed > 0:
-        judgment = cast(
-            Literal["success", "failed", "unknown"],
-            evaluate_run_verdict(
-                True,
-                round((unique.passed / unique.executed) * 100.0, 1),
-                test_pass_threshold=test_pass_threshold,
-            ),
-        )
+    judgment: Literal["success", "failed", "unknown"] = (
+        "success" if unique.executed > 0 else "unknown"
+    )
     return (
         SnapshotTestStats(
             discovered=unique.discovered,
@@ -787,6 +806,111 @@ def _fold_test_stats(
         ),
         conflicts,
     )
+
+
+def test_grain_rates(
+    stats: SnapshotTestStats,
+    driven_modules: set[str],
+    test_modules: set[str],
+) -> tuple[dict[str, GrainRate], tuple[str, ...]]:
+    """Return execution-based test case and surveyed-module grains."""
+
+    if stats.discovered:
+        cases = GrainRate(
+            numerator=stats.unique.executed,
+            denominator=stats.discovered,
+        )
+    else:
+        cases = GrainRate(
+            0,
+            None,
+            reason="static discovery found no count",
+        )
+    cases, conflicts = demote_heavy_red(
+        cases,
+        failed=stats.unique.failed,
+        errors=stats.unique.errors,
+        executed=stats.unique.executed,
+    )
+
+    if test_modules:
+        modules = GrainRate(
+            numerator=len(driven_modules & test_modules),
+            denominator=len(test_modules),
+        )
+    else:
+        modules = GrainRate(0, None, reason="no test modules surveyed")
+    return {"cases": cases, "modules": modules}, conflicts
+
+
+def _module_sets_from_rollup(state: RunEvidenceState) -> tuple[set[str], set[str]]:
+    rollup = state.fact_value("test.stats")
+    if not isinstance(rollup, Mapping):
+        return set(), set()
+
+    def values(name: str) -> set[str]:
+        raw = rollup.get(name)
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            return set()
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    return values("driven_modules"), values("test_modules")
+
+
+def _coverage_rate_payload(state: RunEvidenceState) -> dict[str, Any]:
+    summary = state.fact_value("coverage.summary")
+    if not isinstance(summary, Mapping):
+        return {"status": "unavailable", "reason": "coverage pass not run"}
+
+    status = str(summary.get("status") or "").strip().lower()
+    if status == "unavailable":
+        reason = str(summary.get("reason") or "coverage evidence unavailable").strip()
+        return {"status": "unavailable", "reason": reason}
+
+    raw_rate = summary.get("line_rate")
+    source = str(summary.get("source") or summary.get("coverage_source") or "").strip()
+    if (
+        status in ("", "collected")
+        and type(raw_rate) in (int, float)
+        and 0.0 <= float(raw_rate) <= 100.0
+        and source
+    ):
+        return {
+            "line_rate": round(float(raw_rate), 1),
+            "source": source,
+            "status": "collected",
+        }
+    return {"status": "unavailable", "reason": "coverage evidence invalid"}
+
+
+def _snapshot_rates(
+    state: RunEvidenceState,
+    build: BuildEvidenceSnapshot,
+    tests: SnapshotTestStats,
+    *,
+    validator=None,
+    project_name=None,
+) -> tuple[dict[str, Any], GrainRate, GrainRate, tuple[str, ...]]:
+    """Assemble the one serialized rates block from already-held evidence."""
+    from sag.agent.module_coverage import build_grain_rates, shared_module_scan
+
+    build_grains = build_grain_rates(
+        shared_module_scan(validator, project_name),
+        compiled_classes=build.compiled_classes,
+        source_files=build.source_files,
+    )
+    driven_modules, test_modules = _module_sets_from_rollup(state)
+    test_grains, rate_conflicts = test_grain_rates(
+        tests,
+        driven_modules=driven_modules,
+        test_modules=test_modules,
+    )
+    rates = {
+        "build": {name: grain.payload() for name, grain in build_grains.items()},
+        "test": {name: grain.payload() for name, grain in test_grains.items()},
+        "coverage": _coverage_rate_payload(state),
+    }
+    return rates, build_grains["modules"], test_grains["cases"], rate_conflicts
 
 
 def _snapshot_verdict(
@@ -899,19 +1023,104 @@ def read_verdict_snapshot(orchestrator) -> RunVerdictSnapshot:
         return _unknown_snapshot("snapshot_corrupt")
 
 
-def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapshot:
-    """Validate one decoded schema-v3 verdict payload without granting authority.
+def _validated_rate_grain(
+    payload: Any,
+    *,
+    label: str,
+    allow_heavy_red_demotion: bool = False,
+) -> GrainRate:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"verdict {label} rate must be an object")
+    band = payload.get("band")
+    if band == "unavailable":
+        if set(payload) != {"band", "reason"}:
+            raise ValueError(f"verdict unavailable {label} rate shape is invalid")
+        reason = payload.get("reason")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError(f"verdict unavailable {label} reason is invalid")
+        return GrainRate(0, None, reason=reason)
 
-    This pure schema boundary is shared by live and offline readers.  A caller
-    must still prove that the exact raw bytes are the current host-published
-    verdict; successful payload validation alone never makes a verdict live.
+    if set(payload) != {"rate", "band", "numerator", "denominator"}:
+        raise ValueError(f"verdict collected {label} rate shape is invalid")
+    numerator = payload.get("numerator")
+    denominator = payload.get("denominator")
+    rate = payload.get("rate")
+    if type(numerator) is not int or numerator < 0:
+        raise ValueError(f"verdict {label} numerator is invalid")
+    if type(denominator) is not int or denominator <= 0:
+        raise ValueError(f"verdict {label} denominator is invalid")
+    if type(rate) not in (int, float) or float(rate) < 0.0:
+        raise ValueError(f"verdict {label} percentage is invalid")
+    expected_rate = round(numerator / denominator * 100.0, 1)
+    if float(rate) != expected_rate:
+        raise ValueError(f"verdict {label} percentage does not reconcile")
+    expected_band = band_for(numerator, denominator)
+    if band != expected_band:
+        if not (allow_heavy_red_demotion and expected_band == "fully" and band == "most"):
+            raise ValueError(f"verdict {label} band does not reconcile")
+        return GrainRate(numerator, denominator, band_override="most")
+    return GrainRate(numerator, denominator)
+
+
+def _validated_rates_block(
+    payload: Any,
+    *,
+    conflicts: tuple[str, ...],
+) -> tuple[GrainRate, GrainRate]:
+    if not isinstance(payload, Mapping) or set(payload) != {"build", "test", "coverage"}:
+        raise ValueError("verdict rates block shape is invalid")
+    build = payload.get("build")
+    tests = payload.get("test")
+    if not isinstance(build, Mapping) or set(build) != {"modules", "classes"}:
+        raise ValueError("verdict build rates shape is invalid")
+    if not isinstance(tests, Mapping) or set(tests) != {"cases", "modules"}:
+        raise ValueError("verdict test rates shape is invalid")
+
+    build_modules = _validated_rate_grain(build["modules"], label="build modules")
+    _validated_rate_grain(build["classes"], label="build classes")
+    test_cases = _validated_rate_grain(
+        tests["cases"],
+        label="test cases",
+        allow_heavy_red_demotion="test_failures_heavy" in conflicts,
+    )
+    _validated_rate_grain(tests["modules"], label="test modules")
+
+    coverage = payload.get("coverage")
+    if not isinstance(coverage, Mapping):
+        raise ValueError("verdict coverage rate must be an object")
+    if coverage.get("status") == "unavailable":
+        if set(coverage) != {"status", "reason"}:
+            raise ValueError("verdict unavailable coverage shape is invalid")
+        reason = coverage.get("reason")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("verdict unavailable coverage reason is invalid")
+    elif coverage.get("status") == "collected":
+        if set(coverage) != {"status", "line_rate", "source"}:
+            raise ValueError("verdict collected coverage shape is invalid")
+        line_rate = coverage.get("line_rate")
+        source = coverage.get("source")
+        if type(line_rate) not in (int, float) or not 0.0 <= float(line_rate) <= 100.0:
+            raise ValueError("verdict coverage line rate is invalid")
+        if type(source) is not str or not source.strip():
+            raise ValueError("verdict coverage source is invalid")
+    else:
+        raise ValueError("verdict coverage status is invalid")
+    return build_modules, test_cases
+
+
+def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapshot:
+    """Validate one decoded v3/v4 verdict payload without granting authority.
+
+    The historical function name is retained for offline callers.  V3 is
+    display/forensic only; the live reader separately requires current v4.
     """
 
     if not isinstance(payload, Mapping):
         raise TypeError("verdict payload must be an object")
     if type(payload.get("schema_version")) is not int:
         raise ValueError("verdict schema version must be a strict integer")
-    if payload.get("schema_version") != VERDICT_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in (LEGACY_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION):
         raise ValueError("verdict schema version is not supported")
 
     raw_test_stats = payload.get("test_stats", {})
@@ -956,6 +1165,9 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     compiled_classes = raw_build.get("compiled_classes")
     if compiled_classes is not None:
         validate_raw_count(compiled_classes, label="compiled class")
+    source_files = raw_build.get("source_files")
+    if source_files is not None:
+        validate_raw_count(source_files, label="source file")
 
     snapshot = RunVerdictSnapshot.model_validate(payload)
     if type(snapshot.run_id) is not str or _RUN_ID_RE.fullmatch(snapshot.run_id) is None:
@@ -997,6 +1209,27 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
         or snapshot.build_evidence.compiled_classes < 0
     ):
         raise ValueError("verdict compiled class count is invalid")
+    if snapshot.build_evidence.source_files is not None and (
+        type(snapshot.build_evidence.source_files) is not int
+        or snapshot.build_evidence.source_files < 0
+    ):
+        raise ValueError("verdict source file count is invalid")
+    if schema_version == LEGACY_VERDICT_SCHEMA_VERSION:
+        if snapshot.rates:
+            raise ValueError("schema-v3 verdict cannot carry rates")
+        return snapshot
+
+    build_modules, test_cases = _validated_rates_block(
+        snapshot.rates,
+        conflicts=snapshot.conflicts,
+    )
+    expected_verdict = run_verdict(
+        None,
+        derived_verdict_word(build_modules, test_cases),
+        snapshot.conflicts,
+    )
+    if snapshot.verdict != expected_verdict:
+        raise ValueError("verdict word does not reconcile with the rate bands")
     return snapshot
 
 
@@ -1042,6 +1275,8 @@ def read_live_verdict_snapshot(orchestrator, *, authority=None) -> RunVerdictSna
         try:
             snapshot = validate_verdict_snapshot_v3(record.payload)
         except (TypeError, ValueError):
+            return _unknown_snapshot("snapshot_live_schema_invalid")
+        if snapshot.schema_version != VERDICT_SCHEMA_VERSION:
             return _unknown_snapshot("snapshot_live_schema_invalid")
         canonical = snapshot.model_dump_json().encode("utf-8")
         if record.raw != canonical:
@@ -1100,11 +1335,19 @@ class VerdictFinalizer:
             state,
             test_pass_threshold=self.test_pass_threshold,
         )
+        rates, build_modules_rate, test_cases_rate, rate_conflicts = _snapshot_rates(
+            state,
+            build,
+            tests,
+            validator=self.validator,
+            project_name=self.project_name,
+        )
         conflicts = _dedupe(
             [
                 *state.conflicts,
                 *build_conflicts,
                 *test_conflicts,
+                *rate_conflicts,
                 *_oracle_divergence_conflicts(state, build),
             ]
         )
@@ -1123,13 +1366,14 @@ class VerdictFinalizer:
             run_id=state.run_id,
             finalized_at=state.finalized_at or "unknown",
             input_refs=input_refs,
-            verdict=_snapshot_verdict(
-                build,
-                tests,
+            verdict=run_verdict(
+                None,
+                derived_verdict_word(build_modules_rate, test_cases_rate),
                 conflicts,
             ),
             build_evidence=build,
             test_stats=tests,
+            rates=rates,
             conflicts=conflicts,
             phase_records=tuple(_phase_record_snapshot(record) for record in state.phase_records),
         )
@@ -1169,7 +1413,9 @@ class VerdictFinalizer:
 
         snapshot = self._snapshot_for_state(state)
         try:
-            validate_verdict_snapshot_v3(snapshot.model_dump(mode="json"))
+            validated_snapshot = validate_verdict_snapshot_v3(snapshot.model_dump(mode="json"))
+            if validated_snapshot.schema_version != VERDICT_SCHEMA_VERSION:
+                raise ValueError("writer did not produce the current verdict schema")
         except (TypeError, ValueError) as exc:
             raise ValueError("sealed verdict snapshot violates the live schema") from exc
         if self.has_current_snapshot(state):

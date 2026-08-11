@@ -419,8 +419,8 @@ def test_construction_persistence_failure_ingests_bounded_draft_once(
             8,
             2,
             "success",
-            "success",
-            id="threshold-success",
+            "partial",
+            id="red-content-still-executed",
         ),
         pytest.param(
             OperationOutcome.PARTIAL,
@@ -436,9 +436,9 @@ def test_construction_persistence_failure_ingests_bounded_draft_once(
             True,
             7,
             3,
-            "failed",
-            "failed",
-            id="under-threshold",
+            "success",
+            "partial",
+            id="old-threshold-removed",
         ),
     ],
 )

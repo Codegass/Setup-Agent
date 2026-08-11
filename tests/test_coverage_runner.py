@@ -142,6 +142,7 @@ def test_apply_coverage_merges_into_container_metrics():
         "module_summary": {"modules_total": 1},
         "modules": [{"name": "core", "path": "core", "build_status": "success"}],
     }
+
     class Orch:
         def __init__(self):
             self.atomic = AtomicContainer()
@@ -173,6 +174,57 @@ def test_apply_coverage_merges_into_container_metrics():
     assert persisted["modules"][0]["line_rate"] == 80.0
     assert any(call.get("truncate_output") is False for call in orch.control_kwargs)
     assert max(map(len, orch.atomic.commands)) <= 60200
+
+
+def test_apply_coverage_can_publish_from_an_absent_metrics_file_using_the_cached_scan():
+    """A fresh setup has the gate's module scan but no report artifact yet.
+
+    Coverage runs before verdict close, so marker-verified absence must use the
+    already-held scan as the CAS predecessor rather than skipping JaCoCo.
+    """
+    baseline = {
+        "version": 1,
+        "generated_at": "coverage-prefinalize",
+        "module_summary": {"modules_total": 1, "modules_built": 1},
+        "modules": [{"name": ".", "path": ".", "build_status": "success"}],
+    }
+
+    class Orch:
+        def __init__(self):
+            self.atomic = AtomicContainer()
+            self.files = self.atomic.files
+
+        def execute_control_command(self, command, **kwargs):
+            if command.startswith("cat ") and "jacoco" in command:
+                return {"success": True, "exit_code": 0, "output": REPORT}
+            if "jacoco" in command and "xml" in command:
+                return {
+                    "success": True,
+                    "exit_code": 0,
+                    "output": "/w/p/target/site/jacoco/jacoco.xml",
+                }
+            result = self.atomic.execute_control_command(command, **kwargs)
+            if result.get("exit_code") == 0:
+                result = {**result, "success": True}
+            return result
+
+    orch = Orch()
+
+    assert MODULE_METRICS_PATH not in orch.files
+    assert (
+        apply_coverage(
+            orch,
+            "/w/p",
+            build_system="maven",
+            baseline_metrics=baseline,
+        )
+        is True
+    )
+
+    persisted = json.loads(orch.files[MODULE_METRICS_PATH])
+    assert persisted["module_summary"]["line_rate"] == 80.0
+    assert persisted["module_summary"]["coverage_source"] == "jacoco-existing"
+    assert persisted["modules"][0]["line_rate"] == 80.0
 
 
 def test_apply_coverage_preserves_large_metrics_without_truncation(monkeypatch):

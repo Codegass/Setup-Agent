@@ -135,6 +135,30 @@ def snapshot_factory():
         raw_executions=987,
         flaky_count=0,
     ):
+        build_modules = {
+            "success": {
+                "rate": 100.0,
+                "band": "fully",
+                "numerator": 1,
+                "denominator": 1,
+            },
+            "partial": {
+                "rate": 90.0,
+                "band": "most",
+                "numerator": 9,
+                "denominator": 10,
+            },
+            "failed": {
+                "rate": 0.0,
+                "band": "none",
+                "numerator": 0,
+                "denominator": 1,
+            },
+            "unknown": {
+                "band": "unavailable",
+                "reason": "fixture module scan unavailable",
+            },
+        }[verdict]
         return RunVerdictSnapshot(
             run_id="tvm-run",
             finalized_at="2026-07-17T12:00:00Z",
@@ -164,7 +188,32 @@ def snapshot_factory():
                 ),
                 flaky_count=flaky_count,
             ),
-            conflicts=("test_retry_evidence",),
+            rates={
+                "build": {
+                    "modules": build_modules,
+                    "classes": {
+                        "band": "unavailable",
+                        "reason": "fixture class census unavailable",
+                    },
+                },
+                "test": {
+                    "cases": {
+                        "rate": 100.0,
+                        "band": "fully",
+                        "numerator": unique_total,
+                        "denominator": unique_total,
+                    },
+                    "modules": {
+                        "band": "unavailable",
+                        "reason": "fixture test survey unavailable",
+                    },
+                },
+                "coverage": {
+                    "status": "unavailable",
+                    "reason": "coverage pass not run",
+                },
+            },
+            conflicts=() if verdict == "success" else ("test_retry_evidence",),
         )
 
     return factory
@@ -221,7 +270,11 @@ class RenderedSurfaces:
 
 
 def _verdict_from_text(text):
-    match = re.search(r"\b(SUCCESS|PARTIAL|FAILED|UNKNOWN)\b", text)
+    match = re.search(
+        r"Verdict \(derived\):(?:\*\*)?\s*(success|partial|failed|unknown)",
+        text,
+        re.IGNORECASE,
+    ) or re.search(r"\b(SUCCESS|PARTIAL|FAILED|UNKNOWN)\b", text)
     assert match, text
     return match.group(1).lower()
 
@@ -540,7 +593,7 @@ def test_report_delivery_failure_warns_without_changing_success_exit(snapshot_fa
     assert exit_code == 0
     assert "WARNING" in text
     assert "report delivery failed" in text.lower()
-    assert "SUCCESS" in text
+    assert "Verdict (derived): success" in text
 
 
 def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
@@ -554,6 +607,8 @@ def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
     detail = _session_detail(item, "sag-tvm", None)
 
     assert detail.canonical_verdict == tvm_snapshot.verdict
+    assert detail.rates == tvm_snapshot.rates
+    assert detail.model_dump(mode="json", by_alias=True)["rates"] == tvm_snapshot.rates
     assert detail.snapshot_status == "valid"
     assert detail.test.total == 328
     assert detail.test.raw_executions == 987

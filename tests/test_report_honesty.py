@@ -95,6 +95,9 @@ def _sealed_snapshot(
     phase_records=(),
     build_system="python",
     attention_raw=None,
+    rates=None,
+    failed=0,
+    errors=0,
 ):
     """A setup-mode snapshot shaped exactly like ``_build_report_snapshot``."""
     canonical = {
@@ -108,14 +111,26 @@ def _sealed_snapshot(
         },
         "conflicts": list(conflicts),
         "phase_records": [dict(record) for record in phase_records],
+        "rates": rates or {},
     }
     raw = attention_raw
     if raw is None:
         # The adapter's actual behaviour: every conflict lands as INFO.
         raw = [{"severity": "INFO", "icon": "INFO", "message": conflict} for conflict in conflicts]
+    status = {"verdict": verdict, "overall": verdict}
+    if rates is not None or failed or errors:
+        status.update(
+            {
+                "tests_total": 100,
+                "tests_passed": 100 - failed - errors,
+                "tests_failed": failed,
+                "tests_errors": errors,
+                "tests_skipped": 0,
+            }
+        )
     return {
         "mode": "setup",
-        "status": {"verdict": verdict, "overall": verdict},
+        "status": status,
         "project": {"type": "Python", "build_system": build_system},
         "phases": {"clone": True, "build": build_green, "test": None},
         "physical_evidence": {"build_system": build_system},
@@ -125,7 +140,63 @@ def _sealed_snapshot(
         "evidence_result": {"status": verdict, "conflicts": list(conflicts)},
         "attention": {"items": [], "raw": raw, "ignored_lines": 0},
         "canonical_snapshot": canonical,
+        **({"rates": rates} if rates is not None else {}),
     }
+
+
+def test_setup_report_leads_with_rate_lines_and_derives_the_word_once():
+    rates = {
+        "build": {
+            "modules": {
+                "rate": 100.0,
+                "band": "fully",
+                "numerator": 14,
+                "denominator": 14,
+            },
+            "classes": {
+                "rate": 99.6,
+                "band": "most",
+                "numerator": 3400,
+                "denominator": 3412,
+            },
+        },
+        "test": {
+            "cases": {
+                "rate": 100.0,
+                "band": "most",
+                "numerator": 100,
+                "denominator": 100,
+            },
+            "modules": {
+                "rate": 50.0,
+                "band": "half",
+                "numerator": 1,
+                "denominator": 2,
+            },
+        },
+        "coverage": {
+            "status": "collected",
+            "line_rate": 55.5,
+            "source": "jacoco-injected",
+        },
+    }
+    snapshot = _sealed_snapshot(
+        verdict="partial",
+        conflicts=("test_failures_heavy",),
+        rates=rates,
+        failed=60,
+        errors=20,
+    )
+
+    lines = _tool()._render_console_evidence_result(snapshot)
+
+    assert lines[:3] == [
+        "Build:    modules 14/14 (fully) · classes 3400/3412 (most)",
+        "Tests:    cases 100/100 (most) · modules 1/2 (half) — 60 failed, 20 errors (project-owned)",
+        "Coverage: 55.5% line (jacoco-injected)",
+    ]
+    assert lines[3] == "Verdict (derived): partial"
+    assert sum("partial" in line.lower() for line in lines) == 1
 
 
 def _render(tool, snapshot):

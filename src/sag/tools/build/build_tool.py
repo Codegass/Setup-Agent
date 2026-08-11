@@ -820,6 +820,16 @@ class BuildTool(BaseTool):
                     timeout,
                     maven_version_requirement=maven_version_requirement,
                     params=materialized,
+                    requirements=requirements,
+                )
+            if system == "gradle":
+                return backend.execute(
+                    effective_verb,
+                    args,
+                    working_directory,
+                    timeout,
+                    params=materialized,
+                    requirements=requirements,
                 )
             return backend.execute(
                 effective_verb,

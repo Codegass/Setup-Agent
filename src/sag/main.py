@@ -1,5 +1,6 @@
 """Main CLI interface for SAG (Setup-Agent)."""
 
+import builtins
 import json
 import re
 import subprocess
@@ -37,7 +38,10 @@ from sag.config import (
 )
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.runtime.container_io import read_container_text
+from sag.tools.module_metrics import MODULE_METRICS_PATH
 from sag.utils.git_utils import extract_project_name_from_url
+from sag.verdict_rates import render_rate_lines
 from sag.web.server import run_web_server
 
 console = Console()
@@ -66,11 +70,19 @@ def _render_setup_cli_result(
             conflicts=[*snapshot.conflicts],
         )
 
-    lines = [
-        f"Project: {project_name}",
-        f"Verdict: {snapshot.verdict.upper()}",
-        *format_evidence_layer_lines(metrics_v2),
-    ]
+    lines = render_rate_lines(snapshot.rates)
+    if snapshot.test_stats.failed or snapshot.test_stats.errors:
+        lines[1] += (
+            f" — {snapshot.test_stats.failed} failed, {snapshot.test_stats.errors} errors "
+            "(project-owned)"
+        )
+    lines.extend(
+        [
+            f"Verdict (derived): {snapshot.verdict}",
+            f"Project: {project_name}",
+            *format_evidence_layer_lines(metrics_v2),
+        ]
+    )
     lines.append(f"Report delivery: {termination.report_delivery_status.value}")
     if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
         lines.append("WARNING: setup report delivery failed; sealed verdict is unchanged")
@@ -288,8 +300,32 @@ def _detect_coverage_build_system(orchestrator, project_dir: str):
         return None
 
 
-def _run_coverage_pass(orchestrator, project_name: str) -> bool:
-    """Isolated, best-effort coverage pass AFTER the setup verdict is locked.
+def _coverage_baseline_metrics(validator, project_name: str) -> dict[str, Any] | None:
+    """Project the gate's cached module scan onto the metrics artifact shape."""
+
+    if validator is None:
+        return None
+    try:
+        scan = validator.module_scan(project_name)
+    except Exception as exc:
+        logger.debug(f"coverage baseline module scan unavailable: {exc}")
+        return None
+    if not isinstance(scan, Mapping):
+        return None
+    summary = scan.get("summary")
+    modules = scan.get("modules")
+    if not isinstance(summary, Mapping) or not isinstance(modules, builtins.list) or not modules:
+        return None
+    return {
+        "version": 1,
+        "generated_at": "coverage-prefinalize",
+        "module_summary": dict(summary),
+        "modules": [dict(module) for module in modules if isinstance(module, Mapping)],
+    }
+
+
+def _run_coverage_pass(orchestrator, project_name: str, *, validator=None) -> bool:
+    """Run one isolated, best-effort coverage pass.
 
     Never raises; never changes the setup result. The entire body is guarded so
     that even an unexpected error here cannot reach the command's outer handler
@@ -301,7 +337,16 @@ def _run_coverage_pass(orchestrator, project_name: str) -> bool:
         if build_system is None:
             logger.info("Coverage: no maven/gradle build detected; skipping.")
             return False
-        wrote = apply_coverage(orchestrator, project_dir, build_system)
+        baseline = _coverage_baseline_metrics(validator, project_name)
+        if baseline is None:
+            wrote = apply_coverage(orchestrator, project_dir, build_system)
+        else:
+            wrote = apply_coverage(
+                orchestrator,
+                project_dir,
+                build_system,
+                baseline_metrics=baseline,
+            )
         # Pollution guard (warn-only): tracked source files must be unchanged.
         dirty = _execute_control(
             orchestrator,
@@ -314,6 +359,45 @@ def _run_coverage_pass(orchestrator, project_name: str) -> bool:
     except Exception as exc:  # never propagate into the command's success/exit path
         logger.warning(f"Coverage pass failed (best-effort, ignored): {exc}")
         return False
+
+
+def _run_coverage_evidence_pass(
+    orchestrator,
+    project_name: str,
+    *,
+    validator=None,
+) -> dict[str, Any]:
+    """Return the persisted coverage rollup without recomputing its math."""
+
+    if not _run_coverage_pass(orchestrator, project_name, validator=validator):
+        return {
+            "status": "unavailable",
+            "reason": "coverage pass produced no persisted reports",
+        }
+    try:
+        raw = read_container_text(orchestrator, MODULE_METRICS_PATH, exact_bytes=True)
+        payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else None
+        summary = payload.get("module_summary") if isinstance(payload, dict) else None
+        line_rate = summary.get("line_rate") if isinstance(summary, dict) else None
+        source = summary.get("coverage_source") if isinstance(summary, dict) else None
+        if (
+            type(line_rate) not in (int, float)
+            or not 0.0 <= float(line_rate) <= 100.0
+            or not isinstance(source, str)
+            or not source.strip()
+        ):
+            raise ValueError("persisted module coverage summary is incomplete")
+        return {
+            "status": "collected",
+            "line_rate": round(float(line_rate), 1),
+            "source": source.strip(),
+        }
+    except Exception as exc:
+        logger.warning(f"Coverage summary unavailable after pass: {exc}")
+        return {
+            "status": "unavailable",
+            "reason": "persisted coverage summary unavailable",
+        }
 
 
 @click.group()
@@ -438,7 +522,7 @@ def list():
 @click.option(
     "--coverage",
     is_flag=True,
-    help="Run an isolated JaCoCo coverage pass after setup (best-effort)",
+    help="Run an isolated JaCoCo coverage pass before verdict close (best-effort)",
 )
 @click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.option(
@@ -521,6 +605,21 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
             goal=goal,
             docker_label=docker_label,
             project_ref=project_ref,
+            pre_finalize_evidence_callback=(
+                (
+                    lambda: _run_coverage_evidence_pass(
+                        orchestrator,
+                        project_name,
+                        validator=getattr(
+                            getattr(agent, "react_engine", None),
+                            "physical_validator",
+                            None,
+                        ),
+                    )
+                )
+                if coverage
+                else None
+            ),
         )
         snapshot = read_live_verdict_snapshot(orchestrator)
         cli_result, exit_code = _render_setup_cli_result(
@@ -534,9 +633,6 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
         if record:
             _save_setup_artifacts(orchestrator, project_name)
 
-        if coverage:
-            _run_coverage_pass(orchestrator, project_name)
-
         # Only show completion messages in non-UI mode (UI manager handles this)
         if not config.ui_mode:
             console.print(cli_result)
@@ -549,9 +645,7 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
                 console.print(f'  uv run sag run {docker_name} --task "add tests"')
                 console.print(f"  uv run sag shell {docker_name}")
             else:
-                console.print(
-                    f"[bold red]❌ Project setup verdict: {snapshot.verdict.upper()}[/bold red]"
-                )
+                console.print("[bold yellow]⚠️ Project setup needs attention.[/bold yellow]")
                 console.print(f"[dim]Check logs for details. You can retry with:[/dim]")
                 console.print(f'  sag run {docker_name} --task "continue setup"')
 

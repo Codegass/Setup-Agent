@@ -942,6 +942,36 @@ def _carries_unresolved_property(value: str) -> bool:
     return "${" in str(value or "")
 
 
+def _driven_test_modules_from_receipts(
+    receipts: List[Mapping[str, Any]],
+    *,
+    test_modules: set[str],
+) -> set[str]:
+    """Survey roots with at least one complete module-qualified runtime row.
+
+    ``domain_id`` is the exact surveyed root sealed on every row;
+    ``module_coordinate`` proves the row was not merely attributed to a broad
+    report directory.  An unavailable envelope contributes nothing.
+    """
+
+    driven: set[str] = set()
+    for receipt in receipts:
+        envelope = receipt.get("testcase_execution_rows")
+        if not isinstance(envelope, Mapping) or envelope.get("status") != "complete":
+            continue
+        rows = envelope.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            domain_id = str(row.get("domain_id") or "").strip()
+            coordinate = str(row.get("module_coordinate") or "").strip()
+            if domain_id in test_modules and coordinate:
+                driven.add(domain_id)
+    return driven
+
+
 def evaluate_run_verdict(
     build_green: bool,
     pass_rate: float,
@@ -1620,6 +1650,12 @@ class PhysicalValidator:
             )
         receipts_present = bool(receipt_records)
         primary_root = self._primary_test_coordinate_root() if receipts_present else None
+        resolution = getattr(self, "_last_test_candidate_resolution", None)
+        test_modules = {
+            str(candidate.root)
+            for candidate in getattr(resolution, "candidates", ())
+            if str(getattr(candidate, "root", "")).strip()
+        }
         coordinate_unresolved = receipts_present and not primary_root
 
         try:
@@ -1650,6 +1686,14 @@ class PhysicalValidator:
                 )
             if compact_result and compact_result.get("valid"):
                 test_result.update(compact_result)
+                if test_modules:
+                    test_result["test_modules"] = sorted(test_modules)
+                    test_result["driven_modules"] = sorted(
+                        _driven_test_modules_from_receipts(
+                            receipt_records,
+                            test_modules=test_modules,
+                        )
+                    )
                 test_result.setdefault("report_files", [])
                 test_result.setdefault("report_dirs", [])
                 test_result.setdefault(
@@ -2335,7 +2379,9 @@ class PhysicalValidator:
             from sag.agent import attempt_policy
 
             resolution = attempt_policy.resolve_survey_test_candidates(self.docker_orchestrator)
+            self._last_test_candidate_resolution = resolution
         except Exception as exc:
+            self._last_test_candidate_resolution = None
             logger.debug(f"Primary test coordinate unresolved: {exc}")
             return None
         primary = getattr(resolution, "primary", None)
@@ -3284,6 +3330,15 @@ class PhysicalValidator:
         coverage_info = (
             self._verify_expected_artifacts(project_dir, scoped_artifacts)
             if scoped_artifacts
+            else None
+        )
+        # Rate-banded verdict v4 reuses this existing source-weighted census
+        # beside the physical class count.  No second source-tree scan is
+        # permitted at evidence close.
+        evidence["source_files"] = (
+            int(coverage_info.get("classes_expected") or 0)
+            if isinstance(coverage_info, dict)
+            and int(coverage_info.get("classes_expected") or 0) > 0
             else None
         )
         threshold = self.build_coverage_threshold
@@ -5308,7 +5363,10 @@ class PhysicalValidator:
             test_metrics.get("discovered")
             or test_metrics.get("discovered_tests")
             or test_metrics.get("static_test_count")
+            or test_metrics.get("catalog_test_count")
         )
+        if type(discovered) is int and discovered <= 0:
+            discovered = None
         has_test_count_evidence = test_metrics.get("valid", False) or any(
             key in test_metrics and test_metrics.get(key) is not None
             for key in (
@@ -5333,6 +5391,16 @@ class PhysicalValidator:
                 "flaky_count": test_metrics.get("flaky_count", 0),
                 "pass_rate": round(pass_rate, 1),
                 "collection_errors": collection_errors,
+                **(
+                    {"driven_modules": list(test_metrics["driven_modules"])}
+                    if isinstance(test_metrics.get("driven_modules"), list)
+                    else {}
+                ),
+                **(
+                    {"test_modules": list(test_metrics["test_modules"])}
+                    if isinstance(test_metrics.get("test_modules"), list)
+                    else {}
+                ),
             }
         report_files = test_metrics.get("report_files", [])
         conflicts = []

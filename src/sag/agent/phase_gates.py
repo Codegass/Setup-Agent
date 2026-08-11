@@ -1255,6 +1255,16 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
         "raw": raw,
         "flaky_count": _first_nonnegative_int(status.get("flaky_count"), 0) or 0,
         "conflicts": list(dict.fromkeys(str(item) for item in conflicts if item)),
+        **(
+            {"driven_modules": list(test_stats["driven_modules"])}
+            if isinstance(test_stats.get("driven_modules"), list)
+            else {}
+        ),
+        **(
+            {"test_modules": list(test_stats["test_modules"])}
+            if isinstance(test_stats.get("test_modules"), list)
+            else {}
+        ),
         # Plan 4 audit fix: collection facts must survive into the sealed
         # snapshot — dropping them here recreated the projection failure the
         # 2026-07-26 audit diagnosed. Absent facts stay absent keys so
@@ -2006,6 +2016,22 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             reason = "test evidence ledger integrity is unavailable: " + ", ".join(
                 derived.conflicts
             )
+        receipt_scoped = rollup.get("receipt_scoped") is True
+        if executed > 0 and not receipt_scoped and not evidence_integrity_failure:
+            evidence_integrity_failure = True
+            state = ValidatorState.UNAVAILABLE
+            code = "test_receipt_missing"
+            reason = (
+                "test execution counts are not bound to a terminal invocation receipt; "
+                "receipt-free reports cannot close the test phase"
+            )
+        elif executed > 0 and receipt_scoped and not evidence_integrity_failure:
+            # Rate-banded verdict §4/§5: the phase grades execution. Project
+            # failures and errors remain exact sealed facts, but they never
+            # reject a terminal close; only evidence-integrity failures do.
+            state = ValidatorState.GREEN
+            code = "test_execution_observed"
+            suggestions = ()
     else:
         evidence_integrity_failure = False
     return _ValidatorObservation(

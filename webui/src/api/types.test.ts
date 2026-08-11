@@ -10,6 +10,11 @@ const verdictContract = {
     source: "snapshot",
   },
   canonicalVerdict: "unknown",
+  rates: {
+    build: {
+      modules: { numerator: 2, denominator: 2, rate: 100, band: "fully" },
+    },
+  },
   snapshotStatus: "corrupt",
   legacy: false,
   reportDeliveryStatus: "failed",
@@ -17,6 +22,7 @@ const verdictContract = {
   ExecutionSessionDetail,
   | "verdict"
   | "canonicalVerdict"
+  | "rates"
   | "snapshotStatus"
   | "legacy"
   | "reportDeliveryStatus"
@@ -34,6 +40,7 @@ const testContract = {
 describe("sealed verdict API types", () => {
   it("models canonical authority and legacy labeling fields", () => {
     expect(verdictContract.verdict.source).toBe("snapshot")
+    expect(verdictContract.rates.build.modules.band).toBe("fully")
     expect(verdictContract.snapshotStatus).toBe("corrupt")
     expect(verdictContract.legacy).toBe(false)
   })

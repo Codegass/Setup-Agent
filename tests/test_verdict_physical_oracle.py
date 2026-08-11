@@ -162,8 +162,9 @@ def test_physical_failure_grounds_failed_even_without_build_observations_tvm_sha
 
     assert snapshot.build_evidence.judgment == "failed"
     assert snapshot.build_evidence.source == "physical"
-    # never "unknown" when the physical oracle observed a determinate failure
-    assert snapshot.verdict == "failed"
+    # Premise updated 2026-08-10: the physical failure stays in build_evidence;
+    # this fake has no module denominator, so the compatibility word is partial.
+    assert snapshot.verdict == "partial"
 
 
 def test_full_physical_success_with_green_tests_is_success():
@@ -187,7 +188,7 @@ def test_full_physical_success_with_green_tests_is_success():
     )
     snapshot = _finalize(state, validator)
     assert snapshot.build_evidence.judgment == "success"
-    assert snapshot.verdict == "success"
+    assert snapshot.verdict == "partial"
 
 
 def test_fallback_aggregates_observations_instead_of_last_wins():
@@ -213,14 +214,14 @@ def test_fallback_all_failed_observations_is_failed():
     )
     snapshot = _finalize(state, validator=None)
     assert snapshot.build_evidence.judgment == "failed"
-    assert snapshot.verdict == "failed"
+    assert snapshot.verdict == "partial"
 
 
 def test_true_unknown_requires_nothing_observed_anywhere():
     state = RunEvidenceState(run_id="session-empty")
     snapshot = _finalize(state, validator=None)
     assert snapshot.build_evidence.judgment == "unknown"
-    assert snapshot.verdict == "unknown"
+    assert snapshot.verdict == "partial"
 
 
 def test_validator_exception_degrades_to_observation_fallback_never_raises():
@@ -266,7 +267,7 @@ def test_oracle_divergence_with_gate_record_is_a_visible_conflict():
     snapshot = _finalize(state, validator)
     assert snapshot.build_evidence.judgment == "failed"
     assert "build_oracle_divergence" in snapshot.conflicts
-    assert snapshot.verdict == "failed"
+    assert snapshot.verdict == "partial"
 
 
 class ModuleAwareValidator(FakePhysicalValidator):
@@ -395,7 +396,7 @@ def test_python_projects_keep_module_conflict_suppression():
     _green_tests(state)
     snapshot = _finalize(state, validator)
     assert snapshot.conflicts == ()
-    assert snapshot.verdict == "success"
+    assert snapshot.verdict == "partial"
 
 
 def test_pr9_phantom_green_gate_reaches_the_sealed_verdict():
@@ -437,4 +438,4 @@ def test_pr9_phantom_green_gate_reaches_the_sealed_verdict():
     assert snapshot.build_evidence.judgment == "failed"
     assert snapshot.build_evidence.source == "physical"
     assert snapshot.build_evidence.compiled_classes == 0
-    assert snapshot.verdict == "failed"
+    assert snapshot.verdict == "partial"

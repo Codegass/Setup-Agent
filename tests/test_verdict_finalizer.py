@@ -21,6 +21,9 @@ from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.verdict_finalizer import (
     EvidenceCloseReason,
     PhaseRecordSnapshot,
+    RunVerdictSnapshot,
+    SnapshotTestCounts,
+    SnapshotTestStats,
     VerdictFinalizer as _VerdictFinalizer,
     read_verdict_snapshot,
 )
@@ -106,6 +109,214 @@ class VerdictFinalizer(_VerdictFinalizer):
         return super().finalize(state, reason)
 
 
+class _RateValidator:
+    def validate_build_status(self, _project_name):
+        return {
+            "success": True,
+            "build_complete": True,
+            "evidence_status": "verified",
+            "evidence": {
+                "class_count": 3400,
+                "source_files": 3412,
+            },
+            "evidence_refs": ["artifact://physical-build"],
+        }
+
+    def module_scan(self, _project_name):
+        return {
+            "summary": {
+                "modules_built": 14,
+                "modules_total": 14,
+            },
+            "modules": [],
+            "project_dir": "/workspace/project",
+        }
+
+
+def _set_rate_test_rollup(state, *, passed, failed, errors, driven_modules):
+    state.set_fact(
+        "test.stats",
+        {
+            "discovered": 100,
+            "unique": {
+                "executed": 100,
+                "passed": passed,
+                "failed": failed,
+                "errors": errors,
+                "skipped": 0,
+            },
+            "raw": {
+                "executed": 100,
+                "passed": passed,
+                "failed": failed,
+                "errors": errors,
+                "skipped": 0,
+            },
+            "flaky_count": 0,
+            "driven_modules": driven_modules,
+            "test_modules": ["core", "io"],
+        },
+        evidence_ref="receipt://test-rollup",
+        source_phase="test",
+    )
+
+
+def test_v4_finalize_round_trip_carries_the_complete_rates_block():
+    state = RunEvidenceState(run_id="session-rate-v4")
+    _set_rate_test_rollup(
+        state,
+        passed=90,
+        failed=10,
+        errors=0,
+        driven_modules=["core"],
+    )
+    state.set_fact(
+        "coverage.summary",
+        {
+            "status": "collected",
+            "line_rate": 55.5,
+            "source": "jacoco-injected",
+        },
+        evidence_ref="coverage://module-metrics",
+    )
+
+    orchestrator = FakeVerdictOrchestrator()
+    snapshot = VerdictFinalizer(
+        orchestrator,
+        validator=_RateValidator(),
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    assert snapshot.schema_version == 4
+    assert snapshot.rates == {
+        "build": {
+            "modules": {
+                "rate": 100.0,
+                "band": "fully",
+                "numerator": 14,
+                "denominator": 14,
+            },
+            "classes": {
+                "rate": 99.6,
+                "band": "most",
+                "numerator": 3400,
+                "denominator": 3412,
+            },
+        },
+        "test": {
+            "cases": {
+                "rate": 100.0,
+                "band": "fully",
+                "numerator": 100,
+                "denominator": 100,
+            },
+            "modules": {
+                "rate": 50.0,
+                "band": "half",
+                "numerator": 1,
+                "denominator": 2,
+            },
+        },
+        "coverage": {
+            "line_rate": 55.5,
+            "source": "jacoco-injected",
+            "status": "collected",
+        },
+    }
+    assert read_verdict_snapshot(orchestrator) == snapshot
+
+
+def test_heavy_red_v4_is_partial_from_bands_not_failed_by_pass_rate():
+    """The old 80% pass line is gone: execution is full, then heavy red
+    demotes exactly the cases grain to most and records the weak conflict."""
+    state = RunEvidenceState(run_id="session-heavy-red-v4")
+    _set_rate_test_rollup(
+        state,
+        passed=20,
+        failed=60,
+        errors=20,
+        driven_modules=["core", "io"],
+    )
+
+    snapshot = VerdictFinalizer(
+        FakeVerdictOrchestrator(),
+        validator=_RateValidator(),
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    assert "test_failures_heavy" in snapshot.conflicts
+    assert snapshot.rates["test"]["cases"]["band"] == "most"
+    assert snapshot.verdict == "partial"
+
+
+def test_v3_fixture_payload_loads_with_an_empty_rates_block():
+    payload = {
+        "schema_version": 3,
+        "run_id": "historical-v3",
+        "finalized_at": "2026-08-10T00:00:00Z",
+        "verdict": "partial",
+    }
+
+    snapshot = RunVerdictSnapshot.model_validate(payload)
+
+    assert snapshot.schema_version == 3
+    assert snapshot.rates == {}
+
+
+def test_test_grain_rates_cases_and_modules_with_weak_signal():
+    from sag.agent.verdict_finalizer import test_grain_rates
+
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(
+            executed=100,
+            passed=20,
+            failed=60,
+            errors=20,
+            skipped=0,
+        ),
+        raw=SnapshotTestCounts(
+            executed=100,
+            passed=20,
+            failed=60,
+            errors=20,
+            skipped=0,
+        ),
+    )
+
+    grains, conflicts = test_grain_rates(
+        stats,
+        driven_modules={"/w/p/core"},
+        test_modules={"/w/p/core", "/w/p/io"},
+    )
+
+    assert grains["cases"].band == "most"
+    assert grains["cases"].rate == 100.0
+    assert conflicts == ("test_failures_heavy",)
+    assert grains["modules"].payload()["numerator"] == 1
+    assert grains["modules"].band == "half"
+
+
+def test_test_grain_rates_type_their_absences():
+    from sag.agent.verdict_finalizer import test_grain_rates
+
+    stats = SnapshotTestStats(
+        discovered=None,
+        unique=SnapshotTestCounts(),
+        raw=SnapshotTestCounts(),
+    )
+
+    grains, conflicts = test_grain_rates(
+        stats,
+        driven_modules=set(),
+        test_modules=set(),
+    )
+
+    assert grains["cases"].payload()["reason"] == "static discovery found no count"
+    assert grains["modules"].payload()["reason"] == "no test modules surveyed"
+    assert conflicts == ()
+
+
 def _record_machine_history(state: RunEvidenceState, machine: PhaseMachine) -> None:
     for record in machine.records:
         state.record_phase_record(record)
@@ -162,7 +373,7 @@ def test_finalization_is_byte_identical_and_uses_compare_publish_cas():
     second = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
     assert first.model_dump_json() == second.model_dump_json()
-    assert first.schema_version == 3
+    assert first.schema_version == 4
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
     assert not any(
@@ -399,7 +610,8 @@ def test_narrow_passing_retry_cannot_replace_failed_full_suite_basis():
     assert snapshot.test_stats.executed == 100
     assert snapshot.test_stats.passed == 0
     assert snapshot.test_stats.failed == 100
-    assert snapshot.verdict == "failed"
+    # Premise updated 2026-08-10: red tests grade execution, not pass rate.
+    assert snapshot.verdict == "partial"
     assert snapshot.test_stats.raw.executed == 101
 
 
@@ -450,7 +662,8 @@ def test_executed_count_preserves_broader_suite_when_it_exceeds_discovered():
     assert snapshot.test_stats.discovered == 80
     assert snapshot.test_stats.executed == 100
     assert snapshot.test_stats.failed == 100
-    assert snapshot.verdict == "failed"
+    # Premise updated 2026-08-10: red tests grade execution, not pass rate.
+    assert snapshot.verdict == "partial"
 
 
 def test_pareto_incomparable_retry_keeps_broader_failed_execution_basis():
@@ -501,7 +714,8 @@ def test_pareto_incomparable_retry_keeps_broader_failed_execution_basis():
     assert snapshot.test_stats.executed == 100
     assert snapshot.test_stats.failed == 100
     assert "test_stats_basis_incomparable" in snapshot.conflicts
-    assert snapshot.verdict == "failed"
+    # Red is execution evidence; the incomparable basis remains an integrity cap.
+    assert snapshot.verdict == "partial"
 
 
 def test_dominant_complete_basis_supersedes_missing_discovered_without_conflict():
@@ -552,7 +766,8 @@ def test_dominant_complete_basis_supersedes_missing_discovered_without_conflict(
     assert snapshot.test_stats.executed == 100
     assert snapshot.test_stats.passed == 100
     assert "test_stats_basis_incomparable" not in snapshot.conflicts
-    assert snapshot.verdict == "success"
+    # No module scan was supplied, so build.modules is unavailable, not fully.
+    assert snapshot.verdict == "partial"
 
 
 def test_equal_complete_basis_uses_latest_typed_status():
@@ -604,7 +819,8 @@ def test_equal_complete_basis_uses_latest_typed_status():
     assert snapshot.test_stats.passed == 100
     assert snapshot.test_stats.failed == 0
     assert snapshot.conflicts == ()
-    assert snapshot.verdict == "success"
+    # No module scan was supplied, so build.modules is unavailable, not fully.
+    assert snapshot.verdict == "partial"
 
 
 def test_untyped_test_count_facts_do_not_manufacture_primary_stats():
@@ -688,7 +904,8 @@ def test_validator_rollup_facts_are_the_canonical_snapshot_basis():
     assert snapshot.test_stats.raw.executed == 5000
     assert snapshot.test_stats.flaky_count == 3
     assert snapshot.conflicts == ("test_errors_detected",)
-    assert snapshot.verdict == "success"
+    # No module scan was supplied, so build.modules is unavailable, not fully.
+    assert snapshot.verdict == "partial"
 
 
 def test_snapshot_separates_maven_failures_from_errors():

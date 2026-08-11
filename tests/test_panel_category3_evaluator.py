@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 
 import pytest
+from verdict_rate_fakes import complete_verdict_rates
 
 from build_requirements_fakes import complete_python_build_requirements_v1
 from container_evidence_fakes import canonical_json, complete_run_pin
@@ -792,6 +793,7 @@ def _write_session(tmp_path, *, verdict, build_evidence, unique, events, manifes
         verdict=verdict,
         build_evidence=build_evidence,
         test_stats={"unique": unique_counts, "raw": unique_counts},
+        rates=complete_verdict_rates(verdict),
     )
     verdict_raw = snapshot.model_dump_json().encode("utf-8")
     (setup / "verdict.json").write_bytes(verdict_raw)

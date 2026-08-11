@@ -6,7 +6,7 @@ import re
 import shlex
 import time
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -443,6 +443,7 @@ class ReActEngine(UIEventEmitter):
         target_repo_sha_callback=None,
         orchestrator=None,
         llm_client: Any | None = None,
+        pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -451,6 +452,8 @@ class ReActEngine(UIEventEmitter):
         self.control_event_sink = control_event_sink
         self.orchestrator = orchestrator or getattr(context_manager, "orchestrator", None)
         self._target_repo_sha_callback = target_repo_sha_callback
+        self.pre_finalize_evidence_callback = pre_finalize_evidence_callback
+        self._pre_finalize_evidence_attempted = False
         self._active_control_envelope_id: str | None = None
 
         # Engine-owned phase machine for setup runs (spec §3.1). None keeps the
@@ -1952,6 +1955,31 @@ class ReActEngine(UIEventEmitter):
             self._await_open_obligations(reason)
             self._sweep_job_obligations()
             self._record_unsettled_job_conflicts(reason)
+            callback = getattr(self, "pre_finalize_evidence_callback", None)
+            if (
+                reason is EvidenceCloseReason.TEST_TERMINATED
+                and callback is not None
+                and not getattr(self, "_pre_finalize_evidence_attempted", False)
+            ):
+                self._pre_finalize_evidence_attempted = True
+                try:
+                    summary = callback()
+                except Exception as exc:
+                    logger.warning(f"Pre-finalize coverage callback failed: {exc}")
+                    summary = {
+                        "status": "unavailable",
+                        "reason": "coverage pass failed before verdict close",
+                    }
+                if not isinstance(summary, Mapping):
+                    summary = {
+                        "status": "unavailable",
+                        "reason": "coverage pass returned no summary",
+                    }
+                state.set_fact(
+                    "coverage.summary",
+                    dict(summary),
+                    evidence_ref="coverage://module-metrics",
+                )
         snapshot = finalizer.finalize(state, reason)
         if not was_sealed:
             self._emit_control_event("evidence_close", {"reason": reason.value})
@@ -4762,6 +4790,15 @@ class ReActEngine(UIEventEmitter):
             self._add_system_guidance(guidance, priority=9)
         self._emit_completion_claim_decision(event, decision)
         if event.judge_disposition == GateControlDisposition.HARNESS_RECOVERY_REQUIRED.value:
+            if event.blocker_id == "TEST_ATTEMPT_REQUIRED":
+                # This disposition is the test-floor handoff, not a broken
+                # control transport.  `_execute_tool_step` consumes the
+                # rejected result immediately below and runs the exact
+                # controller-owned build(action='test') attempt.  Treating it
+                # as fatal here aborts one branch too early and makes that
+                # promised recovery unreachable (live lp-dbcp-rates,
+                # 2026-08-10).
+                return False
             self._mark_harness_control_failure(event.blocker_id, event)
             return True
         if decision.decision == "agent_no_progress":

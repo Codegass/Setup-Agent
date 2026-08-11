@@ -270,6 +270,7 @@ export interface ExecutionSessionDetail {
   stepBudget?: number | null
   evidenceStatus?: string | null
   canonicalVerdict?: CanonicalVerdict
+  rates?: Record<string, unknown> | null
   snapshotStatus?: SnapshotStatus
   legacy?: boolean
   reportDeliveryStatus?: ReportDeliveryStatus | null

@@ -21,6 +21,7 @@ from typing import Any, Mapping, Sequence
 from loguru import logger
 
 from sag.runtime.container_io import command_did_not_run
+from sag.verdict_rates import GrainRate
 
 # Denominator authority, in order (Plan 8 spec §3.5). p7d polaris graded a
 # build against a denominator NOTHING derived — the survey could not read
@@ -70,9 +71,7 @@ class ModuleBasis:
             # module set (§3.6); otherwise the receipts collectively, which is
             # still the receipt rung and says so.
             stated_by = (
-                f"receipt {self.provenance}"
-                if self.provenance
-                else "the receipts' module outcomes"
+                f"receipt {self.provenance}" if self.provenance else "the receipts' module outcomes"
             )
             return f"denominator: {stated_by} ({self.total} module(s) attempted)"
         if self.authority == BASIS_SCAN:
@@ -287,14 +286,12 @@ def _island_checklist_line(
     when any scanned module under its root has build output."""
     project_dir = str(coverage.get("project_dir") or "").rstrip("/")
     modules = coverage.get("modules") or []
-    built_paths = [
-        str(m.get("path") or "") for m in modules if m.get("build_status") == "success"
-    ]
+    built_paths = [str(m.get("path") or "") for m in modules if m.get("build_status") == "success"]
 
     def _island_rel(root: str) -> str:
         root = root.rstrip("/")
         if project_dir and root.startswith(project_dir):
-            return root[len(project_dir):].strip("/") or "."
+            return root[len(project_dir) :].strip("/") or "."
         return root
 
     built_islands: list[dict[str, Any]] = []
@@ -304,9 +301,7 @@ def _island_checklist_line(
         if not root:
             continue
         rel = _island_rel(root)
-        covered = any(
-            path == rel or path.startswith(f"{rel}/") for path in built_paths if path
-        )
+        covered = any(path == rel or path.startswith(f"{rel}/") for path in built_paths if path)
         (built_islands if covered else remaining).append(island)
 
     total = len(built_islands) + len(remaining)
@@ -324,6 +319,33 @@ def _island_checklist_line(
         )
         line += f" · remaining: {items}"
     return line
+
+
+def build_grain_rates(
+    coverage: dict[str, Any] | None,
+    *,
+    compiled_classes: int | None,
+    source_files: int | None,
+) -> dict[str, GrainRate]:
+    """Return the two build grains without performing another scan.
+
+    Module scope comes from the summary already produced by
+    :func:`module_coverage`; class substance comes from the physical
+    validator's existing class/source census threaded in by the finalizer.
+    """
+
+    summary = (coverage or {}).get("summary") or {}
+    total = int(summary.get("modules_total") or 0)
+    if total > 0:
+        modules = GrainRate(numerator=int(summary.get("modules_built") or 0), denominator=total)
+    else:
+        modules = GrainRate(0, None, reason="no module scan available")
+
+    if compiled_classes is not None and source_files:
+        classes = GrainRate(numerator=int(compiled_classes), denominator=int(source_files))
+    else:
+        classes = GrainRate(0, None, reason="class census unavailable")
+    return {"modules": modules, "classes": classes}
 
 
 def coverage_conflicts(coverage: dict[str, Any] | None) -> tuple[str, ...]:

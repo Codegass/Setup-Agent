@@ -424,6 +424,8 @@ def validate_v2_project(value: Any, path: str = "project") -> Mapping[str, Any]:
         control.get("midrun_human_approvals"),
         f"{path}.control.midrun_human_approvals",
     )
+    if "rates" in project:
+        _mapping(project.get("rates"), f"{path}.rates")
     return project
 
 
@@ -555,6 +557,15 @@ def compare_project_metrics(
             + ")"
         )
     result = compare_metric_refs(left, right)
+    baseline_rates = baseline.get("rates") if isinstance(baseline, Mapping) else None
+    candidate_rates = candidate.get("rates") if isinstance(candidate, Mapping) else None
+    baseline_rates = baseline_rates if isinstance(baseline_rates, Mapping) else None
+    candidate_rates = candidate_rates if isinstance(candidate_rates, Mapping) else None
+    result["rates_comparable"] = baseline_rates is not None and candidate_rates is not None
+    result["rates"] = {
+        "baseline": baseline_rates,
+        "candidate": candidate_rates,
+    }
     if drift:
         result["invalidated"] = True
         result["invalidation_reason"] = normalized_invalidation_reason
