@@ -116,3 +116,95 @@ def test_render_rate_lines_keeps_all_three_grains_visible():
         "Tests:    cases 100/100 (fully) · modules 1/2 (half)",
         "Coverage: 55.5% line (jacoco-injected)",
     ]
+
+
+# ---------------------------------------------------------------------------
+# A numerator larger than its denominator: the denominator is not a bound
+# ---------------------------------------------------------------------------
+
+
+def test_a_numerator_past_its_denominator_is_never_the_top_band():
+    """Live 2026-08-10 acceptance sealed `classes 201/68 (fully)` at 295.6%
+    and `cases 1605/1163 (fully)` at 138%, with zero conflicts, and the word
+    `success` was manufactured from those two `fully` bands.
+
+    One Java source emits zero, one, or many class files; one statically
+    discovered test emits many parameterized executions. A count that cannot
+    bound its numerator is not a denominator, and P4 forbids naming the most
+    flattering band when the arithmetic is impossible."""
+    from sag.verdict_rates import BAND_UNBOUNDED, band_for
+
+    assert band_for(201, 68) == BAND_UNBOUNDED
+    assert band_for(1605, 1163) == BAND_UNBOUNDED
+    # The exact-equality edge remains honestly full: 14 of 14 IS everything.
+    assert band_for(14, 14) == "fully"
+
+
+def test_an_unbounded_grain_keeps_both_counts_and_states_why():
+    """Both numbers are real observations; only their ratio is meaningless.
+    Unlike `unavailable` (nothing to report), the counts stay visible."""
+    from sag.verdict_rates import BAND_UNBOUNDED, GrainRate
+
+    grain = GrainRate(numerator=201, denominator=68)
+
+    assert grain.band == BAND_UNBOUNDED
+    assert grain.rate is None, "an impossible ratio is not a percentage"
+    payload = grain.payload()
+    assert payload["numerator"] == 201 and payload["denominator"] == 68
+    assert payload["band"] == BAND_UNBOUNDED
+    assert "reason" in payload
+
+
+def test_an_unbounded_grain_cannot_manufacture_success():
+    from sag.verdict_rates import GrainRate, derived_verdict_word
+
+    fully = GrainRate(numerator=1, denominator=1)
+    unbounded = GrainRate(numerator=1605, denominator=1163)
+
+    assert derived_verdict_word(fully, unbounded) == "partial"
+    assert derived_verdict_word(unbounded, fully) == "partial"
+
+
+def test_heavy_red_never_promotes_an_unbounded_grain_into_a_band():
+    """The weak signal demotes; it must not hand `most` to a grain that has
+    no defensible band at all."""
+    from sag.verdict_rates import BAND_UNBOUNDED, GrainRate, demote_heavy_red
+
+    grain, conflicts = demote_heavy_red(
+        GrainRate(numerator=1605, denominator=1163), failed=900, errors=0, executed=1605
+    )
+
+    assert grain.band == BAND_UNBOUNDED
+    assert conflicts == ("test_failures_heavy",)
+
+
+def test_the_banner_shows_the_counts_and_the_reason_for_an_unbounded_grain():
+    from sag.verdict_rates import GrainRate, render_rate_lines
+
+    rates = {
+        "build": {
+            "modules": GrainRate(1, 1).payload(),
+            "classes": GrainRate(201, 68).payload(),
+        },
+        "test": {"cases": GrainRate(1605, 1163).payload(), "modules": GrainRate(1, 1).payload()},
+        "coverage": {"status": "collected", "line_rate": 68.3, "source": "jacoco-existing"},
+    }
+
+    build_line, test_line, _ = render_rate_lines(rates)
+
+    assert "201/68 (unbounded" in build_line
+    assert "1605/1163 (unbounded" in test_line
+    assert "(fully)" in build_line  # the modules grain is untouched
+
+
+def test_any_unbounded_grain_raises_exactly_one_conflict():
+    """Silence is what let `classes 201/68` seal with `conflicts: []`."""
+    from sag.verdict_rates import UNBOUNDED_CONFLICT, GrainRate, unbounded_conflicts
+
+    ok = GrainRate(1, 1)
+    bad = GrainRate(201, 68)
+
+    assert unbounded_conflicts(ok, ok) == ()
+    assert unbounded_conflicts(ok, bad) == (UNBOUNDED_CONFLICT,)
+    assert unbounded_conflicts(bad, bad) == (UNBOUNDED_CONFLICT,), "one conflict, not two"
+    assert unbounded_conflicts(GrainRate(0, None), ok) == (), "absence is not unboundedness"

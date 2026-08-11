@@ -18,7 +18,13 @@ from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import rescue_blocked_build, run_verdict
-from sag.verdict_rates import GrainRate, band_for, demote_heavy_red, derived_verdict_word
+from sag.verdict_rates import (
+    GrainRate,
+    band_for,
+    demote_heavy_red,
+    derived_verdict_word,
+    unbounded_conflicts,
+)
 
 from .evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
@@ -910,6 +916,10 @@ def _snapshot_rates(
         "test": {name: grain.payload() for name, grain in test_grains.items()},
         "coverage": _coverage_rate_payload(state),
     }
+    # An impossible fraction is a conflict, never a quiet top band: the
+    # 2026-08-10 acceptance sealed classes 201/68 and cases 1605/1163 with an
+    # empty conflict list and a manufactured `success`.
+    rate_conflicts += unbounded_conflicts(*build_grains.values(), *test_grains.values())
     return rates, build_grains["modules"], test_grains["cases"], rate_conflicts
 
 
@@ -1039,6 +1049,22 @@ def _validated_rate_grain(
         if type(reason) is not str or not reason.strip():
             raise ValueError(f"verdict unavailable {label} reason is invalid")
         return GrainRate(0, None, reason=reason)
+
+    if band == "unbounded":
+        # Both counts are real observations and stay sealed; only their ratio
+        # is refused, so this shape carries the counts AND the reason.
+        if set(payload) != {"band", "reason", "numerator", "denominator"}:
+            raise ValueError(f"verdict unbounded {label} rate shape is invalid")
+        reason = payload.get("reason")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError(f"verdict unbounded {label} reason is invalid")
+        numerator = payload.get("numerator")
+        denominator = payload.get("denominator")
+        if type(numerator) is not int or type(denominator) is not int:
+            raise ValueError(f"verdict unbounded {label} counts are invalid")
+        if denominator <= 0 or numerator <= denominator:
+            raise ValueError(f"verdict unbounded {label} counts do reconcile as a rate")
+        return GrainRate(numerator, denominator, reason=reason)
 
     if set(payload) != {"rate", "band", "numerator", "denominator"}:
         raise ValueError(f"verdict collected {label} rate shape is invalid")

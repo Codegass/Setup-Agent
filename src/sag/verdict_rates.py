@@ -14,11 +14,20 @@ BAND_HALF = "half"
 BAND_FEW = "few"
 BAND_NONE = "none"
 BAND_UNAVAILABLE = "unavailable"
+# Both counts are real; their ratio is not. A JVM source emits zero, one, or
+# many class files, and one statically discovered test emits many
+# parameterized executions — so such a count can never bound its numerator.
+# Distinct from ``unavailable`` (nothing observed) because the observations
+# exist and stay visible; naming the top band here would let broken
+# arithmetic manufacture the most flattering verdict (P4).
+BAND_UNBOUNDED = "unbounded"
 
 MOST_FLOOR = 75.0
 HALF_FLOOR = 50.0
 HEAVY_RED_DEMOTED_BAND = BAND_MOST
 HEAVY_RED_CONFLICT = "test_failures_heavy"
+UNBOUNDED_CONFLICT = "rate_denominator_not_a_bound"
+UNBOUNDED_REASON = "numerator exceeds denominator; this count cannot bound it"
 
 
 def band_for(numerator: int, denominator: int | None) -> str:
@@ -28,6 +37,8 @@ def band_for(numerator: int, denominator: int | None) -> str:
         return BAND_UNAVAILABLE
     if numerator <= 0:
         return BAND_NONE
+    if numerator > denominator:
+        return BAND_UNBOUNDED
     if numerator >= denominator:
         return BAND_FULLY
     percent = numerator / denominator * 100.0
@@ -55,6 +66,10 @@ class GrainRate:
     def rate(self) -> float | None:
         if not self.denominator or self.denominator <= 0:
             return None
+        if self.numerator > self.denominator:
+            # 295.6% is not a completion percentage; publishing it invites the
+            # reader to treat it as one.
+            return None
         return round(self.numerator / self.denominator * 100.0, 1)
 
     def payload(self) -> dict:
@@ -64,6 +79,13 @@ class GrainRate:
             return {
                 "band": BAND_UNAVAILABLE,
                 "reason": self.reason or "denominator unavailable",
+            }
+        if self.band == BAND_UNBOUNDED:
+            return {
+                "band": BAND_UNBOUNDED,
+                "reason": self.reason or UNBOUNDED_REASON,
+                "numerator": self.numerator,
+                "denominator": self.denominator,
             }
         return {
             "rate": self.rate,
@@ -83,6 +105,14 @@ def demote_heavy_red(
     if cases.band == BAND_FULLY:
         return replace(cases, band_override=HEAVY_RED_DEMOTED_BAND), (HEAVY_RED_CONFLICT,)
     return cases, (HEAVY_RED_CONFLICT,)
+
+
+def unbounded_conflicts(*grains: GrainRate) -> tuple[str, ...]:
+    """Name the broken cardinality once, so no unbounded grain ships silently."""
+
+    if any(grain.band == BAND_UNBOUNDED for grain in grains):
+        return (UNBOUNDED_CONFLICT,)
+    return ()
 
 
 def derived_verdict_word(build_modules: GrainRate, test_cases: GrainRate) -> str:
@@ -105,6 +135,13 @@ def render_rate_lines(rates: dict) -> list[str]:
         numerator = item.get("numerator")
         denominator = item.get("denominator")
         band = item.get("band")
+        if band == BAND_UNBOUNDED:
+            # Both counts stay on the line: they are the observations, and the
+            # reason says why their ratio is not one.
+            return (
+                f"{numerator}/{denominator} "
+                f"({BAND_UNBOUNDED} — {item.get('reason') or UNBOUNDED_REASON})"
+            )
         if numerator is None or denominator is None or not band:
             return "unavailable — rate unavailable"
         return f"{numerator}/{denominator} ({band})"

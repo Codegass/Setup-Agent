@@ -47,6 +47,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sag.tools.base import ToolResult, bind_tool_result_output_storage
+from sag.verdict_rates import UNBOUNDED_CONFLICT
 
 from .attempt_policy import (
     TestCandidateResolution,
@@ -117,6 +118,9 @@ class ReplayMismatchError(ReplayValidationError):
     """A valid transcript no longer reproduces its frozen expectations."""
 
 
+_V4_RATE_CONFLICTS = frozenset({UNBOUNDED_CONFLICT})
+
+
 def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
     """Project today's replay into the immutable verdict-v3 comparison shape.
 
@@ -127,10 +131,20 @@ def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, An
 
     payload = snapshot.model_dump(mode="json")
     payload["schema_version"] = 3
+    # Rate-vocabulary conflicts are v4-only: they name a band relation this
+    # comparison shape does not carry. Letting one through would retroactively
+    # rewrite a frozen v3 record (cassandra-java-driver really did execute
+    # 4,928 of 3,349 discovered) instead of reproducing it. No detection is
+    # lost — the projection still compares test_stats.discovered and .executed
+    # verbatim, which are the counts the conflict is derived from.
+    conflicts = tuple(
+        conflict for conflict in snapshot.conflicts if conflict not in _V4_RATE_CONFLICTS
+    )
+    payload["conflicts"] = list(conflicts)
     payload["verdict"] = _snapshot_verdict(
         snapshot.build_evidence,
         snapshot.test_stats,
-        snapshot.conflicts,
+        conflicts,
     )
     payload.pop("rates", None)
     return payload

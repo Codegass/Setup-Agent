@@ -1008,7 +1008,13 @@ def _accomplishments(total, passed, build_success=True):
         (977, 916, "success"),  # commons-cli 93.8% -> remains success
         (184, 184, "success"),  # 100% -> success
         (100, 80, "success"),  # boundary >= 80%
-        (100, 50, "fail"),  # < 80% -> fail
+        # Premise updated 2026-08-10: SAG grades EXECUTION, so the invented
+        # 80% line is retired and a driven suite is a success whatever the
+        # project's own red count. The one remaining signal is the documented
+        # heavy-red rule, and it is STRICT: red must exceed half.
+        (100, 50, "success"),  # exactly half red -> not heavy red -> success
+        (100, 49, "partial"),  # red just past half -> heavy red -> partial
+        (100, 0, "partial"),  # every executed test red -> heavy red -> partial
     ],
 )
 def test_report_determine_actual_status_uses_policy(total, passed, expected):
@@ -1022,17 +1028,15 @@ def test_report_determine_actual_status_build_failed_is_fail():
     assert tool._determine_actual_status(accomplishments) == "fail"
 
 
-def test_reconcile_status_partial_pass_is_success():
-    """The fallback reconcile path must NOT collapse a >=80% partial to fail."""
+def test_reconcile_without_physical_evidence_is_partial_whatever_the_pass_rate():
+    """This fallback runs only when NO physical validation exists, so it has
+    verified nothing. Premise updated 2026-08-10: a pass rate can neither
+    promote unverified claims to success (96% below) nor condemn them to fail
+    (50% below) — the retired 80% line was doing both."""
     tool = _report_tool()
-    status = tool._reconcile_status("fail", "partial", _accomplishments(184, 177))
-    assert status == "success"
 
-
-def test_reconcile_status_below_threshold_is_fail():
-    tool = _report_tool()
-    status = tool._reconcile_status("success", "success", _accomplishments(100, 50))
-    assert status == "fail"
+    assert tool._reconcile_status("fail", "partial", _accomplishments(184, 177)) == "partial"
+    assert tool._reconcile_status("success", "success", _accomplishments(100, 50)) == "partial"
 
 
 def test_report_and_validator_verdicts_agree_for_partial_pass(monkeypatch):
@@ -1056,12 +1060,14 @@ def test_report_and_validator_verdicts_agree_for_partial_pass(monkeypatch):
 
 
 def test_test_pass_threshold_feeds_both_report_and_run_verdict(monkeypatch):
-    """A non-default test_pass_threshold must change BOTH the test-status verdict
-    and the report verdict (they read the same physical_validator.test_pass_threshold).
+    """The configured pass threshold still labels the VALIDATOR's own test
+    status, and no longer reaches the report verdict.
 
-    Proves the setting is wired end-to-end rather than always resolving to the
-    hardcoded 0.8 default: the identical 85% build-green run is a PASS under 0.8
-    but a FAIL under 0.9 on both gates.
+    Premise updated 2026-08-10: the threshold left the verdict chain because a
+    project's red tests are not SAG's repair duty. This pins the decoupling in
+    both directions — the same 85% run is PARTIAL under 0.8 and FAILED under
+    0.9 on the validator's label, while the report verdict reads `success`
+    under both because the suite was driven either way.
     """
     metrics = lambda project_dir: _metrics(100, 85, failed=15)  # noqa: E731
     accomplishments = _accomplishments(100, 85)
@@ -1080,4 +1086,4 @@ def test_test_pass_threshold_feeds_both_report_and_run_verdict(monkeypatch):
     monkeypatch.setattr(strict_validator, "parse_test_reports_with_catalog", metrics)
     assert strict_validator.validate_test_status("demo")["status"] == "FAILED"
     strict_report = ReportTool(docker_orchestrator=None, physical_validator=strict_validator)
-    assert strict_report._determine_actual_status(accomplishments) == "fail"
+    assert strict_report._determine_actual_status(accomplishments) == "success"

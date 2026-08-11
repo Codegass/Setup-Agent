@@ -12,7 +12,6 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
-from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_EXECUTION_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import (
     EvidenceAssessment,
@@ -2214,10 +2213,14 @@ class ReportTool(BaseTool, UIEventEmitter):
         if phases.get("build") and not status.get("tests_total"):
             add("BLOCKER", "No test reports detected despite successful build.")
 
-        # WARNING: pass rate below threshold (unless already blocker)
-        if status.get("pass_pct") is not None and status["pass_pct"] < 80:
+        # WARNING: heavy project-owned red. SAG grades EXECUTION, so there is no
+        # pass-rate threshold to fall below (the invented 80% left the verdict
+        # chain on 2026-08-10). The one signal that remains is the documented
+        # heavy-red rule — more than half the executed cases red, which usually
+        # means an environment gap rather than a project the agent must fix.
+        if status.get("pass_pct") is not None and status["pass_pct"] < 50:
             pass_rate = format_percentage(status["pass_pct"])
-            add("WARNING", f"Test pass rate below threshold (80%): {pass_rate}.")
+            add("WARNING", f"Most executed tests failed ({pass_rate} passed) — project-owned.")
 
         # WARNING: module coverage shortfall
         if status.get("modules_expected") and status.get("modules_seen") is not None:
@@ -2424,12 +2427,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         """
         Reconcile claimed status with evidence-based status.
 
-        Uses the SINGLE verdict policy (``evaluate_run_verdict``) shared with
-        ``_determine_actual_status`` and the physical validator so this fallback
-        path can never diverge from the primary verdict:
-        build green AND pass_rate >= ``test_pass_threshold`` -> success; else fail.
-        A build-green run that passed the threshold is a SUCCESS (partial pass),
-        not a failure.
+        This fallback is reached only when NO physical validation exists, so it
+        has verified nothing and can only answer PARTIAL. The pass-rate policy
+        it used to share with ``_determine_actual_status`` was retired on
+        2026-08-10: SAG grades execution, and a rate cannot promote a claim
+        that carries no evidence.
         """
         # Extract core step results
         repository_cloned = accomplishments.get("repository_cloned", False)
@@ -2470,23 +2472,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             logger.error("❌ Build failed - compilation issues prevent success")
             return "fail"
 
-        # Delegate the test gate to the single verdict policy so this fallback
-        # path agrees with _determine_actual_status (no header-vs-dashboard drift).
-        threshold = getattr(
-            self.physical_validator, "test_pass_threshold", DEFAULT_TEST_PASS_THRESHOLD
+        # This path runs only when NO physical validation exists (the caller
+        # returns earlier when it does). A pass rate cannot promote unverified
+        # claims: SAG grades execution, and the retired 80% threshold is not a
+        # substitute for evidence. Tests that ran without verification are a
+        # partial result, never a success.
+        logger.info(
+            f"Reconciled without physical evidence: tests ran at "
+            f"{test_pass_rate:.1f}% pass rate, unverified — partial"
         )
-        threshold_pct = threshold * 100.0
-        verdict = evaluate_run_verdict(
-            build_green=True, pass_rate=test_pass_rate, test_pass_threshold=threshold
-        )
-        if verdict == "success":
-            logger.info(
-                f"✅ Success confirmed: Build passed, Test pass rate "
-                f"{test_pass_rate:.1f}% >= {threshold_pct:.0f}%"
-            )
-            return "success"
-        logger.warning(f"❌ Fail: Test pass rate {test_pass_rate:.1f}% < {threshold_pct:.0f}%")
-        return "fail"
+        return "partial"
 
     def _collect_execution_metrics(self) -> dict:
         """Collect comprehensive execution metrics from the session."""
@@ -2904,11 +2899,13 @@ class ReportTool(BaseTool, UIEventEmitter):
         """
         Determine the actual run verdict from build and test results.
 
-        Delegates the final pass/fail decision to ``evaluate_run_verdict`` (the
-        single source of truth shared with the physical validator):
-        - SUCCESS: build green AND test pass rate >= ``test_pass_threshold``
-        - FAIL: repository not cloned, build failed, no test reports, or test
-          pass rate < ``test_pass_threshold``
+        Grades EXECUTION, not pass rate (the invented 80% threshold left the
+        verdict chain on 2026-08-10 — a project's own red tests are not SAG's
+        repair duty):
+        - SUCCESS: repository cloned, build green, and tests actually ran
+        - PARTIAL: the same, but more than half the executed cases were red
+          (the documented heavy-red signal)
+        - FAIL: repository not cloned, build failed, or no tests ran at all
         """
         # Extract the three core indicators
         repository_cloned = accomplishments.get("repository_cloned", False)
@@ -2964,24 +2961,20 @@ class ReportTool(BaseTool, UIEventEmitter):
             logger.warning("⚠️ No test execution detected - treating as 0% pass rate")
             return "fail"
 
-        # Final determination via the SINGLE verdict policy shared with the
-        # physical validator (evaluate_run_verdict) - no hardcoded threshold.
-        # At this point the build is green (we returned "fail" above otherwise).
-        threshold = getattr(
-            self.physical_validator, "test_pass_threshold", DEFAULT_TEST_PASS_THRESHOLD
-        )
-        threshold_pct = threshold * 100.0
-        verdict = evaluate_run_verdict(
-            build_green=True, pass_rate=test_pass_rate, test_pass_threshold=threshold
-        )
-        if verdict == "success":
+        # Final determination grades EXECUTION, not pass rate: a project's own
+        # red tests are not SAG's repair duty, so the invented 80% threshold
+        # left this decision on 2026-08-10. The build is green here and tests
+        # ran (both alternatives returned "fail" above). The one remaining
+        # signal is the documented heavy-red rule, which mirrors the band
+        # table's single fully -> most demotion rather than failing the run.
+        if test_pass_rate < 50.0:
             logger.info(
-                f"✅ SUCCESS: Build passed ✓, Test pass rate "
-                f"{test_pass_rate:.1f}% >= {threshold_pct:.0f}% ✓"
+                f"PARTIAL: build passed and tests ran; most executed tests failed "
+                f"({test_pass_rate:.1f}% passed) — project-owned"
             )
-            return "success"
-        logger.warning(f"❌ FAIL: Test pass rate {test_pass_rate:.1f}% < {threshold_pct:.0f}%")
-        return "fail"
+            return "partial"
+        logger.info(f"SUCCESS: build passed and tests ran ({test_pass_rate:.1f}% passed)")
+        return "success"
 
     def _generate_console_report(
         self,
