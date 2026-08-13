@@ -6,6 +6,7 @@ The ref/web paths DELEGATE to the existing OutputSearchTool/WebSearchTool
 internals (stage-1 consolidates the surface, not the implementations).
 """
 
+import subprocess
 from types import SimpleNamespace
 
 from container_evidence_fakes import ContainerFS
@@ -200,3 +201,203 @@ def test_unknown_target_is_failed_with_options():
     result = tool.execute(target="bogus^target", pattern="x")
     assert result.operation_outcome.value == "failed"
     assert any("file:" in s or "job:" in s for s in result.suggestions)
+
+
+class LocalShellOrchestrator:
+    """Run the tool's real command through a real ``/bin/bash``, no container.
+
+    `DockerOrchestrator.execute_command` wraps every command in ``/bin/bash
+    -c`` and demuxes the result into exactly these keys (combined ``output``,
+    plus separate ``stdout``/``stderr``).  A dict-marker fake can only replay
+    an exit code someone typed by hand; the defect here is what a real shell
+    does to grep's exit code on the far side of a ``| head`` pipe, so these
+    cases run the real pipeline over real files.
+    """
+
+    def __init__(self, root):
+        self.root = str(root)
+        self.commands = []
+
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+        self.commands.append(command)
+        proc = subprocess.run(
+            ["/bin/bash", "-c", command],
+            cwd=workdir or self.root,
+            capture_output=True,
+            text=True,
+        )
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        return {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "output": (stdout + "\n" + stderr).strip() if stderr else stdout,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+
+def test_file_match_returns_the_numbered_lines_a_real_grep_printed(tmp_path):
+    pom = tmp_path / "pom.xml"
+    pom.write_text("<project>\n  <requireMavenVersion>3.9</requireMavenVersion>\n</project>\n")
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(target=f"file:{pom}", pattern="requireMavenVersion")
+
+    assert result.succeeded is True
+    assert result.facts["matched"] is True
+    assert result.output == "2:  <requireMavenVersion>3.9</requireMavenVersion>"
+
+
+def test_genuine_no_match_stays_a_successful_found_nothing(tmp_path):
+    pom = tmp_path / "pom.xml"
+    pom.write_text("<project/>\n")
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(target=f"file:{pom}", pattern="requireMavenVersion")
+
+    # grep exit 1 is the one honest "I looked and it is not there".
+    assert result.succeeded is True
+    assert result.facts["matched"] is False
+    assert result.output == f"No matches for 'requireMavenVersion' in {pom}"
+
+
+def test_absent_path_is_a_typed_failure_that_quotes_grep(tmp_path):
+    missing = tmp_path / "nope.xml"
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(target=f"file:{missing}", pattern="anything")
+
+    assert result.succeeded is False
+    assert result.operation_outcome.value == "failed"
+    assert result.error_code == "SEARCH_FAILED"
+    assert "No such file or directory" in result.output
+    assert "No matches" not in result.output
+    # Never a found-nothing claim: the search did not run.
+    assert result.facts["matched"] is None
+
+
+def test_invalid_regex_is_a_typed_failure_naming_the_cause(tmp_path):
+    subject = tmp_path / "a.txt"
+    subject.write_text("x\n")
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(target=f"file:{subject}", pattern="foo(")
+
+    assert result.succeeded is False
+    assert result.error_code == "SEARCH_FAILED"
+    assert "grep:" in result.output  # the real diagnostic, whatever grep called it
+    assert "No matches" not in result.output
+
+
+def test_extended_regex_alternation_finds_the_gradlew_path(tmp_path):
+    # tapestry-5 HAD build.gradle and gradlew on disk. Plain `grep` is BRE,
+    # where `|` is a literal character, so the harness's own build-file probe
+    # could never match and the model was told the build files did not exist.
+    listing = tmp_path / "paths.txt"
+    listing.write_text("/workspace/tapestry-5/README.md\n/workspace/tapestry-5/gradlew\n")
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(
+        target=f"file:{listing}",
+        pattern=r"(^|/)build\.gradle$|(^|/)gradlew$",
+    )
+
+    assert result.succeeded is True
+    assert result.facts["matched"] is True
+    assert "2:/workspace/tapestry-5/gradlew" in result.output
+
+
+def test_directory_target_is_searched_recursively(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "build.gradle").write_text("apply plugin: 'java'\n")
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(target=f"file:{tmp_path}", pattern="apply plugin")
+
+    assert result.succeeded is True
+    assert result.facts["matched"] is True
+    assert "build.gradle" in result.output
+    assert "Is a directory" not in result.output
+    assert "No matches" not in result.output
+
+
+def test_grep_error_survives_the_head_pipe(tmp_path):
+    subject = tmp_path / "a.txt"
+    subject.write_text("x\n")
+
+    # The trap, run for real: `head` is the LAST command in the pipeline, so an
+    # unguarded `$?` is head's 0 and the erroring grep vanishes behind it.
+    naive = subprocess.run(
+        ["/bin/bash", "-c", f"grep -nE 'foo(' {subject} | head -50"],
+        capture_output=True,
+        text=True,
+    )
+    assert naive.returncode == 0
+    assert "grep:" in naive.stderr
+
+    orch = LocalShellOrchestrator(tmp_path)
+    result = SearchTool(orch).execute(target=f"file:{subject}", pattern="foo(")
+
+    # Same shell, same pipe, same head -- the tool's command keeps grep's status.
+    assert orch.commands and "head -" in orch.commands[0]
+    assert result.succeeded is False
+    assert result.error_code == "SEARCH_FAILED"
+    assert "No matches" not in result.output
+
+
+def test_transport_error_exit_is_never_reported_as_no_matches():
+    diagnostic = "grep: /workspace/p: Is a directory"
+    orch = FakeOrchestrator(
+        responses={
+            "/workspace/p": {
+                "success": False,
+                "exit_code": 2,
+                "output": diagnostic,
+                "stdout": "",
+                "stderr": diagnostic,
+            }
+        }
+    )
+
+    result = SearchTool(orch).execute(target="file:/workspace/p", pattern="gradle")
+
+    assert result.succeeded is False
+    assert result.error_code == "SEARCH_FAILED"
+    assert diagnostic in result.output
+
+
+def test_dispatch_failure_is_a_typed_failure_not_an_empty_answer():
+    orch = FakeOrchestrator(
+        responses={
+            "/workspace/p": {
+                "success": False,
+                "exit_code": -1,
+                "output": "docker exec was never accepted",
+                "dispatch_status": "dispatch_failed",
+            }
+        }
+    )
+
+    result = SearchTool(orch).execute(target="file:/workspace/p/pom.xml", pattern="gradle")
+
+    assert result.succeeded is False
+    assert result.error_code == "SEARCH_FAILED"
+    assert "No matches" not in result.output
+
+
+def test_output_capped_by_head_is_a_capped_read_not_a_failure(tmp_path):
+    # Enough output to overrun the pipe buffer, so `head` closes the pipe while
+    # grep is still writing and grep dies of SIGPIPE (141). Exit 141 means the
+    # read was CAPPED, not that it errored.
+    big = tmp_path / "big.txt"
+    big.write_text("".join(f"match line {index}\n" for index in range(200_000)))
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(target=f"file:{big}", pattern="match", max_results=5)
+
+    assert result.succeeded is True
+    assert result.facts["matched"] is True
+    assert result.output.splitlines()[0] == "1:match line 0"
+    assert len([line for line in result.output.splitlines() if line[:1].isdigit()]) == 5
+    assert "capped at 5" in result.output

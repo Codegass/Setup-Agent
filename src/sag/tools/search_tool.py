@@ -6,12 +6,24 @@ WebSearchTool internals; file/job targets grep inside the container.
 """
 
 import shlex
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
+from sag.runtime.container_io import command_did_not_run
 
 from .base import BaseTool, ToolResult
 from .internal.build_utils import classify_detached_completion
+
+SEARCH_FAILED = "SEARCH_FAILED"
+
+# grep's own vocabulary: 0 = matched, 1 = looked and found nothing, 2 = the
+# search itself failed (unreadable path, invalid regex, ...).
+_GREP_MATCHED = 0
+_GREP_FOUND_NOTHING = 1
+# 128 + SIGPIPE(13): `head` closed the pipe after max_results lines and grep
+# died writing into it. That is a CAPPED read, not a failed one.
+_GREP_CAPPED_BY_HEAD = 141
+_DIAGNOSTIC_QUOTE_LIMIT = 400
 
 
 class SearchTool(BaseTool):
@@ -27,8 +39,9 @@ class SearchTool(BaseTool):
             description=(
                 "Search stored outputs, files, background-job logs, or the web. "
                 "target: ref id (e.g. 'output_5b9a') | 'file:<path>' | 'job:<id>' | 'web:<query>'. "
-                "pattern: grep pattern (ignored for web); for a ref id, omit pattern "
-                "to read the stored output itself."
+                "A 'file:' path may be a file or a directory (searched recursively). "
+                "pattern: extended regular expression, grep -E (ignored for web); "
+                "for a ref id, omit pattern to read the stored output itself."
             ),
         )
         self.docker_orchestrator = docker_orchestrator
@@ -159,16 +172,102 @@ class SearchTool(BaseTool):
         )
 
     def _grep_container(self, path: str, pattern: str, max_results: int) -> ToolResult:
-        cmd = (
-            f"grep -n {shlex.quote(pattern or '.')} {shlex.quote(path)} 2>/dev/null "
-            f"| head -{int(max_results)}"
+        """Grep inside the container, keeping "did not run" apart from "found nothing".
+
+        A search that did not succeed is not a search that found nothing
+        (a41109d).  Three things made this tool state the opposite: stderr went
+        to /dev/null, grep's exit code was never read, and every answer came
+        back as `completed_success`.  A directory target, an absent path and an
+        invalid regex therefore all arrived at the model as a confident "this
+        does not exist" — tapestry-5 was told it had no build files while
+        `build.gradle` and `gradlew` sat on disk.
+        """
+
+        limit = max(1, int(max_results))
+        quoted_path = shlex.quote(path)
+        # Extended regex: plain grep is BRE, where `|` is a literal character,
+        # so an alternation like `(^|/)build\.gradle$|(^|/)gradlew$` can never
+        # match anything.
+        quoted_pattern = shlex.quote(pattern or ".")
+        # `head` is the LAST command in the pipeline, so an unguarded `$?` is
+        # HEAD's status: an erroring grep reads as exit 0. `pipefail` hands the
+        # pipeline grep's status instead, which is the only way exit 2 (the
+        # search failed) stays distinguishable from exit 1 (the search looked).
+        # A directory is searched recursively rather than answered with
+        # "Is a directory", and stderr is kept because those diagnostics ARE
+        # the answer whenever the search did not run.
+        command = (
+            "set -o pipefail; "
+            f"if test -d {quoted_path}; then "
+            f"grep -rnE -e {quoted_pattern} -- {quoted_path} | head -{limit}; "
+            f"else grep -nE -e {quoted_pattern} -- {quoted_path} | head -{limit}; fi"
         )
-        result = self.docker_orchestrator.execute_command(cmd, workdir=None, timeout=60)
-        output = (result.get("output") or "").strip()
-        matched = bool(output)
-        return ToolResult.completed_success(
-            output=output if matched else f"No matches for {pattern!r} in {path}",
-            facts={"target": path, "pattern": pattern, "matched": matched},
+        result = self.docker_orchestrator.execute_command(command, workdir=None, timeout=60)
+
+        exit_code = result.get("exit_code")
+        stdout = self._stream(result, "stdout")
+        diagnostic = self._stream(result, "stderr")
+        if command_did_not_run(result):
+            return self._search_failed(path, pattern, exit_code, diagnostic or stdout)
+        if exit_code in (_GREP_MATCHED, _GREP_CAPPED_BY_HEAD):
+            lines = stdout.splitlines()[:limit]
+            capped = len(lines) >= limit
+            return ToolResult.completed_success(
+                output="\n".join(lines)
+                + (f"\n... [capped at {limit} results; more may exist]" if capped else ""),
+                facts={
+                    "target": path,
+                    "pattern": pattern,
+                    "matched": True,
+                    "capped_at_max_results": capped,
+                },
+            )
+        if exit_code == _GREP_FOUND_NOTHING:
+            return ToolResult.completed_success(
+                output=f"No matches for {pattern!r} in {path}",
+                facts={"target": path, "pattern": pattern, "matched": False},
+            )
+        return self._search_failed(path, pattern, exit_code, diagnostic or stdout)
+
+    @staticmethod
+    def _stream(result: Any, name: str) -> str:
+        """Read one demuxed stream, falling back to the combined output.
+
+        `DockerOrchestrator` returns stdout and stderr separately and also
+        concatenates them into `output`; smaller transports return `output`
+        alone, in which case it is the only text there is.
+        """
+
+        if isinstance(result, Mapping) and name in result:
+            return str(result.get(name) or "").strip()
+        return str((result or {}).get("output") or "").strip()
+
+    def _search_failed(
+        self,
+        path: str,
+        pattern: str,
+        exit_code: Any,
+        diagnostic: str,
+    ) -> ToolResult:
+        """The search itself failed: say what failed, and claim nothing about matches."""
+
+        quoted = diagnostic[:_DIAGNOSTIC_QUOTE_LIMIT] or "no diagnostic was captured"
+        reason = f"search failed in {path} (exit {exit_code}): {quoted}"
+        return ToolResult.completed_failure(
+            output=(
+                f"Search for {pattern!r} in {path} FAILED (exit {exit_code}). "
+                f"This is NOT a 'no matches' answer — nothing was established "
+                f"about {pattern!r}.\n{quoted}"
+            ),
+            error=reason,
+            error_code=SEARCH_FAILED,
+            # No `matched` verdict exists: the search never produced one.
+            facts={"target": path, "pattern": pattern, "matched": None},
+            suggestions=[
+                f"Confirm the path exists (a directory target is searched recursively): {path}",
+                "pattern is an extended regular expression: escape ( ) | + ? { } "
+                "to match them literally",
+            ],
         )
 
     def _web(self, query: str, max_results: int) -> ToolResult:
@@ -185,9 +284,14 @@ class SearchTool(BaseTool):
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "ref id | file:<path> | job:<id> | web:<query>",
+                    "description": (
+                        "ref id | file:<path> (file or directory) | job:<id> | web:<query>"
+                    ),
                 },
-                "pattern": {"type": "string", "description": "grep pattern (ignored for web)"},
+                "pattern": {
+                    "type": "string",
+                    "description": "extended regular expression, grep -E (ignored for web)",
+                },
                 "max_results": {"type": "integer", "default": 50},
             },
             "required": ["target"],
