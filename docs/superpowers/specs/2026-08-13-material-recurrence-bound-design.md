@@ -1,7 +1,19 @@
 # Material recurrence bound — the third rung, and why it is a blocker rather than a harness action
 
 **Date:** 2026-08-13
-**Status:** design decision, ready to implement
+**Status:** implemented (`ab3f13e`); evidence base corrected same day — see below
+
+> **Evidence correction (2026-08-13, post-implementation).** Every count in
+> §1 came from `grep -c` over console logs, which re-render context history —
+> old error lines included — on every save. The authoritative
+> `control_events.jsonl` shows rocketmq-externals produced **5**
+> ENV_EXECUTABLE_NOT_FOUND events in a 34-turn, 4-minute run, not ~689; the
+> other five projects produced 1–2 each, and none looped until spent. The runs
+> died of single-point aborts and honest fast blocks (task #45), not of this
+> loop. The bound stands as cheap defense-in-depth — its mechanism is sound
+> and its cost is near zero — but it was NOT the fix for D2's failures, and
+> its live acceptance criterion ("single digits instead of ~689") was already
+> true before it landed.
 **Scope:** the remaining half of task #42. The wrapper-naming half landed in
 `a07b1d3`.
 

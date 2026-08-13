@@ -67,20 +67,37 @@ follow.
 
 ## Why the builds failed
 
-### 1. Toolchain acquisition loops — the dominant harness failure
+### 1. Toolchain acquisition loops — RETRACTED (2026-08-13)
 
-`ENV_EXECUTABLE_NOT_FOUND` dominates six of the eight zero-class projects that
-had no network trouble: rocketmq-externals ×453, spark-kubernetes-operator
-×151, geode ×142, samza-hello-samza ×139, gora ×104, tapestry-5 ×71. The model
-registers an executable that does not exist (typically `/usr/bin/gradle` or
-`/usr/bin/mvn`), is refused, and repeats until the run is spent.
-
-The 2026-08-09 fix added a suggestion routing the model to
-`project(action='provision', packages=['<tool>'])`, and it is demonstrably not
-holding: tapestry-5 saw that suggestion once against 71 refusals. The guidance
-fires only when no candidate is registered for a named tool, so a call without
-`tool=`, or one made after any candidate exists, never reaches it. This is the
-single highest-volume harness defect in the campaign (task #42).
+> **This section's numbers were a measurement artifact, and its causal claim
+> is withdrawn.** The counts (rocketmq ×453/×689, tapestry ×71, …) were
+> `grep -c` over CONSOLE logs, which re-render branch-history JSON — old error
+> lines included — on every context save. The authoritative
+> `control_events.jsonl` shows the true counts: **1–5 ENV_EXECUTABLE_NOT_FOUND
+> events per run**, runs of **17–34 model turns lasting 3–10 minutes**. Nothing
+> looped until the run was spent; nothing was spent at all.
+>
+> The true causes of these six failures, from the sealed `phase_records`:
+>
+> - **tapestry-5**: analyze ABORTED on `LLM response unavailable:
+>   litellm.InternalServerError` — one transient provider 5xx killed the run
+>   with no retry (react_engine.py:3334), two turns AFTER the model had
+>   recovered from the search lie by finding build.gradle itself with `find`.
+> - **rocketmq-externals**: build ABORTED on `harness control recovery
+>   exhausted: repair_assessment_persist_failed` — the controller failed to
+>   persist its own repair context and killed the run; the model's `blocked`
+>   claim ("no usable Maven toolchain, no wrapper") was factually correct.
+> - **gora / geode / spark-kubernetes-operator / samza-hello-samza**: builds
+>   BLOCKED honestly on real toolchain/runtime issues and the runs converged
+>   quickly by design (`dependents_skipped`) — the fast-close machinery
+>   working, not a loop. spark-kubernetes-operator's record even shows the
+>   wrapper WAS found and used; the build failed on a runtime configuration
+>   issue.
+>
+> The single-point abort family is task #45 and blocks the D2 re-run. The
+> recurrence bound landed as `ab3f13e` remains as low-risk defense-in-depth,
+> but the evidence that motivated it was inflated ~100× by this measurement
+> error — recorded in its spec as well.
 
 ### 2. A failed search is reported as "no matches" (task #41)
 
