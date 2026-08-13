@@ -6,10 +6,12 @@ import json
 import posixpath
 import re
 import shlex
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from loguru import logger
 
+from sag.agent.loop_memory import COMPLETION_CLAIM_CAP
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
@@ -26,6 +28,73 @@ _MAVEN_RUNTIME_ROOT_GROUPS = (
     ("/tmp",),
     ("/opt", "/usr", "/bin", "/sbin"),
 )
+
+# Standing advice, true of every refused path and never a move that can end
+# the wall on its own — which is why the bound carries the productive moves
+# separately.
+_GENERIC_REGISTRATION_MOVES = (
+    "Use bash to verify the exact installed executable path before registering it.",
+    "For downloaded runtimes, register the actual bin executable path under /workspace, /opt, /tmp, or /usr/local.",
+    "Use env inspect to review the current active candidate before retrying a build.",
+)
+_EXECUTABLE_NOT_FOUND = "ENV_EXECUTABLE_NOT_FOUND"
+_REFUSAL_BOUND_REACHED = "ENV_REFUSAL_BOUND_REACHED"
+# The typed facts this tool states about its own recurrence. The engine is the
+# only writer of run evidence, so the tool never records the blocker itself; it
+# reports what it observed and the engine decides what the ledger says.
+MATERIAL_RECURRENCE_BOUND_MARKER = "material_recurrence_bound"
+MATERIAL_RECURRENCE_RELEASE_MARKER = "material_recurrence_released"
+# D2 2026-08-12: rocketmq-externals refused ~689 times across three Maven paths
+# while the provision route rendered 5 times — the advice fires and the model
+# continues, so the missing rung is not more guidance but an end to the
+# repetition.  Three is `LoopMemory.completion_claim_cap`'s existing cap, reused
+# rather than a second invented number
+# (docs/superpowers/specs/2026-08-13-material-recurrence-bound-design.md §3).
+_MATERIAL_RECURRENCE_BOUND = COMPLETION_CLAIM_CAP
+
+
+@dataclass
+class _RefusalChain:
+    """One `(tool, error_code)` identity's refusals inside a single run.
+
+    Identity is deliberately NOT the executable path: rocketmq cycled three
+    Maven paths for one tool, and a path-keyed bound would never have fired.
+    """
+
+    tool: str
+    count: int = 0
+    paths: list[str] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    moves: tuple[str, ...] = ()
+
+    @property
+    def bound_reached(self) -> bool:
+        return self.count >= _MATERIAL_RECURRENCE_BOUND
+
+    def marker(self) -> dict[str, Any]:
+        """The structured fact, never pre-rendered prose: the engine renders."""
+        return {
+            "tool": self.tool,
+            "error_code": _EXECUTABLE_NOT_FOUND,
+            "refused_executables": list(self.paths),
+            "remaining_moves": list(self.moves),
+            "refusal_count": self.count,
+            "bound": _MATERIAL_RECURRENCE_BOUND,
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+    def observe(self, executable: str, moves: tuple[str, ...]) -> None:
+        self.count += 1
+        if executable and not self.already_refused(executable):
+            self.paths.append(executable)
+        # The last refusal's moves are the current ones: the overlay and the
+        # workspace can both change under a run.
+        self.moves = moves
+
+    def already_refused(self, executable: str) -> bool:
+        """A trailing or doubled slash is the same path, not a new probe."""
+        candidate = posixpath.normpath(str(executable or ""))
+        return any(posixpath.normpath(known) == candidate for known in self.paths)
 
 
 class EnvTool(BaseTool):
@@ -45,6 +114,10 @@ class EnvTool(BaseTool):
             ),
         )
         self.store = store or EnvOverlayStore(orchestrator)
+        # Run-scoped: this tool object lives exactly as long as one run, so the
+        # counter needs no reset hook beyond the successful-registration one.
+        self._refusal_chains: dict[tuple[str, str], _RefusalChain] = {}
+        self._released_tool = ""
 
     def execute(
         self,
@@ -83,6 +156,9 @@ class EnvTool(BaseTool):
 
             if action_name == "register":
                 params["tool"] = self.store._normalize_tool(params["tool"])
+                bounded = self._bounded_refusal(params.get("executable"), params["tool"])
+                if bounded is not None:
+                    return bounded
                 if params["tool"] == "maven":
                     canonical_executable, canonical_error = self._canonicalize_maven_executable(
                         params["executable"]
@@ -160,6 +236,9 @@ class EnvTool(BaseTool):
 
             if action_name == "activate":
                 params["tool"] = self.store._normalize_tool(params["tool"])
+                bounded = self._bounded_refusal(params.get("executable"), params["tool"])
+                if bounded is not None:
+                    return bounded
                 if params["tool"] == "maven":
                     canonical_executable, canonical_error = self._canonicalize_maven_executable(
                         params["executable"]
@@ -251,7 +330,12 @@ class EnvTool(BaseTool):
         The overlay is the execution consumer — the dispatch shell sources it.
         The registry is durable runtime inventory used by resolution and
         reporting. Registration writes both, and never fails on the second.
+
+        Both terminal success paths (register and activate) arrive here, which
+        makes this the one place a working runtime for this tool is observed —
+        and therefore where the refusal bound for it is released.
         """
+        self._reset_refusal_bound(tool)
         record_registered_runtime(
             getattr(self.store, "orchestrator", None),
             tool,
@@ -397,6 +481,12 @@ class EnvTool(BaseTool):
     def _validate_executable(
         self, executable: str, tool: Optional[str] = None
     ) -> Optional[ToolResult]:
+        # The bound is read here as well as at the `execute` entry, because
+        # this is where the refusal is born and where the probe is paid for.
+        bounded = self._bounded_refusal(executable, tool)
+        if bounded is not None:
+            return bounded
+
         orchestrator = getattr(self.store, "orchestrator", None)
         if orchestrator is None or not hasattr(orchestrator, "execute_command"):
             return None
@@ -414,7 +504,7 @@ class EnvTool(BaseTool):
         # refusal said only that the path does not exist. What the overlay
         # already knows is the cheapest correction there is, so it is stated.
         registered = self._registered_candidates(tool)
-        suggestions = []
+        moves = []
         # D2 2026-08-12: six runs were spent looping here (rocketmq-externals
         # x453, spark-kubernetes-operator x151, tapestry-5 x71), every one of
         # them finishing with zero compiled classes. The refusal must name what
@@ -425,12 +515,12 @@ class EnvTool(BaseTool):
             # The wrapper needs no network and is the runner the project itself
             # ships — tapestry-5 had gradlew on disk while the model burned its
             # run on a nonexistent /usr/bin/gradle.
-            suggestions.append(
+            moves.append(
                 f"This project ships its own {named_tool} wrapper at {wrapper} — "
                 f"register that instead of a system path."
             )
         if registered:
-            suggestions.append(
+            moves.append(
                 "Already registered and executable: " + ", ".join(registered[:6])
             )
         elif named_tool:
@@ -440,29 +530,123 @@ class EnvTool(BaseTool):
             # because nothing named the provision route). The tool is inferred
             # from the basename when the call did not name one, because the
             # loops recurred through exactly those bare calls.
-            suggestions.append(
+            moves.append(
                 f"No {named_tool} is registered and this path does not exist — if "
                 f"{named_tool} is not installed in the container, install it first: "
                 f"project(action='provision', packages=['{named_tool}'])"
             )
-        suggestions.extend(
-            [
-                "Use bash to verify the exact installed executable path before registering it.",
-                "For downloaded runtimes, register the actual bin executable path under /workspace, /opt, /tmp, or /usr/local.",
-                "Use env inspect to review the current active candidate before retrying a build.",
-            ]
-        )
-        return ToolResult.completed_failure(
+        # Only the moves above can end this wall; the standing advice appended
+        # below cannot, which is why the bound carries the moves alone into the
+        # marker and into every later refusal.
+        chain = self._refusal_chain(executable, tool)
+        chain.observe(executable, tuple(moves))
+        suggestions = [*moves, *_GENERIC_REGISTRATION_MOVES]
+        metadata: dict[str, Any] = {"action": "validate_executable"}
+        if chain.bound_reached:
+            suggestions.append(self._bound_notice(chain))
+            metadata[MATERIAL_RECURRENCE_BOUND_MARKER] = chain.marker()
+        refusal = ToolResult.completed_failure(
             output="",
             error=f"Env overlay executable is not executable or does not exist: {executable}",
-            error_code="ENV_EXECUTABLE_NOT_FOUND",
+            error_code=_EXECUTABLE_NOT_FOUND,
             suggestions=suggestions,
             raw_data={
                 "executable": executable,
                 **({"registered_candidates": registered} if registered else {}),
             },
-            metadata={"action": "validate_executable"},
+            metadata=metadata,
         )
+        # This result's own ref belongs to the next statement of the wall; the
+        # engine unions it in for the one being made now.
+        chain.evidence_refs.append(refusal.output_ref)
+        return refusal
+
+    # ------------------------------------------------------------------
+    # The third rung: a material action may not recur without bound (#42).
+    # The first rung is the refusal naming a productive move; the second is
+    # LoopMemory's advisor redirect at recurrence >= 2. Both fired ~689 times
+    # on rocketmq-externals and neither could end the repetition, so the third
+    # converts it into a stated fact. The tool owns the count, the bound and
+    # the probe it no longer pays for; it states the fact in typed metadata
+    # and the engine — the only writer of run evidence — records the blocker.
+    # Nothing is force-closed and no action is synthesized.
+    # ------------------------------------------------------------------
+
+    def _refusal_identity(self, executable: Any, tool: Optional[str]) -> tuple[str, str]:
+        """`(tool, error_code)` — never the path, which is what cycled."""
+        named = str(tool or "").strip().lower() or self._tool_from_executable(executable)
+        # An unnamed, unmapped tool falls back to the executable's own basename
+        # so three unrelated launchers are not merged into one identity.
+        fallback = str(executable or "").rstrip("/").rsplit("/", 1)[-1].strip().lower()
+        return (named or fallback, _EXECUTABLE_NOT_FOUND)
+
+    def _refusal_chain(self, executable: Any, tool: Optional[str]) -> _RefusalChain:
+        identity = self._refusal_identity(executable, tool)
+        return self._refusal_chains.setdefault(identity, _RefusalChain(tool=identity[0]))
+
+    def _bound_notice(self, chain: _RefusalChain) -> str:
+        return (
+            f"{chain.tool} registration has now been refused {chain.count} times "
+            f"({', '.join(chain.paths)}). These paths are no longer probed; "
+            "take one of the moves above instead of naming them again."
+        )
+
+    def _bounded_refusal(self, executable: Any, tool: Optional[str]) -> Optional[ToolResult]:
+        """The refusal owed to a re-probe past the bound, at the cost of none.
+
+        §3 justifies dropping the probe because "the probe cannot change its
+        answer".  That is true of a path this identity already refused, and
+        false of one it has never tried — the wrapper the refusal itself
+        recommends, or a binary the recommended provision just installed. So
+        the identity owns the bound and the count, and the paths it already
+        refused are the ones that stop costing a round trip; a first look at a
+        new path is not a re-probe and is never refused unseen.
+        """
+        path = str(executable or "").strip()
+        if not path:
+            # A call with no executable is a schema error, and the existing
+            # missing-parameter refusal is the more useful answer.
+            return None
+        chain = self._refusal_chains.get(self._refusal_identity(path, tool))
+        if chain is None or not chain.bound_reached:
+            return None
+        if not chain.already_refused(path):
+            return None
+        return ToolResult.completed_failure(
+            output="",
+            error=(
+                f"{chain.tool} registration refused without probing: "
+                f"{_EXECUTABLE_NOT_FOUND} recurred {chain.count} times for "
+                f"{', '.join(chain.paths)}"
+            ),
+            error_code=_REFUSAL_BOUND_REACHED,
+            suggestions=[*chain.moves, self._bound_notice(chain)],
+            raw_data={
+                "executable": path,
+                "tool": chain.tool,
+                "refused_executables": list(chain.paths),
+                "refusal_count": chain.count,
+                "bound": _MATERIAL_RECURRENCE_BOUND,
+            },
+            metadata={
+                "action": "validate_executable",
+                MATERIAL_RECURRENCE_BOUND_MARKER: chain.marker(),
+            },
+        )
+
+    def _reset_refusal_bound(self, tool: str) -> None:
+        """A registration that succeeded ends this tool's wall.
+
+        A later failure after a real success is new information, not the same
+        wall, so the count restarts. A wall that had been stated is reported as
+        released on the successful result, so the engine can retire a blocker
+        that would otherwise stand against a tool that now registers.
+        """
+        normalized = str(tool or "").strip().lower()
+        for identity in [key for key in self._refusal_chains if key[0] == normalized]:
+            chain = self._refusal_chains.pop(identity)
+            if chain.bound_reached:
+                self._released_tool = normalized
 
     # A system path the model reached for, mapped to the tool it wanted. Only
     # the launchers whose absence produced the D2 loops need an entry.
@@ -640,10 +824,18 @@ class EnvTool(BaseTool):
             raw_data["active_candidate"] = active_candidate
         if measured_version is not None:
             raw_data["measured_version"] = measured_version
+        metadata: dict[str, Any] = {"action": action}
+        released, self._released_tool = self._released_tool, ""
+        if released:
+            metadata[MATERIAL_RECURRENCE_RELEASE_MARKER] = {
+                "tool": released,
+                "error_code": _EXECUTABLE_NOT_FOUND,
+                "reason": f"{released} registration succeeded",
+            }
         return ToolResult.completed_success(
             output=json.dumps(raw_data, indent=2, sort_keys=True),
             raw_data=raw_data,
-            metadata={"action": action},
+            metadata=metadata,
         )
 
     def _get_parameters_schema(self) -> dict[str, Any]:

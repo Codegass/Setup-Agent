@@ -5389,6 +5389,10 @@ class ReActEngine(UIEventEmitter):
         """Consume orchestrator metadata, then consult engine-owned loop memory."""
         metadata = execution.metadata or {}
 
+        # Ahead of the loop-memory consult and independent of it: a tool that
+        # bounded its own recurrence states that fact in typed metadata, and
+        # the engine is what writes it into the ledger.
+        self._relay_material_recurrence_marker(execution)
         memory = getattr(self, "loop_memory", None)
         if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
             return None
@@ -5407,6 +5411,85 @@ class ReActEngine(UIEventEmitter):
         # `decision.request_thinking` is LoopMemory's redirect signal. It has no
         # consumer in the single-executor loop; Plan 3 wires it to the advisor.
         return decision
+
+    # The third rung of the recurrence ladder (#42,
+    # docs/superpowers/specs/2026-08-13-material-recurrence-bound-design.md).
+    # A tool that has bounded its own recurrence reports the structured fact;
+    # only the engine writes run evidence, so only the engine renders and
+    # records the blocker — and retires it when the wall is released.
+    _MATERIAL_RECURRENCE_MARKER = "material_recurrence_bound"
+    _MATERIAL_RECURRENCE_RELEASE = "material_recurrence_released"
+
+    @staticmethod
+    def _material_recurrence_identity(marker: Mapping[str, Any]) -> str:
+        """The stable key of one bounded recurrence, inside the signature.
+
+        `(tool, error_code)` exactly as the bound counts it — never the paths
+        or the count, which keep growing while the same wall stands.
+        """
+        tool = str(marker.get("tool") or "").strip() or "unknown"
+        error_code = str(marker.get("error_code") or "").strip() or "UNKNOWN"
+        return f"material_recurrence_bound:{tool}:{error_code}"
+
+    def _material_recurrence_signature(self, marker: Mapping[str, Any]) -> str:
+        """Render the model-facing statement from the structured fact.
+
+        `failure_signature` is the only free-text field on a `BlockerRecord`
+        and the one the cumulative handoff prints, so the tool, the paths
+        already refused and the moves that remain are stated in it.
+        """
+        paths = [str(path) for path in marker.get("refused_executables") or () if str(path)]
+        moves = [str(move) for move in marker.get("remaining_moves") or () if str(move)]
+        count = marker.get("refusal_count")
+        return (
+            f"{self._material_recurrence_identity(marker)}: "
+            f"{count if count is not None else len(paths)} refusals for "
+            f"{', '.join(paths) or 'no named path'}; "
+            f"remaining moves: {' | '.join(moves) or 'none the harness can see'}"
+        )
+
+    def _relay_material_recurrence_marker(self, execution: ToolExecution) -> None:
+        """Write the tool's bounded-recurrence fact into engine-owned state."""
+        metadata = getattr(execution.result, "metadata", None) or {}
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return
+        machine = getattr(self, "phase_machine", None)
+
+        released = metadata.get(self._MATERIAL_RECURRENCE_RELEASE)
+        if isinstance(released, Mapping):
+            identity = self._material_recurrence_identity(released)
+            for blocker in state.blockers:
+                if blocker.status == "active" and blocker.failure_signature.startswith(identity):
+                    state.resolve_blocker(
+                        blocker.blocker_id,
+                        resolution=str(released.get("reason") or "").strip()
+                        or "the bounded registration succeeded",
+                        evidence_ref=execution.result.output_ref or None,
+                    )
+
+        marker = metadata.get(self._MATERIAL_RECURRENCE_MARKER)
+        if not isinstance(marker, Mapping):
+            return
+        identity = self._material_recurrence_identity(marker)
+        if any(
+            blocker.status == "active" and blocker.failure_signature.startswith(identity)
+            for blocker in state.blockers
+        ):
+            # The wall was already stated. A further first look at a new path
+            # can refuse again past the bound; it is the same wall.
+            return
+        refs = [str(ref) for ref in marker.get("evidence_refs") or () if str(ref).strip()]
+        if execution.result.output_ref:
+            refs.append(execution.result.output_ref)
+        state.record_blocker(
+            failure_signature=self._material_recurrence_signature(marker),
+            category="loop",
+            error_code="MATERIAL_RECURRENCE_BOUND",
+            evidence_refs=refs,
+            source_phase=getattr(machine, "current_phase", None),
+            source_attempt_id=getattr(machine, "current_attempt_id", None),
+        )
 
     def _observe_action_intent_progress(self, execution: ToolExecution) -> bool:
         """Advance completion epochs only for a real public experiment."""

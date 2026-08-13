@@ -1548,3 +1548,232 @@ def test_without_a_wrapper_the_refusal_still_routes_to_provision():
     assert any(
         "provision" in s and "maven" in s for s in (result.suggestions or [])
     ), "a refusal must name a call that can succeed"
+
+
+# ---------------------------------------------------------------------------
+# The third rung: a material action may not recur without bound (#42)
+# docs/superpowers/specs/2026-08-13-material-recurrence-bound-design.md §3
+# ---------------------------------------------------------------------------
+
+ROCKETMQ_WRAPPER = "/workspace/rocketmq-externals/mvnw"
+ROCKETMQ_PATHS = (
+    "/usr/share/maven/bin/mvn",
+    "/opt/maven/bin/mvn",
+    "/usr/bin/mvn",
+)
+
+
+class _OneRealMavenOrchestrator(FakeEnvOverlayOrchestrator):
+    """Every path the model guesses is absent except one real installation."""
+
+    real = "/opt/apache-maven-3.9.9/bin/mvn"
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append((command, workdir, timeout))
+        if self.real in command:
+            if command.startswith("realpath -e -- "):
+                return {"success": True, "output": f"{self.real}\n", "exit_code": 0}
+            if command.startswith("test -x "):
+                return {"success": True, "output": "EXISTS\n", "exit_code": 0}
+            if command.endswith(" -version"):
+                return {
+                    "success": True,
+                    "output": "Apache Maven 3.9.9\nMaven home: /opt/apache-maven-3.9.9",
+                    "exit_code": 0,
+                }
+        if command.startswith(("test -x ", "realpath -e -- ")) or command.endswith(" -version"):
+            return {"success": False, "output": "", "exit_code": 1}
+        if "mvnw" in command or "gradlew" in command:
+            return {"success": True, "output": "", "exit_code": 0}
+        if command.startswith("cat /workspace/.setup_agent/env_overlay.json"):
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": self.files.get("/workspace/.setup_agent/env_overlay.json", ""),
+            }
+        return {"success": True, "output": "", "exit_code": 0}
+
+
+def _refuse(tool, executable, *, name="maven"):
+    return tool.execute(action="register", tool=name, executable=executable, activate=True)
+
+
+def _bound_marker(result):
+    """The typed fact the tool states; the engine is what writes the ledger."""
+    return (result.metadata or {}).get("material_recurrence_bound")
+
+
+def test_the_third_identical_refusal_states_the_bound_naming_tool_paths_and_moves():
+    """§3: the first two refusals are ordinary; the third converts a known
+    hopeless repetition into a stated fact. rocketmq-externals refused ~689
+    times while the provision route rendered 5 times — more guidance was never
+    the missing piece. The tool states the fact; `RunEvidenceState` is written
+    by the engine alone (see tests/test_material_recurrence_bound.py)."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=ROCKETMQ_WRAPPER))
+
+    first = _refuse(tool, ROCKETMQ_PATHS[0])
+    second = _refuse(tool, ROCKETMQ_PATHS[0])
+    assert not first.succeeded and not second.succeeded
+    assert _bound_marker(first) is None and _bound_marker(second) is None
+
+    third = _refuse(tool, ROCKETMQ_PATHS[0])
+
+    assert not third.succeeded, "the result stays a refusal, never a synthesized success"
+    marker = _bound_marker(third)
+    assert marker["tool"] == "maven", "the fact names the tool"
+    assert marker["error_code"] == "ENV_EXECUTABLE_NOT_FOUND", "and the refused error code"
+    assert marker["refused_executables"] == [ROCKETMQ_PATHS[0]], "and the paths already refused"
+    assert marker["refusal_count"] == 3 and marker["bound"] == 3
+    moves = " ".join(marker["remaining_moves"])
+    assert ROCKETMQ_WRAPPER in moves, "and the wrapper move that remains"
+    assert "provision" in moves, "and the provision route that remains"
+    assert marker["evidence_refs"], "and the refusals it was computed from"
+
+
+def test_three_paths_for_one_tool_trip_the_bound_because_identity_is_not_the_path():
+    """The rocketmq shape: one tool, three Maven paths, one wall. A path-keyed
+    bound would never have fired, so identity is (tool, error_code)."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=ROCKETMQ_WRAPPER))
+
+    for path in ROCKETMQ_PATHS[:2]:
+        refusal = _refuse(tool, path)
+        assert not refusal.succeeded and _bound_marker(refusal) is None
+
+    third = _refuse(tool, ROCKETMQ_PATHS[2])
+
+    assert not third.succeeded
+    assert _bound_marker(third)["refused_executables"] == list(ROCKETMQ_PATHS)
+
+
+def test_three_refusals_across_three_different_tools_do_not_trip_the_bound():
+    """One refusal each for three tools is three separate first attempts, not
+    one wall; the bound is per (tool, error_code)."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
+
+    for name, path in (
+        ("maven", "/usr/bin/mvn"),
+        ("gradle", "/usr/bin/gradle"),
+        ("java", "/usr/bin/java"),
+    ):
+        refusal = _refuse(tool, path, name=name)
+        assert not refusal.succeeded
+        assert _bound_marker(refusal) is None
+
+
+def test_a_successful_registration_resets_the_counter_and_reports_the_release():
+    """§3: a later failure after a real success is new information, not the
+    same wall. A blocker left standing against a tool that now registers would
+    be a false statement in the ledger, so the success reports the release."""
+    orchestrator = _OneRealMavenOrchestrator()
+    tool = EnvTool(orchestrator)
+
+    for path in ROCKETMQ_PATHS:
+        assert not _refuse(tool, path).succeeded
+
+    registered = _refuse(tool, _OneRealMavenOrchestrator.real)
+
+    assert registered.succeeded is True
+    assert registered.metadata["material_recurrence_released"]["tool"] == "maven"
+    for path in ROCKETMQ_PATHS[:2]:
+        refusal = _refuse(tool, path)
+        assert not refusal.succeeded
+        assert _bound_marker(refusal) is None, "the successful registration restarted the count"
+
+    assert _bound_marker(_refuse(tool, ROCKETMQ_PATHS[2])), "three fresh refusals trip it again"
+
+
+def test_after_the_bound_a_path_already_refused_costs_no_further_container_probe():
+    """§4's fourth unit, with one premise corrected. §3 drops the probe because
+    "the probe cannot change its answer" — true of a path this identity already
+    refused, false of one never tried. So the identity owns the bound and the
+    count, and the paths it already refused are the ones that stop costing a
+    round trip."""
+    orchestrator = _MissingExecutableOrchestrator(wrapper=ROCKETMQ_WRAPPER)
+    tool = EnvTool(orchestrator)
+
+    for path in ROCKETMQ_PATHS:
+        assert not _refuse(tool, path).succeeded
+    probes = len(orchestrator.commands)
+
+    bounded = _refuse(tool, ROCKETMQ_PATHS[0])
+
+    assert len(orchestrator.commands) == probes, "a refused path is never re-probed"
+    assert bounded.succeeded is False, "the model is never told an action succeeded"
+    assert bounded.error_code == "ENV_REFUSAL_BOUND_REACHED"
+    named = " ".join(bounded.suggestions or [])
+    assert ROCKETMQ_WRAPPER in named and "provision" in named, "the moves that remain are named"
+    assert _bound_marker(bounded)["refused_executables"] == list(ROCKETMQ_PATHS)
+
+
+def test_a_trailing_slash_is_not_a_new_path():
+    """The suppression is about the path, not the spelling of it; a trailing
+    slash must not buy another round trip to the same answer."""
+    orchestrator = _MissingExecutableOrchestrator(wrapper=None)
+    tool = EnvTool(orchestrator)
+
+    for path in ROCKETMQ_PATHS:
+        assert not _refuse(tool, path).succeeded
+    probes = len(orchestrator.commands)
+
+    respelled = _refuse(tool, f"{ROCKETMQ_PATHS[0]}/")
+
+    assert len(orchestrator.commands) == probes
+    assert respelled.error_code == "ENV_REFUSAL_BOUND_REACHED"
+
+
+def test_a_new_path_past_the_bound_is_probed_once_and_still_states_one_wall():
+    """The complement of the rule above: a path never tried is probed, because
+    the harness has no evidence about it. It restates the same identity, which
+    is why the engine — not the tool — owns the record-once decision."""
+    orchestrator = _MissingExecutableOrchestrator(wrapper=None)
+    tool = EnvTool(orchestrator)
+
+    for path in ROCKETMQ_PATHS:
+        assert not _refuse(tool, path).succeeded
+    probes = len(orchestrator.commands)
+
+    refused = _refuse(tool, "/usr/local/bin/mvn")
+
+    assert len(orchestrator.commands) > probes, "an untried path is never refused unseen"
+    assert refused.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    marker = _bound_marker(refused)
+    assert marker["tool"] == "maven" and marker["error_code"] == "ENV_EXECUTABLE_NOT_FOUND"
+
+
+class _GradleWrapperOrchestrator(FakeEnvOverlayOrchestrator):
+    """No system gradle; the project's own wrapper is on disk and runs."""
+
+    wrapper = "/workspace/tapestry-5/gradlew"
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append((command, workdir, timeout))
+        if command.startswith("find /workspace") and "gradlew" in command:
+            return {"success": True, "output": f"{self.wrapper}\n", "exit_code": 0}
+        if self.wrapper in command:
+            return {"success": True, "output": "EXISTS\n", "exit_code": 0}
+        if command.startswith(("test -x ", "realpath -e -- ")) or command.endswith(" -version"):
+            return {"success": False, "output": "", "exit_code": 1}
+        if command.startswith("cat /workspace/.setup_agent/env_overlay.json"):
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": self.files.get("/workspace/.setup_agent/env_overlay.json", ""),
+            }
+        return {"success": True, "output": "", "exit_code": 0}
+
+
+def test_the_bound_still_probes_the_wrapper_the_refusal_itself_recommends():
+    """The anti-deadlock fence §3 needs to stay coherent: rung 1 promises every
+    refusal names a productive move, and the bound may not then refuse that
+    move unseen. A run that recovers by another route is never cut short."""
+    orchestrator = _GradleWrapperOrchestrator()
+    tool = EnvTool(orchestrator)
+
+    for _ in range(3):
+        assert not _refuse(tool, "/usr/bin/gradle", name="gradle").succeeded
+    assert _bound_marker(_refuse(tool, "/usr/bin/gradle", name="gradle"))
+
+    recovered = _refuse(tool, _GradleWrapperOrchestrator.wrapper, name="gradle")
+
+    assert recovered.succeeded is True, "the recommended move is still available past the bound"
+    assert recovered.metadata["material_recurrence_released"]["tool"] == "gradle"

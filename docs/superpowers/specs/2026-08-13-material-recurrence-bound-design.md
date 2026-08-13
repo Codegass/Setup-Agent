@@ -76,8 +76,26 @@ have fired.
 - a typed blocker is recorded once in `RunEvidenceState`, naming the tool, the
   paths already refused, and the moves that remain (the project's wrapper when
   one was found, and the provision route);
-- the tool stops re-probing the container for that identity. The probe cannot
-  change its answer and the round trip is pure cost.
+- the tool stops re-probing the container for the paths that identity has
+  already refused. The probe cannot change its answer for those, and the round
+  trip is pure cost.
+
+> **Correction (2026-08-13, found in implementation).** This clause first read
+> "stops re-probing for that identity", which deadlocks the run. After the
+> bound, `env register tool=maven <anything>` would be refused unseen —
+> including the project wrapper the same refusal recommends first, and
+> including a path a successful provision just installed. The reset below
+> ("when a registration for that tool succeeds") then becomes unreachable, and
+> nothing else resolves the blocker. That contradicts both this spec's own
+> "a run that recovers by another route is never cut short" and rung 1's
+> promise that a refusal names a move that can succeed.
+>
+> The bound and the count stay keyed on `(tool, error_code)` — that is what
+> makes rocketmq's three paths trip it. Only the probe suppression is
+> path-scoped, because "the probe cannot change its answer" is true of a path
+> already refused and false of one never tried. On the D2 shape this still
+> removes 686 of the 689 round trips; a first look at a new path is probed
+> once, joins the refused set, and does not restate the wall.
 
 **What does NOT change:** no phase is force-closed and no action is
 synthesized. The blocker makes the state legible; the existing convergence

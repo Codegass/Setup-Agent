@@ -10,6 +10,10 @@ import shlex
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
+# The one recurrence cap this harness has agreed on. Named here so a second
+# bound cannot invent a second number and drift away from it.
+COMPLETION_CLAIM_CAP = 3
+
 _STATE_SCOPES = (
     "environment",
     "dependencies",
@@ -447,7 +451,12 @@ def _is_recurrence_candidate(event: LoopEvent, outcome: OutcomeKey) -> bool:
 class LoopMemory:
     """Detect recurrence only when the action outcome and relevant state agree."""
 
-    def __init__(self, *, diversity_threshold: int = 16, completion_claim_cap: int = 3) -> None:
+    def __init__(
+        self,
+        *,
+        diversity_threshold: int = 16,
+        completion_claim_cap: int = COMPLETION_CLAIM_CAP,
+    ) -> None:
         self.diversity_threshold = int(diversity_threshold)
         if self.diversity_threshold <= 0:
             raise ValueError("diversity threshold must be positive")
