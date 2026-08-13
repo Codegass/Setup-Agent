@@ -25,6 +25,20 @@ _GREP_FOUND_NOTHING = 1
 _GREP_CAPPED_BY_HEAD = 141
 _DIAGNOSTIC_QUOTE_LIMIT = 400
 
+# `find` reports 0 when it walked everything it was given, >0 when some part of
+# the walk failed — it says nothing about whether anything matched, so for the
+# name form an empty stdout under exit 0 is the found-nothing answer.
+_FIND_TRAVERSED = 0
+_FIND_CAPPED_BY_HEAD = 141
+# Shallow on purpose: build files sit at the root or one or two modules down,
+# and an unbounded walk of a checked-out repo is the kind of command that hangs.
+NAME_SEARCH_MAX_DEPTH = 4
+_NAME_GLOB_SEPARATOR = "|"
+# Metacharacters that mean something in an extended regex and are LITERAL in a
+# name glob. `.` is excluded: it is literal in both and is in half the filenames
+# anyone would look for.
+_REGEX_ONLY_METACHARACTERS = "^$()+\\"
+
 
 class SearchTool(BaseTool):
     def __init__(
@@ -38,9 +52,19 @@ class SearchTool(BaseTool):
             name="search",
             description=(
                 "Search stored outputs, files, background-job logs, or the web. "
-                "target: ref id (e.g. 'output_5b9a') | 'file:<path>' | 'job:<id>' | 'web:<query>'. "
-                "A 'file:' path may be a file or a directory (searched recursively). "
-                "pattern: extended regular expression, grep -E (ignored for web); "
+                "target: ref id (e.g. 'output_5b9a') | 'file:<path>' | 'name:<dir>' "
+                "| 'job:<id>' | 'web:<query>'. "
+                "'file:' greps file CONTENTS (a file, or a directory searched "
+                "recursively): it matches text INSIDE files, so it cannot report "
+                "whether a file exists. "
+                "'name:' matches file and directory NAMES under <dir>, to depth "
+                f"{NAME_SEARCH_MAX_DEPTH}, and never reads file content: this is the "
+                "form that establishes whether a path such as gradlew or pom.xml is "
+                "on disk. "
+                "pattern: for 'file:' and ref ids an extended regular expression "
+                "(grep -E); for 'name:' one or more shell globs separated by "
+                f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew'), "
+                "matched against the name alone; ignored for web; "
                 "for a ref id, omit pattern to read the stored output itself."
             ),
         )
@@ -53,6 +77,8 @@ class SearchTool(BaseTool):
         target = (target or "").strip()
         if target.startswith("file:"):
             return self._grep_container(target[5:], pattern, max_results)
+        if target.startswith("name:"):
+            return self._find_by_name(target[5:], pattern, max_results)
         if target.startswith("job:"):
             return self._poll_job(target[4:])
         if target.startswith("web:"):
@@ -72,7 +98,8 @@ class SearchTool(BaseTool):
             error="unknown target",
             suggestions=[
                 "Use a ref id from a tool result (e.g. 'output_5b9a')",
-                "Use 'file:/workspace/...' to grep a file in the container",
+                "Use 'file:/workspace/...' to grep the CONTENTS of a file in the container",
+                "Use 'name:/workspace/...' to find a file by NAME under a directory",
                 "Use 'job:<id>' to grep a background job log",
                 "Use 'web:<query>' for a web search",
             ],
@@ -229,6 +256,110 @@ class SearchTool(BaseTool):
             )
         return self._search_failed(path, pattern, exit_code, diagnostic or stdout)
 
+    def _find_by_name(self, path: str, pattern: str, max_results: int) -> ToolResult:
+        """Find files by NAME under a directory — the question `file:` cannot answer.
+
+        `file:` greps CONTENTS, so a filename it never sees written inside a
+        file does not exist as far as it is concerned.  In D2 a model asked
+        which build system a project used by grepping the project directory for
+        `(^|/)build\\.gradle$|...|(^|/)gradlew$`, got a truthful "no matches",
+        and concluded tapestry-5 had no build files while `build.gradle` and
+        `gradlew` sat on disk.  Nothing on this tool could have answered it.
+
+        Carried on the `target=` prefix rather than a separate `by_name=`
+        parameter: the tool already routes on that prefix, so the forms stay
+        mutually exclusive by construction — no `web:` query can be asked to
+        match names, and the model has one thing to get right (which prefix)
+        instead of two (prefix and flag).  The tool list stays the size it is,
+        which is why a new registered tool was not an option either (#19).
+
+        Bounded three ways, like `_grep_container`: a shallow `-maxdepth`, a
+        `head` cap, and the transport timeout.  There is no `-exec`, so nothing
+        here can outlive the walk.
+        """
+
+        limit = max(1, int(max_results))
+        globs = [
+            glob.strip() for glob in (pattern or "*").split(_NAME_GLOB_SEPARATOR) if glob.strip()
+        ] or ["*"]
+        # `-name` matches the NAME component only, which is the whole point;
+        # alternation is spelled `-o` because a glob has no `|`.
+        expression = " -o ".join(f"-name {shlex.quote(glob)}" for glob in globs)
+        # Same pipeline discipline as the grep path: `head` is last, so without
+        # `pipefail` the pipeline reports head's 0 and a failed walk reads as a
+        # successful one — and for THIS form an exit 0 with no output is the
+        # found-nothing verdict, so that mistake would manufacture exactly the
+        # false "it is not there" this form exists to prevent.
+        command = (
+            "set -o pipefail; "
+            f"find {shlex.quote(path)} -maxdepth {NAME_SEARCH_MAX_DEPTH} "
+            f"{shlex.quote('(')} {expression} {shlex.quote(')')} -print "
+            f"| head -{limit}"
+        )
+        result = self.docker_orchestrator.execute_command(command, workdir=None, timeout=60)
+
+        exit_code = result.get("exit_code")
+        stdout = self._stream(result, "stdout")
+        diagnostic = self._stream(result, "stderr")
+        suggestions = [
+            f"Confirm the directory exists and is readable: {path}",
+            "pattern is one or more shell globs separated by "
+            f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew'); "
+            "use 'file:<path>' to search file CONTENTS instead",
+        ]
+        if command_did_not_run(result) or exit_code not in (
+            _FIND_TRAVERSED,
+            _FIND_CAPPED_BY_HEAD,
+        ):
+            return self._search_failed(
+                path, pattern, exit_code, diagnostic or stdout, suggestions=suggestions
+            )
+
+        lines = [line for line in stdout.splitlines() if line.strip()][:limit]
+        facts = {
+            "target": path,
+            "pattern": pattern,
+            "matched": bool(lines),
+            "max_depth": NAME_SEARCH_MAX_DEPTH,
+        }
+        if not lines:
+            # The walk succeeded and it was BOUNDED: "not within this depth" is
+            # the honest claim, "not in this tree" is not one this can make.
+            return ToolResult.completed_success(
+                output=(
+                    f"No file or directory named {pattern!r} under {path} "
+                    f"(searched to depth {NAME_SEARCH_MAX_DEPTH})"
+                    + self._glob_vocabulary_note(pattern)
+                ),
+                facts=facts,
+            )
+        capped = len(lines) >= limit
+        facts["capped_at_max_results"] = capped
+        return ToolResult.completed_success(
+            output="\n".join(lines)
+            + (f"\n... [capped at {limit} results; more may exist]" if capped else ""),
+            facts=facts,
+        )
+
+    @staticmethod
+    def _glob_vocabulary_note(pattern: str) -> str:
+        """Say which vocabulary just failed to match, when the shape suggests a regex.
+
+        A regular expression handed to this form yields a TRUE no-match — no
+        file is named `(^|/)gradlew$` — that answers a different question than
+        the one asked.  Truthful and misleading is the failure mode this tool
+        was fixed for once already; the verdict stands, the reason goes with it.
+        """
+
+        if not any(char in (pattern or "") for char in _REGEX_ONLY_METACHARACTERS):
+            return ""
+        return (
+            "\n[pattern was matched as a shell glob against the name alone: "
+            f"{' '.join(_REGEX_ONLY_METACHARACTERS)} are literal characters here, "
+            "and a '/' can never match. 'file:<path>' is the form that takes an "
+            "extended regular expression]"
+        )
+
     @staticmethod
     def _stream(result: Any, name: str) -> str:
         """Read one demuxed stream, falling back to the combined output.
@@ -248,6 +379,7 @@ class SearchTool(BaseTool):
         pattern: str,
         exit_code: Any,
         diagnostic: str,
+        suggestions: list[str] | None = None,
     ) -> ToolResult:
         """The search itself failed: say what failed, and claim nothing about matches."""
 
@@ -263,7 +395,8 @@ class SearchTool(BaseTool):
             error_code=SEARCH_FAILED,
             # No `matched` verdict exists: the search never produced one.
             facts={"target": path, "pattern": pattern, "matched": None},
-            suggestions=[
+            suggestions=suggestions
+            or [
                 f"Confirm the path exists (a directory target is searched recursively): {path}",
                 "pattern is an extended regular expression: escape ( ) | + ? { } "
                 "to match them literally",
@@ -285,12 +418,22 @@ class SearchTool(BaseTool):
                 "target": {
                     "type": "string",
                     "description": (
-                        "ref id | file:<path> (file or directory) | job:<id> | web:<query>"
+                        "ref id "
+                        "| file:<path> greps file CONTENTS (file, or directory searched "
+                        "recursively) and cannot report whether a file exists "
+                        f"| name:<dir> matches file and directory NAMES under <dir> to "
+                        f"depth {NAME_SEARCH_MAX_DEPTH}, reading no content "
+                        "| job:<id> | web:<query>"
                     ),
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "extended regular expression, grep -E (ignored for web)",
+                    "description": (
+                        "file:/ref id -> extended regular expression, grep -E; "
+                        "name: -> shell globs separated by "
+                        f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew') "
+                        "matched against the name alone; ignored for web"
+                    ),
                 },
                 "max_results": {"type": "integer", "default": 50},
             },
