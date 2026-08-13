@@ -516,8 +516,16 @@ class EnvTool(BaseTool):
             # ships — tapestry-5 had gradlew on disk while the model burned its
             # run on a nonexistent /usr/bin/gradle.
             moves.append(
-                f"This project ships its own {named_tool} wrapper at {wrapper} — "
-                f"register that instead of a system path."
+                # NOT offered as a registration: both build tools already prefer
+                # the wrapper on their own (maven_tool runs ./mvnw when
+                # use_wrapper is unset; gradle_tool defaults to it), and the
+                # Maven canonicalizer refuses any executable not named `mvn`.
+                # "Register the wrapper" was therefore unnecessary for Gradle
+                # and impossible for Maven — naming a move that does not serve
+                # the goal is the #19 defect class, in guidance I wrote myself.
+                f"This project ships its own {named_tool} wrapper at {wrapper}, and the "
+                f"build tool already uses it — dispatch the build instead of "
+                f"registering a runtime."
             )
         if registered:
             moves.append(

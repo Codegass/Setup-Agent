@@ -1526,9 +1526,16 @@ def test_a_missing_executable_names_the_projects_own_wrapper_first():
     )
 
     assert not result.succeeded and result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
-    assert "/workspace/tapestry-5/gradlew" in (result.suggestions or [None])[0], (
-        "the wrapper is named, and named first"
-    )
+    first = (result.suggestions or [None])[0]
+    assert "/workspace/tapestry-5/gradlew" in first, "the wrapper is named, and named first"
+    # Premise corrected 2026-08-13: telling the model to REGISTER the wrapper
+    # proposed a call that does not serve the goal (#19's defect class). Both
+    # build tools already prefer the project's wrapper automatically —
+    # maven_tool runs ./mvnw when use_wrapper is unset, gradle_tool defaults to
+    # the wrapper — and env registration of mvnw is refused outright by the
+    # canonicalizer. The productive move is to dispatch the build.
+    assert "instead of registering" in first.lower(), "it redirects AWAY from registration"
+    assert "dispatch the build" in first.lower(), "and names the move that exists"
 
 
 def test_without_a_wrapper_the_refusal_still_routes_to_provision():
