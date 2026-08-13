@@ -425,6 +425,15 @@ class NoProgressGuard:
         return self._stagnant >= self.threshold
 
 
+# Transport-persist failures the run can outlive by closing the phase
+# honestly (spec 2026-08-13 transient containment). Integrity failures —
+# gate_decision_persist_failed, repair_context_projection_invalid, the
+# barrier and dispatch families — are deliberately NOT here.
+_CONTAINED_CONTROL_PERSIST_CODES = frozenset(
+    {"repair_assessment_persist_failed", "repair_context_transport_unavailable"}
+)
+
+
 class ReActEngine(UIEventEmitter):
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
@@ -2024,6 +2033,61 @@ class ReActEngine(UIEventEmitter):
             report_delivery_status=self._report_delivery_status(),
         )
 
+    # Provider errors that a retry can plausibly outlive. Anything not
+    # listed — BadRequestError reproduces byte-for-byte (the 2026-08-09
+    # wire-schema incident), auth and context-window errors likewise — stays
+    # deterministic, fail-closed (spec 2026-08-13 transient containment).
+    _TRANSIENT_PROVIDER_ERRORS = (
+        "InternalServerError",
+        "ServiceUnavailableError",
+        "RateLimitError",
+        "APIConnectionError",
+        "Timeout",
+    )
+    _NATIVE_TURN_BACKOFF_SECONDS = (5.0, 15.0, 45.0)
+
+    @staticmethod
+    def _is_transient_provider_error(exc: BaseException) -> bool:
+        import litellm
+
+        for name in ReActEngine._TRANSIENT_PROVIDER_ERRORS:
+            cls = getattr(litellm, name, None)
+            if isinstance(cls, type) and isinstance(exc, cls):
+                return True
+        return False
+
+    def _native_turn_with_retry(self, messages, *, sleep=None):
+        """One native turn, riding out transient provider failures.
+
+        Bounded at three retries with 5/15/45s backoff (~65s worst case
+        against a 7,200s wall clock; the wall guard still runs first every
+        iteration, so retrying can never extend a run past its cap). A
+        deterministic error propagates immediately; exhaustion propagates the
+        last error with the attempt count logged, so the abort that follows
+        stays honest — it just stops being trigger-happy.
+        """
+        import time as _time
+
+        wait = sleep if callable(sleep) else _time.sleep
+        attempts = 1 + len(self._NATIVE_TURN_BACKOFF_SECONDS)
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.llm_client.get_native_turn(messages)
+            except Exception as exc:
+                if not self._is_transient_provider_error(exc) or attempt >= attempts:
+                    if attempt > 1:
+                        getattr(self, "agent_logger", logger).error(
+                            f"Native turn failed after {attempt} attempts: {exc}"
+                        )
+                    raise
+                delay = self._NATIVE_TURN_BACKOFF_SECONDS[attempt - 1]
+                getattr(self, "agent_logger", logger).warning(
+                    f"Transient provider error (attempt {attempt}/{attempts}), "
+                    f"retrying in {delay:.0f}s: {exc}"
+                )
+                wait(delay)
+        raise RuntimeError("unreachable: retry loop returns or raises")
+
     def abort(self, *, reason: str) -> RunTermination:
         machine = getattr(self, "phase_machine", None)
         if machine is None:
@@ -3324,10 +3388,14 @@ class ReActEngine(UIEventEmitter):
 
                 messages = render_messages(system_prompt, self.steps)
                 try:
-                    turn = self.llm_client.get_native_turn(messages)
+                    turn = self._native_turn_with_retry(messages)
                 except Exception as exc:
                     # `get_native_turn` propagates provider errors instead of
-                    # swallowing them the way `get_response` did.
+                    # swallowing them the way `get_response` did. Transient
+                    # classes were already retried with backoff (spec
+                    # 2026-08-13: one 5xx aborted D2 tapestry-5 two turns
+                    # after the model had self-corrected); what reaches here
+                    # is deterministic or exhausted, and the abort is honest.
                     logger.error(f"Native executor request failed: {exc}")
                     self._export_token_usage_csv()
                     if phase_mode:
@@ -4533,6 +4601,75 @@ class ReActEngine(UIEventEmitter):
             },
         )
 
+    def _close_phase_for_control_persist_exhaustion(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+        event: CompletionClaimEvent,
+    ) -> bool:
+        """Contain a transport-persist exhaustion as an honest phase close.
+
+        D2 rocketmq: `repair_assessment_persist_failed` aborted the RUN while
+        the model's blocked claim was factually correct. The fail-closed core
+        stands — the judge's ceiling could not be made durable, so the phase
+        must not continue — but the phase ENDING is the containment: no
+        further model turn can exceed an un-persisted ceiling in a phase that
+        no longer exists (spec 2026-08-13 §3). The run then routes like any
+        blocked phase: dependents skip, evidence closes, the report delivers.
+        Integrity families never reach here (fenced by
+        `_CONTAINED_CONTROL_PERSIST_CODES`).
+        """
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if machine is None or state is None or state.sealed or machine.is_complete:
+            return False
+        refs = tuple(gate.evidence_refs)
+        state.record_blocker(
+            failure_signature=(
+                f"control_persist_exhausted:{machine.current_attempt_id}:{event.blocker_id}"
+            ),
+            category="harness_control",
+            error_code=event.blocker_id,
+            evidence_refs=refs,
+            source_phase=machine.current_phase,
+            source_attempt_id=machine.current_attempt_id,
+        )
+        honest_claim = PhaseClaim(
+            phase=machine.current_phase,
+            signal="blocked",
+            claimed_outcome=PhaseOutcome.UNKNOWN,
+            reason=(
+                "controller could not persist the judge-owned repair context; "
+                "the phase closes rather than continue without a durable ceiling"
+            ),
+            evidence_refs=refs,
+        )
+        honest_gate = validate_phase_claim(
+            honest_claim,
+            gate.validator_state,
+            reason=f"{event.blocker_id}; {gate.reason}",
+            evidence_refs=refs,
+            code=event.blocker_id,
+            validated_facts=gate.validated_facts,
+            control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
+            blocker_owner=BlockerOwner.HARNESS,
+        )
+        self._emit_control_gate(honest_claim, honest_gate)
+        self._record_gate_facts(honest_claim.phase, honest_gate)
+        record = machine.close_attempt(honest_gate)
+        route = self.transition_policy.decide(
+            record,
+            state=state,
+            budgets=self._repair_budgets(),
+        )
+        self._pending_repair_context = None
+        self._apply_phase_decision(record, route)
+        getattr(self, "agent_logger", logger).warning(
+            f"Contained control-persist exhaustion ({event.blocker_id}): "
+            f"closed {honest_claim.phase} blocked instead of aborting the run"
+        )
+        return True
+
     def _close_phase_for_agent_no_progress(
         self,
         claim: PhaseClaim,
@@ -4799,6 +4936,8 @@ class ReActEngine(UIEventEmitter):
                 # promised recovery unreachable (live lp-dbcp-rates,
                 # 2026-08-10).
                 return False
+            if event.blocker_id in _CONTAINED_CONTROL_PERSIST_CODES:
+                return self._close_phase_for_control_persist_exhaustion(claim, gate, event)
             self._mark_harness_control_failure(event.blocker_id, event)
             return True
         if decision.decision == "agent_no_progress":
