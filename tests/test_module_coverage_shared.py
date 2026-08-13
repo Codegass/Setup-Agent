@@ -664,33 +664,110 @@ def test_build_grain_rates_type_their_absences():
 
 
 # ---------------------------------------------------------------------------
-# A module scan contradicted by physical output is not a zero
+# A DEGENERATE module scan is not a zero — but a measured one is
 # ---------------------------------------------------------------------------
 
 
-def test_a_module_scan_of_none_beside_real_classes_is_a_contradiction():
+def _measured_rows(count, *, class_count=0):
+    """Rows a scan actually measured: it looked in each module and counted."""
+    return [
+        {
+            "path": f"m{i}",
+            "class_count": class_count,
+            "build_status": "unknown",
+            "build_source": "none",
+        }
+        for i in range(count)
+    ]
+
+
+def test_a_module_scan_far_smaller_than_the_declaration_is_a_contradiction():
     """D2 2026-08-12: kafka compiled 11,421 classes and the physical oracle
     judged the build partial, yet the module scan reported 0 built of a
-    denominator of 2 — for a Gradle project with dozens of subprojects. The
-    derived word's rule (modules `none` -> failed) then overrode the oracle and
-    sealed `failed`.
+    denominator of 2 — for a Gradle build declaring 41 subprojects centrally.
+    The derived word's rule (modules `none` -> failed) then overrode the oracle
+    and sealed `failed`.
 
-    Two independent physical observations disagreeing is a contradiction, not
-    a measurement of zero, and P4 forbids resolving it into the harsher verdict
-    by default. The grain states the contradiction and raises its conflict."""
+    Premise updated: the trigger is the SCAN's own degeneracy (2 enumerated of
+    41 declared), not "class files exist" — a project-wide .class census also
+    counts checked-in test fixtures, so keying on it masked genuine failures.
+    A scan that missed most of the build is not a measurement of zero."""
     from sag.agent.module_coverage import (
         MODULE_SCAN_CONTRADICTED_CONFLICT,
         build_grain_rates,
     )
 
-    coverage = {"summary": {"modules_total": 2, "modules_built": 0}}
-    grains, conflicts = build_grain_rates(
-        coverage, compiled_classes=11421, source_files=1319
-    )
+    coverage = {
+        "summary": {"modules_total": 2, "modules_built": 0, "modules_declared": 41},
+        "modules": _measured_rows(2),
+    }
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=11421, source_files=1319)
 
     assert grains["modules"].band == "unavailable"
-    assert "11421" in (grains["modules"].reason or ""), "the contradicting count is named"
+    reason = grains["modules"].reason or ""
+    assert "41" in reason and "2" in reason, "the degeneracy is named, not just asserted"
     assert conflicts == (MODULE_SCAN_CONTRADICTED_CONFLICT,)
+
+
+def test_a_scan_that_measured_no_module_at_all_is_a_contradiction():
+    """The other degeneracy: rows exist but every one is unmeasured (the class
+    probe failed, no receipt spoke for it). Nothing there says zero either."""
+    from sag.agent.module_coverage import (
+        MODULE_SCAN_CONTRADICTED_CONFLICT,
+        build_grain_rates,
+    )
+
+    coverage = {
+        "summary": {"modules_total": 3, "modules_built": 0},
+        "modules": _measured_rows(3, class_count=None),
+    }
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=1418, source_files=900)
+
+    assert grains["modules"].band == "unavailable"
+    assert conflicts == (MODULE_SCAN_CONTRADICTED_CONFLICT,)
+
+
+def test_a_reactor_that_failed_every_module_is_a_measurement_not_a_blind_scan():
+    """A reactor row legitimately carries no class count — no disk scan matched
+    it — yet Maven itself stated the outcome. That is a measurement, so 0 of 51
+    stays `none` even in a repo shipping .class fixtures."""
+    from sag.agent.module_coverage import build_grain_rates
+
+    coverage = {
+        "summary": {"modules_total": 51, "modules_built": 0},
+        "modules": [
+            {
+                "path": "",
+                "class_count": None,
+                "build_status": "failure",
+                "build_source": "reactor",
+            }
+            for _ in range(51)
+        ],
+    }
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=37, source_files=4100)
+
+    assert grains["modules"].band == "none"
+    assert conflicts == ()
+
+
+def test_checked_in_class_fixtures_do_not_mask_a_genuinely_failed_build():
+    """The mirror image of the kafka misgrade, and the test the earlier fix
+    could not write: `compiled_classes` is a project-wide `find -name '*.class'`
+    that counts CHECKED-IN .class fixtures. Keyed on that census, a repo that
+    ships fixtures and then fails every module banded `unavailable` and sealed
+    PARTIAL. The scan here measured all 51 modules and found nothing: that is a
+    zero, and the verdict may say failed."""
+    from sag.agent.module_coverage import build_grain_rates
+
+    coverage = {
+        "summary": {"modules_total": 51, "modules_built": 0, "modules_declared": 51},
+        "modules": _measured_rows(51),
+    }
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=37, source_files=4100)
+
+    assert grains["modules"].band == "none"
+    assert conflicts == ()
 
 
 def test_a_genuinely_empty_build_still_bands_none():
@@ -705,15 +782,89 @@ def test_a_genuinely_empty_build_still_bands_none():
     assert conflicts == ()
 
 
+def test_a_census_that_counted_zero_makes_even_a_degenerate_scan_a_none():
+    """A degenerate scan states nothing — but a census that positively counted
+    ZERO class files anywhere in the tree corroborates the zero independently,
+    so there is no contradiction left to state."""
+    from sag.agent.module_coverage import build_grain_rates
+
+    coverage = {
+        "summary": {"modules_total": 2, "modules_built": 0, "modules_declared": 41},
+        "modules": _measured_rows(2),
+    }
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=0, source_files=1319)
+
+    assert grains["modules"].band == "none"
+    assert conflicts == ()
+
+
+def test_an_honest_kafka_fraction_is_never_touched_by_the_guard():
+    """With the enumeration taught the settings.gradle include list, the kafka
+    shape produces a real fraction (38 of 41 built) and the guard — now a rare
+    fallback — must leave it exactly as measured."""
+    from sag.agent.module_coverage import build_grain_rates
+
+    coverage = {
+        "summary": {"modules_total": 41, "modules_built": 38, "modules_declared": 41},
+        "modules": _measured_rows(41, class_count=120),
+    }
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=11421, source_files=13190)
+
+    assert grains["modules"].payload() == {
+        "rate": 92.7,
+        "band": "most",
+        "numerator": 38,
+        "denominator": 41,
+    }
+    assert conflicts == ()
+
+
 def test_the_contradicted_grain_cannot_manufacture_a_failed_word():
+    """Premise updated with its sibling above: the contradiction is now keyed on
+    the degenerate scan (2 enumerated of 41 declared)."""
     from sag.agent.module_coverage import build_grain_rates
     from sag.verdict_rates import GrainRate, derived_verdict_word
 
     grains, _ = build_grain_rates(
-        {"summary": {"modules_total": 2, "modules_built": 0}},
+        {
+            "summary": {"modules_total": 2, "modules_built": 0, "modules_declared": 41},
+            "modules": _measured_rows(2),
+        },
         compiled_classes=11421,
         source_files=1319,
     )
 
     # Kafka's real shape: contradicted modules, no tests driven.
     assert derived_verdict_word(grains["modules"], GrainRate(0, 20497)) == "partial"
+
+
+def test_module_coverage_states_how_many_modules_the_build_declared():
+    """The scan carries the DECLARED count to the summary, so a reader can tell
+    a small project (2 of 2) from a blind scan (2 of 41)."""
+    validator = FakeValidator(
+        primary="gradle",
+        by_system={
+            "gradle": [
+                {
+                    "path": ".",
+                    "name": ".",
+                    "class_count": 0,
+                    "jar_count": 0,
+                    "report_dirs": [],
+                    "has_test_sources": False,
+                    "declared_modules": 41,
+                },
+                {
+                    "path": "clients",
+                    "name": "clients",
+                    "class_count": 1200,
+                    "jar_count": 1,
+                    "report_dirs": [],
+                    "has_test_sources": True,
+                    "declared_modules": 41,
+                },
+            ]
+        },
+    )
+    coverage = module_coverage(validator, "kafka")
+    assert coverage["summary"]["modules_declared"] == 41

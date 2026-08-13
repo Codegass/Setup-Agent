@@ -266,8 +266,19 @@ def module_coverage(validator, project_name) -> dict[str, Any] | None:
             build_error_samples={},
             generated_at="coverage",
         )
+        summary = dict(metrics.get("module_summary") or {})
+        # What the build DECLARED, beside what the scan enumerated. Carried by
+        # the scan records (`scan_modules` stamps the settings.gradle include
+        # count) so the two numbers come from ONE walk, and a reader downstream
+        # can tell a genuinely small project from a scan that never looked.
+        declared = max(
+            (int(module.get("declared_modules") or 0) for module in merged.values()),
+            default=0,
+        )
+        if declared:
+            summary["modules_declared"] = declared
         return {
-            "summary": metrics.get("module_summary") or {},
+            "summary": summary,
             "modules": metrics.get("modules") or [],
             "project_dir": project_dir,
         }
@@ -321,10 +332,36 @@ def _island_checklist_line(
     return line
 
 
-# A module scan that attributes nothing while class files exist is neither a
-# zero nor an absence: it is two physical observations disagreeing, and the
-# verdict must see the disagreement rather than the harsher of the two.
+# A module scan that never looked at most of the build is neither a zero nor an
+# absence: its `0 built` and the class files on disk are two physical
+# observations disagreeing, and the verdict must see the disagreement rather
+# than the harsher of the two.
 MODULE_SCAN_CONTRADICTED_CONFLICT = "module_scan_contradicts_physical_build"
+
+
+def _degenerate_scan(coverage: dict[str, Any] | None) -> str:
+    """Why this scan's zero is not a measurement — "" when it is one.
+
+    Degeneracy is a property of the SCAN, stated by the scan's own records:
+    either it enumerated far fewer modules than the build declares, or it
+    measured nothing about any module it did enumerate. Both are "we did not
+    look", which no count of zero can be read out of.
+    """
+    summary = (coverage or {}).get("summary") or {}
+    total = int(summary.get("modules_total") or 0)
+    declared = int(summary.get("modules_declared") or 0)
+    if declared > total:
+        return f"the scan enumerated {total} of the {declared} modules the build declares"
+    rows = (coverage or {}).get("modules") or []
+    # A row is measured when it carries a class count OR a build outcome some
+    # receipt stated (a reactor row legitimately has no class count and still
+    # reports a real failure — that IS a measurement, and camel's 0/51 is it).
+    if rows and all(
+        row.get("class_count") is None and str(row.get("build_source") or "none") == "none"
+        for row in rows
+    ):
+        return f"no scanned module of {total} carries a measurement"
+    return ""
 
 
 def build_grain_rates(
@@ -345,20 +382,29 @@ def build_grain_rates(
     conflicts: tuple[str, ...] = ()
     if total > 0:
         built = int(summary.get("modules_built") or 0)
-        if built == 0 and (compiled_classes or 0) > 0:
-            # Two independent physical observations disagree: the scan attributes
-            # nothing while class files sit on disk (live D2 kafka: 0 of 2 modules
-            # beside 11,421 classes, on a Gradle build with dozens of
-            # subprojects). A contradiction is not a measurement of zero, and
-            # resolving it silently into `none` let the derived word override the
-            # physical oracle and seal `failed`.
+        degenerate = _degenerate_scan(coverage) if built == 0 else ""
+        # A RARE fallback since the enumeration learned to read the
+        # settings.gradle include list: the kafka shape (0 of 2 beside 11,421
+        # classes, on a build declaring dozens of subprojects) now yields an
+        # honest N/M and never reaches here. What remains is the scan that
+        # genuinely could not look — and its zero must not become the verdict.
+        #
+        # Keyed on the SCAN, never on the class census: `compiled_classes` is a
+        # project-wide `find -name '*.class'` that also counts checked-in .class
+        # test fixtures, so keying the band on it masked genuinely failed builds
+        # in every repo that ships one. The census enters only to withhold the
+        # contradiction when it positively counted ZERO — that corroborates the
+        # zero independently, and nothing is left to disagree about.
+        if degenerate and compiled_classes != 0:
+            census = (
+                f"{int(compiled_classes)} class files exist"
+                if compiled_classes is not None
+                else "the class census could not be read"
+            )
             modules = GrainRate(
                 0,
                 None,
-                reason=(
-                    f"module scan attributed none of {total} while "
-                    f"{int(compiled_classes or 0)} class files exist"
-                ),
+                reason=f"module scan unusable: {degenerate}; {census}",
             )
             conflicts = (MODULE_SCAN_CONTRADICTED_CONFLICT,)
         else:

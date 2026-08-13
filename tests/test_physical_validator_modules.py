@@ -4,13 +4,35 @@ from sag.agent.physical_validator import PhysicalValidator
 
 class FakeOrch:
     def __init__(self, responses):
-        self.responses = responses  # dict: substring -> {"success","output","exit_code"}
+        # dict: substring -> {"success","output","exit_code"}, or a callable
+        # taking the command (for probes whose answer depends on what was asked)
+        self.responses = responses
+        self.commands = []  # every command issued, in order (probe-shape fences)
 
     def execute_command(self, command, **kwargs):
+        self.commands.append(command)
         for needle, resp in self.responses.items():
             if needle in command:
+                if callable(resp):
+                    resp = resp(command)
                 return {"success": True, "exit_code": 0, **resp}
         return {"success": True, "exit_code": 0, "output": ""}
+
+
+def _disk_holding(*present):
+    """Answer the batched `test -d` probe the way a disk would: echo back the
+    candidates the command ACTUALLY asked about, and only those that exist.
+
+    A fake that echoes a fixed list regardless of the question answers for the
+    parser instead of testing it — an enumeration bug then passes the fence.
+    """
+    on_disk = set(present)
+
+    def respond(command):
+        asked = command.split("for d in ", 1)[1].split(";", 1)[0].split()
+        return {"output": "\n".join(d for d in asked if d in on_disk)}
+
+    return respond
 
 
 def test_scan_modules_maven_counts_artifacts_and_report_dirs():
@@ -110,6 +132,148 @@ def test_scan_modules_gradle_aggregator_shell_root_no_src_main():
     v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
     modules = v.scan_modules("/w/g", "gradle")
     assert {m["path"]: m for m in modules}["."].get("aggregator_shell") is True
+
+
+# ---------------------------------------------------------------------------
+# Centrally declared Gradle subprojects (kafka/samza shape)
+# ---------------------------------------------------------------------------
+
+# Kafka's real settings.gradle: ONE `include` statement naming every subproject
+# across continuation lines, and NO build.gradle in any subdirectory.
+KAFKA_SETTINGS = """\
+// Licensed to the Apache Software Foundation (ASF)
+include 'clients',
+    'connect:api',
+    'connect:runtime',
+    'core',
+    'streams'
+
+rootProject.name = 'kafka'
+"""
+
+
+def test_scan_modules_gradle_enumerates_centrally_declared_subprojects():
+    """D2 kafka: a Gradle build declares all subprojects in settings.gradle and
+    ships ONE root build.gradle. The per-directory build-file walk therefore
+    finds nothing, the denominator collapsed to the root (+ stray poms), and the
+    11,421 classes sitting in unenumerated subproject build dirs were invisible.
+    A module the settings file declares is a module."""
+    responses = {
+        # the per-directory walk finds no subdirectory build.gradle at all
+        "-name 'build.gradle'": {"output": ""},
+        "cat /w/kafka/settings.gradle": {"output": KAFKA_SETTINGS},
+        # every declared directory exists on disk
+        "for d in": _disk_holding(
+            "/w/kafka/clients",
+            "/w/kafka/connect/api",
+            "/w/kafka/connect/runtime",
+            "/w/kafka/core",
+            "/w/kafka/streams",
+        ),
+        "/clients/build/classes": {"output": "1200"},
+        "/connect/api/build/classes": {"output": "180"},
+        "/connect/runtime/build/classes": {"output": "900"},
+        "/core/build/classes": {"output": "2100"},
+        "/streams/build/classes": {"output": "1400"},
+        "/clients/build/libs' -name '*.jar": {"output": "1"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/kafka", "gradle")
+    by_path = {m["path"]: m for m in modules}
+
+    # the real subproject count, not root-plus-strays
+    assert set(by_path) == {".", "clients", "connect/api", "connect/runtime", "core", "streams"}
+    # and their real outputs
+    assert by_path["clients"]["class_count"] == 1200
+    assert by_path["connect/api"]["class_count"] == 180
+    assert by_path["connect/api"]["name"] == "connect:api"
+    assert by_path["core"]["class_count"] == 2100
+    assert by_path["clients"]["jar_count"] == 1
+
+
+def test_scan_modules_gradle_reads_the_kotlin_settings_file():
+    """p7d polaris: the declaration lived in settings.gradle.kts, which nothing
+    read — a parenthesized, multi-line `include(...)`."""
+    settings_kts = 'include(\n    ":api",\n    ":service:common",\n)\n'
+    responses = {
+        "-name 'build.gradle'": {"output": ""},
+        # only the .kts file exists; the groovy read comes back empty
+        "cat /w/p/settings.gradle 2>": {"output": ""},
+        "cat /w/p/settings.gradle.kts": {"output": settings_kts},
+        "for d in": _disk_holding("/w/p/api", "/w/p/service/common"),
+        "/api/build/classes": {"output": "12"},
+        "/service/common/build/classes": {"output": "34"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    by_path = {m["path"]: m for m in v.scan_modules("/w/p", "gradle")}
+    assert set(by_path) == {".", "api", "service/common"}
+    assert by_path["service/common"]["class_count"] == 34
+
+
+def test_scan_modules_gradle_drops_declared_dirs_that_are_not_on_disk():
+    """A declaration the disk does not back is not a module: counting it would
+    manufacture a permanent shortfall no build could close."""
+    responses = {
+        "-name 'build.gradle'": {"output": ""},
+        "cat /w/p/settings.gradle": {"output": "include ':real', ':relocated'\n"},
+        # only ':real' has a directory at the conventional path
+        "for d in": _disk_holding("/w/p/real"),
+        "/real/build/classes": {"output": "7"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    assert {m["path"] for m in v.scan_modules("/w/p", "gradle")} == {".", "real"}
+
+
+def test_scan_modules_gradle_never_counts_an_included_build_as_a_module():
+    """`includeBuild` names a SEPARATE build (composite), not a subproject."""
+    responses = {
+        "-name 'build.gradle'": {"output": ""},
+        "cat /w/p/settings.gradle": {
+            # the composite build's directory sits INSIDE the checkout and
+            # exists, so only the parse can keep it out of the denominator
+            "output": "includeBuild 'build-logic'\ninclude ':app'\n"
+        },
+        "for d in": _disk_holding("/w/p/app", "/w/p/build-logic"),
+        "/app/build/classes": {"output": "5"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    assert {m["path"] for m in v.scan_modules("/w/p", "gradle")} == {".", "app"}
+
+
+def test_scan_modules_gradle_records_how_many_modules_were_declared():
+    """The scan states what the build DECLARED beside what it enumerated, so a
+    downstream reader can tell a small project from a blind scan."""
+    responses = {
+        "-name 'build.gradle'": {"output": ""},
+        "cat /w/kafka/settings.gradle": {"output": KAFKA_SETTINGS},
+        "for d in": _disk_holding(
+            "/w/kafka/clients",
+            "/w/kafka/connect/api",
+            "/w/kafka/connect/runtime",
+            "/w/kafka/core",
+            "/w/kafka/streams",
+        ),
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/kafka", "gradle")
+    assert all(m["declared_modules"] == 5 for m in modules)
+
+
+def test_scan_modules_maven_needs_no_declaration_parse():
+    """The Maven answer: `<module>` names a DIRECTORY that must contain its own
+    pom.xml, so the per-directory pom walk already enumerates every declared
+    module — the Gradle gap has no Maven twin. The maven scan therefore reads no
+    settings/aggregator declaration at all, and stays byte-identical."""
+    responses = {
+        "-name 'pom.xml'": {"output": "/w/p/core/pom.xml"},
+        "/core/target/classes": {"output": "50"},
+    }
+    orch = FakeOrch(responses)
+    v = PhysicalValidator(docker_orchestrator=orch)
+    by_path = {m["path"]: m for m in v.scan_modules("/w/p", "maven")}
+    assert set(by_path) == {".", "core"}
+    assert not [c for c in orch.commands if "settings.gradle" in c]
+    assert "declared_modules" not in by_path["core"]
 
 
 def test_parse_module_test_reports_counts_per_module():

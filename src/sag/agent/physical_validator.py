@@ -942,6 +942,51 @@ def _carries_unresolved_property(value: str) -> bool:
     return "${" in str(value or "")
 
 
+_GRADLE_INCLUDE_HEAD = re.compile(r"^include\b")
+_GRADLE_QUOTED = re.compile(r"""(['"])([^'"\r\n]*)\1""")
+
+
+def _parse_gradle_include_paths(settings_content: str) -> List[str]:
+    """Subproject directories an `include` statement declares, root-relative.
+
+    THE parse (P3): both the expected-artifact walk and the module scan read
+    the settings file through here, so a subproject can never be a module to
+    one and invisible to the other.
+
+    One statement may name many subprojects across continuation lines — kafka's
+    settings.gradle is a single `include` listing forty — so this walks the
+    statement, not one regex match per `include` keyword. Both DSLs continue a
+    statement the same way: a Groovy list broken after a comma, and a Kotlin
+    ``include(`` call closed on a later line. ``includeBuild`` names a SEPARATE
+    build in a composite, never a subproject of this one, and the word boundary
+    after ``include`` is what refuses to match it.
+
+    Returns ``':connect:api'`` as ``'connect/api'``: the directory Gradle maps a
+    subproject to by default, which is where its ``build/classes`` lives.
+    """
+    paths: List[str] = []
+    in_statement = False
+    for raw in (settings_content or "").splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if _GRADLE_INCLUDE_HEAD.match(line):
+            line = line[len("include") :]
+        elif not in_statement:
+            continue
+        paths.extend(match.group(2) for match in _GRADLE_QUOTED.finditer(line))
+        # A statement continues while the line ends open: a trailing comma
+        # (Groovy list) or the opening paren of a multi-line Kotlin call.
+        in_statement = line.endswith(",") or line.endswith("(")
+
+    seen: List[str] = []
+    for path in paths:
+        rel = path.strip().strip(":").replace(":", "/").strip("/")
+        if rel and rel not in seen:
+            seen.append(rel)
+    return seen
+
+
 def _driven_test_modules_from_receipts(
     receipts: List[Mapping[str, Any]],
     *,
@@ -6123,6 +6168,34 @@ class PhysicalValidator:
         lines = [l for l in (found.get("output") or "").splitlines() if l.strip()]
         module_dirs = sorted({l.rsplit("/", 1)[0] for l in lines})
 
+        # Gradle declares its subprojects CENTRALLY. Kafka and samza list every
+        # one in settings.gradle beside a single root build.gradle, so the
+        # per-directory walk above sees no submodule at all: D2 kafka scanned a
+        # denominator of 2 (root + two stray quickstart poms) on a build with
+        # dozens of subprojects, and the 11,421 classes sitting in their
+        # unenumerated `build/classes` were invisible to every per-module probe.
+        # A module the settings file declares is a module.
+        #
+        # Maven needs no counterpart: `<module>` names a directory that MUST
+        # contain that module's own pom.xml, so the pom walk above already
+        # enumerates every declared module. There is no Maven twin of this gap.
+        declared_count = 0
+        if build_system == "gradle":
+            declared = self._declared_gradle_subprojects(project_dir)
+            declared_count = len(declared)
+            if declared:
+                # One probe for all of them, and only directories that EXIST
+                # join the denominator: a declaration the disk does not back
+                # (a relocated `projectDir`) would otherwise manufacture a
+                # permanent shortfall no build could close.
+                candidates = " ".join(shlex.quote(f"{project_dir}/{rel}") for rel in declared)
+                probe = self._execute_command_with_logging(
+                    f'for d in {candidates}; do test -d "$d" && echo "$d"; done',
+                    "locating declared gradle subprojects",
+                )
+                on_disk = [l.strip() for l in (probe.get("output") or "").splitlines() if l.strip()]
+                module_dirs = sorted(set(module_dirs) | set(on_disk))
+
         # Always scan the root module too. The submodule find runs at mindepth 2,
         # so the depth-1 root pom is excluded — a root that compiled its own
         # sources (e.g. commons-chain's 33 classes) would otherwise be invisible
@@ -6179,6 +6252,13 @@ class PhysicalValidator:
                 "report_dirs": report_dirs,
                 "has_test_sources": has_test_sources,
             }
+            if declared_count:
+                # What the build DECLARED, carried beside what the scan found so
+                # a reader downstream can tell a small project from a blind scan
+                # (module_coverage lifts it to the summary). Stamped on every
+                # row rather than the root's: the mixed-layout merge keeps the
+                # richer record per path, and the root's may lose.
+                record["declared_modules"] = declared_count
 
             # Aggregator-shell detection (root record only, in a MULTI-module
             # scan). Live httpcomponents-client: the reactor root is a Maven
@@ -7376,6 +7456,33 @@ class PhysicalValidator:
 
         return expected
 
+    def _declared_gradle_subprojects(self, project_dir: str) -> List[str]:
+        """The subprojects settings.gradle(.kts) declares, as relative dirs.
+
+        The single reader of the settings file (P3): the expected-artifact walk
+        and `scan_modules` both come here, so the modules a build DECLARES and
+        the modules the scan COUNTS are one list. Reads the Kotlin DSL too —
+        p7d polaris declared 26 subprojects in `settings.gradle.kts` and nothing
+        read it. Cached per project dir: the scan asks once per build system.
+        """
+        cache_key = self._get_cache_key("gradle_subprojects", project_dir)
+        cached = self._get_cached_result(cache_key)
+        if cached is not None:
+            return list(cached)
+
+        content = ""
+        for name in ("settings.gradle", "settings.gradle.kts"):
+            result = self._execute_command_with_logging(
+                f"cat {project_dir}/{name} 2>/dev/null", f"reading {name}"
+            )
+            if result["success"] and (result.get("output") or "").strip():
+                content = result["output"]
+                break
+
+        declared = _parse_gradle_include_paths(content)
+        self._cache_result(cache_key, declared)
+        return list(declared)
+
     def _parse_gradle_expected_artifacts(self, project_dir: str) -> List[Dict[str, str]]:
         """
         Parse build.gradle to determine expected Gradle artifacts including .class files.
@@ -7398,24 +7505,13 @@ class PhysicalValidator:
 
         # Check if it's a Java/Kotlin project
         if "java" in gradle_content or "kotlin" in gradle_content:
-            # Check for settings.gradle to detect multi-project
-            settings_cmd = f"cat {project_dir}/settings.gradle 2>/dev/null"
-            settings_result = self._execute_command_with_logging(
-                settings_cmd, "reading settings.gradle"
-            )
+            # The declared subprojects, read through the ONE settings parse the
+            # module scan also uses (P3) — so a subproject can never be expected
+            # here and absent from the denominator there.
+            includes = self._declared_gradle_subprojects(project_dir)
 
-            if settings_result["success"]:
-                settings_content = settings_result["output"]
-                # Extract included projects
-                import re
-
-                # Updated regex to handle multi-line include statements
-                includes = re.findall(
-                    r"include\s*\(?\s*['\"]([^'\"]+)['\"]\s*\)?", settings_content, re.MULTILINE
-                )
-
-                for subproject in includes:
-                    subproject_path = subproject.replace(":", "/")
+            if includes:
+                for subproject_path in includes:
                     subproject_dir = f"{project_dir}/{subproject_path}"
 
                     # Expected .class files for subproject
