@@ -415,19 +415,35 @@ class EnvTool(BaseTool):
         # already knows is the cheapest correction there is, so it is stated.
         registered = self._registered_candidates(tool)
         suggestions = []
+        # D2 2026-08-12: six runs were spent looping here (rocketmq-externals
+        # x453, spark-kubernetes-operator x151, tapestry-5 x71), every one of
+        # them finishing with zero compiled classes. The refusal must name what
+        # the harness can SEE, productive move first.
+        named_tool = tool or self._tool_from_executable(executable)
+        wrapper = self._project_wrapper_for(named_tool)
+        if wrapper:
+            # The wrapper needs no network and is the runner the project itself
+            # ships — tapestry-5 had gradlew on disk while the model burned its
+            # run on a nonexistent /usr/bin/gradle.
+            suggestions.append(
+                f"This project ships its own {named_tool} wrapper at {wrapper} — "
+                f"register that instead of a system path."
+            )
         if registered:
             suggestions.append(
                 "Already registered and executable: " + ", ".join(registered[:6])
             )
-        elif tool:
+        elif named_tool:
             # No candidate exists anywhere: registering other paths cannot
             # succeed either. The one productive move is installing the tool
             # (live 2026-08-09: the model probed absent /usr/bin/mvn in a loop
-            # because nothing named the provision route).
+            # because nothing named the provision route). The tool is inferred
+            # from the basename when the call did not name one, because the
+            # loops recurred through exactly those bare calls.
             suggestions.append(
-                f"No {tool} is registered and this path does not exist — if "
-                f"{tool} is not installed in the container, install it first: "
-                f"project(action='provision', packages=['{tool}'])"
+                f"No {named_tool} is registered and this path does not exist — if "
+                f"{named_tool} is not installed in the container, install it first: "
+                f"project(action='provision', packages=['{named_tool}'])"
             )
         suggestions.extend(
             [
@@ -447,6 +463,45 @@ class EnvTool(BaseTool):
             },
             metadata={"action": "validate_executable"},
         )
+
+    # A system path the model reached for, mapped to the tool it wanted. Only
+    # the launchers whose absence produced the D2 loops need an entry.
+    _EXECUTABLE_TOOLS = {"gradle": "gradle", "mvn": "maven", "maven": "maven", "java": "java"}
+    # The runner a project ships for itself, which needs no network at all.
+    _TOOL_WRAPPERS = {"gradle": "gradlew", "maven": "mvnw"}
+
+    @classmethod
+    def _tool_from_executable(cls, executable: Any) -> str:
+        basename = str(executable or "").rstrip("/").rsplit("/", 1)[-1].strip().lower()
+        return cls._EXECUTABLE_TOOLS.get(basename, "")
+
+    def _project_wrapper_for(self, tool: Optional[str]) -> str:
+        """The project's own wrapper for this tool, if one is on disk.
+
+        Best effort and bounded: one shallow probe on an error path the caller
+        was already paying a probe for. An unreadable workspace costs the caller
+        nothing beyond the refusal it was already getting.
+        """
+        wrapper = self._TOOL_WRAPPERS.get(str(tool or "").strip().lower())
+        if not wrapper:
+            return ""
+        orchestrator = getattr(self.store, "orchestrator", None)
+        if orchestrator is None or not hasattr(orchestrator, "execute_command"):
+            return ""
+        try:
+            result = orchestrator.execute_command(
+                f"find /workspace -maxdepth 2 -name {shlex.quote(wrapper)} -type f -print -quit",
+                workdir=None,
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.debug(f"wrapper probe unavailable: {exc}")
+            return ""
+        if not isinstance(result, dict) or result.get("exit_code") not in (0, None):
+            return ""
+        return str(result.get("output") or "").strip().splitlines()[0].strip() if result.get(
+            "output"
+        ) else ""
 
     def _registered_candidates(self, tool: Optional[str]) -> list:
         """Executables the overlay already holds for this tool, blocked ones out.

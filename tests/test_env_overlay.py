@@ -1490,3 +1490,61 @@ def test_env_not_found_with_no_candidates_routes_to_provision():
         "project(action='provision', packages=['maven'])" in s
         for s in (result.suggestions or [])
     )
+
+
+# ---------------------------------------------------------------------------
+# D2 2026-08-12: the toolchain acquisition loop (#42)
+# ---------------------------------------------------------------------------
+
+
+class _MissingExecutableOrchestrator(FakeEnvOverlayOrchestrator):
+    """Nothing the model asks for exists; a gradle wrapper sits in the project."""
+
+    def __init__(self, wrapper: str | None = "/workspace/tapestry-5/gradlew"):
+        super().__init__()
+        self.wrapper = wrapper
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append((command, workdir, timeout))
+        if command.startswith(("test -x ", "realpath -e -- ")) or command.endswith(" -version"):
+            return {"success": False, "output": "", "exit_code": 1}
+        if "gradlew" in command or "mvnw" in command:
+            if self.wrapper and self.wrapper.rsplit("/", 1)[-1] in command:
+                return {"success": True, "output": f"{self.wrapper}\n", "exit_code": 0}
+            return {"success": True, "output": "", "exit_code": 0}
+        return {"success": True, "output": "", "exit_code": 0}
+
+
+def test_a_missing_executable_names_the_projects_own_wrapper_first():
+    """D2: tapestry-5 had gradlew on disk, and the model still burned 71 calls
+    registering a nonexistent /usr/bin/gradle. The wrapper needs no network and
+    is the move most likely to work, so the refusal names it first."""
+    tool = EnvTool(_MissingExecutableOrchestrator())
+
+    result = tool.execute(
+        action="register", tool="gradle", executable="/usr/bin/gradle", activate=True
+    )
+
+    assert not result.succeeded and result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert "/workspace/tapestry-5/gradlew" in (result.suggestions or [None])[0], (
+        "the wrapper is named, and named first"
+    )
+
+
+def test_without_a_wrapper_the_refusal_still_routes_to_provision():
+    """Premise corrected against the D2 evidence: `register` requires `tool`,
+    so the loops did not recur through bare calls. rocketmq-externals refused
+    ~689 times across three maven paths and the provision route was rendered
+    5 times — the guidance fires, and the model kept going anyway. Bounding
+    that recurrence is task #42's remaining half; what is pinned here is that
+    a project without a wrapper still gets the one move that can succeed."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
+
+    result = tool.execute(
+        action="register", tool="maven", executable="/usr/bin/mvn", activate=True
+    )
+
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert any(
+        "provision" in s and "maven" in s for s in (result.suggestions or [])
+    ), "a refusal must name a call that can succeed"
