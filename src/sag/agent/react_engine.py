@@ -5530,8 +5530,10 @@ class ReActEngine(UIEventEmitter):
 
         # Ahead of the loop-memory consult and independent of it: a tool that
         # bounded its own recurrence states that fact in typed metadata, and
-        # the engine is what writes it into the ledger.
+        # the engine is what writes it into the ledger — including the release
+        # no tool can report, because it happens in another tool's runner.
         self._relay_material_recurrence_marker(execution)
+        self._release_material_recurrence_on_build(execution)
         memory = getattr(self, "loop_memory", None)
         if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
             return None
@@ -5560,15 +5562,62 @@ class ReActEngine(UIEventEmitter):
     _MATERIAL_RECURRENCE_RELEASE = "material_recurrence_released"
 
     @staticmethod
-    def _material_recurrence_identity(marker: Mapping[str, Any]) -> str:
+    def _material_recurrence_tool_prefix(tool: Any) -> str:
+        """Every wall stated about one tool, whichever refusal code stated it."""
+        return f"material_recurrence_bound:{str(tool or '').strip() or 'unknown'}:"
+
+    @classmethod
+    def _material_recurrence_identity(cls, marker: Mapping[str, Any]) -> str:
         """The stable key of one bounded recurrence, inside the signature.
 
         `(tool, error_code)` exactly as the bound counts it — never the paths
         or the count, which keep growing while the same wall stands.
         """
-        tool = str(marker.get("tool") or "").strip() or "unknown"
         error_code = str(marker.get("error_code") or "").strip() or "UNKNOWN"
-        return f"material_recurrence_bound:{tool}:{error_code}"
+        return f"{cls._material_recurrence_tool_prefix(marker.get('tool'))}{error_code}"
+
+    @classmethod
+    def _material_recurrence_release_prefixes(
+        cls,
+        released: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """Which walls a reported release retires.
+
+        The codes it names, or — when it names none — every wall stated about
+        that tool, since a tool that now registers has no standing
+        registration wall of any code left to state.
+        """
+        prefix = cls._material_recurrence_tool_prefix(released.get("tool"))
+        codes = [
+            str(code).strip()
+            for code in (
+                *(released.get("error_codes") or ()),
+                released.get("error_code") or "",
+            )
+            if str(code).strip()
+        ]
+        return tuple(f"{prefix}{code}" for code in dict.fromkeys(codes)) or (prefix,)
+
+    def _resolve_material_recurrence_blockers(
+        self,
+        prefixes: Sequence[str],
+        *,
+        reason: str,
+        evidence_ref: str | None = None,
+    ) -> None:
+        """Retire the stated walls the harness has just seen walked around."""
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed or not prefixes:
+            return
+        for blocker in state.blockers:
+            if blocker.status == "active" and any(
+                blocker.failure_signature.startswith(prefix) for prefix in prefixes
+            ):
+                state.resolve_blocker(
+                    blocker.blocker_id,
+                    resolution=reason,
+                    evidence_ref=evidence_ref or None,
+                )
 
     def _material_recurrence_signature(self, marker: Mapping[str, Any]) -> str:
         """Render the model-facing statement from the structured fact.
@@ -5597,15 +5646,12 @@ class ReActEngine(UIEventEmitter):
 
         released = metadata.get(self._MATERIAL_RECURRENCE_RELEASE)
         if isinstance(released, Mapping):
-            identity = self._material_recurrence_identity(released)
-            for blocker in state.blockers:
-                if blocker.status == "active" and blocker.failure_signature.startswith(identity):
-                    state.resolve_blocker(
-                        blocker.blocker_id,
-                        resolution=str(released.get("reason") or "").strip()
-                        or "the bounded registration succeeded",
-                        evidence_ref=execution.result.output_ref or None,
-                    )
+            self._resolve_material_recurrence_blockers(
+                self._material_recurrence_release_prefixes(released),
+                reason=str(released.get("reason") or "").strip()
+                or "the bounded registration succeeded",
+                evidence_ref=execution.result.output_ref or None,
+            )
 
         marker = metadata.get(self._MATERIAL_RECURRENCE_MARKER)
         if not isinstance(marker, Mapping):
@@ -5628,6 +5674,52 @@ class ReActEngine(UIEventEmitter):
             evidence_refs=refs,
             source_phase=getattr(machine, "current_phase", None),
             source_attempt_id=getattr(machine, "current_attempt_id", None),
+        )
+
+    def _release_material_recurrence_on_build(self, execution: ToolExecution) -> None:
+        """Retire a registration wall the model walked around by building.
+
+        The wall is a statement about REGISTERING a runtime, and the refusal's
+        own leading move now steers away from registering at all ("the build
+        tool already uses the wrapper — dispatch the build instead", c0339ae).
+        A model that takes that advice never produces a registration success,
+        so the tool never reports a release and the blocker would be restated
+        under ACTIVE BLOCKERS at every phase entry for the rest of the run
+        (#46 defect 3). The runner that just ran is the other proof, and the
+        engine — the only writer of run evidence — is where it is read.
+        """
+        if execution.call.name not in self._BUILD_EVIDENCE_TOOLS:
+            return
+        result = execution.result
+        if not result.succeeded:
+            # `resolution` is a statement in the ledger, and only a build that
+            # succeeded supports the one made below.
+            return
+        metadata = result.metadata or {}
+        # `receipt_id` is present exactly when THIS dispatch's invocation
+        # receipt was persisted (maven_tool.py:1088, gradle_tool.py:785): a
+        # result whose runner never dispatched carries neither key, and a
+        # failed receipt write reports `receipt_persisted: false` instead of an
+        # id. The persisted receipt is the terminal fact, so it is the signal.
+        if not str(metadata.get("receipt_id") or "").strip():
+            return
+        system = (
+            str(
+                (result.facts or {}).get("system")
+                or metadata.get("system")
+                or (execution.call.name if execution.call.name != "build" else "")
+            )
+            .strip()
+            .lower()
+        )
+        if not system:
+            return
+        # Scoped to the tool whose runner ran: a Gradle build says nothing
+        # about a Maven registration wall.
+        self._resolve_material_recurrence_blockers(
+            (self._material_recurrence_tool_prefix(system),),
+            reason=f"a {system} build succeeded via its own runner",
+            evidence_ref=result.output_ref or None,
         )
 
     def _observe_action_intent_progress(self, execution: ToolExecution) -> bool:

@@ -1699,15 +1699,27 @@ def test_after_the_bound_a_path_already_refused_costs_no_further_container_probe
     orchestrator = _MissingExecutableOrchestrator(wrapper=ROCKETMQ_WRAPPER)
     tool = EnvTool(orchestrator)
 
-    for path in ROCKETMQ_PATHS:
-        assert not _refuse(tool, path).succeeded
+    probed = {path: _refuse(tool, path) for path in ROCKETMQ_PATHS}
+    assert not any(refusal.succeeded for refusal in probed.values())
     probes = len(orchestrator.commands)
 
     bounded = _refuse(tool, ROCKETMQ_PATHS[0])
 
     assert len(orchestrator.commands) == probes, "a refused path is never re-probed"
     assert bounded.succeeded is False, "the model is never told an action succeeded"
-    assert bounded.error_code == "ENV_REFUSAL_BOUND_REACHED"
+    # Premise corrected (#46 defect 1): this pin used to require a NEW typed
+    # code at the bound. `OutcomeKey` carries error_code AND failure_signature
+    # (loop_memory.py:145-151), so a re-typed refusal opened a fresh LoopMemory
+    # chain exactly when the tool declared the wall — the third rung disarming
+    # the second. The bound is stated in the marker and in the notice; the
+    # typed identity is the identity of the refusal it stands in for.
+    assert bounded.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert bounded.failure_signature == probed[ROCKETMQ_PATHS[0]].failure_signature, (
+        "same wall, same root-cause identity, so the engine's chain keeps counting"
+    )
+    assert "no longer probed" in " ".join(bounded.suggestions or []), (
+        "and the bound is still stated to the model"
+    )
     named = " ".join(bounded.suggestions or [])
     assert ROCKETMQ_WRAPPER in named and "provision" in named, "the moves that remain are named"
     assert _bound_marker(bounded)["refused_executables"] == list(ROCKETMQ_PATHS)
@@ -1726,7 +1738,11 @@ def test_a_trailing_slash_is_not_a_new_path():
     respelled = _refuse(tool, f"{ROCKETMQ_PATHS[0]}/")
 
     assert len(orchestrator.commands) == probes
-    assert respelled.error_code == "ENV_REFUSAL_BOUND_REACHED"
+    # Premise corrected (#46 defect 1): the refusal keeps the wall's own typed
+    # code so LoopMemory's chain is not reset by the bound; the bound itself is
+    # carried by the marker the engine relays.
+    assert respelled.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert _bound_marker(respelled)["refusal_count"] >= 3
 
 
 def test_a_new_path_past_the_bound_is_probed_once_and_still_states_one_wall():
@@ -1768,6 +1784,192 @@ class _GradleWrapperOrchestrator(FakeEnvOverlayOrchestrator):
                 "output": self.files.get("/workspace/.setup_agent/env_overlay.json", ""),
             }
         return {"success": True, "output": "", "exit_code": 0}
+
+
+class _ExecutableButUnusableOrchestrator(FakeEnvOverlayOrchestrator):
+    """Every guessed path exists and is executable; what it IS decides the code.
+
+    `.../mvn.sh` canonicalizes to a name Maven registration cannot accept, and
+    anything under `/broken/` fails its own `-version` probe. Both are refusals
+    of the same shape as a missing binary: this exact registration cannot
+    succeed as asked, however many times it is asked.
+    """
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        if command.endswith(" -version") and "/broken/" in command:
+            self.commands.append((command, workdir, timeout))
+            return {"success": False, "output": "not a JVM launcher", "exit_code": 1}
+        return super().execute_command(command, workdir, timeout)
+
+
+NAME_MISMATCH_PATH = "/opt/maven-3.9.6/bin/mvn.sh"
+PROBE_FAILED_PATH = "/opt/broken/bin/mvn"
+
+
+class _OneRefusalPerCodeOrchestrator(FakeEnvOverlayOrchestrator):
+    """One path per refusal code the bounded family claims to count."""
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        target = shlex.split(command)[-1] if command.startswith("realpath -e -- ") else ""
+        if target == "/workspace/maven/bin/mvn":
+            self.commands.append((command, workdir, timeout))
+            # A symlink out of the workspace root group it was asked under.
+            return {"success": True, "output": "/opt/maven/bin/mvn\n", "exit_code": 0}
+        if "/absent/" in command and command.startswith(("realpath -e -- ", "test -x ")):
+            self.commands.append((command, workdir, timeout))
+            return {"success": False, "output": "", "exit_code": 1}
+        if command.endswith(" -version"):
+            if "/broken/" in command:
+                self.commands.append((command, workdir, timeout))
+                return {"success": False, "output": "", "exit_code": 1}
+            if "/imposter/" in command:
+                self.commands.append((command, workdir, timeout))
+                return {"success": True, "output": "GNU bash, version 5.2\n", "exit_code": 0}
+        return super().execute_command(command, workdir, timeout)
+
+
+BOUNDED_FAMILY = [
+    ("/opt/absent/bin/mvn", "ENV_EXECUTABLE_NOT_FOUND"),
+    ("opt/maven/bin/mvn", "ENV_EXECUTABLE_PATH_NOT_ABSOLUTE"),
+    ("/home/agent/maven/bin/mvn", "ENV_EXECUTABLE_PATH_OUTSIDE_RUNTIME_ROOTS"),
+    ("/workspace/maven/bin/mvn", "ENV_EXECUTABLE_REALPATH_ESCAPE"),
+    ("/opt/maven-3.9.6/bin/mvn.sh", "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH"),
+    ("/opt/imposter/bin/mvn", "ENV_RUNTIME_IDENTITY_MISMATCH"),
+    ("/opt/broken/bin/mvn", "ENV_RUNTIME_PROBE_FAILED"),
+]
+
+
+@pytest.mark.parametrize("path, code", BOUNDED_FAMILY)
+def test_every_code_the_family_claims_to_count_trips_its_own_bound(path, code):
+    """The family is a claim about which refusals are walls, and a claim no
+    test drives is a claim no call site has to keep. Each member trips on its
+    third identical refusal, under its own code, as its own wall."""
+    tool = EnvTool(_OneRefusalPerCodeOrchestrator())
+
+    for _ in range(2):
+        refusal = _refuse(tool, path)
+        assert refusal.error_code == code
+        assert _bound_marker(refusal) is None
+
+    third = _refuse(tool, path)
+
+    assert third.error_code == code, "the typed code is stable across the bound"
+    assert _bound_marker(third)["error_code"] == code
+    assert _bound_marker(third)["refusal_count"] == 3
+
+
+def test_a_name_mismatch_is_counted_by_the_bound_under_its_own_code():
+    """The wall the bound was written for was one error code deep, and the
+    sibling refusals on the same wall recurred unbounded at full probe cost.
+    The counted family is every env-registration code that says "this exact
+    registration cannot succeed as asked"."""
+    tool = EnvTool(_ExecutableButUnusableOrchestrator())
+
+    for _ in range(2):
+        refusal = _refuse(tool, NAME_MISMATCH_PATH)
+        assert refusal.error_code == "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH"
+        assert _bound_marker(refusal) is None, "the first two refusals are ordinary"
+
+    third = _refuse(tool, NAME_MISMATCH_PATH)
+
+    assert third.error_code == "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH", "the code stays stable"
+    marker = _bound_marker(third)
+    assert marker["tool"] == "maven"
+    assert marker["error_code"] == "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH", "its own wall"
+    assert marker["refused_executables"] == [NAME_MISMATCH_PATH]
+    assert marker["refusal_count"] == 3 and marker["bound"] == 3
+
+
+def test_a_failed_runtime_probe_is_counted_by_the_bound_under_its_own_code():
+    """The other sibling: the path is there and executable, and the runtime at
+    it cannot identify itself. Three identical answers are a wall."""
+    tool = EnvTool(_ExecutableButUnusableOrchestrator())
+
+    for _ in range(2):
+        refusal = _refuse(tool, PROBE_FAILED_PATH)
+        assert refusal.error_code == "ENV_RUNTIME_PROBE_FAILED"
+        assert _bound_marker(refusal) is None
+
+    third = _refuse(tool, PROBE_FAILED_PATH)
+
+    assert third.error_code == "ENV_RUNTIME_PROBE_FAILED"
+    assert _bound_marker(third)["error_code"] == "ENV_RUNTIME_PROBE_FAILED"
+
+
+def test_two_different_codes_for_one_tool_are_two_walls_and_neither_trips():
+    """Chain identity stays (tool, error_code). Two refusals of one code and
+    two of another are two separate answers to two separate asks — merging
+    them would bound a tool that has been told two different things twice."""
+    tool = EnvTool(_ExecutableButUnusableOrchestrator())
+
+    for path in (NAME_MISMATCH_PATH, PROBE_FAILED_PATH) * 2:
+        refusal = _refuse(tool, path)
+        assert not refusal.succeeded
+        assert _bound_marker(refusal) is None, "four refusals, two walls, neither at three"
+
+    assert _bound_marker(_refuse(tool, NAME_MISMATCH_PATH))["error_code"] == (
+        "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH"
+    ), "the third of one code trips that code's wall alone"
+
+
+def test_a_sibling_code_past_its_bound_stops_paying_for_its_probe():
+    """The probe suppression follows the widened family: a path this code has
+    already refused three times costs no further container round trip, and the
+    typed code it is refused with is still the code of the wall."""
+    orchestrator = _ExecutableButUnusableOrchestrator()
+    tool = EnvTool(orchestrator)
+
+    for _ in range(3):
+        assert not _refuse(tool, PROBE_FAILED_PATH).succeeded
+    probes = len(orchestrator.commands)
+
+    bounded = _refuse(tool, PROBE_FAILED_PATH)
+
+    assert len(orchestrator.commands) == probes, "a refused path is never re-probed"
+    assert bounded.succeeded is False
+    assert bounded.error_code == "ENV_RUNTIME_PROBE_FAILED"
+    assert _bound_marker(bounded)["refused_executables"] == [PROBE_FAILED_PATH]
+
+
+def test_a_successful_registration_reports_every_wall_it_ends():
+    """One tool can stand walled under several codes of the family. A release
+    that named only one of them would leave the others standing in the ledger
+    against a tool that demonstrably registers."""
+    tool = EnvTool(_ExecutableButUnusableOrchestrator())
+
+    for _ in range(3):
+        assert not _refuse(tool, NAME_MISMATCH_PATH).succeeded
+        assert not _refuse(tool, PROBE_FAILED_PATH).succeeded
+    assert _bound_marker(_refuse(tool, NAME_MISMATCH_PATH)), "both walls are stated"
+    assert _bound_marker(_refuse(tool, PROBE_FAILED_PATH))
+
+    registered = _refuse(tool, "/opt/apache-maven-3.9.9/bin/mvn")
+
+    assert registered.succeeded is True
+    release = registered.metadata["material_recurrence_released"]
+    assert release["tool"] == "maven"
+    assert sorted(release["error_codes"]) == [
+        "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
+        "ENV_RUNTIME_PROBE_FAILED",
+    ], "every wall this success ends is named"
+
+
+def test_an_unproven_registration_is_never_counted_as_a_wall():
+    """The family excludes codes that state a transient or harness condition:
+    a tool with no command executor cannot probe anything, and refusing the
+    next call unseen for a condition that clears on its own would deadlock a
+    run that was about to recover."""
+
+    class _NoExecutor:
+        def write_file(self, path, content):
+            return {"success": True, "output": "", "exit_code": 0}
+
+    tool = EnvTool(_NoExecutor())
+
+    for _ in range(4):
+        refusal = _refuse(tool, "/opt/maven/bin/mvn")
+        assert refusal.error_code == "ENV_EXECUTABLE_REALPATH_UNAVAILABLE"
+        assert _bound_marker(refusal) is None, "a harness capability gap is not a wall"
 
 
 def test_the_bound_still_probes_the_wrapper_the_refusal_itself_recommends():

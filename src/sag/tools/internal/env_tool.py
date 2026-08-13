@@ -38,7 +38,51 @@ _GENERIC_REGISTRATION_MOVES = (
     "Use env inspect to review the current active candidate before retrying a build.",
 )
 _EXECUTABLE_NOT_FOUND = "ENV_EXECUTABLE_NOT_FOUND"
-_REFUSAL_BOUND_REACHED = "ENV_REFUSAL_BOUND_REACHED"
+# The env-registration refusals that all state the same kind of fact: THIS
+# registration cannot succeed as asked, and asking again for the same path
+# cannot change the answer. Each is counted under its own (tool, error_code)
+# identity — separate codes are separate walls, because they answer different
+# asks and carry different remaining moves.
+#   ENV_EXECUTABLE_NOT_FOUND ..................... nothing is at the path; the
+#       D2 wall itself (rocketmq-externals x453, spark-kubernetes-operator
+#       x151, tapestry-5 x71).
+#   ENV_EXECUTABLE_PATH_NOT_ABSOLUTE ............. a relative spelling is not
+#       resolvable in the container and stays unresolvable when respelled the
+#       same way.
+#   ENV_EXECUTABLE_PATH_OUTSIDE_RUNTIME_ROOTS .... the trusted-root policy is a
+#       property of the path, not of the container's current state.
+#   ENV_EXECUTABLE_REALPATH_ESCAPE ............... likewise a property of what
+#       the symlink at that path points at.
+#   ENV_MAVEN_EXECUTABLE_NAME_MISMATCH ........... the canonical basename does
+#       not become `mvn` by registering the same path again.
+#   ENV_RUNTIME_IDENTITY_MISMATCH ................ the binary at the path is
+#       not Maven, however often it is offered as Maven.
+#   ENV_RUNTIME_PROBE_FAILED ..................... the runtime at the path does
+#       not complete its own -version probe.
+# Deliberately NOT counted, because each states a transient or harness
+# condition the next call can legitimately find changed:
+# ENV_RUNTIME_PROBE_UNAVAILABLE and ENV_EXECUTABLE_REALPATH_UNAVAILABLE (no
+# command executor at all), ENV_EXECUTABLE_REALPATH_FAILED (the executor
+# answered with something unreadable), ENV_ACTIVATION_NOT_CONFIRMED (overlay
+# state a retry can settle), ENV_RUNTIME_REQUIREMENT_MISMATCH (the observed
+# requirement set is mutable run state, not a property of the executable), and
+# the schema/exception codes ENV_MISSING_PARAMETER, ENV_INVALID_ACTION,
+# ENV_VALIDATION_ERROR, ENV_OPERATION_FAILED. The project facade's
+# PROJECT_ENV_ACTIVATION_REQUIRED never reaches this tool: project_tool.py
+# refuses that call before the delegate is invoked.
+# Every refusal that names an executable is routed through `_count_refusal`,
+# so this set — not which call site happened to remember — is what decides.
+_BOUNDED_REFUSAL_CODES = frozenset(
+    {
+        _EXECUTABLE_NOT_FOUND,
+        "ENV_EXECUTABLE_PATH_NOT_ABSOLUTE",
+        "ENV_EXECUTABLE_PATH_OUTSIDE_RUNTIME_ROOTS",
+        "ENV_EXECUTABLE_REALPATH_ESCAPE",
+        "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
+        "ENV_RUNTIME_IDENTITY_MISMATCH",
+        "ENV_RUNTIME_PROBE_FAILED",
+    }
+)
 # The typed facts this tool states about its own recurrence. The engine is the
 # only writer of run evidence, so the tool never records the blocker itself; it
 # reports what it observed and the engine decides what the ledger says.
@@ -62,10 +106,14 @@ class _RefusalChain:
     """
 
     tool: str
+    error_code: str = _EXECUTABLE_NOT_FOUND
     count: int = 0
     paths: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
     moves: tuple[str, ...] = ()
+    # What this chain already answered for each path, so a restatement past the
+    # bound can be identical in the two fields the engine keys recurrence on.
+    answers: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     @property
     def bound_reached(self) -> bool:
@@ -75,7 +123,7 @@ class _RefusalChain:
         """The structured fact, never pre-rendered prose: the engine renders."""
         return {
             "tool": self.tool,
-            "error_code": _EXECUTABLE_NOT_FOUND,
+            "error_code": self.error_code,
             "refused_executables": list(self.paths),
             "remaining_moves": list(self.moves),
             "refusal_count": self.count,
@@ -83,13 +131,26 @@ class _RefusalChain:
             "evidence_refs": list(self.evidence_refs),
         }
 
-    def observe(self, executable: str, moves: tuple[str, ...]) -> None:
+    def observe(
+        self,
+        executable: str,
+        moves: tuple[str, ...],
+        *,
+        error: str = "",
+        failure_signature: str = "",
+    ) -> None:
         self.count += 1
         if executable and not self.already_refused(executable):
             self.paths.append(executable)
         # The last refusal's moves are the current ones: the overlay and the
         # workspace can both change under a run.
         self.moves = moves
+        if executable:
+            self.answers[posixpath.normpath(str(executable))] = (error, failure_signature)
+
+    def answer_for(self, executable: str) -> tuple[str, str]:
+        """The refusal this chain already gave for one path, verbatim."""
+        return self.answers.get(posixpath.normpath(str(executable or "")), ("", ""))
 
     def already_refused(self, executable: str) -> bool:
         """A trailing or doubled slash is the same path, not a new probe."""
@@ -118,6 +179,7 @@ class EnvTool(BaseTool):
         # counter needs no reset hook beyond the successful-registration one.
         self._refusal_chains: dict[tuple[str, str], _RefusalChain] = {}
         self._released_tool = ""
+        self._released_codes: list[str] = []
 
     def execute(
         self,
@@ -203,24 +265,28 @@ class EnvTool(BaseTool):
                     active_candidate is None
                     or active_candidate.get("executable") != params["executable"]
                 ):
-                    return ToolResult.completed_failure(
-                        output="",
-                        error=(
-                            "Runtime registration did not activate the requested executable: "
-                            f"{params['executable']}"
+                    return self._count_refusal(
+                        ToolResult.completed_failure(
+                            output="",
+                            error=(
+                                "Runtime registration did not activate the requested executable: "
+                                f"{params['executable']}"
+                            ),
+                            error_code="ENV_ACTIVATION_NOT_CONFIRMED",
+                            suggestions=[
+                                "Inspect the runtime overlay before retrying the build",
+                                "Do not retry the stale executable while activation is unconfirmed",
+                            ],
+                            raw_data={
+                                "action": "register",
+                                "requested_executable": params["executable"],
+                                "active_candidate": active_candidate,
+                                "overlay": overlay,
+                            },
+                            metadata={"action": "register", "activation_confirmed": False},
                         ),
-                        error_code="ENV_ACTIVATION_NOT_CONFIRMED",
-                        suggestions=[
-                            "Inspect the runtime overlay before retrying the build",
-                            "Do not retry the stale executable while activation is unconfirmed",
-                        ],
-                        raw_data={
-                            "action": "register",
-                            "requested_executable": params["executable"],
-                            "active_candidate": active_candidate,
-                            "overlay": overlay,
-                        },
-                        metadata={"action": "register", "activation_confirmed": False},
+                        executable=params["executable"],
+                        tool=params["tool"],
                     )
                 self._record_registered_runtime(
                     params["tool"],
@@ -364,40 +430,55 @@ class EnvTool(BaseTool):
         """Resolve one Maven executable to a stable, trusted container path."""
         requested = str(executable or "").strip()
         if not requested or not posixpath.isabs(requested):
-            return None, ToolResult.completed_failure(
-                output="",
-                error="Maven executable must be an absolute container path",
-                error_code="ENV_EXECUTABLE_PATH_NOT_ABSOLUTE",
-                suggestions=[
-                    "Provide the full container path to the downloaded distribution's bin/mvn."
-                ],
-                raw_data={"executable": requested, "tool": "maven"},
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output="",
+                    error="Maven executable must be an absolute container path",
+                    error_code="ENV_EXECUTABLE_PATH_NOT_ABSOLUTE",
+                    suggestions=[
+                        "Provide the full container path to the downloaded distribution's bin/mvn."
+                    ],
+                    raw_data={"executable": requested, "tool": "maven"},
+                ),
+                executable=requested,
+                tool="maven",
+                unusable="this path is not an absolute container path",
             )
 
         normalized_requested = posixpath.normpath(requested)
         requested_group = self._runtime_root_group(normalized_requested)
         if requested_group is None:
-            return None, ToolResult.completed_failure(
-                output="",
-                error=(
-                    "Maven executable is outside the allowed container runtime roots: "
-                    f"{normalized_requested}"
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output="",
+                    error=(
+                        "Maven executable is outside the allowed container runtime roots: "
+                        f"{normalized_requested}"
+                    ),
+                    error_code="ENV_EXECUTABLE_PATH_OUTSIDE_RUNTIME_ROOTS",
+                    suggestions=[
+                        "Constraint: registered runtimes must resolve beneath an allowed "
+                        "container root"
+                    ],
+                    raw_data={"executable": normalized_requested, "tool": "maven"},
                 ),
-                error_code="ENV_EXECUTABLE_PATH_OUTSIDE_RUNTIME_ROOTS",
-                suggestions=[
-                    "Constraint: registered runtimes must resolve beneath an allowed container root"
-                ],
-                raw_data={"executable": normalized_requested, "tool": "maven"},
+                executable=normalized_requested,
+                tool="maven",
+                unusable="this path is outside the allowed container runtime roots",
             )
 
         orchestrator = getattr(self.store, "orchestrator", None)
         if orchestrator is None or not hasattr(orchestrator, "execute_command"):
-            return None, ToolResult.completed_failure(
-                output="",
-                error="Cannot resolve the Maven executable realpath without a runtime executor",
-                error_code="ENV_EXECUTABLE_REALPATH_UNAVAILABLE",
-                suggestions=["Observed capability: runtime realpath executor is unavailable"],
-                raw_data={"executable": normalized_requested, "tool": "maven"},
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output="",
+                    error="Cannot resolve the Maven executable realpath without a runtime executor",
+                    error_code="ENV_EXECUTABLE_REALPATH_UNAVAILABLE",
+                    suggestions=["Observed capability: runtime realpath executor is unavailable"],
+                    raw_data={"executable": normalized_requested, "tool": "maven"},
+                ),
+                executable=normalized_requested,
+                tool="maven",
             )
 
         resolved = orchestrator.execute_command(
@@ -420,52 +501,69 @@ class EnvTool(BaseTool):
             validation_error = self._validate_executable(normalized_requested, "maven")
             if validation_error:
                 return None, validation_error
-            return None, ToolResult.completed_failure(
-                output=str(resolved.get("output") or ""),
-                error=f"Could not resolve an exact Maven executable realpath: {normalized_requested}",
-                error_code="ENV_EXECUTABLE_REALPATH_FAILED",
-                suggestions=[
-                    "Verify the absolute path exists and resolves to one executable before "
-                    "registering it."
-                ],
-                raw_data={
-                    "executable": normalized_requested,
-                    "tool": "maven",
-                    "realpath_exit_code": resolved.get("exit_code"),
-                },
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output=str(resolved.get("output") or ""),
+                    error=(
+                        "Could not resolve an exact Maven executable realpath: "
+                        f"{normalized_requested}"
+                    ),
+                    error_code="ENV_EXECUTABLE_REALPATH_FAILED",
+                    suggestions=[
+                        "Verify the absolute path exists and resolves to one executable before "
+                        "registering it."
+                    ],
+                    raw_data={
+                        "executable": normalized_requested,
+                        "tool": "maven",
+                        "realpath_exit_code": resolved.get("exit_code"),
+                    },
+                ),
+                executable=normalized_requested,
+                tool="maven",
             )
 
         canonical = posixpath.normpath(resolved_lines[0])
         if not self._path_in_roots(canonical, requested_group):
-            return None, ToolResult.completed_failure(
-                output="",
-                error=(
-                    "Maven executable realpath escaped its trusted runtime root: "
-                    f"{normalized_requested} -> {canonical}"
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output="",
+                    error=(
+                        "Maven executable realpath escaped its trusted runtime root: "
+                        f"{normalized_requested} -> {canonical}"
+                    ),
+                    error_code="ENV_EXECUTABLE_REALPATH_ESCAPE",
+                    suggestions=[
+                        "Register a Maven executable whose symlink target remains in the same "
+                        "trusted runtime root."
+                    ],
+                    raw_data={
+                        "executable": normalized_requested,
+                        "resolved_executable": canonical,
+                        "tool": "maven",
+                    },
                 ),
-                error_code="ENV_EXECUTABLE_REALPATH_ESCAPE",
-                suggestions=[
-                    "Register a Maven executable whose symlink target remains in the same "
-                    "trusted runtime root."
-                ],
-                raw_data={
-                    "executable": normalized_requested,
-                    "resolved_executable": canonical,
-                    "tool": "maven",
-                },
+                executable=normalized_requested,
+                tool="maven",
+                unusable="this path resolves outside its trusted runtime root",
             )
 
         if posixpath.basename(canonical) != "mvn":
-            return None, ToolResult.completed_failure(
-                output="",
-                error=f"Canonical Maven executable must be named mvn: {canonical}",
-                error_code="ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
-                suggestions=["Register the distribution's exact canonical bin/mvn path."],
-                raw_data={
-                    "executable": normalized_requested,
-                    "resolved_executable": canonical,
-                    "tool": "maven",
-                },
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output="",
+                    error=f"Canonical Maven executable must be named mvn: {canonical}",
+                    error_code="ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
+                    suggestions=["Register the distribution's exact canonical bin/mvn path."],
+                    raw_data={
+                        "executable": normalized_requested,
+                        "resolved_executable": canonical,
+                        "tool": "maven",
+                    },
+                ),
+                executable=normalized_requested,
+                tool="maven",
+                unusable="this path does not resolve to an executable named mvn",
             )
         return canonical, None
 
@@ -498,12 +596,46 @@ class EnvTool(BaseTool):
         if result.get("exit_code") == 0 and "EXISTS" in output:
             return None
 
-        # Live p7b-camel-quarkus: the model asked for
-        # /usr/lib/jvm/java-17-openjdk-AMD64/bin/java on an arm64 machine while
-        # the arm64 path for the same JDK was already registered, and the
-        # refusal said only that the path does not exist. What the overlay
-        # already knows is the cheapest correction there is, so it is stated.
         registered = self._registered_candidates(tool)
+        # Only these moves can end this wall; the standing advice appended
+        # below cannot, which is why the bound carries the moves alone into the
+        # marker and into every later refusal.
+        moves = self._remaining_moves(
+            executable,
+            tool,
+            registered=registered,
+            unusable="this path does not exist",
+        )
+        refusal = ToolResult.completed_failure(
+            output="",
+            error=f"Env overlay executable is not executable or does not exist: {executable}",
+            error_code=_EXECUTABLE_NOT_FOUND,
+            suggestions=[*moves, *_GENERIC_REGISTRATION_MOVES],
+            raw_data={
+                "executable": executable,
+                **({"registered_candidates": registered} if registered else {}),
+            },
+            metadata={"action": "validate_executable"},
+        )
+        return self._count_refusal(refusal, executable=executable, tool=tool, moves=moves)
+
+    def _remaining_moves(
+        self,
+        executable: Any,
+        tool: Optional[str],
+        *,
+        registered: Optional[list] = None,
+        unusable: str,
+    ) -> list[str]:
+        """The moves that can still end this wall, productive first.
+
+        Live p7b-camel-quarkus: the model asked for
+        /usr/lib/jvm/java-17-openjdk-AMD64/bin/java on an arm64 machine while
+        the arm64 path for the same JDK was already registered, and the refusal
+        said only that the path does not exist. What the overlay already knows
+        is the cheapest correction there is, so it is stated.
+        """
+        candidates = self._registered_candidates(tool) if registered is None else registered
         moves = []
         # D2 2026-08-12: six runs were spent looping here (rocketmq-externals
         # x453, spark-kubernetes-operator x151, tapestry-5 x71), every one of
@@ -527,47 +659,21 @@ class EnvTool(BaseTool):
                 f"build tool already uses it — dispatch the build instead of "
                 f"registering a runtime."
             )
-        if registered:
-            moves.append(
-                "Already registered and executable: " + ", ".join(registered[:6])
-            )
+        if candidates:
+            moves.append("Already registered and executable: " + ", ".join(candidates[:6]))
         elif named_tool:
-            # No candidate exists anywhere: registering other paths cannot
-            # succeed either. The one productive move is installing the tool
-            # (live 2026-08-09: the model probed absent /usr/bin/mvn in a loop
-            # because nothing named the provision route). The tool is inferred
-            # from the basename when the call did not name one, because the
-            # loops recurred through exactly those bare calls.
+            # No usable candidate exists anywhere: registering other paths
+            # cannot succeed either. The one productive move is installing the
+            # tool (live 2026-08-09: the model probed absent /usr/bin/mvn in a
+            # loop because nothing named the provision route). The tool is
+            # inferred from the basename when the call did not name one,
+            # because the loops recurred through exactly those bare calls.
             moves.append(
-                f"No {named_tool} is registered and this path does not exist — if "
+                f"No {named_tool} is registered and {unusable} — if "
                 f"{named_tool} is not installed in the container, install it first: "
                 f"project(action='provision', packages=['{named_tool}'])"
             )
-        # Only the moves above can end this wall; the standing advice appended
-        # below cannot, which is why the bound carries the moves alone into the
-        # marker and into every later refusal.
-        chain = self._refusal_chain(executable, tool)
-        chain.observe(executable, tuple(moves))
-        suggestions = [*moves, *_GENERIC_REGISTRATION_MOVES]
-        metadata: dict[str, Any] = {"action": "validate_executable"}
-        if chain.bound_reached:
-            suggestions.append(self._bound_notice(chain))
-            metadata[MATERIAL_RECURRENCE_BOUND_MARKER] = chain.marker()
-        refusal = ToolResult.completed_failure(
-            output="",
-            error=f"Env overlay executable is not executable or does not exist: {executable}",
-            error_code=_EXECUTABLE_NOT_FOUND,
-            suggestions=suggestions,
-            raw_data={
-                "executable": executable,
-                **({"registered_candidates": registered} if registered else {}),
-            },
-            metadata=metadata,
-        )
-        # This result's own ref belongs to the next statement of the wall; the
-        # engine unions it in for the one being made now.
-        chain.evidence_refs.append(refusal.output_ref)
-        return refusal
+        return moves
 
     # ------------------------------------------------------------------
     # The third rung: a material action may not recur without bound (#42).
@@ -580,17 +686,84 @@ class EnvTool(BaseTool):
     # Nothing is force-closed and no action is synthesized.
     # ------------------------------------------------------------------
 
-    def _refusal_identity(self, executable: Any, tool: Optional[str]) -> tuple[str, str]:
-        """`(tool, error_code)` — never the path, which is what cycled."""
+    def _refusal_tool(self, executable: Any, tool: Optional[str]) -> str:
+        """The tool half of the identity — never the path, which is what cycled."""
         named = str(tool or "").strip().lower() or self._tool_from_executable(executable)
         # An unnamed, unmapped tool falls back to the executable's own basename
         # so three unrelated launchers are not merged into one identity.
         fallback = str(executable or "").rstrip("/").rsplit("/", 1)[-1].strip().lower()
-        return (named or fallback, _EXECUTABLE_NOT_FOUND)
+        return named or fallback
 
-    def _refusal_chain(self, executable: Any, tool: Optional[str]) -> _RefusalChain:
-        identity = self._refusal_identity(executable, tool)
-        return self._refusal_chains.setdefault(identity, _RefusalChain(tool=identity[0]))
+    def _refusal_identity(
+        self,
+        executable: Any,
+        tool: Optional[str],
+        error_code: str,
+    ) -> tuple[str, str]:
+        """`(tool, error_code)`: two codes for one tool are two walls."""
+        return (self._refusal_tool(executable, tool), error_code)
+
+    def _refusal_chain(
+        self,
+        executable: Any,
+        tool: Optional[str],
+        error_code: str,
+    ) -> _RefusalChain:
+        identity = self._refusal_identity(executable, tool, error_code)
+        return self._refusal_chains.setdefault(
+            identity,
+            _RefusalChain(tool=identity[0], error_code=identity[1]),
+        )
+
+    def _count_refusal(
+        self,
+        refusal: ToolResult,
+        *,
+        executable: Any,
+        tool: Optional[str],
+        moves: Optional[list[str]] = None,
+        unusable: str = "the runtime at this path cannot be registered",
+    ) -> ToolResult:
+        """Count one refusal of the bounded family and state the bound at it.
+
+        Every code in `_BOUNDED_REFUSAL_CODES` says the same thing about a
+        repetition — this ask cannot succeed — so each keeps its own count. A
+        code outside the family, or a call that named no path, is returned
+        untouched.
+        """
+        code = str(refusal.error_code or "")
+        path = str(executable or "").strip()
+        if code not in _BOUNDED_REFUSAL_CODES or not path:
+            return refusal
+        chain = self._refusal_chain(path, tool, code)
+        if moves is None:
+            # Two shallow probes, and only for the refusal that reaches the
+            # bound: rung 1's promise is kept by this refusal's own
+            # suggestions, and `chain.moves` is read only once a wall is stated.
+            moves = (
+                self._remaining_moves(path, tool, unusable=unusable)
+                if chain.count + 1 >= _MATERIAL_RECURRENCE_BOUND
+                else list(chain.moves)
+            )
+        chain.observe(
+            path,
+            tuple(moves),
+            error=str(refusal.error or ""),
+            failure_signature=str(refusal.failure_signature or ""),
+        )
+        if chain.bound_reached:
+            stated = list(refusal.suggestions or ())
+            refusal.suggestions = [
+                *(move for move in chain.moves if move not in stated),
+                *stated,
+                self._bound_notice(chain),
+            ]
+            refusal.metadata[MATERIAL_RECURRENCE_BOUND_MARKER] = chain.marker()
+        # This result's own ref belongs to the next statement of the wall; the
+        # engine unions it in for the one being made now.
+        if refusal.output_ref:
+            chain.evidence_refs.append(refusal.output_ref)
+        return refusal
 
     def _bound_notice(self, chain: _RefusalChain) -> str:
         return (
@@ -609,29 +782,49 @@ class EnvTool(BaseTool):
         the identity owns the bound and the count, and the paths it already
         refused are the ones that stop costing a round trip; a first look at a
         new path is not a re-probe and is never refused unseen.
+
+        The restatement is the SAME refusal, not a new one: it carries the
+        typed code and the failure signature this wall already answered with,
+        because `OutcomeKey` is (outcome, error_code, failure_signature) and a
+        re-typed refusal would restart the engine's recurrence chain at exactly
+        the moment the tool declared the wall (#46 defect 1). The bound is
+        carried by the marker, the notice and the error text instead.
         """
         path = str(executable or "").strip()
         if not path:
             # A call with no executable is a schema error, and the existing
             # missing-parameter refusal is the more useful answer.
             return None
-        chain = self._refusal_chains.get(self._refusal_identity(path, tool))
-        if chain is None or not chain.bound_reached:
+        tool_key = self._refusal_tool(path, tool)
+        chain = next(
+            (
+                candidate
+                for (chain_tool, _code), candidate in self._refusal_chains.items()
+                if chain_tool == tool_key
+                and candidate.bound_reached
+                and candidate.already_refused(path)
+            ),
+            None,
+        )
+        if chain is None:
             return None
-        if not chain.already_refused(path):
-            return None
+        answered, signature = chain.answer_for(path)
+        stated = answered or (
+            f"{chain.tool} registration was refused with {chain.error_code}: {path}"
+        )
         return ToolResult.completed_failure(
             output="",
             error=(
-                f"{chain.tool} registration refused without probing: "
-                f"{_EXECUTABLE_NOT_FOUND} recurred {chain.count} times for "
-                f"{', '.join(chain.paths)}"
+                f"{stated} (refused without probing: {chain.error_code} recurred "
+                f"{chain.count} times for {', '.join(chain.paths)})"
             ),
-            error_code=_REFUSAL_BOUND_REACHED,
+            error_code=chain.error_code,
+            failure_signature=signature or None,
             suggestions=[*chain.moves, self._bound_notice(chain)],
             raw_data={
                 "executable": path,
                 "tool": chain.tool,
+                "probed": False,
                 "refused_executables": list(chain.paths),
                 "refusal_count": chain.count,
                 "bound": _MATERIAL_RECURRENCE_BOUND,
@@ -643,18 +836,20 @@ class EnvTool(BaseTool):
         )
 
     def _reset_refusal_bound(self, tool: str) -> None:
-        """A registration that succeeded ends this tool's wall.
+        """A registration that succeeded ends this tool's walls.
 
         A later failure after a real success is new information, not the same
-        wall, so the count restarts. A wall that had been stated is reported as
-        released on the successful result, so the engine can retire a blocker
-        that would otherwise stand against a tool that now registers.
+        wall, so the count restarts. Every wall that had been stated is
+        reported as released on the successful result — by code, since one tool
+        can have been refused under several of them — so the engine can retire
+        blockers that would otherwise stand against a tool that now registers.
         """
         normalized = str(tool or "").strip().lower()
         for identity in [key for key in self._refusal_chains if key[0] == normalized]:
             chain = self._refusal_chains.pop(identity)
             if chain.bound_reached:
                 self._released_tool = normalized
+                self._released_codes.append(chain.error_code)
 
     # A system path the model reached for, mapped to the tool it wanted. Only
     # the launchers whose absence produced the D2 loops need an entry.
@@ -724,12 +919,18 @@ class EnvTool(BaseTool):
         """Prove Maven identity/version before mutating the shared overlay."""
         orchestrator = getattr(self.store, "orchestrator", None)
         if orchestrator is None or not hasattr(orchestrator, "execute_command"):
-            return None, ToolResult.completed_failure(
-                output="",
-                error="Cannot verify Maven without a runtime command executor",
-                error_code="ENV_RUNTIME_PROBE_UNAVAILABLE",
-                suggestions=["Observed capability: runtime version probe executor is unavailable"],
-                raw_data={"executable": executable, "tool": "maven"},
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output="",
+                    error="Cannot verify Maven without a runtime command executor",
+                    error_code="ENV_RUNTIME_PROBE_UNAVAILABLE",
+                    suggestions=[
+                        "Observed capability: runtime version probe executor is unavailable"
+                    ],
+                    raw_data={"executable": executable, "tool": "maven"},
+                ),
+                executable=executable,
+                tool="maven",
             )
 
         probe = orchestrator.execute_command(
@@ -738,31 +939,42 @@ class EnvTool(BaseTool):
         )
         output = probe.get("output") or ""
         if probe.get("exit_code") != 0 or probe.get("success") is False:
-            return None, ToolResult.completed_failure(
-                output=output,
-                error=f"Maven runtime probe failed for {executable}",
-                error_code="ENV_RUNTIME_PROBE_FAILED",
-                suggestions=[
-                    "Constraint: the submitted executable must complete its identity/version probe"
-                ],
-                raw_data={
-                    "executable": executable,
-                    "tool": "maven",
-                    "probe_exit_code": probe.get("exit_code"),
-                },
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output=output,
+                    error=f"Maven runtime probe failed for {executable}",
+                    error_code="ENV_RUNTIME_PROBE_FAILED",
+                    suggestions=[
+                        "Constraint: the submitted executable must complete its "
+                        "identity/version probe"
+                    ],
+                    raw_data={
+                        "executable": executable,
+                        "tool": "maven",
+                        "probe_exit_code": probe.get("exit_code"),
+                    },
+                ),
+                executable=executable,
+                tool="maven",
+                unusable="the runtime at this path fails its own version probe",
             )
 
         match = _MAVEN_VERSION_RE.search(_ANSI_ESCAPE_RE.sub("", output))
         if not match:
-            return None, ToolResult.completed_failure(
-                output=output,
-                error=f"Executable did not identify itself as Apache Maven: {executable}",
-                error_code="ENV_RUNTIME_IDENTITY_MISMATCH",
-                suggestions=[
-                    "Register the distribution's exact bin/mvn executable, not a similarly "
-                    "named script or archive."
-                ],
-                raw_data={"executable": executable, "tool": "maven"},
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output=output,
+                    error=f"Executable did not identify itself as Apache Maven: {executable}",
+                    error_code="ENV_RUNTIME_IDENTITY_MISMATCH",
+                    suggestions=[
+                        "Register the distribution's exact bin/mvn executable, not a similarly "
+                        "named script or archive."
+                    ],
+                    raw_data={"executable": executable, "tool": "maven"},
+                ),
+                executable=executable,
+                tool="maven",
+                unusable="the runtime at this path is not Apache Maven",
             )
 
         measured_version = match.group(1)
@@ -798,24 +1010,28 @@ class EnvTool(BaseTool):
             None,
         )
         if failed_requirement:
-            return None, ToolResult.completed_failure(
-                output=output,
-                error=(
-                    f"Measured Maven {measured_version} does not satisfy "
-                    f"{failed_requirement.raw}"
+            return None, self._count_refusal(
+                ToolResult.completed_failure(
+                    output=output,
+                    error=(
+                        f"Measured Maven {measured_version} does not satisfy "
+                        f"{failed_requirement.raw}"
+                    ),
+                    error_code="ENV_RUNTIME_REQUIREMENT_MISMATCH",
+                    suggestions=[
+                        "Download a Maven distribution satisfying the same requirement; do not "
+                        "weaken or omit the requirement."
+                    ],
+                    raw_data={
+                        "executable": executable,
+                        "tool": "maven",
+                        "measured_version": measured_version,
+                        "requirement": failed_requirement.raw,
+                        "requirement_source": failed_requirement.source,
+                    },
                 ),
-                error_code="ENV_RUNTIME_REQUIREMENT_MISMATCH",
-                suggestions=[
-                    "Download a Maven distribution satisfying the same requirement; do not "
-                    "weaken or omit the requirement."
-                ],
-                raw_data={
-                    "executable": executable,
-                    "tool": "maven",
-                    "measured_version": measured_version,
-                    "requirement": failed_requirement.raw,
-                    "requirement_source": failed_requirement.source,
-                },
+                executable=executable,
+                tool="maven",
             )
         return measured_version, None
 
@@ -834,10 +1050,13 @@ class EnvTool(BaseTool):
             raw_data["measured_version"] = measured_version
         metadata: dict[str, Any] = {"action": action}
         released, self._released_tool = self._released_tool, ""
+        codes, self._released_codes = list(dict.fromkeys(self._released_codes)), []
         if released:
             metadata[MATERIAL_RECURRENCE_RELEASE_MARKER] = {
                 "tool": released,
-                "error_code": _EXECUTABLE_NOT_FOUND,
+                # Every wall this success ends, named: one tool can have been
+                # refused under several codes of the bounded family.
+                "error_codes": codes,
                 "reason": f"{released} registration succeeded",
             }
         return ToolResult.completed_success(
