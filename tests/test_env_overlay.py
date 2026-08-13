@@ -1539,12 +1539,13 @@ def test_a_missing_executable_names_the_projects_own_wrapper_first():
 
 
 def test_without_a_wrapper_the_refusal_still_routes_to_provision():
-    """Premise corrected against the D2 evidence: `register` requires `tool`,
-    so the loops did not recur through bare calls. rocketmq-externals refused
-    ~689 times across three maven paths and the provision route was rendered
-    5 times — the guidance fires, and the model kept going anyway. Bounding
-    that recurrence is task #42's remaining half; what is pinned here is that
-    a project without a wrapper still gets the one move that can succeed."""
+    """Premise corrected twice. First against the register-requires-tool fact
+    (the loops did not recur through bare calls). Then on 2026-08-13 the
+    counts themselves were retracted: the ~689 figure was grep -c over
+    re-rendered console logs; control_events.jsonl shows ~5 refusals in a
+    34-turn run (see the scorecard's RETRACTED section). What this test pins
+    survives both corrections: a project without a wrapper still gets the one
+    move that can succeed."""
     tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
 
     result = tool.execute(
