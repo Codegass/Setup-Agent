@@ -632,7 +632,10 @@ def test_build_grain_rates_read_the_summary_and_the_class_census():
     from sag.agent.module_coverage import build_grain_rates
 
     coverage = {"summary": {"modules_total": 14, "modules_built": 12}}
-    grains = build_grain_rates(coverage, compiled_classes=3400, source_files=3412)
+    # Returns (grains, conflicts) like its sibling test_grain_rates: a grain
+    # may now expose a contradiction, and the caller must see it.
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=3400, source_files=3412)
+    assert conflicts == ()
 
     assert grains["modules"].payload() == {
         "rate": 85.7,
@@ -647,7 +650,8 @@ def test_build_grain_rates_read_the_summary_and_the_class_census():
 def test_build_grain_rates_type_their_absences():
     from sag.agent.module_coverage import build_grain_rates
 
-    grains = build_grain_rates(None, compiled_classes=None, source_files=None)
+    grains, conflicts = build_grain_rates(None, compiled_classes=None, source_files=None)
+    assert conflicts == ()
 
     assert grains["modules"].payload() == {
         "band": "unavailable",
@@ -657,3 +661,59 @@ def test_build_grain_rates_type_their_absences():
         "band": "unavailable",
         "reason": "class census unavailable",
     }
+
+
+# ---------------------------------------------------------------------------
+# A module scan contradicted by physical output is not a zero
+# ---------------------------------------------------------------------------
+
+
+def test_a_module_scan_of_none_beside_real_classes_is_a_contradiction():
+    """D2 2026-08-12: kafka compiled 11,421 classes and the physical oracle
+    judged the build partial, yet the module scan reported 0 built of a
+    denominator of 2 — for a Gradle project with dozens of subprojects. The
+    derived word's rule (modules `none` -> failed) then overrode the oracle and
+    sealed `failed`.
+
+    Two independent physical observations disagreeing is a contradiction, not
+    a measurement of zero, and P4 forbids resolving it into the harsher verdict
+    by default. The grain states the contradiction and raises its conflict."""
+    from sag.agent.module_coverage import (
+        MODULE_SCAN_CONTRADICTED_CONFLICT,
+        build_grain_rates,
+    )
+
+    coverage = {"summary": {"modules_total": 2, "modules_built": 0}}
+    grains, conflicts = build_grain_rates(
+        coverage, compiled_classes=11421, source_files=1319
+    )
+
+    assert grains["modules"].band == "unavailable"
+    assert "11421" in (grains["modules"].reason or ""), "the contradicting count is named"
+    assert conflicts == (MODULE_SCAN_CONTRADICTED_CONFLICT,)
+
+
+def test_a_genuinely_empty_build_still_bands_none():
+    """camel in the same campaign: 0 classes AND 0 of 51 modules. Nothing
+    contradicts anything, so `none` stands and the verdict may say failed."""
+    from sag.agent.module_coverage import build_grain_rates
+
+    coverage = {"summary": {"modules_total": 51, "modules_built": 0}}
+    grains, conflicts = build_grain_rates(coverage, compiled_classes=0, source_files=None)
+
+    assert grains["modules"].band == "none"
+    assert conflicts == ()
+
+
+def test_the_contradicted_grain_cannot_manufacture_a_failed_word():
+    from sag.agent.module_coverage import build_grain_rates
+    from sag.verdict_rates import GrainRate, derived_verdict_word
+
+    grains, _ = build_grain_rates(
+        {"summary": {"modules_total": 2, "modules_built": 0}},
+        compiled_classes=11421,
+        source_files=1319,
+    )
+
+    # Kafka's real shape: contradicted modules, no tests driven.
+    assert derived_verdict_word(grains["modules"], GrainRate(0, 20497)) == "partial"

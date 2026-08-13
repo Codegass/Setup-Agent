@@ -900,7 +900,7 @@ def _snapshot_rates(
     """Assemble the one serialized rates block from already-held evidence."""
     from sag.agent.module_coverage import build_grain_rates, shared_module_scan
 
-    build_grains = build_grain_rates(
+    build_grains, build_conflicts = build_grain_rates(
         shared_module_scan(validator, project_name),
         compiled_classes=build.compiled_classes,
         source_files=build.source_files,
@@ -919,6 +919,7 @@ def _snapshot_rates(
     # An impossible fraction is a conflict, never a quiet top band: the
     # 2026-08-10 acceptance sealed classes 201/68 and cases 1605/1163 with an
     # empty conflict list and a manufactured `success`.
+    rate_conflicts += build_conflicts
     rate_conflicts += unbounded_conflicts(*build_grains.values(), *test_grains.values())
     return rates, build_grains["modules"], test_grains["cases"], rate_conflicts
 

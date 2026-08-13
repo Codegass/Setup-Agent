@@ -321,13 +321,19 @@ def _island_checklist_line(
     return line
 
 
+# A module scan that attributes nothing while class files exist is neither a
+# zero nor an absence: it is two physical observations disagreeing, and the
+# verdict must see the disagreement rather than the harsher of the two.
+MODULE_SCAN_CONTRADICTED_CONFLICT = "module_scan_contradicts_physical_build"
+
+
 def build_grain_rates(
     coverage: dict[str, Any] | None,
     *,
     compiled_classes: int | None,
     source_files: int | None,
-) -> dict[str, GrainRate]:
-    """Return the two build grains without performing another scan.
+) -> tuple[dict[str, GrainRate], tuple[str, ...]]:
+    """Return the two build grains, and any conflict they expose, with no rescan.
 
     Module scope comes from the summary already produced by
     :func:`module_coverage`; class substance comes from the physical
@@ -336,8 +342,27 @@ def build_grain_rates(
 
     summary = (coverage or {}).get("summary") or {}
     total = int(summary.get("modules_total") or 0)
+    conflicts: tuple[str, ...] = ()
     if total > 0:
-        modules = GrainRate(numerator=int(summary.get("modules_built") or 0), denominator=total)
+        built = int(summary.get("modules_built") or 0)
+        if built == 0 and (compiled_classes or 0) > 0:
+            # Two independent physical observations disagree: the scan attributes
+            # nothing while class files sit on disk (live D2 kafka: 0 of 2 modules
+            # beside 11,421 classes, on a Gradle build with dozens of
+            # subprojects). A contradiction is not a measurement of zero, and
+            # resolving it silently into `none` let the derived word override the
+            # physical oracle and seal `failed`.
+            modules = GrainRate(
+                0,
+                None,
+                reason=(
+                    f"module scan attributed none of {total} while "
+                    f"{int(compiled_classes or 0)} class files exist"
+                ),
+            )
+            conflicts = (MODULE_SCAN_CONTRADICTED_CONFLICT,)
+        else:
+            modules = GrainRate(numerator=built, denominator=total)
     else:
         modules = GrainRate(0, None, reason="no module scan available")
 
@@ -345,7 +370,7 @@ def build_grain_rates(
         classes = GrainRate(numerator=int(compiled_classes), denominator=int(source_files))
     else:
         classes = GrainRate(0, None, reason="class census unavailable")
-    return {"modules": modules, "classes": classes}
+    return {"modules": modules, "classes": classes}, conflicts
 
 
 def coverage_conflicts(coverage: dict[str, Any] | None) -> tuple[str, ...]:
