@@ -88,9 +88,16 @@ single highest-volume harness defect in the campaign (task #42).
 `grep -n <pattern> <path> 2>/dev/null | head -N`, discards stderr, never
 inspects the exit code, and always returns `completed_success`. grep's three
 outcomes — match, no match, and **error** — collapse into one confident
-"No matches for …". Plain grep is also BRE, so the harness's own build-file
-probe `(^|/)build\.gradle$|(^|/)settings\.gradle$|(^|/)pom\.xml$|(^|/)gradlew$`
+"No matches for …". Plain grep is also BRE, so the build-file probe
+`(^|/)build\.gradle$|(^|/)settings\.gradle$|(^|/)pom\.xml$|(^|/)gradlew$`
 treats `|` literally and can never match.
+
+> **Correction (2026-08-13).** That pattern is the model's own invention, not
+> a harness probe — it appears nowhere in the repository. The distinction
+> matters: `search(file:…)` greps file CONTENTS, so even with alternation and
+> exit codes fixed, the call can never find a file *named* `gradlew`. The
+> model reached for a name lookup the tool does not offer. Fixed defect
+> tracked as #41 (landed, `cf7a7fb`); the missing affordance is #43.
 
 Tapestry-5 has both `build.gradle` and `gradlew` on disk. It was told it had
 no build files, tried `gradlew` 378 times and a nonexistent `/usr/bin/gradle`
