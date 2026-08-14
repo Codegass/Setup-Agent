@@ -1,0 +1,43 @@
+{
+  "campaign_id": "d2r3-serial-20260814",
+  "campaign_kind": "d2r3-serial-oom-contrast",
+  "contrast_baseline": "d2r2-20260813",
+  "coverage_pass": false,
+  "coverage_pass_rationale": "same as d2r2: coverage is swept separately after review",
+  "lanes": 1,
+  "named_confound": "tree carries the gate-truth chain (31e3dcf..7dce3aa): sealed counts are not byte-comparable with d2r2; receipt-backed execution volume is the contrast metric",
+  "projects": [
+    {
+      "name": "kafka",
+      "ref": "4.3.1",
+      "run_order_index": 0,
+      "url": "https://github.com/apache/kafka.git"
+    },
+    {
+      "name": "ignite",
+      "ref": "2.18.0",
+      "run_order_index": 1,
+      "url": "https://github.com/apache/ignite.git"
+    },
+    {
+      "name": "camel-quarkus",
+      "ref": "3.36.0",
+      "run_order_index": 2,
+      "url": "https://github.com/apache/camel-quarkus.git"
+    },
+    {
+      "name": "polaris",
+      "ref": "apache-polaris-1.5.0",
+      "run_order_index": 3,
+      "url": "https://github.com/apache/polaris.git"
+    }
+  ],
+  "prompt_bundle_sha256": "cef63daf9c98604bda8b7cf55b97a228e9aba5a5f50c1f32ca430b5766d2b3f9",
+  "runs_per_project": 1,
+  "schema_version": 1,
+  "source": {
+    "dirty": false,
+    "git_sha": "7dce3aaad42229e656caa2dad65783021fb4da5e",
+    "tree_sha256": "2ca3dcc655a636db83c59ba16d1962d304227de3f568bf9ef3d02fdf050484f7"
+  }
+}

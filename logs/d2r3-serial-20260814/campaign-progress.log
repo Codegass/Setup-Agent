@@ -1,0 +1,10 @@
+07:27:57 D2R3 START: 4 projects, 1 lane, source 7dce3aaad422
+07:27:57 START [00] kafka (ref=4.3.1)
+07:41:51 DONE  [00] kafka exit=1 after 834s
+07:41:51 START [01] ignite (ref=2.18.0)
+09:33:35 DONE  [01] ignite exit=1 after 6703s
+09:33:35 START [02] camel-quarkus (ref=3.36.0)
+10:01:28 DONE  [02] camel-quarkus exit=1 after 1673s
+10:01:28 START [03] polaris (ref=apache-polaris-1.5.0)
+10:22:02 DONE  [03] polaris exit=1 after 1233s
+10:22:02 D2R3 COMPLETE: kafka:1, ignite:1, camel-quarkus:1, polaris:1

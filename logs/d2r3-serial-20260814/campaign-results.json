@@ -1,0 +1,22 @@
+[
+  {
+    "exit_code": 1,
+    "project": "kafka",
+    "seconds": 834
+  },
+  {
+    "exit_code": 1,
+    "project": "ignite",
+    "seconds": 6703
+  },
+  {
+    "exit_code": 1,
+    "project": "camel-quarkus",
+    "seconds": 1673
+  },
+  {
+    "exit_code": 1,
+    "project": "polaris",
+    "seconds": 1233
+  }
+]
