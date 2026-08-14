@@ -28,12 +28,11 @@ def test_run_verdict_conflicts_cap_at_partial():
     assert v == "partial"
 
 
-def test_run_verdict_ignores_conflicts_already_adjudicated_by_threshold():
+def test_run_verdict_ignores_conflicts_that_only_restate_counted_red():
     """test_failures_detected / test_errors_detected merely RESTATE the counted
-    failures that the pass-rate threshold policy (evaluate_run_verdict) already
-    accepted into the physical verdict. Feeding them back in double-adjudicates
-    the same failures: a 206/214 (96.3% >= threshold) run was announced
-    'partial' where pre-stage-3 said SUCCESS (round-6 review)."""
+    failures the physical verdict already read as execution. Feeding them back
+    in double-adjudicates the same failures: a 206/214 run was announced
+    'partial' where the execution evidence says the suite ran."""
     assert run_verdict("success", "success",
                        ["test_failures_detected", "test_errors_detected"]) == "success"
 

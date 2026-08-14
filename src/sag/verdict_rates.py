@@ -1,9 +1,13 @@
-"""Pure band table and rate grains for the rate-banded verdict.
+"""Pure band table, rate grains and execution prose for the rate-banded verdict.
 
 One place decides what a percentage is called. Grains are never folded: no
 minimum, weighting, or hidden aggregate combines them. The only band mutation
 is the heavy-red weak signal, which can demote the test-cases grain from
 ``fully`` to ``most`` without changing its underlying fraction.
+
+One place also decides how an execution READS (:func:`execution_sentence`).
+Gate prose that renders itself from a pass rate is how ignite sealed "Tests
+below the 80% pass threshold: 29/37" beside `validator_state: green`.
 """
 
 from dataclasses import dataclass, replace
@@ -29,6 +33,55 @@ HEAVY_RED_CONFLICT = "test_failures_heavy"
 UNBOUNDED_CONFLICT = "rate_denominator_not_a_bound"
 UNBOUNDED_REASON = "numerator exceeds denominator; this count cannot bound it"
 UNATTRIBUTED_CONFLICT = "test_executions_unattributed_to_receipts"
+
+
+# The affirming sentence's opening token. Everything that grades execution
+# renders through :func:`execution_sentence`, so a decision can check whether a
+# reason IS that sentence without parsing prose.
+EXECUTION_SENTENCE_PREFIX = "executed "
+# The deficiency classes spec §2.3 names. A gate result whose reason asserts one
+# of these cannot carry an upgrading outcome.
+DEFICIENCY_MARKERS = ("below", "insufficient", "missing")
+
+
+def execution_sentence(
+    *,
+    executed: int,
+    discovered: int | None,
+    passed: int,
+    failed: int,
+    errors: int = 0,
+    skipped: int = 0,
+) -> str:
+    """What the dispatch ran, against what was discovered, and the red as fact.
+
+    ``executed 3,571 of 20,497 discovered · 3,568 passed, 2 failed, 1 skipped``.
+    No percentage appears: a rate is a band's job (:func:`band_for`), and a rate
+    in a gate reason is what invited the 80% cliff back in every time. Errors are
+    their own clause when present rather than being folded into ``failed``.
+    """
+
+    if discovered and discovered > 0:
+        head = f"executed {executed:,} of {discovered:,} discovered"
+    else:
+        head = f"executed {executed:,} of an undetermined discovery"
+    counts = [f"{passed:,} passed", f"{failed:,} failed"]
+    if errors:
+        counts.append(f"{errors:,} errored")
+    counts.append(f"{skipped:,} skipped")
+    return f"{head} · {', '.join(counts)}"
+
+
+def no_execution_sentence(discovered: int | None) -> str:
+    """Zero executions stated as zero executions, never as a failed percentage.
+
+    geode sealed ``Tests below the 80% pass threshold: 0/0 (0.0%)`` — a run that
+    executed nothing described as a run that ran and scored badly.
+    """
+
+    if discovered and discovered > 0:
+        return f"no tests executed of {discovered:,} discovered"
+    return "no tests executed"
 
 
 def band_for(numerator: int, denominator: int | None) -> str:

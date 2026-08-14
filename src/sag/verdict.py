@@ -11,13 +11,12 @@ from typing import Iterable, Optional
 VERDICT_ORDER = ["failed", "partial", "success"]
 _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 
-# Conflicts that merely RESTATE counted test failures. The pass-rate threshold
-# policy (evaluate_run_verdict) has already adjudicated those counts into the
-# physical verdict, so feeding them back into the conflict cap would demote
-# every threshold-pass run with any failing test to partial (round-6 review:
-# build green + 206/214 = 96.3% >= threshold announced 'partial' where
-# pre-stage-3 said SUCCESS). The cap stays reserved for genuine uncertainty
-# about the evidence itself (e.g. test_report_parse_error).
+# Conflicts that merely RESTATE counted test failures. The project's red is an
+# exact sealed fact and the physical verdict has already read it as execution
+# (spec 2026-08-14 §2), so feeding it back into the conflict cap would demote
+# every fully-executed run with any failing test to partial. The cap stays
+# reserved for genuine uncertainty about the evidence itself (e.g.
+# test_report_parse_error).
 ADJUDICATED_CONFLICTS = frozenset({"test_failures_detected", "test_errors_detected"})
 
 

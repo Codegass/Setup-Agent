@@ -447,7 +447,7 @@ def test_the_new_rollup_key_does_not_invalidate_the_sealed_test_stats():
     turn a valid receipt-scoped rollup into `validated_test_stats_invalid`."""
     gate = _gate("test", PhaseOutcome.PARTIAL)
     state = _state_with_domain_fact("test.stats", gate.validated_facts["test.stats"])
-    stats, conflicts = _fold_test_stats(state, test_pass_threshold=0.8)
+    stats, conflicts = _fold_test_stats(state)
     assert "validated_test_stats_invalid" not in conflicts
     assert stats.unique.executed == 50
 

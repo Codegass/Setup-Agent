@@ -15,7 +15,6 @@ from sag.agent.verdict_finalizer import (
     RunVerdictSnapshot,
     SnapshotTestStats,
 )
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.tools.report_tool import ReportTool
 from build_requirements_fakes import complete_build_requirements_v1
@@ -37,19 +36,10 @@ def _validator_with_published_manifest() -> PhysicalValidator:
 
 
 class FakePhysicalValidator:
-    def __init__(
-        self,
-        build_status,
-        test_status,
-        analysis_status=None,
-        test_pass_threshold=DEFAULT_TEST_PASS_THRESHOLD,
-    ):
+    def __init__(self, build_status, test_status, analysis_status=None):
         self.build_status = build_status
         self.test_status = test_status
         self.analysis_status = analysis_status or {"analyzed": False}
-        # Mirror the real PhysicalValidator attribute so the run-success gate
-        # reads the configured threshold (not a hardcoded default).
-        self.test_pass_threshold = test_pass_threshold
         self.build_project_names = []
         self.test_project_names = []
         self.analysis_project_names = []
@@ -166,12 +156,11 @@ def test_verified_final_status_allows_skipped_tests_without_failures():
     assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
 
 
-def test_verified_final_status_accepts_partial_pass_above_threshold():
-    """A build-green run with failures but pass rate >= threshold is a SUCCESS
-    (partial pass), matching the single verdict policy used by the report.
+def test_verified_final_status_accepts_a_suite_that_ran_with_one_failure():
+    """A build-green run whose suite executed is a SUCCESS, red tests and all.
 
-    Previously this path applied zero tolerance (any failure -> fail); the run
-    gate now delegates to evaluate_run_verdict so it agrees with the report.
+    Previously this path applied zero tolerance (any failure -> fail), then an
+    80% cliff; the run gate now grades execution, as the report does.
     """
     agent = _agent_with_validator(
         FakePhysicalValidator(
@@ -189,7 +178,7 @@ def test_verified_final_status_accepts_partial_pass_above_threshold():
                 "test_exclusions": [],
                 "modules_without_tests": [],
                 # The real validator restates counted failures as conflicts;
-                # they must not demote a threshold pass (round-6 review).
+                # they must not demote a suite that ran (round-6 review).
                 "conflicts": ["test_failures_detected"],
             },
             analysis_status={
@@ -203,15 +192,20 @@ def test_verified_final_status_accepts_partial_pass_above_threshold():
     assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
 
 
-def test_verified_final_status_rejects_below_threshold_tests():
-    """Build green but pass rate below test_pass_threshold -> failure."""
+def test_verified_final_status_accepts_a_fully_executed_half_red_suite():
+    """A suite that ran end to end is a pass on the test axis, red and all.
+
+    Premise updated 2026-08-14 (spec §2): 50/100 passing used to be FAILED on
+    the invented 80% cliff. The 50 failures are the project's, they stay exact
+    facts on the status dict, and they adjudicate nothing.
+    """
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status={"success": True, "reason": "Build fingerprints found"},
             test_status={
                 "has_test_reports": True,
-                "status": "FAILED",
-                "reason": "Tests below threshold",
+                "status": "SUCCESS",
+                "reason": "executed 100 of 100 discovered · 50 passed, 50 failed, 0 skipped",
                 "pass_rate": 50.0,
                 "total_tests": 100,
                 "passed_tests": 50,
@@ -229,28 +223,22 @@ def test_verified_final_status_rejects_below_threshold_tests():
         )
     )
 
-    assert agent._legacy_get_verified_final_status(react_engine_success=True) is False
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
 
 
-def test_verified_final_status_honors_configured_threshold():
-    """The configured test_pass_threshold must change the run-success verdict.
-
-    Proves SAG_TEST_PASS_THRESHOLD / Config.test_pass_threshold is wired through
-    PhysicalValidator into the run gate (not the hardcoded 0.8 default): the same
-    85% build-green run passes under the default 0.8 but fails under a 0.9 gate.
-    """
-
-    def _profile(threshold):
-        return FakePhysicalValidator(
+def test_verified_final_status_caps_a_partly_executed_suite_at_partial():
+    """Fully executed means executed >= discovered — the only line left."""
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
             build_status={"success": True, "reason": "Build fingerprints found"},
             test_status={
                 "has_test_reports": True,
-                "status": "PARTIAL",
-                "reason": "Tests partially passed",
-                "pass_rate": 85.0,
-                "total_tests": 100,
+                "status": "SUCCESS",
+                "reason": "executed 85 of 100 discovered · 85 passed, 0 failed, 0 skipped",
+                "pass_rate": 100.0,
+                "total_tests": 85,
                 "passed_tests": 85,
-                "failed_tests": 15,
+                "failed_tests": 0,
                 "error_tests": 0,
                 "skipped_tests": 0,
                 "test_exclusions": [],
@@ -261,14 +249,11 @@ def test_verified_final_status_honors_configured_threshold():
                 "has_static_test_count": True,
                 "static_test_count": 100,
             },
-            test_pass_threshold=threshold,
         )
+    )
 
-    default_agent = _agent_with_validator(_profile(0.8))
-    strict_agent = _agent_with_validator(_profile(0.9))
-
-    assert default_agent._legacy_get_verified_final_status(react_engine_success=True) is True
-    assert strict_agent._legacy_get_verified_final_status(react_engine_success=True) is False
+    agent._legacy_get_verified_final_status(react_engine_success=True)
+    assert agent.final_verdict == "partial"
 
 
 def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatch):
@@ -351,7 +336,9 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
 
     result = validator.validate_test_status("demo")
 
-    assert result["evidence_status"] == "partial"
+    # The suite ran; its red and its parse error travel as conflicts, not as a
+    # downgraded evidence word (spec 2026-08-14 §2).
+    assert result["evidence_status"] == "success"
     assert result["test_stats"]["executed"] == 430
     assert result["test_stats"]["passed"] == 420
     assert result["test_stats"]["failed"] > 0

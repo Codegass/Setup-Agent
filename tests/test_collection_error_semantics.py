@@ -289,7 +289,6 @@ def test_compact_parser_keeps_named_testcases(tmp_path):
 
 def test_sealed_test_stats_carry_collection_errors_with_zero_executed(monkeypatch):
     validator = PhysicalValidator.__new__(PhysicalValidator)
-    validator.test_pass_threshold = 0.8
     validator.project_path = "/workspace"
 
     metrics = {
@@ -331,7 +330,6 @@ def test_sealed_test_stats_carry_collection_errors_with_zero_executed(monkeypatc
 @pytest.mark.parametrize("collection_errors", [0, 28])
 def test_conflict_marker_only_fires_on_collection_failures(monkeypatch, collection_errors):
     validator = PhysicalValidator.__new__(PhysicalValidator)
-    validator.test_pass_threshold = 0.8
     validator.project_path = "/workspace"
 
     metrics = {

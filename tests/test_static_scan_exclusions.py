@@ -331,19 +331,17 @@ def test_static_count_still_used_when_collected_json_absent():
     assert "static_test_count_source" not in result
 
 
-def test_agent_gate_no_partial_cap_with_collected_denominator():
-    """click's numbers through the CLI gate: 1902 executed of 1927 collected
-    (98.7% >= 80%) -> SUCCESS, no tests_not_fully_executed PARTIAL cap."""
-    agent = _agent_with_validator(
+def _click_gate_agent(executed):
+    return _agent_with_validator(
         FakePhysicalValidator(
             build_status={"success": True, "build_complete": True, "reason": "ok"},
             test_status={
                 "has_test_reports": True,
                 "status": "SUCCESS",
-                "reason": "98.7%",
+                "reason": f"executed {executed} of 1,927 discovered",
                 "pass_rate": 100.0,
-                "total_tests": 1902,
-                "passed_tests": 1902,
+                "total_tests": executed,
+                "passed_tests": executed,
                 "failed_tests": 0,
                 "error_tests": 0,
                 "skipped_tests": 0,
@@ -359,6 +357,25 @@ def test_agent_gate_no_partial_cap_with_collected_denominator():
         )
     )
 
+
+def test_agent_gate_caps_at_partial_below_the_collected_denominator():
+    """click's numbers through the CLI gate: 1902 executed of 1927 collected.
+
+    Premise updated 2026-08-14 (spec §2): the cap used to fire below a
+    configured 0.8, so 98.7% read as a full success and 25 uncounted tests
+    vanished. "Fully executed" now means executed >= discovered — the same
+    boundary v4's `fully` band draws.
+    """
+    agent = _click_gate_agent(1902)
+
+    agent._legacy_get_verified_final_status(react_engine_success=True)
+
+    assert agent.final_verdict == "partial"
+
+
+def test_agent_gate_leaves_a_fully_executed_suite_at_success():
+    agent = _click_gate_agent(1927)
+
     assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
     assert agent.final_verdict == "success"
 
@@ -366,7 +383,7 @@ def test_agent_gate_no_partial_cap_with_collected_denominator():
 def test_report_snapshot_prefers_collected_denominator_on_python():
     """The report snapshot's execution-coverage gate must use the collect-only
     denominator on python even when the trunk carries a polluted static count:
-    1902 executed / 1927 collected -> no tests_not_fully_executed conflict."""
+    1902 executed / 1927 collected, not 1902 / 32927."""
     tool = ReportTool(
         context_manager=SimpleNamespace(
             load_trunk_context=lambda: SimpleNamespace(
@@ -409,7 +426,9 @@ def test_report_snapshot_prefers_collected_denominator_on_python():
     status = snapshot["status"]
     assert status["static_test_count"] == 1927
     assert status["execution_rate"] == pytest.approx(1902 / 1927 * 100, abs=0.01)
-    assert "tests_not_fully_executed" not in snapshot["evidence_result"].get("conflicts", [])
+    # The shortfall is real and named against the RIGHT denominator; the point
+    # of the collect-only priority is the 1927, not the absence of a conflict.
+    assert "tests_not_fully_executed" in snapshot["evidence_result"].get("conflicts", [])
 
 
 def test_report_snapshot_java_trunk_static_count_unchanged():

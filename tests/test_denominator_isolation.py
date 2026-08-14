@@ -39,7 +39,6 @@ class _Validator:
 
     def __init__(self, detected):
         self.detected = detected
-        self.test_execution_threshold = 0.8
 
     def _detect_build_system(self, project_dir):
         return self.detected

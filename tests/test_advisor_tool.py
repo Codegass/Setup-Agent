@@ -310,9 +310,7 @@ def _registration_agent():
     agent = object.__new__(SetupAgent)
     agent.config = SimpleNamespace(
         workspace_path="/workspace",
-        test_pass_threshold=0.95,
         build_coverage_threshold=0.75,
-        test_execution_threshold=0.8,
     )
     agent.orchestrator = SimpleNamespace(
         project_name="demo",

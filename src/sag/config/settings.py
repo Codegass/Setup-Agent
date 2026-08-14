@@ -9,12 +9,6 @@ from pydantic import BaseModel, Field
 
 from .models import LogLevel
 
-# Test verdict policy: the required fraction of executed tests that must pass for a
-# build-green run to count as a SUCCESS. This is the SINGLE SOURCE OF TRUTH for the
-# pass-rate gate consumed by both the report verdict and the run/test success policy
-# (replaces the previously hardcoded "80%" magic number scattered across modules).
-DEFAULT_TEST_PASS_THRESHOLD = 0.8
-
 # Build verdict policy: the required fraction of EXPECTED compiled classes (source-
 # weighted across the ACTIVE reactor modules) that must actually be produced for a
 # build to count as a full SUCCESS. A setup is only a success when every active
@@ -25,13 +19,11 @@ DEFAULT_TEST_PASS_THRESHOLD = 0.8
 # output but below this threshold) is reported as PARTIAL, never SUCCESS.
 DEFAULT_BUILD_COVERAGE_THRESHOLD = 1.0
 
-# Test verdict policy: the required fraction of DETECTED tests that must actually be
-# EXECUTED for a build-green run to count as a full SUCCESS. Mirrors the build
-# coverage gate but for test execution: a run that detected a static suite (e.g.
-# 1122 tests) yet only ran a fraction of it (e.g. 1) is reported as PARTIAL, never
-# SUCCESS — the test suite was not really exercised. Configurable via
-# SAG_TEST_EXECUTION_THRESHOLD; 0.8 = "most detected tests must run".
-DEFAULT_TEST_EXECUTION_THRESHOLD = 0.8
+# There is deliberately no test pass-rate or test execution-rate threshold here.
+# Spec 2026-08-14 §2 retired both: a project's red tests are not SAG's repair
+# duty, and an invented 80% cliff adjudicated claims it could not justify. What
+# ran against what was discovered is stated as fact (sag.verdict_rates), and the
+# rate is named by the band table — never by a configured cut-off.
 
 
 class Config(BaseModel):
@@ -119,14 +111,9 @@ class Config(BaseModel):
     advisor_phase_cap: int = Field(default=4)
 
     # Validation / verdict policy
-    # Minimum test pass rate (fraction, 0-1) for a build-green run to be a SUCCESS.
-    test_pass_threshold: float = Field(default=DEFAULT_TEST_PASS_THRESHOLD)
     # Minimum source-weighted compiled-class coverage (fraction, 0-1) for a
     # multi-module build to count as green.
     build_coverage_threshold: float = Field(default=DEFAULT_BUILD_COVERAGE_THRESHOLD)
-    # Minimum fraction (0-1) of DETECTED tests that must be executed for a
-    # build-green run to be a SUCCESS (else the run is capped at PARTIAL).
-    test_execution_threshold: float = Field(default=DEFAULT_TEST_EXECUTION_THRESHOLD)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -185,14 +172,8 @@ class Config(BaseModel):
             advisor_mode=os.getenv("SAG_ADVISOR_MODE", "same-model"),
             advisor_max_tokens=int(os.getenv("SAG_ADVISOR_MAX_TOKENS", "2048")),
             advisor_phase_cap=int(os.getenv("SAG_ADVISOR_PHASE_CAP", "4")),
-            test_pass_threshold=float(
-                os.getenv("SAG_TEST_PASS_THRESHOLD", str(DEFAULT_TEST_PASS_THRESHOLD))
-            ),
             build_coverage_threshold=float(
                 os.getenv("SAG_BUILD_COVERAGE_THRESHOLD", str(DEFAULT_BUILD_COVERAGE_THRESHOLD))
-            ),
-            test_execution_threshold=float(
-                os.getenv("SAG_TEST_EXECUTION_THRESHOLD", str(DEFAULT_TEST_EXECUTION_THRESHOLD))
             ),
         )
 

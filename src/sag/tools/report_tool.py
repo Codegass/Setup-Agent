@@ -12,7 +12,6 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
-from sag.config.settings import DEFAULT_TEST_EXECUTION_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import (
     EvidenceAssessment,
     EvidenceStatus,
@@ -2036,18 +2035,11 @@ class ReportTool(BaseTool, UIEventEmitter):
                 status["tests_passed"] = None
 
         tests_ok = None
-        if pass_pct is not None:
-            # Use the SAME pass-rate threshold as the run verdict so the
-            # dashboard pass/fail can never diverge from the header verdict.
-            snapshot_threshold_pct = (
-                getattr(
-                    self.physical_validator,
-                    "test_pass_threshold",
-                    DEFAULT_TEST_PASS_THRESHOLD,
-                )
-                * 100.0
-            )
-            tests_ok = pass_pct >= snapshot_threshold_pct
+        if status["tests_total"] is not None and status["tests_total"] > 0:
+            # Execution, not the project's pass percentage (spec §2.1). The
+            # sealed path already reads `tests_ok` off the execution-derived
+            # judgment; this legacy snapshot now answers the same question.
+            tests_ok = True
         elif status["tests_total"] is not None:
             tests_ok = actual_accomplishments.get("test_success", False)
         status["tests_ok"] = tests_ok
@@ -2116,25 +2108,17 @@ class ReportTool(BaseTool, UIEventEmitter):
         # Test-execution shortfall caps the run at PARTIAL: a static suite was
         # detected but only a fraction actually ran (e.g. carbondata 1/1122 = 0.1%).
         # Mirror the build-coverage gate — emit tests_not_fully_executed (a genuine,
-        # non-adjudicated conflict) when execution coverage is below the configured
-        # threshold, so the verdict kernel caps an otherwise-clean run at partial.
-        exec_threshold_pct = (
-            getattr(
-                self.physical_validator,
-                "test_execution_threshold",
-                DEFAULT_TEST_EXECUTION_THRESHOLD,
-            )
-            * 100.0
-        )
+        # non-adjudicated conflict) so the verdict kernel caps an otherwise-clean
+        # run at partial. The conflict says what its name says: NOT FULLY
+        # executed. It used to fire below a configured 0.8, which made "fully"
+        # mean "four fifths" and let a fifth of a suite vanish without a word.
         # executed >= detected is full coverage BY DEFINITION (the rate is
         # clamped to exactly 100.0 above), so the gate can never fire there —
-        # not even under a strict 100% threshold. Below 100.0 the exact ratio
-        # and the threshold comparison are unchanged.
+        # the same boundary v4's `fully` band draws.
         if (
             status.get("static_test_count")
             and status.get("execution_rate") is not None
             and status["execution_rate"] < 100.0
-            and status["execution_rate"] < exec_threshold_pct
         ):
             ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
             if "tests_not_fully_executed" not in ev_conflicts:

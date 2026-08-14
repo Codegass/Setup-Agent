@@ -45,11 +45,7 @@ from sag.agent.evidence_records import (
 )
 from sag.agent.receipt_structure import dispatch_terminated as _dispatch_terminated
 from sag.agent.receipt_structure import module_key as _receipt_module_key
-from sag.config.settings import (
-    DEFAULT_BUILD_COVERAGE_THRESHOLD,
-    DEFAULT_TEST_EXECUTION_THRESHOLD,
-    DEFAULT_TEST_PASS_THRESHOLD,
-)
+from sag.config.settings import DEFAULT_BUILD_COVERAGE_THRESHOLD
 from sag.runtime.container_io import (
     ContainerFileReadError,
 )
@@ -70,6 +66,7 @@ from sag.testcases.results import (
     aggregate_test_results,
     canonical_test_identity,
 )
+from sag.verdict_rates import execution_sentence, no_execution_sentence
 
 # top_level.txt names that are install tooling, never the project under test —
 # a second deny-list layer under the record selection in
@@ -1017,38 +1014,53 @@ def _driven_test_modules_from_receipts(
     return driven
 
 
-def evaluate_run_verdict(
-    build_green: bool,
-    pass_rate: float,
-    *,
-    test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
-) -> str:
-    """SINGLE SOURCE OF TRUTH for the build+test run verdict.
+class TestEvidenceDecision(NamedTuple):
+    """One decision: the label, the evidence word AND the sentence that says why.
 
-    This is the one documented place that decides whether a run is a pass or a
-    fail. Both the report verdict (``ReportTool._determine_actual_status``) and
-    the run/test success path read this policy so the two can never diverge.
-
-    Policy:
-        * build NOT green                              -> "failed"
-        * build green AND pass_rate >= threshold       -> "success"
-        * build green AND pass_rate <  threshold       -> "failed"
-
-    A build that compiled with at least ``test_pass_threshold`` of its tests
-    passing is a SUCCESS (a partial pass), not a failure.
-
-    Args:
-        build_green: Whether the build produced real compiled artifacts.
-        pass_rate: Test pass rate as a PERCENTAGE in the range 0-100.
-        test_pass_threshold: Required pass rate as a FRACTION in 0-1
-            (default :data:`DEFAULT_TEST_PASS_THRESHOLD`, i.e. 0.8 -> 80%).
-
-    Returns:
-        ``"success"`` or ``"failed"``.
+    Spec 2026-08-14 §2.3. The three used to be selected by three separate
+    branches over the same pass rate, which is how ignite sealed a "below the
+    threshold" sentence beside a green evidence status. They are produced here or
+    not at all, so a reason can never point away from the word it accompanies.
     """
-    if not build_green:
-        return "failed"
-    return "success" if pass_rate >= test_pass_threshold * 100.0 else "failed"
+
+    status: str
+    evidence_status: str
+    reason: str
+
+
+def decide_test_evidence(
+    *,
+    valid: bool,
+    executed: int,
+    discovered: Optional[int],
+    passed: int,
+    failed: int,
+    errors: int,
+    skipped: int,
+) -> TestEvidenceDecision:
+    """Grade test evidence on EXECUTION, never on a pass percentage.
+
+    The project's red is an exact fact the sentence states; it is not a SAG
+    failure and it adjudicates nothing (spec §2.1/§2.2). Execution coverage is
+    named by the rate bands downstream, not by a cut-off here.
+    """
+
+    if not valid:
+        return TestEvidenceDecision("WARNING", "unknown", "No test reports found")
+    if executed <= 0:
+        return TestEvidenceDecision("FAILED", "blocked", no_execution_sentence(discovered))
+    return TestEvidenceDecision(
+        "SUCCESS",
+        "success",
+        execution_sentence(
+            executed=executed,
+            discovered=discovered,
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            skipped=skipped,
+        ),
+    )
 
 
 def _coverage_basis(coverage_info: Dict[str, Any]) -> str:
@@ -1095,9 +1107,7 @@ class PhysicalValidator:
         docker_orchestrator=None,
         project_path: str = "/workspace",
         compilation_recency_hours: int = 1,
-        test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
         build_coverage_threshold: float = DEFAULT_BUILD_COVERAGE_THRESHOLD,
-        test_execution_threshold: float = DEFAULT_TEST_EXECUTION_THRESHOLD,
         command_tracker=None,
         receipt_run_id: Optional[str] = None,
     ):
@@ -1108,13 +1118,8 @@ class PhysicalValidator:
             docker_orchestrator: Docker orchestrator for command execution
             project_path: Base path of the project in container
             compilation_recency_hours: Hours to consider compilation as recent (default 1)
-            test_pass_threshold: Minimum test pass rate (fraction 0-1) for a
-                build-green run to be a SUCCESS. Feeds :func:`evaluate_run_verdict`.
             build_coverage_threshold: Minimum source-weighted compiled-class coverage
                 (fraction 0-1) for a multi-module build to count as green.
-            test_execution_threshold: Minimum fraction (0-1) of DETECTED tests that
-                must actually execute for a build-green run to be a SUCCESS; below
-                this the run is capped at PARTIAL (tests not really exercised).
             command_tracker: Shared CommandTracker recording build/test commands
                 and the build's wall-clock duration. validate_build_status reads
                 the last recorded build off it to surface build_time/build_command
@@ -1126,9 +1131,7 @@ class PhysicalValidator:
         self.docker_orchestrator = docker_orchestrator
         self.project_path = project_path
         self.compilation_recency_hours = compilation_recency_hours
-        self.test_pass_threshold = test_pass_threshold
         self.build_coverage_threshold = build_coverage_threshold
-        self.test_execution_threshold = test_execution_threshold
         self.command_tracker = command_tracker
         self.receipt_run_id = str(receipt_run_id or "").strip() or None
 
@@ -5352,49 +5355,12 @@ class PhysicalValidator:
         # Calculate pass rate
         pass_rate = self.calculate_test_pass_rate(test_metrics)
 
-        # Apply the SINGLE verdict policy (same one the report verdict reads) so
-        # the PARTIAL/FAILED boundary uses the documented pass-rate threshold
-        # rather than an implicit "any pass > 0" rule.
-        threshold_pct = self.test_pass_threshold * 100.0
-        tests_pass_threshold = (
-            evaluate_run_verdict(True, pass_rate, test_pass_threshold=self.test_pass_threshold)
-            == "success"
-        )
-
         # pytest collection nodes are NOT executed tests (Plan 4 Task 2). They
         # travel with the verdict so the report can quote the real root cause
         # instead of inventing "N tests errored".
         collection_errors = test_metrics.get("collection_errors", 0) or 0
         collection_errors_skipped = test_metrics.get("collection_errors_skipped", 0) or 0
         collection_error_summary = test_metrics.get("collection_error_summary")
-
-        # Determine test status based on metrics
-        if not test_metrics.get("valid", False):
-            status = "WARNING"
-            reason = "No test reports found"
-        elif pass_rate == 100.0:
-            status = "SUCCESS"
-            reason = f"All {test_metrics['total_tests']} tests passed"
-        elif tests_pass_threshold:
-            status = "PARTIAL"
-            reason = (
-                f"Tests passed above the {threshold_pct:.0f}% threshold: "
-                f"{test_metrics['passed_tests']}/{test_metrics['total_tests']} ({pass_rate:.1f}%)"
-            )
-        else:
-            status = "FAILED"
-            reason = (
-                f"Tests below the {threshold_pct:.0f}% pass threshold: "
-                f"{test_metrics['passed_tests']}/{test_metrics['total_tests']} ({pass_rate:.1f}%)"
-            )
-
-        # "0/0 (0.0%)" describes a run that executed nothing as if it had run
-        # and failed. When collection died, say exactly that and name the cause.
-        if collection_errors and not test_metrics.get("total_tests", 0):
-            status = "FAILED"
-            reason = f"Test collection failed for {collection_errors} files — 0 tests executed"
-            if collection_error_summary:
-                reason = f"{reason}: {collection_error_summary}"
 
         failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
         # Python projects: python_tool's pytest --collect-only denominator is
@@ -5412,6 +5378,30 @@ class PhysicalValidator:
         )
         if type(discovered) is int and discovered <= 0:
             discovered = None
+
+        # One decision, three fields (spec §2.3). The pass rate is reported as a
+        # fact below; it decides nothing here.
+        decision = decide_test_evidence(
+            valid=bool(test_metrics.get("valid", False)),
+            executed=test_metrics.get("total_tests", 0) or 0,
+            discovered=discovered,
+            passed=test_metrics.get("passed_tests", 0) or 0,
+            failed=test_metrics.get("failed_tests", 0) or 0,
+            errors=test_metrics.get("error_tests", 0) or 0,
+            skipped=test_metrics.get("skipped_tests", 0) or 0,
+        )
+        status, evidence_status, reason = decision
+
+        # A dead collection is not "no tests executed" with no cause: it names
+        # the cause. Same direction as the decision it refines — still FAILED,
+        # still a deficiency sentence.
+        if collection_errors and not test_metrics.get("total_tests", 0):
+            status = "FAILED"
+            evidence_status = "blocked"
+            reason = f"Test collection failed for {collection_errors} files — 0 tests executed"
+            if collection_error_summary:
+                reason = f"{reason}: {collection_error_summary}"
+
         has_test_count_evidence = test_metrics.get("valid", False) or any(
             key in test_metrics and test_metrics.get(key) is not None
             for key in (
@@ -5461,17 +5451,6 @@ class PhysicalValidator:
             conflicts.append("test_report_parse_error")
         if test_metrics.get("metrics_conflicts", []):
             conflicts.append("metrics_conflict")
-
-        if not test_metrics.get("valid", False):
-            evidence_status = "unknown"
-        elif pass_rate == 100.0 and failed_count == 0:
-            evidence_status = "success"
-        elif tests_pass_threshold:
-            # Passed the threshold but not perfect -> partial pass (still a pass).
-            evidence_status = "partial"
-        else:
-            # Below the threshold -> the verdict fails on tests.
-            evidence_status = "blocked"
 
         # Receipt-scoped evidence (Plan 5 Task B2). Superseded reports are a
         # visible conflict; an unreadable receipt is an evidence-closure

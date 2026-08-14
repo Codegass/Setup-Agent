@@ -13,6 +13,13 @@ from typing import Any, Iterable, Literal, Mapping, Optional
 
 from loguru import logger
 
+from sag.verdict_rates import (
+    DEFICIENCY_MARKERS,
+    EXECUTION_SENTENCE_PREFIX,
+    execution_sentence,
+    no_execution_sentence,
+)
+
 from .control_ownership import BlockerOwner
 from .evidence_records import EvidencePublicationBinding, read_live_published_json_records
 from .invocation_receipts import RECEIPT_DIR, validate_receipt_v2
@@ -467,6 +474,64 @@ def settlement_capped_outcome(
     if capped is ValidatorState.GREEN:
         return None
     return _VALIDATED_OUTCOMES[capped]
+
+
+def reason_asserts_deficiency(reason: str) -> bool:
+    """Does this sentence claim something was below, insufficient or missing?
+
+    Spec §2.3's deficiency classes, verbatim. Prose is checked ONLY to refuse a
+    contradiction, never to decide one: the decision below renders its own
+    sentence, so this predicate can only fire on a programming error inside it.
+    """
+
+    lowered = str(reason or "").lower()
+    return any(marker in lowered for marker in DEFICIENCY_MARKERS)
+
+
+@dataclass(frozen=True)
+class _GradedDecision:
+    """One branch, three outputs: the state, the code AND the sentence.
+
+    ignite (spec §2) sealed `validator_state: "green"` beside *"Tests below the
+    80% pass threshold: 29/37 (78.4%)"* because the upgrade branch chose a state
+    and a code while the reason kept whatever an earlier branch had assembled.
+    Producing all three here — and refusing the pairs that point in opposite
+    directions — makes that shape unconstructible rather than merely unrendered.
+    """
+
+    state: ValidatorState
+    code: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        green = self.state is ValidatorState.GREEN
+        if green and reason_asserts_deficiency(self.reason):
+            raise ValueError(
+                f"a green decision cannot state a deficiency: {self.code!r} / {self.reason!r}"
+            )
+        if not green and self.reason.startswith(EXECUTION_SENTENCE_PREFIX):
+            raise ValueError(
+                "only a green decision states the execution sentence: "
+                f"{self.code!r} / {self.reason!r}"
+            )
+
+
+def _test_execution_decision(rollup: Mapping[str, Any]) -> _GradedDecision:
+    """The one green test decision, rendered from the counts that earned it."""
+
+    unique = rollup.get("unique") if isinstance(rollup.get("unique"), Mapping) else {}
+    return _GradedDecision(
+        state=ValidatorState.GREEN,
+        code="test_execution_observed",
+        reason=execution_sentence(
+            executed=int(unique.get("executed") or 0),
+            discovered=rollup.get("discovered"),
+            passed=int(unique.get("passed") or 0),
+            failed=int(unique.get("failed") or 0),
+            errors=int(unique.get("errors") or 0),
+            skipped=int(unique.get("skipped") or 0),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1953,23 +2018,42 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
     errors = int(status.get("error_tests", 0) or 0)
     total = int(status.get("total_tests", executed) or 0)
 
+    # Every branch below states its own three fields together (spec §2.3). The
+    # overriding branches used to keep the validator's sentence, so a RED
+    # "collection failed" could arrive narrating a completed execution.
     if errors == total and total > 0:
-        state = ValidatorState.RED
-        code = "test_collection_failed"
+        decision = _GradedDecision(
+            state=ValidatorState.RED,
+            code="test_collection_failed",
+            reason=(
+                f"every executed test errored: {errors:,} of {total:,} — "
+                "the suite produced no test outcome"
+            ),
+        )
     elif discovered > 0 and executed == 0:
-        state = ValidatorState.RED
-        code = "tests_not_executed"
+        # The validator's own sentence for this state names the CAUSE when it
+        # has one ("Test collection failed for 28 files — 0 tests executed");
+        # it is that decision's render of the same physical fact, not a second
+        # opinion, so consuming it keeps the cause rather than generalizing it
+        # away. The rendered sentence is the floor when it said nothing.
+        decision = _GradedDecision(
+            state=ValidatorState.RED,
+            code="tests_not_executed",
+            reason=str(status.get("reason") or "").strip() or no_execution_sentence(discovered),
+        )
     else:
-        state = _state_from_evidence_status(status.get("evidence_status") or status.get("status"))
-        code = f"test_{state.value}"
-
-    if state is ValidatorState.UNAVAILABLE and not status.get("has_test_reports"):
-        detail = str(status.get("reason") or "").strip()
-        reason = "no test reports or execution evidence available"
-        if detail:
-            reason = f"{reason}: {detail}"
-    else:
-        reason = status.get("reason") or "test validator returned no conclusion"
+        observed = _state_from_evidence_status(
+            status.get("evidence_status") or status.get("status")
+        )
+        if observed is ValidatorState.UNAVAILABLE and not status.get("has_test_reports"):
+            detail = str(status.get("reason") or "").strip()
+            observed_reason = "no test reports or execution evidence available"
+            if detail:
+                observed_reason = f"{observed_reason}: {detail}"
+        else:
+            observed_reason = status.get("reason") or "test validator returned no conclusion"
+        decision = _GradedDecision(observed, f"test_{observed.value}", observed_reason)
+    state, code, reason = decision.state, decision.code, decision.reason
     suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
@@ -2011,26 +2095,34 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             for conflict in derived.conflicts
         )
         if evidence_integrity_failure:
-            state = ValidatorState.UNAVAILABLE
-            code = "test_evidence_ledger_unavailable"
-            reason = "test evidence ledger integrity is unavailable: " + ", ".join(
-                derived.conflicts
+            decision = _GradedDecision(
+                state=ValidatorState.UNAVAILABLE,
+                code="test_evidence_ledger_unavailable",
+                reason="test evidence ledger integrity is unavailable: "
+                + ", ".join(derived.conflicts),
             )
+            state, code, reason = decision.state, decision.code, decision.reason
         receipt_scoped = rollup.get("receipt_scoped") is True
         if executed > 0 and not receipt_scoped and not evidence_integrity_failure:
             evidence_integrity_failure = True
-            state = ValidatorState.UNAVAILABLE
-            code = "test_receipt_missing"
-            reason = (
-                "test execution counts are not bound to a terminal invocation receipt; "
-                "receipt-free reports cannot close the test phase"
+            decision = _GradedDecision(
+                state=ValidatorState.UNAVAILABLE,
+                code="test_receipt_missing",
+                reason=(
+                    "test execution counts are not bound to a terminal invocation receipt; "
+                    "receipt-free reports cannot close the test phase"
+                ),
             )
+            state, code, reason = decision.state, decision.code, decision.reason
         elif executed > 0 and receipt_scoped and not evidence_integrity_failure:
             # Rate-banded verdict §4/§5: the phase grades execution. Project
             # failures and errors remain exact sealed facts, but they never
             # reject a terminal close; only evidence-integrity failures do.
-            state = ValidatorState.GREEN
-            code = "test_execution_observed"
+            # The upgrade brings its own sentence (spec §2.3): the validator's
+            # label described the pass rate, and keeping it here is exactly how
+            # ignite sealed "below the threshold" next to `green`.
+            decision = _test_execution_decision(rollup)
+            state, code, reason = decision.state, decision.code, decision.reason
             suggestions = ()
     else:
         evidence_integrity_failure = False

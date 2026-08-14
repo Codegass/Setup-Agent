@@ -569,10 +569,7 @@ class ReActEngine(UIEventEmitter):
                 )
                 self.run_evidence_state = RunEvidenceState(run_id=run_id)
             if self.verdict_finalizer is None and orchestrator is not None:
-                self.verdict_finalizer = VerdictFinalizer(
-                    orchestrator,
-                    test_pass_threshold=self.config.test_pass_threshold,
-                )
+                self.verdict_finalizer = VerdictFinalizer(orchestrator)
             self.phase_handoff = PhaseHandoff(
                 self.run_evidence_state,
                 orchestrator=orchestrator,
@@ -582,9 +579,7 @@ class ReActEngine(UIEventEmitter):
         self.physical_validator = PhysicalValidator(
             docker_orchestrator=orchestrator,
             project_path="/workspace",
-            test_pass_threshold=self.config.test_pass_threshold,
             build_coverage_threshold=self.config.build_coverage_threshold,
-            test_execution_threshold=self.config.test_execution_threshold,
             receipt_run_id=(
                 self.run_evidence_state.run_id if self.run_evidence_state is not None else None
             ),

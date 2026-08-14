@@ -34,7 +34,6 @@ from sag.agent.invocation_receipts import (
     python_import_targets,
 )
 from sag.agent.invocation_receipts import target_sha as probe_target_sha
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.runtime.env_overlay import (
     RUNTIME_REQUIREMENT_CONFLICT,
     EnvOverlayStore,
@@ -205,7 +204,6 @@ class BuildTool(BaseTool):
         maven_tool=None,
         gradle_tool=None,
         python_tool=None,
-        test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
     ):
         super().__init__(
             name="build",
@@ -218,7 +216,6 @@ class BuildTool(BaseTool):
             ),
         )
         self.docker_orchestrator = docker_orchestrator
-        self.test_pass_threshold = test_pass_threshold
         self._backends = {}
         if maven_tool is not None:
             self._backends["maven"] = MavenBackend(maven_tool)
@@ -1718,6 +1715,11 @@ class BuildTool(BaseTool):
                     "manifest_goal": island_context["manifest_goal"],
                 }
             )
+        # The judgment word is the dispatch's own: did the invocation run its
+        # selected tests to a terminal state (spec §2.1). A pass rate used to
+        # rewrite it here — 79% of a suite that ran completely became "failed"
+        # while 81% became "partial". Red counts stay exact sealed facts on the
+        # facts dict and the receipt; they adjudicate nothing.
         operation_outcome = inner.operation_outcome
         stats = inner.test_stats
         if stats is not None:
@@ -1728,10 +1730,6 @@ class BuildTool(BaseTool):
                 skipped=stats.skipped,
                 pass_rate=stats.pass_rate,
             )
-            if inner.succeeded and stats.failed > 0:
-                operation_outcome = (
-                    "partial" if stats.pass_rate >= self.test_pass_threshold * 100 else "failed"
-                )
         # The narration is the feature (transparency-by-construction, spec
         # §§1b-1c, 3): whatever the pre-flight did — or could not do — must be
         # visible in the agent's observation, not just in host logs.

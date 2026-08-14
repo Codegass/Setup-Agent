@@ -39,10 +39,7 @@ from test_physical_validator_modules import FakeOrch
 
 import sag.agent.physical_validator as physical_validator_module
 from sag.agent.physical_validator import PhysicalValidator
-from sag.config.settings import (
-    DEFAULT_TEST_EXECUTION_THRESHOLD,
-    Config,
-)
+from sag.config.settings import Config
 from sag.tools.internal.maven_tool import MavenTool
 from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.module_metrics import assemble_module_metrics
@@ -1802,11 +1799,11 @@ def test_run_verdict_tests_not_fully_executed_caps_at_partial():
     assert run_verdict("success", "success", ["tests_not_fully_executed"]) == "partial"
 
 
-def test_settings_test_execution_threshold_default_and_env(monkeypatch):
-    assert DEFAULT_TEST_EXECUTION_THRESHOLD == 0.8
-    assert Config().test_execution_threshold == 0.8
+def test_execution_coverage_has_no_configurable_cut_off(monkeypatch):
+    """spec §2.4: the knob is deleted, so no environment can move the line."""
     monkeypatch.setenv("SAG_TEST_EXECUTION_THRESHOLD", "0.5")
-    assert Config.from_env().test_execution_threshold == 0.5
+    assert "test_execution_threshold" not in Config.model_fields
+    assert not hasattr(Config.from_env(), "test_execution_threshold")
 
 
 def test_agent_caps_at_partial_when_modules_incomplete():

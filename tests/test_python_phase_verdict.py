@@ -27,7 +27,6 @@ from types import SimpleNamespace
 from sag.agent.agent import SetupAgent
 from sag.agent.phase_machine import PHASE_NAMES, PhaseMachine
 from sag.agent.react_engine import PHASE_OBJECTIVES, ReActEngine, phase_objective
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 
 # ---------------------------------------------------------------------------
 # fakes (pattern mirrors tests/test_agent_final_status.py)
@@ -35,17 +34,10 @@ from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 
 
 class FakePhysicalValidator:
-    def __init__(
-        self,
-        build_status,
-        test_status,
-        analysis_status=None,
-        test_pass_threshold=DEFAULT_TEST_PASS_THRESHOLD,
-    ):
+    def __init__(self, build_status, test_status, analysis_status=None):
         self.build_status = build_status
         self.test_status = test_status
         self.analysis_status = analysis_status or {"analyzed": False}
-        self.test_pass_threshold = test_pass_threshold
 
     def validate_build_status(self, project_name):
         return self.build_status
@@ -211,16 +203,21 @@ def test_java_green_evidence_is_not_capped_by_phase_termination():
     assert agent.final_verdict_reason == ""
 
 
-def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
-    """Physical validation still rules: real build evidence but a failing
-    test gate keeps the run FAILED even with the scoped cap."""
+def test_blocked_build_with_evidence_never_promotes_past_physical_evidence():
+    """Physical validation still rules: incomplete build evidence caps the run.
+
+    Premise updated 2026-08-14 (spec §2): a heavily red suite that RAN is 100
+    executions, not a SAG failure, so it no longer drives the word to `failed`.
+    What is still refused is the promotion — the incomplete build keeps
+    `success` off the table however green the model's claim was.
+    """
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status=_python_partial_build_status(),
             test_status={
                 "has_test_reports": True,
-                "status": "FAILED",
-                "reason": "most tests failed",
+                "status": "SUCCESS",
+                "reason": "executed 100 of 100 discovered · 10 passed, 90 failed, 0 skipped",
                 "pass_rate": 10.0,
                 "total_tests": 100,
                 "passed_tests": 10,
@@ -234,10 +231,9 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._legacy_get_verified_final_status(react_engine_success=True)
+    agent._legacy_get_verified_final_status(react_engine_success=True)
 
-    assert result is False
-    assert agent.final_verdict == "failed"
+    assert agent.final_verdict == "partial"
 
 
 # ---------------------------------------------------------------------------

@@ -259,6 +259,12 @@ def test_maven_requirement_is_refused_for_wrong_ecosystem(system):
 
 
 def test_test_stats_surface_in_facts():
+    """The counts are facts on the envelope; they do not rewrite its word.
+
+    Premise updated 2026-08-14 (spec §2.1): 3 red out of 214 used to demote a
+    completed dispatch to `partial` because 96.3% sat above the 80% line — and
+    a 79% one to `failed`. The word now says what the invocation did.
+    """
     from sag.evidence import TestStats
 
     maven = FakeBackendTool(
@@ -273,7 +279,8 @@ def test_test_stats_surface_in_facts():
 
     assert result.facts["executed"] == 214
     assert result.facts["passed"] == 206
-    assert result.operation_outcome.value == "partial"
+    assert result.facts["failed"] == 3
+    assert result.operation_outcome.value == "success"
 
 
 def test_maven_test_runs_the_full_verify_lifecycle():

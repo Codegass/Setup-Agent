@@ -1414,9 +1414,7 @@ _SAFE_RUNTIME_CONFIG_FIELDS = (
     "max_iterations",
     "context_switch_threshold",
     "max_wall_clock_seconds",
-    "test_pass_threshold",
     "build_coverage_threshold",
-    "test_execution_threshold",
 )
 
 

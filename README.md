@@ -447,7 +447,6 @@ All configuration is managed through the `.env` file in the project's root direc
 - `SAG_LOG_LEVEL`: Logging verbosity. `DEBUG` is highly detailed and includes LiteLLM's internal logs.
 - `SAG_MAX_ITERATIONS`: Maximum iterations for a single `run` or `project` command.
 - `SAG_MAX_WALL_CLOCK_SECONDS`: Global wall-clock cap for a whole run (default `7200`); the run ends with a clear status once exceeded, independent of per-command behavior.
-- `SAG_TEST_PASS_THRESHOLD`: Minimum test pass rate (fraction, default `0.8`) for a build-green run to count as a full success.
 - `SAG_DISPATCH_SOFT_TIMEOUT_SECONDS`: Soft window before a long build is handed back as a pollable detached job (default `900`).
 
 ## 🔍 How It Works: A Look Under the Hood

@@ -13,7 +13,6 @@ from typing import Any, Literal, cast
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
@@ -659,12 +658,7 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
 
 def _fold_test_stats(
     state: RunEvidenceState,
-    *,
-    test_pass_threshold: float,
 ) -> tuple[SnapshotTestStats, tuple[str, ...]]:
-    # Kept as a keyword-only compatibility seam for replay/unit callers.  The
-    # 80% policy no longer participates in verdict construction.
-    del test_pass_threshold
     validated_rollup = state.fact_value("test.stats")
     if isinstance(validated_rollup, dict):
         conflicts = _dedupe(validated_rollup.get("conflicts") or ())
@@ -1378,12 +1372,10 @@ class VerdictFinalizer:
         self,
         orchestrator,
         *,
-        test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
         validator=None,
         project_name: str | None = None,
     ):
         self.orchestrator = orchestrator
-        self.test_pass_threshold = test_pass_threshold
         # The physical validator is the build oracle at evidence-close (same
         # oracle the gates consult). None (e.g. replay) degrades the fold to
         # the observation aggregate.
@@ -1403,10 +1395,7 @@ class VerdictFinalizer:
             validator=self.validator,
             project_name=self.project_name,
         )
-        tests, test_conflicts = _fold_test_stats(
-            state,
-            test_pass_threshold=self.test_pass_threshold,
-        )
+        tests, test_conflicts = _fold_test_stats(state)
         rates, build_modules_rate, test_cases_rate, rate_conflicts = _snapshot_rates(
             state,
             build,

@@ -1,11 +1,11 @@
-"""Tests for Phase 2: Gradle build validation + single test-verdict policy.
+"""Tests for Phase 2: Gradle build validation + the single test-evidence decision.
 
 Covers:
 - TASK 2.1: Gradle build validation requires REAL compiled outputs
   (build/classes/**/*.class, build/libs/*.jar), excludes the wrapper jar, and
   treats the bare .gradle cache dir as a non-deciding hint.
-- TASK 2.2: One documented test-verdict policy (evaluate_run_verdict) shared by
-  the report verdict and the run/test success path, plus failing_test_names
+- One decision (decide_test_evidence) producing the label, the evidence word and
+  the sentence together, graded on execution, plus failing_test_names
   enumeration.
 """
 
@@ -31,13 +31,9 @@ from sag.agent.physical_validator import (
     PhysicalValidator,
     _driven_test_modules_from_receipts,
     _format_build_duration,
-    evaluate_run_verdict,
+    decide_test_evidence,
 )
-from sag.config.settings import (
-    DEFAULT_BUILD_COVERAGE_THRESHOLD,
-    DEFAULT_TEST_PASS_THRESHOLD,
-    Config,
-)
+from sag.config.settings import DEFAULT_BUILD_COVERAGE_THRESHOLD, Config
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.report_tool import ReportTool
 
@@ -618,19 +614,10 @@ def _coverage_validator(coverage, found, missing, threshold):
 
 
 # ===========================================================================
-# TASK 2.2 - Single test-verdict policy (evaluate_run_verdict)
+# Single test-evidence decision (decide_test_evidence). The pass-rate policy
+# this section used to pin was retired by spec 2026-08-14 §2: the label, the
+# evidence word and the sentence come out of ONE branch, graded on execution.
 # ===========================================================================
-def test_settings_test_pass_threshold_default():
-    assert DEFAULT_TEST_PASS_THRESHOLD == 0.8
-    assert Config().test_pass_threshold == 0.8
-
-
-def test_settings_test_pass_threshold_from_env(monkeypatch):
-    """SAG_TEST_PASS_THRESHOLD must override the default in Config.from_env."""
-    monkeypatch.setenv("SAG_TEST_PASS_THRESHOLD", "0.95")
-    assert Config.from_env().test_pass_threshold == 0.95
-
-
 def test_settings_build_coverage_threshold_default():
     # All active modules must compile for SUCCESS -> default is 100%.
     assert DEFAULT_BUILD_COVERAGE_THRESHOLD == 1.0
@@ -644,24 +631,45 @@ def test_settings_build_coverage_threshold_from_env(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "build_green,pass_rate,expected",
+    "valid,executed,passed,failed,expected_status,expected_evidence",
     [
-        (False, 100.0, "failed"),  # build not green -> always failed
-        (False, 0.0, "failed"),
-        (True, 100.0, "success"),  # perfect pass
-        (True, 96.2, "success"),  # commons-vfs: build green, >=80%
-        (True, 80.0, "success"),  # boundary: >= threshold is success
-        (True, 79.9, "failed"),  # just below threshold
-        (True, 0.0, "failed"),
+        (False, 0, 0, 0, "WARNING", "unknown"),  # no reports at all
+        (True, 0, 0, 0, "FAILED", "blocked"),  # geode: nothing ran
+        (True, 100, 100, 0, "SUCCESS", "success"),  # perfect pass
+        (True, 184, 177, 7, "SUCCESS", "success"),  # commons-vfs 96.2%
+        (True, 37, 29, 8, "SUCCESS", "success"),  # ignite 78.4% — still ran
+        (True, 100, 0, 100, "SUCCESS", "success"),  # all red, all executed
     ],
 )
-def test_evaluate_run_verdict_policy(build_green, pass_rate, expected):
-    assert evaluate_run_verdict(build_green, pass_rate) == expected
+def test_test_evidence_is_decided_by_execution_not_by_pass_rate(
+    valid, executed, passed, failed, expected_status, expected_evidence
+):
+    decision = decide_test_evidence(
+        valid=valid,
+        executed=executed,
+        discovered=None,
+        passed=passed,
+        failed=failed,
+        errors=0,
+        skipped=0,
+    )
+    assert decision.status == expected_status
+    assert decision.evidence_status == expected_evidence
 
 
-def test_evaluate_run_verdict_custom_threshold():
-    assert evaluate_run_verdict(True, 85.0, test_pass_threshold=0.9) == "failed"
-    assert evaluate_run_verdict(True, 95.0, test_pass_threshold=0.9) == "success"
+def test_the_decision_states_its_own_reason():
+    """One branch, three fields: no reason can point away from its own word."""
+    decision = decide_test_evidence(
+        valid=True,
+        executed=37,
+        discovered=37,
+        passed=29,
+        failed=8,
+        errors=0,
+        skipped=0,
+    )
+    assert decision.reason == "executed 37 of 37 discovered · 29 passed, 8 failed, 0 skipped"
+    assert "%" not in decision.reason
 
 
 def _metrics(total, passed, failed=0, error=0, failing_names=None):
@@ -680,9 +688,11 @@ def _metrics(total, passed, failed=0, error=0, failing_names=None):
     }
 
 
-def test_validate_test_status_partial_pass_above_threshold(monkeypatch):
-    """commons-vfs: 177/184 (96.2%) build-green -> PARTIAL (a pass), NOT FAILED.
+def test_validate_test_status_grades_a_red_suite_that_ran_on_its_execution(monkeypatch):
+    """commons-vfs: 177/184 ran to a terminal state, so the evidence is green.
 
+    The 7 failures stay exact facts on the result and in the reason; they are
+    the project's, and they adjudicate nothing (spec 2026-08-14 §2).
     failing_test_names must be propagated for callers to enumerate failures.
     """
     failing = [f"com.example.VfsTest::case{i}" for i in range(7)]
@@ -695,14 +705,18 @@ def test_validate_test_status_partial_pass_above_threshold(monkeypatch):
 
     result = validator.validate_test_status("demo")
 
-    assert result["status"] == "PARTIAL"
-    assert result["evidence_status"] == "partial"
+    assert result["status"] == "SUCCESS"
+    assert result["evidence_status"] == "success"
+    assert result["reason"] == (
+        "executed 184 of an undetermined discovery · 177 passed, 5 failed, 2 errored, 0 skipped"
+    )
     assert result["pass_rate"] == pytest.approx(96.2, abs=0.05)
     assert result["failing_test_names"] == failing
+    assert "test_failures_detected" in result["conflicts"]
 
 
-def test_validate_test_status_below_threshold_fails(monkeypatch):
-    """<80% build-green -> FAILED, with failing_test_names populated."""
+def test_validate_test_status_never_fails_a_suite_for_being_half_red(monkeypatch):
+    """50/100 passing used to be FAILED at the 80% cliff; it executed fully."""
     failing = [f"com.example.Bad::t{i}" for i in range(50)]
     validator = PhysicalValidator(project_path="/workspace")
     monkeypatch.setattr(
@@ -713,9 +727,11 @@ def test_validate_test_status_below_threshold_fails(monkeypatch):
 
     result = validator.validate_test_status("demo")
 
-    assert result["status"] == "FAILED"
-    assert result["evidence_status"] == "blocked"
+    assert result["status"] == "SUCCESS"
+    assert result["evidence_status"] == "success"
+    assert "50 failed" in result["reason"]
     assert result["failing_test_names"] == failing
+    assert "test_failures_detected" in result["conflicts"]
 
 
 def test_validate_test_status_all_pass_success(monkeypatch):
@@ -1039,7 +1055,7 @@ def test_reconcile_without_physical_evidence_is_partial_whatever_the_pass_rate()
     assert tool._reconcile_status("success", "success", _accomplishments(100, 50)) == "partial"
 
 
-def test_report_and_validator_verdicts_agree_for_partial_pass(monkeypatch):
+def test_report_and_validator_verdicts_agree_on_a_red_suite_that_ran(monkeypatch):
     """Single source of truth: report verdict and run/test verdict don't diverge."""
     validator = PhysicalValidator(project_path="/workspace")
     monkeypatch.setattr(
@@ -1052,38 +1068,28 @@ def test_report_and_validator_verdicts_agree_for_partial_pass(monkeypatch):
     tool = ReportTool(docker_orchestrator=None, physical_validator=validator)
     report_verdict = tool._determine_actual_status(_accomplishments(184, 177))
 
-    # Build green + 96.2% pass rate: report says success, validator says PARTIAL
-    # (a pass) with a non-blocked evidence status -> consistent verdict.
+    # Build green, suite executed: both graders read the same execution.
     assert report_verdict == "success"
-    assert test_status["status"] == "PARTIAL"
+    assert test_status["status"] == "SUCCESS"
     assert test_status["evidence_status"] != "blocked"
 
 
-def test_test_pass_threshold_feeds_both_report_and_run_verdict(monkeypatch):
-    """The configured pass threshold still labels the VALIDATOR's own test
-    status, and no longer reaches the report verdict.
+def test_no_configured_pass_rate_can_relabel_the_same_execution(monkeypatch):
+    """The knob is gone, not defaulted: there is nothing left to configure.
 
-    Premise updated 2026-08-10: the threshold left the verdict chain because a
-    project's red tests are not SAG's repair duty. This pins the decoupling in
-    both directions — the same 85% run is PARTIAL under 0.8 and FAILED under
-    0.9 on the validator's label, while the report verdict reads `success`
-    under both because the suite was driven either way.
+    The same 85/100 run was PARTIAL under 0.8 and FAILED under 0.9 — one
+    execution wearing two labels because a number in the environment said so.
     """
     metrics = lambda project_dir: _metrics(100, 85, failed=15)  # noqa: E731
     accomplishments = _accomplishments(100, 85)
 
-    # Default threshold (0.8): 85% is a partial pass / success on both gates.
-    default_validator = PhysicalValidator(project_path="/workspace")
-    assert default_validator.test_pass_threshold == DEFAULT_TEST_PASS_THRESHOLD
-    monkeypatch.setattr(default_validator, "parse_test_reports_with_catalog", metrics)
-    assert default_validator.validate_test_status("demo")["status"] == "PARTIAL"
-    default_report = ReportTool(docker_orchestrator=None, physical_validator=default_validator)
-    assert default_report._determine_actual_status(accomplishments) == "success"
+    validator = PhysicalValidator(project_path="/workspace")
+    assert not hasattr(validator, "test_pass_threshold")
+    assert not hasattr(validator, "test_execution_threshold")
+    with pytest.raises(TypeError):
+        PhysicalValidator(project_path="/workspace", test_pass_threshold=0.9)
 
-    # Stricter threshold (0.9): the same 85% now fails on both gates.
-    strict_validator = PhysicalValidator(project_path="/workspace", test_pass_threshold=0.9)
-    assert strict_validator.test_pass_threshold == 0.9
-    monkeypatch.setattr(strict_validator, "parse_test_reports_with_catalog", metrics)
-    assert strict_validator.validate_test_status("demo")["status"] == "FAILED"
-    strict_report = ReportTool(docker_orchestrator=None, physical_validator=strict_validator)
-    assert strict_report._determine_actual_status(accomplishments) == "success"
+    monkeypatch.setattr(validator, "parse_test_reports_with_catalog", metrics)
+    assert validator.validate_test_status("demo")["status"] == "SUCCESS"
+    report = ReportTool(docker_orchestrator=None, physical_validator=validator)
+    assert report._determine_actual_status(accomplishments) == "success"

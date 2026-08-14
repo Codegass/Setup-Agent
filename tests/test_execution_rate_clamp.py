@@ -69,15 +69,14 @@ def test_paramiko_executed_exceeds_detected_clamps_rate_at_100():
     )
 
 
-def test_gate_never_fires_when_executed_exceeds_detected_even_at_strict_threshold():
-    """A strict 100%-execution threshold is a legal config; executed >= detected
-    must still read as full coverage."""
+def test_gate_never_fires_when_executed_exceeds_detected():
+    """executed >= detected reads as full coverage, clamp and all.
 
-    class StrictValidator:
-        test_execution_threshold = 1.0  # require 100% execution
-
+    The gate's line is now exactly 100% (spec 2026-08-14 §2 retired the
+    configurable cut-off), so this is the boundary case that matters most:
+    an over-execution must not tip a full run into a shortfall.
+    """
     tool = ReportTool()
-    tool.physical_validator = StrictValidator()
     snapshot = _snapshot(tool, detected=559, executed=560, passed=541, failed=19)
 
     assert snapshot["status"]["execution_rate"] == 100.0

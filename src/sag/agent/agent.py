@@ -20,6 +20,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
+from sag.verdict_rates import execution_sentence
 
 from .context_manager import ContextManager
 from .control_events import (
@@ -566,9 +567,7 @@ class SetupAgent:
         self.physical_validator = PhysicalValidator(
             docker_orchestrator=self.orchestrator,
             project_path=self.config.workspace_path,
-            test_pass_threshold=self.config.test_pass_threshold,
             build_coverage_threshold=self.config.build_coverage_threshold,
-            test_execution_threshold=self.config.test_execution_threshold,
             receipt_run_id=getattr(self, "run_id", None),
         )
         # Attach the shared tracker so validate_build_status can surface the
@@ -635,7 +634,6 @@ class SetupAgent:
                 maven_tool=maven_tool,
                 gradle_tool=gradle_tool,
                 python_tool=python_tool,
-                test_pass_threshold=self.config.test_pass_threshold,
             ),
             ProjectTool(
                 setup_tool=setup_tool,
@@ -821,10 +819,7 @@ class SetupAgent:
 
             self.phase_machine = PhaseMachine()
             self.run_evidence_state = RunEvidenceState(run_id=self.run_id)
-            self.verdict_finalizer = VerdictFinalizer(
-                self.orchestrator,
-                test_pass_threshold=self.config.test_pass_threshold,
-            )
+            self.verdict_finalizer = VerdictFinalizer(self.orchestrator)
             self.context_journal = ContextJournal(self.orchestrator)
             # Actual repo directory name (from URL); the phase gates probe
             # /workspace/<project_name> with it.
@@ -1563,17 +1558,11 @@ START by working toward the current phase objective shown in my context.
         as a full success (beam 2026-06-10 printed 🎉 with zero executed
         tests and no report).
 
-        The test gate delegates to :func:`evaluate_run_verdict` (the single
-        verdict policy shared with the report verdict) so the run/test success
-        path can never diverge from the report.
+        The test gate grades EXECUTION (spec 2026-08-14 §2): what ran against
+        what was discovered. A project's red tests are its own facts, reported
+        exactly and adjudicating nothing.
         """
         self._require_legacy_verdict_mode()
-
-        from sag.agent.physical_validator import evaluate_run_verdict
-        from sag.config.settings import (
-            DEFAULT_TEST_EXECUTION_THRESHOLD,
-            DEFAULT_TEST_PASS_THRESHOLD,
-        )
 
         self.final_verdict = "failed"
         # Surfaced to the verdict-kernel combiner (_get_verified_final_status)
@@ -1632,11 +1621,6 @@ START by working toward the current phase objective shown in my context.
 
             # Report test status and fail when a known test suite was not successfully verified.
             if test_status["has_test_reports"]:
-                pass_rate = test_status["pass_rate"]
-                failed_or_error_tests = test_status.get("failed_tests", 0) + test_status.get(
-                    "error_tests", 0
-                )
-
                 # Build verified but the detected suite did not actually run ->
                 # PARTIAL, not a 0% pass-rate FAILURE (0 tests executed is "not
                 # run", not "0% passed"). Mirrors the report's
@@ -1651,81 +1635,43 @@ START by working toward the current phase objective shown in my context.
                     )
                     return False
 
-                # Route the test gate through the SINGLE verdict policy
-                # (evaluate_run_verdict) so the run/test success path can never
-                # diverge from the report verdict: a build-green run at or above
-                # test_pass_threshold is a SUCCESS (partial pass), not a failure.
-                # This is the same threshold the report verdict consumes, so a
-                # configured SAG_TEST_PASS_THRESHOLD applies to both gates.
-                threshold = getattr(
-                    self.physical_validator,
-                    "test_pass_threshold",
-                    DEFAULT_TEST_PASS_THRESHOLD,
-                )
-                threshold_pct = threshold * 100.0
-                verdict = evaluate_run_verdict(True, pass_rate, test_pass_threshold=threshold)
-
-                if verdict != "success":
-                    logger.error(
-                        "❌ Test validation: FAILED - "
-                        f"{test_status['passed_tests']}/{test_status['total_tests']} tests passed "
-                        f"({pass_rate:.1f}% < {threshold_pct:.0f}% threshold); "
-                        f"{test_status.get('failed_tests', 0)} failed, "
-                        f"{test_status.get('error_tests', 0)} errors"
-                    )
-                    self.final_verdict = "failed"
-                    return False
-                # Tests pass the threshold, but an incomplete-module build caps
-                # the whole run at PARTIAL — never announce SUCCESS unless every
-                # active module compiled.
+                # The suite ran to a terminal state, so the run is a pass on the
+                # test axis — an incomplete-module build still caps the whole run
+                # at PARTIAL, because SUCCESS requires every active module to
+                # have compiled.
                 self.final_verdict = "success" if build_complete else "partial"
                 if not build_complete:
                     logger.warning(
-                        "⚠️ Run capped at PARTIAL: tests passed but not all active "
+                        "⚠️ Run capped at PARTIAL: tests executed but not all active "
                         "modules compiled"
                     )
 
-                # Execution-coverage cap: a detected suite that barely ran (e.g.
-                # 1/1122) is not a full success even if the few tests that ran
-                # passed — mirror the report's tests_not_fully_executed gate so the
-                # CLI verdict matches.
-                exec_threshold = getattr(
-                    self.physical_validator,
-                    "test_execution_threshold",
-                    DEFAULT_TEST_EXECUTION_THRESHOLD,
-                )
+                # Execution-coverage cap: a detected suite that only partly ran
+                # (e.g. 1/1122) is not a FULL success — "fully executed" means
+                # executed >= discovered, the same boundary v4's `fully` band
+                # draws and the report's tests_not_fully_executed conflict uses.
                 executed = test_status.get("total_tests") or 0
                 if (
                     self.final_verdict == "success"
                     and isinstance(static_test_count, int)
                     and static_test_count > 0
-                    and executed < static_test_count * exec_threshold
+                    and executed < static_test_count
                 ):
                     self.final_verdict = "partial"
                     logger.warning(
                         "⚠️ Run capped at PARTIAL: only "
-                        f"{executed}/{static_test_count} detected tests executed "
-                        f"(< {exec_threshold * 100:.0f}% threshold)"
+                        f"{executed}/{static_test_count} detected tests executed"
                     )
 
-                if pass_rate == 100.0:
-                    logger.info(
-                        f"✅ Test validation: ALL PASSED - {test_status['total_tests']} tests (100% pass rate)"
-                    )
-                elif failed_or_error_tests == 0:
-                    logger.info(
-                        "⚠️ Test validation: PASSED WITH SKIPS - "
-                        f"{test_status['passed_tests']}/{test_status['total_tests']} tests passed, "
-                        f"{test_status.get('skipped_tests', 0)} skipped "
-                        f"({pass_rate:.1f}% pass rate)"
-                    )
-                else:
-                    logger.info(
-                        "⚠️ Test validation: PARTIAL PASS - "
-                        f"{test_status['passed_tests']}/{test_status['total_tests']} tests passed "
-                        f"({pass_rate:.1f}% >= {threshold_pct:.0f}% threshold); "
-                        f"{failed_or_error_tests} failing"
-                    )
+                sentence = execution_sentence(
+                    executed=executed,
+                    discovered=static_test_count if isinstance(static_test_count, int) else None,
+                    passed=test_status.get("passed_tests") or 0,
+                    failed=test_status.get("failed_tests") or 0,
+                    errors=test_status.get("error_tests") or 0,
+                    skipped=test_status.get("skipped_tests") or 0,
+                )
+                logger.info(f"📊 Test validation: {sentence}")
 
                 # Log test exclusions if detected
                 if test_status["test_exclusions"]:

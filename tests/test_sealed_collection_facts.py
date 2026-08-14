@@ -64,7 +64,7 @@ def test_fold_threads_collection_facts_from_the_validated_rollup():
     rollup = _validated_test_rollup(TVM_STATUS)
     state.register_fact(StateScope.TEST_RUNTIME, "test.stats", rollup, "gate://test")
 
-    stats, _conflicts = _fold_test_stats(state, test_pass_threshold=0.8)
+    stats, _conflicts = _fold_test_stats(state)
 
     assert stats.collection_errors == 28
     assert stats.collection_errors_skipped == 28
@@ -99,7 +99,7 @@ def test_fold_seals_receipt_scoped_basis_and_auxiliary_quarantine():
     rollup = _validated_test_rollup(BIGTOP_SCOPED_STATUS)
     state.register_fact(StateScope.TEST_RUNTIME, "test.stats", rollup, "gate://test")
 
-    stats, _conflicts = _fold_test_stats(state, test_pass_threshold=0.8)
+    stats, _conflicts = _fold_test_stats(state)
 
     assert stats.receipt_scoped is True
     assert stats.auxiliary_test_stats == {
