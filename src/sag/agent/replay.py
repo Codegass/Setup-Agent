@@ -68,6 +68,7 @@ from .control_events import (
     ControlEvent,
     EvidencePublicationPayload,
     EvidenceStoreBoundPayload,
+    GateOutcomeRevisedPayload,
     SourceFileManifest,
     action_envelope_sha256,
     canonical_json,
@@ -293,6 +294,77 @@ def _recorded_test_dispatch(tool: str, params: Mapping[str, Any]) -> bool:
             for token in command
         )
     return False
+
+
+def _delivered_gate_word(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The graded word a tool result handed the model, when it carried one."""
+
+    metadata = result.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    body = metadata.get("gate_result")
+    if not isinstance(body, Mapping):
+        return None
+    decision_id = str(body.get("decision_id") or "").strip()
+    if not decision_id or not str(metadata.get("phase_signal") or "").strip():
+        return None
+    return {
+        "decision_id": decision_id,
+        "accepted": bool(body.get("accepted")),
+        "validated_outcome": str(body.get("validated_outcome") or ""),
+    }
+
+
+def _verify_gate_word_lineage(
+    payload: Mapping[str, Any],
+    *,
+    delivered: Mapping[str, Any] | None,
+    seen_decision_ids: set[str],
+    revisions: set[tuple[str, str]],
+) -> None:
+    """The sealed word is the delivered word, or it names the one it replaced.
+
+    Eight archived sessions replayed clean while their `gate_decision`
+    contradicted the `gate_result` the model had been handed seconds earlier:
+    the walk paired the two events and never compared their words. Archived
+    transcripts carry no `decision_id`, so they are read exactly as before.
+    """
+
+    decision_id = str(payload.get("decision_id") or "").strip()
+    supersedes = str(payload.get("supersedes") or "").strip()
+    if supersedes:
+        known = set(seen_decision_ids)
+        if delivered is not None:
+            known.add(str(delivered["decision_id"]))
+        if supersedes not in known:
+            raise ReplayValidationError(
+                "gate decision supersedes a grading that was never recorded"
+            )
+    if delivered is None or not decision_id:
+        return
+    sealed_word = (
+        bool(payload.get("expected_accepted")),
+        str(payload.get("expected_outcome") or ""),
+    )
+    delivered_word = (bool(delivered["accepted"]), str(delivered["validated_outcome"]))
+    if decision_id == str(delivered["decision_id"]):
+        if sealed_word != delivered_word:
+            raise ReplayValidationError(
+                "one grading cannot carry two words: the delivered copy and the "
+                "sealed gate decision disagree"
+            )
+        return
+    if supersedes != str(delivered["decision_id"]):
+        raise ReplayValidationError(
+            "gate decision replaces the delivered grading without superseding it"
+        )
+    if sealed_word == delivered_word:
+        return
+    if (str(delivered["decision_id"]), decision_id) not in revisions:
+        raise ReplayValidationError(
+            "a sealed word that differs from the delivered one has no "
+            "gate_outcome_revised observation"
+        )
 
 
 def _repair_assessment_id_for_gate(
@@ -1185,6 +1257,11 @@ class ControlReplayRunner:
         settled_jobs: set[str] = set()
         settled_job_events: dict[str, tuple[str, int]] = {}
         stall_event_fingerprints: set[str] = set()
+        # Gate truth (spec 2026-08-14 §3): the word a tool result handed the
+        # model, the gradings already named, and the revisions spoken aloud.
+        delivered_gate_word: dict[str, Any] | None = None
+        seen_decision_ids: set[str] = set()
+        gate_outcome_revisions: set[tuple[str, str]] = set()
         evidence_publications: dict[tuple[str, str, str], EvidencePublicationPayload] = {}
         evidence_store_binding: EvidenceStoreBoundPayload | None = None
         barrier_integrity_failure_seen = False
@@ -1477,6 +1554,9 @@ class ControlReplayRunner:
                     ):
                         raise ReplayValidationError("tool result targets a stale phase attempt")
                     result_payload = dict(payload["result"])
+                    delivered_gate_word = (
+                        _delivered_gate_word(result_payload) or delivered_gate_word
+                    )
                     output_ref = result_payload.get("output_ref")
                     if output_ref:
                         output_storage.register(
@@ -1620,8 +1700,29 @@ class ControlReplayRunner:
                     # Production records these facts only after the paired gate
                     # decision is accepted. The observation event is audit data,
                     # not a second state mutation.
+                elif event.kind == "gate_outcome_revised":
+                    revision = GateOutcomeRevisedPayload.model_validate(payload)
+                    if (
+                        delivered_gate_word is None
+                        or str(delivered_gate_word["decision_id"]) != revision.delivered_decision_id
+                    ):
+                        raise ReplayValidationError(
+                            "gate_outcome_revised names a word that was never delivered"
+                        )
+                    gate_outcome_revisions.add(
+                        (revision.delivered_decision_id, revision.revised_decision_id)
+                    )
                 elif event.kind == "gate_decision":
                     gate_decision_count += 1
+                    _verify_gate_word_lineage(
+                        payload,
+                        delivered=delivered_gate_word,
+                        seen_decision_ids=seen_decision_ids,
+                        revisions=gate_outcome_revisions,
+                    )
+                    if str(payload.get("decision_id") or "").strip():
+                        seen_decision_ids.add(str(payload["decision_id"]).strip())
+                    delivered_gate_word = None
                     if active_repair_context is not None:
                         finalizer_gate = bool(
                             pending_finalizer_gate is not None

@@ -101,6 +101,9 @@ CONTROL_EVENT_KINDS = (
     # publication so restart cannot rebind one evidence epoch to a replacement
     # container with the same reusable name.
     "evidence_store_bound",
+    # Gate truth (spec 2026-08-14 §3.1): a word already delivered to the model
+    # may only be replaced out loud. Appended for the same positional reason.
+    "gate_outcome_revised",
 )
 ControlEventKind = Literal[
     "planner_response",
@@ -125,6 +128,7 @@ ControlEventKind = Literal[
     "job_stall_observed",
     "evidence_publication",
     "evidence_store_bound",
+    "gate_outcome_revised",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -914,14 +918,61 @@ class GateDecisionPayload(_StrictPayload):
     # Required by ReplayHeader v3. Absent stays absent for archived v1/v2
     # transcripts and is rejected by the v3 replay policy, not this parser.
     code: str | None = Field(default=None, min_length=1, max_length=256)
+    # Spec 2026-08-14 §3.3. `gate_result` is the gate's own serialization,
+    # byte-identical to the copy embedded in the tool result that delivered it;
+    # the flat fields above are the event's bounded projection of that same
+    # object. `supersedes` names the earlier grading this one replaces.
+    decision_id: str | None = Field(default=None, min_length=1, max_length=128)
+    supersedes: str | None = Field(default=None, min_length=1, max_length=128)
+    gate_result: dict[str, Any] | None = None
 
     @model_serializer(mode="wrap")
     def _ownership_absent_stays_absent(self, handler):
         data = handler(self)
-        for name in ("control_disposition", "blocker_owner", "code"):
+        for name in (
+            "control_disposition",
+            "blocker_owner",
+            "code",
+            "decision_id",
+            "supersedes",
+            "gate_result",
+        ):
             if name not in self.model_fields_set:
                 data.pop(name, None)
         return data
+
+
+class GateOutcomeRevisedPayload(_StrictPayload):
+    """A word the model already acted on, replaced in the open (spec §3.1).
+
+    The engine may not re-derive an outcome after delivering it. When new
+    evidence must change it anyway, this event and the observation the model
+    reads are rendered from the same object, and the replacing `gate_decision`
+    names `delivered_decision_id` in its `supersedes`.
+    """
+
+    phase: str = Field(min_length=1)
+    delivered_decision_id: str = Field(min_length=1, max_length=128)
+    revised_decision_id: str = Field(min_length=1, max_length=128)
+    delivered_outcome: Literal["success", "partial", "failed", "unknown"]
+    revised_outcome: Literal["success", "partial", "failed", "unknown"]
+    delivered_accepted: bool
+    revised_accepted: bool
+    reason: str = ""
+    code: str = Field(min_length=1, max_length=256)
+    observation_text: str = Field(min_length=1)
+    source_attempt_id: str | None = None
+
+    @model_validator(mode="after")
+    def _a_revision_replaces_a_different_decision(self) -> "GateOutcomeRevisedPayload":
+        if self.delivered_decision_id == self.revised_decision_id:
+            raise ValueError("a revision must name two distinct gradings")
+        if (self.delivered_outcome, self.delivered_accepted) == (
+            self.revised_outcome,
+            self.revised_accepted,
+        ):
+            raise ValueError("a revision must name a word that actually moved")
+        return self
 
 
 class PhaseTransitionPayload(_StrictPayload):
@@ -1187,6 +1238,7 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "job_stall_observed": JobStallObservedPayload,
     "evidence_publication": EvidencePublicationPayload,
     "evidence_store_bound": EvidenceStoreBoundPayload,
+    "gate_outcome_revised": GateOutcomeRevisedPayload,
 }
 
 

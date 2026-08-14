@@ -100,6 +100,7 @@ from .phase_gates import (
     ValidatorState,
     check_phase_claim,
     claimable_outcome,
+    gate_observation_text,
     validate_phase_claim,
 )
 from .phase_handoff import PhaseHandoff
@@ -165,6 +166,7 @@ _STRICT_LINEAGE_CONTROL_KINDS = frozenset(
         "forced_action",
         "tool_result",
         "gate_decision",
+        "gate_outcome_revised",
         "repair_context_opened",
         "phase_transition",
         "evidence_close",
@@ -2729,6 +2731,13 @@ class ReActEngine(UIEventEmitter):
     ) -> None:
         machine = self.phase_machine
         self._pending_repair_context = None
+        # Claimed before `machine.apply` moves the attempt on: an observation
+        # queued under a closed attempt is a statement about a phase the model
+        # is no longer in.
+        pending_observation = getattr(self, "_pending_gate_observation", None)
+        self._pending_gate_observation = None
+        if pending_observation is not None and pending_observation[2] != self._current_attempt_id():
+            pending_observation = None
         self._emit_control_phase_transition(decision, repair_request=repair_request)
         appended = machine.apply(decision)
         for applied in appended:
@@ -2761,6 +2770,8 @@ class ReActEngine(UIEventEmitter):
             # BEFORE the model plans this phase — including on a repair
             # re-entry.
             self._maybe_consult_advisor_at_phase_entry()
+            if pending_observation is not None:
+                self._add_system_guidance(pending_observation[0], priority=pending_observation[1])
 
     def _project_name_for_gate(self) -> str | None:
         try:
@@ -2807,9 +2818,31 @@ class ReActEngine(UIEventEmitter):
             if claim.phase != machine.current_phase or claim.signal != signal:
                 self.agent_logger.warning("Ignoring a stale or mismatched phase claim")
                 return None
-            gate = self._cap_unresolved_test_gate(claim, gate)
+            # The word in `gate` is the word the model already read and the one
+            # the tool result already embedded. Everything below either seals
+            # exactly it, or says out loud that it is replacing it (spec §3.1).
+            delivered = gate
+            self._register_delivered_gate(claim, delivered)
+            gate = self._cap_unresolved_test_gate(claim, delivered)
+            word_revised = False
+            if gate is not delivered:
+                # A second grading is legal; it just has to name the first.
+                gate = gate.superseding(delivered)
+                word_revised = (gate.accepted, PhaseOutcome(gate.validated_outcome)) != (
+                    delivered.accepted,
+                    PhaseOutcome(delivered.validated_outcome),
+                )
             if not gate.accepted:
-                self._emit_control_gate(claim, gate)
+                revision = (
+                    self._emit_gate_outcome_revised(claim, delivered, gate)
+                    if word_revised
+                    else None
+                )
+                # The revision names both words; a second rendering of the same
+                # seal would only repeat it.
+                self._seal_engine_gate(claim, gate, deliver=revision is None)
+                if revision is not None:
+                    self._deliver_gate_observation(revision, priority=9)
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
                 return None
             required_attempt = self._missing_required_test_attempt()
@@ -2825,6 +2858,11 @@ class ReActEngine(UIEventEmitter):
                     priority=9,
                 )
                 return None
+            revision = (
+                self._emit_gate_outcome_revised(claim, delivered, gate) if word_revised else None
+            )
+            if revision is not None:
+                self._deliver_gate_observation(revision, priority=9)
             self._emit_control_gate(claim, gate)
             self._record_gate_facts(claim.phase, gate)
             record = machine.close_attempt(gate)
@@ -3110,7 +3148,7 @@ class ReActEngine(UIEventEmitter):
             ),
             validated_facts=validated_facts,
         )
-        self._emit_control_gate(claim, gate)
+        self._seal_engine_gate(claim, gate)
         self._record_gate_facts(phase, gate)
         record = machine.close_attempt(gate)
         state = getattr(self, "run_evidence_state", None)
@@ -4268,29 +4306,97 @@ class ReActEngine(UIEventEmitter):
             f"{gate.code or gate.control_disposition.value}",
         )
 
+    @staticmethod
+    def _embedded_gate_body(gate: GateResult) -> Dict[str, Any]:
+        """The gate's ONE serialization, bounded exactly as the tool result
+        bounds its embedded copy.
+
+        `_control_result_projection` compacts the whole metadata mapping, so the
+        gate body is visited one level down. Compacting it at the top level here
+        would bound its children at a different depth and the two copies of the
+        same object would stop comparing equal.
+        """
+        return compact_control_value({"gate_result": gate.to_metadata()})["gate_result"]
+
+    def _current_attempt_id(self) -> str:
+        return str(getattr(getattr(self, "phase_machine", None), "current_attempt_id", "") or "")
+
+    def _delivered_gates(self) -> Dict[str, GateResult]:
+        """Words handed to the model under the OPEN attempt, and only those.
+
+        A gate delivered under a closed attempt can never be the one a later
+        decision replaces, so the registry is rebuilt rather than accumulated.
+        """
+        attempt = self._current_attempt_id()
+        if getattr(self, "_delivered_gate_attempt", None) != attempt:
+            self._delivered_gate_attempt = attempt
+            self._delivered_gate_decisions = {}
+        return self._delivered_gate_decisions
+
+    def _register_delivered_gate(self, claim: PhaseClaim, gate: GateResult) -> None:
+        self._delivered_gates()[canonical_sha256(claim.to_metadata())] = gate
+
+    def _refuse_undelivered_word(self, claim: PhaseClaim, gate: GateResult) -> None:
+        """A word the model acted on may not be replaced behind its back.
+
+        camel delivered `failed` and sealed `unknown`; polaris embedded
+        `success`/`green` and sealed `unknown`/`unavailable` two events later.
+        Both are one statement re-graded after delivery. A second grading is
+        legal — it just has to name the first and be spoken aloud first.
+        """
+        delivered = self._delivered_gates().get(canonical_sha256(claim.to_metadata()))
+        if delivered is None or delivered.decision_id == gate.decision_id:
+            return
+        if gate.supersedes != delivered.decision_id:
+            raise ValueError(
+                "a gate decision that replaces a delivered word must supersede it: "
+                f"delivered {delivered.decision_id}, sealing {gate.decision_id}"
+            )
+        if (gate.accepted, PhaseOutcome(gate.validated_outcome)) == (
+            delivered.accepted,
+            PhaseOutcome(delivered.validated_outcome),
+        ):
+            return
+        revisions = getattr(self, "_revised_gate_decisions", None) or set()
+        if (delivered.decision_id, gate.decision_id) not in revisions:
+            raise ValueError(
+                "a sealed word that differs from the delivered one requires a "
+                f"gate_outcome_revised observation: {delivered.decision_id} -> "
+                f"{gate.decision_id}"
+            )
+
     def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult):
+        self._refuse_undelivered_word(claim, gate)
+        body = self._embedded_gate_body(gate)
+        # The flat fields below are the event's bounded, provenance-resolved
+        # projection of `body`; `body` itself goes in verbatim, because it is the
+        # copy that must equal the one the tool result already delivered.
         validated_facts = compact_control_value(dict(gate.validated_facts))
         machine = getattr(self, "phase_machine", None)
         control_evidence_refs = list(self._gate_evidence_refs(gate))
-        gate_code = gate.code or (
-            "phase_claim_accepted" if gate.accepted else "phase_claim_contradicted"
+        gate_code = body["code"] or (
+            "phase_claim_accepted" if body["accepted"] else "phase_claim_contradicted"
         )
         gate_payload: Dict[str, Any] = {
             "phase": claim.phase,
             "signal": claim.signal,
             "claimed_outcome": claim.claimed_outcome.value,
-            "validator_state": gate.validator_state.value,
-            "expected_accepted": gate.accepted,
-            "expected_outcome": gate.validated_outcome.value,
-            "control_disposition": gate.control_disposition.value,
-            "blocker_owner": gate.blocker_owner.value,
+            "decision_id": body["decision_id"],
+            "validator_state": body["validator_state"],
+            "expected_accepted": body["accepted"],
+            "expected_outcome": body["validated_outcome"],
+            "control_disposition": body["control_disposition"],
+            "blocker_owner": body["blocker_owner"],
             "code": gate_code,
-            "reason": gate.reason,
+            "reason": body["reason"],
             "key_results": claim.key_results,
             "evidence_refs": control_evidence_refs,
             "validated_facts": validated_facts,
+            "gate_result": body,
             "source_attempt_id": getattr(machine, "current_attempt_id", None),
         }
+        if body.get("supersedes"):
+            gate_payload["supersedes"] = body["supersedes"]
         if claim.phase == "test":
             gate_payload["test_candidate_resolution"] = resolve_survey_test_candidates(
                 getattr(self, "orchestrator", None)
@@ -4299,15 +4405,84 @@ class ReActEngine(UIEventEmitter):
             "validator_observation",
             {
                 "phase": claim.phase,
-                "validator_state": gate.validator_state.value,
-                "control_disposition": gate.control_disposition.value,
-                "blocker_owner": gate.blocker_owner.value,
-                "reason": gate.reason,
+                "validator_state": body["validator_state"],
+                "control_disposition": body["control_disposition"],
+                "blocker_owner": body["blocker_owner"],
+                "reason": body["reason"],
                 "evidence_refs": control_evidence_refs,
                 "validated_facts": validated_facts,
             },
         )
         return self._emit_control_event("gate_decision", gate_payload)
+
+    def _emit_gate_outcome_revised(
+        self,
+        claim: PhaseClaim,
+        delivered: GateResult,
+        revised: GateResult,
+    ) -> str:
+        """One text, two sinks: the model reads the revision the record seals.
+
+        The text is returned rather than delivered here because the caller knows
+        which window the model will actually read: a revision appended before a
+        phase transition is erased by the window reset that follows it.
+        """
+
+        text = gate_observation_text(
+            revised,
+            phase=claim.phase,
+            origin="outcome_revision",
+            superseded=delivered,
+        )
+        machine = getattr(self, "phase_machine", None)
+        self._emit_control_event(
+            "gate_outcome_revised",
+            {
+                "phase": claim.phase,
+                "delivered_decision_id": delivered.decision_id,
+                "revised_decision_id": revised.decision_id,
+                "delivered_outcome": PhaseOutcome(delivered.validated_outcome).value,
+                "revised_outcome": PhaseOutcome(revised.validated_outcome).value,
+                "delivered_accepted": delivered.accepted,
+                "revised_accepted": revised.accepted,
+                "reason": revised.reason,
+                "code": revised.code or "gate_outcome_revised",
+                "observation_text": text,
+                "source_attempt_id": getattr(machine, "current_attempt_id", None),
+            },
+        )
+        revisions = getattr(self, "_revised_gate_decisions", None)
+        if revisions is None:
+            revisions = set()
+            self._revised_gate_decisions = revisions
+        revisions.add((delivered.decision_id, revised.decision_id))
+        return text
+
+    def _seal_engine_gate(self, claim: PhaseClaim, gate: GateResult, *, deliver: bool = True):
+        """The engine's own closes state the word they seal (spec §3.2).
+
+        Four close paths minted a claim, graded it and sealed a `gate_decision`
+        while the model saw nothing but a `logger.warning`. Emitting and
+        delivering through one sink makes that a property of the sink rather
+        than a discipline each caller has to remember.
+        """
+        event = self._emit_control_gate(claim, gate)
+        if deliver:
+            self._deliver_gate_observation(
+                gate_observation_text(gate, phase=claim.phase, origin="engine_close"),
+                priority=8,
+            )
+        return event
+
+    def _deliver_gate_observation(self, text: str, *, priority: int) -> None:
+        """State the word in this window, and again in the one a reset opens.
+
+        A close observation appended moments before `_apply_phase_decision`
+        rebuilds the window is erased by that rebuild — which is how four engine
+        closes could look delivered and still reach nobody.
+        """
+        self._pending_gate_observation = (text, priority, self._current_attempt_id())
+        self._add_system_guidance(text, priority=priority)
 
     def _repair_tool_affordances(self) -> tuple[ToolSemanticAffordance, ...]:
         """Project-action capabilities, without params, examples, or ordering."""
@@ -4658,7 +4833,7 @@ class ReActEngine(UIEventEmitter):
             control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
             blocker_owner=BlockerOwner.HARNESS,
         )
-        self._emit_control_gate(honest_claim, honest_gate)
+        self._seal_engine_gate(honest_claim, honest_gate)
         self._record_gate_facts(honest_claim.phase, honest_gate)
         record = machine.close_attempt(honest_gate)
         route = self.transition_policy.decide(
@@ -4764,7 +4939,7 @@ class ReActEngine(UIEventEmitter):
                 control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
                 blocker_owner=gate.blocker_owner,
             )
-        self._emit_control_gate(honest_claim, honest_gate)
+        self._seal_engine_gate(honest_claim, honest_gate)
         self._record_gate_facts(honest_claim.phase, honest_gate)
         record = machine.close_attempt(honest_gate)
         route = self.transition_policy.decide(
@@ -5848,7 +6023,7 @@ class ReActEngine(UIEventEmitter):
             evidence_refs=refs,
             claim=claim,
         )
-        self._emit_control_gate(claim, gate)
+        self._seal_engine_gate(claim, gate)
         record = machine.close_attempt(gate)
         route = self.transition_policy.decide(
             record,

@@ -25,6 +25,7 @@ from sag.agent.phase_gates import (
     GateResult,
     ValidatorState,
     check_phase_claim,
+    gate_observation_text,
     settlement_capped_outcome,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
@@ -475,10 +476,9 @@ class PhaseTool(BaseTool):
 
         control_disposition = GateControlDisposition(gate.control_disposition).value
         return ToolResult.completed_success(
-            output=(
-                f"Phase '{phase}' terminal claim accepted with validated outcome "
-                f"'{gate.validated_outcome.value}'. Awaiting engine routing."
-            ),
+            # The word the model reads and the word the record seals come out of
+            # one renderer reading one object (spec §3.1).
+            output=gate_observation_text(gate, phase=phase, origin="terminal_claim"),
             facts={"phase": phase},
             metadata={
                 "control_disposition": control_disposition,

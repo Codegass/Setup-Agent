@@ -491,7 +491,7 @@ def _terminal_observed(job_id="job-replay-1", exit_code=137):
 
 def test_ws2_job_lifecycle_control_events_are_strict_and_append_only():
     assert CONTROL_EVENT_SCHEMA_VERSION == 5
-    assert CONTROL_EVENT_KINDS[-9:] == (
+    assert CONTROL_EVENT_KINDS[13:22] == (
         "job_terminal_observed",
         "job_terminal_unpersisted",
         "job_live_at_close",

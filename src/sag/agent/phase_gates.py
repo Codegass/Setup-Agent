@@ -6,6 +6,8 @@ selects the next phase; routing belongs to ``PhaseTransitionPolicy``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shlex
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -166,6 +168,23 @@ _ANALYSIS_HARNESS_FAILURE_CODES = frozenset(
 ANALYSIS_FACTS_RECOVERY_CODES = frozenset({"analysis_trunk_missing", "analysis_facts_missing"})
 
 
+GATE_DECISION_ID_PREFIX = "gate-"
+_GATE_DECISION_ID_CHARS = 32
+
+
+def _gate_identity(fields: Mapping[str, Any]) -> str:
+    """Name one grading by what it says, never by when it was constructed.
+
+    A content digest — not a uuid — because the same statement has to carry the
+    same name in the live stream, in the embedded copy, and in an offline replay
+    of bytes recorded before this field existed. ``default=str`` keeps an
+    unserializable fact from turning identity into an exception.
+    """
+    body = json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+    return f"{GATE_DECISION_ID_PREFIX}{digest[:_GATE_DECISION_ID_CHARS]}"
+
+
 @dataclass(frozen=True)
 class GateResult:
     accepted: bool
@@ -180,6 +199,13 @@ class GateResult:
     code: str = ""
     validated_facts: Mapping[str, Any] = field(default_factory=dict)
     claim: PhaseClaim | None = None
+    # Spec 2026-08-14 §3.3. `supersedes` names the grading this one replaces, so
+    # two gradings in sequence can never be read as one statement.
+    supersedes: str = ""
+    # DERIVED, never supplied: the identity is a function of what the grading
+    # says, so any `replace` that changes a word necessarily renames the
+    # decision, and no caller can hold an id over content it no longer matches.
+    decision_id: str = field(init=False, default="", compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.accepted, bool):
@@ -204,17 +230,11 @@ class GateResult:
         if not isinstance(self.validated_facts, Mapping):
             raise TypeError("validated facts must be a mapping")
         object.__setattr__(self, "validated_facts", dict(self.validated_facts))
+        object.__setattr__(self, "supersedes", str(self.supersedes or ""))
+        object.__setattr__(self, "decision_id", _gate_identity(self._graded_body()))
 
-    @property
-    def disposition(self) -> ClaimDisposition:
-        return ClaimDisposition(self.claim_disposition)
-
-    def with_claim(self, claim: PhaseClaim) -> "GateResult":
-        if self.claim is not None and self.claim != claim:
-            raise ValueError("gate result already belongs to a different phase claim")
-        return replace(self, claim=claim)
-
-    def to_metadata(self) -> dict[str, Any]:
+    def _graded_body(self) -> dict[str, Any]:
+        """Everything this grading asserts, and nothing about where it landed."""
         return {
             "accepted": self.accepted,
             "validated_outcome": PhaseOutcome(self.validated_outcome).value,
@@ -227,7 +247,38 @@ class GateResult:
             "suggestions": list(self.suggestions),
             "code": self.code,
             "validated_facts": dict(self.validated_facts),
+            "supersedes": self.supersedes,
         }
+
+    @property
+    def disposition(self) -> ClaimDisposition:
+        return ClaimDisposition(self.claim_disposition)
+
+    def with_claim(self, claim: PhaseClaim) -> "GateResult":
+        if self.claim is not None and self.claim != claim:
+            raise ValueError("gate result already belongs to a different phase claim")
+        return replace(self, claim=claim)
+
+    def superseding(self, prior: "GateResult") -> "GateResult":
+        """Name the grading this one replaces, and take a new identity for it."""
+        if not prior.decision_id:
+            raise ValueError("a superseded gate result must carry a decision id")
+        return replace(self, supersedes=prior.decision_id)
+
+    def to_metadata(self) -> dict[str, Any]:
+        """THE serialization of this grading. Every sink writes this dict.
+
+        polaris S10 embedded one shape in the tool result and assembled another
+        for the control event; the two disagreed on the outcome word on adjacent
+        lines. There is one producer now, so the copies cannot drift.
+        """
+        body = self._graded_body()
+        body["decision_id"] = self.decision_id
+        # Absent stays absent: an archived v1/v2 gate superseded nothing, and a
+        # first grading superseded nothing either.
+        if not self.supersedes:
+            body.pop("supersedes")
+        return body
 
     @classmethod
     def from_metadata(
@@ -259,7 +310,46 @@ class GateResult:
             code=str(value.get("code") or ""),
             validated_facts=dict(facts),
             claim=claim,
+            supersedes=str(value.get("supersedes") or ""),
         )
+
+
+GateObservationOrigin = Literal["terminal_claim", "engine_close", "outcome_revision"]
+
+
+def gate_observation_text(
+    gate: "GateResult",
+    *,
+    phase: str,
+    origin: GateObservationOrigin = "terminal_claim",
+    superseded: "GateResult | None" = None,
+) -> str:
+    """The one renderer of the word a gate states to the model.
+
+    camel §0.7 read *"validated outcome 'failed'"* while the record read
+    `unknown` because the sentence the model saw was written in one file and the
+    sealed decision in another. Every sink that states a word calls this, so the
+    text and the record cannot come from different objects.
+    """
+    outcome = PhaseOutcome(gate.validated_outcome).value
+    if origin == "terminal_claim":
+        return (
+            f"Phase '{phase}' terminal claim accepted with validated outcome "
+            f"'{outcome}'. Awaiting engine routing."
+        )
+    if origin == "engine_close":
+        return (
+            f"PHASE_CLOSED: the harness closed phase '{phase}' with validated outcome "
+            f"'{outcome}' ({gate.code or 'phase_closed'}): {gate.reason}"
+        )
+    if superseded is None:
+        raise ValueError("an outcome revision must name the grading it supersedes")
+    prior = PhaseOutcome(superseded.validated_outcome).value
+    return (
+        f"GATE_OUTCOME_REVISED: phase '{phase}' was answered with validated outcome "
+        f"'{prior}', and the sealed outcome is '{outcome}' "
+        f"({gate.code or 'gate_outcome_revised'}): {gate.reason}"
+    )
 
 
 def _unclosed_domains(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:

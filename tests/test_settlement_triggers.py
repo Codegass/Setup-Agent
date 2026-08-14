@@ -562,7 +562,10 @@ def test_a_pre_plan_8_transcript_still_replays_byte_identically():
 def test_job_unsettled_is_appended_after_job_settled():
     assert CONTROL_EVENT_KINDS[11] == "job_settled"
     assert CONTROL_EVENT_KINDS[12] == "job_unsettled"
-    assert CONTROL_EVENT_KINDS[13:] == (
+    # Absolute positions, not a tail slice: later kinds are appended after this
+    # block (gate truth added `gate_outcome_revised`), and a `[13:]` assertion
+    # would read every honest append as a violation.
+    assert CONTROL_EVENT_KINDS[13:22] == (
         "job_terminal_observed",
         "job_terminal_unpersisted",
         "job_live_at_close",
@@ -573,7 +576,8 @@ def test_job_unsettled_is_appended_after_job_settled():
         "evidence_publication",
         "evidence_store_bound",
     )
-    assert len(CONTROL_EVENT_KINDS) == 22
+    assert CONTROL_EVENT_KINDS[22] == "gate_outcome_revised"
+    assert len(CONTROL_EVENT_KINDS) == 23
 
 
 def test_the_job_unsettled_payload_states_the_job_its_file_and_what_it_was():
