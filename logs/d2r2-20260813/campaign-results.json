@@ -1,0 +1,117 @@
+[
+  {
+    "exit_code": 1,
+    "project": "camel",
+    "seconds": 904
+  },
+  {
+    "exit_code": 1,
+    "project": "kafka",
+    "seconds": 866
+  },
+  {
+    "exit_code": 1,
+    "project": "ignite",
+    "seconds": 1369
+  },
+  {
+    "exit_code": 1,
+    "project": "lucene",
+    "seconds": 307
+  },
+  {
+    "exit_code": 1,
+    "project": "geode",
+    "seconds": 951
+  },
+  {
+    "exit_code": 1,
+    "project": "jackrabbit",
+    "seconds": 1648
+  },
+  {
+    "exit_code": 1,
+    "project": "camel-quarkus",
+    "seconds": 938
+  },
+  {
+    "exit_code": 1,
+    "project": "cassandra-java-driver",
+    "seconds": 395
+  },
+  {
+    "exit_code": 1,
+    "project": "tapestry-5",
+    "seconds": 509
+  },
+  {
+    "exit_code": 1,
+    "project": "cayenne",
+    "seconds": 411
+  },
+  {
+    "exit_code": 1,
+    "project": "samza",
+    "seconds": 1440
+  },
+  {
+    "exit_code": 1,
+    "project": "polaris",
+    "seconds": 740
+  },
+  {
+    "exit_code": 1,
+    "project": "seatunnel-web",
+    "seconds": 235
+  },
+  {
+    "exit_code": 1,
+    "project": "ofbiz-plugins",
+    "seconds": 213
+  },
+  {
+    "exit_code": 1,
+    "project": "kogito-examples",
+    "seconds": 817
+  },
+  {
+    "exit_code": 1,
+    "project": "commons-dbcp",
+    "seconds": 362
+  },
+  {
+    "exit_code": 1,
+    "project": "freemarker",
+    "seconds": 276
+  },
+  {
+    "exit_code": 1,
+    "project": "httpcomponents-client",
+    "seconds": 381
+  },
+  {
+    "exit_code": 1,
+    "project": "spark-kubernetes-operator",
+    "seconds": 469
+  },
+  {
+    "exit_code": 1,
+    "project": "gora",
+    "seconds": 475
+  },
+  {
+    "exit_code": 1,
+    "project": "rocketmq-externals",
+    "seconds": 140
+  },
+  {
+    "exit_code": 1,
+    "project": "samza-hello-samza",
+    "seconds": 514
+  },
+  {
+    "exit_code": 1,
+    "project": "tomcat-jakartaee-migration",
+    "seconds": 210
+  }
+]
