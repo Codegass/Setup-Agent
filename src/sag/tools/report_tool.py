@@ -31,7 +31,13 @@ _OBLIGATION_RECORDS_UNSET = object()
 _REPORT_METRICS_PUBLICATION_LOCK = threading.RLock()
 from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import ADJUDICATED_CONFLICTS, rescue_blocked_build, run_verdict
-from sag.verdict_rates import render_rate_lines
+from sag.verdict_rates import (
+    BAND_FEW,
+    BAND_HALF,
+    BAND_NONE,
+    band_for,
+    render_rate_lines,
+)
 
 from .base import BaseTool, ToolResult
 
@@ -2229,16 +2235,27 @@ class ReportTool(BaseTool, UIEventEmitter):
         if flags.get("fail_at_end"):
             add("INFO", "fail_at_end enabled (test failures may be deferred).")
 
-        # INFO: modules with low pass percentage
+        # INFO: modules where fewer than most executed cases came back green.
+        # The band table names the fraction (spec §2: the invented 80% cut-off
+        # left the verdict chain on 2026-08-10 and has no business surviving in
+        # operator prose either). A module that executed nothing has no fraction
+        # to band — `unavailable` is not a low score.
+        weak_bands = {BAND_HALF, BAND_FEW, BAND_NONE}
         low_modules = []
         for module, data in per_module.items():
-            module_pass = data.get("pass_pct")
-            if module_pass is not None and module_pass < 80:
-                low_modules.append(f"{module} ({format_percentage(module_pass)})")
+            passed = data.get("passed")
+            total = data.get("total")
+            if not isinstance(passed, (int, float)) or not isinstance(total, (int, float)):
+                continue
+            band = band_for(int(passed), int(total))
+            if band in weak_bands:
+                low_modules.append(f"{module} ({band})")
 
         if low_modules:
             low_modules.sort(key=lambda entry: entry)
-            add("INFO", f"Modules below 80% pass rate: {truncate_list(low_modules)}.")
+            add(
+                "INFO", f"Modules where fewer than most tests passed: {truncate_list(low_modules)}."
+            )
 
         # INFO: ignored telemetry lines
         ignored_lines = test_history.get("ignored_lines", 0)

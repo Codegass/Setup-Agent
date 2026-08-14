@@ -12,7 +12,9 @@ from typing import Any, Callable, Dict, List, Optional
 from sag.agent.attempt_policy import (
     build_attempt_requirement,
     required_test_attempt,
+    resolve_survey_test_candidates,
     run_test_receipts,
+    terminal_test_receipts,
     untried_islands_requirement,
 )
 from sag.agent.job_obligations import read_obligations
@@ -141,6 +143,38 @@ class PhaseTool(BaseTool):
                 },
             },
         )
+
+    def _test_receipt_scope_facts(self, required_attempt) -> Dict[str, Any]:
+        """Both receipt counts, each under a name that says which one it is.
+
+        The sealed number was a hard-coded 0 that told freemarker's run it had
+        no receipts while it held one. Counting fixed the lie and left a subtler
+        one: the count is RUN-WIDE, while the requirement that produced this
+        rejection asked the candidate-bound question — so `1` sat next to
+        `TEST_ATTEMPT_REQUIRED` ("no terminal test receipt") answering a
+        question nobody beside it had asked. Both are sealed, both are named.
+
+        The candidate-bound count exists only where candidates do: an
+        unresolvable survey has nothing to bind to, and an absent fact stays
+        absent rather than seal a 0 that means "not asked".
+        """
+        facts: Dict[str, Any] = {
+            "run_wide_test_receipts": len(run_test_receipts(self.run_evidence_state)),
+            "test_attempt_requirement": required_attempt.to_metadata(),
+        }
+        resolved = resolve_survey_test_candidates(self.orchestrator)
+        if resolved.status == "available":
+            candidates = (
+                (resolved.primary,) if resolved.primary is not None else resolved.candidates
+            )
+            facts["candidate_bound_test_receipts"] = len(
+                terminal_test_receipts(
+                    self.run_evidence_state,
+                    attempt_id=getattr(self.machine, "current_attempt_id", None),
+                    candidates=candidates,
+                )
+            )
+        return facts
 
     @staticmethod
     def _rejection_output(reason: str, facts: Dict[str, Any]) -> str:
@@ -346,14 +380,7 @@ class PhaseTool(BaseTool):
                 ),
                 control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
                 blocker_owner="harness",
-                validated_facts={
-                    # Counted, never asserted: this was a hard-coded 0 that
-                    # sealed "no receipts" into runs that had one. The count is
-                    # run-wide because the fact names the run, not the
-                    # candidate the requirement happens to be about.
-                    "test_execution_receipts": len(run_test_receipts(self.run_evidence_state)),
-                    "test_attempt_requirement": required_attempt.to_metadata(),
-                },
+                validated_facts=self._test_receipt_scope_facts(required_attempt),
             )
 
         if verb == "blocked" or claimed_outcome is PhaseOutcome.FAILED:

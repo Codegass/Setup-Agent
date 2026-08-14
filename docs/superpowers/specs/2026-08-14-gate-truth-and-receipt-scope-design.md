@@ -209,6 +209,25 @@ graders; the model acts on the first word, history records the second.
    shape reconstructed must fail closed (engine refuses to seal a diverging
    word without the revision observation).
 
+### Inventory — the outcome words derived outside the gate chain
+
+"One grader" scopes the CLAIM chain. Two other producers state an outcome word
+by design, and both are named here so the next reader does not rediscover them
+as bugs:
+
+1. **`report_tool._determine_actual_status`** (`report_tool.py:2881-2960`, fed to
+   the kernel at `:945-963` via `_physical_verdict_from_snapshot`) grades
+   success/partial/fail from the report snapshot, including its own heavy-red
+   rule. This is the PHYSICAL judge in the documented minimum-across-
+   independent-judges design, not a second model-facing grader: its word never
+   reaches the model as a phase outcome, and the condensed-log renderer already
+   refuses to read `status.overall` directly (`:2260-2265`). It is deliberate.
+2. **The four engine closes** state their own word, but through the same
+   `validate_phase_claim` funnel and the same `_seal_engine_gate` sink as
+   everything else (§3.2), so they are inside the chain, not beside it.
+
+Anything else that derives an outcome word outside `phase_gates` is a defect.
+
 ### Acceptance
 
 - camel shape: unconstructible without a `gate_outcome_revised` observation.

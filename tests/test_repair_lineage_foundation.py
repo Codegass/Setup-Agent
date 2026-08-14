@@ -26,6 +26,7 @@ from sag.agent.control_events import (
     canonical_sha256,
 )
 from sag.agent.evidence_assessments import assessment_id
+from sag.agent.phase_gates import GATE_ASSESSMENT_SUBJECT_PREFIX
 from sag.agent.replay import (
     ControlReplayRunner,
     ReplayValidationError,
@@ -563,7 +564,9 @@ def _v3_repair_rows():
         "validated_facts": {},
         "evidence_refs": ["receipt-1"],
     }
-    trigger = assessment_id("gate-" + canonical_sha256(subject)[:16], "build_failed")
+    trigger = assessment_id(
+        GATE_ASSESSMENT_SUBJECT_PREFIX + canonical_sha256(subject)[:16], "build_failed"
+    )
     context = RepairContext.model_validate(
         _context_payload(
             repair_context_id=repair_context_identity(trigger),

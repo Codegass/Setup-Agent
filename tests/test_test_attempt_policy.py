@@ -868,7 +868,8 @@ def test_phase_tool_rejects_zero_attempt_terminal_claims(action):
     )
 
     assert result.error_code == "TEST_ATTEMPT_REQUIRED"
-    assert result.facts["test_execution_receipts"] == 0
+    assert result.facts["run_wide_test_receipts"] == 0
+    assert result.facts["candidate_bound_test_receipts"] == 0
     assert result.facts["test_attempt_requirement"]["required_action"]["params"][
         "working_directory"
     ].endswith("bigtop-data-generators")

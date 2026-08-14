@@ -39,9 +39,43 @@ UNATTRIBUTED_CONFLICT = "test_executions_unattributed_to_receipts"
 # renders through :func:`execution_sentence`, so a decision can check whether a
 # reason IS that sentence without parsing prose.
 EXECUTION_SENTENCE_PREFIX = "executed "
-# The deficiency classes spec §2.3 names. A gate result whose reason asserts one
-# of these cannot carry an upgrading outcome.
-DEFICIENCY_MARKERS = ("below", "insufficient", "missing")
+# The deficiency classes spec §2.3 names — below / insufficient / missing —
+# written as the PREDICATE each takes rather than as bare words, and matched on
+# a lowered reason.
+#
+# The class is "this sentence grades the evidence short", not "this sentence
+# contains a negative word". The distinction is load-bearing in both
+# directions and both directions are drawn from the corpus:
+#
+#   * bigtop's green build sealed "The repair produced the missing local
+#     artifact" — a repaired absence named by the branch that repaired it. A
+#     bare `missing` refuses that honest sentence.
+#   * a green build reason carries an INVENTORY of what is left ("no output
+#     yet: [...]", "remaining: gradle 'build' in ..."). Naming remaining work
+#     is why the checklist exists; it is not a grade of what was observed.
+#
+# This is a bounded refusal list over the phrasings this harness produces, not
+# a semantic classifier: "only 29 of 37 passed" asserts the class and is not
+# matched here. It can only fire on a programming error, because the guarantee
+# that a green reason SAYS something green is render-from-branch (one decision
+# produces the state, the code and the sentence together) — see
+# ``phase_gates._GradedDecision``. This predicate is the construction-time
+# refusal behind it, never the fence itself.
+DEFICIENCY_MARKERS = (
+    "below the",
+    "below threshold",
+    "below minimum",
+    "insufficient",
+    "fell short",
+    "too few",
+    "is missing",
+    "are missing",
+    "was missing",
+    "were missing",
+    "remains missing",
+    "remain missing",
+    "still missing",
+)
 
 
 def execution_sentence(

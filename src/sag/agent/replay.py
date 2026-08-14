@@ -88,6 +88,7 @@ from .loop_memory import CompletionClaimEvent, LoopDecision, LoopEvent, LoopMemo
 from .phase_gates import (
     ANALYSIS_FACTS_RECOVERY_CODES,
     ANALYSIS_RECOVERY_FACT,
+    GATE_ASSESSMENT_SUBJECT_PREFIX,
     OPEN_OBLIGATIONS_FACT,
     ValidatorState,
     validate_phase_claim,
@@ -398,7 +399,7 @@ def _repair_assessment_id_for_gate(
             {str(ref).strip() for ref in payload.get("evidence_refs") or () if str(ref).strip()}
         ),
     }
-    subject_id = "gate-" + canonical_sha256(subject_material)[:16]
+    subject_id = GATE_ASSESSMENT_SUBJECT_PREFIX + canonical_sha256(subject_material)[:16]
     return assessment_id(subject_id, code)
 
 

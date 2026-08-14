@@ -90,6 +90,7 @@ from .loop_memory import (
 from .native_messages import render_messages
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_gates import (
+    GATE_ASSESSMENT_SUBJECT_PREFIX,
     JOB_BARRIER_FACT,
     JOB_INTEGRITY_FACT,
     OPEN_OBLIGATIONS_FACT,
@@ -248,8 +249,9 @@ PHASE_OBJECTIVES = {
         "Establish terminal runner evidence for the required surveyed test coordinates. "
         "Test coordinates can live in a different module or build system from build "
         "coordinates. Persist executed, passed, failed, error, and skipped counts with their "
-        "receipt references. Partial pass above threshold is a valid outcome when reported "
-        "honestly; absence of a runner receipt cannot support test success."
+        "receipt references. Report what executed against what was discovered; red tests are "
+        "project facts to report, not a repair duty. Claim the outcome the receipts support; "
+        "absence of a runner receipt cannot support test success."
     ),
     "report": (
         "Persist the final setup report grounded in the sealed verdict, current receipts, "
@@ -274,8 +276,9 @@ PYTHON_PHASE_OBJECTIVES = {
         "Establish terminal Python runner evidence at the surveyed test coordinates, with "
         "executed, passed, failed, error, and skipped counts bound to receipt references. "
         "When native readiness is absent or unknown, the surveyed bounded-smoke constraint "
-        "limits collection until capability evidence changes. Partial pass above threshold is "
-        "a valid outcome when reported honestly; no runner receipt cannot support success."
+        "limits collection until capability evidence changes. Report what executed against "
+        "what was discovered; red tests are project facts to report, not a repair duty. Claim "
+        "the outcome the receipts support; no runner receipt cannot support success."
     ),
 }
 
@@ -2735,10 +2738,7 @@ class ReActEngine(UIEventEmitter):
         # Claimed before `machine.apply` moves the attempt on: an observation
         # queued under a closed attempt is a statement about a phase the model
         # is no longer in.
-        pending_observation = getattr(self, "_pending_gate_observation", None)
-        self._pending_gate_observation = None
-        if pending_observation is not None and pending_observation[2] != self._current_attempt_id():
-            pending_observation = None
+        pending_observation = self._pending_window_observation()
         self._emit_control_phase_transition(decision, repair_request=repair_request)
         appended = machine.apply(decision)
         for applied in appended:
@@ -2840,10 +2840,12 @@ class ReActEngine(UIEventEmitter):
                     else None
                 )
                 # The revision names both words; a second rendering of the same
-                # seal would only repeat it.
-                self._seal_engine_gate(claim, gate, deliver=revision is None)
+                # seal would only repeat it. This branch routes no phase
+                # decision, so whichever word it states is stated HERE and
+                # carried nowhere.
+                self._seal_engine_gate(claim, gate, deliver=revision is None, carry=False)
                 if revision is not None:
-                    self._deliver_gate_observation(revision, priority=9)
+                    self._state_gate_observation_now(revision, priority=9)
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
                 return None
             required_attempt = self._missing_required_test_attempt()
@@ -2863,7 +2865,7 @@ class ReActEngine(UIEventEmitter):
                 self._emit_gate_outcome_revised(claim, delivered, gate) if word_revised else None
             )
             if revision is not None:
-                self._deliver_gate_observation(revision, priority=9)
+                self._deliver_gate_observation(revision, priority=9, decision_id=gate.decision_id)
             self._emit_control_gate(claim, gate)
             self._record_gate_facts(claim.phase, gate)
             record = machine.close_attempt(gate)
@@ -4396,6 +4398,9 @@ class ReActEngine(UIEventEmitter):
 
     def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult):
         self._refuse_undelivered_word(claim, gate)
+        # The word the record now stands behind. A carried observation about an
+        # earlier grading is retired by this line, not by whoever remembers.
+        self._last_sealed_decision_id = gate.decision_id
         body = self._embedded_gate_body(gate)
         # The flat fields below are the event's bounded, provenance-resolved
         # projection of `body`; `body` itself goes in verbatim, because it is the
@@ -4488,31 +4493,85 @@ class ReActEngine(UIEventEmitter):
         revisions.add((delivered.decision_id, revised.decision_id))
         return text
 
-    def _seal_engine_gate(self, claim: PhaseClaim, gate: GateResult, *, deliver: bool = True):
+    def _seal_engine_gate(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+        *,
+        deliver: bool = True,
+        carry: bool = True,
+    ):
         """The engine's own closes state the word they seal (spec §3.2).
 
         Four close paths minted a claim, graded it and sealed a `gate_decision`
         while the model saw nothing but a `logger.warning`. Emitting and
         delivering through one sink makes that a property of the sink rather
         than a discipline each caller has to remember.
+
+        `carry` is False for a caller that routes no phase decision after this:
+        with no window reset to survive, a carried copy is a word left waiting
+        for the next transition to speak it out of turn.
         """
         event = self._emit_control_gate(claim, gate)
         if deliver:
-            self._deliver_gate_observation(
-                gate_observation_text(gate, phase=claim.phase, origin="engine_close"),
-                priority=8,
-            )
+            text = gate_observation_text(gate, phase=claim.phase, origin="engine_close")
+            if carry:
+                self._deliver_gate_observation(text, priority=8, decision_id=gate.decision_id)
+            else:
+                self._state_gate_observation_now(text, priority=8)
         return event
 
-    def _deliver_gate_observation(self, text: str, *, priority: int) -> None:
+    def _deliver_gate_observation(self, text: str, *, priority: int, decision_id: str) -> None:
         """State the word in this window, and again in the one a reset opens.
 
         A close observation appended moments before `_apply_phase_decision`
         rebuilds the window is erased by that rebuild — which is how four engine
         closes could look delivered and still reach nobody.
+
+        The carried copy NAMES the decision it describes. A branch that speaks
+        and then declines to route (the rejected cap) leaves its word standing
+        while the attempt stays open, and the next grading of that attempt
+        replaces it: re-stating the superseded sentence in the window the
+        transition opens contradicts the record the model just watched seal
+        (spec §3.1).
         """
-        self._pending_gate_observation = (text, priority, self._current_attempt_id())
+        self._pending_gate_observation = (
+            text,
+            priority,
+            self._current_attempt_id(),
+            str(decision_id or ""),
+        )
         self._add_system_guidance(text, priority=priority)
+
+    def _state_gate_observation_now(self, text: str, *, priority: int) -> None:
+        """State the word in THIS window, and carry nothing forward.
+
+        For a branch that speaks and then declines to route: no window reset
+        follows it, so there is nothing for a carried copy to survive — it would
+        simply wait under the still-open attempt for the next transition. That
+        is how a superseded revision ("the sealed outcome is 'unknown'") was
+        re-stated as CRITICAL GUIDANCE inside the phase that followed the sealed
+        `success` which replaced it.
+        """
+        self._pending_gate_observation = None
+        self._add_system_guidance(text, priority=priority)
+
+    def _pending_window_observation(self) -> tuple[str, int] | None:
+        """The carried word, if it still describes what the record last sealed.
+
+        Claiming it clears it: a word that does not survive this test is spent,
+        not deferred to some later transition.
+        """
+        parked = getattr(self, "_pending_gate_observation", None)
+        self._pending_gate_observation = None
+        if parked is None:
+            return None
+        text, priority, attempt_id, decision_id = parked
+        if attempt_id != self._current_attempt_id():
+            return None
+        if decision_id != getattr(self, "_last_sealed_decision_id", None):
+            return None
+        return (text, priority)
 
     def _repair_tool_affordances(self) -> tuple[ToolSemanticAffordance, ...]:
         """Project-action capabilities, without params, examples, or ordering."""
@@ -4605,7 +4664,7 @@ class ReActEngine(UIEventEmitter):
             "validated_facts": compact_control_value(dict(gate.validated_facts or {})),
             "evidence_refs": sorted(set(gate.evidence_refs)),
         }
-        subject_id = "gate-" + canonical_sha256(subject_material)[:16]
+        subject_id = GATE_ASSESSMENT_SUBJECT_PREFIX + canonical_sha256(subject_material)[:16]
         return ControlAssessment(
             event_or_intent_id=subject_id,
             stage="gate",

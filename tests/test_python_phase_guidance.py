@@ -116,7 +116,7 @@ def test_test_intro_carries_pytest_objective():
     intro = _engine_at(3, _python_env())._phase_intro_step().content
     assert "terminal Python runner evidence" in intro
     assert "executed, passed, failed, error, and skipped counts" in intro
-    assert "Partial pass above threshold is a valid outcome" in intro
+    assert "red tests are project facts to report, not a repair duty" in intro
     assert "build(action=" not in intro
     assert "Recommended Tests" not in intro
 
@@ -411,7 +411,7 @@ def test_live_python_test_intro_carries_pytest_objective():
     intro = _engine_at(3, env)._phase_intro_step().content
     assert "terminal Python runner evidence" in intro
     assert "build(action=" not in intro
-    assert "Partial pass above threshold is a valid" in intro
+    assert "red tests are project facts to report, not a repair duty" in intro
     # pytest runs AT the build root by construction — the split-root call-out
     # (test_root == build_root) must not render a test coordinates line.
     assert "not in the build module" not in intro

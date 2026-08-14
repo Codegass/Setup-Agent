@@ -222,7 +222,14 @@ def test_a_run_wide_receipt_makes_the_unavailable_close_unconstructible():
 def test_the_sealed_receipt_count_is_counted_not_a_literal_zero():
     """``phase_tool`` sealed ``test_execution_receipts: 0`` as a constant; in
     freemarker a terminal ``action=test`` receipt with 158 report claims
-    existed while that zero was written into the record."""
+    existed while that zero was written into the record.
+
+    The name now carries the scope. The counted fact is RUN-WIDE while the
+    requirement that produced the rejection is candidate-bound, and one number
+    labelled for neither question reads as the answer to the code beside it:
+    ``TEST_ATTEMPT_REQUIRED`` ("no terminal test receipt") next to ``1``. Both
+    scopes are sealed, each under a name that says which question it answers.
+    """
     state = _ready_state()
     # An auxiliary-island receipt: run-wide real, candidate-bound absent, so the
     # requirement still fires and the sealed count must still be honest.
@@ -243,7 +250,9 @@ def test_the_sealed_receipt_count_is_counted_not_a_literal_zero():
     result = tool.execute(action="done", outcome="failed")
 
     assert result.error_code == "TEST_ATTEMPT_REQUIRED"
-    assert result.facts["test_execution_receipts"] == 1
+    assert result.facts["run_wide_test_receipts"] == 1
+    assert result.facts["candidate_bound_test_receipts"] == 0
+    assert "test_execution_receipts" not in result.facts
 
 
 # ---------------------------------------------------------------------------

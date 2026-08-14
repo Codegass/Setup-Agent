@@ -189,6 +189,46 @@ def test_a_superseding_grading_names_the_one_it_replaces():
     assert sealed.to_metadata()["supersedes"] == delivered.decision_id
 
 
+def test_an_assessment_subject_is_not_mistakable_for_a_decision(tmp_path):
+    """Two identity namespaces shared one `gate-` prefix.
+
+    `decision_id` names a grading; the repair-assessment subject names the
+    thing an assessment is ABOUT. Only their digest lengths told them apart, so
+    any reader — or any future fence keyed on the prefix — read one as the
+    other. Now the prefixes are disjoint in both directions, and replay derives
+    the same subject the live mint does.
+    """
+    from sag.agent.phase_gates import GATE_ASSESSMENT_SUBJECT_PREFIX, GATE_DECISION_ID_PREFIX
+    from sag.agent.replay import _repair_assessment_id_for_gate
+
+    assert not GATE_ASSESSMENT_SUBJECT_PREFIX.startswith(GATE_DECISION_ID_PREFIX)
+    assert not GATE_DECISION_ID_PREFIX.startswith(GATE_ASSESSMENT_SUBJECT_PREFIX)
+
+    engine = _engine(tmp_path)
+    claim = _claim(PhaseOutcome.FAILED)
+    gate = _gate(
+        PhaseOutcome.FAILED,
+        claim=claim,
+        accepted=False,
+        reason="the build did not compile",
+        code="build_red",
+    )
+    assessment = engine._gate_control_assessment(claim, gate)
+
+    assert gate.decision_id.startswith(GATE_DECISION_ID_PREFIX)
+    assert assessment.subject_id.startswith(GATE_ASSESSMENT_SUBJECT_PREFIX)
+    assert not assessment.subject_id.startswith(GATE_DECISION_ID_PREFIX)
+
+    event = engine._emit_control_gate(claim, gate)
+    assert (
+        _repair_assessment_id_for_gate(
+            event.payload,
+            phase_attempt_id=engine.phase_machine.current_attempt_id,
+        )
+        == assessment.assessment_id
+    )
+
+
 def test_a_gate_with_nothing_to_supersede_stays_absent_in_the_record():
     body = _gate(PhaseOutcome.FAILED).to_metadata()
 
@@ -390,6 +430,58 @@ def test_a_retry_of_the_same_claim_is_a_second_grading_not_a_persist_failure(tmp
 
     assert getattr(engine, "_fatal_harness_control_failure", None) is None
     assert _last(tmp_path, "gate_decision").payload["decision_id"] == prepared.gate.decision_id
+
+
+def test_a_declining_branch_states_the_revision_now_and_parks_nothing(tmp_path):
+    """The cap speaks in the window the rejection lands in.
+
+    `_deliver_gate_observation` also PARKS its text so a window reset cannot
+    swallow it — but the cap branch routes no phase decision at all, so nothing
+    resets and the parked copy has no window of its own to reach. Left there it
+    waits for the next transition, which is how a superseded `unknown` was
+    re-stated as CRITICAL GUIDANCE inside the phase that followed a sealed
+    `success`.
+    """
+    engine = _engine(tmp_path, start_phase="test")
+    claim = _claim(PhaseOutcome.SUCCESS, phase="test")
+    delivered = _gate(PhaseOutcome.SUCCESS, claim=claim, code="test_execution_observed")
+    capped = _gate(
+        PhaseOutcome.UNKNOWN,
+        claim=claim,
+        accepted=False,
+        reason="test coordinates remained unavailable after the one bounded survey refresh",
+        code="test_candidate_resolution_unavailable",
+    )
+    engine._cap_unresolved_test_gate = lambda claim_, gate_: capped
+
+    engine._handle_phase_signals([_terminal_step(claim, delivered)])
+
+    revision = _last(tmp_path, "gate_outcome_revised").payload["observation_text"]
+    assert any(revision in message for message in _guidance(engine))
+    assert engine._pending_window_observation() is None
+
+
+def test_a_superseded_word_cannot_be_re_stated_in_the_window_that_follows(tmp_path):
+    """A parked word survives the reset only while it is still what the record
+    says. The park names its decision, so a later grading of the same attempt
+    retires it instead of letting it speak after it was replaced."""
+    engine = _engine(tmp_path, start_phase="test")
+    claim = _claim(PhaseOutcome.SUCCESS, phase="test")
+    first = _gate(PhaseOutcome.FAILED, claim=claim, code="tests_not_executed")
+    engine._seal_engine_gate(claim, first)
+    assert engine._pending_window_observation() is not None
+
+    engine._seal_engine_gate(claim, first)
+    later = _gate(
+        PhaseOutcome.SUCCESS,
+        claim=claim,
+        code="test_execution_observed",
+        reason="executed 12 of 12 discovered · 12 passed, 0 failed, 0 skipped",
+    ).superseding(first)
+    engine._emit_gate_outcome_revised(claim, first, later)
+    engine._emit_control_gate(claim, later)
+
+    assert engine._pending_window_observation() is None
 
 
 def test_the_record_names_the_claim_by_the_key_the_live_registry_used(tmp_path):

@@ -171,6 +171,14 @@ ANALYSIS_FACTS_RECOVERY_CODES = frozenset({"analysis_trunk_missing", "analysis_f
 GATE_DECISION_ID_PREFIX = "gate-"
 _GATE_DECISION_ID_CHARS = 32
 
+# A repair assessment's SUBJECT is the gate it was made about, not the grading
+# itself — a different namespace, and it shared the `gate-` prefix with
+# `decision_id`. Only their digest lengths kept them apart, so a reader (or any
+# fence keyed on the prefix) could not tell a decision from a thing assessed.
+# Deliberately not `gate-`-prefixed: telling them apart must not require
+# counting characters.
+GATE_ASSESSMENT_SUBJECT_PREFIX = "gate_assessment-"
+
 
 def _gate_identity(fields: Mapping[str, Any]) -> str:
     """Name one grading by what it says, never by when it was constructed.
@@ -234,6 +242,13 @@ class GateResult:
         object.__setattr__(self, "blocker_owner", blocker_owner)
         if validated_outcome is not _VALIDATED_OUTCOMES[validator_state]:
             raise ValueError("validated outcome must match the validator state")
+        # Spec §2.3, at the ONE place every producer passes through: an
+        # upgrading word may not arrive wearing a sentence that says the
+        # evidence fell short. `_GradedDecision` held this for `_inspect_test`
+        # alone while the four engine closes hand-write their reasons and the
+        # build gate assembles its own — so ignite's pairing stayed
+        # constructible everywhere the fence was not looking.
+        refuse_direction_contradiction(validator_state, self.reason, self.code)
         expected_accepted = claim_disposition is not ClaimDisposition.CONTRADICTED
         if self.accepted is not expected_accepted:
             raise ValueError("gate acceptance conflicts with the claim disposition")
@@ -579,15 +594,31 @@ def settlement_capped_outcome(
 
 
 def reason_asserts_deficiency(reason: str) -> bool:
-    """Does this sentence claim something was below, insufficient or missing?
+    """Does this sentence GRADE the evidence below, insufficient or missing?
 
-    Spec §2.3's deficiency classes, verbatim. Prose is checked ONLY to refuse a
-    contradiction, never to decide one: the decision below renders its own
-    sentence, so this predicate can only fire on a programming error inside it.
+    Spec §2.3's deficiency classes, as :data:`DEFICIENCY_MARKERS` states them —
+    predicates, not bare words, so an inventory clause naming what remains and a
+    sentence naming a repaired absence both read as the facts they are. Prose is
+    checked ONLY to refuse a contradiction, never to decide one: every green
+    decision renders its own sentence, so this predicate can fire only on a
+    programming error inside one of them.
     """
 
     lowered = str(reason or "").lower()
     return any(marker in lowered for marker in DEFICIENCY_MARKERS)
+
+
+def refuse_direction_contradiction(
+    state: ValidatorState | str,
+    reason: str,
+    code: str = "",
+) -> None:
+    """Refuse a grading whose sentence points away from its own word (§2.3)."""
+
+    if ValidatorState(state) is not ValidatorState.GREEN:
+        return
+    if reason_asserts_deficiency(reason):
+        raise ValueError(f"a green decision cannot state a deficiency: {code!r} / {reason!r}")
 
 
 @dataclass(frozen=True)
@@ -597,8 +628,11 @@ class _GradedDecision:
     ignite (spec §2) sealed `validator_state: "green"` beside *"Tests below the
     80% pass threshold: 29/37 (78.4%)"* because the upgrade branch chose a state
     and a code while the reason kept whatever an earlier branch had assembled.
-    Producing all three here — and refusing the pairs that point in opposite
-    directions — makes that shape unconstructible rather than merely unrendered.
+    Producing all three here is the load-bearing guarantee; the refusals are the
+    construction-time backstop. The green half now lives in
+    :class:`GateResult` — a property of the RESULT, so no producer is outside it
+    — and this class keeps the half that is about the render: the affirming
+    sentence belongs to the branch that earned it.
     """
 
     state: ValidatorState
@@ -606,12 +640,10 @@ class _GradedDecision:
     reason: str
 
     def __post_init__(self) -> None:
-        green = self.state is ValidatorState.GREEN
-        if green and reason_asserts_deficiency(self.reason):
-            raise ValueError(
-                f"a green decision cannot state a deficiency: {self.code!r} / {self.reason!r}"
-            )
-        if not green and self.reason.startswith(EXECUTION_SENTENCE_PREFIX):
+        refuse_direction_contradiction(self.state, self.reason, self.code)
+        if self.state is not ValidatorState.GREEN and self.reason.startswith(
+            EXECUTION_SENTENCE_PREFIX
+        ):
             raise ValueError(
                 "only a green decision states the execution sentence: "
                 f"{self.code!r} / {self.reason!r}"
@@ -646,6 +678,13 @@ class _ValidatorObservation:
     validated_facts: Mapping[str, Any] = field(default_factory=dict)
     control_disposition: GateControlDisposition = GateControlDisposition.TERMINAL_CLAIMABLE
     blocker_owner: BlockerOwner = BlockerOwner.NONE
+
+    def __post_init__(self) -> None:
+        # The same §2.3 refusal the gate result makes, made where the physical
+        # probes are wrapped: a contradiction assembled from validator prose
+        # degrades to `validator_unavailable` (fail closed, harness-visible)
+        # instead of escaping the gate call as an unhandled error.
+        refuse_direction_contradiction(self.state, self.reason, self.code)
 
 
 @dataclass(frozen=True)
@@ -2124,11 +2163,17 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
     # Every branch below states its own three fields together (spec §2.3). The
     # overriding branches used to keep the validator's sentence, so a RED
     # "collection failed" could arrive narrating a completed execution.
+    #
+    # The branches DRAFT that triple; the one `_GradedDecision` is built at the
+    # end, from the triple that is actually sealed. Grading a draft here failed
+    # the whole gate to `validator_unavailable` over a sentence the very next
+    # branch throws away — a refusal aimed at a statement no reader would ever
+    # have seen (review 2026-08-14).
     if errors == total and total > 0:
-        decision = _GradedDecision(
-            state=ValidatorState.RED,
-            code="test_collection_failed",
-            reason=(
+        state, code, reason = (
+            ValidatorState.RED,
+            "test_collection_failed",
+            (
                 f"every executed test errored: {errors:,} of {total:,} — "
                 "the suite produced no test outcome"
             ),
@@ -2139,10 +2184,10 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
         # it is that decision's render of the same physical fact, not a second
         # opinion, so consuming it keeps the cause rather than generalizing it
         # away. The rendered sentence is the floor when it said nothing.
-        decision = _GradedDecision(
-            state=ValidatorState.RED,
-            code="tests_not_executed",
-            reason=str(status.get("reason") or "").strip() or no_execution_sentence(discovered),
+        state, code, reason = (
+            ValidatorState.RED,
+            "tests_not_executed",
+            str(status.get("reason") or "").strip() or no_execution_sentence(discovered),
         )
     else:
         observed = _state_from_evidence_status(
@@ -2155,8 +2200,7 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
                 observed_reason = f"{observed_reason}: {detail}"
         else:
             observed_reason = status.get("reason") or "test validator returned no conclusion"
-        decision = _GradedDecision(observed, f"test_{observed.value}", observed_reason)
-    state, code, reason = decision.state, decision.code, decision.reason
+        state, code, reason = observed, f"test_{observed.value}", observed_reason
     suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
@@ -2198,13 +2242,11 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             for conflict in derived.conflicts
         )
         if evidence_integrity_failure:
-            decision = _GradedDecision(
-                state=ValidatorState.UNAVAILABLE,
-                code="test_evidence_ledger_unavailable",
-                reason="test evidence ledger integrity is unavailable: "
-                + ", ".join(derived.conflicts),
+            state, code, reason = (
+                ValidatorState.UNAVAILABLE,
+                "test_evidence_ledger_unavailable",
+                "test evidence ledger integrity is unavailable: " + ", ".join(derived.conflicts),
             )
-            state, code, reason = decision.state, decision.code, decision.reason
         receipt_scoped = rollup.get("receipt_scoped") is True
         if executed > 0 and not receipt_scoped and not evidence_integrity_failure:
             # Universal claim scoping (2026-08-14) made this key constant for
@@ -2216,15 +2258,14 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             # compact parser could not run). Unpartitioned counts stay visible
             # as facts and still may not close the phase.
             evidence_integrity_failure = True
-            decision = _GradedDecision(
-                state=ValidatorState.UNAVAILABLE,
-                code="test_receipt_missing",
-                reason=(
+            state, code, reason = (
+                ValidatorState.UNAVAILABLE,
+                "test_receipt_missing",
+                (
                     "test execution counts did not come from the receipt-claim partition; "
                     "unattributable reports cannot close the test phase"
                 ),
             )
-            state, code, reason = decision.state, decision.code, decision.reason
         elif executed > 0 and receipt_scoped and not evidence_integrity_failure:
             # Rate-banded verdict §4/§5: the phase grades execution. Project
             # failures and errors remain exact sealed facts, but they never
@@ -2237,12 +2278,14 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             suggestions = ()
     else:
         evidence_integrity_failure = False
+    # THE decision — the only one graded, and the only one that leaves here.
+    decision = _GradedDecision(state=state, code=code, reason=reason)
     return _ValidatorObservation(
-        state,
-        reason=reason,
+        decision.state,
+        reason=decision.reason,
         evidence_refs=_status_refs(status),
         suggestions=suggestions,
-        code=code,
+        code=decision.code,
         validated_facts={"test.stats": rollup} if rollup is not None else {},
         control_disposition=(
             GateControlDisposition.HARNESS_RECOVERY_REQUIRED

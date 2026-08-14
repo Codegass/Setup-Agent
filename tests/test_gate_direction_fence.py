@@ -16,10 +16,12 @@ import pytest
 
 from sag.agent.phase_gates import (
     ClaimDisposition,
+    GateResult,
     ValidatorState,
     _GradedDecision,
     check_phase_claim,
     reason_asserts_deficiency,
+    validate_phase_claim,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.config.settings import Config
@@ -157,13 +159,36 @@ def test_a_non_green_decision_refuses_the_execution_sentence():
 
 
 def test_a_contradictory_validator_word_fails_closed_instead_of_going_green():
-    """Even fed ignite's sealed pairing, no path reaches a green close.
+    """Fed ignite's sealed pairing where nothing later re-renders it, no path
+    reaches a green close.
 
-    The gate degrades to UNAVAILABLE — a harness-visible refusal to grade — and
-    never launders the contradiction into `success`. Fail closed, not fail quiet.
+    The pairing checked is the one the gate would SEAL: this status executed
+    nothing, so no counts branch replaces the validator's sentence and the
+    contradiction is the decision. The gate degrades to UNAVAILABLE — a
+    harness-visible refusal to grade — and never launders it into `success`.
+    Fail closed, not fail quiet.
     """
     status = _ignite_status()
-    status["reason"] = IGNITE_SEALED_REASON
+    status.update(
+        {
+            "reason": IGNITE_SEALED_REASON,
+            "total_tests": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+            "unique_tests": 0,
+            "unique_passed_tests": 0,
+            "unique_failed_tests": 0,
+            "static_test_count": 0,
+            "test_stats": {
+                "discovered": 0,
+                "executed": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+            },
+        }
+    )
 
     gate = _gate(status, PhaseOutcome.PARTIAL)
 
@@ -171,6 +196,26 @@ def test_a_contradictory_validator_word_fails_closed_instead_of_going_green():
     assert gate.validated_outcome is PhaseOutcome.UNKNOWN
     # The sentence survives as the DIAGNOSIS of the refusal, never as a grade.
     assert "deficiency" in gate.reason
+
+
+def test_a_draft_reason_the_next_branch_discards_never_degrades_the_seal():
+    """The refusal grades the decision that is SEALED, not an intermediate one.
+
+    The `else` arm drafts a decision from the validator's raw sentence, and the
+    receipt-bound execution branch immediately replaces it with its own render.
+    Raising on the draft degraded the whole gate to `validator_unavailable` /
+    HARNESS_RECOVERY_REQUIRED over a sentence no reader would ever have seen —
+    a fail-closed that punished the run for prose the harness itself discarded.
+    """
+    status = _ignite_status()
+    status["reason"] = IGNITE_SEALED_REASON
+
+    gate = _gate(status, PhaseOutcome.PARTIAL)
+
+    assert gate.validator_state is ValidatorState.GREEN
+    assert gate.code == "test_execution_observed"
+    assert gate.reason == "executed 37 of 37 discovered · 29 passed, 8 failed, 0 skipped"
+    assert IGNITE_SEALED_REASON not in gate.reason
 
 
 def test_a_zero_execution_gate_keeps_the_cause_the_validator_named():
@@ -207,8 +252,85 @@ def test_a_zero_execution_gate_keeps_the_cause_the_validator_named():
 def test_the_deficiency_vocabulary_is_the_one_the_spec_names():
     assert reason_asserts_deficiency("Tests below the 80% pass threshold")
     assert reason_asserts_deficiency("insufficient test execution evidence")
-    assert reason_asserts_deficiency("no test reports found — reports missing")
+    assert reason_asserts_deficiency("no test reports found — the runner receipt is missing")
     assert not reason_asserts_deficiency("executed 37 of 37 discovered · 29 passed, 8 failed")
+
+
+def test_the_lexicon_reads_a_predicate_and_not_a_noun():
+    """`missing` names a thing as often as it grades one.
+
+    bigtop's green build sealed *"The repair produced the missing local
+    artifact"* — a repaired absence, stated by the branch that fixed it. A bare
+    substring refused that sentence, which would have failed a run closed on
+    honest evidence. The class is the ASSERTION that evidence is short, so the
+    markers are anchored to the predicate form it takes.
+    """
+    assert not reason_asserts_deficiency("The repair produced the missing local artifact")
+    assert reason_asserts_deficiency("the terminal runner receipt is missing")
+    assert reason_asserts_deficiency("two expected artifacts are still missing")
+
+
+# --------------------------------------------------------------------------- #
+# §2.3 — the direction fence is a property of the RESULT, not of one producer
+# --------------------------------------------------------------------------- #
+def _green_gate(reason: str, *, code: str = "build_green") -> GateResult:
+    return GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        reason=reason,
+        code=code,
+    )
+
+
+def test_no_producer_can_pair_a_green_word_with_a_deficiency_sentence():
+    """`_GradedDecision` is local to `_inspect_test`; the ignite pairing has to
+    be unconstructible for the four engine closes and every other producer too."""
+    with pytest.raises(ValueError, match="deficiency"):
+        _green_gate(IGNITE_SEALED_REASON, code="test_execution_observed")
+
+
+def test_the_hand_written_close_funnel_refuses_the_ignite_pairing():
+    """The engine closes reach `validate_phase_claim` with hand-written prose."""
+    with pytest.raises(ValueError, match="deficiency"):
+        validate_phase_claim(
+            PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.PARTIAL),
+            ValidatorState.GREEN,
+            reason=IGNITE_SEALED_REASON,
+            code="test_execution_observed",
+        )
+
+
+def test_a_capped_gate_may_still_state_the_deficiency_it_capped_on():
+    """The refusal is about DIRECTION, not about vocabulary: a non-green word
+    stating a shortfall is exactly what an honest gate does."""
+    gate = validate_phase_claim(
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.PARTIAL),
+        ValidatorState.PARTIAL,
+        reason="two expected artifacts are still missing",
+        code="build_partial",
+    )
+
+    assert gate.validated_outcome is PhaseOutcome.PARTIAL
+    assert gate.reason == "two expected artifacts are still missing"
+
+
+def test_a_green_build_reason_keeps_its_inventory_clause():
+    """`_inspect_build` appends a coverage checklist to a GREEN reason. Naming
+    what has no output yet is an inventory of work, not a grade of the evidence
+    — the line exists precisely so an accepted phase still says what remains."""
+    checklist = _green_gate(
+        "artifacts present under the project root · Module coverage: 3/5 built "
+        "[core, api, tools] · no output yet: [examples, docs]"
+    )
+    islands = _green_gate(
+        "artifacts present under the project root · Recommended islands: 1/2 built "
+        "· remaining: gradle 'build' in /workspace/demo/native"
+    )
+
+    assert "no output yet" in checklist.reason
+    assert "remaining:" in islands.reason
 
 
 # --------------------------------------------------------------------------- #
@@ -242,6 +364,71 @@ def test_execution_sentence_states_counts_and_never_a_rate():
         execution_sentence(executed=214, discovered=None, passed=206, failed=3, skipped=5)
         == "executed 214 of an undetermined discovery · 206 passed, 3 failed, 5 skipped"
     )
+
+
+def test_the_phase_objectives_teach_no_threshold_the_harness_does_not_have():
+    """The most model-visible surviving pass-rate site (§2 acceptance).
+
+    Both TEST objectives read *"Partial pass above threshold is a valid outcome
+    when reported honestly"* for four commits after the threshold left the
+    chain: the model planned and claimed against a policy nothing in the
+    harness enforces. The literal-token grep below walked past it because
+    "pass threshold" never appears — so the model-facing surfaces ban the bare
+    word.
+    """
+    from sag.agent.react_engine import (
+        KICKOFF_PHASE_OBJECTIVES,
+        PHASE_OBJECTIVES,
+        PYTHON_PHASE_OBJECTIVES,
+    )
+
+    for name, objectives in (
+        ("PHASE_OBJECTIVES", PHASE_OBJECTIVES),
+        ("PYTHON_PHASE_OBJECTIVES", PYTHON_PHASE_OBJECTIVES),
+        ("KICKOFF_PHASE_OBJECTIVES", KICKOFF_PHASE_OBJECTIVES),
+    ):
+        for phase, text in objectives.items():
+            assert "threshold" not in text.lower(), f"{name}[{phase!r}]"
+            assert "%" not in text, f"{name}[{phase!r}]"
+
+    for objectives in (PHASE_OBJECTIVES, PYTHON_PHASE_OBJECTIVES):
+        objective = objectives["test"]
+        # What replaced it: execution honesty, and red as a fact to report.
+        assert "discovered" in objective
+        assert "repair" in objective
+
+
+def test_the_operator_log_states_a_band_and_not_an_invented_cut_off():
+    """§2's vocabulary retirement reaches the attention lines too: the INFO row
+    still cut modules at an invented 80%, the one number v4 replaced with the
+    shared band table."""
+    from sag.tools.report_tool import ReportTool
+
+    snapshot = {
+        "phases": {"build": True, "test": True},
+        "status": {"tests_total": 120, "pass_pct": 95.0},
+        "test_history": {"ignored_lines": 0},
+        "flags": {},
+        "per_module": {
+            "core": {"total": 100, "passed": 99, "pass_pct": 99.0},
+            "api": {"total": 20, "passed": 15, "pass_pct": 75.0},
+            "tools": {"total": 20, "passed": 4, "pass_pct": 20.0},
+            "docs": {"total": 0, "passed": 0, "pass_pct": None},
+        },
+    }
+
+    items = ReportTool._evaluate_attention_flags(ReportTool.__new__(ReportTool), snapshot)
+    messages = [item["message"] for item in items]
+
+    assert not [message for message in messages if "80%" in message]
+    banded = [message for message in messages if "tools" in message]
+    assert banded, messages
+    assert "few" in banded[0]
+    # A module that ran nothing has no fraction to band; it is not a low score.
+    assert "docs" not in banded[0]
+    assert "core" not in banded[0]
+    # The boundary is the band table's, not an invented one: 15/20 is `most`.
+    assert "api" not in banded[0]
 
 
 def test_zero_execution_reads_as_zero_execution_not_as_a_failed_percentage():
