@@ -23,8 +23,12 @@ def test_combine_ignores_none_and_unknown():
 
 
 def test_run_verdict_conflicts_cap_at_partial():
+    # The exemplar was `test_report_parse_error` until the 2026-08-14 spec's
+    # item 12: a report the harness cannot read can always be deleted, and
+    # deleting it lifted the word, so it is disclosed rather than graded. An
+    # unreadable RECEIPT takes the headline's authority with it.
     v = run_verdict(machine_outcome="success", physical_verdict="success",
-                    conflicts=["test_report_parse_error"])
+                    conflicts=["test_receipt_unreadable"])
     assert v == "partial"
 
 
@@ -39,7 +43,7 @@ def test_run_verdict_ignores_conflicts_that_only_restate_counted_red():
 
 def test_run_verdict_genuine_uncertainty_still_caps_alongside_adjudicated():
     assert run_verdict("success", "success",
-                       ["test_failures_detected", "test_report_parse_error"]) == "partial"
+                       ["test_failures_detected", "test_receipt_unreadable"]) == "partial"
 
 
 def test_run_verdict_machine_failure_dominates():

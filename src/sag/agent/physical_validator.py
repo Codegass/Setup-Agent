@@ -536,6 +536,7 @@ for groovy in root.rglob("src/test/groovy/**/*.groovy"):
         groovy_classes.add(groovy.stem)
 
 parsing_errors = []
+unmeasured_files = []
 metrics_conflicts = set()
 
 
@@ -543,11 +544,14 @@ def parse_report(report_file, errors=None):
     """Return canonical cases, suite-only counts, and explicit attempt metadata.
 
     `errors` is the channel an unreadable report is reported through. It
-    defaults to `parsing_errors`, which is the CAPPING channel: a receipt
-    claimed those bytes, so a broken claimed report is a conflict between the
-    run's own statements. Excluded (auxiliary/stale) files pass their own list
-    instead — nobody claimed them, so their unreadability is disclosed with the
-    rest of the excluded volume and grades nothing.
+    defaults to `parsing_errors`, the ATTRIBUTED channel: a receipt claimed
+    those bytes, so the operator is told which claimed report the harness could
+    not open. Excluded (auxiliary/stale) files pass their own list instead, so
+    each destination's unreadable files are counted where they belong.
+
+    No channel GRADES: an unreadable report has no measured volume to defend,
+    and it can always be deleted (a claimed report that is gone attributes
+    nothing and says nothing), so capping on one only ever paid a run for `rm`.
     """
     sink = parsing_errors if errors is None else errors
     try:
@@ -680,6 +684,11 @@ collection_messages_total = {}
 for report_file in report_files:
     parsed = parse_report(report_file)
     if parsed is None:
+        # The THIRD door out of the headline: a receipt claims these exact
+        # bytes and the parser cannot open them. Not auxiliary (someone
+        # claimed it), not stale (the claim still matches), and not volume
+        # (nothing was measured) — so it is counted and pathed on its own.
+        unmeasured_files.append(report_file)
         continue
     collection_errors_total += parsed["collection_errors"]
     collection_errors_skipped_total += parsed["collection_errors_skipped"]
@@ -757,12 +766,12 @@ for key in latest:
 # drops its executions out of every sentence, and a rewritten report then reads
 # exactly like a report that never existed.
 #
-# Their parse failures leave through their own door too. Sharing
-# `parsing_errors` minted `test_report_parse_error` — the CAPPING conflict
-# reserved for evidence the harness could not read — for a stray XML no receipt
-# vouches for, so an UNPARSEABLE unclaimed report capped a run that a PARSEABLE
-# one did not, and deleting the corrupt file improved the word. The count of
-# what could not be read rides with the volume it belongs to and grades nobody.
+# Their parse failures are counted at their own door too. Sharing
+# `parsing_errors` merged them into the attributed message list, so a stray XML
+# no receipt vouches for was reported as a claimed report the run could not
+# read. The count of what could not be read rides with the volume it belongs
+# to, so every destination can say WHICH zero it is. No door grades: capping on
+# an unreadable report only ever paid a run for deleting it (item 12).
 def excluded_counts(files):
     counts = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
     unreadable = []
@@ -845,6 +854,12 @@ if auxiliary_files:
 if stale_files:
     result["stale_test_reports"] = stale_files[:200]
     result["stale_test_stats"] = excluded_stats(stale_counts)
+if unmeasured_files:
+    # Attributed but unmeasured. The only fact here is HOW MANY claimed reports
+    # could not be read: there is no executed/passed/... to state, and stating
+    # zeros would be a measured outcome for bytes nobody measured.
+    result["unmeasured_test_reports"] = unmeasured_files[:200]
+    result["unmeasured_test_stats"] = {"unparseable": len(unmeasured_files)}
 print(json.dumps(result, separators=(",", ":")))
 '''
 
@@ -5568,6 +5583,8 @@ class PhysicalValidator:
             "auxiliary_report_files",
             "stale_test_reports",
             "stale_test_stats",
+            "unmeasured_test_reports",
+            "unmeasured_test_stats",
             "receipt_error",
             "receipt_error_files",
         ):

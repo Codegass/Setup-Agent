@@ -8,7 +8,7 @@ announced as a clean success."""
 
 from typing import Iterable, Optional
 
-from sag.verdict_rates import EXCLUDED_VOLUME_CONFLICTS
+from sag.verdict_rates import UNCOUNTED_REPORT_CONFLICTS
 
 VERDICT_ORDER = ["failed", "partial", "success"]
 _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
@@ -21,30 +21,37 @@ _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 #     verdict has already read it as execution (spec 2026-08-14 §2), so feeding
 #     it back into the conflict cap would demote every fully-executed run with
 #     any failing test to partial.
-#   * EXCLUDED_VOLUME_CONFLICTS names the volume the headline left out, by both
-#     doors: test_executions_unattributed_to_receipts (claimed by nobody) and
-#     test_reports_stale (claimed, then rewritten). Capping on EITHER inverted
-#     P4, from opposite sides. On the REPORT side: bigtop's headline 50 + 4
-#     unclaimed reports capped at partial and DELETING those four files lifted
-#     the cap. On the RECEIPT side: one corpus, one rewritten report, identical
-#     headline 25 — with the receipt that revealed the rewrite the report was
-#     STALE and capped, and DELETING that receipt made it auxiliary and sealed
-#     success. Both are "removing evidence improved the verdict" (2026-07-29
+#   * UNCOUNTED_REPORT_CONFLICTS names every report fact the headline did not
+#     count, by all three doors: test_executions_unattributed_to_receipts
+#     (claimed by nobody), test_reports_stale (claimed, then rewritten) and
+#     test_report_parse_error (could not be read at all). Capping on ANY of
+#     them inverted P4, and each inversion was demonstrated on one corpus with
+#     an identical headline:
+#       - REPORT axis: bigtop's headline 50 + 4 unclaimed reports capped at
+#         partial and DELETING those four files lifted the cap; likewise `rm`
+#         on one corrupt report — claimed or unclaimed — lifted partial to
+#         success while every counted execution stayed put.
+#       - RECEIPT axis: headline 25, one rewritten report — with the receipt
+#         that revealed the rewrite it was STALE and capped, without it the same
+#         bytes were auxiliary and sealed success; the same for a corrupt
+#         report, capping only while a receipt claimed it.
+#     All of them are "removing evidence improved the verdict" (2026-07-29
 #     evidence-lifecycle spec, P4).
-#     The headline band derives from attributed counts alone, so excluded
-#     volume has no second claim on the verdict to make; and the cap defended
-#     nothing it was reached for — a run that wants the volume uncapped need
-#     only dispatch through a non-receipting tool from the start, so the cap
-#     taxed the run that used the receipting tool first. Anti-fabrication is
-#     EXCLUSION, and exclusion is untouched: neither volume is ever counted.
-#     Both stay named, pathed, counted and spoken in the cases grain
-#     (spec 2026-08-14 amendment items 4 and 7).
+#     The headline band derives from attributed counts alone, so a report the
+#     headline never counted has no second claim on the verdict to make; and the
+#     cap defended nothing it was reached for — a run that wants the volume
+#     uncapped need only dispatch through a non-receipting tool from the start,
+#     so the cap taxed the run that used the receipting tool first.
+#     Anti-fabrication is EXCLUSION, and exclusion is untouched: none of these
+#     volumes is ever counted. All three stay named, pathed, counted and spoken
+#     in the cases grain (spec 2026-08-14 amendment items 4, 7 and 12).
 #
-# The cap stays reserved for genuine uncertainty about the evidence itself —
-# bytes the harness could not READ (e.g. test_report_parse_error), never bytes
-# it read, measured and deliberately left out of the numerator.
+# The cap stays where deletion cannot buy it: an evidence-CLOSURE failure whose
+# removal takes the headline's authority with it (test_receipt_unreadable —
+# without the ledger nothing is attributed and the headline is 0), never a
+# report file a run can delete without changing a single execution it ran.
 ADJUDICATED_CONFLICTS = frozenset(
-    {"test_failures_detected", "test_errors_detected", *EXCLUDED_VOLUME_CONFLICTS}
+    {"test_failures_detected", "test_errors_detected", *UNCOUNTED_REPORT_CONFLICTS}
 )
 
 

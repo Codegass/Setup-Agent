@@ -33,6 +33,7 @@ exactly the state with no candidates), and ``phase_tool`` stamped
 """
 
 import contextlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -552,9 +553,11 @@ def test_the_unattributed_conflict_is_adjudicated_not_capping():
     assert UNATTRIBUTED_CONFLICT in ADJUDICATED_CONFLICTS
     assert run_verdict("success", "success", (UNATTRIBUTED_CONFLICT,)) == "success"
     # It is still an honest-uncertainty conflict for every other reader, and a
-    # genuine evidence conflict standing beside it still caps.
-    beside_a_parse_error = (UNATTRIBUTED_CONFLICT, "test_report_parse_error")
-    assert run_verdict("success", "success", beside_a_parse_error) == "partial"
+    # genuine evidence conflict standing beside it still caps. (The exemplar
+    # was `test_report_parse_error` until item 12 showed a report nobody could
+    # read can always be deleted; an unreadable RECEIPT cannot be traded away.)
+    beside_an_unreadable_receipt = (UNATTRIBUTED_CONFLICT, "test_receipt_unreadable")
+    assert run_verdict("success", "success", beside_an_unreadable_receipt) == "partial"
 
 
 # ---------------------------------------------------------------------------
@@ -760,10 +763,13 @@ def test_the_stale_conflict_is_adjudicated_not_capping():
     assert EXCLUDED_VOLUME_CONFLICTS <= ADJUDICATED_CONFLICTS
     assert run_verdict("success", "success", (STALE_CONFLICT,)) == "success"
     assert run_verdict("success", "success", EXCLUDED_VOLUME_CONFLICTS) == "success"
-    # Uncertainty about evidence the harness could not READ still caps, beside
-    # either door: excluded volume is measured, a parse error is not.
+    # An evidence-CLOSURE failure still caps beside either door. This assertion
+    # named `test_report_parse_error` until item 12: a report the harness could
+    # not read can be deleted, and deleting it lifted the word, so it grades
+    # nothing either. An unreadable RECEIPT takes the whole headline's
+    # authority with it and cannot be traded for a better verdict.
     assert (
-        run_verdict("success", "success", (STALE_CONFLICT, "test_report_parse_error")) == "partial"
+        run_verdict("success", "success", (STALE_CONFLICT, "test_receipt_unreadable")) == "partial"
     )
 
 
@@ -883,16 +889,16 @@ def _corrupt_shape(tmp_path, monkeypatch, *, name: str, keep_the_stray: bool = T
     return result, _validated_test_rollup(result)
 
 
-def test_an_unreadable_unclaimed_report_never_reaches_the_capping_channel(tmp_path, monkeypatch):
-    """A stray XML nobody claims is disclosed, never counted and never capping.
+def test_an_unreadable_unclaimed_report_leaves_by_its_own_door(tmp_path, monkeypatch):
+    """A stray XML nobody claims is counted where it belongs, never in the
+    attributed channel.
 
     ``excluded_counts`` parsed the auxiliary and stale files through the SAME
     ``parse_report`` that feeds ``parsing_errors``, so an unparseable report
-    outside the claim set minted ``test_report_parse_error`` — the capping
-    conflict reserved for evidence the harness could not read. A receipt
-    vouches for no byte of that file, so its unreadability is not a conflict
-    between the run's own statements: it is one more thing the run can see and
-    cannot attribute.
+    outside the claim set was reported as a claimed report the run could not
+    read (and, until item 12, capped through it). A receipt vouches for no byte
+    of that file: it is one more thing the run can see and cannot attribute, and
+    it says so at its own door.
     """
     result, rollup = _corrupt_shape(tmp_path, monkeypatch, name="stray")
 
@@ -915,7 +921,9 @@ def test_deleting_a_corrupt_stray_report_never_changes_the_word(tmp_path, monkey
 
     While an unclaimed unparseable report capped, ``rm`` on that one file
     lifted the same corpus with the same headline from ``partial`` to
-    ``success`` — 'removing evidence must never improve a verdict'.
+    ``success`` — 'removing evidence must never improve a verdict'. Item 12
+    holds the same line for the claimed door, where the file can equally be
+    deleted; this arm keeps the unclaimed one fenced.
     """
     from sag.verdict import run_verdict
 
@@ -932,16 +940,30 @@ def test_deleting_a_corrupt_stray_report_never_changes_the_word(tmp_path, monkey
     assert present_verdict == deleted_verdict == "success"
 
 
-def test_an_unreadable_claimed_report_still_caps(tmp_path, monkeypatch):
-    """The other direction, fenced: a receipt claimed those exact bytes and the
-    harness cannot read them. That is a genuine conflict between the run's own
-    statements, and it keeps today's capping semantics."""
+# ---------------------------------------------------------------------------
+# Amendment item 12 — an unreadable report is disclosed, never graded
+# ---------------------------------------------------------------------------
+def _intact_claim_corrupt_shape(
+    tmp_path,
+    monkeypatch,
+    *,
+    name: str,
+    publish_the_claim: bool = True,
+    keep_the_report: bool = True,
+):
+    """25 attributed cases plus ONE corrupt report a receipt claims by hash.
+
+    The receipt is written AFTER the corrupt bytes, so its claim MATCHES them:
+    the file is attributed, not stale. ``publish_the_claim`` decides whether
+    that receipt exists at all; ``keep_the_report`` decides whether the corrupt
+    file does. Nothing else differs between the arms, and the headline is 25 in
+    every one of them.
+    """
     from test_receipt_scoped_rollup import _validator, _write
 
     from sag.agent.phase_gates import _validated_test_rollup
-    from sag.verdict import run_verdict
 
-    workspace = ReceiptWorkspace(tmp_path)
+    workspace = ReceiptWorkspace(tmp_path / name)
     kept = workspace.primary_report(
         "TEST-org.apache.bigtop.datagen.KeptTest.xml",
         "org.apache.bigtop.datagen.KeptTest",
@@ -951,17 +973,196 @@ def test_an_unreadable_claimed_report_still_caps(tmp_path, monkeypatch):
         workspace.primary_root / "target" / "surefire-reports" / "TEST-Truncated.xml",
         CORRUPT_XML,
     )
-    workspace.write_receipt(_receipt("inv-test-1-0001", workspace.primary_root, new=[kept, broken]))
+    workspace.write_receipt(_receipt("inv-test-1-0001", workspace.primary_root, new=[kept]))
+    claim = _receipt("inv-test-1-0002", workspace.primary_root, new=[broken])
+    if publish_the_claim:
+        workspace.write_receipt(claim)
+    if not keep_the_report:
+        broken.unlink()
     _bind_primary_coordinate(monkeypatch, workspace)
-    validator, _ = _validator(workspace)
+    with _own_evidence_epoch(tmp_path, name):
+        validator, _ = _validator(workspace)
+        result = validator.parse_test_reports(str(workspace.project))
+    return result, _validated_test_rollup(result)
 
-    result = validator.parse_test_reports(str(workspace.project))
-    rollup = _validated_test_rollup(result)
+
+def test_deleting_the_receipt_that_claimed_a_corrupt_report_never_changes_the_word(
+    tmp_path, monkeypatch
+):
+    """P4 on the receipt axis, through the parse-error door.
+
+    Item 8 moved EXCLUDED parse failures out of the capping channel and left
+    ATTRIBUTED ones in it, which made the cap follow the receipt: the same
+    truncated bytes capped when a receipt claimed them and did not when the
+    receipt was deleted. One corpus, headline 25 either way, one file either
+    way — ``partial`` with the claim, ``success`` without it. Deleting a
+    receipt improved the sealed word, which is the inversion items 4 and 7
+    each closed from the other side.
+    """
+    from sag.verdict import run_verdict
+
+    claimed, claimed_rollup = _intact_claim_corrupt_shape(
+        tmp_path, monkeypatch, name="claim-kept"
+    )
+    unclaimed, unclaimed_rollup = _intact_claim_corrupt_shape(
+        tmp_path, monkeypatch, name="claim-deleted", publish_the_claim=False
+    )
+
+    assert claimed["total_tests"] == unclaimed["total_tests"] == 25
+    # The door the receipt chooses is still NAMED, and still a different door.
+    assert claimed["unmeasured_test_stats"] == {"unparseable": 1}
+    assert unclaimed["auxiliary_test_stats"]["unparseable"] == 1
+    assert unclaimed.get("unmeasured_test_stats") is None
+
+    assert run_verdict("success", "success", claimed_rollup["conflicts"]) == "success"
+    assert run_verdict("success", "success", unclaimed_rollup["conflicts"]) == "success"
+
+
+def test_deleting_the_corrupt_report_a_receipt_claims_never_changes_the_word(
+    tmp_path, monkeypatch
+):
+    """P4 on the REPORT axis, inside the attributed channel.
+
+    A claimed report that is deleted leaves no trace at all — ``content_sha256``
+    returns None and the claim attributes nothing — so while an unreadable
+    claimed report capped, ``rm`` on that one file lifted the same corpus with
+    the same headline from ``partial`` to ``success``. No treatment where an
+    unreadable report caps can be monotone here: the file can always be
+    deleted. Unreadable reports are therefore disclosed and never graded.
+    """
+    from sag.verdict import run_verdict
+
+    present, present_rollup = _intact_claim_corrupt_shape(
+        tmp_path, monkeypatch, name="report-kept"
+    )
+    deleted, deleted_rollup = _intact_claim_corrupt_shape(
+        tmp_path, monkeypatch, name="report-deleted", keep_the_report=False
+    )
+
+    assert present["total_tests"] == deleted["total_tests"] == 25
+    assert deleted.get("unmeasured_test_stats") is None
+    assert "test_report_parse_error" not in deleted_rollup["conflicts"]
+
+    assert run_verdict("success", "success", present_rollup["conflicts"]) == "success"
+    assert run_verdict("success", "success", deleted_rollup["conflicts"]) == "success"
+
+
+def test_the_unreadable_report_conflict_is_adjudicated_not_capping():
+    """The kernel-level statement, beside items 4 and 7.
+
+    ``test_report_parse_error`` says one thing: a report could not be read. A
+    report that could not be read has no volume in the headline to defend and
+    can always be deleted, so grading it can only pay a run for destroying it.
+    The cap stays where deletion cannot buy it: an unreadable RECEIPT takes the
+    authority for the whole headline with it.
+    """
+    from sag.verdict import ADJUDICATED_CONFLICTS, run_verdict
+    from sag.verdict_rates import UNCOUNTED_REPORT_CONFLICTS, UNREADABLE_REPORT_CONFLICT
+
+    assert UNREADABLE_REPORT_CONFLICT == "test_report_parse_error"
+    assert UNCOUNTED_REPORT_CONFLICTS == {
+        UNATTRIBUTED_CONFLICT,
+        "test_reports_stale",
+        UNREADABLE_REPORT_CONFLICT,
+    }
+    assert UNCOUNTED_REPORT_CONFLICTS <= ADJUDICATED_CONFLICTS
+    assert run_verdict("success", "success", (UNREADABLE_REPORT_CONFLICT,)) == "success"
+    assert run_verdict("success", "success", UNCOUNTED_REPORT_CONFLICTS) == "success"
+    assert run_verdict("success", "success", ("test_receipt_unreadable",)) == "partial"
+
+
+def test_the_disclosure_names_the_reports_under_intact_claims():
+    """The third door speaks in the same sentence as the other two, in its own
+    clause: 'under receipt claims' is a claim that still matches bytes nobody
+    could read, which is neither unclaimed nor rewritten."""
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        unmeasured_test_stats={"unparseable": 2},
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert grains["cases"].payload()["reason"] == (
+        "50/100 — 2 unparseable reports under receipt claims"
+    )
+    assert "test_report_parse_error" in conflicts
+    assert UNATTRIBUTED_CONFLICT not in conflicts
+
+
+def test_all_three_doors_are_named_in_one_sentence():
+    """No door borrows another's words, and the excluded-volume clauses that
+    existed before this one are unchanged."""
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        auxiliary_test_stats={
+            "executed": 4,
+            "passed": 4,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "unparseable": 1,
+        },
+        stale_test_stats={
+            "executed": 6,
+            "passed": 6,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+        },
+        unmeasured_test_stats={"unparseable": 1},
+    )
+
+    grains, _ = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert grains["cases"].payload()["reason"] == (
+        "50/100 — 4 executions visible on disk but bound to no receipt "
+        "(1 unparseable report), 6 under rewritten claims, "
+        "1 unparseable report under receipt claims"
+    )
+
+
+def test_an_unreadable_claimed_report_is_counted_and_pathed(tmp_path, monkeypatch):
+    """The other direction: a receipt claimed those exact bytes and the harness
+    cannot read them. That is a THIRD door out of the headline, and it is
+    disclosed exactly like the other two — its own paths, its own count, its own
+    clause — rather than graded (amendment item 12)."""
+    result, rollup = _intact_claim_corrupt_shape(tmp_path, monkeypatch, name="claimed-corrupt")
 
     assert result["total_tests"] == 25
     assert len(result["parsing_errors"]) == 1
     assert "test_report_parse_error" in rollup["conflicts"]
-    assert run_verdict("success", "success", rollup["conflicts"]) == "partial"
+    # Named, pathed and counted — never a measured zero, never counted into any
+    # volume, and never merged into a door that would call it unclaimed.
+    assert [Path(item).name for item in result["unmeasured_test_reports"]] == [
+        "TEST-Truncated.xml"
+    ]
+    assert result["unmeasured_test_stats"] == {"unparseable": 1}
+    assert rollup["unmeasured_test_stats"] == {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "unparseable": 1,
+    }
+    assert result.get("auxiliary_test_stats") is None
+    assert result.get("stale_test_stats") is None
+    # …and it survives the seal, so the sentence a reader sees is the one this
+    # corpus produced: real parser, real files, real rollup, real snapshot.
+    snapshot = _sealed_snapshot(rollup, run_id="unmeasured-door")
+    assert snapshot.test_stats.unmeasured_test_stats["unparseable"] == 1
+    assert [Path(item).name for item in snapshot.test_stats.unmeasured_test_reports] == [
+        "TEST-Truncated.xml"
+    ]
+    assert snapshot.rates["test"]["cases"]["reason"] == (
+        "25 executed, static discovery found no count — 1 unparseable report under receipt claims"
+    )
 
 
 def test_an_unreadable_report_under_a_rewritten_claim_is_disclosed_not_capping(

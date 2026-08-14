@@ -19,6 +19,7 @@ from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import rescue_blocked_build, run_verdict
 from sag.verdict_rates import (
     UNATTRIBUTED_CONFLICT,
+    UNREADABLE_REPORT_CONFLICT,
     GrainRate,
     band_for,
     demote_heavy_red,
@@ -109,6 +110,13 @@ class SnapshotTestStats(BaseModel):
     auxiliary_test_stats: dict[str, int] | None = None
     stale_test_reports: list[str] | None = None
     stale_test_stats: dict[str, int] | None = None
+    # The third door: reports a receipt claims that the parser could not open.
+    # They carry no volume — only how many there were — and they are ungraded
+    # for the reason the other two are, plus one of their own: an unreadable
+    # report can be DELETED, and a claimed report that is gone attributes
+    # nothing, so capping on its presence pays a run for `rm` (item 12).
+    unmeasured_test_reports: list[str] | None = None
+    unmeasured_test_stats: dict[str, int] | None = None
     # WHERE the unattributed volume was read, so the disclosure can say it.
     # ABSENT means reports on disk — the only door that ever existed, and the
     # same absent-key convention `receipt_scoped` uses. The tool-observation
@@ -129,6 +137,8 @@ class SnapshotTestStats(BaseModel):
             "auxiliary_test_stats",
             "stale_test_reports",
             "stale_test_stats",
+            "unmeasured_test_reports",
+            "unmeasured_test_stats",
             "unattributed_source",
         ):
             if data.get(key) is None:
@@ -791,6 +801,13 @@ def _fold_test_stats(
                     [str(item) for item in validated_rollup.get("stale_test_reports") or ()] or None
                 ),
                 stale_test_stats=_excluded_counts(validated_rollup.get("stale_test_stats")),
+                unmeasured_test_reports=(
+                    [str(item) for item in validated_rollup.get("unmeasured_test_reports") or ()]
+                    or None
+                ),
+                unmeasured_test_stats=_excluded_counts(
+                    validated_rollup.get("unmeasured_test_stats")
+                ),
             ),
             conflicts,
         )
@@ -927,19 +944,22 @@ def _excluded_volume_clauses(
     *,
     unattributed_unparseable: int = 0,
     stale_unparseable: int = 0,
+    unmeasured_unparseable: int = 0,
     unattributed_source: str | None = None,
 ) -> list[str]:
-    """Name each excluded destination separately, in one shared vocabulary.
+    """Name each destination the headline did not count, in one vocabulary.
 
-    A report leaves the headline through one of two doors and they mean
+    A report leaves the headline through one of three doors and they mean
     different things: AUXILIARY is claimed by nobody, STALE was claimed and the
-    bytes were then rewritten. Only the first was ever spoken aloud, so a
+    bytes were then rewritten, UNMEASURED is claimed by a still-matching receipt
+    and could not be read. Only the first was ever spoken aloud, so a
     superseded-sha claim silently dropped its volume and a rewritten report read
-    exactly like a report that never existed. Neither is ever counted.
+    exactly like a report that never existed. None of them is ever counted.
 
-    What could not be READ at either door is named in that door's own clause,
-    so a sentence carrying both never leaves a reader guessing which unparseable
-    count belongs to which volume.
+    What could not be READ at a door is named in that door's own clause, so a
+    sentence carrying several never leaves a reader guessing which unparseable
+    count belongs to which volume. The unmeasured door speaks last and only in
+    unparseable reports: it is the one door with no volume to report.
     """
     where = (
         "reported in tool output"
@@ -964,6 +984,8 @@ def _excluded_volume_clauses(
         clauses.append(clause)
     elif stale_unparseable:
         clauses.append(f"{_unparseable_clause(stale_unparseable)} under rewritten claims")
+    if unmeasured_unparseable:
+        clauses.append(f"{_unparseable_clause(unmeasured_unparseable)} under receipt claims")
     return clauses
 
 
@@ -976,12 +998,14 @@ def test_grain_rates(
 
     unattributed = _unattributed_executions(stats)
     unattributed_unparseable = _excluded_unparseable(stats.auxiliary_test_stats)
+    unmeasured_unparseable = _excluded_unparseable(stats.unmeasured_test_stats)
     excluded = ", ".join(
         _excluded_volume_clauses(
             unattributed,
             _excluded_executions(stats.stale_test_stats),
             unattributed_unparseable=unattributed_unparseable,
             stale_unparseable=_excluded_unparseable(stats.stale_test_stats),
+            unmeasured_unparseable=unmeasured_unparseable,
             unattributed_source=stats.unattributed_source,
         )
     )
@@ -1018,6 +1042,10 @@ def test_grain_rates(
         # and is disclosed all the same — the conflict and the sentence travel
         # together, or the sentence is a fact nothing points at.
         conflicts += (UNATTRIBUTED_CONFLICT,)
+    if unmeasured_unparseable:
+        # Same rule at the claimed door: the clause and the conflict that names
+        # it travel together, so the sentence is never a fact nothing points at.
+        conflicts += (UNREADABLE_REPORT_CONFLICT,)
 
     if test_modules:
         modules = GrainRate(

@@ -846,7 +846,10 @@ def test_report_result_header_matches_kernel_verdict():
         },
         "evidence_result": {
             "status": "success",
-            "conflicts": ["test_report_parse_error"],
+            # An unsettled conflict — `test_report_parse_error` stood here
+            # until the 2026-08-14 spec's item 12 made an unreadable report a
+            # disclosure rather than a grade.
+            "conflicts": ["test_receipt_unreadable"],
             "test_stats": None,
             "evidence_refs": [],
         },
@@ -858,7 +861,7 @@ def test_report_result_header_matches_kernel_verdict():
         snapshot=snapshot,
     )
     result_lines = [l for l in lines if l.startswith("**Result:**")]
-    expected = run_verdict("success", "success", ["test_report_parse_error"])
+    expected = run_verdict("success", "success", ["test_receipt_unreadable"])
     assert expected == "partial"
     assert "PARTIAL" in result_lines[0].upper()
 
@@ -958,7 +961,7 @@ def test_condensed_log_output_matches_kernel_verdict():
         "phases": {"clone": True, "build": True, "test": True},
         "evidence_result": {
             "status": "success",
-            "conflicts": ["test_report_parse_error"],
+            "conflicts": ["test_receipt_unreadable"],
             "test_stats": None,
             "evidence_refs": [],
         },
@@ -1310,9 +1313,9 @@ def test_an_adjudicated_conflict_does_not_degrade_the_legacy_evidence_status():
     assert tool._derive_evidence_status_from_test_stats(None, sorted(ADJUDICATED_CONFLICTS)) is None
     # A conflict nobody adjudicated still degrades exactly as before.
     assert (
-        tool._derive_evidence_status_from_test_stats(nothing_ran, ["test_report_parse_error"])
+        tool._derive_evidence_status_from_test_stats(nothing_ran, ["test_receipt_unreadable"])
         == "partial"
     )
-    assert tool._derive_evidence_status_from_test_stats(None, ["test_report_parse_error"]) == (
+    assert tool._derive_evidence_status_from_test_stats(None, ["test_receipt_unreadable"]) == (
         "partial"
     )

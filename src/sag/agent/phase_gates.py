@@ -1504,6 +1504,15 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
                 # executions out of every disclosure, so a rewritten report
                 # reads exactly like a report that never existed.
                 "stale_test_stats": _excluded_report_counts(status.get("stale_test_stats")),
+                # The fourth destination — attributed, and unmeasured. A receipt
+                # claims these bytes and the parser could not open them, so
+                # there is nothing to count except HOW MANY reports that is.
+                "unmeasured_test_reports": (
+                    [str(item) for item in status.get("unmeasured_test_reports") or ()] or None
+                ),
+                "unmeasured_test_stats": _excluded_report_counts(
+                    status.get("unmeasured_test_stats")
+                ),
             }.items()
             if value is not None
         },
@@ -1511,13 +1520,13 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _excluded_report_counts(value: Any) -> dict[str, int] | None:
-    """An excluded destination's volume in the primary rollup's count shape.
+    """A destination's volume in the primary rollup's count shape.
 
-    Auxiliary (claimed by nobody) and stale (claimed, superseded) reports both
-    land here, each under its own key and never merged into one another or into
-    the headline. Present only when the validator observed that destination at
-    all; an all-zero block still counts as observed ("reports existed, no tests
-    ran").
+    Auxiliary (claimed by nobody), stale (claimed, superseded) and unmeasured
+    (claimed, unreadable) reports all land here, each under its own key and
+    never merged into one another or into the headline. Present only when the
+    validator observed that destination at all; an all-zero block still counts
+    as observed ("reports existed, no tests ran").
 
     ``unparseable`` is a count of reports whose volume could not be measured at
     all, carried so an all-zero block can say WHICH zero it is. It is not a

@@ -684,7 +684,11 @@ def test_final_verdict_uses_kernel_conflict_cap():
                 "skipped_tests": 5,
                 "test_exclusions": [],
                 "modules_without_tests": [],
-                "conflicts": ["test_report_parse_error"],
+                # `test_report_parse_error` stood here until the 2026-08-14
+                # spec's item 12 made an unreadable report a disclosure: a file
+                # nobody could read can always be deleted, and deleting it
+                # lifted the word. An unreadable RECEIPT cannot be traded away.
+                "conflicts": ["test_receipt_unreadable"],
             },
         )
     )
@@ -712,7 +716,7 @@ def test_partial_reason_for_conflict_capped_run():
                 "skipped_tests": 4,
                 "test_exclusions": [],
                 "modules_without_tests": [],
-                "conflicts": ["test_report_parse_error"],
+                "conflicts": ["test_receipt_unreadable"],
             },
         )
     )

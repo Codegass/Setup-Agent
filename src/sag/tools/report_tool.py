@@ -183,6 +183,14 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
                 ),
                 "stale_test_reports": (list(test_analysis.get("stale_test_reports") or []) or None),
                 "stale_test_stats": test_analysis.get("stale_test_stats"),
+                # The third door: claimed by a still-matching receipt and
+                # unreadable. It carries no volume, only how many reports the
+                # parser could not open, and it travels with the other two so no
+                # projection can lose the one door that has nothing to count.
+                "unmeasured_test_reports": (
+                    list(test_analysis.get("unmeasured_test_reports") or []) or None
+                ),
+                "unmeasured_test_stats": test_analysis.get("unmeasured_test_stats"),
             }.items()
             if value is not None
         },

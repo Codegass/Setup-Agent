@@ -34,15 +34,29 @@ UNBOUNDED_CONFLICT = "rate_denominator_not_a_bound"
 UNBOUNDED_REASON = "numerator exceeds denominator; this count cannot bound it"
 UNATTRIBUTED_CONFLICT = "test_executions_unattributed_to_receipts"
 STALE_CONFLICT = "test_reports_stale"
-# The two doors a report leaves the headline by, named as ONE class because the
-# verdict must grade them alike. AUXILIARY is claimed by nobody; STALE was
-# claimed and the bytes were then rewritten. Both volumes are measured, named,
-# pathed and counted — and neither is ever counted INTO the headline, which is
-# why neither has a second claim on the verdict to make. Grading them
-# differently made the door a receipt's presence chooses, so deleting a receipt
-# moved a report stale->auxiliary and lifted the word (spec 2026-08-14
-# amendment item 7). A third door added later belongs in this set.
+UNREADABLE_REPORT_CONFLICT = "test_report_parse_error"
+# The two doors a report leaves the headline by with its volume MEASURED, named
+# as ONE class because the verdict must grade them alike. AUXILIARY is claimed
+# by nobody; STALE was claimed and the bytes were then rewritten. Both volumes
+# are measured, named, pathed and counted — and neither is ever counted INTO the
+# headline, which is why neither has a second claim on the verdict to make.
+# Grading them differently made the door a receipt's presence chooses, so
+# deleting a receipt moved a report stale->auxiliary and lifted the word
+# (spec 2026-08-14 amendment item 7).
 EXCLUDED_VOLUME_CONFLICTS = frozenset({UNATTRIBUTED_CONFLICT, STALE_CONFLICT})
+# The third door: a report whose volume could not be measured AT ALL, at any
+# destination. It is not excluded volume — there is no volume — so it keeps its
+# own name; it is ungraded for a stronger reason than the other two. An
+# unreadable report can always be DELETED, and a claimed report that is deleted
+# attributes nothing and says nothing, so any treatment that caps on its
+# presence pays a run for `rm`. There is no monotone reading in which an
+# unreadable report grades anything (spec 2026-08-14 amendment item 12).
+#
+# This is the set the verdict kernel must leave alone: every report fact a run
+# can add or remove without ever changing what it EXECUTED.
+UNCOUNTED_REPORT_CONFLICTS = frozenset(
+    {*EXCLUDED_VOLUME_CONFLICTS, UNREADABLE_REPORT_CONFLICT}
+)
 
 
 # The affirming sentence's opening token. Everything that grades execution

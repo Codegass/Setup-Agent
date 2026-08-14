@@ -133,7 +133,9 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    The conflict and its disclosure sentence are otherwise unchanged: visibility
    without authority, now also without a cap. A genuine evidence conflict
    standing beside it (`test_report_parse_error`) still caps exactly as before;
-   `test_reports_stale` is settled by item 7.
+   `test_reports_stale` is settled by item 7. (That exemplar is superseded by
+   item 12 — an unreadable report grades nothing either. The conflict that
+   still caps beside this one is `test_receipt_unreadable`.)
 5. **The stale destination is disclosed.** Reports leave the headline through
    two doors and they mean different things: AUXILIARY is claimed by nobody,
    STALE was claimed and the bytes were then rewritten. Only the first was ever
@@ -188,7 +190,11 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
      is exactly this commit's rule for excluded evidence.
    The cap stays reserved for uncertainty about evidence the harness could not
    READ (`test_report_parse_error`, `test_receipt_unreadable`) — never for bytes
-   it read, measured and deliberately left out of the numerator. Consequence,
+   it read, measured and deliberately left out of the numerator. (Item 12
+   narrows this line: `test_report_parse_error` leaves the reservation, because
+   bytes nobody could read can be DELETED and a deleted claimed report says
+   nothing at all. `test_receipt_unreadable` stays — removing the ledger takes
+   the headline's authority with it.) Consequence,
    named: like the unattributed conflict, `test_reports_stale` no longer renders
    as an operator BLOCKER line (`report_tool._sealed_failure_blockers` skips adjudicated
    conflicts); the five disclosures above carry it. Fenced by
@@ -213,7 +219,10 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    statements. Both directions are fenced, and the metrics-v2 excluded buckets
    state an explicit UNMEASURED marker (not `executed: 0`) where the volume
    could not be parsed at all: zero is a count, and an unreadable report has
-   none.
+   none. (The ATTRIBUTED half of this item is RETRACTED by item 12: keeping
+   that cap left the same P4 inversion on both axes, and the "conflict between
+   the run's own statements" predicate is the one item 7 had already ruled a
+   DISCLOSURE fact for the strictly stronger stale contradiction.)
 9. **The observation fold is unattributed volume too (adjudicated).** When NO
    `test.stats` fact exists, `_fold_test_stats` falls through to the
    tool-observation fold, which sealed `result.test_stats` as the FULL headline
@@ -257,10 +266,67 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
     reader a close threads through all three (the same shape
     `attempt_policy.test_closure_survey` gave `phase_tool`), so the read happens
     at most once and still only if the close actually asks (P3).
+12. **An unreadable report is disclosed, never graded (adjudicated).** Item 8
+    closed the parse-error cap on the REPORT axis for excluded files and left it
+    armed for ATTRIBUTED ones, which made the cap follow the receipt. Both
+    inversions it left are reproduced end to end through the real parser on real
+    files — one corpus, headline 25 in every arm, one corrupt report either way:
+    - RECEIPT axis: with a receipt claiming the corrupt bytes the file is
+      `verified`, its exception lands in `parsing_errors`, mints
+      `test_report_parse_error` and seals `partial`. Delete that receipt and the
+      SAME bytes land in `auxiliary` with `unparseable: 1`, no capping conflict,
+      `success`. Deleting a receipt improved the sealed word.
+    - REPORT axis, inside the attributed channel: `rm` on that same claimed
+      corrupt file leaves NO trace at all — `content_sha256` returns None, the
+      claim attributes nothing, the scan never sees the file — so the run seals
+      `success` with every counted execution unchanged. Deleting a report
+      improved the sealed word.
+    The second arm settles the owner call, because it rules out the alternative
+    resolution (keep the cap, name the gradient): the cap is non-monotone even
+    with attribution held fixed. Generally — an unreadable report can ALWAYS be
+    deleted, and a deleted claimed report is indistinguishable from one that
+    never existed, so NO treatment in which an unreadable report caps is monotone
+    on the report axis. Capping on one can only pay a run for `rm`. Item 7's
+    second bullet applies verbatim besides: a truncated report produced through
+    `bash` sealed `success` while the identical truncated report produced through
+    the receipting tool sealed `partial`.
+    `test_report_parse_error` therefore joins `verdict.ADJUDICATED_CONFLICTS`,
+    through the named set `verdict_rates.UNCOUNTED_REPORT_CONFLICTS` =
+    `EXCLUDED_VOLUME_CONFLICTS` + `{test_report_parse_error}` — every report fact
+    a run can add or remove without changing what it EXECUTED. Item 8's
+    rationale for the attributed cap ("a receipt claimed those exact bytes, so a
+    broken claimed report is a genuine conflict between the run's own
+    statements") is retracted: it is the same predicate item 7 already ruled a
+    DISCLOSURE fact for `test_reports_stale`, where the contradiction is strictly
+    stronger (claimed hash H, bytes are now H') and does not cap.
+    The price item 7 set for un-capping is paid in full — a THIRD door out of the
+    headline, named and disclosed like the other two rather than folded into one
+    that would misdescribe it. AUXILIARY is claimed by nobody, STALE was claimed
+    and rewritten, UNMEASURED is claimed by a still-matching receipt and could not
+    be read: its own paths (`unmeasured_test_reports`), its own count
+    (`unmeasured_test_stats`, `unparseable` only — there is no volume to state and
+    zeros would be a measured outcome for bytes nobody measured), its own clause
+    in the cases grain ("1 unparseable report under receipt claims"), its own
+    conflict name, and the `parsing_errors` message naming the file. Consequence,
+    named: like the other two, `test_report_parse_error` no longer renders as an
+    operator BLOCKER line (`report_tool._sealed_failure_blockers` skips
+    adjudicated conflicts); those five disclosures carry it. The cap now stays
+    where deletion cannot buy it — an evidence-CLOSURE failure whose removal takes
+    the headline's authority with it (`test_receipt_unreadable`: with no ledger
+    nothing is attributed and the headline is 0). Every fence that used
+    `test_report_parse_error` as its "still caps" exemplar was rebased onto
+    `test_receipt_unreadable` with the reason recorded inline. Fenced by
+    `tests/test_run_wide_receipt_scope.py::
+    test_deleting_the_receipt_that_claimed_a_corrupt_report_never_changes_the_word`,
+    `::test_deleting_the_corrupt_report_a_receipt_claims_never_changes_the_word`,
+    `::test_the_unreadable_report_conflict_is_adjudicated_not_capping`,
+    `::test_an_unreadable_claimed_report_is_counted_and_pathed` (parser → rollup →
+    sealed snapshot → sentence), `::test_the_disclosure_names_the_reports_under_
+    intact_claims` and `::test_all_three_doors_are_named_in_one_sentence`.
 
 ### Deferred items (2026-08-14, named so they are not invisible)
 
-Four known gaps are accepted for now rather than silently carried:
+Six known gaps are accepted for now rather than silently carried:
 
 1. **Task #52 — `run_test_receipts` /workspace fallback bound.**
    `attempt_policy.run_test_receipts` falls back to the entire `/workspace` when
@@ -301,6 +367,25 @@ Four known gaps are accepted for now rather than silently carried:
    much; ❌ keeps the one documented boundary (`HALF_FLOOR`, the heavy-red
    rule). Recorded here because "95 and 100 render differently" reads like a
    bug to every next reader, and it is a decision.
+5. **The unmeasured door has no metrics-v2 bucket.** Item 12's third
+   destination reaches the sealed snapshot, the rates sentence and the report
+   snapshot's `test_analysis`, but `report_metrics._project_tests` still
+   publishes exactly three observation buckets (`quarantined_observations`,
+   `unattributed_observations`, `stale_observations`). A fourth is a metrics-v2
+   SCHEMA change — the required-key lists at `report_metrics.py:79/292`, the
+   `sag.web.models` read model, the renderer at `:1267` and the golden battery
+   all pin those names — and this round changed no published schema. Nothing
+   REGRESSED: the claimed bucket never stated how many of its reports were
+   unreadable, before or after. Named because item 8's own text promised the
+   excluded buckets an UNMEASURED marker, and the door added after it has none.
+6. **The shell-fallback path names its unreadable files without counting them.**
+   `parsing_errors` in the find/cat rescan (`physical_validator.py:1935/1943`)
+   still mints `test_report_parse_error`, which now grades nothing there too —
+   so item 12 closes that path's gradient as well. What it does not gain is the
+   compact parser's COUNTED disclosure: the fallback partitions nothing (item
+   6), so there is no destination to attach an `unparseable` tally to and the
+   conflict name plus the message carry it alone. Bounded to images without
+   `python3`, where the rollup already closes no phase.
 
 ## 2. Fix B — the 80% thresholds leave the gate/claim chain (#49)
 
