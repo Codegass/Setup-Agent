@@ -256,8 +256,9 @@ class ReportTool(BaseTool, UIEventEmitter):
             action: Action to perform ('generate' for final report)
             summary: Brief summary of what was accomplished
             status: Overall status ('success' or 'fail') - REQUIRED
-                   - 'success': Build validation passed AND test pass rate >= 80%
-                   - 'fail': Build failed OR test report not found OR test pass rate < 80%
+                   - 'success': build validation passed AND tests ran to a
+                     terminal result (red tests are project facts, not a grade)
+                   - 'fail': build failed OR no test execution was observed
             details: Additional details about the setup process
         """
         result_test_stats = self._coerce_report_test_stats(test_stats)
@@ -339,8 +340,10 @@ class ReportTool(BaseTool, UIEventEmitter):
                     f"  - action (optional): 'generate' (default: 'generate')\n"
                     f"  - summary (optional): Brief summary of accomplishments\n"
                     f"  - status (required): 'success' or 'fail'\n"
-                    f"     • 'success': Build passed AND test pass rate >= 80%\n"
-                    f"     • 'fail': Build failed OR tests not found OR pass rate < 80%\n"
+                    f"     • 'success': the build completed and the tests ran to a terminal "
+                    f"result; red tests are project facts to report\n"
+                    f"     • 'fail': the build did not complete, or no test execution was "
+                    f"observed\n"
                     f"  - details (optional): Additional details about the setup\n\n"
                     f"  - evidence_status (optional): success/partial/blocked/conflict/unknown\n"
                     f"  - test_stats (optional): TestStats or test counts dictionary\n"
@@ -356,8 +359,9 @@ class ReportTool(BaseTool, UIEventEmitter):
         if not status:
             return ToolResult.completed_failure(
                 output="❌ Missing required parameter: 'status'. Must be either 'success' or 'fail'\n"
-                "• 'success': Build passed AND test pass rate >= 80%\n"
-                "• 'fail': Build failed OR tests not found OR pass rate < 80%",
+                "• 'success': the build completed and the tests ran to a terminal result; "
+                "red tests are project facts to report\n"
+                "• 'fail': the build did not complete, or no test execution was observed",
                 error="Missing required parameter: status",
             )
 
@@ -2317,8 +2321,10 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         IMPORTANT: TODO list completion is NOT a prerequisite for report generation.
         The final status (success/fail) is determined solely by:
-        - Build validation: Must pass
-        - Test pass rate: Must be > 80%
+        - Build validation: must pass
+        - Test execution: the tests must have run (the invented 80% pass-rate
+          cut-off left this decision on 2026-08-10; see
+          ``_determine_actual_status``)
 
         TODO list is tracked for visibility but does not affect the final status.
         """

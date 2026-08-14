@@ -9,6 +9,7 @@ ONE decision, so the contradiction has nowhere to be assembled.
 
 import ast
 import io
+import re
 import tokenize
 from pathlib import Path
 
@@ -28,6 +29,25 @@ from sag.config.settings import Config
 from sag.verdict_rates import execution_sentence
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "sag"
+
+# The retired policy, described as a CLASS rather than as the five tokens that
+# happened to spell it. `pass threshold` was banned and "test pass rate >= 80%"
+# walked past the ban; what both sentences do is state a pass-rate rule, so the
+# rule is what is read for: the quantity by name, the word `threshold` standing
+# next to test vocabulary, or a TYPED percentage doing the same. A rendered
+# `{rate:.1f}%` is a measurement of what happened and stays allowed.
+_PASS_RATE_NAMED = re.compile(r"pass[ _-]?rate", re.I)
+_TYPED_PERCENTAGE = re.compile(r"\d+(?:\.\d+)?\s*%")
+_GRADED_QUANTITY = re.compile(r"\btests?\b|\bpass(?:ed|es|ing)?\b|\brates?\b", re.I)
+
+
+def states_a_pass_rate_policy(text: str) -> bool:
+    """Does this sentence state a pass-rate rule to whoever reads it?"""
+    if _PASS_RATE_NAMED.search(text):
+        return True
+    if "threshold" in text.lower() and _GRADED_QUANTITY.search(text):
+        return True
+    return bool(_TYPED_PERCENTAGE.search(text) and _GRADED_QUANTITY.search(text))
 
 
 class _TestEvidenceValidator:
@@ -398,6 +418,34 @@ def test_the_phase_objectives_teach_no_threshold_the_harness_does_not_have():
         assert "repair" in objective
 
 
+def test_the_report_tool_refusals_teach_no_pass_rate_policy():
+    """The last place the retired 80% was still stated to the model (§2.1/§2.2).
+
+    Both refusal branches of `report` rendered *"'success': Build passed AND
+    test pass rate >= 80%"* / *"'fail': ... pass rate < 80%"* as LIVE f-strings
+    handed to `ToolResult.completed_failure(output=...)`, so the model read the
+    retired policy as the definition of the status it was being asked for — and
+    would answer `fail` at 78% for a rule nothing in the harness grades any
+    more. The gate side lost pass-rate adjudication four commits ago; this was
+    the CLAIM side of the same sentence.
+    """
+    from sag.tools.report_tool import ReportTool
+
+    tool = ReportTool(workflow_mode="legacy")
+
+    invalid_parameters = tool.execute(action="generate", status="success", unexpected_param=1)
+    missing_status = tool.execute(action="generate", status="")
+
+    for result in (invalid_parameters, missing_status):
+        assert states_a_pass_rate_policy(result.output) is False, result.output
+        assert "80%" not in result.output
+
+    # What replaced it: what ran to a terminal result, and red as a project fact.
+    for result in (invalid_parameters, missing_status):
+        assert "terminal" in result.output
+        assert "red tests" in result.output
+
+
 def test_the_operator_log_states_a_band_and_not_an_invented_cut_off():
     """§2's vocabulary retirement reaches the attention lines too: the INFO row
     still cut modules at an invented 80%, the one number v4 replaced with the
@@ -517,4 +565,189 @@ def test_no_pass_rate_threshold_survives_anywhere_in_the_claim_chain():
             for token in banned:
                 if token in line:
                     offenders.append(f"{path.relative_to(SRC_ROOT)}:{number}:{token}")
+    assert offenders == []
+
+
+# --------------------------------------------------------------------------- #
+# §2.2 — the ban is a property of the SURFACE, not of five spellings
+# --------------------------------------------------------------------------- #
+def _literal_fragments(node: ast.AST) -> list:
+    """Every TYPED string fragment of an expression, placeholders excluded.
+
+    `f"{rate:.1f}% passed"` measures what happened and is not read; `"80%"` is
+    a rule someone wrote down, and it is. Wrappers are followed — a sentence
+    handed to the model through `_append_evidence_summary_to_output(...)` or a
+    `join` is the same sentence — because the reader cannot see the wrapper.
+    """
+    if isinstance(node, ast.Constant):
+        return [node.value] if isinstance(node.value, str) else []
+    if isinstance(node, ast.JoinedStr):
+        fragments = []
+        for value in node.values:
+            fragments.extend(_literal_fragments(value))
+        return fragments
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return _literal_fragments(node.left) + _literal_fragments(node.right)
+    if isinstance(node, ast.IfExp):
+        return _literal_fragments(node.body) + _literal_fragments(node.orelse)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        fragments = []
+        for element in node.elts:
+            fragments.extend(_literal_fragments(element))
+        return fragments
+    if isinstance(node, ast.Call):
+        fragments = _literal_fragments(node.func)
+        for argument in node.args:
+            fragments.extend(_literal_fragments(argument))
+        for keyword in node.keywords:
+            fragments.extend(_literal_fragments(keyword.value))
+        return fragments
+    return []
+
+
+def _names_bound_to_text(scope: ast.AST) -> dict:
+    """name -> every fragment assigned or appended to it in this scope.
+
+    A tool that accumulates its output in a local and hands the local over says
+    exactly what an inline string says; the model cannot tell them apart.
+    """
+    bound: dict = {}
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if value is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                bound.setdefault(target.id, []).extend(_literal_fragments(value))
+    return bound
+
+
+def _collect_model_facing(node: ast.AST, bound: dict, found: list) -> None:
+    """Append (line, surface, fragment) for every literal handed to the model.
+
+    Two surfaces reach it. A tool `description` — `BaseTool.get_schema` hands
+    the tool description and its parameter descriptions over verbatim — and a
+    ToolResult's `output`/`error`, both of which
+    `tool_orchestration.format_tool_result` renders into the observation.
+    `suggestions` is deliberately dropped there, so it is not model-facing and
+    is not read here.
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        bound = {**bound, **_names_bound_to_text(node)}
+    if isinstance(node, ast.Call):
+        function = node.func
+        is_result = (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "ToolResult"
+        )
+        for keyword in node.keywords:
+            if keyword.arg == "description":
+                surface = "description"
+            elif keyword.arg in {"output", "error"} and is_result:
+                surface = f"ToolResult.{keyword.arg}"
+            else:
+                continue
+            fragments = _literal_fragments(keyword.value)
+            if isinstance(keyword.value, ast.Name):
+                fragments.extend(bound.get(keyword.value.id, []))
+            for fragment in fragments:
+                found.append((node.lineno, surface, fragment))
+    elif isinstance(node, ast.Dict):
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == "description":
+                for fragment in _literal_fragments(value):
+                    found.append(
+                        (getattr(value, "lineno", node.lineno), "schema description", fragment)
+                    )
+    for child in ast.iter_child_nodes(node):
+        _collect_model_facing(child, bound, found)
+
+
+def _model_facing_offenders(source: str, label: str) -> list:
+    found: list = []
+    _collect_model_facing(ast.parse(source), {}, found)
+    return [
+        f"{label}:{line} [{surface}] {fragment.strip()[:80]!r}"
+        for line, surface, fragment in found
+        if states_a_pass_rate_policy(fragment)
+    ]
+
+
+def test_the_model_facing_fence_bites_on_every_surface_it_claims():
+    """A fence nobody has seen fire is a fence-shaped comment.
+
+    Each shape below is the retired policy standing on one of the surfaces the
+    model reads — inline, accumulated in a local, passed through a wrapper, in
+    a tool description, in a parameter schema — and each must be caught. The
+    measurement that shares the vocabulary must not be: `{rate:.1f}%` states
+    what happened rather than what the answer has to be.
+    """
+    caught = _model_facing_offenders(
+        """
+def refuse():
+    return ToolResult.completed_failure(
+        output="'success': Build passed AND test pass rate >= 80%",
+        error="pass rate < 80%",
+    )
+
+
+def accumulate():
+    output = "status meaning:\\n"
+    output += "  'success' requires tests above the 80% threshold\\n"
+    return ToolResult.completed_failure(output=output)
+
+
+def wrap():
+    return ToolResult.completed_failure(
+        output=self._append_evidence_summary_to_output(
+            "answer 'fail' when fewer than 80% of the tests passed"
+        )
+    )
+
+
+def describe():
+    BaseTool.__init__(self, name="report", description="Answer fail below 80% of tests.")
+
+
+def schema():
+    return {"status": {"description": "'success' when the pass rate clears the threshold"}}
+""",
+        "synthetic",
+    )
+    assert len(caught) == 6, caught
+
+    measurements = _model_facing_offenders(
+        """
+def measure(rate, executed, discovered):
+    return ToolResult.completed_success(
+        output=f"executed {executed} of {discovered} discovered · {rate:.1f}% passed",
+    )
+""",
+        "synthetic",
+    )
+    assert measurements == []
+
+
+def test_no_model_facing_string_teaches_a_pass_rate_policy():
+    """§2 acceptance, closed as a CLASS instead of as five spellings.
+
+    The literal-token grep above banned `pass threshold` and walked straight
+    past `report`'s live refusal text — *"'success': Build passed AND test pass
+    rate >= 80%"* — for the same reason it walked past the phase objectives:
+    the sentence spells the policy differently. What the model must never be
+    handed is the RULE, on any surface it reads.
+    """
+    offenders = []
+    for path in sorted(SRC_ROOT.rglob("*.py")):
+        offenders.extend(
+            _model_facing_offenders(
+                path.read_text(encoding="utf-8"), str(path.relative_to(SRC_ROOT))
+            )
+        )
     assert offenders == []
