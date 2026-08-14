@@ -66,7 +66,7 @@ from sag.testcases.results import (
     aggregate_test_results,
     canonical_test_identity,
 )
-from sag.verdict_rates import execution_sentence, no_execution_sentence
+from sag.verdict_rates import STALE_CONFLICT, execution_sentence, no_execution_sentence
 
 # top_level.txt names that are install tooling, never the project under test —
 # a second deny-list layer under the record selection in
@@ -5484,10 +5484,12 @@ class PhysicalValidator:
             conflicts.append("metrics_conflict")
 
         # Receipt-scoped evidence (Plan 5 Task B2). Superseded reports are a
-        # visible conflict; an unreadable receipt is an evidence-closure
-        # failure that no pass rate may paper over.
+        # visible conflict — named, pathed and counted, and adjudicated rather
+        # than capping (spec 2026-08-14 amendment item 7). An unreadable receipt
+        # is a different thing: an evidence-closure failure that no pass rate
+        # may paper over.
         if test_metrics.get("stale_test_reports"):
-            conflicts.append("test_reports_stale")
+            conflicts.append(STALE_CONFLICT)
         receipt_error = test_metrics.get("receipt_error")
         if receipt_error:
             conflicts.append("test_receipt_unreadable")

@@ -8,7 +8,7 @@ announced as a clean success."""
 
 from typing import Iterable, Optional
 
-from sag.verdict_rates import UNATTRIBUTED_CONFLICT
+from sag.verdict_rates import EXCLUDED_VOLUME_CONFLICTS
 
 VERDICT_ORDER = ["failed", "partial", "success"]
 _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
@@ -21,20 +21,30 @@ _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 #     verdict has already read it as execution (spec 2026-08-14 §2), so feeding
 #     it back into the conflict cap would demote every fully-executed run with
 #     any failing test to partial.
-#   * test_executions_unattributed_to_receipts names reports the receipts do not
-#     claim. Capping on it inverted P4 from the REPORT side: bigtop's headline
-#     50 + 4 unclaimed reports capped at partial, and DELETING those four files
-#     lifted the cap — evidence presence worsened the verdict. The headline band
-#     already derives from attributed counts alone, and stray unclaimed XML may
-#     legitimately pre-date the checkout, so non-capping is the only treatment
-#     monotone on both the receipt and the report axis. The conflict and its
-#     disclosure sentence are unchanged: visibility without authority, now also
-#     without a cap (spec 2026-08-14 amendment item 4).
+#   * EXCLUDED_VOLUME_CONFLICTS names the volume the headline left out, by both
+#     doors: test_executions_unattributed_to_receipts (claimed by nobody) and
+#     test_reports_stale (claimed, then rewritten). Capping on EITHER inverted
+#     P4, from opposite sides. On the REPORT side: bigtop's headline 50 + 4
+#     unclaimed reports capped at partial and DELETING those four files lifted
+#     the cap. On the RECEIPT side: one corpus, one rewritten report, identical
+#     headline 25 — with the receipt that revealed the rewrite the report was
+#     STALE and capped, and DELETING that receipt made it auxiliary and sealed
+#     success. Both are "removing evidence improved the verdict" (2026-07-29
+#     evidence-lifecycle spec, P4).
+#     The headline band derives from attributed counts alone, so excluded
+#     volume has no second claim on the verdict to make; and the cap defended
+#     nothing it was reached for — a run that wants the volume uncapped need
+#     only dispatch through a non-receipting tool from the start, so the cap
+#     taxed the run that used the receipting tool first. Anti-fabrication is
+#     EXCLUSION, and exclusion is untouched: neither volume is ever counted.
+#     Both stay named, pathed, counted and spoken in the cases grain
+#     (spec 2026-08-14 amendment items 4 and 7).
 #
-# The cap stays reserved for genuine uncertainty about the evidence itself
-# (e.g. test_report_parse_error).
+# The cap stays reserved for genuine uncertainty about the evidence itself —
+# bytes the harness could not READ (e.g. test_report_parse_error), never bytes
+# it read, measured and deliberately left out of the numerator.
 ADJUDICATED_CONFLICTS = frozenset(
-    {"test_failures_detected", "test_errors_detected", UNATTRIBUTED_CONFLICT}
+    {"test_failures_detected", "test_errors_detected", *EXCLUDED_VOLUME_CONFLICTS}
 )
 
 

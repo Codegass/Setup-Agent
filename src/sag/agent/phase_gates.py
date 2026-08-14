@@ -18,6 +18,7 @@ from loguru import logger
 from sag.verdict_rates import (
     DEFICIENCY_MARKERS,
     EXECUTION_SENTENCE_PREFIX,
+    STALE_CONFLICT,
     execution_sentence,
     no_execution_sentence,
 )
@@ -1449,7 +1450,7 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
     if status.get("parsing_errors"):
         conflicts.append("test_report_parse_error")
     if status.get("stale_test_reports"):
-        conflicts.append("test_reports_stale")
+        conflicts.append(STALE_CONFLICT)
     collection_summary = str(
         status.get("collection_error_summary") or test_stats.get("collection_error_summary") or ""
     ).strip()

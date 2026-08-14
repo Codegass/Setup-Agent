@@ -33,6 +33,16 @@ HEAVY_RED_CONFLICT = "test_failures_heavy"
 UNBOUNDED_CONFLICT = "rate_denominator_not_a_bound"
 UNBOUNDED_REASON = "numerator exceeds denominator; this count cannot bound it"
 UNATTRIBUTED_CONFLICT = "test_executions_unattributed_to_receipts"
+STALE_CONFLICT = "test_reports_stale"
+# The two doors a report leaves the headline by, named as ONE class because the
+# verdict must grade them alike. AUXILIARY is claimed by nobody; STALE was
+# claimed and the bytes were then rewritten. Both volumes are measured, named,
+# pathed and counted — and neither is ever counted INTO the headline, which is
+# why neither has a second claim on the verdict to make. Grading them
+# differently made the door a receipt's presence chooses, so deleting a receipt
+# moved a report stale->auxiliary and lifted the word (spec 2026-08-14
+# amendment item 7). A third door added later belongs in this set.
+EXCLUDED_VOLUME_CONFLICTS = frozenset({UNATTRIBUTED_CONFLICT, STALE_CONFLICT})
 
 
 # The affirming sentence's opening token. Everything that grades execution

@@ -125,13 +125,15 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    - stray unclaimed XML may legitimately pre-date the checkout (a vendored
      sample, a cached report from an image layer), which is not the run's doing
      and not something the run can repair;
-   - non-capping is the only treatment monotone on BOTH axes — adding a receipt
-     can only move reports from auxiliary to headline, and adding or deleting an
-     unattributed report moves the disclosure and never the word.
+   - non-capping is the only treatment monotone on the REPORT axis — adding or
+     deleting an unattributed report moves the disclosure and never the word.
+     (As first written this bullet claimed monotonicity on BOTH axes. That was
+     false and item 7 corrects it: the same change opened a receipt-axis
+     gradient through the OTHER excluded door.)
    The conflict and its disclosure sentence are otherwise unchanged: visibility
    without authority, now also without a cap. A genuine evidence conflict
-   standing beside it (`test_report_parse_error`, `test_reports_stale`) still
-   caps exactly as before.
+   standing beside it (`test_report_parse_error`) still caps exactly as before;
+   `test_reports_stale` is settled by item 7.
 5. **The stale destination is disclosed.** Reports leave the headline through
    two doors and they mean different things: AUXILIARY is claimed by nobody,
    STALE was claimed and the bytes were then rewritten. Only the first was ever
@@ -142,7 +144,7 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    cases grain names them separately — `50/100 — 4 executions visible on disk
    but bound to no receipt, 6 under rewritten claims`. Stale volume is still
    never counted, and it still rides the existing `test_reports_stale` conflict
-   rather than the unattributed one.
+   rather than the unattributed one. (How that conflict grades is item 7.)
 6. **Fallback parity.** When the compact in-container parser cannot run (no
    `python3` in the image) the shell find/cat rescan produces counts with no
    claim partition behind them. Sealing those as the HEADLINE meant that, for a
@@ -155,10 +157,48 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    is unchanged — an unpartitioned rollup still closes nothing
    (`test_receipt_missing`) — and the deliberate shell-fallback fences in
    `tests/test_pytest_report_aggregation.py` still test that path's AGGREGATION.
+7. **Both excluded doors are graded alike (adjudicated).** Item 4 closed the
+   report axis and, by leaving `test_reports_stale` capping, opened the receipt
+   axis: a report the receipts claim and whose bytes were then rewritten lands
+   in the STALE bucket and capped; the SAME file with that receipt absent lands
+   in the AUXILIARY bucket and did not. Demonstrated end to end through the real
+   parser on real files — one workspace, headline 25 either way, 8 excluded
+   executions either way — `partial` with the receipt, `success` without it. So
+   DELETING a receipt lifted the word, which is P4 read straight off the page:
+   "removing evidence must never improve a verdict … discarding a receipt,
+   failing to read one … may make a verdict less certain. It may never make it
+   better" (2026-07-29 evidence-lifecycle spec). The gradient is new here: at
+   the parent commit both classifications capped.
+   The two doors are therefore ONE class — `verdict_rates.EXCLUDED_VOLUME_CONFLICTS`
+   = {`test_executions_unattributed_to_receipts`, `test_reports_stale`} — folded
+   into `verdict.ADJUDICATED_CONFLICTS`. Rationale, in the order it was decided:
+   - item 4's first bullet applies verbatim to stale: the headline band derives
+     from ATTRIBUTED counts alone, and stale volume is never counted into it, so
+     it has no second claim on the verdict to make;
+   - the cap defended nothing it was reached for. Anti-fabrication is EXCLUSION,
+     which is untouched. A run that wants the volume uncapped only ever had to
+     dispatch through a non-receipting tool from the START (auxiliary, already
+     uncapped) — so the cap could only tax the run that used the receipting tool
+     FIRST, which is the inverted incentive P4 exists to kill;
+   - what stale has that auxiliary lacks — the run itself wrote both statements —
+     is a DISCLOSURE fact, and it is fully disclosed: its own conflict name, its
+     own paths (`stale_test_reports`), its own counts (`stale_test_stats`), its
+     own clause in the cases grain ("6 under rewritten claims"), and its own
+     metrics bucket (`receipt_claim_superseded`). It is graded by nobody, which
+     is exactly this commit's rule for excluded evidence.
+   The cap stays reserved for uncertainty about evidence the harness could not
+   READ (`test_report_parse_error`, `test_receipt_unreadable`) — never for bytes
+   it read, measured and deliberately left out of the numerator. Consequence,
+   named: like the unattributed conflict, `test_reports_stale` no longer renders
+   as an operator BLOCKER line (`report_tool._sealed_failure_blockers` skips adjudicated
+   conflicts); the five disclosures above carry it. Fenced by
+   `tests/test_run_wide_receipt_scope.py::test_deleting_the_receipt_that_revealed_a_rewrite_never_changes_the_word`
+   (real parser, real files, real rollup, real kernel) and
+   `::test_the_stale_conflict_is_adjudicated_not_capping`.
 
 ### Deferred items (2026-08-14, named so they are not invisible)
 
-Two known gaps are accepted for now rather than silently carried:
+Three known gaps are accepted for now rather than silently carried:
 
 1. **Task #52 — `run_test_receipts` /workspace fallback bound.**
    `attempt_policy.run_test_receipts` falls back to the entire `/workspace` when

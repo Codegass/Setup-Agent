@@ -32,6 +32,7 @@ exactly the state with no candidates), and ``phase_tool`` stamped
 ``test_execution_receipts: 0`` as a hard-coded literal rather than a count.
 """
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -639,6 +640,131 @@ def test_the_parser_counts_the_volume_under_rewritten_claims(tmp_path, monkeypat
         "errors": 0,
         "skipped": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 7 — both excluded doors are graded alike
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _own_evidence_epoch(tmp_path, name: str):
+    """One host authority per shape: these are two RUNS, one container each."""
+    from sag.agent.control_events import ControlEventSink
+    from sag.agent.evidence_publications import (
+        EvidencePublicationAuthority,
+        install_evidence_publication_authority,
+        reset_evidence_publication_authority,
+    )
+
+    token = install_evidence_publication_authority(
+        EvidencePublicationAuthority.for_live_run(
+            run_id="run-pytest",
+            sink=ControlEventSink(tmp_path / f"{name}-control-events.jsonl"),
+        )
+    )
+    try:
+        yield
+    finally:
+        reset_evidence_publication_authority(token)
+
+
+def _rewrite_shape(tmp_path, monkeypatch, *, publish_the_claim: bool):
+    """One corpus, one rewrite, the receipt that reveals it present or absent.
+
+    Two primary reports. Receipt A claims TEST-Kept.xml and still matches it, so
+    the headline is 25 either way. TEST-Other.xml is written with 10 cases and
+    then REWRITTEN to 8 — the shape of a dispatch that went through the
+    receipting tool and was then re-run through ``bash``. Whether receipt B
+    exists decides only which excluded bucket those 8 executions land in.
+    """
+    from test_receipt_scoped_rollup import _surefire_xml, _validator, _write
+
+    from sag.agent.phase_gates import _validated_test_rollup
+
+    name = "claimed" if publish_the_claim else "unclaimed"
+    workspace = ReceiptWorkspace(tmp_path / name)
+    kept = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.KeptTest.xml",
+        "org.apache.bigtop.datagen.KeptTest",
+        [f"kept{i}" for i in range(25)],
+    )
+    other = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.OtherTest.xml",
+        "org.apache.bigtop.datagen.OtherTest",
+        [f"other{i}" for i in range(10)],
+    )
+    workspace.write_receipt(_receipt("inv-test-1-0001", workspace.primary_root, new=[kept]))
+    claim_b = _receipt("inv-test-1-0002", workspace.primary_root, new=[other])
+    _write(
+        other,
+        _surefire_xml("org.apache.bigtop.datagen.OtherTest", [f"other{i}" for i in range(8)]),
+    )
+    if publish_the_claim:
+        workspace.write_receipt(claim_b)
+    _bind_primary_coordinate(monkeypatch, workspace)
+    with _own_evidence_epoch(tmp_path, name):
+        validator, _ = _validator(workspace)
+        result = validator.parse_test_reports(str(workspace.project))
+    return result, _validated_test_rollup(result)
+
+
+def test_deleting_the_receipt_that_revealed_a_rewrite_never_changes_the_word(tmp_path, monkeypatch):
+    """P4, on the receipt axis: the run that produced MORE evidence must not
+    seal the worse word.
+
+    The excluded volume leaves the headline through two doors. STALE was
+    claimed and the bytes were then rewritten; AUXILIARY is claimed by nobody.
+    While stale capped and auxiliary did not, DELETING receipt B lifted an
+    identical corpus with an identical headline from ``partial`` to ``success``
+    — 'discarding a receipt ... may never make [a verdict] better'
+    (2026-07-29 evidence-lifecycle spec, P4).
+
+    Exclusion, not the cap, is the anti-fabrication mechanism, and exclusion is
+    unchanged: the 8 rewritten executions are still counted by nobody. A run
+    that wants them uncapped only ever had to dispatch through a non-receipting
+    tool from the start, so the cap defended nothing and taxed the run that
+    used the receipting tool first.
+    """
+    from sag.verdict import run_verdict
+
+    claimed, claimed_rollup = _rewrite_shape(tmp_path, monkeypatch, publish_the_claim=True)
+    unclaimed, unclaimed_rollup = _rewrite_shape(tmp_path, monkeypatch, publish_the_claim=False)
+
+    # Same corpus, same headline, same excluded volume — only the door differs.
+    assert claimed["total_tests"] == unclaimed["total_tests"] == 25
+    assert claimed["stale_test_stats"]["executed"] == 8
+    assert claimed.get("auxiliary_test_stats") is None
+    assert unclaimed["auxiliary_test_stats"]["executed"] == 8
+    assert unclaimed.get("stale_test_stats") is None
+    # Both doors are still named out loud, each by its own conflict.
+    assert "test_reports_stale" in claimed_rollup["conflicts"]
+    assert "test_reports_stale" not in unclaimed_rollup["conflicts"]
+
+    claimed_verdict = run_verdict("success", "success", claimed_rollup["conflicts"])
+    unclaimed_verdict = run_verdict("success", "success", unclaimed_rollup["conflicts"])
+
+    assert claimed_verdict == unclaimed_verdict == "success"
+
+
+def test_the_stale_conflict_is_adjudicated_not_capping():
+    """The kernel-level statement of the same property, beside item 4's.
+
+    ``test_reports_stale`` names volume the headline already excludes, so it has
+    no second claim on the verdict to make — the same rationale that made
+    ``test_executions_unattributed_to_receipts`` non-capping, applied to the
+    other excluded door.
+    """
+    from sag.verdict import ADJUDICATED_CONFLICTS, run_verdict
+    from sag.verdict_rates import EXCLUDED_VOLUME_CONFLICTS, STALE_CONFLICT
+
+    assert EXCLUDED_VOLUME_CONFLICTS == {UNATTRIBUTED_CONFLICT, STALE_CONFLICT}
+    assert EXCLUDED_VOLUME_CONFLICTS <= ADJUDICATED_CONFLICTS
+    assert run_verdict("success", "success", (STALE_CONFLICT,)) == "success"
+    assert run_verdict("success", "success", EXCLUDED_VOLUME_CONFLICTS) == "success"
+    # Uncertainty about evidence the harness could not READ still caps, beside
+    # either door: excluded volume is measured, a parse error is not.
+    assert (
+        run_verdict("success", "success", (STALE_CONFLICT, "test_report_parse_error")) == "partial"
+    )
 
 
 # ---------------------------------------------------------------------------
