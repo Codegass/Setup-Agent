@@ -99,6 +99,7 @@ from .phase_gates import (
     GateResult,
     ValidatorState,
     check_phase_claim,
+    claim_identity,
     claimable_outcome,
     gate_observation_text,
     validate_phase_claim,
@@ -4098,11 +4099,31 @@ class ReActEngine(UIEventEmitter):
         return envelope_id
 
     @staticmethod
+    def _delivered_claim_identity(metadata: Mapping[str, Any] | None) -> str:
+        """Name the claim a delivered gate belongs to, from the metadata itself.
+
+        Taken before compaction: `phase_claim` is bounded like every other
+        recorded string, and a truncated claim would hash to a name the live
+        registry never used (spec §3.4).
+        """
+        claim_data = (metadata or {}).get("phase_claim")
+        if not isinstance(claim_data, Mapping):
+            return ""
+        try:
+            return claim_identity(PhaseClaim.from_metadata(claim_data))
+        except (TypeError, ValueError, PermissionError):
+            return ""
+
+    @staticmethod
     def _control_result_projection(result: ToolResult) -> Dict[str, Any]:
         output_ref = result.output_ref or next(
             (str(ref) for ref in [*result.evidence_refs, *result.refs] if ref),
             None,
         )
+        metadata = compact_control_value(result.metadata)
+        claim_sha256 = ReActEngine._delivered_claim_identity(result.metadata)
+        if claim_sha256:
+            metadata["phase_claim_sha256"] = claim_sha256
         projection: Dict[str, Any] = {
             "invocation_status": result.invocation_status.value,
             "operation_outcome": result.operation_outcome.value,
@@ -4113,7 +4134,7 @@ class ReActEngine(UIEventEmitter):
                 else "output body omitted; verify output_sha256"
             ),
             "evidence_assessment": result.evidence_assessment.value,
-            "metadata": compact_control_value(result.metadata),
+            "metadata": metadata,
             "evidence_refs": list(result.evidence_refs),
             "conflicts": list(result.conflicts),
             "validator_findings": [
@@ -4334,7 +4355,15 @@ class ReActEngine(UIEventEmitter):
         return self._delivered_gate_decisions
 
     def _register_delivered_gate(self, claim: PhaseClaim, gate: GateResult) -> None:
-        self._delivered_gates()[canonical_sha256(claim.to_metadata())] = gate
+        """Record the word this result hands the model, whatever it decided.
+
+        A rejection is delivered exactly as an acceptance is: the model reads
+        the gate's reason and re-plans on it. Registering only the accepted path
+        left a delivered-but-unclosed word standing as the target of the next
+        rejection of the same claim text, and the honest second grading was
+        refused as if the first had been replaced behind the model's back.
+        """
+        self._delivered_gates()[claim_identity(claim)] = gate
 
     def _refuse_undelivered_word(self, claim: PhaseClaim, gate: GateResult) -> None:
         """A word the model acted on may not be replaced behind its back.
@@ -4344,7 +4373,7 @@ class ReActEngine(UIEventEmitter):
         Both are one statement re-graded after delivery. A second grading is
         legal — it just has to name the first and be spoken aloud first.
         """
-        delivered = self._delivered_gates().get(canonical_sha256(claim.to_metadata()))
+        delivered = self._delivered_gates().get(claim_identity(claim))
         if delivered is None or delivered.decision_id == gate.decision_id:
             return
         if gate.supersedes != delivered.decision_id:
@@ -4382,6 +4411,7 @@ class ReActEngine(UIEventEmitter):
             "signal": claim.signal,
             "claimed_outcome": claim.claimed_outcome.value,
             "decision_id": body["decision_id"],
+            "claim_sha256": claim_identity(claim),
             "validator_state": body["validator_state"],
             "expected_accepted": body["accepted"],
             "expected_outcome": body["validated_outcome"],
@@ -5033,6 +5063,10 @@ class ReActEngine(UIEventEmitter):
             result_metadata["blocker_owner"] = "harness"
         execution.result = execution.result.model_copy(update={"metadata": result_metadata})
         execution.observation_text = format_tool_result(execution.call.name, execution.result)
+        # The observation above is the delivery. Everything downstream — the
+        # recorded tool_result, the seal in _apply_rejected_completion_control —
+        # states the word this line just handed the model.
+        self._register_delivered_gate(claim, gate)
         return _PreparedRejectedCompletion(claim, gate, event, decision, context)
 
     def _mark_harness_control_failure(

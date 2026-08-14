@@ -925,6 +925,11 @@ class GateDecisionPayload(_StrictPayload):
     decision_id: str | None = Field(default=None, min_length=1, max_length=128)
     supersedes: str | None = Field(default=None, min_length=1, max_length=128)
     gate_result: dict[str, Any] | None = None
+    # Spec 2026-08-14 §3.4. Names the claim this decision grades, so a reader
+    # pairs it with the word delivered for THAT claim rather than with whatever
+    # word happened to be delivered last. `key_results` above is bounded like
+    # every other flat field; this digest is taken from the claim itself.
+    claim_sha256: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_serializer(mode="wrap")
     def _ownership_absent_stays_absent(self, handler):
@@ -936,6 +941,7 @@ class GateDecisionPayload(_StrictPayload):
             "decision_id",
             "supersedes",
             "gate_result",
+            "claim_sha256",
         ):
             if name not in self.model_fields_set:
                 data.pop(name, None)

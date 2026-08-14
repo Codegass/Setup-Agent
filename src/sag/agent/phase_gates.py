@@ -185,6 +185,18 @@ def _gate_identity(fields: Mapping[str, Any]) -> str:
     return f"{GATE_DECISION_ID_PREFIX}{digest[:_GATE_DECISION_ID_CHARS]}"
 
 
+def claim_identity(claim: PhaseClaim) -> str:
+    """Name one claim by what it asserts (spec §3.4).
+
+    A delivered word and the decision that seals it pair by this name — live in
+    ``_delivered_gates`` and offline in replay. Adjacency in the stream is not
+    the pairing: a second grading of the SAME claim must supersede the word the
+    model read, while a close of a different claim owes it nothing.
+    """
+    body = json.dumps(claim.to_metadata(), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+
+
 @dataclass(frozen=True)
 class GateResult:
     accepted: bool

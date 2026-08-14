@@ -28,10 +28,13 @@ from sag.agent.control_events import (
     compact_control_value,
 )
 from sag.agent.evidence_state import RunEvidenceState
+from sag.agent.loop_memory import LoopMemory
 from sag.agent.phase_gates import (
     ClaimDisposition,
+    GateControlDisposition,
     GateResult,
     ValidatorState,
+    claim_identity,
     gate_observation_text,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
@@ -120,6 +123,7 @@ def _engine(tmp_path, *, start_phase="build"):
     )
     engine.finalized_reasons = []
     engine._finalize_evidence = lambda reason: engine.finalized_reasons.append(reason)
+    engine.loop_memory = LoopMemory()
     return engine
 
 
@@ -135,6 +139,23 @@ def _terminal_step(claim, gate):
                 "gate_result": gate.to_metadata(),
             },
         ),
+    )
+
+
+def _rejected_phase_execution(claim, *, code, reason, disposition, owner="harness"):
+    """A phase-tool rejection as `_execute_tool_step` hands it to the engine."""
+    from sag.tools.phase_tool import PhaseTool
+
+    return SimpleNamespace(
+        call=SimpleNamespace(name="phase"),
+        result=PhaseTool._rejected_claim_result(
+            claim,
+            code=code,
+            reason=reason,
+            control_disposition=disposition,
+            blocker_owner=owner,
+        ),
+        observation_text="",
     )
 
 
@@ -338,6 +359,81 @@ def test_a_cap_that_only_refines_the_reason_chains_without_shouting(tmp_path):
     assert not [event for event in _events(tmp_path) if event.kind == "gate_outcome_revised"]
 
 
+def test_a_retry_of_the_same_claim_is_a_second_grading_not_a_persist_failure(tmp_path):
+    """The cap seals a revision and leaves the attempt OPEN, so the model is
+    free to dispatch a test and re-issue the identical claim. The phase tool
+    rejects the retry, and that rejection is a word the model reads — not a
+    grading slipped in behind the delivered one. `gate_decision_persist_failed`
+    is reserved for a decision that could not be made durable (spec §4)."""
+    engine = _engine(tmp_path, start_phase="test")
+    claim = _claim(PhaseOutcome.SUCCESS, phase="test")
+    delivered = _gate(PhaseOutcome.SUCCESS, claim=claim, code="test_execution_observed")
+    capped = _gate(
+        PhaseOutcome.UNKNOWN,
+        claim=claim,
+        accepted=False,
+        reason="test coordinates remained unavailable after the one bounded survey refresh",
+        code="test_candidate_resolution_unavailable",
+    )
+    engine._cap_unresolved_test_gate = lambda claim_, gate_: capped
+    engine._handle_phase_signals([_terminal_step(claim, delivered)])
+    assert not engine.phase_machine.is_complete
+
+    execution = _rejected_phase_execution(
+        claim,
+        code="WAIT_REQUIRED",
+        reason="a dispatched runner job is still live; its receipt is not settled",
+        disposition=GateControlDisposition.WAIT_REQUIRED,
+    )
+    prepared = engine._prepare_rejected_completion(execution)
+    engine._apply_rejected_completion_control(prepared)
+
+    assert getattr(engine, "_fatal_harness_control_failure", None) is None
+    assert _last(tmp_path, "gate_decision").payload["decision_id"] == prepared.gate.decision_id
+
+
+def test_the_record_names_the_claim_by_the_key_the_live_registry_used(tmp_path):
+    """Delivered word and sealed decision carry ONE name for the claim, so an
+    offline reader pairs them exactly as `_delivered_gates` does. The name is
+    taken before the record is bounded: `phase_claim` is truncated like every
+    other recorded string, and a digest of the truncated copy would name a
+    claim the live run never graded."""
+    engine = _engine(tmp_path, start_phase="test")
+    claim = replace(_claim(PhaseOutcome.SUCCESS, phase="test"), key_results="compiled. " * 90)
+    execution = _rejected_phase_execution(
+        claim,
+        code="WAIT_REQUIRED",
+        reason="a dispatched runner job is still live; its receipt is not settled",
+        disposition=GateControlDisposition.WAIT_REQUIRED,
+    )
+    prepared = engine._prepare_rejected_completion(execution)
+    engine._apply_rejected_completion_control(prepared)
+
+    recorded = ReActEngine._control_result_projection(execution.result)["metadata"]
+    assert len(recorded["phase_claim"]["key_results"]) < len(claim.key_results)
+    assert recorded["phase_claim_sha256"] == claim_identity(claim)
+    assert _last(tmp_path, "gate_decision").payload["claim_sha256"] == claim_identity(claim)
+    assert claim_identity(claim) in engine._delivered_gates()
+
+
+def test_the_rejection_the_model_read_is_the_word_a_later_seal_must_supersede(tmp_path):
+    """Registering the rejection keeps the fence pointed at the same target:
+    an engine re-grading of THAT claim still has to name the word it replaces."""
+    engine = _engine(tmp_path, start_phase="test")
+    claim = _claim(PhaseOutcome.SUCCESS, phase="test")
+    execution = _rejected_phase_execution(
+        claim,
+        code="WAIT_REQUIRED",
+        reason="a dispatched runner job is still live; its receipt is not settled",
+        disposition=GateControlDisposition.WAIT_REQUIRED,
+    )
+    prepared = engine._prepare_rejected_completion(execution)
+    engine._apply_rejected_completion_control(prepared)
+
+    with pytest.raises(ValueError, match="delivered"):
+        engine._emit_control_gate(claim, _gate(PhaseOutcome.FAILED, claim=claim))
+
+
 # ---------------------------------------------------------------------------
 # §3 item 2 — engine-generated decisions render their own observation
 # ---------------------------------------------------------------------------
@@ -447,6 +543,63 @@ def _write(path, rows):
     return path
 
 
+_BUILD_CLAIM = claim_identity(
+    PhaseClaim(
+        phase="build",
+        signal="done",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="41/41 Paramiko source files compiled.",
+    )
+)
+_OTHER_CLAIM = claim_identity(
+    PhaseClaim(
+        phase="build",
+        signal="blocked",
+        claimed_outcome=PhaseOutcome.UNKNOWN,
+        reason="the engine closed this attempt at the floor",
+    )
+)
+
+
+def _delivered_body():
+    return {
+        "decision_id": "gate-delivered",
+        "accepted": True,
+        "validated_outcome": "failed",
+        "claim_disposition": "confirmed",
+        "validator_state": "red",
+        "control_disposition": "terminal_claimable",
+        "blocker_owner": "none",
+        "reason": "tests were not executed",
+        "evidence_refs": [],
+        "suggestions": [],
+        "code": "tests_not_executed",
+        "validated_facts": {},
+    }
+
+
+def _deliver_word(rows, *, claim_sha256, signal="done"):
+    """Hand the model a graded word on the first tool result of the stream."""
+    for row in rows:
+        if row.get("kind") == "tool_result":
+            metadata = row["payload"]["result"]["metadata"]
+            metadata["gate_result"] = _delivered_body()
+            metadata["phase_claim_sha256"] = claim_sha256
+            if signal:
+                metadata["phase_signal"] = signal
+            return row
+    raise AssertionError("the fixture carries no tool result")
+
+
+def _seal(rows, *, claim_sha256, decision_id="gate-sealed"):
+    for row in rows:
+        if row.get("kind") == "gate_decision":
+            row["payload"]["decision_id"] = decision_id
+            row["payload"]["claim_sha256"] = claim_sha256
+            return row
+    raise AssertionError("the fixture carries no gate decision")
+
+
 def test_replay_refuses_a_supersedes_that_names_no_earlier_decision(tmp_path):
     rows = _paramiko_rows()
     for row in rows:
@@ -464,29 +617,35 @@ def test_replay_refuses_a_seal_that_diverges_from_the_delivered_word(tmp_path):
     """The eight corpus sessions replayed clean because replay never compared
     the sealed word with the one the model was handed."""
     rows = _paramiko_rows()
-    delivered = {
-        "decision_id": "gate-delivered",
-        "accepted": True,
-        "validated_outcome": "failed",
-        "claim_disposition": "confirmed",
-        "validator_state": "red",
-        "control_disposition": "terminal_claimable",
-        "blocker_owner": "none",
-        "reason": "tests were not executed",
-        "evidence_refs": [],
-        "suggestions": [],
-        "code": "tests_not_executed",
-        "validated_facts": {},
-    }
-    for row in rows:
-        if row.get("kind") == "tool_result":
-            row["payload"]["result"]["metadata"]["gate_result"] = delivered
-            row["payload"]["result"]["metadata"]["phase_signal"] = "done"
-            break
-    for row in rows:
-        if row.get("kind") == "gate_decision":
-            row["payload"]["decision_id"] = "gate-sealed"
-            break
+    _deliver_word(rows, claim_sha256=_BUILD_CLAIM)
+    _seal(rows, claim_sha256=_BUILD_CLAIM)
+    transcript = _write(tmp_path / "paramiko.jsonl", rows)
+
+    with pytest.raises(ReplayValidationError, match="delivered"):
+        ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+
+def test_replay_lets_a_close_of_another_claim_stand(tmp_path):
+    """The live refusal is keyed by (open attempt, claim): an engine close that
+    grades its OWN claim owes nothing to a word delivered for a different one.
+    Pairing the two by adjacency condemned honest transcripts — the delivered
+    word here is simply never claimed by any decision."""
+    rows = _paramiko_rows()
+    _deliver_word(rows, claim_sha256=_BUILD_CLAIM)
+    _seal(rows, claim_sha256=_OTHER_CLAIM)
+    transcript = _write(tmp_path / "paramiko.jsonl", rows)
+
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert result.gate_decision_count == 2
+
+
+def test_replay_reads_a_rejected_grading_as_a_delivered_word(tmp_path):
+    """A rejection carries its gate into the observation the model reads, so it
+    is delivered even though it carries no `phase_signal` (phase_tool.py:192)."""
+    rows = _paramiko_rows()
+    _deliver_word(rows, claim_sha256=_BUILD_CLAIM, signal="")
+    _seal(rows, claim_sha256=_BUILD_CLAIM)
     transcript = _write(tmp_path / "paramiko.jsonl", rows)
 
     with pytest.raises(ReplayValidationError, match="delivered"):
@@ -495,29 +654,12 @@ def test_replay_refuses_a_seal_that_diverges_from_the_delivered_word(tmp_path):
 
 def test_replay_accepts_the_named_revision(tmp_path):
     rows = _paramiko_rows()
-    delivered = {
-        "decision_id": "gate-delivered",
-        "accepted": True,
-        "validated_outcome": "failed",
-        "claim_disposition": "confirmed",
-        "validator_state": "red",
-        "control_disposition": "terminal_claimable",
-        "blocker_owner": "none",
-        "reason": "tests were not executed",
-        "evidence_refs": [],
-        "suggestions": [],
-        "code": "tests_not_executed",
-        "validated_facts": {},
-    }
-    for row in rows:
-        if row.get("kind") == "tool_result":
-            row["payload"]["result"]["metadata"]["gate_result"] = delivered
-            row["payload"]["result"]["metadata"]["phase_signal"] = "done"
-            break
+    _deliver_word(rows, claim_sha256=_BUILD_CLAIM)
     revised = None
     for index, row in enumerate(rows):
         if row.get("kind") == "gate_decision":
             row["payload"]["decision_id"] = "gate-sealed"
+            row["payload"]["claim_sha256"] = _BUILD_CLAIM
             row["payload"]["supersedes"] = "gate-delivered"
             revised = (
                 index,

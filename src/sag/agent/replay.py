@@ -296,8 +296,15 @@ def _recorded_test_dispatch(tool: str, params: Mapping[str, Any]) -> bool:
     return False
 
 
-def _delivered_gate_word(result: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The graded word a tool result handed the model, when it carried one."""
+def _delivered_gate_word(result: Mapping[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """The claim a tool result graded and the word it handed the model.
+
+    A rejection delivers its gate exactly as an acceptance does — the model
+    reads the reason and re-plans on it — so `phase_signal` is not the test.
+    The claim name is: without it the word cannot be paired with the decision
+    that grades the same claim, and pairing by adjacency condemns transcripts
+    the live rule permits (spec §3.4).
+    """
 
     metadata = result.get("metadata")
     if not isinstance(metadata, Mapping):
@@ -306,9 +313,10 @@ def _delivered_gate_word(result: Mapping[str, Any]) -> dict[str, Any] | None:
     if not isinstance(body, Mapping):
         return None
     decision_id = str(body.get("decision_id") or "").strip()
-    if not decision_id or not str(metadata.get("phase_signal") or "").strip():
+    claim_sha256 = str(metadata.get("phase_claim_sha256") or "").strip()
+    if not decision_id or not claim_sha256:
         return None
-    return {
+    return claim_sha256, {
         "decision_id": decision_id,
         "accepted": bool(body.get("accepted")),
         "validated_outcome": str(body.get("validated_outcome") or ""),
@@ -1257,9 +1265,14 @@ class ControlReplayRunner:
         settled_jobs: set[str] = set()
         settled_job_events: dict[str, tuple[str, int]] = {}
         stall_event_fingerprints: set[str] = set()
-        # Gate truth (spec 2026-08-14 §3): the word a tool result handed the
-        # model, the gradings already named, and the revisions spoken aloud.
-        delivered_gate_word: dict[str, Any] | None = None
+        # Gate truth (spec 2026-08-14 §3): the words tool results handed the
+        # model under the open attempt keyed by the claim each graded, the
+        # gradings already named, and the revisions spoken aloud. Same key and
+        # same scope as the live `_delivered_gates` registry — a word delivered
+        # for one claim is nothing to a decision that grades another, and a word
+        # no decision ever claimed simply expires with its attempt.
+        delivered_gate_words: dict[str, dict[str, Any]] = {}
+        delivered_gate_attempt: str | None = None
         seen_decision_ids: set[str] = set()
         gate_outcome_revisions: set[tuple[str, str]] = set()
         evidence_publications: dict[tuple[str, str, str], EvidencePublicationPayload] = {}
@@ -1281,6 +1294,15 @@ class ControlReplayRunner:
             active_envelope = envelope
             envelope_count += 1
             return envelope
+
+        def delivered_words() -> dict[str, dict[str, Any]]:
+            """Words delivered under the OPEN attempt, and only those."""
+            nonlocal delivered_gate_words, delivered_gate_attempt
+            attempt = str(machine.current_attempt_id or "")
+            if delivered_gate_attempt != attempt:
+                delivered_gate_attempt = attempt
+                delivered_gate_words = {}
+            return delivered_gate_words
 
         for event in transcript.events:
             payload = event.payload
@@ -1554,9 +1576,10 @@ class ControlReplayRunner:
                     ):
                         raise ReplayValidationError("tool result targets a stale phase attempt")
                     result_payload = dict(payload["result"])
-                    delivered_gate_word = (
-                        _delivered_gate_word(result_payload) or delivered_gate_word
-                    )
+                    delivered_word = _delivered_gate_word(result_payload)
+                    if delivered_word is not None:
+                        graded_claim, word = delivered_word
+                        delivered_words()[graded_claim] = word
                     output_ref = result_payload.get("output_ref")
                     if output_ref:
                         output_storage.register(
@@ -1702,10 +1725,9 @@ class ControlReplayRunner:
                     # not a second state mutation.
                 elif event.kind == "gate_outcome_revised":
                     revision = GateOutcomeRevisedPayload.model_validate(payload)
-                    if (
-                        delivered_gate_word is None
-                        or str(delivered_gate_word["decision_id"]) != revision.delivered_decision_id
-                    ):
+                    if revision.delivered_decision_id not in {
+                        str(word["decision_id"]) for word in delivered_words().values()
+                    }:
                         raise ReplayValidationError(
                             "gate_outcome_revised names a word that was never delivered"
                         )
@@ -1714,15 +1736,15 @@ class ControlReplayRunner:
                     )
                 elif event.kind == "gate_decision":
                     gate_decision_count += 1
+                    claim_sha256 = str(payload.get("claim_sha256") or "").strip()
                     _verify_gate_word_lineage(
                         payload,
-                        delivered=delivered_gate_word,
+                        delivered=delivered_words().get(claim_sha256) if claim_sha256 else None,
                         seen_decision_ids=seen_decision_ids,
                         revisions=gate_outcome_revisions,
                     )
                     if str(payload.get("decision_id") or "").strip():
                         seen_decision_ids.add(str(payload["decision_id"]).strip())
-                    delivered_gate_word = None
                     if active_repair_context is not None:
                         finalizer_gate = bool(
                             pending_finalizer_gate is not None
