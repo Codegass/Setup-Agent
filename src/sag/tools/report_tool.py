@@ -2753,11 +2753,10 @@ class ReportTool(BaseTool, UIEventEmitter):
                 )
                 actual_accomplishments["physical_validation"]["test_status"] = test_status
 
-                # Log test status insights
-                if test_status.get("pass_rate", 0) <= 80 and test_status.get("has_test_reports"):
-                    logger.warning(
-                        f"⚠️ Test pass rate is {test_status['pass_rate']:.1f}% (below 80% threshold)"
-                    )
+                # Log test status insights. Red tests are sealed facts, not a
+                # repair duty — the log states the rate without inventing a bar.
+                if test_status.get("has_test_reports") and test_status.get("pass_rate", 100) < 100:
+                    logger.info(f"Test pass rate is {test_status['pass_rate']:.1f}%")
                 if test_status.get("test_exclusions"):
                     logger.warning(
                         f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}"
