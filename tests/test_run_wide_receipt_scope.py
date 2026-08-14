@@ -255,6 +255,85 @@ def test_the_sealed_receipt_count_is_counted_not_a_literal_zero():
     assert "test_execution_receipts" not in result.facts
 
 
+def test_the_closure_survey_is_read_once_per_claim(monkeypatch):
+    """One question, one computation.
+
+    `_test_receipt_scope_facts` re-ran `resolve_survey_test_candidates` — a
+    manifest read plus several realpath probes — to answer a question
+    `required_test_attempt` had just answered for the rejection it is
+    describing. Two reads of one survey can also disagree: the requirement and
+    the fact beside it would then be graded against different coordinates.
+    """
+    from sag.agent import attempt_policy
+
+    calls = []
+    real = attempt_policy.resolve_survey_test_candidates
+
+    def counted(orchestrator):
+        calls.append(orchestrator)
+        return real(orchestrator)
+
+    monkeypatch.setattr(attempt_policy, "resolve_survey_test_candidates", counted)
+    # The pre-fix second reader imported the symbol into its own namespace, so
+    # patching only `attempt_policy` would not have seen it.
+    monkeypatch.setattr(
+        "sag.tools.phase_tool.resolve_survey_test_candidates", counted, raising=False
+    )
+    state = _ready_state()
+    _record_build_phase_test(state, root="/workspace/bigtop/bigtop-test-framework")
+    tool = PhaseTool(
+        machine=SimpleNamespace(
+            current_phase="test",
+            current_attempt_id="test-1",
+            is_complete=False,
+        ),
+        validator=None,
+        orchestrator=ManifestOrchestrator(),
+        project_name="bigtop",
+        gate_fn=AcceptingGate(),
+        run_evidence_state=state,
+    )
+
+    result = tool.execute(action="done", outcome="failed")
+
+    assert result.error_code == "TEST_ATTEMPT_REQUIRED"
+    assert len(calls) == 1
+
+
+def test_a_non_test_phase_claim_spends_no_survey_probe(monkeypatch):
+    """The single read is still LAZY: a claim that never asks the test-closure
+    question must not pay for the answer."""
+    from sag.agent import attempt_policy
+
+    calls = []
+    real = attempt_policy.resolve_survey_test_candidates
+
+    def counted(orchestrator):
+        calls.append(orchestrator)
+        return real(orchestrator)
+
+    monkeypatch.setattr(attempt_policy, "resolve_survey_test_candidates", counted)
+    monkeypatch.setattr(
+        "sag.tools.phase_tool.resolve_survey_test_candidates", counted, raising=False
+    )
+    tool = PhaseTool(
+        machine=SimpleNamespace(
+            current_phase="build",
+            current_attempt_id="build-1",
+            is_complete=False,
+        ),
+        validator=None,
+        orchestrator=ManifestOrchestrator(),
+        project_name="bigtop",
+        gate_fn=AcceptingGate(),
+        run_evidence_state=_ready_state(),
+    )
+
+    tool.execute(action="done", outcome="success")
+
+    assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # §1 item 3 — unattributed executions are named, never silently zeroed
 # ---------------------------------------------------------------------------
@@ -405,6 +484,241 @@ def test_a_zero_headline_without_auxiliary_volume_is_not_a_conflict():
     _, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert UNATTRIBUTED_CONFLICT not in conflicts
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 4 — the disclosure is monotone on the REPORT axis too
+# ---------------------------------------------------------------------------
+def _bigtop_stats(*, auxiliary: bool) -> SnapshotTestStats:
+    """bigtop's real partition: 50 attributed cases, 4 reports nobody claimed."""
+    return SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        judgment="success",
+        receipt_scoped=True,
+        auxiliary_test_stats=(
+            {"executed": 4, "passed": 4, "failed": 0, "errors": 0, "skipped": 0}
+            if auxiliary
+            else None
+        ),
+    )
+
+
+def _verdict_for(stats: SnapshotTestStats) -> str:
+    from sag.agent.verdict_finalizer import BuildEvidenceSnapshot, _snapshot_verdict
+
+    _, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+    return _snapshot_verdict(
+        BuildEvidenceSnapshot(observed=True, green=True, judgment="success", source="physical"),
+        stats,
+        conflicts,
+    )
+
+
+def test_deleting_the_unattributed_reports_never_changes_the_verdict_word():
+    """The capping version violated P4 from the REPORT side.
+
+    bigtop's shape: headline 50 attributed + 4 unclaimed reports capped the run
+    at `partial`; `rm` on those four unclaimed XML files lifted the cap to
+    `success`. Evidence PRESENCE worsened the verdict, which is the same
+    inversion the arming asymmetry had on the receipt side — and stray XML may
+    legitimately pre-date the checkout, so its presence is not the run's doing.
+
+    Non-capping is the only treatment monotone on both axes: the headline band
+    already derives from attributed counts alone, so adding or deleting
+    unattributed reports moves the DISCLOSURE and never the word.
+    """
+    with_reports = _bigtop_stats(auxiliary=True)
+    without_reports = _bigtop_stats(auxiliary=False)
+
+    _, conflicts = grain_rates(with_reports, driven_modules=set(), test_modules=set())
+
+    # Sealed exactly as before: named, visible, and still out of the numerator.
+    assert UNATTRIBUTED_CONFLICT in conflicts
+    assert grain_rates(with_reports, driven_modules=set(), test_modules=set())[0][
+        "cases"
+    ].payload()["reason"] == ("50/100 — 4 executions visible on disk but bound to no receipt")
+    # Neither their presence nor their deletion moves the word.
+    assert _verdict_for(with_reports) == "success"
+    assert _verdict_for(without_reports) == "success"
+
+
+def test_the_unattributed_conflict_is_adjudicated_not_capping():
+    """The kernel-level statement of the same property."""
+    from sag.verdict import ADJUDICATED_CONFLICTS, run_verdict
+
+    assert UNATTRIBUTED_CONFLICT in ADJUDICATED_CONFLICTS
+    assert run_verdict("success", "success", (UNATTRIBUTED_CONFLICT,)) == "success"
+    # It is still an honest-uncertainty conflict for every other reader, and a
+    # genuine evidence conflict standing beside it still caps.
+    beside_a_parse_error = (UNATTRIBUTED_CONFLICT, "test_report_parse_error")
+    assert run_verdict("success", "success", beside_a_parse_error) == "partial"
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 5 — the stale third destination is disclosed
+# ---------------------------------------------------------------------------
+def test_stale_volume_is_named_separately_from_auxiliary_volume():
+    """A superseded-sha claim used to drop its volume out of every sentence.
+
+    Three destinations exist (verified / auxiliary / stale) and only two were
+    ever spoken aloud, so a rewritten report was indistinguishable from a report
+    that never existed.
+    """
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        auxiliary_test_stats={"executed": 4, "passed": 4, "failed": 0, "errors": 0, "skipped": 0},
+        stale_test_stats={"executed": 6, "passed": 6, "failed": 0, "errors": 0, "skipped": 0},
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert grains["cases"].payload()["reason"] == (
+        "50/100 — 4 executions visible on disk but bound to no receipt, 6 under rewritten claims"
+    )
+    assert UNATTRIBUTED_CONFLICT in conflicts
+    # Stale volume is disclosed, never counted.
+    assert grains["cases"].payload()["numerator"] == 50
+
+
+def test_stale_volume_alone_is_still_disclosed():
+    """Nothing unattributed, six executions under rewritten claims: the sentence
+    exists and the unattributed conflict does not (stale rides
+    ``test_reports_stale``, which the rollup already emits)."""
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        stale_test_stats={"executed": 6, "passed": 5, "failed": 1, "errors": 0, "skipped": 0},
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert grains["cases"].payload()["reason"] == "50/100 — 6 executions under rewritten claims"
+    assert UNATTRIBUTED_CONFLICT not in conflicts
+
+
+def test_the_parser_counts_the_volume_under_rewritten_claims(tmp_path, monkeypatch):
+    """The counts the disclosure needs come from the same partition pass."""
+    from test_receipt_scoped_rollup import _surefire_xml, _validator, _write
+
+    workspace = ReceiptWorkspace(tmp_path)
+    kept = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.KeptTest.xml",
+        "org.apache.bigtop.datagen.KeptTest",
+        [f"kept{i}" for i in range(25)],
+    )
+    superseded = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.StaleTest.xml",
+        "org.apache.bigtop.datagen.StaleTest",
+        [f"stale{i}" for i in range(10)],
+    )
+    payload = _receipt("inv-test-1-0001", workspace.primary_root, new=[kept, superseded])
+    _write(
+        superseded,
+        _surefire_xml("org.apache.bigtop.datagen.StaleTest", [f"stale{i}" for i in range(7)]),
+    )
+    workspace.write_receipt(payload)
+    _bind_primary_coordinate(monkeypatch, workspace)
+    validator, _ = _validator(workspace)
+
+    result = validator.parse_test_reports(str(workspace.project))
+
+    assert result["total_tests"] == 25
+    assert result["stale_test_reports"] == [str(superseded)]
+    # The bytes on disk hold 7 cases; the claim vouches for the 10 that are gone.
+    assert result["stale_test_stats"] == {
+        "executed": 7,
+        "passed": 7,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 6 — fallback parity: the unpartitioned corpus is not a headline
+# ---------------------------------------------------------------------------
+def _sealed_snapshot(rollup: dict, *, run_id: str = "receipt-scope-shape"):
+    from sag.agent.verdict_finalizer import VerdictFinalizer
+
+    state = RunEvidenceState(run_id=run_id)
+    state.register_fact(StateScope.TEST_RUNTIME, "test.stats", rollup, "artifact://test-rollup")
+    state.seal(finalized_at="2026-08-14T00:00:00Z", close_reason="test_terminated")
+    return VerdictFinalizer(orchestrator=None)._snapshot_for_state(state)
+
+
+def _counts(executed: int) -> dict:
+    return {
+        "executed": executed,
+        "passed": executed,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+
+
+def test_an_unpartitioned_rollup_is_unattributed_volume_not_a_headline():
+    """The shell find/cat rescan partitions nothing, so everything it counted is
+    unclaimed by construction. Sealing it as the headline gave the LESS
+    machinery the HIGHER number for the same corpus."""
+    snapshot = _sealed_snapshot(
+        {
+            "discovered": 9754,
+            "unique": _counts(10448),
+            "raw": _counts(10448),
+        }
+    )
+
+    assert snapshot.test_stats.unique.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats == _counts(10448)
+    assert UNATTRIBUTED_CONFLICT in snapshot.conflicts
+    assert snapshot.rates["test"]["cases"]["reason"] == (
+        "0/9754 — 10,448 executions visible on disk but bound to no receipt"
+    )
+    # `receipt_scoped` stays absent: the routing states the provenance, it does
+    # not invent one.
+    assert snapshot.test_stats.receipt_scoped is None
+
+
+def test_both_parsers_seal_the_same_zero_receipt_corpus():
+    """Fallback parity. For a run with no receipts the compact parser seals
+    headline 0 + auxiliary 10,448; the shell rescan used to seal 10,448 as the
+    headline — the two paths disagreed by the entire corpus, and the higher
+    number came from the LESS machinery.
+
+    The phase-close refusal is untouched by this routing: an unpartitioned
+    rollup still closes nothing (``test_receipt_missing``), fenced by
+    ``tests/test_phase_gates.py::
+    test_counts_that_did_not_come_from_the_claim_partition_cannot_close_the_phase``.
+    """
+    partitioned = _sealed_snapshot(
+        {
+            "discovered": 9754,
+            "unique": {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0},
+            "raw": {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0},
+            "receipt_scoped": True,
+            "auxiliary_test_stats": _counts(10448),
+        },
+        run_id="compact-parser-shape",
+    )
+    unpartitioned = _sealed_snapshot(
+        {
+            "discovered": 9754,
+            "unique": _counts(10448),
+            "raw": _counts(10448),
+        },
+        run_id="shell-fallback-shape",
+    )
+
+    assert partitioned.rates["test"]["cases"] == unpartitioned.rates["test"]["cases"]
+    assert partitioned.verdict == unpartitioned.verdict
+    assert partitioned.test_stats.unique == unpartitioned.test_stats.unique
 
 
 @pytest.fixture

@@ -1494,21 +1494,29 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
                 # partition (constant for that parser since 2026-08-14); a
                 # rollup without it came from the unpartitioned shell fallback.
                 "receipt_scoped": True if status.get("receipt_scoped") else None,
-                "auxiliary_test_stats": _auxiliary_counts(status.get("auxiliary_test_stats")),
+                "auxiliary_test_stats": _excluded_report_counts(status.get("auxiliary_test_stats")),
                 "stale_test_reports": (
                     [str(item) for item in status.get("stale_test_reports") or ()] or None
                 ),
+                # The third destination's VOLUME, not just its file names: a
+                # superseded-sha claim that names only paths drops its
+                # executions out of every disclosure, so a rewritten report
+                # reads exactly like a report that never existed.
+                "stale_test_stats": _excluded_report_counts(status.get("stale_test_stats")),
             }.items()
             if value is not None
         },
     }
 
 
-def _auxiliary_counts(value: Any) -> dict[str, int] | None:
-    """Auxiliary reports in the primary rollup's count shape, never merged.
+def _excluded_report_counts(value: Any) -> dict[str, int] | None:
+    """An excluded destination's volume in the primary rollup's count shape.
 
-    Present only when the validator observed auxiliary reports at all; an
-    all-zero block still counts as observed ("reports existed, no tests ran").
+    Auxiliary (claimed by nobody) and stale (claimed, superseded) reports both
+    land here, each under its own key and never merged into one another or into
+    the headline. Present only when the validator observed that destination at
+    all; an all-zero block still counts as observed ("reports existed, no tests
+    ran").
     """
     if not isinstance(value, Mapping) or not value:
         return None

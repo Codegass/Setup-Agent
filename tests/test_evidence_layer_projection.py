@@ -40,6 +40,7 @@ def _snapshot(
     conflicts=(),
     auxiliary=None,
     stale=None,
+    stale_counts=None,
 ):
     return RunVerdictSnapshot(
         run_id="metrics-v2-run",
@@ -59,6 +60,7 @@ def _snapshot(
             receipt_scoped=receipt_scoped or None,
             auxiliary_test_stats=auxiliary,
             stale_test_reports=stale,
+            stale_test_stats=stale_counts,
         ),
     )
 
@@ -465,6 +467,30 @@ def test_stale_files_stay_visible_without_inventing_observation_outcomes():
     assert stale["executed"] is None
     assert stale["report_file_count"] == 2
     assert stale["reason_counts"] is None
+
+
+def test_measured_stale_volume_is_stated_rather_than_left_null():
+    """The third destination stops vanishing.
+
+    The claim partition counts stale reports on the same pass it counts
+    auxiliary ones, so their volume is a measurement, not an invention. Where
+    the seal carries it the projection states it; where it does not, the bucket
+    above still refuses to make an outcome up.
+    """
+    metrics = _metrics(
+        _snapshot(
+            stale=["old-a.xml", "old-b.xml"],
+            stale_counts=_count(6, 5, failed=1),
+        )
+    )
+    stale = metrics["tests"]["stale_observations"]
+
+    assert stale["executed"] == 6
+    assert stale["failed"] == 1
+    assert stale["report_file_count"] == 2
+    assert stale["reason_counts"] == {"receipt_claim_superseded": 6}
+    # Disclosed, never counted: the receipt-execution grain is untouched.
+    assert metrics["tests"]["claimed"]["receipt_executions"]["executed"] == 2
 
 
 def test_success_with_degraded_transport_is_a_writer_contract_error():

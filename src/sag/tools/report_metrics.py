@@ -691,6 +691,14 @@ def _snapshot_test_facts(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 for path in (test_stats.get("stale_test_reports") or ())
                 if str(path).strip()
             ],
+            "stale": _known_counts(
+                (
+                    test_stats.get("stale_test_stats")
+                    if isinstance(test_stats.get("stale_test_stats"), Mapping)
+                    else None
+                ),
+                basis="reports whose receipt claim was superseded",
+            ),
             "flaky": _int_or_none(test_stats.get("flaky_count")),
         }
 
@@ -722,6 +730,7 @@ def _snapshot_test_facts(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "receipt_scoped": False,
         "auxiliary": None,
         "stale_reports": [],
+        "stale": None,
         "flaky": _int_or_none(status.get("tests_flaky")),
     }
 
@@ -799,6 +808,7 @@ def _project_tests(
         )
 
     stale_reports = facts["stale_reports"]
+    stale_counts = facts["stale"]
     row_stale = row_projection.get("stale") if isinstance(row_projection, Mapping) else None
     if stale_reports:
         row_stale_files = (
@@ -807,8 +817,15 @@ def _project_tests(
             else 0
         )
         stale = _observation_bucket(
-            _all_null_counts(reason="stale report outcomes are intentionally not reparsed"),
+            # The volume is stated when the partition measured it, and only
+            # then: a superseded claim that named paths alone dropped its
+            # executions out of every disclosure, but a seal that never counted
+            # them is not a licence to invent an outcome for them.
+            stale_counts
+            if stale_counts is not None
+            else _all_null_counts(reason="stale report outcomes were not counted by this seal"),
             report_file_count=len(set(stale_reports)) + (row_stale_files or 0),
+            reason="receipt_claim_superseded" if stale_counts is not None else None,
         )
     elif isinstance(row_stale, Mapping):
         stale = dict(row_stale)

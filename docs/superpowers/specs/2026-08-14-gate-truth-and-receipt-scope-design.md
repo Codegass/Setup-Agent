@@ -111,6 +111,83 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    `tests/test_python_tool.py::test_pytest_receipt_claims_the_junitxml_it_wrote`.
    No claims-producer fix was needed, and universal scoping does not zero
    Python projects.
+4. **The unattributed conflict is NON-CAPPING (adjudicated).** Item 2 above
+   made the disclosure monotone on the RECEIPT axis and left it non-monotone on
+   the REPORT axis: on bigtop's shape a headline of 50 attributed cases beside 4
+   unclaimed reports capped the run at `partial`, and deleting those four XML
+   files lifted the cap to `success`. Evidence PRESENCE worsened the verdict —
+   the same P4 inversion as the arming asymmetry, entering from the other side.
+   `test_executions_unattributed_to_receipts` therefore joins
+   `verdict.ADJUDICATED_CONFLICTS`: it is named, it is disclosed, and it does not
+   cap. Rationale, in the order it was decided:
+   - the headline band already derives from ATTRIBUTED counts alone, so the
+     unattributed volume has no second claim on the verdict to make;
+   - stray unclaimed XML may legitimately pre-date the checkout (a vendored
+     sample, a cached report from an image layer), which is not the run's doing
+     and not something the run can repair;
+   - non-capping is the only treatment monotone on BOTH axes — adding a receipt
+     can only move reports from auxiliary to headline, and adding or deleting an
+     unattributed report moves the disclosure and never the word.
+   The conflict and its disclosure sentence are otherwise unchanged: visibility
+   without authority, now also without a cap. A genuine evidence conflict
+   standing beside it (`test_report_parse_error`, `test_reports_stale`) still
+   caps exactly as before.
+5. **The stale destination is disclosed.** Reports leave the headline through
+   two doors and they mean different things: AUXILIARY is claimed by nobody,
+   STALE was claimed and the bytes were then rewritten. Only the first was ever
+   spoken aloud, so a superseded-sha claim silently dropped its volume and a
+   rewritten report read exactly like a report that never existed. The claim
+   partition now counts stale reports on the same pass it counts auxiliary ones
+   (`stale_test_stats`, beside the existing `stale_test_reports` paths) and the
+   cases grain names them separately — `50/100 — 4 executions visible on disk
+   but bound to no receipt, 6 under rewritten claims`. Stale volume is still
+   never counted, and it still rides the existing `test_reports_stale` conflict
+   rather than the unattributed one.
+6. **Fallback parity.** When the compact in-container parser cannot run (no
+   `python3` in the image) the shell find/cat rescan produces counts with no
+   claim partition behind them. Sealing those as the HEADLINE meant that, for a
+   zero-receipt run, the compact parser sealed headline 0 + auxiliary N while
+   the fallback sealed N — the two paths disagreed by the entire corpus, and the
+   higher number came from the LESS machinery. The finalizer now routes a rollup
+   WITHOUT the `receipt_scoped` marker (i.e. fallback-produced) to unattributed
+   volume: headline 0, the counts disclosed through the same conflict and the
+   same sentence. The counts are moved, never deleted. The phase-close refusal
+   is unchanged — an unpartitioned rollup still closes nothing
+   (`test_receipt_missing`) — and the deliberate shell-fallback fences in
+   `tests/test_pytest_report_aggregation.py` still test that path's AGGREGATION.
+
+### Deferred items (2026-08-14, named so they are not invisible)
+
+Two known gaps are accepted for now rather than silently carried:
+
+1. **Task #52 — `run_test_receipts` /workspace fallback bound.**
+   `attempt_policy.run_test_receipts` falls back to the entire `/workspace` when
+   `project_root` is None, which is exactly the state the predicate is consulted
+   in (`manifest_unreadable` / `coordinates_missing` are the statuses that most
+   often trigger the close). A terminal test dispatch in a sibling checkout or a
+   vendored sample under `/workspace` therefore satisfies the run-wide question.
+   Bounded and low-likelihood on single-project containers, but the WIDEST
+   boundary is applied precisely where the survey is least trustworthy. Tracked
+   as task #52; not fixed here because narrowing it needs a boundary the
+   unreadable-manifest state does not have.
+2. **The panel-lock fence skips when its evidence is absent.**
+   `tests/test_category3_panel_registry.py` skips eight data assertions when
+   `logs/panel-category3/panel-lock.json` is missing from a checkout. Absent
+   evidence skipping with a visible reason is the accepted behaviour for now —
+   it is not read as a pass — but the fence does go quiet exactly when its
+   evidence disappears. Revisit if the lock regains a committed source of truth;
+   the fix is to commit the lock (or gate the skip on an explicit opt-out), not
+   to assert over data that is not there.
+3. **Three invented cut-offs remain in `_render_issues_recommendations`** —
+   found while retiring the five markers, recorded rather than silently left.
+   `report_tool.py:5151/5161/5175` still select operator PROSE at `>= 95`
+   ("High Pass Rate"), `< 90` ("Low Execution Rate") and `< 80` ("Incomplete
+   Coverage"). They pick a sentence rather than grade an outcome, and each
+   carries a wording decision the marker rule does not settle (what "low"
+   should mean once the boundary is the band table, and whether an existing
+   `"Low Execution Rate"` line may be reworded — `tests/test_provision_priority
+   .py:296` reads it). Out of scope for the marker decision; the same treatment
+   applies when they are addressed.
 
 ## 2. Fix B — the 80% thresholds leave the gate/claim chain (#49)
 

@@ -100,6 +100,7 @@ class SnapshotTestStats(BaseModel):
     receipt_scoped: bool | None = None
     auxiliary_test_stats: dict[str, int] | None = None
     stale_test_reports: list[str] | None = None
+    stale_test_stats: dict[str, int] | None = None
 
     @model_serializer(mode="wrap")
     def _omit_unobserved_collection_fields(self, handler):
@@ -113,6 +114,7 @@ class SnapshotTestStats(BaseModel):
             "receipt_scoped",
             "auxiliary_test_stats",
             "stale_test_reports",
+            "stale_test_stats",
         ):
             if data.get(key) is None:
                 data.pop(key, None)
@@ -656,6 +658,30 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
     return stats, distinct_failures, errors
 
 
+_EXCLUDED_COUNT_FIELDS = ("executed", "passed", "failed", "errors", "skipped")
+
+
+def _excluded_counts(value: Any) -> dict[str, int] | None:
+    """One excluded destination's volume, or None when it was never observed."""
+    if not isinstance(value, Mapping):
+        return None
+    return {str(name): _nonnegative_int(count) or 0 for name, count in value.items()}
+
+
+def _counts_payload(counts: SnapshotTestCounts) -> dict[str, int]:
+    return {field: getattr(counts, field) for field in _EXCLUDED_COUNT_FIELDS}
+
+
+def _sum_excluded_counts(left: dict[str, int] | None, right: dict[str, int]) -> dict[str, int]:
+    """Add one excluded volume to another without inventing an absent one."""
+    if not left:
+        return dict(right)
+    merged = dict(left)
+    for name, count in right.items():
+        merged[name] = merged.get(name, 0) + count
+    return merged
+
+
 def _fold_test_stats(
     state: RunEvidenceState,
 ) -> tuple[SnapshotTestStats, tuple[str, ...]]:
@@ -693,6 +719,21 @@ def _fold_test_stats(
             or validated_raw.executed < validated_unique.executed
         ):
             return SnapshotTestStats(), _dedupe([*conflicts, "validated_test_stats_invalid"])
+        auxiliary = _excluded_counts(validated_rollup.get("auxiliary_test_stats"))
+        if not validated_rollup.get("receipt_scoped"):
+            # Fallback parity. `receipt_scoped` is constant for the compact
+            # in-container parser, so a rollup without it came from the shell
+            # find/cat rescan, which partitions NOTHING: every count it carries
+            # is a report no receipt claims. Sealing that as the headline gave
+            # the LESS machinery the HIGHER number — for a zero-receipt run the
+            # compact parser sealed headline 0 + auxiliary N while the fallback
+            # sealed N, so the two paths disagreed by the entire corpus. The
+            # counts are routed to where their provenance puts them, not
+            # deleted: same disclosure sentence, same conflict, and the
+            # phase-close refusal (`test_receipt_missing`) is unchanged.
+            auxiliary = _sum_excluded_counts(auxiliary, _counts_payload(validated_raw))
+            validated_unique = SnapshotTestCounts()
+            validated_raw = SnapshotTestCounts()
         # Execution, not the project's pass percentage, is the physical fact
         # this snapshot records.  Red remains visible in the counts and the
         # heavy-red rate signal; it is not a failed SAG execution.
@@ -716,17 +757,11 @@ def _fold_test_stats(
                     else None
                 ),
                 receipt_scoped=True if validated_rollup.get("receipt_scoped") else None,
-                auxiliary_test_stats=(
-                    {
-                        str(name): _nonnegative_int(count) or 0
-                        for name, count in validated_rollup["auxiliary_test_stats"].items()
-                    }
-                    if isinstance(validated_rollup.get("auxiliary_test_stats"), Mapping)
-                    else None
-                ),
+                auxiliary_test_stats=auxiliary,
                 stale_test_reports=(
                     [str(item) for item in validated_rollup.get("stale_test_reports") or ()] or None
                 ),
+                stale_test_stats=_excluded_counts(validated_rollup.get("stale_test_stats")),
             ),
             conflicts,
         )
@@ -809,6 +844,13 @@ def _fold_test_stats(
     )
 
 
+def _excluded_executions(counts: dict[str, int] | None) -> int:
+    """One excluded destination's execution volume (0 = nothing excluded)."""
+    if not isinstance(counts, Mapping):
+        return 0
+    return _nonnegative_int(counts.get("executed")) or 0
+
+
 def _unattributed_executions(stats: SnapshotTestStats) -> int:
     """Executions visible on disk that no receipt claims (0 = none excluded).
 
@@ -826,11 +868,26 @@ def _unattributed_executions(stats: SnapshotTestStats) -> int:
     attribute the corpus. Excluded volume is disclosed at any headline, and the
     sentence names both numbers so a reader can see the ratio.
     """
-    auxiliary = stats.auxiliary_test_stats
-    if not isinstance(auxiliary, Mapping):
-        return 0
-    executed = _nonnegative_int(auxiliary.get("executed")) or 0
-    return executed
+    return _excluded_executions(stats.auxiliary_test_stats)
+
+
+def _excluded_volume_clauses(unattributed: int, stale: int) -> list[str]:
+    """Name each excluded destination separately, in one shared vocabulary.
+
+    A report leaves the headline through one of two doors and they mean
+    different things: AUXILIARY is claimed by nobody, STALE was claimed and the
+    bytes were then rewritten. Only the first was ever spoken aloud, so a
+    superseded-sha claim silently dropped its volume and a rewritten report read
+    exactly like a report that never existed. Neither is ever counted.
+    """
+    clauses: list[str] = []
+    if unattributed:
+        clauses.append(f"{unattributed:,} executions visible on disk but bound to no receipt")
+    if stale:
+        # "executions" is said once per sentence, by whichever clause opens it.
+        volume = f"{stale:,}" if clauses else f"{stale:,} executions"
+        clauses.append(f"{volume} under rewritten claims")
+    return clauses
 
 
 def test_grain_rates(
@@ -841,15 +898,15 @@ def test_grain_rates(
     """Return execution-based test case and surveyed-module grains."""
 
     unattributed = _unattributed_executions(stats)
+    excluded = ", ".join(
+        _excluded_volume_clauses(unattributed, _excluded_executions(stats.stale_test_stats))
+    )
     if stats.discovered:
         cases = GrainRate(
             numerator=stats.unique.executed,
             denominator=stats.discovered,
             reason=(
-                f"{stats.unique.executed}/{stats.discovered} — {unattributed:,} "
-                "executions visible on disk but bound to no receipt"
-                if unattributed
-                else None
+                f"{stats.unique.executed}/{stats.discovered} — {excluded}" if excluded else None
             ),
         )
     else:
@@ -860,9 +917,8 @@ def test_grain_rates(
             0,
             None,
             reason=(
-                f"{stats.unique.executed} executed, static discovery found no count — "
-                f"{unattributed:,} executions visible on disk but bound to no receipt"
-                if unattributed
+                f"{stats.unique.executed} executed, static discovery found no count — {excluded}"
+                if excluded
                 else "static discovery found no count"
             ),
         )
@@ -1224,14 +1280,16 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
         value = raw_test_stats.get(field)
         if value is not None:
             validate_raw_count(value, label=field)
-    auxiliary = raw_test_stats.get("auxiliary_test_stats")
-    if auxiliary is not None:
-        if not isinstance(auxiliary, Mapping):
-            raise ValueError("verdict auxiliary test stats must be an object")
-        for name, value in auxiliary.items():
+    for destination in ("auxiliary", "stale"):
+        excluded = raw_test_stats.get(f"{destination}_test_stats")
+        if excluded is None:
+            continue
+        if not isinstance(excluded, Mapping):
+            raise ValueError(f"verdict {destination} test stats must be an object")
+        for name, value in excluded.items():
             if type(name) is not str or not name:
-                raise ValueError("verdict auxiliary test stat name is invalid")
-            validate_raw_count(value, label=f"auxiliary test {name}")
+                raise ValueError(f"verdict {destination} test stat name is invalid")
+            validate_raw_count(value, label=f"{destination} test {name}")
 
     raw_build = payload.get("build_evidence", {})
     if not isinstance(raw_build, Mapping):

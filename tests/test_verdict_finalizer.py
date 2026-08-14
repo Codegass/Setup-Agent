@@ -155,6 +155,11 @@ def _set_rate_test_rollup(state, *, passed, failed, errors, driven_modules):
             "flaky_count": 0,
             "driven_modules": driven_modules,
             "test_modules": ["core", "io"],
+            # The provenance a live dispatch states: these counts came out of
+            # the receipt-claim partition. A rollup WITHOUT the marker is the
+            # shell fallback's unpartitioned corpus and is sealed as
+            # unattributed volume, never as the headline.
+            "receipt_scoped": True,
         },
         evidence_ref="receipt://test-rollup",
         source_phase="test",
@@ -888,6 +893,7 @@ def test_validator_rollup_facts_are_the_canonical_snapshot_basis():
             },
             "flaky_count": 3,
             "conflicts": ["test_errors_detected"],
+            "receipt_scoped": True,
         },
         evidence_ref="report://surefire",
         source_phase="test",

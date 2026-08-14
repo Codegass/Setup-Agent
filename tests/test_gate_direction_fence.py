@@ -479,6 +479,68 @@ def test_the_operator_log_states_a_band_and_not_an_invented_cut_off():
     assert "api" not in banded[0]
 
 
+_RATE_MARKER_LABELS = ("Execution Rate", "Pass Rate", "Unique Tests Executed")
+
+
+def _marker_rows(pass_rate: float, exec_rate: float) -> list:
+    """The five rate-keyed operator markers for one (pass, execution) pair."""
+    from sag.tools.report_tool import ReportTool
+
+    tool = ReportTool.__new__(ReportTool)
+    snapshot = {
+        "phases": {"clone": True, "build": True, "test": True},
+        "physical_evidence": {"class_files": 10, "jar_files": 1},
+        "status": {
+            "static_test_count": 100,
+            "tests_total": 100,
+            "tests_unique": 100,
+            "tests_passed": int(pass_rate),
+            "tests_failed": 100 - int(pass_rate),
+            "tests_errors": 0,
+            "tests_skipped": 0,
+            "pass_pct": pass_rate,
+            "execution_rate": exec_rate,
+        },
+        "metrics_v2": {},
+    }
+    rendered = [
+        *ReportTool._render_summary_dashboard(tool, snapshot),
+        *ReportTool._render_detailed_test_analysis(tool, snapshot),
+    ]
+    return [line for line in rendered if any(label in line for label in _RATE_MARKER_LABELS)]
+
+
+@pytest.mark.parametrize(
+    ("rate", "marker", "forbidden"),
+    (
+        (100.0, "✅", ("⚠️", "❌")),
+        (96.0, "⚠️", ("✅",)),
+        (78.0, "⚠️", ("✅",)),
+        (49.0, "❌", ("✅",)),
+    ),
+    ids=("complete", "above_the_old_95", "between_80_and_95", "heavy_red"),
+)
+def test_the_operator_markers_key_to_the_documented_heavy_red_rule(rate, marker, forbidden):
+    """The five report markers still cut at the invented 80 (and an invented 95).
+
+    §2 retired the 80% from the verdict chain, and the operator log's INFO row
+    followed it into the shared band table — but the dashboard and the metrics
+    tables kept grading `>= 95 / >= 80 / else` in five places. 96% and 78% got
+    different icons for a distinction nothing in the harness makes.
+
+    The one documented rule is the heavy-red signal (`verdict_rates.HALF_FLOOR`):
+    below half the executed cases green is ❌, anything short of complete is ⚠️,
+    and only complete is ✅. No invented cut-off survives.
+    """
+    rows = _marker_rows(rate, rate)
+
+    assert len(rows) == 5, rows
+    for row in rows:
+        assert marker in row, row
+        for icon in forbidden:
+            assert icon not in row, row
+
+
 def test_zero_execution_reads_as_zero_execution_not_as_a_failed_percentage():
     """geode §2: `Tests below the 80% pass threshold: 0/0 (0.0%)` is gone."""
     from sag.agent.physical_validator import PhysicalValidator

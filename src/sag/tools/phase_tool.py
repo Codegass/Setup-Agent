@@ -12,9 +12,9 @@ from typing import Any, Callable, Dict, List, Optional
 from sag.agent.attempt_policy import (
     build_attempt_requirement,
     required_test_attempt,
-    resolve_survey_test_candidates,
     run_test_receipts,
     terminal_test_receipts,
+    test_closure_survey,
     untried_islands_requirement,
 )
 from sag.agent.job_obligations import read_obligations
@@ -144,7 +144,7 @@ class PhaseTool(BaseTool):
             },
         )
 
-    def _test_receipt_scope_facts(self, required_attempt) -> Dict[str, Any]:
+    def _test_receipt_scope_facts(self, required_attempt, resolved) -> Dict[str, Any]:
         """Both receipt counts, each under a name that says which one it is.
 
         The sealed number was a hard-coded 0 that told freemarker's run it had
@@ -157,13 +157,16 @@ class PhaseTool(BaseTool):
         The candidate-bound count exists only where candidates do: an
         unresolvable survey has nothing to bind to, and an absent fact stays
         absent rather than seal a 0 that means "not asked".
+
+        ``resolved`` is the survey the REQUIREMENT was graded against, handed
+        down by the caller. Re-probing it here asked the same question a second
+        time and could have answered it differently.
         """
         facts: Dict[str, Any] = {
             "run_wide_test_receipts": len(run_test_receipts(self.run_evidence_state)),
             "test_attempt_requirement": required_attempt.to_metadata(),
         }
-        resolved = resolve_survey_test_candidates(self.orchestrator)
-        if resolved.status == "available":
+        if resolved is not None and resolved.status == "available":
             candidates = (
                 (resolved.primary,) if resolved.primary is not None else resolved.candidates
             )
@@ -363,11 +366,16 @@ class PhaseTool(BaseTool):
                     },
                 )
 
+        # One question, one computation: the survey is read here at most once
+        # (never for a phase that does not ask the test-closure question) and
+        # the same resolution grades the requirement and the facts beside it.
+        survey = test_closure_survey(self.run_evidence_state, self.orchestrator, phase=phase)
         required_attempt = required_test_attempt(
             self.run_evidence_state,
             self.orchestrator,
             phase=phase,
             attempt_id=getattr(self.machine, "current_attempt_id", None),
+            resolution=survey,
         )
         if required_attempt is not None:
             return self._rejected_claim_result(
@@ -380,7 +388,7 @@ class PhaseTool(BaseTool):
                 ),
                 control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
                 blocker_owner="harness",
-                validated_facts=self._test_receipt_scope_facts(required_attempt),
+                validated_facts=self._test_receipt_scope_facts(required_attempt, survey),
             )
 
         if verb == "blocked" or claimed_outcome is PhaseOutcome.FAILED:

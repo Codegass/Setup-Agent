@@ -741,19 +741,28 @@ for identity in sorted(attempts):
 for key in latest:
     latest[key] += suite_only[key]
 
-# Auxiliary reports are aggregated on their own basis: raw statuses, no
-# canonical identities, no histories. They are evidence ABOUT the run, never
-# evidence OF the primary coordinate.
-auxiliary_counts = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
-for report_file in auxiliary_files:
-    parsed = parse_report(report_file)
-    if parsed is None:
-        continue
-    if parsed["cases"] is None:
-        add_suite_counts(auxiliary_counts, parsed["suite_counts"])
-        continue
-    for identity, status in parsed["cases"]:
-        bump(auxiliary_counts, status)
+# Auxiliary and stale reports are aggregated on their own basis: raw statuses,
+# no canonical identities, no histories. They are evidence ABOUT the run, never
+# evidence OF the primary coordinate. Stale volume is counted for the same
+# reason auxiliary volume is: a superseded-sha claim that names only a file path
+# drops its executions out of every sentence, and a rewritten report then reads
+# exactly like a report that never existed.
+def excluded_counts(files):
+    counts = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+    for report_file in files:
+        parsed = parse_report(report_file)
+        if parsed is None:
+            continue
+        if parsed["cases"] is None:
+            add_suite_counts(counts, parsed["suite_counts"])
+            continue
+        for identity, status in parsed["cases"]:
+            bump(counts, status)
+    return counts
+
+
+auxiliary_counts = excluded_counts(auxiliary_files)
+stale_counts = excluded_counts(stale_files)
 
 result = {
     "valid": bool(scanned_files),
@@ -808,6 +817,13 @@ if auxiliary_files:
     result["auxiliary_report_files"] = auxiliary_files[:200]
 if stale_files:
     result["stale_test_reports"] = stale_files[:200]
+    result["stale_test_stats"] = {
+        "executed": stale_counts["total"],
+        "passed": stale_counts["passed"],
+        "failed": stale_counts["failed"],
+        "errors": stale_counts["error"],
+        "skipped": stale_counts["skipped"],
+    }
 print(json.dumps(result, separators=(",", ":")))
 '''
 
@@ -2429,8 +2445,14 @@ class PhysicalValidator:
         """attempt_policy's primary test coordinate (Plan 4), or None.
 
         Receipts alone cannot say which invocation is *primary*; that is the
-        survey coordinate's job. Without it we cannot honestly claim scoping,
-        so the caller falls back to the legacy scan and says so.
+        survey coordinate's job. There is no legacy-scan fallback behind this
+        any more (universal claim scoping, 2026-08-14). ``None`` means only that
+        `_verified_report_claims` cannot narrow the ledger to one coordinate, so
+        it admits every run-wide receipt's claims; the claim partition itself
+        still runs, and the caller names the missing coordinate out loud
+        (`test_primary_coordinate_unresolved`) rather than pretending it scoped.
+        The resolution is cached on ``_last_test_candidate_resolution`` for the
+        callers that need to say WHY the coordinate is absent.
         """
         try:
             from sag.agent import attempt_policy
@@ -5522,6 +5544,7 @@ class PhysicalValidator:
             "auxiliary_test_stats",
             "auxiliary_report_files",
             "stale_test_reports",
+            "stale_test_stats",
             "receipt_error",
             "receipt_error_files",
         ):

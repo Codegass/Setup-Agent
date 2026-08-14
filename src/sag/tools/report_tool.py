@@ -35,11 +35,35 @@ from sag.verdict_rates import (
     BAND_FEW,
     BAND_HALF,
     BAND_NONE,
+    HALF_FLOOR,
     band_for,
     render_rate_lines,
 )
 
 from .base import BaseTool, ToolResult
+
+
+def rate_marker(rate: Optional[float]) -> str:
+    """The one icon rule for a measured rate in the operator report.
+
+    The dashboard and the metrics tables graded `>= 95 ✅ / >= 80 ⚠️ / else ❌`
+    in five places: two invented cut-offs, one of them the same 80% spec §2
+    took out of the verdict chain, giving 96% and 78% different icons for a
+    distinction nothing in this harness makes.
+
+    What the harness documents is one rule — the heavy-red signal at
+    ``HALF_FLOOR`` (more than half the executed cases red, the same boundary
+    ``_determine_actual_status`` and the band table use). So: ❌ below half,
+    ⚠️ for anything short of complete, ✅ only at complete. A rate nobody
+    measured is 📊, never a grade.
+    """
+    if rate is None:
+        return "📊"
+    if rate < HALF_FLOOR:
+        return "❌"
+    if rate < 100:
+        return "⚠️"
+    return "✅"
 
 if TYPE_CHECKING:
     from sag.agent.verdict_finalizer import RunVerdictSnapshot
@@ -158,6 +182,7 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
                     list(test_analysis.get("auxiliary_report_files") or []) or None
                 ),
                 "stale_test_reports": (list(test_analysis.get("stale_test_reports") or []) or None),
+                "stale_test_stats": test_analysis.get("stale_test_stats"),
             }.items()
             if value is not None
         },
@@ -4891,12 +4916,12 @@ with open(lock_path,"a+b") as lock:
                 exec_icon = "✅"  # More tests run than expected is generally good
                 exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed} run, {static_count} expected)"
             else:
-                exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
+                exec_icon = rate_marker(exec_rate)
                 exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count})"
             lines.append(f"│ Execution Rate  │ {exec_msg:<32} │")
 
         if pass_rate is not None:
-            pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
+            pass_icon = rate_marker(pass_rate)
             flaky_note = f", {flaky_count} flaky" if flaky_count else ""
             pass_msg = (
                 f"{pass_icon} {format_percentage(pass_rate)} "
@@ -4998,7 +5023,8 @@ with open(lock_path,"a+b") as lock:
             )
 
         lines.append(
-            f"| **Unique Tests Executed** | {executed} | Snapshot-local unique count | {'✅' if pass_rate and pass_rate >= 95 else '⚠️' if pass_rate and pass_rate >= 80 else '❌' if pass_rate is not None else '📊'} |"
+            f"| **Unique Tests Executed** | {executed} | Snapshot-local unique count | "
+            f"{rate_marker(pass_rate)} |"
         )
 
         # Highlight method-level deduplication when parameterized/dynamic tests expand at runtime.
@@ -5034,7 +5060,7 @@ with open(lock_path,"a+b") as lock:
                     f"| | *Note:* | *Runtime discovered more tests than static analysis* | 📊 |"
                 )
             else:
-                exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
+                exec_icon = rate_marker(exec_rate)
                 actual_tests_run = int(exec_rate * static_count / 100)
                 lines.append(
                     f"| **Execution Rate** | {format_percentage(exec_rate)} | {coverage_count} of {static_count} tests run | {exec_icon} |"
@@ -5045,7 +5071,7 @@ with open(lock_path,"a+b") as lock:
                         lines.append(f"| | *~{skipped_est} tests* | *possibly not executed* | ⚠️ |")
 
         if pass_rate is not None:
-            pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
+            pass_icon = rate_marker(pass_rate)
             lines.append(
                 f"| **Pass Rate** | {format_percentage(pass_rate)} | {passed} ÷ {executed} | {pass_icon} |"
             )

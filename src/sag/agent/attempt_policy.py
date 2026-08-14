@@ -732,6 +732,30 @@ def _pending_test_dispatches(
     return tuple(pending)
 
 
+def test_closure_survey(
+    state: RunEvidenceState | None,
+    orchestrator: Any,
+    *,
+    phase: str | None,
+    resolution: TestCandidateResolution | None = None,
+) -> TestCandidateResolution | None:
+    """The ONE survey read the test-closure question needs, or ``None``.
+
+    ``None`` means the question is not asked at all — a non-test phase, or a
+    build that never opened a test entry — so no manifest read and no realpath
+    probe is spent on it. Callers that need both the requirement AND facts about
+    it read the survey here once and hand the same resolution to both: two reads
+    of one survey can disagree, and a requirement graded against one set of
+    coordinates sealed beside a fact graded against another is the same
+    fact/word split spec §2.3 fences elsewhere.
+    """
+    if state is None or phase != "test":
+        return None
+    if state.fact_value("build.test_entry_ready") is not True:
+        return None
+    return resolution or resolve_survey_test_candidates(orchestrator)
+
+
 def required_test_attempt(
     state: RunEvidenceState | None,
     orchestrator: Any,
@@ -741,11 +765,14 @@ def required_test_attempt(
     resolution: TestCandidateResolution | None = None,
 ) -> TestAttemptRequirement | None:
     """Return the exact missing harness action, or ``None`` when closure is legal."""
-    if state is None or phase != "test":
+    resolved = test_closure_survey(
+        state,
+        orchestrator,
+        phase=phase,
+        resolution=resolution,
+    )
+    if resolved is None or state is None:
         return None
-    if state.fact_value("build.test_entry_ready") is not True:
-        return None
-    resolved = resolution or resolve_survey_test_candidates(orchestrator)
     if resolved.status != "available":
         # An unresolvable coordinate cannot un-run a test that already ran.
         # Without candidates there is nothing to bind a receipt to, so the
