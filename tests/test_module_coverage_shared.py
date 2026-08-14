@@ -237,15 +237,20 @@ def test_aggregator_shell_verdict_folds_to_success():
         ToolResult.completed_success(output="all modules built", refs=["output_build"]),
         provenance="output_build",
     )
-    state.ingest_tool_result(
+    # Rebased 2026-08-14 (spec amendment item 9) onto the provenance a live
+    # dispatch states: a receipt-scoped rollup. This fixture's subject is the
+    # module-coverage shell, and a headline count without a claim partition is
+    # exactly what the finalizer now declines to publish.
+    state.register_fact(
         StateScope.TEST_RUNTIME,
-        "build",
-        ToolResult.completed_success(
-            output="green",
-            test_stats=TestStats(discovered=2255, executed=2255, passed=2255, failed=0, skipped=0),
-            refs=["output_tests"],
-        ),
-        provenance="output_tests",
+        "test.stats",
+        {
+            "discovered": 2255,
+            "unique": {"executed": 2255, "passed": 2255, "failed": 0, "errors": 0, "skipped": 0},
+            "raw": {"executed": 2255, "passed": 2255, "failed": 0, "errors": 0, "skipped": 0},
+            "receipt_scoped": True,
+        },
+        "output_tests",
     )
     orchestrator = Orch()
     authority = EvidencePublicationAuthority(

@@ -62,6 +62,68 @@ def test_receipt_scoped_rows_enter_only_receipt_execution_grain():
     assert metrics["tests"]["unattributed_observations"]["executed"] == 0
 
 
+def _excluded_snapshot(*, auxiliary, stale, stale_reports):
+    snapshot = _snapshot(receipt_scoped=True)
+    snapshot["test_stats"] = {
+        **snapshot["test_stats"],
+        "auxiliary_test_stats": auxiliary,
+        "stale_test_reports": stale_reports,
+        "stale_test_stats": stale,
+    }
+    return snapshot
+
+
+_UNPARSEABLE_ONLY = {
+    "executed": 0,
+    "passed": 0,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "unparseable": 1,
+}
+_MEASURED = {"executed": 6, "passed": 6, "failed": 0, "errors": 0, "skipped": 0}
+
+
+def test_a_volume_the_parser_could_not_read_is_unmeasured_not_a_measured_zero():
+    """The excluded buckets stated ``executed: 0`` for reports the parser could
+    not open at all — a measured outcome for bytes nobody measured. Zero is a
+    count; an unreadable report has none."""
+    metrics = _assemble(
+        _excluded_snapshot(
+            auxiliary=_UNPARSEABLE_ONLY,
+            stale=_UNPARSEABLE_ONLY,
+            stale_reports=["/workspace/p/target/surefire-reports/TEST-Broken.xml"],
+        )
+    )
+
+    for bucket in ("quarantined_observations", "stale_observations"):
+        observed = metrics["tests"][bucket]
+        assert observed["availability"] == "unavailable", bucket
+        assert observed["executed"] is None, bucket
+        assert "could not be parsed" in observed["reason"], bucket
+    # The files themselves stay counted: the run saw them, it just cannot say
+    # what ran in them.
+    assert metrics["tests"]["stale_observations"]["report_file_count"] == 1
+
+
+def test_a_volume_the_parser_did_read_is_still_stated():
+    """The other direction: a measured excluded volume keeps stating itself,
+    unparseable neighbours or not."""
+    metrics = _assemble(
+        _excluded_snapshot(
+            auxiliary={**_MEASURED, "unparseable": 1},
+            stale=_MEASURED,
+            stale_reports=["/workspace/p/target/surefire-reports/TEST-Stale.xml"],
+        )
+    )
+
+    assert metrics["tests"]["quarantined_observations"]["executed"] == 6
+    assert metrics["tests"]["stale_observations"]["executed"] == 6
+    assert metrics["tests"]["stale_observations"]["reason_counts"] == {
+        "receipt_claim_superseded": 6
+    }
+
+
 def test_absent_measurements_are_null_not_zero():
     metrics = _assemble({})
 

@@ -267,7 +267,7 @@ def _engine(tmp_path, *, advisor_mode="same-model", max_iterations=20):
     # Forced test attempts have their own suite; without a surveyable
     # orchestrator the policy would demand a project refresh in the test phase
     # and this script is about the advisor, not receipts.
-    engine._missing_required_test_attempt = lambda: None
+    engine._missing_required_test_attempt = lambda *_a, **_k: None
     engine._reset_advisor_run_state()
 
     orchestrator = ToolOrchestrator(

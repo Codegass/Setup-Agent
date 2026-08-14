@@ -1284,3 +1284,35 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
     assert observed["executed"] == 18839
     assert observed["passed"] == 18805
     assert observed["failed"] == 5
+
+
+def test_an_adjudicated_conflict_does_not_degrade_the_legacy_evidence_status():
+    """The legacy workflow's status derivation degraded on ANY conflict.
+
+    ``verdict.ADJUDICATED_CONFLICTS`` names the conflicts that are already
+    graded elsewhere and must move no verdict — excluded volume the headline
+    never counted, and red the counts already state. Reading them here as
+    "something is wrong, call it partial" re-grades them behind the kernel's
+    back, on the one surface that still derives its own word.
+    """
+    from sag.verdict import ADJUDICATED_CONFLICTS
+
+    tool = ReportTool()
+    # The conflict list is consulted exactly where the counts decide nothing:
+    # no executions sealed, and no stats at all.
+    nothing_ran = TestStats(discovered=100, executed=0, passed=0, failed=0, skipped=0)
+
+    assert tool._derive_evidence_status_from_test_stats(nothing_ran, []) is None
+    assert (
+        tool._derive_evidence_status_from_test_stats(nothing_ran, sorted(ADJUDICATED_CONFLICTS))
+        is None
+    )
+    assert tool._derive_evidence_status_from_test_stats(None, sorted(ADJUDICATED_CONFLICTS)) is None
+    # A conflict nobody adjudicated still degrades exactly as before.
+    assert (
+        tool._derive_evidence_status_from_test_stats(nothing_ran, ["test_report_parse_error"])
+        == "partial"
+    )
+    assert tool._derive_evidence_status_from_test_stats(None, ["test_report_parse_error"]) == (
+        "partial"
+    )

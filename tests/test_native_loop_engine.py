@@ -181,7 +181,7 @@ def _engine(turns, *, max_iterations=12):
     # Forced test attempts have their own suite (test_forced_attempt_native.py);
     # without a surveyable orchestrator the policy would demand a project
     # refresh in the test phase and this script is about the loop, not receipts.
-    engine._missing_required_test_attempt = lambda: None
+    engine._missing_required_test_attempt = lambda *_a, **_k: None
 
     orchestrator = ToolOrchestrator(
         tools=engine.tools,

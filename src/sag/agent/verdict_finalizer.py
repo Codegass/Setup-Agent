@@ -43,6 +43,14 @@ _VERDICT_FILENAME = "verdict.json"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 
+# Where unattributed volume was READ, for the one case that is not files on
+# disk. The claim partition and the shell rescan both read reports a reader can
+# go open; the tool-observation fold reads numbers a runner printed, which is
+# the render layer and never an authority. Both volumes are disclosed the same
+# way and counted by nobody — the sentence just has to say which one it is
+# looking at, and absence keeps meaning "reports on disk".
+UNATTRIBUTED_FROM_OBSERVATIONS = "tool_observations"
+
 
 class EvidenceCloseReason(str, Enum):
     TEST_TERMINATED = "test_terminated"
@@ -101,6 +109,12 @@ class SnapshotTestStats(BaseModel):
     auxiliary_test_stats: dict[str, int] | None = None
     stale_test_reports: list[str] | None = None
     stale_test_stats: dict[str, int] | None = None
+    # WHERE the unattributed volume was read, so the disclosure can say it.
+    # ABSENT means reports on disk — the only door that ever existed, and the
+    # same absent-key convention `receipt_scoped` uses. The tool-observation
+    # fold routes console-derived counts through the same destination and must
+    # not describe them as files anyone can go look at, so it says so.
+    unattributed_source: Literal["tool_observations"] | None = None
 
     @model_serializer(mode="wrap")
     def _omit_unobserved_collection_fields(self, handler):
@@ -115,6 +129,7 @@ class SnapshotTestStats(BaseModel):
             "auxiliary_test_stats",
             "stale_test_reports",
             "stale_test_stats",
+            "unattributed_source",
         ):
             if data.get(key) is None:
                 data.pop(key, None)
@@ -682,6 +697,13 @@ def _sum_excluded_counts(left: dict[str, int] | None, right: dict[str, int]) -> 
     return merged
 
 
+# Conflicts a rollup DERIVES from its own headline counts. When those counts
+# leave the headline the statements about them leave with them: a sealed
+# `test_failures_detected` beside a headline of 0/0/0 states a red the snapshot
+# no longer carries, and a fact must not outlive its basis.
+_COUNT_DERIVED_CONFLICTS = frozenset({"test_failures_detected", "test_errors_detected"})
+
+
 def _fold_test_stats(
     state: RunEvidenceState,
 ) -> tuple[SnapshotTestStats, tuple[str, ...]]:
@@ -720,6 +742,7 @@ def _fold_test_stats(
         ):
             return SnapshotTestStats(), _dedupe([*conflicts, "validated_test_stats_invalid"])
         auxiliary = _excluded_counts(validated_rollup.get("auxiliary_test_stats"))
+        flaky_count = _nonnegative_int(validated_rollup.get("flaky_count")) or 0
         if not validated_rollup.get("receipt_scoped"):
             # Fallback parity. `receipt_scoped` is constant for the compact
             # in-container parser, so a rollup without it came from the shell
@@ -734,6 +757,12 @@ def _fold_test_stats(
             auxiliary = _sum_excluded_counts(auxiliary, _counts_payload(validated_raw))
             validated_unique = SnapshotTestCounts()
             validated_raw = SnapshotTestCounts()
+            # The counts moved, so everything DERIVED from them moves with
+            # them: the red conflicts restate a headline that is now zero, and
+            # the flaky tally was computed over identities this snapshot no
+            # longer claims. Both are still visible where the volume went.
+            conflicts = tuple(item for item in conflicts if item not in _COUNT_DERIVED_CONFLICTS)
+            flaky_count = 0
         # Execution, not the project's pass percentage, is the physical fact
         # this snapshot records.  Red remains visible in the counts and the
         # heavy-red rate signal; it is not a failed SAG execution.
@@ -745,7 +774,7 @@ def _fold_test_stats(
                 discovered=_nonnegative_int(validated_rollup.get("discovered")),
                 unique=validated_unique,
                 raw=validated_raw,
-                flaky_count=_nonnegative_int(validated_rollup.get("flaky_count")) or 0,
+                flaky_count=flaky_count,
                 judgment=validated_judgment,
                 collection_errors=_nonnegative_int(validated_rollup.get("collection_errors")),
                 collection_errors_skipped=_nonnegative_int(
@@ -814,7 +843,7 @@ def _fold_test_stats(
             item[0],
         ),
     )
-    unique, unique_failures, unique_errors = primary
+    unique, _, _ = primary
     raw = SnapshotTestCounts(
         executed=sum(stats.executed for stats, _, _ in snapshots),
         passed=sum(stats.passed for stats, _, _ in snapshots),
@@ -823,22 +852,27 @@ def _fold_test_stats(
         skipped=sum(stats.skipped for stats, _, _ in snapshots),
     )
     conflicts = ("test_stats_basis_incomparable",) if len(frontier) > 1 else ()
-    judgment: Literal["success", "failed", "unknown"] = (
-        "success" if unique.executed > 0 else "unknown"
-    )
+    # Observation-fold parity (spec amendment item 9). Reaching here means NO
+    # `test.stats` fact exists at all, so these counts were parsed out of a
+    # runner's CONSOLE TEXT: no report file was opened, no receipt claims them,
+    # and the render layer is exactly the authority this repo's principles
+    # forbid. Sealing them as the full headline gave the fold with the LEAST
+    # machinery the BIGGEST number, with no partition, no conflict and no
+    # sentence — the same inversion fallback parity closed one branch above.
+    #
+    # The counts are routed to unattributed volume, never deleted: same
+    # destination, same conflict, and a sentence that names both the volume and
+    # where it was read. The facts derived from them (judgment, the flaky
+    # tally) go with them. The phase-close refusal is untouched — no
+    # `receipt_scoped` marker is invented here, so counts that did not come
+    # from a claim partition still close nothing. `discovered` is a DISCOVERY
+    # fact rather than an execution one and stays, so the grain can show 0 of
+    # what was surveyed instead of a ratio with nothing on either side.
     return (
         SnapshotTestStats(
             discovered=unique.discovered,
-            unique=SnapshotTestCounts(
-                executed=unique.executed,
-                passed=unique.passed,
-                failed=unique_failures,
-                errors=unique_errors,
-                skipped=unique.skipped,
-            ),
-            raw=raw,
-            flaky_count=unique.flaky_count,
-            judgment=judgment,
+            auxiliary_test_stats=_counts_payload(raw),
+            unattributed_source=UNATTRIBUTED_FROM_OBSERVATIONS,
         ),
         conflicts,
     )
@@ -871,7 +905,30 @@ def _unattributed_executions(stats: SnapshotTestStats) -> int:
     return _excluded_executions(stats.auxiliary_test_stats)
 
 
-def _excluded_volume_clauses(unattributed: int, stale: int) -> list[str]:
+def _excluded_unparseable(counts: dict[str, int] | None) -> int:
+    """Reports at one excluded destination whose volume could not be measured.
+
+    An unreadable excluded report contributes ZERO executions, so a corpus
+    whose only stray XML is corrupt measures 0 and — before this — said
+    nothing at all. Never counted, never capping, always said.
+    """
+    if not isinstance(counts, Mapping):
+        return 0
+    return _nonnegative_int(counts.get("unparseable")) or 0
+
+
+def _unparseable_clause(count: int) -> str:
+    return f"{count:,} unparseable report{'' if count == 1 else 's'}"
+
+
+def _excluded_volume_clauses(
+    unattributed: int,
+    stale: int,
+    *,
+    unattributed_unparseable: int = 0,
+    stale_unparseable: int = 0,
+    unattributed_source: str | None = None,
+) -> list[str]:
     """Name each excluded destination separately, in one shared vocabulary.
 
     A report leaves the headline through one of two doors and they mean
@@ -879,14 +936,34 @@ def _excluded_volume_clauses(unattributed: int, stale: int) -> list[str]:
     bytes were then rewritten. Only the first was ever spoken aloud, so a
     superseded-sha claim silently dropped its volume and a rewritten report read
     exactly like a report that never existed. Neither is ever counted.
+
+    What could not be READ at either door is named in that door's own clause,
+    so a sentence carrying both never leaves a reader guessing which unparseable
+    count belongs to which volume.
     """
+    where = (
+        "reported in tool output"
+        if unattributed_source == UNATTRIBUTED_FROM_OBSERVATIONS
+        else "visible on disk"
+    )
     clauses: list[str] = []
     if unattributed:
-        clauses.append(f"{unattributed:,} executions visible on disk but bound to no receipt")
+        clause = f"{unattributed:,} executions {where} but bound to no receipt"
+        if unattributed_unparseable:
+            clause += f" ({_unparseable_clause(unattributed_unparseable)})"
+        clauses.append(clause)
+    elif unattributed_unparseable:
+        unreadable = _unparseable_clause(unattributed_unparseable)
+        clauses.append(f"{unreadable} {where} but bound to no receipt")
     if stale:
         # "executions" is said once per sentence, by whichever clause opens it.
         volume = f"{stale:,}" if clauses else f"{stale:,} executions"
-        clauses.append(f"{volume} under rewritten claims")
+        clause = f"{volume} under rewritten claims"
+        if stale_unparseable:
+            clause += f" ({_unparseable_clause(stale_unparseable)})"
+        clauses.append(clause)
+    elif stale_unparseable:
+        clauses.append(f"{_unparseable_clause(stale_unparseable)} under rewritten claims")
     return clauses
 
 
@@ -898,8 +975,15 @@ def test_grain_rates(
     """Return execution-based test case and surveyed-module grains."""
 
     unattributed = _unattributed_executions(stats)
+    unattributed_unparseable = _excluded_unparseable(stats.auxiliary_test_stats)
     excluded = ", ".join(
-        _excluded_volume_clauses(unattributed, _excluded_executions(stats.stale_test_stats))
+        _excluded_volume_clauses(
+            unattributed,
+            _excluded_executions(stats.stale_test_stats),
+            unattributed_unparseable=unattributed_unparseable,
+            stale_unparseable=_excluded_unparseable(stats.stale_test_stats),
+            unattributed_source=stats.unattributed_source,
+        )
     )
     if stats.discovered:
         cases = GrainRate(
@@ -928,8 +1012,11 @@ def test_grain_rates(
         errors=stats.unique.errors,
         executed=stats.unique.executed,
     )
-    if unattributed:
+    if unattributed or unattributed_unparseable:
         # Visibility without authority: the volume is named, never counted.
+        # An unclaimed report the parser could not open has no volume to state
+        # and is disclosed all the same — the conflict and the sentence travel
+        # together, or the sentence is a fact nothing points at.
         conflicts += (UNATTRIBUTED_CONFLICT,)
 
     if test_modules:

@@ -534,16 +534,24 @@ def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path
     assert len(result.evidence_refs) == 1
     assert result.evidence_refs[0].startswith("/workspace/.setup_agent/pytest-reports/pytest-")
     assert snapshot.test_stats.discovered == 5
-    assert snapshot.test_stats.executed == 5
-    assert snapshot.test_stats.passed == 5
-    assert snapshot.test_stats.failed == 0
-    assert snapshot.test_stats.errors == 0
-    assert snapshot.test_stats.skipped == 0
+    # Rebased 2026-08-14 (spec amendment item 9): the junitxml counts still flow
+    # all the way to the seal — through the destination a count belongs to when
+    # no claim partition has run over it. The receipt-scoped rollup that would
+    # make them a headline is sealed by the test-phase gate, which this unit
+    # seam does not drive.
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats == {
+        "executed": 5,
+        "passed": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
     assert result.metadata["failed_tests"] == 0
     assert result.metadata["error_tests"] == 0
-    # Premise updated 2026-08-10: this unit seam has no module survey, so the
-    # executed cases are fully while the derived compatibility word is partial.
-    assert snapshot.rates["test"]["cases"]["band"] == "fully"
+    assert snapshot.rates["test"]["cases"]["reason"] == (
+        "0/5 — 5 executions reported in tool output but bound to no receipt"
+    )
     assert snapshot.verdict == "partial"
 
 

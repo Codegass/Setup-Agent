@@ -196,9 +196,71 @@ non-monotone edges that the review found. Both are closed here; items 1, 2 and
    (real parser, real files, real rollup, real kernel) and
    `::test_the_stale_conflict_is_adjudicated_not_capping`.
 
+8. **The parse-error CAP follows attribution, not the scan (adjudicated).**
+   `excluded_counts` parsed the auxiliary and stale files through the same
+   `parse_report` that feeds `parsing_errors`, so any XML exception anywhere in
+   the corpus minted `test_report_parse_error` — the CAPPING conflict reserved
+   for evidence the harness could not read. An UNPARSEABLE unclaimed report
+   therefore capped a run that a PARSEABLE one did not, and `rm` on one corrupt
+   stray XML lifted the word: P4 inverted again, through the last door left
+   open. Parse failures of EXCLUDED files (auxiliary and stale) now leave
+   through their own channel: counted per destination as `unparseable`,
+   disclosed inside that destination's clause ("… 4 executions visible on disk
+   but bound to no receipt (1 unparseable report)"), never counted into any
+   volume and never capping. Parse failures of ATTRIBUTED reports keep today's
+   capping semantics unchanged — a receipt claimed those exact bytes, so a
+   broken claimed report is a genuine conflict between the run's own
+   statements. Both directions are fenced, and the metrics-v2 excluded buckets
+   state an explicit UNMEASURED marker (not `executed: 0`) where the volume
+   could not be parsed at all: zero is a count, and an unreadable report has
+   none.
+9. **The observation fold is unattributed volume too (adjudicated).** When NO
+   `test.stats` fact exists, `_fold_test_stats` falls through to the
+   tool-observation fold, which sealed `result.test_stats` as the FULL headline
+   with no partition, no conflict and no sentence — less machinery, a bigger
+   number, and counts that came from a runner's console text, which is exactly
+   the render-layer authority this repo's principles refuse. It is the same
+   inversion item 6 closed for the shell rescan, entering through the third
+   door. The fold now routes its counts to unattributed volume identically:
+   headline 0, the same `test_executions_unattributed_to_receipts` disclosure,
+   and a sentence that names its provenance
+   (`0/9754 — 10,448 executions reported in tool output but bound to no
+   receipt`, via `SnapshotTestStats.unattributed_source`). The selection
+   machinery still runs and still decides what it can honestly decide — the
+   `discovered` denominator and the `test_stats_basis_incomparable` frontier
+   conflict. The phase-close refusal is unchanged: no `receipt_scoped` marker is
+   invented, so these counts still close nothing.
+   Consequence, named: a run whose only test evidence is a tool result can no
+   longer seal `success`. Fixtures that depended on an observation-fold headline
+   were rebased on the provenance a live dispatch states (a receipt-scoped
+   rollup) or onto the destination the volume now lands in, and the three
+   affected `tests/fixtures/control_layer` transcripts had their
+   `expected_snapshot` refreshed. Their recorded bytes — event rows,
+   `source_manifest` hashes and `expected_event_digest` — are untouched and
+   byte-verified unchanged; what moved is the harness's declared OUTPUT for
+   those bytes, which is what those fixtures exist to pin.
+10. **A zeroed count takes its derived facts with it.** Item 6's fallback-parity
+    zeroing left `test_failures_detected` / `test_errors_detected` and a
+    `flaky_count` standing beside a headline of 0/0/0 — statements about counts
+    the snapshot no longer carries. Conflicts DERIVED from the headline counts,
+    and the flaky tally computed over the identities they named, are dropped
+    with them. Conflicts from any other basis (`metrics_conflict`,
+    `test_report_parse_error`, the stale conflict) are untouched. A fact must
+    not outlive its basis.
+11. **One close, one survey read.** A single engine close asked
+    `resolve_survey_test_candidates` up to three times — once for the missing
+    attempt requirement, once for the unresolved-coordinate cap, once for the
+    forced refusals — each a manifest read plus realpath probes. Three reads of
+    one survey can disagree, and then the requirement, the cap and the refusals
+    answer different coordinates while the record shows one close.
+    `ReActEngine._test_candidate_survey()` returns the one lazily-memoized
+    reader a close threads through all three (the same shape
+    `attempt_policy.test_closure_survey` gave `phase_tool`), so the read happens
+    at most once and still only if the close actually asks (P3).
+
 ### Deferred items (2026-08-14, named so they are not invisible)
 
-Three known gaps are accepted for now rather than silently carried:
+Four known gaps are accepted for now rather than silently carried:
 
 1. **Task #52 — `run_test_receipts` /workspace fallback bound.**
    `attempt_policy.run_test_receipts` falls back to the entire `/workspace` when
@@ -227,7 +289,18 @@ Three known gaps are accepted for now rather than silently carried:
    should mean once the boundary is the band table, and whether an existing
    `"Low Execution Rate"` line may be reworded — `tests/test_provision_priority
    .py:296` reads it). Out of scope for the marker decision; the same treatment
-   applies when they are addressed.
+   applies when they are addressed. Re-confirmed 2026-08-14 (round 3): these
+   three ICON+PROSE boundaries are the named residue carried into task #38, and
+   nothing in this round touched them.
+4. **`rate_marker`'s strict-100 ✅ is deliberate, not an off-by-one.** A 99.9%
+   pass rate renders ⚠️, and that is the intended reading: the missing 0.1% is
+   red tests, red tests are exact sealed facts, and a report that decorates
+   "3,568 passed, 2 failed, 1 skipped" with a green check is the kafka
+   sentence in icon form ("Tests passed above the 80% threshold: 99.9%"). ✅ is
+   reserved for complete; ⚠️ says *something did not pass* without grading how
+   much; ❌ keeps the one documented boundary (`HALF_FLOOR`, the heavy-red
+   rule). Recorded here because "95 and 100 render differently" reads like a
+   bug to every next reader, and it is a decision.
 
 ## 2. Fix B — the 80% thresholds leave the gate/claim chain (#49)
 

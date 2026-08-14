@@ -2129,11 +2129,37 @@ class ReActEngine(UIEventEmitter):
         remaining = max_iter - getattr(self, "current_iteration", 0)
         return max_iter, reserved, remaining
 
-    def _missing_required_test_attempt(self) -> TestAttemptRequirement | None:
+    def _test_candidate_survey(self) -> Callable[[], TestCandidateResolution]:
+        """The ONE survey read a single close is allowed to spend.
+
+        One close asks the test-coordinate question up to three times — the
+        missing-attempt requirement, the unresolved-coordinate cap and the
+        forced refusals — and each asked it for itself: three manifest reads
+        and three sets of realpath probes for one grading. Two reads of one
+        survey can disagree (a manifest rewritten between them, a symlink that
+        resolves differently), and then the requirement, the cap and the
+        refusals answer different coordinates while the record shows one close.
+
+        The reader stays LAZY, so a close that never asks the question still
+        spends no probe (P3: one question, one computation).
+        """
+        resolved: list[TestCandidateResolution] = []
+
+        def survey() -> TestCandidateResolution:
+            if not resolved:
+                resolved.append(resolve_survey_test_candidates(getattr(self, "orchestrator", None)))
+            return resolved[0]
+
+        return survey
+
+    def _missing_required_test_attempt(
+        self,
+        survey: Callable[[], TestCandidateResolution] | None = None,
+    ) -> TestAttemptRequirement | None:
         machine = getattr(self, "phase_machine", None)
         if machine is None or machine.is_complete:
             return None
-        resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+        resolution = (survey or self._test_candidate_survey())()
         self._last_test_candidate_resolution = resolution
         return required_test_attempt(
             getattr(self, "run_evidence_state", None),
@@ -2145,6 +2171,7 @@ class ReActEngine(UIEventEmitter):
 
     def _unresolved_test_coordinates_after_refresh(
         self,
+        survey: Callable[[], TestCandidateResolution] | None = None,
     ) -> TestCandidateResolution | None:
         machine = getattr(self, "phase_machine", None)
         state = getattr(self, "run_evidence_state", None)
@@ -2158,7 +2185,7 @@ class ReActEngine(UIEventEmitter):
             )
         ):
             return None
-        resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+        resolution = (survey or self._test_candidate_survey())()
         if resolution.status == "available":
             return None
         # Spec §1 item 2: `test_candidate_resolution_unavailable` may only be
@@ -2169,12 +2196,15 @@ class ReActEngine(UIEventEmitter):
             return None
         return resolution
 
-    def _forced_test_refusals(self):
+    def _forced_test_refusals(
+        self,
+        survey: Callable[[], TestCandidateResolution] | None = None,
+    ):
         machine = getattr(self, "phase_machine", None)
         state = getattr(self, "run_evidence_state", None)
         if machine is None or state is None or machine.current_phase != "test":
             return ()
-        resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+        resolution = (survey or self._test_candidate_survey())()
         if resolution.status != "available":
             return ()
         return forced_test_refusal_receipts(
@@ -2187,10 +2217,13 @@ class ReActEngine(UIEventEmitter):
         self,
         claim: PhaseClaim,
         gate: GateResult,
+        *,
+        survey: Callable[[], TestCandidateResolution] | None = None,
     ) -> GateResult:
         """An unresolved coordinate may close honestly, but can never be green."""
-        resolution = self._unresolved_test_coordinates_after_refresh()
-        refusals = self._forced_test_refusals()
+        survey = survey or self._test_candidate_survey()
+        resolution = self._unresolved_test_coordinates_after_refresh(survey)
+        refusals = self._forced_test_refusals(survey)
         if resolution is None and not refusals:
             return gate
         capped_state = (
@@ -2824,7 +2857,10 @@ class ReActEngine(UIEventEmitter):
             # exactly it, or says out loud that it is replacing it (spec §3.1).
             delivered = gate
             self._register_delivered_gate(claim, delivered)
-            gate = self._cap_unresolved_test_gate(claim, delivered)
+            # One close, one survey read: the cap and the requirement below both
+            # ask the same question and must get the same answer.
+            survey = self._test_candidate_survey()
+            gate = self._cap_unresolved_test_gate(claim, delivered, survey=survey)
             word_revised = False
             if gate is not delivered:
                 # A second grading is legal; it just has to name the first.
@@ -2848,7 +2884,7 @@ class ReActEngine(UIEventEmitter):
                     self._state_gate_observation_now(revision, priority=9)
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
                 return None
-            required_attempt = self._missing_required_test_attempt()
+            required_attempt = self._missing_required_test_attempt(survey)
             if required_attempt is not None:
                 self._force_required_test_attempt(
                     required_attempt,
@@ -3060,7 +3096,10 @@ class ReActEngine(UIEventEmitter):
         phase = machine.current_phase
         _, reserved, remaining = self._phase_budget_numbers(phase)
 
-        required_attempt = self._missing_required_test_attempt()
+        # One close, one survey read — the requirement, the unresolved-coordinate
+        # cap and the refusals below all answer the same question.
+        survey = self._test_candidate_survey()
+        required_attempt = self._missing_required_test_attempt(survey)
         # Install the deterministic dispatch/poll while two turns remain
         # outside downstream floors: one to dispatch and one to poll.  Waiting
         # until remaining == reserved would consume the report guarantee.
@@ -3091,8 +3130,8 @@ class ReActEngine(UIEventEmitter):
             return False
 
         probe = self._phase_gate_check(phase)
-        unresolved = self._unresolved_test_coordinates_after_refresh()
-        refusals = self._forced_test_refusals()
+        unresolved = self._unresolved_test_coordinates_after_refresh(survey)
+        refusals = self._forced_test_refusals(survey)
         validator_state = (
             (
                 ValidatorState.RED

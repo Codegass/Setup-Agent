@@ -177,7 +177,7 @@ def _engine(
     engine._emit_control_tool_result = lambda **kwargs: engine.emitted_tool_results.append(kwargs)
     engine._apply_tool_execution_loop_effects = lambda execution: loop_decision
     engine._close_phase_for_loop = lambda decision, execution: False
-    engine._missing_required_test_attempt = lambda: None
+    engine._missing_required_test_attempt = lambda *_a, **_k: None
     engine._add_observation_step = fake_add_observation_step
     engine._reset_advisor_run_state()
     return engine

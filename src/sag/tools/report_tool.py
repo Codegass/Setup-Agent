@@ -804,13 +804,21 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _derive_evidence_status_from_test_stats(
         self, test_stats: Optional[TestStats], conflicts: List[str]
     ) -> Optional[str]:
+        # The legacy workflow's own derivation degraded on ANY conflict, so the
+        # conflicts the kernel has already adjudicated — excluded volume the
+        # headline never counted, red the counts already state — re-graded a run
+        # here, behind the one place allowed to grade them. A conflict may only
+        # move this word if nobody has settled it.
+        unsettled = [
+            conflict for conflict in (conflicts or ()) if conflict not in ADJUDICATED_CONFLICTS
+        ]
         if not test_stats:
-            return "partial" if conflicts else None
+            return "partial" if unsettled else None
         if test_stats.failed > 0 or test_stats.errors > 0:
             return "partial" if test_stats.passed > 0 else "blocked"
         if test_stats.executed > 0:
             return "success"
-        return "partial" if conflicts else None
+        return "partial" if unsettled else None
 
     def _append_evidence_summary_to_output(
         self,

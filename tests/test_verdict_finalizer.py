@@ -455,26 +455,39 @@ def test_sealed_retry_never_accepts_or_caches_an_older_run_snapshot():
     assert id(new_state) not in finalizer._snapshots
 
 
-def test_snapshot_uses_unique_test_counts_and_keeps_raw_retries_secondary():
+def test_console_retry_volume_is_disclosed_and_never_a_headline():
+    """Rebased 2026-08-14 (spec amendment item 9). TVM's three pytest retries
+    were parsed out of CONSOLE TEXT: no report file was opened and no receipt
+    claims them, so they are unattributed volume exactly like an unclaimed XML
+    on disk. The selection still chooses the basis whose ``discovered`` this
+    snapshot seals; what it never does any more is publish a headline count
+    nobody can attribute."""
     snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
         _tvm_state(), EvidenceCloseReason.TEST_TERMINATED
     )
 
     assert snapshot.verdict == "partial"
     assert snapshot.test_stats.discovered == 328
-    assert snapshot.test_stats.executed == 328
-    assert snapshot.test_stats.passed == 328
-    assert snapshot.test_stats.raw.executed == 984
-    assert snapshot.test_stats.pass_rate == 100.0
-    serialized = snapshot.model_dump()["test_stats"]
-    assert serialized["unique"] == {
-        "executed": 328,
-        "passed": 328,
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.judgment == "unknown"
+    # Moved, never deleted: the three retries' rows are the excluded volume.
+    assert snapshot.test_stats.auxiliary_test_stats == {
+        "executed": 984,
+        "passed": 984,
         "failed": 0,
         "errors": 0,
         "skipped": 0,
     }
-    assert serialized["raw"]["executed"] == 984
+    assert "test_executions_unattributed_to_receipts" in snapshot.conflicts
+    serialized = snapshot.model_dump()["test_stats"]
+    assert serialized["unique"] == {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+    assert serialized["unattributed_source"] == "tool_observations"
     assert "executed" not in serialized
     assert "pass_rate" not in serialized
 
@@ -535,6 +548,13 @@ def test_compileall_basis_mismatch_is_a_snapshot_metrics_conflict():
 
 
 def test_flaky_count_flows_into_unique_snapshot_basis():
+    """Rebased 2026-08-14 onto the provenance a live dispatch states.
+
+    A flaky tally is computed over identities the headline claims, so it can
+    only be sealed where those identities are: a receipt-scoped rollup. Stated
+    over console text it was a fact with no basis, which is why the observation
+    fold now drops it with the counts it came from.
+    """
     state = RunEvidenceState(run_id="session-flaky")
     state.ingest_tool_result(
         StateScope.ARTIFACTS,
@@ -544,18 +564,17 @@ def test_flaky_count_flows_into_unique_snapshot_basis():
             facts={"build_success": True},
         ),
     )
-    state.ingest_tool_result(
+    state.register_fact(
         StateScope.TEST_RUNTIME,
-        "build",
-        ToolResult.completed_success(
-            output="tests green with retries",
-            test_stats=TestStats(
-                discovered=5,
-                executed=5,
-                passed=5,
-                flaky_count=2,
-            ),
-        ),
+        "test.stats",
+        {
+            "discovered": 5,
+            "unique": {"executed": 5, "passed": 5, "failed": 0, "errors": 0, "skipped": 0},
+            "raw": {"executed": 7, "passed": 5, "failed": 2, "errors": 0, "skipped": 0},
+            "flaky_count": 2,
+            "receipt_scoped": True,
+        },
+        "artifact://test-rollup",
     )
 
     snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
@@ -611,13 +630,16 @@ def test_narrow_passing_retry_cannot_replace_failed_full_suite_basis():
         state, EvidenceCloseReason.TEST_TERMINATED
     )
 
+    # Rebased 2026-08-14 (spec amendment item 9): console counts are excluded
+    # volume, so the selection is read where it still decides something — the
+    # discovered basis. The one-test retry's `discovered: 1` did not replace
+    # the full suite's 100.
     assert snapshot.test_stats.discovered == 100
-    assert snapshot.test_stats.executed == 100
-    assert snapshot.test_stats.passed == 0
-    assert snapshot.test_stats.failed == 100
+    assert snapshot.test_stats.executed == 0
     # Premise updated 2026-08-10: red tests grade execution, not pass rate.
     assert snapshot.verdict == "partial"
-    assert snapshot.test_stats.raw.executed == 101
+    assert snapshot.test_stats.auxiliary_test_stats["executed"] == 101
+    assert snapshot.test_stats.auxiliary_test_stats["failed"] == 100
 
 
 def test_executed_count_preserves_broader_suite_when_it_exceeds_discovered():
@@ -664,9 +686,12 @@ def test_executed_count_preserves_broader_suite_when_it_exceeds_discovered():
         state, EvidenceCloseReason.TEST_TERMINATED
     )
 
+    # Rebased 2026-08-14: the 100-executed basis still wins the selection, so
+    # its `discovered: 80` is the denominator sealed — the 90/90 retry did not
+    # take it.
     assert snapshot.test_stats.discovered == 80
-    assert snapshot.test_stats.executed == 100
-    assert snapshot.test_stats.failed == 100
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats["executed"] == 190
     # Premise updated 2026-08-10: red tests grade execution, not pass rate.
     assert snapshot.verdict == "partial"
 
@@ -715,9 +740,12 @@ def test_pareto_incomparable_retry_keeps_broader_failed_execution_basis():
         state, EvidenceCloseReason.TEST_TERMINATED
     )
 
+    # Rebased 2026-08-14: the broader basis still wins, and the incomparable
+    # frontier is still named — the counts are just disclosed rather than
+    # published as a headline nobody can attribute.
     assert snapshot.test_stats.discovered == 100
-    assert snapshot.test_stats.executed == 100
-    assert snapshot.test_stats.failed == 100
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats["failed"] == 100
     assert "test_stats_basis_incomparable" in snapshot.conflicts
     # Red is execution evidence; the incomparable basis remains an integrity cap.
     assert snapshot.verdict == "partial"
@@ -767,9 +795,11 @@ def test_dominant_complete_basis_supersedes_missing_discovered_without_conflict(
         state, EvidenceCloseReason.TEST_TERMINATED
     )
 
+    # Rebased 2026-08-14: the complete basis dominates, so its discovered count
+    # is the one sealed and no incomparable-frontier conflict is minted.
     assert snapshot.test_stats.discovered == 100
-    assert snapshot.test_stats.executed == 100
-    assert snapshot.test_stats.passed == 100
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats["executed"] == 150
     assert "test_stats_basis_incomparable" not in snapshot.conflicts
     # No module scan was supplied, so build.modules is unavailable, not fully.
     assert snapshot.verdict == "partial"
@@ -819,11 +849,13 @@ def test_equal_complete_basis_uses_latest_typed_status():
         state, EvidenceCloseReason.TEST_TERMINATED
     )
 
+    # Rebased 2026-08-14: equal bases collapse to one frontier entry, so no
+    # incomparable conflict is minted; the only conflict left is the disclosure
+    # of the volume itself.
     assert snapshot.test_stats.discovered == 100
-    assert snapshot.test_stats.executed == 100
-    assert snapshot.test_stats.passed == 100
-    assert snapshot.test_stats.failed == 0
-    assert snapshot.conflicts == ()
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats["executed"] == 200
+    assert snapshot.conflicts == ("test_executions_unattributed_to_receipts",)
     # No module scan was supplied, so build.modules is unavailable, not fully.
     assert snapshot.verdict == "partial"
 
@@ -954,10 +986,12 @@ def test_snapshot_separates_maven_failures_from_errors():
         state, EvidenceCloseReason.TEST_TERMINATED
     )
 
-    assert snapshot.test_stats.failed == 2
-    assert snapshot.test_stats.errors == 3
-    assert snapshot.test_stats.raw.failed == 2
-    assert snapshot.test_stats.raw.errors == 3
+    # Rebased 2026-08-14: the split is the property under test and it survives
+    # into the destination the console volume now lands in.
+    assert snapshot.test_stats.auxiliary_test_stats["failed"] == 2
+    assert snapshot.test_stats.auxiliary_test_stats["errors"] == 3
+    assert snapshot.test_stats.failed == 0
+    assert snapshot.test_stats.errors == 0
 
 
 def test_conflict_caps_a_green_physical_verdict_at_partial():
@@ -985,7 +1019,11 @@ def test_conflict_caps_a_green_physical_verdict_at_partial():
     )
 
     assert snapshot.verdict == "partial"
-    assert snapshot.conflicts == ("test_report_parse_ambiguous",)
+    assert snapshot.conflicts == (
+        "test_report_parse_ambiguous",
+        # Rebased 2026-08-14: the console volume is disclosed beside it.
+        "test_executions_unattributed_to_receipts",
+    )
 
 
 def test_verified_build_evidence_rescues_failed_build_judge_to_partial():

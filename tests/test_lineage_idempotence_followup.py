@@ -134,8 +134,11 @@ def test_state_dump_load_replay_is_idempotent_by_execution_id():
         replayed,
         EvidenceCloseReason.TEST_TERMINATED,
     )
-    assert snapshot.test_stats.executed == 5
-    assert snapshot.test_stats.raw.executed == 5
+    # Rebased 2026-08-14 (spec amendment item 9): idempotence is the subject —
+    # ingesting the same execution twice contributes its volume ONCE. The
+    # destination moved; the arithmetic under test did not.
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats["executed"] == 5
 
 
 def test_hostile_unpersisted_draft_has_one_small_total_budget():

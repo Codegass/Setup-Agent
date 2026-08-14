@@ -145,8 +145,12 @@ def test_package_or_install_stats_are_one_build_and_test_observation(tmp_path, t
     observation = engine.run_evidence_state.tool_observations[0]
     assert _role_values(observation) == {"build", "test"}
     assert snapshot.build_evidence.green is True
-    assert snapshot.test_stats.executed == 10
-    assert snapshot.test_stats.passed == 10
+    # Rebased 2026-08-14 (spec amendment item 9): the subject here is the ROLE
+    # split, and the embedded counts reach the seal through the destination a
+    # count with no claim partition behind it belongs to.
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.auxiliary_test_stats["executed"] == 10
+    assert snapshot.test_stats.auxiliary_test_stats["passed"] == 10
 
 
 def test_facade_jdk_retry_preserves_two_maven_actual_executions(
@@ -398,9 +402,17 @@ def test_construction_persistence_failure_ingests_bounded_draft_once(
         assert snapshot.build_evidence.observed is True
         assert snapshot.build_evidence.outcome is OperationOutcome.FAILED
     else:
-        assert snapshot.test_stats.executed == 5
-        assert snapshot.test_stats.passed == 3
-        assert snapshot.test_stats.failed == 2
+        # Rebased 2026-08-14 (spec amendment item 9): the draft's counts still
+        # reach the seal — through the destination that names them as volume no
+        # receipt claims, which is what a count with no claim partition is.
+        assert snapshot.test_stats.executed == 0
+        assert snapshot.test_stats.auxiliary_test_stats == {
+            "executed": 5,
+            "passed": 3,
+            "failed": 2,
+            "errors": 0,
+            "skipped": 0,
+        }
 
 
 @pytest.mark.parametrize(
@@ -475,6 +487,29 @@ def test_sealed_test_judgment_owns_report_and_terminal_ui(
                 skipped=0,
             ),
         ),
+    )
+    # Rebased 2026-08-14 (spec amendment item 9) onto the provenance a live test
+    # close seals. This fixture's subject is that ONE sealed judgment owns both
+    # the report and the terminal UI; a bash-dispatched count with no claim
+    # partition behind it now seals `unknown`, which is geode's shape and has
+    # its own fences.
+    counts = {
+        "executed": 10,
+        "passed": passed,
+        "failed": failed,
+        "errors": 0,
+        "skipped": 0,
+    }
+    engine.run_evidence_state.register_fact(
+        StateScope.TEST_RUNTIME,
+        "test.stats",
+        {
+            "discovered": 10,
+            "unique": dict(counts),
+            "raw": dict(counts),
+            "receipt_scoped": True,
+        },
+        "artifact://test-rollup",
     )
     snapshot = engine.verdict_finalizer.finalize(
         engine.run_evidence_state,

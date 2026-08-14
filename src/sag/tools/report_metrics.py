@@ -415,6 +415,30 @@ def _known_counts(
     return {**counts, "availability": "available", "basis": basis}
 
 
+def _excluded_volume(value: Mapping[str, Any] | None, *, basis: str) -> dict[str, Any] | None:
+    """One excluded destination's volume — measured, unmeasurable, or absent.
+
+    The excluded partitions carry an ``unparseable`` marker for reports whose
+    volume could not be measured at all. A report the parser could not open
+    contributes zero executions, so a destination holding nothing BUT such
+    reports used to publish ``executed: 0`` — a measured outcome for bytes
+    nobody measured, and indistinguishable from a destination where reports
+    existed and genuinely ran nothing. Zero is a count; an unreadable report
+    has none.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    counts = _known_counts(value, basis=basis)
+    if counts is None:
+        return None
+    unparseable = _int_or_none(value.get("unparseable")) or 0
+    if unparseable and counts["executed"] == 0:
+        return _all_null_counts(
+            reason=f"{unparseable} excluded report(s) could not be parsed; volume unmeasured"
+        )
+    return counts
+
+
 def _zero_counts(*, basis: str) -> dict[str, Any]:
     return {
         **{field: 0 for field in COUNT_FIELDS},
@@ -678,7 +702,7 @@ def _snapshot_test_facts(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "unique": unique,
             "raw": raw,
             "receipt_scoped": test_stats.get("receipt_scoped") is True,
-            "auxiliary": _known_counts(
+            "auxiliary": _excluded_volume(
                 (
                     test_stats.get("auxiliary_test_stats")
                     if isinstance(test_stats.get("auxiliary_test_stats"), Mapping)
@@ -691,7 +715,7 @@ def _snapshot_test_facts(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 for path in (test_stats.get("stale_test_reports") or ())
                 if str(path).strip()
             ],
-            "stale": _known_counts(
+            "stale": _excluded_volume(
                 (
                     test_stats.get("stale_test_stats")
                     if isinstance(test_stats.get("stale_test_stats"), Mapping)
@@ -820,7 +844,9 @@ def _project_tests(
             # The volume is stated when the partition measured it, and only
             # then: a superseded claim that named paths alone dropped its
             # executions out of every disclosure, but a seal that never counted
-            # them is not a licence to invent an outcome for them.
+            # them is not a licence to invent an outcome for them. Reports the
+            # parser could not open are unmeasured here too, never a measured
+            # zero — `_excluded_volume` draws that line.
             stale_counts
             if stale_counts is not None
             else _all_null_counts(reason="stale report outcomes were not counted by this seal"),

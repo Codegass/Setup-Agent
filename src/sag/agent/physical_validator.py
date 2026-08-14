@@ -539,13 +539,22 @@ parsing_errors = []
 metrics_conflicts = set()
 
 
-def parse_report(report_file):
-    """Return canonical cases, suite-only counts, and explicit attempt metadata."""
+def parse_report(report_file, errors=None):
+    """Return canonical cases, suite-only counts, and explicit attempt metadata.
+
+    `errors` is the channel an unreadable report is reported through. It
+    defaults to `parsing_errors`, which is the CAPPING channel: a receipt
+    claimed those bytes, so a broken claimed report is a conflict between the
+    run's own statements. Excluded (auxiliary/stale) files pass their own list
+    instead — nobody claimed them, so their unreadability is disclosed with the
+    rest of the excluded volume and grades nothing.
+    """
+    sink = parsing_errors if errors is None else errors
     try:
         tree = ET.parse(report_file)
         xml_root = tree.getroot()
     except Exception as exc:
-        parsing_errors.append(f"Error parsing {report_file}: {exc}")
+        sink.append(f"Error parsing {report_file}: {exc}")
         return None
     attempt_values = set()
     attempt_error = None
@@ -747,10 +756,18 @@ for key in latest:
 # reason auxiliary volume is: a superseded-sha claim that names only a file path
 # drops its executions out of every sentence, and a rewritten report then reads
 # exactly like a report that never existed.
+#
+# Their parse failures leave through their own door too. Sharing
+# `parsing_errors` minted `test_report_parse_error` — the CAPPING conflict
+# reserved for evidence the harness could not read — for a stray XML no receipt
+# vouches for, so an UNPARSEABLE unclaimed report capped a run that a PARSEABLE
+# one did not, and deleting the corrupt file improved the word. The count of
+# what could not be read rides with the volume it belongs to and grades nobody.
 def excluded_counts(files):
     counts = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+    unreadable = []
     for report_file in files:
-        parsed = parse_report(report_file)
+        parsed = parse_report(report_file, unreadable)
         if parsed is None:
             continue
         if parsed["cases"] is None:
@@ -758,6 +775,7 @@ def excluded_counts(files):
             continue
         for identity, status in parsed["cases"]:
             bump(counts, status)
+    counts["unparseable"] = len(unreadable)
     return counts
 
 
@@ -806,24 +824,27 @@ result = {
 # carries meaning elsewhere — a rollup WITHOUT it did not come from here.
 result["receipt_scoped"] = True
 # Absent facts stay absent keys: nothing observed, nothing stated.
-if auxiliary_files:
-    result["auxiliary_test_stats"] = {
-        "executed": auxiliary_counts["total"],
-        "passed": auxiliary_counts["passed"],
-        "failed": auxiliary_counts["failed"],
-        "errors": auxiliary_counts["error"],
-        "skipped": auxiliary_counts["skipped"],
+def excluded_stats(counts):
+    stats = {
+        "executed": counts["total"],
+        "passed": counts["passed"],
+        "failed": counts["failed"],
+        "errors": counts["error"],
+        "skipped": counts["skipped"],
     }
+    # Absent facts stay absent keys, so a corpus that parsed cleanly seals the
+    # exact block it always did.
+    if counts["unparseable"]:
+        stats["unparseable"] = counts["unparseable"]
+    return stats
+
+
+if auxiliary_files:
+    result["auxiliary_test_stats"] = excluded_stats(auxiliary_counts)
     result["auxiliary_report_files"] = auxiliary_files[:200]
 if stale_files:
     result["stale_test_reports"] = stale_files[:200]
-    result["stale_test_stats"] = {
-        "executed": stale_counts["total"],
-        "passed": stale_counts["passed"],
-        "failed": stale_counts["failed"],
-        "errors": stale_counts["error"],
-        "skipped": stale_counts["skipped"],
-    }
+    result["stale_test_stats"] = excluded_stats(stale_counts)
 print(json.dumps(result, separators=(",", ":")))
 '''
 

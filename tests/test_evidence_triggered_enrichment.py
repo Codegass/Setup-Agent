@@ -136,7 +136,7 @@ def enrichment_engine():
         engine._emit_control_action_envelope = fake_emit_control_action_envelope
         engine._emit_control_tool_result = lambda **kwargs: None
         engine._apply_tool_execution_loop_effects = lambda execution: None
-        engine._missing_required_test_attempt = lambda: None
+        engine._missing_required_test_attempt = lambda *_a, **_k: None
         return engine
 
     return _build

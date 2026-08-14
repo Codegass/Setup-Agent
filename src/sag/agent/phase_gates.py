@@ -1518,13 +1518,22 @@ def _excluded_report_counts(value: Any) -> dict[str, int] | None:
     the headline. Present only when the validator observed that destination at
     all; an all-zero block still counts as observed ("reports existed, no tests
     ran").
+
+    ``unparseable`` is a count of reports whose volume could not be measured at
+    all, carried so an all-zero block can say WHICH zero it is. It is not a
+    count field: it never enters an executed/passed/... sum, and it stays an
+    absent key when the corpus parsed cleanly.
     """
     if not isinstance(value, Mapping) or not value:
         return None
-    return {
+    counts = {
         name: _first_nonnegative_int(value.get(name), 0) or 0
         for name in ("executed", "passed", "failed", "errors", "skipped")
     }
+    unparseable = _first_nonnegative_int(value.get("unparseable"), 0) or 0
+    if unparseable:
+        counts["unparseable"] = unparseable
+    return counts
 
 
 def _normalized_domain_root(value: Any) -> str:

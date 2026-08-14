@@ -192,7 +192,7 @@ def native_engine():
             execution.call.name
         )
         engine._close_phase_for_loop = fake_close_phase_for_loop
-        engine._missing_required_test_attempt = lambda: None
+        engine._missing_required_test_attempt = lambda *_a, **_k: None
         engine._add_observation_step = fake_add_observation_step
         return engine
 

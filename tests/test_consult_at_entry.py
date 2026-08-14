@@ -508,7 +508,7 @@ def _flow_engine(tmp_path, *, advisor_mode="same-model", max_iterations=20):
     engine.physical_validator = SimpleNamespace(
         validate_build_artifacts=lambda project_name=None: {},
     )
-    engine._missing_required_test_attempt = lambda: None
+    engine._missing_required_test_attempt = lambda *_a, **_k: None
     engine._reset_advisor_run_state()
 
     orchestrator = ToolOrchestrator(

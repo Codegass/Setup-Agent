@@ -905,7 +905,7 @@ def test_no_op_convergence_in_the_test_phase_forces_the_floor_before_closing():
 
     requirement = SimpleNamespace(action_text=lambda: "build(action='test')")
     forced = []
-    engine._missing_required_test_attempt = lambda: requirement
+    engine._missing_required_test_attempt = lambda *_a, **_k: requirement
     engine._force_required_test_attempt = (
         lambda req, *, trigger: forced.append((req, trigger)) or True
     )

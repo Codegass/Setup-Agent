@@ -332,7 +332,7 @@ def test_a_capped_word_names_both_words_to_the_model_before_it_seals(tmp_path):
         reason="test coordinates remained unavailable after the one bounded survey refresh",
         code="test_candidate_resolution_unavailable",
     )
-    engine._cap_unresolved_test_gate = lambda claim_, gate_: capped
+    engine._cap_unresolved_test_gate = lambda claim_, gate_, **_: capped
 
     engine._handle_phase_signals([_terminal_step(claim, delivered)])
 
@@ -366,7 +366,7 @@ def test_an_acceptance_capped_to_a_rejection_is_not_a_logger_warning(tmp_path):
         reason="test coordinates remained unavailable",
         code="test_candidate_resolution_unavailable",
     )
-    engine._cap_unresolved_test_gate = lambda claim_, gate_: rejected
+    engine._cap_unresolved_test_gate = lambda claim_, gate_, **_: rejected
 
     engine._handle_phase_signals([_terminal_step(claim, delivered)])
 
@@ -389,7 +389,7 @@ def test_a_cap_that_only_refines_the_reason_chains_without_shouting(tmp_path):
         reason="the harness-owned test action produced no candidate-bound runner receipt",
         code="forced_test_attempt_nonreceipt",
     )
-    engine._cap_unresolved_test_gate = lambda claim_, gate_: refined
+    engine._cap_unresolved_test_gate = lambda claim_, gate_, **_: refined
 
     engine._handle_phase_signals([_terminal_step(claim, delivered)])
 
@@ -415,7 +415,7 @@ def test_a_retry_of_the_same_claim_is_a_second_grading_not_a_persist_failure(tmp
         reason="test coordinates remained unavailable after the one bounded survey refresh",
         code="test_candidate_resolution_unavailable",
     )
-    engine._cap_unresolved_test_gate = lambda claim_, gate_: capped
+    engine._cap_unresolved_test_gate = lambda claim_, gate_, **_: capped
     engine._handle_phase_signals([_terminal_step(claim, delivered)])
     assert not engine.phase_machine.is_complete
 
@@ -452,7 +452,7 @@ def test_a_declining_branch_states_the_revision_now_and_parks_nothing(tmp_path):
         reason="test coordinates remained unavailable after the one bounded survey refresh",
         code="test_candidate_resolution_unavailable",
     )
-    engine._cap_unresolved_test_gate = lambda claim_, gate_: capped
+    engine._cap_unresolved_test_gate = lambda claim_, gate_, **_: capped
 
     engine._handle_phase_signals([_terminal_step(claim, delivered)])
 
@@ -546,7 +546,7 @@ def test_every_engine_generated_close_seals_through_the_delivering_sink():
 
 def test_the_loop_close_states_the_word_it_seals(tmp_path):
     engine = _engine(tmp_path)
-    engine._missing_required_test_attempt = lambda: None
+    engine._missing_required_test_attempt = lambda *_a, **_k: None
     execution = SimpleNamespace(
         result=SimpleNamespace(
             output_ref="output_build_1",

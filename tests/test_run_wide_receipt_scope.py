@@ -847,6 +847,432 @@ def test_both_parsers_seal_the_same_zero_receipt_corpus():
     assert partitioned.test_stats.unique == unpartitioned.test_stats.unique
 
 
+# ---------------------------------------------------------------------------
+# Amendment item 8 — the parse-error CAP follows attribution, not the scan
+# ---------------------------------------------------------------------------
+CORRUPT_XML = "<testsuite><testcase classname='X' name='y'"
+
+
+def _corrupt_shape(tmp_path, monkeypatch, *, name: str, keep_the_stray: bool = True):
+    """25 attributed cases plus one stray XML that cannot be parsed at all.
+
+    The stray sits under the auxiliary coordinate: nobody claims it, so it
+    leaves the headline through the AUXILIARY door and its bytes were never
+    vouched for by this run.
+    """
+    from test_receipt_scoped_rollup import _validator, _write
+
+    from sag.agent.phase_gates import _validated_test_rollup
+
+    workspace = ReceiptWorkspace(tmp_path / name)
+    kept = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.KeptTest.xml",
+        "org.apache.bigtop.datagen.KeptTest",
+        [f"kept{i}" for i in range(25)],
+    )
+    if keep_the_stray:
+        _write(
+            workspace.auxiliary_root / "target" / "surefire-reports" / "TEST-Truncated.xml",
+            CORRUPT_XML,
+        )
+    workspace.write_receipt(_receipt("inv-test-1-0001", workspace.primary_root, new=[kept]))
+    _bind_primary_coordinate(monkeypatch, workspace)
+    with _own_evidence_epoch(tmp_path, name):
+        validator, _ = _validator(workspace)
+        result = validator.parse_test_reports(str(workspace.project))
+    return result, _validated_test_rollup(result)
+
+
+def test_an_unreadable_unclaimed_report_never_reaches_the_capping_channel(tmp_path, monkeypatch):
+    """A stray XML nobody claims is disclosed, never counted and never capping.
+
+    ``excluded_counts`` parsed the auxiliary and stale files through the SAME
+    ``parse_report`` that feeds ``parsing_errors``, so an unparseable report
+    outside the claim set minted ``test_report_parse_error`` — the capping
+    conflict reserved for evidence the harness could not read. A receipt
+    vouches for no byte of that file, so its unreadability is not a conflict
+    between the run's own statements: it is one more thing the run can see and
+    cannot attribute.
+    """
+    result, rollup = _corrupt_shape(tmp_path, monkeypatch, name="stray")
+
+    assert result["total_tests"] == 25
+    assert result["parsing_errors"] == []
+    assert "test_report_parse_error" not in rollup["conflicts"]
+    # Never counted — and stated as unmeasurable rather than as a measured zero.
+    assert result["auxiliary_test_stats"] == {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "unparseable": 1,
+    }
+
+
+def test_deleting_a_corrupt_stray_report_never_changes_the_word(tmp_path, monkeypatch):
+    """P4 again, through the parse-error door.
+
+    While an unclaimed unparseable report capped, ``rm`` on that one file
+    lifted the same corpus with the same headline from ``partial`` to
+    ``success`` — 'removing evidence must never improve a verdict'.
+    """
+    from sag.verdict import run_verdict
+
+    present, present_rollup = _corrupt_shape(tmp_path, monkeypatch, name="present")
+    deleted, deleted_rollup = _corrupt_shape(
+        tmp_path, monkeypatch, name="deleted", keep_the_stray=False
+    )
+
+    assert present["total_tests"] == deleted["total_tests"] == 25
+    assert deleted.get("auxiliary_test_stats") is None
+    present_verdict = run_verdict("success", "success", present_rollup["conflicts"])
+    deleted_verdict = run_verdict("success", "success", deleted_rollup["conflicts"])
+
+    assert present_verdict == deleted_verdict == "success"
+
+
+def test_an_unreadable_claimed_report_still_caps(tmp_path, monkeypatch):
+    """The other direction, fenced: a receipt claimed those exact bytes and the
+    harness cannot read them. That is a genuine conflict between the run's own
+    statements, and it keeps today's capping semantics."""
+    from test_receipt_scoped_rollup import _validator, _write
+
+    from sag.agent.phase_gates import _validated_test_rollup
+    from sag.verdict import run_verdict
+
+    workspace = ReceiptWorkspace(tmp_path)
+    kept = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.KeptTest.xml",
+        "org.apache.bigtop.datagen.KeptTest",
+        [f"kept{i}" for i in range(25)],
+    )
+    broken = _write(
+        workspace.primary_root / "target" / "surefire-reports" / "TEST-Truncated.xml",
+        CORRUPT_XML,
+    )
+    workspace.write_receipt(_receipt("inv-test-1-0001", workspace.primary_root, new=[kept, broken]))
+    _bind_primary_coordinate(monkeypatch, workspace)
+    validator, _ = _validator(workspace)
+
+    result = validator.parse_test_reports(str(workspace.project))
+    rollup = _validated_test_rollup(result)
+
+    assert result["total_tests"] == 25
+    assert len(result["parsing_errors"]) == 1
+    assert "test_report_parse_error" in rollup["conflicts"]
+    assert run_verdict("success", "success", rollup["conflicts"]) == "partial"
+
+
+def test_an_unreadable_report_under_a_rewritten_claim_is_disclosed_not_capping(
+    tmp_path, monkeypatch
+):
+    """The stale door gets the same treatment as the auxiliary one: the run
+    stated a hash, the bytes moved, and what stands there now cannot be read.
+    The rewrite is disclosed by ``test_reports_stale`` and its own counts; it
+    does not additionally mint the capping parse-error conflict."""
+    from test_receipt_scoped_rollup import _validator, _write
+
+    from sag.agent.phase_gates import _validated_test_rollup
+
+    workspace = ReceiptWorkspace(tmp_path)
+    kept = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.KeptTest.xml",
+        "org.apache.bigtop.datagen.KeptTest",
+        [f"kept{i}" for i in range(25)],
+    )
+    superseded = workspace.primary_report(
+        "TEST-org.apache.bigtop.datagen.StaleTest.xml",
+        "org.apache.bigtop.datagen.StaleTest",
+        [f"stale{i}" for i in range(10)],
+    )
+    payload = _receipt("inv-test-1-0001", workspace.primary_root, new=[kept, superseded])
+    _write(superseded, CORRUPT_XML)
+    workspace.write_receipt(payload)
+    _bind_primary_coordinate(monkeypatch, workspace)
+    validator, _ = _validator(workspace)
+
+    result = validator.parse_test_reports(str(workspace.project))
+    rollup = _validated_test_rollup(result)
+
+    assert result["total_tests"] == 25
+    assert result["parsing_errors"] == []
+    assert "test_report_parse_error" not in rollup["conflicts"]
+    assert "test_reports_stale" in rollup["conflicts"]
+    assert result["stale_test_stats"] == {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "unparseable": 1,
+    }
+
+
+def test_the_disclosure_names_the_reports_it_could_not_read():
+    """Excluded volume that could not be measured is still SAID. Counting it as
+    a silent zero is how a corrupt unclaimed report became invisible."""
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        auxiliary_test_stats={
+            "executed": 4,
+            "passed": 4,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "unparseable": 1,
+        },
+        stale_test_stats={
+            "executed": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "unparseable": 2,
+        },
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert grains["cases"].payload()["reason"] == (
+        "50/100 — 4 executions visible on disk but bound to no receipt "
+        "(1 unparseable report), 2 unparseable reports under rewritten claims"
+    )
+    assert UNATTRIBUTED_CONFLICT in conflicts
+
+
+def test_an_unmeasurable_excluded_volume_still_names_itself():
+    """Zero measurable executions plus one unreadable file is not 'nothing
+    excluded': the disclosure and its conflict both survive."""
+    stats = SnapshotTestStats(
+        discovered=100,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        auxiliary_test_stats={
+            "executed": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "unparseable": 1,
+        },
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert grains["cases"].payload()["reason"] == (
+        "50/100 — 1 unparseable report visible on disk but bound to no receipt"
+    )
+    assert UNATTRIBUTED_CONFLICT in conflicts
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 9 — the observation fold is unattributed volume too
+# ---------------------------------------------------------------------------
+def _console_state(run_id: str = "console-fold"):
+    """A run whose ONLY test evidence is a tool result's parsed console text."""
+    from sag.agent.evidence_state import EvidenceRole
+    from sag.evidence import OperationOutcome, TestStats
+
+    state = RunEvidenceState(run_id=run_id)
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(output="build complete", facts={"build_success": True}),
+        roles=[EvidenceRole.BUILD],
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="Tests run: 120, Failures: 2",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=200,
+                executed=120,
+                passed=118,
+                failed=2,
+                skipped=0,
+                flaky_count=3,
+            ),
+        ),
+        roles=[EvidenceRole.TEST],
+    )
+    return state
+
+
+def test_console_derived_counts_are_unattributed_volume_not_a_headline():
+    """The observation fold ran when NO ``test.stats`` fact existed at all, and
+    sealed console-derived counts as the full headline — no partition, no
+    conflict, less machinery and a bigger number than either parser. It is the
+    same inversion fallback parity closed, arriving through the render layer
+    this repo's principles forbid as an authority."""
+    from sag.agent.verdict_finalizer import _fold_test_stats
+
+    state = _console_state()
+    stats, _conflicts = _fold_test_stats(state)
+
+    assert stats.unique == SnapshotTestCounts()
+    assert stats.raw == SnapshotTestCounts()
+    assert stats.judgment == "unknown"
+    # Moved, never deleted — and its provenance travels with it.
+    assert stats.auxiliary_test_stats == {
+        "executed": 120,
+        "passed": 118,
+        "failed": 2,
+        "errors": 0,
+        "skipped": 0,
+    }
+    assert stats.unattributed_source == "tool_observations"
+    # Derived facts do not outlive the counts they came from.
+    assert stats.flaky_count == 0
+    # The routing states the provenance; it never invents a partition.
+    assert stats.receipt_scoped is None
+
+
+def test_the_console_disclosure_names_where_the_number_came_from():
+    from sag.agent.verdict_finalizer import VerdictFinalizer
+
+    state = _console_state("console-fold-sealed")
+    state.seal(finalized_at="2026-08-14T00:00:00Z", close_reason="test_terminated")
+    snapshot = VerdictFinalizer(orchestrator=None)._snapshot_for_state(state)
+
+    assert UNATTRIBUTED_CONFLICT in snapshot.conflicts
+    assert snapshot.rates["test"]["cases"]["reason"] == (
+        "0/200 — 120 executions reported in tool output but bound to no receipt"
+    )
+    assert snapshot.rates["test"]["cases"]["numerator"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 10 — a zeroed count takes its derived facts with it
+# ---------------------------------------------------------------------------
+def test_fallback_parity_drops_the_facts_its_counts_carried():
+    """The unpartitioned rollup's counts move to unattributed volume, so the
+    conflicts DERIVED from those counts (and the flaky tally computed over
+    them) must move with them. A sealed ``test_failures_detected`` over a
+    headline of 0/0/0 states a red the snapshot no longer carries."""
+    snapshot = _sealed_snapshot(
+        {
+            "discovered": 100,
+            "unique": {"executed": 50, "passed": 40, "failed": 8, "errors": 2, "skipped": 0},
+            "raw": {"executed": 50, "passed": 40, "failed": 8, "errors": 2, "skipped": 0},
+            "flaky_count": 4,
+            "conflicts": ["test_failures_detected", "test_errors_detected", "metrics_conflict"],
+        },
+        run_id="fallback-derived-facts",
+    )
+
+    assert snapshot.test_stats.unique == SnapshotTestCounts()
+    assert snapshot.test_stats.flaky_count == 0
+    assert "test_failures_detected" not in snapshot.conflicts
+    assert "test_errors_detected" not in snapshot.conflicts
+    # A conflict that did NOT come from those counts is untouched.
+    assert "metrics_conflict" in snapshot.conflicts
+    assert snapshot.test_stats.auxiliary_test_stats == {
+        "executed": 50,
+        "passed": 40,
+        "failed": 8,
+        "errors": 2,
+        "skipped": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Amendment item 11 — one close, one survey read
+# ---------------------------------------------------------------------------
+def _counted_survey(monkeypatch):
+    from sag.agent import attempt_policy
+
+    calls = []
+    real = attempt_policy.resolve_survey_test_candidates
+
+    def counted(orchestrator):
+        calls.append(orchestrator)
+        return real(orchestrator)
+
+    monkeypatch.setattr(attempt_policy, "resolve_survey_test_candidates", counted)
+    monkeypatch.setattr(
+        "sag.agent.react_engine.resolve_survey_test_candidates", counted, raising=False
+    )
+    return calls
+
+
+def _capping_engine(phase: str = "test"):
+    state = _ready_state()
+    state.ingest_tool_result(
+        StateScope.PROJECT_ANALYSIS,
+        "project",
+        ToolResult.completed_failure(output="refresh failed", error="manifest unavailable"),
+        params={"action": "analyze"},
+        source_phase="test",
+        source_attempt_id="test-1",
+    )
+    _record_build_phase_test(state)
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = SimpleNamespace(
+        current_phase=phase,
+        current_attempt_id="test-1",
+        is_complete=False,
+    )
+    engine.run_evidence_state = state
+    engine.orchestrator = UnreadableManifestOrchestrator()
+    return engine
+
+
+def test_one_engine_close_asks_the_survey_once(monkeypatch):
+    """P3: one question, one computation.
+
+    ``_cap_unresolved_test_gate`` asked ``resolve_survey_test_candidates``
+    twice for one grading — once through the unresolved-coordinate probe and
+    once through the forced-refusal probe — and ``_missing_required_test_attempt``
+    asked a third time in the same close. Three reads of one survey can
+    disagree, and then the cap, the refusals and the requirement answer
+    different coordinates while the record shows one close.
+    """
+    calls = _counted_survey(monkeypatch)
+    engine = _capping_engine()
+    claim = PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS)
+    green = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        code="test_execution_observed",
+        claim=claim,
+    )
+    survey = engine._test_candidate_survey()
+
+    engine._cap_unresolved_test_gate(claim, green, survey=survey)
+    engine._missing_required_test_attempt(survey=survey)
+
+    assert len(calls) == 1
+
+
+def test_a_close_that_never_asks_still_spends_no_probe(monkeypatch):
+    """The shared read stays LAZY: threading one answer through the close must
+    not make a non-test grading pay for an answer it never reads."""
+    calls = _counted_survey(monkeypatch)
+    engine = _capping_engine(phase="build")
+    claim = PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS)
+    green = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        code="build_success",
+        claim=claim,
+    )
+
+    engine._cap_unresolved_test_gate(claim, green, survey=engine._test_candidate_survey())
+
+    assert calls == []
+
+
 @pytest.fixture
 def bigtop_reports(tmp_path):
     workspace = ReceiptWorkspace(tmp_path)
