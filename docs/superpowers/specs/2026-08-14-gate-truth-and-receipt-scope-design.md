@@ -76,6 +76,42 @@ and stays. P4 still holds: nothing here removes evidence.
 - Existing anti-fabrication fences stay green (stale/claimed-changed reports
   still excluded).
 
+### Amendment 2026-08-14 — counting monotonicity (owner decision, task #48 follow-up)
+
+The first implementation of §1 was faithful to items 1-3 and still carried two
+non-monotone edges that the review found. Both are closed here; items 1, 2 and
+4 above stand, item 3's trigger is superseded.
+
+1. **Universal claim scoping.** The verified/auxiliary/stale partition applies
+   REGARDLESS of receipt presence. The `receipt_scoped = bool(records)` arming
+   is removed: a run with zero receipts and reports on disk seals headline 0 +
+   auxiliary counts + the unattributed conflict, exactly like geode. Before
+   this, arming on receipt PRESENCE while excluding on report CLAIMS meant a
+   run with ONE compile receipt sealed 0 while the SAME corpus with the ledger
+   removed sealed all of it — deleting attributed evidence improved the number,
+   P4 inverted. The gradient is now monotone: adding a receipt can only move
+   reports from auxiliary to headline; removing one can never improve any
+   sealed number. `receipt_scoped` stays in the sealed schema and is CONSTANT
+   for that parser; its absence in a rollup now means only that the counts came
+   from the unpartitioned shell fallback (which still cannot close a phase —
+   `test_receipt_missing`).
+2. **Monotone disclosure.** §1 item 3's trigger ("headline is 0") is replaced
+   by "auxiliary executed > 0". A nonzero headline never switches the conflict
+   or the sentence off, because one receipted test would otherwise erase both
+   the conflict and every trace of the volume standing beside it. The sentence
+   names both numbers (`1/9754 — 10,448 executions visible on disk but bound to
+   no receipt`; without a denominator, `50 executed, static discovery found no
+   count — 4 executions …`). The conflict remains a capping conflict, so a run
+   that cannot attribute part of what it sees is capped at partial.
+3. **Pre-flight (mandatory, recorded).** Python/pytest test receipts DO carry
+   `report_delta` claims for their junitxml: `python_tool` brackets the run with
+   `snapshot_reports([working_directory, PYTEST_REPORT_DIR])` and takes the
+   after-snapshot AFTER the attempt tagger rewrites the XML, so the claimed
+   hash is the byte content the validator later reads. Fenced by
+   `tests/test_python_tool.py::test_pytest_receipt_claims_the_junitxml_it_wrote`.
+   No claims-producer fix was needed, and universal scoping does not zero
+   Python projects.
+
 ## 2. Fix B — the 80% thresholds leave the gate/claim chain (#49)
 
 ### Convicting evidence

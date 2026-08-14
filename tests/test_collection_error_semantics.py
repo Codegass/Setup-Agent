@@ -14,9 +14,11 @@ Fixture shape is copied from the real artifact
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -143,17 +145,29 @@ class _PytestReportOrchestrator:
         return {"exit_code": 1, "output": ""}
 
 
-def _run_compact_parser(project_dir: str, pytest_reports_dir: str) -> dict:
-    """Execute the in-container parser body locally (same source string).
+def _claim_every_report(*roots: str) -> dict:
+    """Claim every report XML under ``roots``, the way a dispatch's receipt does.
 
-    These sessions have no invocation receipts, so the parser stays on its
-    legacy global-scan basis.
+    Universal claim scoping counts only reports a receipt vouches for, so a
+    parser-semantics fixture states the claims the live dispatch states — here
+    the pytest/surefire run that wrote these very files.
     """
+    claims: dict[str, list[str]] = {}
+    for root in roots:
+        directory = Path(root)
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*.xml")):
+            claims[str(path)] = [hashlib.sha256(path.read_bytes()).hexdigest()]
+    return claims
+
+
+def _run_compact_parser(project_dir: str, pytest_reports_dir: str) -> dict:
+    """Execute the in-container parser body locally (same source string)."""
     namespace = {
         "project_dir": project_dir,
         "pytest_reports_dir": pytest_reports_dir,
-        "receipt_scoped": False,
-        "receipt_claims": {},
+        "receipt_claims": _claim_every_report(project_dir, pytest_reports_dir),
         "primary_root": None,
     }
     buffer = io.StringIO()

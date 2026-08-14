@@ -1451,8 +1451,9 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
                 # counts it produced. Auxiliary reports stay visible next to
                 # the primary numerator without ever entering it, and stale
                 # (superseded) reports are named rather than silently dropped.
-                # A receipt-free run emits none of these keys, so recorded
-                # replay fixtures serialize byte-identically.
+                # `receipt_scoped` states that the counts came from the claim
+                # partition (constant for that parser since 2026-08-14); a
+                # rollup without it came from the unpartitioned shell fallback.
                 "receipt_scoped": True if status.get("receipt_scoped") else None,
                 "auxiliary_test_stats": _auxiliary_counts(status.get("auxiliary_test_stats")),
                 "stale_test_reports": (
@@ -2206,13 +2207,21 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             state, code, reason = decision.state, decision.code, decision.reason
         receipt_scoped = rollup.get("receipt_scoped") is True
         if executed > 0 and not receipt_scoped and not evidence_integrity_failure:
+            # Universal claim scoping (2026-08-14) made this key constant for
+            # the compact in-container parser: a receipt-free run partitions
+            # its corpus too, and seals `receipt_scoped: True` with a zero
+            # headline. So the key's ABSENCE no longer means "this run had no
+            # receipts" — it means these counts did not come out of the claim
+            # partition at all (the shell find/cat fallback, reached when the
+            # compact parser could not run). Unpartitioned counts stay visible
+            # as facts and still may not close the phase.
             evidence_integrity_failure = True
             decision = _GradedDecision(
                 state=ValidatorState.UNAVAILABLE,
                 code="test_receipt_missing",
                 reason=(
-                    "test execution counts are not bound to a terminal invocation receipt; "
-                    "receipt-free reports cannot close the test phase"
+                    "test execution counts did not come from the receipt-claim partition; "
+                    "unattributable reports cannot close the test phase"
                 ),
             )
             state, code, reason = decision.state, decision.code, decision.reason

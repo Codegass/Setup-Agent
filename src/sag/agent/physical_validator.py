@@ -285,11 +285,10 @@ _RECEIPTS_UNREADABLE = "unreadable"
 
 
 # In-container test-report parser (executed via `python3 - <<'PY'`). The four
-# header assignments (project_dir, pytest_reports_dir, receipt_scoped,
-# receipt_claims, primary_root) are prepended by
-# _parse_test_reports_compact_in_container. Receipt facts have already crossed
-# the strict host-publication boundary; the embedded parser never reopens a
-# container evidence ledger on its own.
+# header assignments (project_dir, pytest_reports_dir, receipt_claims,
+# primary_root) are prepended by _parse_test_reports_compact_in_container.
+# Receipt facts have already crossed the strict host-publication boundary; the
+# embedded parser never reopens a container evidence ledger on its own.
 # Kept as a plain module string so the embedded script needs no f-string brace
 # escaping.
 #
@@ -300,12 +299,22 @@ _RECEIPTS_UNREADABLE = "unreadable"
 # Raw executions remain diagnostics; primary/unique counts use each history's
 # latest status while first/worst/retry/flaky facts remain visible.
 #
-# Scoping model (Plan 5 Task B2): the scan discovers candidates, the receipts
-# decide provenance. Only reports CLAIMED by a receipt of the primary test
-# coordinate — and whose recorded sha256 still matches the file on disk — feed
-# the primary rollup. Everything else is auxiliary (visible, never counted) or
-# stale (claimed, superseded, quarantined). No receipts at all means the
-# legacy global scan, unchanged and unannotated.
+# Scoping model (Plan 5 Task B2, universal since 2026-08-14): the scan
+# discovers candidates, the receipts decide provenance. Only reports CLAIMED by
+# a receipt of the primary test coordinate — and whose recorded sha256 still
+# matches the file on disk — feed the primary rollup. Everything else is
+# auxiliary (visible, never counted) or stale (claimed, superseded,
+# quarantined).
+#
+# The partition is UNCONDITIONAL. It used to be armed on receipt PRESENCE
+# (`receipt_scoped = bool(records)`) while exclusion ran against report CLAIMS,
+# which inverted the evidence gradient: geode, whose only receipts were two
+# `compileJava` receipts claiming nothing, sealed headline 0 over a
+# 10,448-execution corpus, while the SAME corpus with the ledger removed took
+# the unscoped branch and sealed all 10,448. Deleting attributed evidence
+# improved the number. Provenance is a property of each report, so a run with
+# no receipts has no attributed reports — not a licence to count every file it
+# can see.
 _COMPACT_REPORT_PARSER_BODY = '''
 import hashlib
 import json
@@ -497,28 +506,25 @@ scanned_files = sorted(
 # "which modules produced any reports at all", not "which are primary".
 report_dirs = sorted({str(Path(path).parent) for path in scanned_files})
 
-auxiliary_files = []
-stale_files = []
-if receipt_scoped:
-    verified = set()
-    unverified = set()
-    for claimed_path, claimed_hashes in receipt_claims.items():
-        current = content_sha256(claimed_path)
-        if current is None:
-            # Claimed and since deleted: nothing on disk to attribute.
-            continue
-        if current in claimed_hashes:
-            verified.add(claimed_path)
-        else:
-            unverified.add(claimed_path)
-    unverified -= verified
-    report_files = [path for path in scanned_files if path in verified]
-    auxiliary_files = [
-        path for path in scanned_files if path not in verified and path not in unverified
-    ]
-    stale_files = sorted(unverified)
-else:
-    report_files = scanned_files
+# The partition runs over whatever the receipts claim, INCLUDING nothing at
+# all: an empty claim set makes every scanned report auxiliary.
+verified = set()
+unverified = set()
+for claimed_path, claimed_hashes in receipt_claims.items():
+    current = content_sha256(claimed_path)
+    if current is None:
+        # Claimed and since deleted: nothing on disk to attribute.
+        continue
+    if current in claimed_hashes:
+        verified.add(claimed_path)
+    else:
+        unverified.add(claimed_path)
+unverified -= verified
+report_files = [path for path in scanned_files if path in verified]
+auxiliary_files = [
+    path for path in scanned_files if path not in verified and path not in unverified
+]
+stale_files = sorted(unverified)
 
 groovy_classes = set()
 for groovy in root.rglob("src/test/groovy/**/*.groovy"):
@@ -784,10 +790,13 @@ result = {
     "parsing_errors": parsing_errors[:50],
 }
 
-# Absent facts stay absent keys: a legacy (receipt-free) run emits none of the
-# scoping keys, so recorded replay fixtures serialize byte-identically.
-if receipt_scoped:
-    result["receipt_scoped"] = True
+# `receipt_scoped` is now CONSTANT for this parser: it states "these counts
+# came out of the claim partition", which is every count this parser produces.
+# The key is kept for schema stability (sealed snapshots, the report metrics
+# projection and archived replay fixtures all read it), and its absence still
+# carries meaning elsewhere — a rollup WITHOUT it did not come from here.
+result["receipt_scoped"] = True
+# Absent facts stay absent keys: nothing observed, nothing stated.
 if auxiliary_files:
     result["auxiliary_test_stats"] = {
         "executed": auxiliary_counts["total"],
@@ -2475,8 +2484,9 @@ class PhysicalValidator:
         reading local to the container and only returns aggregate metrics.
 
         ``primary_root`` is attempt_policy's primary test coordinate; with it
-        the parser scopes the rollup to receipted reports. ``None`` (no
-        receipts, or no resolvable coordinate) keeps the legacy global scan.
+        the claim set is narrowed to that coordinate's receipts. ``None`` (no
+        resolvable coordinate) narrows nothing — every claim of every current
+        receipt counts — but it never widens the rollup past the claims.
 
         Returns ``None`` only when the parser did not run or produced no
         readable JSON — a run that found nothing still returns its dict, so
@@ -2508,7 +2518,6 @@ class PhysicalValidator:
             "# SAG_COMPACT_TEST_REPORT_PARSER\n"
             f"project_dir = {json.dumps(project_dir)}\n"
             f"pytest_reports_dir = {json.dumps(PYTEST_REPORT_DIR)}\n"
-            f"receipt_scoped = {bool(records)!r}\n"
             f"receipt_claims = {json.dumps(receipt_claims, sort_keys=True)}\n"
             f"primary_root = {json.dumps(primary_root) if primary_root else 'None'}\n"
             f"{_COMPACT_REPORT_PARSER_BODY}\n"

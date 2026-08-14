@@ -579,30 +579,69 @@ def test_receipt_missing_required_schema_fields_is_corrupt(bigtop, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Legacy fallback: no receipts means byte-identical behaviour
+# Universal claim scoping: the partition does not wait for a receipt to exist
 # ---------------------------------------------------------------------------
-def test_no_receipts_directory_keeps_the_global_scan(bigtop, monkeypatch):
-    """Recorded sessions have no receipts: the legacy rollup must not move."""
+def test_no_receipts_directory_still_partitions_the_corpus(bigtop, monkeypatch):
+    """Zero receipts is zero authority, not a licence to count everything.
+
+    The partition used to be ARMED on receipt presence while exclusion ran
+    against report CLAIMS, so a run with no receipt directory at all took the
+    unscoped branch and handed the headline to 54 executions nothing vouched
+    for — while geode's run, whose only receipts were two `compileJava`
+    receipts claiming nothing, took the full partition and sealed 0. Deleting
+    attributed evidence therefore IMPROVED the sealed number. The arming is
+    gone: the partition is a property of the scan, not of the ledger's size.
+    """
     _bind_primary_coordinate(monkeypatch, bigtop)
     validator, _ = _validator(bigtop)
 
     result = validator.parse_test_reports(str(bigtop.project))
 
-    assert result["total_tests"] == 54
-    assert "receipt_scoped" not in result
-    assert "auxiliary_test_stats" not in result
+    assert result["receipt_scoped"] is True
+    assert result["total_tests"] == 0
+    assert result["auxiliary_test_stats"]["executed"] == 54
     assert "stale_test_reports" not in result
 
 
-def test_empty_receipts_directory_keeps_the_global_scan(bigtop, monkeypatch):
+def test_empty_receipts_directory_still_partitions_the_corpus(bigtop, monkeypatch):
     _bind_primary_coordinate(monkeypatch, bigtop)
     bigtop.receipts_dir.mkdir(parents=True, exist_ok=True)
     validator, _ = _validator(bigtop)
 
     result = validator.parse_test_reports(str(bigtop.project))
 
-    assert result["total_tests"] == 54
-    assert "receipt_scoped" not in result
+    assert result["receipt_scoped"] is True
+    assert result["total_tests"] == 0
+    assert result["auxiliary_test_stats"]["executed"] == 54
+
+
+def test_a_receipt_can_only_move_reports_from_auxiliary_to_the_headline(bigtop, monkeypatch):
+    """The evidence gradient is monotone in both directions.
+
+    Adding a receipt may only move reports from auxiliary to headline; a run
+    without it may never seal a HIGHER number. The same corpus is read twice —
+    once with no ledger at all, then with the primary coordinate's receipt.
+    """
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    primary_reports = sorted((bigtop.primary_root / "target" / "surefire-reports").glob("*.xml"))
+    receipt = _receipt("inv-test-1-0001", bigtop.primary_root, new=primary_reports)
+    validator, _ = _validator(bigtop)
+
+    def scan(records):
+        return validator._parse_test_reports_compact_in_container(
+            str(bigtop.project),
+            primary_root=str(bigtop.primary_root),
+            receipt_records=records,
+        )
+
+    without_receipt = scan([])
+    with_receipt = scan([receipt])
+
+    assert without_receipt["total_tests"] == 0
+    assert without_receipt["auxiliary_test_stats"]["executed"] == 54
+    assert with_receipt["total_tests"] == 50
+    assert with_receipt["auxiliary_test_stats"]["executed"] == 4
+    assert without_receipt["total_tests"] <= with_receipt["total_tests"]
 
 
 def test_an_unresolved_primary_coordinate_still_counts_only_claimed_reports(bigtop, monkeypatch):
@@ -656,8 +695,17 @@ def test_a_receipt_claiming_nothing_leaves_the_main_count_empty(bigtop, monkeypa
     assert (result.get("auxiliary_test_stats") or {}).get("executed") == 54
 
 
-def test_legacy_rollup_shape_is_unchanged(bigtop, monkeypatch):
-    """Byte-compat with recorded replay fixtures: absent facts stay absent keys."""
+def test_an_unreceipted_rollup_states_the_partition_it_came_from(bigtop, monkeypatch):
+    """The sealed shape of a receipt-free run, after universal scoping.
+
+    This was `test_legacy_rollup_shape_is_unchanged`, which pinned the OTHER
+    shape: no scoping keys and `unique.executed == 54`, i.e. the whole corpus
+    as the headline because the ledger was empty. Under universal scoping the
+    rollup states its basis (`receipt_scoped`) and carries the excluded volume
+    beside a zero headline. Archived replay fixtures are unaffected: they
+    replay the rollups their own runs recorded, and every optional key here is
+    still absent-when-unobserved.
+    """
     _bind_primary_coordinate(monkeypatch, bigtop)
     validator, orchestrator = _validator(bigtop)
 
@@ -672,8 +720,12 @@ def test_legacy_rollup_shape_is_unchanged(bigtop, monkeypatch):
         "conflicts",
         "collection_errors",
         "collection_errors_skipped",
+        "receipt_scoped",
+        "auxiliary_test_stats",
     }
-    assert rollup["unique"]["executed"] == 54
+    assert rollup["receipt_scoped"] is True
+    assert rollup["unique"]["executed"] == 0
+    assert rollup["auxiliary_test_stats"]["executed"] == 54
 
 
 def test_a_cached_claim_counts_toward_the_primary_rollup(bigtop, monkeypatch):

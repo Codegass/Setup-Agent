@@ -12,13 +12,17 @@ implementation commit and summarized here because it moves the target:
   primary-coordinate claims filter — ``_verified_report_claims`` returned
   ``{}`` because the admitted receipts claim nothing.  Both spec §1.4
   candidates are ruled out by the bytes.
-* What geode DOES expose is an arming asymmetry: receipt scoping is armed on
+* What geode DOES expose is an arming asymmetry: receipt scoping was armed on
   receipt PRESENCE while exclusion is enforced against report CLAIMS, so a run
   whose only receipts are compile receipts publishes a guaranteed zero
-  headline over a 10,448-execution corpus.  Arming on claims instead would
-  hand the headline to reports no receipt vouches for, which is the exact
-  fabrication receipt scoping exists to stop.  §1 item 3 is therefore the
-  correct mitigation and these fences hold the headline at zero.
+  headline over a 10,448-execution corpus — while the SAME corpus with no
+  ledger at all took the unscoped branch and published all 10,448.  Deleting
+  attributed evidence improved the number, which is P4 inverted.  Fixed
+  2026-08-14 by removing the arming entirely: the partition is universal, the
+  headline is what the claims cover, and the excluded volume is named.  The
+  first review of this file argued that arming on claims "would hand the
+  headline to reports no receipt vouches for" — it does the opposite, and the
+  zero-receipt path was already doing exactly that.
 
 The control-side dropper is separate and real: the close path consulted zero
 receipts.  ``required_test_attempt`` returns its analyze requirement before
@@ -313,8 +317,14 @@ def test_the_named_conflict_reaches_the_sealed_verdict():
     validate_verdict_snapshot_v3(snapshot.model_dump(mode="json"))
 
 
-def test_auxiliary_volume_without_a_zero_headline_is_not_a_conflict():
-    """Quarantined neighbors are normal whenever the headline was attributed."""
+def test_auxiliary_volume_is_disclosed_even_when_the_headline_is_not_zero():
+    """A nonzero headline never switches the disclosure off.
+
+    The trigger used to be `headline == 0`, so ONE receipted test deleted both
+    the conflict and every trace of the volume standing beside it — a live
+    incentive to launder a corpus by running one test through a
+    receipt-producing tool. Excluded volume is excluded volume at any headline.
+    """
     stats = SnapshotTestStats(
         discovered=100,
         unique=SnapshotTestCounts(executed=50, passed=50),
@@ -325,8 +335,54 @@ def test_auxiliary_volume_without_a_zero_headline_is_not_a_conflict():
 
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
-    assert UNATTRIBUTED_CONFLICT not in conflicts
-    assert "reason" not in grains["cases"].payload()
+    assert UNATTRIBUTED_CONFLICT in conflicts
+    assert grains["cases"].payload()["reason"] == (
+        "50/100 — 4 executions visible on disk but bound to no receipt"
+    )
+
+
+def test_one_receipted_test_cannot_launder_the_geode_corpus():
+    """geode with a single attributed execution: 1/9754 stays 1/9754, and the
+    10,448 unattributed executions are still named next to it."""
+    stats = SnapshotTestStats(
+        discovered=9754,
+        unique=SnapshotTestCounts(executed=1, passed=1),
+        raw=SnapshotTestCounts(executed=1, passed=1),
+        receipt_scoped=True,
+        auxiliary_test_stats={
+            "executed": 10448,
+            "passed": 10422,
+            "failed": 3,
+            "errors": 0,
+            "skipped": 23,
+        },
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert UNATTRIBUTED_CONFLICT in conflicts
+    assert grains["cases"].payload()["reason"] == (
+        "1/9754 — 10,448 executions visible on disk but bound to no receipt"
+    )
+
+
+def test_the_disclosure_names_both_numbers_without_a_denominator():
+    """No discovered count is no excuse to state only one of the two volumes."""
+    stats = SnapshotTestStats(
+        discovered=None,
+        unique=SnapshotTestCounts(executed=50, passed=50),
+        raw=SnapshotTestCounts(executed=50, passed=50),
+        receipt_scoped=True,
+        auxiliary_test_stats={"executed": 4, "passed": 4, "failed": 0, "errors": 0, "skipped": 0},
+    )
+
+    grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
+
+    assert UNATTRIBUTED_CONFLICT in conflicts
+    assert grains["cases"].payload()["reason"] == (
+        "50 executed, static discovery found no count — "
+        "4 executions visible on disk but bound to no receipt"
+    )
 
 
 def test_a_zero_headline_without_auxiliary_volume_is_not_a_conflict():

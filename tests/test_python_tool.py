@@ -1244,6 +1244,51 @@ def test_test_assigns_monotonic_attempt_ids_and_persists_them_in_junit():
     assert " 2" in tag_commands[1]
 
 
+def test_pytest_receipt_claims_the_junitxml_it_wrote():
+    """A pytest test receipt claims its own JUnit XML in `report_delta`.
+
+    Universal claim scoping (2026-08-14 spec §1 as amended) makes every
+    on-disk report either headline (claimed by a receipt) or auxiliary. A
+    pytest dispatch whose receipt claimed nothing would therefore zero every
+    Python project's headline count, so the claim is load-bearing and fenced
+    here: the report lives OUTSIDE the project dir (PYTEST_REPORT_DIR), the
+    attempt tagger REWRITES it after the run, and the after-snapshot must
+    still bind the bytes the validator will hash.
+    """
+
+    report = f"{PYTEST_REPORT_DIR}/pytest-attempt-000001.xml"
+    digest = "a" * 64
+    state = {"ran": False}
+
+    def snapshot(cmd):
+        # `find <roots> -exec sha256sum`: empty before the run, one report after.
+        return ok(f"{digest}  {report}\n") if state["ran"] else ok("")
+
+    def run(cmd):
+        state["ran"] = True
+        return ok("42 passed in 1.20s")
+
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", ok("tests/test_a.py::test_x\n42 tests collected in 0.12s")),
+            ("sha256sum", snapshot),
+            ("--junitxml", run),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    snapshots = [command for command in orch.commands if "-exec sha256sum" in command]
+    assert len(snapshots) == 2
+    assert PYTEST_REPORT_DIR in snapshots[0]
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 1
+    assert receipts[0]["effective_action"] == "test"
+    assert receipts[0]["report_delta"]["new"] == [{"path": report, "sha256": digest}]
+
+
 def test_attempt_tag_script_writes_suite_property_atomically(tmp_path):
     report = tmp_path / "report.xml"
     report.write_text(

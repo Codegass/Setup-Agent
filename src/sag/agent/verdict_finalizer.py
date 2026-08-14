@@ -810,8 +810,7 @@ def _fold_test_stats(
 
 
 def _unattributed_executions(stats: SnapshotTestStats) -> int:
-    """Executions visible on disk that no receipt claims (0 = none, or none
-    excluded).
+    """Executions visible on disk that no receipt claims (0 = none excluded).
 
     geode ran two `./gradlew test` dispatches to BUILD SUCCESSFUL through the
     `bash` tool, which emits no invocation receipt. 10,448 executions landed on
@@ -819,9 +818,14 @@ def _unattributed_executions(stats: SnapshotTestStats) -> int:
     `none` with no sentence anywhere saying why. The exclusion is correct — an
     unreceipted report has no provenance — but a silent zero states the
     opposite of what happened.
+
+    The disclosure asks ONLY what was excluded, never what was counted. Gating
+    it on a zero headline meant one receipted test erased both the conflict and
+    the volume beside it: the cheapest way to clear geode's 10,448 would have
+    been to run a single test through a receipt-producing tool, not to
+    attribute the corpus. Excluded volume is disclosed at any headline, and the
+    sentence names both numbers so a reader can see the ratio.
     """
-    if stats.unique.executed > 0:
-        return 0
     auxiliary = stats.auxiliary_test_stats
     if not isinstance(auxiliary, Mapping):
         return 0
@@ -849,10 +853,14 @@ def test_grain_rates(
             ),
         )
     else:
+        # Both volumes or neither: without a denominator the grain shows no
+        # ratio, so the attributed count has to be IN the sentence or a reader
+        # sees the excluded volume alone and reads it as the whole story.
         cases = GrainRate(
             0,
             None,
             reason=(
+                f"{stats.unique.executed} executed, static discovery found no count — "
                 f"{unattributed:,} executions visible on disk but bound to no receipt"
                 if unattributed
                 else "static discovery found no count"

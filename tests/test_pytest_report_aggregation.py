@@ -23,9 +23,11 @@ executes the emitted `python3 - <<'PY'` command with a subprocess against
 tmp-dir fixtures (same code path as the live container run).
 """
 
+import hashlib
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -161,10 +163,41 @@ def workspace(tmp_path, monkeypatch):
     return project, reports
 
 
+def _claiming_receipt(project):
+    """The receipt this run's dispatch wrote, claiming every report on disk.
+
+    Universal claim scoping (spec 2026-08-14 §1 as amended) counts a report
+    only where a current receipt claims its exact bytes, so an aggregation
+    fixture has to state the provenance a live dispatch states. It is the live
+    shape: python_tool's test receipt claims the junitxml it wrote
+    (tests/test_python_tool.py::test_pytest_receipt_claims_the_junitxml_it_wrote)
+    and so do the Maven/Gradle runners. Aggregation semantics are what these
+    tests are about; the partition has its own fences in
+    tests/test_receipt_scoped_rollup.py.
+    """
+    from sag.tools.internal import python_tool
+
+    roots = [Path(project), Path(python_tool.PYTEST_REPORT_DIR)]
+    claimed = sorted({str(path) for root in roots if root.is_dir() for path in root.rglob("*.xml")})
+    return {
+        "working_directory": str(project),
+        "report_delta": {
+            "new": [
+                {"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+                for path in claimed
+            ],
+            "changed": [],
+        },
+    }
+
+
 def _parse(project):
     validator = PhysicalValidator(
         docker_orchestrator=LocalExecOrch(), project_path=str(project.parent)
     )
+    # The published-ledger seam: these fixtures write reports directly rather
+    # than through a runner, so the ledger states what that runner would have.
+    validator._read_live_invocation_receipts = lambda: [_claiming_receipt(project)]
     return validator.parse_test_reports(str(project))
 
 

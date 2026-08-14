@@ -554,6 +554,46 @@ def test_red_tests_never_reject_a_test_phase_close():
     assert "test_failures" not in gate.code
 
 
+def test_counts_that_did_not_come_from_the_claim_partition_cannot_close_the_phase():
+    """`receipt_scoped` absent has exactly ONE meaning after universal scoping.
+
+    The compact in-container parser now states `receipt_scoped: True` on every
+    rollup it produces — a receipt-free run partitions its corpus like any
+    other and seals a zero headline plus the auxiliary volume. So a rollup
+    that arrives WITHOUT the key came from the shell find/cat fallback (the
+    compact parser could not run), whose counts carry no provenance partition
+    at all. Those counts are still published as facts, and they still may not
+    close the test phase.
+    """
+
+    class UnpartitionedFallback(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "evidence_status": "success",
+                "reason": "10 passed",
+                "report_files": ["report://shell-fallback"],
+                "test_stats": {"discovered": 10, "executed": 10, "passed": 10},
+                "unique_tests": 10,
+                "unique_passed_tests": 10,
+            }
+
+    gate = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=UnpartitionedFallback(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert gate.accepted is False
+    assert gate.validator_state is ValidatorState.UNAVAILABLE
+    assert gate.code == "test_receipt_missing"
+    assert gate.control_disposition is GateControlDisposition.HARNESS_RECOVERY_REQUIRED
+    assert gate.validated_facts["test.stats"]["unique"]["executed"] == 10
+    assert "receipt_scoped" not in gate.validated_facts["test.stats"]
+
+
 def test_detected_but_unexecuted_tests_are_red():
     class NoExecution(FakeValidator):
         def validate_test_status(self, project_name=None):
