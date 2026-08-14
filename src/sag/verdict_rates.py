@@ -28,6 +28,7 @@ HEAVY_RED_DEMOTED_BAND = BAND_MOST
 HEAVY_RED_CONFLICT = "test_failures_heavy"
 UNBOUNDED_CONFLICT = "rate_denominator_not_a_bound"
 UNBOUNDED_REASON = "numerator exceeds denominator; this count cannot bound it"
+UNATTRIBUTED_CONFLICT = "test_executions_unattributed_to_receipts"
 
 
 def band_for(numerator: int, denominator: int | None) -> str:
@@ -87,12 +88,19 @@ class GrainRate:
                 "numerator": self.numerator,
                 "denominator": self.denominator,
             }
-        return {
+        payload = {
             "rate": self.rate,
             "band": self.band,
             "numerator": self.numerator,
             "denominator": self.denominator,
         }
+        if self.reason:
+            # A measured fraction can still need a sentence: a zero numerator
+            # over a real denominator says nothing about the executions that
+            # were excluded from it. Absent reason stays an absent key, so
+            # recorded snapshots keep verifying byte-identically.
+            payload["reason"] = self.reason
+        return payload
 
 
 def demote_heavy_red(

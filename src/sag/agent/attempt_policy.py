@@ -592,6 +592,48 @@ def terminal_test_receipts(
     return (*direct, *terminal_polls)
 
 
+def run_test_receipts(
+    state: RunEvidenceState | None,
+    *,
+    project_root: str | None = None,
+) -> tuple[ToolObservation, ...]:
+    """Return terminal test-bearing receipts from ANY phase/attempt of this run.
+
+    Deliberately candidate-free. Every other receipt predicate here binds to a
+    survey candidate, which makes them unreachable in the exact state the close
+    path fires: ``unsafe_coordinates`` yields ``candidates=()`` and
+    `_matches_candidate` is unconditionally False on an empty tuple. A
+    ``build(action=test)`` receipt harvested in the build phase is the same
+    physical fact as a test-phase one, so the only scoping left is this run and
+    the directory boundary — the resolved project root when the survey has one,
+    otherwise the container workspace, never nothing.
+    """
+    if state is None:
+        return ()
+    root = str(project_root or "").strip() or "/workspace"
+    receipts: list[ToolObservation] = []
+    for observation in state.tool_observations:
+        if not _is_test_dispatch(observation) or not observation.result.is_terminal:
+            continue
+        metadata = observation.result.metadata or {}
+        # A rendered command is intent; the backend must attest that the runner
+        # crossed the dispatch boundary, exactly as `_terminal_runner_receipt`
+        # requires of a candidate-bound one.
+        if metadata.get("runner_dispatched") is not True:
+            continue
+        if not str(metadata.get("command") or "").strip():
+            continue
+        execution_root, _ = test_execution_binding(
+            observation.tool_name,
+            observation.params,
+            observation.result,
+        )
+        if execution_root is None or not _is_contained(execution_root, root):
+            continue
+        receipts.append(observation)
+    return tuple(receipts)
+
+
 def forced_test_refusal_receipts(
     state: RunEvidenceState,
     *,
@@ -705,6 +747,13 @@ def required_test_attempt(
         return None
     resolved = resolution or resolve_survey_test_candidates(orchestrator)
     if resolved.status != "available":
+        # An unresolvable coordinate cannot un-run a test that already ran.
+        # Without candidates there is nothing to bind a receipt to, so the
+        # honest question is the run-wide one: did any dispatch of this run
+        # reach a terminal runner? If it did, closure is legal and the forced
+        # survey refresh has nothing left to establish.
+        if run_test_receipts(state, project_root=resolved.project_root):
+            return None
         if has_test_candidate_refresh_receipt(state, attempt_id=attempt_id):
             return None
         return TestAttemptRequirement(

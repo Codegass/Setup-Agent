@@ -42,6 +42,7 @@ from .attempt_policy import (
     required_test_attempt,
     resolve_current_build_receipt_scope,
     resolve_survey_test_candidates,
+    run_test_receipts,
     test_execution_binding,
     test_execution_matches_candidate,
 )
@@ -2157,7 +2158,15 @@ class ReActEngine(UIEventEmitter):
         ):
             return None
         resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
-        return resolution if resolution.status != "available" else None
+        if resolution.status == "available":
+            return None
+        # Spec §1 item 2: `test_candidate_resolution_unavailable` may only be
+        # emitted once the run-wide receipt set is empty of test-bearing
+        # receipts. Both close sites read this predicate, so they inherit the
+        # consult from here rather than each growing their own.
+        if run_test_receipts(state, project_root=resolution.project_root):
+            return None
+        return resolution
 
     def _forced_test_refusals(self):
         machine = getattr(self, "phase_machine", None)

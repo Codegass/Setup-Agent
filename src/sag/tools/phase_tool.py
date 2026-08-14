@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 from sag.agent.attempt_policy import (
     build_attempt_requirement,
     required_test_attempt,
+    run_test_receipts,
     untried_islands_requirement,
 )
 from sag.agent.job_obligations import read_obligations
@@ -345,7 +346,11 @@ class PhaseTool(BaseTool):
                 control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
                 blocker_owner="harness",
                 validated_facts={
-                    "test_execution_receipts": 0,
+                    # Counted, never asserted: this was a hard-coded 0 that
+                    # sealed "no receipts" into runs that had one. The count is
+                    # run-wide because the fact names the run, not the
+                    # candidate the requirement happens to be about.
+                    "test_execution_receipts": len(run_test_receipts(self.run_evidence_state)),
                     "test_attempt_requirement": required_attempt.to_metadata(),
                 },
             )

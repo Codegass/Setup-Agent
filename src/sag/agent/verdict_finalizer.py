@@ -19,6 +19,7 @@ from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import rescue_blocked_build, run_verdict
 from sag.verdict_rates import (
+    UNATTRIBUTED_CONFLICT,
     GrainRate,
     band_for,
     demote_heavy_red,
@@ -814,6 +815,26 @@ def _fold_test_stats(
     )
 
 
+def _unattributed_executions(stats: SnapshotTestStats) -> int:
+    """Executions visible on disk that no receipt claims (0 = none, or none
+    excluded).
+
+    geode ran two `./gradlew test` dispatches to BUILD SUCCESSFUL through the
+    `bash` tool, which emits no invocation receipt. 10,448 executions landed on
+    disk, the headline sealed 0, and `rates.test.cases` read `0/9754` band
+    `none` with no sentence anywhere saying why. The exclusion is correct — an
+    unreceipted report has no provenance — but a silent zero states the
+    opposite of what happened.
+    """
+    if stats.unique.executed > 0:
+        return 0
+    auxiliary = stats.auxiliary_test_stats
+    if not isinstance(auxiliary, Mapping):
+        return 0
+    executed = _nonnegative_int(auxiliary.get("executed")) or 0
+    return executed
+
+
 def test_grain_rates(
     stats: SnapshotTestStats,
     driven_modules: set[str],
@@ -821,16 +842,27 @@ def test_grain_rates(
 ) -> tuple[dict[str, GrainRate], tuple[str, ...]]:
     """Return execution-based test case and surveyed-module grains."""
 
+    unattributed = _unattributed_executions(stats)
     if stats.discovered:
         cases = GrainRate(
             numerator=stats.unique.executed,
             denominator=stats.discovered,
+            reason=(
+                f"{stats.unique.executed}/{stats.discovered} — {unattributed:,} "
+                "executions visible on disk but bound to no receipt"
+                if unattributed
+                else None
+            ),
         )
     else:
         cases = GrainRate(
             0,
             None,
-            reason="static discovery found no count",
+            reason=(
+                f"{unattributed:,} executions visible on disk but bound to no receipt"
+                if unattributed
+                else "static discovery found no count"
+            ),
         )
     cases, conflicts = demote_heavy_red(
         cases,
@@ -838,6 +870,9 @@ def test_grain_rates(
         errors=stats.unique.errors,
         executed=stats.unique.executed,
     )
+    if unattributed:
+        # Visibility without authority: the volume is named, never counted.
+        conflicts += (UNATTRIBUTED_CONFLICT,)
 
     if test_modules:
         modules = GrainRate(
@@ -1067,8 +1102,18 @@ def _validated_rate_grain(
             raise ValueError(f"verdict unbounded {label} counts do reconcile as a rate")
         return GrainRate(numerator, denominator, reason=reason)
 
-    if set(payload) != {"rate", "band", "numerator", "denominator"}:
+    # A measured fraction may carry one optional sentence (spec §1 item 3: the
+    # cases grain names the executions excluded from its own numerator). The
+    # sentence is additive — absent stays absent, so recorded v4 artifacts
+    # written before it keep validating byte-identically.
+    if set(payload) not in (
+        {"rate", "band", "numerator", "denominator"},
+        {"rate", "band", "numerator", "denominator", "reason"},
+    ):
         raise ValueError(f"verdict collected {label} rate shape is invalid")
+    reason = payload.get("reason")
+    if "reason" in payload and (type(reason) is not str or not reason.strip()):
+        raise ValueError(f"verdict collected {label} reason is invalid")
     numerator = payload.get("numerator")
     denominator = payload.get("denominator")
     rate = payload.get("rate")
@@ -1085,8 +1130,8 @@ def _validated_rate_grain(
     if band != expected_band:
         if not (allow_heavy_red_demotion and expected_band == "fully" and band == "most"):
             raise ValueError(f"verdict {label} band does not reconcile")
-        return GrainRate(numerator, denominator, band_override="most")
-    return GrainRate(numerator, denominator)
+        return GrainRate(numerator, denominator, reason=reason, band_override="most")
+    return GrainRate(numerator, denominator, reason=reason)
 
 
 def _validated_rates_block(
