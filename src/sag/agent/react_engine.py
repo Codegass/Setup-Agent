@@ -6022,6 +6022,12 @@ class ReActEngine(UIEventEmitter):
             invocation_status=result.invocation_status.value,
             job_id=str(result.poll_ref or metadata.get("job_id") or ""),
             output_cursor=output_cursor,
+            # The harness's phase-entry consult is READ by the ladder like every
+            # other call (spec §2.2 rule 1) and COUNTED by none of it: the
+            # controller asked a reviewer a question between two of the model's
+            # actions, and a question the model never asked may not disarm the
+            # break the model's own repetition armed.
+            outside_ladder=bool((execution.metadata or {}).get("advisor_entry_consult")),
         )
 
     def _ensure_project_facts(self) -> str:

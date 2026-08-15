@@ -207,6 +207,16 @@ class LoopEvent:
     relevant_scopes: tuple[str, ...] = ()
     job_id: str = ""
     output_cursor: str = ""
+    #: The engine states that this call is not a project action the ladder
+    #: bounds, whatever tool it names. The phase-entry advisor consult is the
+    #: one: the HARNESS authors it, between two of the model's own calls, and
+    #: the advisor's consult cap already bounds how often it happens. Counting
+    #: it would put a second instrument on one phase, and — because the ladder
+    #: disarms on any different action — it would let a question the model
+    #: never asked cancel the break the model's own repetition armed.
+    #: It is recorded in the event, so `sag.agent.replay` re-derives the same
+    #: decision from the same bytes.
+    outside_ladder: bool = False
 
     def with_state(self, state: Mapping[str, int]) -> "LoopEvent":
         return replace(self, relevant_state=dict(state))
@@ -782,12 +792,15 @@ class LoopMemory:
             event.relevant_state,
             _relevant_scopes(event),
         )
-        if _normalize_text(event.tool_name) in TOOLS_OUTSIDE_THE_LADDER:
+        if _normalize_text(event.tool_name) in TOOLS_OUTSIDE_THE_LADDER or event.outside_ladder:
             # Before any state is read or written, so parity in the ledger can
             # never become interference in the loop breaker: no chain, no armed
-            # key, no diversity census, no history row. The decision is real —
-            # `sag.agent.replay` re-derives it from the recorded event and
-            # compares — and it says exactly what happened, which is nothing.
+            # key, no diversity census, no history row. Membership is by TOOL
+            # for the three that never make project actions, and by the engine's
+            # own statement for the one call that is outside the ladder without
+            # its tool being — the harness's phase-entry consult. The decision
+            # is real — `sag.agent.replay` re-derives it from the recorded event
+            # and compares — and it says exactly what happened, which is nothing.
             return self._decision(
                 "continue",
                 action_key=action_key,

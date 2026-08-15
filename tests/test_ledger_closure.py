@@ -216,6 +216,93 @@ def test_a_claim_tool_leaves_the_ladders_state_exactly_as_it_found_it():
     assert memory.observe(failing).decision == "close_phase"
 
 
+def test_the_phase_entry_consult_leaves_the_ladders_state_exactly_as_it_found_it():
+    """The harness asking a reviewer a question is not the model taking an action.
+
+    The phase-entry consult is authored by the controller, between two of the
+    model's own calls, and the advisor's consult cap already bounds how often
+    it happens. Counting it in the recurrence ladder puts a second instrument
+    on one phase — and, worse, lets a question the MODEL never asked disarm the
+    break its own repetition armed.
+    """
+    memory = LoopMemory()
+    failing = LoopEvent(
+        tool_name="build",
+        args={"action": "compile"},
+        operation_outcome="failed",
+        error_code="MAVEN_BUILD_ERROR",
+        failure_signature="MAVEN_BUILD_ERROR:8d576114",
+        relevant_state={"artifacts": 0},
+        relevant_scopes=("artifacts",),
+        phase="build",
+        attempt_id="build-1",
+    )
+    consulting = LoopEvent(
+        tool_name="advisor",
+        args={},
+        operation_outcome="success",
+        relevant_state={"artifacts": 0},
+        relevant_scopes=("artifacts",),
+        phase="build",
+        attempt_id="build-1",
+        outside_ladder=True,
+    )
+    for _ in range(4):
+        memory.observe(failing)
+    armed_before = memory._armed_key
+    chains_before = dict(memory._chains)
+
+    consult_decision = memory.observe(consulting)
+
+    assert consult_decision.decision == "continue"
+    assert consult_decision.reason_code == "tool_outside_recurrence_ladder"
+    assert memory._armed_key == armed_before
+    assert memory._chains == chains_before
+    assert memory.observe(failing).decision == "close_phase"
+
+
+def test_an_advisor_call_the_model_made_is_still_the_ladders_business():
+    """The CONSULT is outside the ladder; the tool is not.
+
+    A call the model chose to make is a call the ladder reads, whichever tool
+    it names. Exempting the tool would have been a policy nobody asked for.
+    """
+    memory = LoopMemory()
+    asked = LoopEvent(
+        tool_name="advisor",
+        args={},
+        operation_outcome="success",
+        relevant_state={"artifacts": 0},
+        relevant_scopes=("artifacts",),
+        phase="build",
+        attempt_id="build-1",
+    )
+
+    decision = memory.observe(asked)
+
+    assert decision.reason_code != "tool_outside_recurrence_ladder"
+
+
+def test_the_ledger_says_which_calls_the_ladder_was_never_going_to_count(closed_run):
+    """The consult's own record states it, so a replay re-derives the same word."""
+    advisor = [
+        row["payload"]
+        for row in _events(closed_run, "loop_decision")
+        if row["payload"]["event"]["tool_name"] == "advisor"
+    ]
+
+    assert advisor, "this run took no phase-entry consult"
+    assert all(row["event"]["outside_ladder"] is True for row in advisor)
+    assert {row["expected_reason_code"] for row in advisor} == {"tool_outside_recurrence_ladder"}
+    # The model's own calls are read by the ladder, and say so.
+    model_calls = [
+        row["payload"]["event"]
+        for row in _events(closed_run, "loop_decision")
+        if row["payload"]["event"]["tool_name"] != "advisor"
+    ]
+    assert all(event["outside_ladder"] is False for event in model_calls)
+
+
 # ---------------------------------------------------------------------------
 # Rule 4 — a refusal is a record, not an absence
 # ---------------------------------------------------------------------------
