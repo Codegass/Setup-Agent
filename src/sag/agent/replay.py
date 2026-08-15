@@ -156,6 +156,13 @@ def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, An
 #: The walk reads and counts them so pre-Plan-2 transcripts still verify.
 _HISTORICAL_EVENT_KINDS = frozenset({"scheduler_decision", "planner_response"})
 _POST_CLOSE_PUBLICATION_KINDS = frozenset({"run_pin", "report_metrics"})
+#: Records ABOUT a run rather than moves within it (spec §2.1, §2.2 rule 4).
+#: Every fact they state is one this walk has already verified from the events
+#: they describe, so they move no replay state — but they are CURRENT kinds, not
+#: historical ones, and a walk that had no branch for them raised
+#: `unsupported event kind` on an honest ledger: an integrity-family abort on
+#: every post-closure session that sealed a turn or refused a call.
+_DERIVED_RECORD_KINDS = frozenset({"turn_record", "refusal_record"})
 
 
 def _observe_evidence_publication(
@@ -2291,17 +2298,19 @@ class ControlReplayRunner:
                             transition,
                             progress_fingerprint=fingerprint,
                         )
-                elif event.kind == "turn_record":
-                    # A DERIVED seal over events this walk has already verified
-                    # — the envelope, the result, the gate, the loop decision.
-                    # It moves no replay state, and re-deriving it here would
-                    # be a second derivation of the same facts (spec §1: one
-                    # pipeline). The conservation fence over turn ids belongs
-                    # to the trajectory layer, which reads this stream whole;
-                    # the walk's job is that a sealed turn never invalidates a
-                    # transcript that is otherwise exact. The payload is
-                    # already validated by `ControlEvent`, and the record's
-                    # bytes still enter the produced digest below.
+                elif event.kind in _DERIVED_RECORD_KINDS:
+                    # DERIVED seals over events this walk has already verified.
+                    # A `turn_record` names the envelope, the result, the gate
+                    # and the loop decision it sealed; a `refusal_record` names
+                    # a call that reached no tool, so there is no dispatch to
+                    # re-derive and no state to move. Re-deriving either here
+                    # would be a second derivation of the same facts (spec §1:
+                    # one pipeline), and the conservation fence over turn ids
+                    # belongs to the trajectory layer, which reads this stream
+                    # whole. The walk's job is that a record ABOUT a run never
+                    # invalidates a transcript that is otherwise exact. Both
+                    # payloads are already validated by `ControlEvent`, and
+                    # their bytes still enter the produced digest below.
                     pass
                 else:  # pragma: no cover - ControlEvent validation owns this
                     raise ReplayValidationError(f"unsupported event kind: {event.kind}")

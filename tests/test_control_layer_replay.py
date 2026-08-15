@@ -198,6 +198,61 @@ def test_replay_rejects_a_forged_completion_recurrence_count(tmp_path):
         ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
 
+def _sealed_turn_event():
+    return {
+        "kind": "turn_record",
+        "payload": {
+            "turn_id": 1,
+            "phase": "test",
+            "iteration": 4,
+            "actor": "model",
+            "window_digest": {"system_prompt_sha256": "a" * 64, "component_refs": []},
+            "t0": "2026-08-15T10:00:00Z",
+            "t1": "2026-08-15T10:00:04Z",
+        },
+    }
+
+
+def _refusal_event():
+    return {
+        "kind": "refusal_record",
+        "payload": {
+            "tool": "search",
+            "tool_call_id": "call_9",
+            "refusal_code": "REPAIR_CONTEXT_NOT_ACTIVE",
+            "exact_params_sha256": canonical_sha256({"pattern": "spotless"}),
+        },
+    }
+
+
+@pytest.mark.parametrize("record", [_sealed_turn_event, _refusal_event])
+def test_a_record_about_a_run_never_makes_that_run_unreplayable(tmp_path, record):
+    """Stage B's two observability kinds are CARRIED by the walk, not refused.
+
+    Both are statements ABOUT a transcript the walk already verifies — a sealed
+    turn, and a call that never reached a tool (spec §2.2 rule 4). Neither moves
+    replay state. A kind with no branch falls through to `unsupported event
+    kind`, which is an integrity-family abort raised on a legitimate ledger:
+    every post-closure session carrying one becomes unreplayable, and the
+    house's control-integrity oracle declares an honest run impossible.
+    """
+    rows = _paramiko_rows_with_job_events([record()])
+    transcript = tmp_path / "sealed-record.jsonl"
+    _write_replay_rows(transcript, rows)
+
+    kind = record()["kind"]
+    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
+
+    assert result.snapshot is not None
+    assert result.unconsumed_events == ()
+    assert kind in {
+        json.loads(line).get("kind") for line in transcript.read_text().splitlines()
+    }
+    # Carried by a branch of its own, not filed away as machinery this walk
+    # stopped modelling: these kinds are current, and the notice is for the old.
+    assert kind not in result.skipped_event_kinds
+
+
 def _write_replay_rows(path, rows):
     for sequence, row in enumerate(rows[1:], 1):
         row["sequence"] = sequence
