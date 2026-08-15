@@ -5604,8 +5604,17 @@ class ReActEngine(UIEventEmitter):
             return
         machine = getattr(self, "phase_machine", None)
         digest = window_digest or self._window_for(actor)
+        # The id is spent HERE, on the turn that is being sealed, and never
+        # given back. Advancing it after a successful emit made the hole check
+        # of spec §2.2 rule 5 unfalsifiable: a record that did not persist
+        # handed its id to the next turn, so the sequence closed over the loss
+        # and the reducer's `conservation_violation` became dead code for every
+        # engine-produced ledger. A run that lost its whole turn stream derived
+        # a clean, silent, one-turn trajectory. A lost record is a hole, and a
+        # hole is what the fence is written to find.
+        turn_id = int(getattr(self, "_sealed_turn_count", 0)) + 1
+        self._sealed_turn_count = turn_id
         try:
-            turn_id = int(getattr(self, "_sealed_turn_count", 0)) + 1
             payload = TurnRecordPayload(
                 turn_id=turn_id,
                 phase=(getattr(machine, "current_phase", "") or "") or "unknown",
@@ -5626,9 +5635,8 @@ class ReActEngine(UIEventEmitter):
                     update={"tokens_in": tokens_in, "tokens_out": tokens_out}
                 )
             self._emit_control_event("turn_record", payload.model_dump(mode="json"))
-            self._sealed_turn_count = turn_id
         except Exception as exc:  # observability never ends a run
-            logger.warning(f"turn record was not sealed: {exc}")
+            logger.warning(f"turn record {turn_id} was not sealed: {exc}")
 
     def _delivered_observation_ref(self, step: Any) -> Optional[str]:
         """[C] as the model read it, not as the tool returned it.

@@ -429,6 +429,60 @@ def test_every_decision_has_its_envelope_and_its_answer(closed_run):
     assert decisions == 4 and refusals == 1
 
 
+class _LosingSink:
+    """A ledger that will not take one particular turn record.
+
+    A full disk, a revoked handle, a payload the sink rejects — the engine
+    already treats all three the same way, by logging and going on. What this
+    stands in for is that the record does not reach the file.
+    """
+
+    def __init__(self, inner, *, drop_turn_id):
+        self._inner = inner
+        self._drop_turn_id = drop_turn_id
+        self.dropped = 0
+
+    def emit(self, kind, payload):
+        if kind == "turn_record" and payload.get("turn_id") == self._drop_turn_id:
+            self.dropped += 1
+            raise OSError("the ledger would not take this record")
+        return self._inner.emit(kind, payload)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_a_turn_record_that_never_persisted_leaves_the_hole_it_is_looked_for_by(tmp_path):
+    """Rule 5's hole check must be falsifiable, or it is true by construction.
+
+    The turn counter used to advance AFTER the emit and inside its try, so a
+    record that failed to persist gave its id back to the next turn: the engine
+    could not produce a hole, "the turn_id sequence has no holes" held by
+    construction, and the reducer's `conservation_violation` was dead code for
+    every engine-produced ledger. A run whose whole turn-record stream failed
+    derived a clean, silent, one-turn trajectory.
+
+    The id is spent when the turn is sealed. A record that does not arrive is
+    then exactly what it is: a hole, in the place the fence looks.
+    """
+    turns = [_phase_turn(index) for index in range(1, 4)]
+    engine = _closure_engine(tmp_path, turns)
+    engine.control_event_sink = _LosingSink(engine.control_event_sink, drop_turn_id=2)
+    engine.run_setup_loop("set up the project", max_iterations=3)
+
+    stated = [row["payload"]["turn_id"] for row in _events(engine, "turn_record")]
+
+    assert engine.control_event_sink.dropped == 1
+    assert 2 not in stated
+    assert stated == sorted(stated) and stated[0] == 1
+    violations = [
+        warning
+        for warning in build_trajectory(tmp_path).warnings
+        if warning.code == "conservation_violation"
+    ]
+    assert len(violations) == 1 and "3" in violations[0].detail
+
+
 def test_the_turn_sequence_has_no_holes(closed_run):
     """Three model turns and the controller's consult, in one sequence."""
     records = _events(closed_run, "turn_record")
