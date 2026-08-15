@@ -104,6 +104,10 @@ CONTROL_EVENT_KINDS = (
     # Gate truth (spec 2026-08-14 §3.1): a word already delivered to the model
     # may only be replaced out loud. Appended for the same positional reason.
     "gate_outcome_revised",
+    # Observation trajectory (spec 2026-08-14 §2.1): one sealed record per
+    # turn, stating the exact window the model saw. Appended last, like every
+    # kind before it, so no reader keyed on position moves.
+    "turn_record",
 )
 ControlEventKind = Literal[
     "planner_response",
@@ -129,6 +133,7 @@ ControlEventKind = Literal[
     "evidence_publication",
     "evidence_store_bound",
     "gate_outcome_revised",
+    "turn_record",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -996,6 +1001,80 @@ class LoopDecisionPayload(_StrictPayload):
     expected_reason_code: str = Field(min_length=1)
 
 
+class WindowDigestPayload(_StrictPayload):
+    """Component-level reference to the EXACT messages array one turn saw.
+
+    [A] — "what did the model see" — was archaeology: branch history is a
+    truncated, compaction-shaped approximation of the rendered window, and
+    every observation-poisoning investigation paid to reconstruct it (spec §0).
+    A digest ends that. `system_prompt_sha256` names which prompt build spoke;
+    `component_refs` names each message of the rendered array, in the order it
+    was rendered, so resolving the refs and concatenating them in list order
+    reproduces the window byte-for-byte.
+
+    Bytes are stored ONCE: identical messages across turns resolve to the same
+    ref. Which is exactly why the list is neither deduplicated nor sorted — two
+    identical messages occupy two positions, and a set of refs reconstructs
+    nothing. An empty list is the honest statement that no component could be
+    stored, never a partial window pretending to be whole.
+    """
+
+    system_prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Bounded like every other strict field. A window longer than this cannot
+    # be stated exactly, and a record that cannot be exact states nothing.
+    component_refs: tuple[str, ...] = Field(default=(), max_length=2048)
+
+    @field_validator("component_refs")
+    @classmethod
+    def _every_component_is_named(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not str(ref).strip() for ref in value):
+            raise ValueError("a window component reference cannot be empty")
+        return value
+
+
+class TurnRecordPayload(_StrictPayload):
+    """One sealed turn: what the model saw, what it said, what it heard.
+
+    Sealed by the engine only, through the same publication path as every
+    other control event (spec §2.1). Controller-initiated moves — forced
+    actions and engine-generated gate closes — seal records of their own with
+    `actor: controller`, in the same `turn_id` sequence, so the harness's turns
+    stop being invisible next to the model's.
+
+    Absence is stated, never implied: a turn whose call was refused before an
+    envelope existed carries `envelope_ref: None`, and a turn nobody was billed
+    for carries no tokens. What a record never does is end before it began.
+    """
+
+    turn_id: int = Field(ge=1)
+    phase: str = Field(min_length=1)
+    iteration: int | None = Field(default=None, ge=0)
+    actor: Literal["model", "controller"]
+    window_digest: WindowDigestPayload
+    envelope_ref: str | None = Field(default=None, min_length=1)
+    observation_ref: str | None = Field(default=None, min_length=1)
+    gate_decision_id: str | None = Field(default=None, min_length=1)
+    tokens_in: int | None = Field(default=None, ge=0)
+    tokens_out: int | None = Field(default=None, ge=0)
+    t0: str = Field(min_length=1)
+    t1: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _a_turn_ends_after_it_starts(self) -> "TurnRecordPayload":
+        try:
+            start = datetime.fromisoformat(self.t0)
+            end = datetime.fromisoformat(self.t1)
+        except ValueError as exc:
+            raise ValueError(f"a turn's timestamps must be ISO-8601: {exc}") from exc
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end < start:
+            raise ValueError("a turn cannot end before it began")
+        return self
+
+
 class EvidenceClosePayload(_StrictPayload):
     reason: Literal[
         "test_terminated",
@@ -1245,6 +1324,7 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "evidence_publication": EvidencePublicationPayload,
     "evidence_store_bound": EvidenceStoreBoundPayload,
     "gate_outcome_revised": GateOutcomeRevisedPayload,
+    "turn_record": TurnRecordPayload,
 }
 
 
@@ -1526,6 +1606,8 @@ __all__ = [
     "RunPin",
     "SourceExcerpt",
     "SourceFileManifest",
+    "TurnRecordPayload",
+    "WindowDigestPayload",
     "action_envelope_sha256",
     "job_stall_transition",
     "canonical_json",

@@ -577,7 +577,8 @@ def test_job_unsettled_is_appended_after_job_settled():
         "evidence_store_bound",
     )
     assert CONTROL_EVENT_KINDS[22] == "gate_outcome_revised"
-    assert len(CONTROL_EVENT_KINDS) == 23
+    assert CONTROL_EVENT_KINDS[23] == "turn_record"
+    assert len(CONTROL_EVENT_KINDS) == 24
 
 
 def test_the_job_unsettled_payload_states_the_job_its_file_and_what_it_was():

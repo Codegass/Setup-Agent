@@ -599,7 +599,10 @@ def test_the_phase_tool_renders_the_accepted_word_through_the_shared_renderer():
 # §3 — schema ripple
 # ---------------------------------------------------------------------------
 def test_the_revision_kind_is_appended_never_inserted():
-    assert CONTROL_EVENT_KINDS[-1] == "gate_outcome_revised"
+    # An absolute position, not a tail slice: kinds are appended after this
+    # one (`turn_record`), and a `[-1]` assertion would read every honest
+    # append as an insertion.
+    assert CONTROL_EVENT_KINDS[22] == "gate_outcome_revised"
     assert CONTROL_EVENT_KINDS[:10] == (
         "planner_response",
         "scheduler_decision",

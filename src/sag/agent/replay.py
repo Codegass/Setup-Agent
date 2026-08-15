@@ -2291,6 +2291,18 @@ class ControlReplayRunner:
                             transition,
                             progress_fingerprint=fingerprint,
                         )
+                elif event.kind == "turn_record":
+                    # A DERIVED seal over events this walk has already verified
+                    # — the envelope, the result, the gate, the loop decision.
+                    # It moves no replay state, and re-deriving it here would
+                    # be a second derivation of the same facts (spec §1: one
+                    # pipeline). The conservation fence over turn ids belongs
+                    # to the trajectory layer, which reads this stream whole;
+                    # the walk's job is that a sealed turn never invalidates a
+                    # transcript that is otherwise exact. The payload is
+                    # already validated by `ControlEvent`, and the record's
+                    # bytes still enter the produced digest below.
+                    pass
                 else:  # pragma: no cover - ControlEvent validation owns this
                     raise ReplayValidationError(f"unsupported event kind: {event.kind}")
             except ReplayValidationError:
