@@ -126,8 +126,9 @@ def create_app(
         session_id: str,
         detail: str = "summary",
         since: int | None = Query(default=None, ge=0),
+        since_seq: int | None = Query(default=None, ge=0),
     ) -> dict:
-        """One session's trajectory-v1 document — whole, or since a turn.
+        """One session's trajectory-v1 document — whole, or since a watermark.
 
         The body is exactly what `sag trajectory` prints and what
         `build_trajectory` derives: `{schema_version, session, phases, turns,
@@ -140,11 +141,9 @@ def create_app(
         and leaves `outputs` null; `detail=full` additionally resolves every ref
         the turns name to its verbatim bytes. Summary is the polling tier.
 
-        **The `since=<turn_id>` delta contract**, which the frontend polls:
+        **What a cut may remove.** Whichever cut is asked for, it removes TURNS
+        and nothing else:
 
-        - the response is the SAME document with one thing removed — the turns
-          whose `turn_id <= since`. `since` is exclusive, and it cuts turns and
-          nothing else;
         - `annotations` and `warnings` are the CURRENT WHOLE state on every
           response, not an increment, so a consumer REPLACES them rather than
           appending. This is `DeltaAccumulator`'s rule read through a stateless
@@ -160,16 +159,46 @@ def create_app(
           map to merge, not a list to append. It is also why `full` is not the
           tier to poll with.
 
-        A turn at or below the cut is never restated, and a turn's state can
-        still change after it is first sent: the token ledger is exported when
-        the loop exits, so the bill for the last turns lands after they do. A
-        consumer that wants those joins re-reads without `since` — at the
-        summary tier that is a cheap replay of a file it is already tailing.
+        **`since_seq=<control sequence>` is the cut a LIVE consumer polls**, and
+        the only one that converges while a run is moving. It keeps every turn
+        the ledger has touched at a sequence above the watermark — the turn still
+        in flight, whose envelope arrived at one sequence and whose result and
+        decision arrive at later ones; the turn a `gate_outcome_revised` regrades
+        long after it closed; the dispatch a `job_live_at_close` marks at the end
+        of the run. A turn naming no sequence at all cannot be shown unchanged,
+        so it is always restated. Sequences are the ledger's own append order, so
+        a turn's highest one is the last line folded into it, and the consumer's
+        watermark is the highest sequence it holds.
+
+        **`since=<turn_id>` cuts by turn id**, dropping `turn_id <= since`. It is
+        a pager over a run that is no longer moving, NOT a live channel: a turn
+        it has already sent can never be restated, so a poll that catches a turn
+        in flight holds that turn's half-stated row forever while the whole-state
+        rule withdraws the warnings that said so. Live consumers use `since_seq`.
+
+        The two cuts are different watermarks over the same document, so asking
+        for both at once is refused rather than silently resolved one way.
+
+        One join still lands outside the ledger: the engine exports
+        `token_usage.csv` when the loop EXITS, so the last turns' bills arrive
+        with no control event to carry them. A consumer re-reads whole when the
+        run stops — at the summary tier that is a cheap replay of a file it is
+        already tailing.
         """
         if detail not in DETAIL_TIERS:
             raise HTTPException(
                 status_code=422,
                 detail=f"Unknown detail tier: {detail}. Use one of {', '.join(DETAIL_TIERS)}.",
+            )
+
+        if since is not None and since_seq is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "since and since_seq are two different cuts over one document: "
+                    "since drops turn ids at or below it, since_seq keeps every turn "
+                    "the ledger touched above it. Ask for one."
+                ),
             )
 
         try:
@@ -191,9 +220,16 @@ def create_app(
             ) from exc
 
         document = trajectory.model_dump(mode="json")
-        if since is None:
-            return document
-        document["turns"] = [turn for turn in document["turns"] if turn["turn_id"] > since]
+        if since_seq is not None:
+            document["turns"] = [
+                turn
+                for turn in document["turns"]
+                # A turn that names no sequence cannot be shown unchanged, so it
+                # is restated rather than assumed to be the row already held.
+                if not turn["control_seq"] or max(turn["control_seq"]) > since_seq
+            ]
+        elif since is not None:
+            document["turns"] = [turn for turn in document["turns"] if turn["turn_id"] > since]
         return document
 
     @app.get("/api/stream/dashboard")

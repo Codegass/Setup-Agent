@@ -12,6 +12,7 @@ import {
   bandTurns,
   formatSeq,
   gateChain,
+  latestControlSeq,
   latestTurnId,
   mergeTrajectory,
   recurrenceCount,
@@ -124,6 +125,32 @@ describe("latestTurnId", () => {
 
   it("is null before any turn — a poller must not cut at zero by accident", () => {
     expect(latestTurnId(doc())).toBeNull()
+  })
+})
+
+describe("latestControlSeq", () => {
+  it("is the last ledger line folded into any turn the document holds", () => {
+    const held = doc({
+      turns: [turn(1, { control_seq: [3, 4, 6] }), turn(2, { control_seq: [7] })],
+    })
+    expect(latestControlSeq(held)).toBe(7)
+  })
+
+  it("is the newest line even when it landed on an older turn", () => {
+    // ignite's forced dispatch: the turn closed at seq 239 and the run's close
+    // folded seq 240 onto it afterwards, while no newer turn ever opened.
+    const held = doc({
+      turns: [turn(1, { control_seq: [235, 238, 239, 240] }), turn(2, { control_seq: [236] })],
+    })
+    expect(latestControlSeq(held)).toBe(240)
+  })
+
+  it("ignores a turn that names no sequence — the endpoint restates those anyway", () => {
+    expect(latestControlSeq(doc({ turns: [turn(1, { control_seq: [] })] }))).toBeNull()
+  })
+
+  it("is null before any turn — a poller must not cut at zero by accident", () => {
+    expect(latestControlSeq(doc())).toBeNull()
   })
 })
 

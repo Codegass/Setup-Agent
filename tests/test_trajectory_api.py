@@ -148,6 +148,110 @@ def test_a_since_cut_returns_only_the_turns_after_it(tmp_path):
     assert cut["schema_version"] == whole["schema_version"]
 
 
+def _ledger(session_dir: Path, fixture: Path, lines: int | None = None) -> int:
+    """Write the first `lines` lines of a fixture's ledger, as a run writing it.
+
+    A live ledger is a file that grows. Truncating an archived one is how a poll
+    that catches a run mid-turn is reproduced without inventing a single byte:
+    every line is the engine's own.
+    """
+    raw = (fixture / "control_events.jsonl").read_text(encoding="utf-8").splitlines(True)
+    kept = raw if lines is None else raw[:lines]
+    (session_dir / "control_events.jsonl").write_text("".join(kept), encoding="utf-8")
+    return len(kept)
+
+
+def test_a_turn_still_open_at_the_cut_is_restated_when_the_ledger_fills_it(tmp_path):
+    """The poller's cut is over the LEDGER, not over the turn ids it has seen.
+
+    kafka's first turn is opened by its `action_envelope` (seq 3) and finished by
+    the `tool_result` (seq 4) and `loop_decision` (seq 6) that answer it, thirteen
+    seconds later. A poll landing in between holds that turn half-stated — phase
+    `unknown`, no iteration, no observation, no bill, `control_seq [3]` — and its
+    holes are stated as warnings.
+
+    A turn-id cut can never repair that: `turn_id <= since` drops the turn
+    forever, while the whole-state rule withdraws the warnings that named its
+    holes, leaving a row that is wrong and no longer says so. The sequence cut
+    restates every turn the ledger has touched since the consumer last read.
+    """
+    logs, session_dir, mirror = _mount(tmp_path)
+    _ledger(session_dir, KAFKA, lines=3)
+    client = _client(logs, mirror)
+    session = _session_id("kafka")
+
+    open_turn = client.get(f"/api/sessions/{session}/trajectory").json()["turns"][0]
+    assert open_turn["control_seq"] == [3] and open_turn["iteration"] is None
+
+    _ledger(session_dir, KAFKA, lines=8)
+    by_turn = client.get(f"/api/sessions/{session}/trajectory?since=1").json()
+    caught_up = client.get(f"/api/sessions/{session}/trajectory?since_seq=3").json()
+
+    # The cut the turn id gives is the turn that was open — it drops itself.
+    assert 1 not in [turn["turn_id"] for turn in by_turn["turns"]]
+    restated = next(turn for turn in caught_up["turns"] if turn["turn_id"] == 1)
+    assert restated["phase"] == "provision"
+    assert restated["iteration"] == 1
+    assert restated["observation"]["ref"] == "output_6163859b019d"
+    assert restated["tokens"] == {"input": 4134, "output": 71}
+    assert restated["t1"] == "2026-08-14T11:28:49.545505Z"
+    assert restated["control_seq"] == [3, 4, 6]
+
+
+def test_the_sequence_cut_drops_only_the_turns_the_ledger_has_not_touched(tmp_path):
+    """Everything else is the `since=` contract, unchanged."""
+    logs, _, mirror = _mount(tmp_path)
+    client = _client(logs, mirror)
+    session = _session_id("kafka")
+
+    whole = client.get(f"/api/sessions/{session}/trajectory").json()
+    cut = client.get(f"/api/sessions/{session}/trajectory?since_seq=100").json()
+
+    assert cut["turns"] == [turn for turn in whole["turns"] if max(turn["control_seq"]) > 100]
+    assert cut["turns"] and len(cut["turns"]) < len(whole["turns"])
+    assert cut["warnings"] == whole["warnings"] and whole["warnings"]
+    assert cut["annotations"] == whole["annotations"]
+    assert cut["session"] == whole["session"]
+    assert cut["phases"] == whole["phases"]
+
+
+def test_a_late_fold_onto_a_turn_reaches_the_poller_the_turn_cut_lost(tmp_path):
+    """ignite's job close (seq 240) lands on the turn that dispatched it (235).
+
+    The turn was opened, answered and decided by seq 239; the `job_live_at_close`
+    at 240 folds onto it afterwards, and the slice corpus pins its
+    `control_seq` as `[235, 238, 239, 240]` — the handle a reader descends with.
+    A consumer that had already been sent that turn is never sent it again under
+    a turn-id cut, so the fold is lost to every poller. Under the sequence cut it
+    is exactly what comes back.
+    """
+    logs, session_dir, mirror = _mount(tmp_path, fixture=IGNITE, project="ignite")
+    client = _client(logs, mirror, project="ignite")
+    session = _session_id("ignite")
+
+    whole = client.get(f"/api/sessions/{session}/trajectory").json()
+    dispatch = next(turn for turn in whole["turns"] if 240 in turn["control_seq"])
+    assert dispatch["control_seq"] == [235, 238, 239, 240]
+
+    by_turn = client.get(f"/api/sessions/{session}/trajectory?since={dispatch['turn_id']}").json()
+    by_seq = client.get(f"/api/sessions/{session}/trajectory?since_seq=239").json()
+
+    assert by_turn["turns"] == []
+    assert [turn["turn_id"] for turn in by_seq["turns"]] == [dispatch["turn_id"]]
+
+
+def test_two_cuts_at_once_are_refused_by_name(tmp_path):
+    """One read, one watermark. A response cut two ways states neither."""
+    logs, _, mirror = _mount(tmp_path)
+
+    response = _client(logs, mirror).get(
+        f"/api/sessions/{_session_id('kafka')}/trajectory?since=3&since_seq=3"
+    )
+
+    assert response.status_code == 422
+    assert "since" in response.json()["detail"] and "since_seq" in response.json()["detail"]
+
+
 def test_a_cut_past_the_last_turn_still_states_the_run(tmp_path):
     """Nothing new is not nothing: the holes are stated on every poll."""
     logs, _, mirror = _mount(tmp_path)

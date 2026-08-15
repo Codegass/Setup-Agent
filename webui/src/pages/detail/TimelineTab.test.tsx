@@ -63,22 +63,73 @@ describe("TimelineTab", () => {
     expect(screen.getByRole("button", { name: /^Turn 1/ })).toBeInTheDocument()
   })
 
-  it("polls since the last turn it holds while the run is live", async () => {
+  it("polls since the last ledger line it holds while the run is live", async () => {
     vi.useFakeTimers()
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => Promise.resolve(json(doc())))
-      .mockImplementation(() => Promise.resolve(json(doc({ turns: [turn(2)] }))))
+      .mockImplementation(() =>
+        Promise.resolve(json(doc({ turns: [turn(2, { control_seq: [4, 5] })] }))),
+      )
 
     render(<TimelineTab live sessionId="S1" />)
     await settle()
     await settle(5000)
 
     expect(fetchMock).toHaveBeenLastCalledWith(
-      "/api/sessions/S1/trajectory?detail=summary&since=1",
+      "/api/sessions/S1/trajectory?detail=summary&since_seq=1",
     )
     expect(screen.getByRole("button", { name: /^Turn 1/ })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /^Turn 2/ })).toBeInTheDocument()
+  })
+
+  it("holds the turn that was still open until the ledger restates it", async () => {
+    // The desync this cut exists to end: a poll catches a turn between its
+    // envelope and its result, and a turn-id cut (`since=<the last turn held>`)
+    // drops that very turn from every later response. The row then stands
+    // forever half-stated — no observation, no bill, a `control_seq` missing the
+    // lines a reader would descend with — while the whole-state rule withdraws
+    // the warnings that said so.
+    vi.useFakeTimers()
+    const open = turn(1, {
+      phase: "unknown",
+      call: { tool: "project", params_ref: "envelope-000003" },
+      observation: null,
+      control_seq: [3],
+    })
+    const filled = turn(1, {
+      phase: "provision",
+      iteration: 1,
+      call: { tool: "project", params_ref: "envelope-000003" },
+      observation: { ref: "output_6163859b019d" },
+      control_seq: [3, 4, 6],
+    })
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          json(
+            doc({
+              turns: [open],
+              warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+            }),
+          ),
+        ),
+      )
+      .mockImplementation(() =>
+        Promise.resolve(json(doc({ turns: [filled, turn(2, { control_seq: [7] })] }))),
+      )
+
+    render(<TimelineTab live sessionId="S1" />)
+    await settle()
+    await settle(5000)
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/sessions/S1/trajectory?detail=summary&since_seq=3",
+    )
+    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 1")
+    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("3·4·6")
+    expect(screen.queryByText("missing_tool_result")).not.toBeInTheDocument()
   })
 
   it("does not poll a session that is no longer running", async () => {

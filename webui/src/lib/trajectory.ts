@@ -20,13 +20,13 @@ import type {
 /**
  * Fold a polled response into the document already held.
  *
- * The endpoint's `since=` contract, applied: `turns` are upserted by `turn_id`
- * (a turn's state can still change after it is first sent — the token ledger is
- * exported at loop exit, so the last turns' bills land after the turns do), and
- * `session`, `phases`, `annotations` and `warnings` are REPLACED, because they
- * arrive whole on every response and a cut has no channel for a retraction.
- * `outputs` is merged: refs are content-addressed and shared, so a map already
- * holding the system prompt keeps it when a later poll does not mention it.
+ * The endpoint's cut contract, applied: `turns` are upserted by `turn_id` — a
+ * turn's state changes after it is first sent, which is the whole reason the
+ * poll cuts by ledger watermark and not by turn id — and `session`, `phases`,
+ * `annotations` and `warnings` are REPLACED, because they arrive whole on every
+ * response and a cut has no channel for a retraction. `outputs` is merged: refs
+ * are content-addressed and shared, so a map already holding the system prompt
+ * keeps it when a later poll does not mention it.
  */
 export function mergeTrajectory(
   current: TrajectoryDocument | null,
@@ -56,12 +56,40 @@ export function mergeTrajectory(
   }
 }
 
-/** The cut to poll from next, or null when no turn has been stated yet. */
+/** The highest turn id the document states, or null when it states no turn. */
 export function latestTurnId(doc: TrajectoryDocument): number | null {
   let latest: number | null = null
   for (const turn of doc.turns) {
     if (latest === null || turn.turn_id > latest) {
       latest = turn.turn_id
+    }
+  }
+  return latest
+}
+
+/**
+ * The cut to poll from next: the last ledger line this document was folded from.
+ *
+ * A turn id is the wrong watermark and cannot be made into the right one. A turn
+ * is OPENED by one control event and finished by later ones, so the newest turn
+ * a poll sees is routinely still in flight; cutting at its id drops it from
+ * every later response, and it stands half-stated forever. Older turns move too
+ * — a gate regraded after the model already acted on the first word, a detached
+ * job whose end is only known at the close of the run.
+ *
+ * Every one of those is a control event with a sequence, folded into the turn's
+ * `control_seq`, so the highest sequence held is the one watermark that names
+ * what this document has already seen. A turn naming no sequence contributes
+ * nothing to it — and the endpoint restates such a turn on every response,
+ * because nothing about it can be shown unchanged.
+ */
+export function latestControlSeq(doc: TrajectoryDocument): number | null {
+  let latest: number | null = null
+  for (const turn of doc.turns) {
+    for (const seq of turn.control_seq) {
+      if (latest === null || seq > latest) {
+        latest = seq
+      }
     }
   }
   return latest

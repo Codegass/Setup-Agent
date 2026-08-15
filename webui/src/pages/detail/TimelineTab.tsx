@@ -9,7 +9,7 @@ import type { BytesStatus } from "@/components/trajectory/RefDescent"
 import { TrajectoryTimeline } from "@/components/trajectory/TrajectoryTimeline"
 import { TurnSparkline } from "@/components/trajectory/TurnSparkline"
 import { DASHBOARD_POLL_MS } from "@/lib/polling"
-import { latestTurnId, mergeTrajectory } from "@/lib/trajectory"
+import { latestControlSeq, mergeTrajectory } from "@/lib/trajectory"
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -22,17 +22,23 @@ function message(error: unknown): string {
  * else — one derivation serving the timeline, the CLI and the golden fences
  * (spec §1/§4). Two reads, with different jobs:
  *
- * - the SUMMARY tier is what the run is polled at. While the session is live
- *   the poll carries `since=<the last turn held>`, so each response restates
- *   only the turns that are new — and, per the endpoint's contract, the whole
- *   current state of everything else, which `mergeTrajectory` applies;
+ * - the SUMMARY tier is what the run is polled at. While the session is live the
+ *   poll carries `since_seq=<the last ledger line held>`, so each response
+ *   restates every turn the ledger has touched since — the turn that was still
+ *   in flight when the last poll caught it as much as the turns that opened
+ *   after it — and, per the endpoint's contract, the whole current state of
+ *   everything else, which `mergeTrajectory` applies. Cutting at the last TURN
+ *   ID instead dropped the in-flight turn from every later response: it stayed
+ *   on screen half-stated, its `control_seq` missing the very lines a reader
+ *   descends with, and the warnings that named its holes were withdrawn
+ *   underneath it by the whole-state rule;
  * - the FULL tier is fetched only when a row is expanded and names bytes the
  *   view does not hold. It is never the polling tier: `outputs` comes back
  *   whole every time.
  *
- * When the run stops, the timeline reads it whole once more: the token ledger
- * is exported at loop exit, so the last turns' bills land after the turns did,
- * and a poll that only ever asks for new turns would never see them.
+ * When the run stops, the timeline reads it whole once more: the token ledger is
+ * exported at loop exit, so the last turns' bills land with no control event to
+ * carry them, and no watermark cut can ask for a change the ledger never stated.
  */
 export function TimelineTab({ sessionId, live }: { sessionId: string; live: boolean }) {
   const [doc, setDoc] = useState<TrajectoryDocument | null>(null)
@@ -69,10 +75,10 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
         setLoading(true)
       }
       try {
-        const since = options?.whole || !held.current ? null : latestTurnId(held.current)
+        const sinceSeq = options?.whole || !held.current ? null : latestControlSeq(held.current)
         const incoming = await fetchTrajectory(
           sessionId,
-          since == null ? undefined : { since },
+          sinceSeq == null ? undefined : { sinceSeq },
         )
         apply(incoming)
         setError(null)
@@ -121,17 +127,20 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
   }, [live, load])
 
   const needBytes = useCallback(() => {
-    const latest = held.current ? latestTurnId(held.current) : null
+    const held_seq = held.current ? latestControlSeq(held.current) : null
     if (bytesStatus.current === "loading") {
       return
     }
-    // Already resolved through this turn: whatever the row still cannot show is
-    // a ref no store in this session answers, and asking again would not change
-    // that. A turn that arrived after the last full read is asked for again.
+    // Already resolved through this ledger line: whatever the row still cannot
+    // show is a ref no store in this session answers, and asking again would not
+    // change that. The watermark is the ledger's, not the turn list's — a turn
+    // already held names its observation only once the result that answered it
+    // lands, so a guard reading turn ids would refuse to fetch the bytes of
+    // every ref that arrived on a turn the view was already showing.
     if (
       bytesStatus.current === "ready" &&
       resolvedThrough.current != null &&
-      (latest == null || latest <= resolvedThrough.current)
+      (held_seq == null || held_seq <= resolvedThrough.current)
     ) {
       return
     }
@@ -143,7 +152,7 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
       .then((full) => {
         apply(full)
         bytesStatus.current = "ready"
-        resolvedThrough.current = latestTurnId(full)
+        resolvedThrough.current = latestControlSeq(full)
         setBytes("ready")
       })
       .catch((err) => {

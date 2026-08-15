@@ -41,23 +41,30 @@ export function fetchSession(sessionId: string): Promise<ExecutionSessionDetail>
 /**
  * One session's trajectory-v1 document.
  *
- * `since` is the poller's cut and it cuts TURNS ONLY: the response still
- * restates `session`, `phases`, `annotations` and `warnings` whole, because a
- * warning can be withdrawn and an annotation can land on a turn far below the
- * cut, and a cut has no channel for a retraction. Consumers upsert turns by id
- * and REPLACE the rest — see `mergeTrajectory`.
+ * `sinceSeq` is the poller's cut, and it is a CONTROL-EVENT SEQUENCE, not a turn
+ * id: the response keeps every turn the ledger has touched above that watermark,
+ * which is the only cut that can restate a turn the consumer already holds — the
+ * turn caught between its envelope and its result, a gate regraded after its
+ * turn closed, a detached job whose end lands at the close of the run. A turn-id
+ * cut drops exactly those turns, forever.
+ *
+ * It cuts TURNS ONLY: the response still restates `session`, `phases`,
+ * `annotations` and `warnings` whole, because a warning can be withdrawn and an
+ * annotation can land on a turn far below the cut, and a cut has no channel for
+ * a retraction. Consumers upsert turns by id and REPLACE the rest — see
+ * `mergeTrajectory`.
  *
  * `detail=full` additionally resolves every ref to its bytes; it is not the
  * tier to poll with, since `outputs` is whole on every response.
  */
 export function fetchTrajectory(
   sessionId: string,
-  options?: { detail?: TrajectoryDetail; since?: number },
+  options?: { detail?: TrajectoryDetail; sinceSeq?: number },
 ): Promise<TrajectoryDocument> {
   const query = new URLSearchParams({ detail: options?.detail ?? "summary" })
-  // `since=0` is a real cut (drop nothing, and say so), not a missing option.
-  if (options?.since != null) {
-    query.set("since", String(options.since))
+  // `since_seq=0` is a real cut (drop nothing, and say so), not a missing option.
+  if (options?.sinceSeq != null) {
+    query.set("since_seq", String(options.sinceSeq))
   }
 
   return getJson<TrajectoryDocument>(

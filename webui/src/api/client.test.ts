@@ -62,26 +62,26 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=summary")
   })
 
-  it("carries the detail tier and the since cut into the query", async () => {
+  it("carries the detail tier and the ledger watermark into the query", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(jsonResponse({ schema_version: 1, turns: [] }))
 
-    await fetchTrajectory("S 1/?", { detail: "full", since: 12 })
+    await fetchTrajectory("S 1/?", { detail: "full", sinceSeq: 12 })
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/S%201%2F%3F/trajectory?detail=full&since=12",
+      "/api/sessions/S%201%2F%3F/trajectory?detail=full&since_seq=12",
     )
   })
 
-  it("sends since=0 rather than dropping it — zero is a cut, not an absence", async () => {
+  it("sends since_seq=0 rather than dropping it — zero is a cut, not an absence", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(jsonResponse({ schema_version: 1, turns: [] }))
 
-    await fetchTrajectory("S1", { since: 0 })
+    await fetchTrajectory("S1", { sinceSeq: 0 })
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=summary&since=0")
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=summary&since_seq=0")
   })
 
   it("submits a task with the backend source_session field", async () => {
