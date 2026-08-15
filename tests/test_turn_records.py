@@ -565,6 +565,36 @@ def test_a_thought_only_turn_leaves_the_ledger_balanced(tmp_path):
     assert len(_model_records(engine)) == len(model_calls) + 1
 
 
+def test_a_bill_that_would_not_validate_costs_the_bill_and_never_the_record(tmp_path):
+    """`model_copy(update=...)` does not validate, so `ge=0` was not enforced.
+
+    The payload is built first and the bill joined onto it afterwards, and
+    `model_copy` writes what it is handed straight past every field constraint
+    the class declares — a negative token count sealed as fact, in the one
+    layer whose whole job is to be believable.
+
+    The constraint holds on the way in, and the record is the point: a bill
+    that will not validate is dropped and named, never paid for with the turn.
+    A record that does not appear is a hole, and a hole is what rule 5 looks
+    for.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    engine._turn_bill = lambda iteration: (-5, COMPLETION_TOKENS)
+
+    engine._seal_turn_record(
+        actor="model",
+        t0="2026-08-15T00:00:00Z",
+        t1="2026-08-15T00:00:01Z",
+        iteration=1,
+    )
+
+    records = _events(engine, "turn_record")
+    assert len(records) == 1, "the record was lost with the bill"
+    sealed = records[0]["payload"]
+    assert sealed["turn_id"] == 1 and sealed["actor"] == "model"
+    assert sealed["tokens_in"] is None and sealed["tokens_out"] is None
+
+
 # ---------------------------------------------------------------------------
 # Task 8 — the controller's turns, observations included
 # ---------------------------------------------------------------------------

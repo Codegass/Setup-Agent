@@ -50,6 +50,7 @@ from .attempt_policy import (
 )
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
+    CANCELLED_CALL_REFUSAL_CODE,
     WINDOW_DIGEST_MAX_COMPONENTS,
     WINDOW_TRUNCATION_REF,
     ControlEventSink,
@@ -5697,6 +5698,39 @@ class ReActEngine(UIEventEmitter):
         claimed.add(iteration)
         return row.get("prompt_tokens"), row.get("completion_tokens")
 
+    @staticmethod
+    def _billed(
+        payload: TurnRecordPayload,
+        tokens_in: Optional[int],
+        tokens_out: Optional[int],
+    ) -> TurnRecordPayload:
+        """Join the bill onto the record — through the record's own constraints.
+
+        The bill is known only after the payload is built, and `model_copy`
+        does not validate: `update=` writes what it is handed straight past
+        every `Field` the class declares, so a negative or non-integer token
+        count sealed as fact in the one layer whose whole job is to be
+        believable.
+
+        Re-validating is the fix, and what it costs when it fails is the BILL,
+        never the turn. A record that does not appear is a hole in the sealed
+        sequence (§2.2 rule 5); a record with no tokens on it is a record.
+        """
+        try:
+            return TurnRecordPayload.model_validate(
+                {
+                    **payload.model_dump(mode="json"),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                }
+            )
+        except Exception as exc:  # observability never ends a run
+            logger.warning(
+                f"turn record {payload.turn_id} sealed without its bill "
+                f"({tokens_in}/{tokens_out}): {exc}"
+            )
+            return payload
+
     def _seal_turn_record(
         self,
         *,
@@ -5748,10 +5782,7 @@ class ReActEngine(UIEventEmitter):
                 t1=t1,
             )
             if actor == "model":
-                tokens_in, tokens_out = self._turn_bill(iteration)
-                payload = payload.model_copy(
-                    update={"tokens_in": tokens_in, "tokens_out": tokens_out}
-                )
+                payload = self._billed(payload, *self._turn_bill(iteration))
             self._emit_control_event("turn_record", payload.model_dump(mode="json"))
         except Exception as exc:  # observability never ends a run
             logger.warning(f"turn record {turn_id} was not sealed: {exc}")
@@ -7673,11 +7704,6 @@ class ReActEngine(UIEventEmitter):
             step.tool_call_id = tool_call_id
         return step
 
-    #: The answer a call gets when the batch it was in ended before its turn.
-    #: One code, because one thing happened to it; the reason it was given is
-    #: the observation it was answered with, sealed as that turn's [C].
-    CANCELLED_CALL_REFUSAL_CODE = "CALL_NOT_EXECUTED"
-
     def _seal_cancelled_call(self, step: ReActStep, reason: str) -> None:
         """Answer the call the batch broke over — and record that answer.
 
@@ -7706,7 +7732,7 @@ class ReActEngine(UIEventEmitter):
         call = self._build_tool_call_from_step(step)
         self._seal_refusal_record(
             call,
-            refusal_code=self.CANCELLED_CALL_REFUSAL_CODE,
+            refusal_code=CANCELLED_CALL_REFUSAL_CODE,
             params=call.raw_params,
             tool_call_id=step.tool_call_id,
         )

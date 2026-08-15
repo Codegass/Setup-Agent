@@ -459,3 +459,84 @@ def test_store_and_retrieve_large_output_uses_chunked_write_and_round_trips():
     assert max(len(cmd) for cmd in orchestrator.commands) <= DEFAULT_MAX_CMD_CHARS + 200
 
     assert storage.retrieve_output(ref_id) == big
+
+
+# ---------------------------------------------------------------------------
+# The host store's index is append-friendly (spec §7 amendment 1)
+# ---------------------------------------------------------------------------
+
+
+def _store_components(root, turns, per_turn=3):
+    """A synthetic run's worth of net-new window components, host-side."""
+    storage = OutputStorageManager(root)
+    for turn in range(turns):
+        for component in range(per_turn):
+            storage.store_output(
+                task_id=OBSERVABILITY_TASK_ID,
+                tool_name="window_component",
+                output=f'{{"role":"user","content":"turn {turn:03d} component {component}"}}',
+                timestamp=f"2026-08-15T00:{turn:02d}:{component:02d}Z",
+            )
+    return storage
+
+
+def test_the_host_index_grows_with_the_components_stored_not_with_the_turns(tmp_path):
+    """Sixty turns cost three times twenty, not nine times — the loop's own path.
+
+    `_save_index` rewrote the WHOLE index for every `store_output`, and sealing
+    a turn stores two or three net-new components, so the index write is on the
+    loop's critical path: measured over a 60-turn synthetic run, 165 rewrites
+    and 8.4 MB of cumulative index bytes for an index that ends under 60 KB.
+    The cost is quadratic in the run's length while the CONTENT is linear in
+    its net-new components.
+
+    An index that is only ever appended to costs what it holds. The fence is
+    the ratio: three times the turns, three times the bytes.
+    """
+    twenty = _store_components(tmp_path / "twenty", 20)
+    sixty = _store_components(tmp_path / "sixty", 60)
+
+    assert len(twenty.current_index) == 60 and len(sixty.current_index) == 180
+    ratio = sixty.index_bytes_written / twenty.index_bytes_written
+    assert 2.5 < ratio < 3.5, f"index bytes grew {ratio:.1f}x for 3x the turns"
+
+
+def test_every_host_index_byte_written_is_a_byte_the_index_still_holds(tmp_path):
+    """Append-only, stated as an equality: nothing was written twice.
+
+    A ratio can be satisfied by a smaller rewrite. This cannot: cumulative
+    bytes written equal the file's final size exactly when every write was an
+    append, and a fresh reader over the same directory must still find every
+    ref the run stored.
+    """
+    storage = _store_components(tmp_path / "run", 60)
+    journal = tmp_path / "run" / "output_index.jsonl"
+
+    assert journal.is_file()
+    assert storage.index_bytes_written == journal.stat().st_size
+
+    reader = OutputStorageManager(tmp_path / "run")
+    assert len(reader.current_index) == 180
+    last = list(storage.current_index)[-1]
+    assert reader.retrieve_output(last) == storage.retrieve_output(last)
+
+
+def test_the_container_backed_index_is_left_exactly_as_it_was():
+    """The amendment is about HOST bytes; the container's store does not move.
+
+    Its index is one file the container reads back whole, written by one
+    command, and nothing in the observability layer writes there at all — so
+    the shape it has is the shape it keeps, journal or no journal.
+    """
+    orchestrator = FakeOutputStorageOrchestrator()
+    storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+
+    refs = [
+        storage.store_output(task_id="maven", tool_name="maven", output=f"log {index}")
+        for index in range(3)
+    ]
+
+    assert all(refs)
+    assert "/workspace/.setup_agent/contexts/output_index.jsonl" not in orchestrator.files
+    index = orchestrator.files[INDEX_PATH]
+    assert all(ref in index for ref in refs)

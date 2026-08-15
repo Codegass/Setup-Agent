@@ -62,6 +62,24 @@ _EMERGENCY_SEARCH_LIMIT = 256
 #: never handed it, in whichever store it appears.
 OBSERVABILITY_TASK_ID = "turn_records"
 
+#: The HOST store's index, as a journal. One line per stored record, appended
+#: and never rewritten, read back over the compacted `output_index.json` a
+#: legacy store may still carry.
+#:
+#: `_save_index` rewrites the whole index per `store_output`, which was fine
+#: while storing was a tool's occasional act. Sealing turn records put it on
+#: the loop's critical path — two or three net-new window components a turn —
+#: and the cost of an index that is rewritten per entry is quadratic in the
+#: entries while its CONTENT is linear in them: measured over a 60-turn
+#: synthetic run, 165 rewrites and 8.4 MB written for an index under 60 KB.
+#:
+#: An append-only journal costs what it holds. It needs no compaction pass
+#: either: refs are content-addressed and each one is written once, so the
+#: journal has exactly the lines the index has entries. The CONTAINER-backed
+#: store keeps `_save_index` unchanged — it is read back whole with one
+#: command, and nothing on the observability path writes there at all.
+INDEX_JOURNAL_NAME = "output_index.jsonl"
+
 
 def _storage_metadata(metadata: Any) -> Dict[str, Any]:
     """Copy durable metadata while bounding the newly indexed action scalar."""
@@ -260,6 +278,7 @@ class OutputStorageManager:
                 # Update file paths after changing storage_dir
                 self.storage_file = self.storage_dir / "full_outputs.jsonl"
                 self.index_file = self.storage_dir / "output_index.json"
+                self.index_journal_file = self.storage_dir / INDEX_JOURNAL_NAME
             except Exception as e:
                 logger.error(f"Failed to create storage directory {self.storage_dir}: {e}")
 
@@ -267,6 +286,12 @@ class OutputStorageManager:
         if not hasattr(self, "storage_file"):
             self.storage_file = self.storage_dir / "full_outputs.jsonl"
             self.index_file = self.storage_dir / "output_index.json"
+            self.index_journal_file = self.storage_dir / INDEX_JOURNAL_NAME
+
+        #: Cumulative index bytes this manager has written. The measure the
+        #: append-only journal exists to bound: it grows with the entries the
+        #: index holds, not with the square of them.
+        self.index_bytes_written = 0
 
         # Log initialization - show both container and local paths when using orchestrator
         if self.orchestrator:
@@ -293,28 +318,80 @@ class OutputStorageManager:
                 except Exception as e:
                     logger.warning(f"Failed to parse output index from container: {e}")
         else:
-            # Local filesystem fallback
+            # Local filesystem fallback: the compacted file a legacy store may
+            # carry, with the journal's appends replayed over it in order.
+            index: Dict[str, Dict[str, Any]] = {}
             if self.index_file.exists():
                 try:
                     with open(self.index_file, "r") as f:
-                        return json.load(f)
+                        index = json.load(f)
                 except Exception as e:
                     logger.warning(f"Failed to load output index: {e}")
+                    index = {}
+            index.update(self._read_index_journal())
+            if index:
+                return index
         return self._rebuild_index_from_storage()
 
-    def _save_index(self):
-        """Save the current index to disk."""
+    def _read_index_journal(self) -> Dict[str, Dict[str, Any]]:
+        """Replay the host journal's appends, newest statement per ref winning."""
+        if not self.index_journal_file.exists():
+            return {}
+        entries: Dict[str, Dict[str, Any]] = {}
         try:
-            if self.orchestrator:
-                index_json = json.dumps(self.current_index, indent=2)
-                if not self._write_container_text(self.container_index_file, index_json):
-                    raise OSError("failed to save output index to container")
-            else:
-                # Local filesystem fallback
-                with open(self.index_file, "w") as f:
-                    json.dump(self.current_index, f, indent=2)
+            with open(self.index_journal_file, "r") as journal:
+                for line in journal:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        # A torn last line is a write in flight, not a lost
+                        # index: the JSONL remains the source of truth.
+                        continue
+                    ref_id = row.pop("ref_id", None) if isinstance(row, dict) else None
+                    if is_output_storage_ref(ref_id):
+                        entries[ref_id] = row
+        except OSError as exc:
+            logger.warning(f"Failed to read output index journal: {exc}")
+        return entries
+
+    def _save_index(self):
+        """Write the whole index — the CONTAINER's shape, unchanged.
+
+        One file, written by one command and read back by one `cat`, which is
+        what makes a whole-index write the right shape there. The host's index
+        is appended to instead (`_record_index_entry`); its `output_index.json`
+        is a compacted file older runs left behind, and it is read, never
+        rewritten.
+        """
+        try:
+            index_json = json.dumps(self.current_index, indent=2)
+            if not self._write_container_text(self.container_index_file, index_json):
+                raise OSError("failed to save output index to container")
+            self.index_bytes_written += len(index_json)
         except Exception as exc:
             raise OSError(f"failed to save output index: {exc}") from exc
+
+    def _record_index_entry(self, ref_id: str, entry: Dict[str, Any]) -> None:
+        """Persist ONE index entry — appended host-side, rewritten in-container.
+
+        The container's index is a single file it reads back whole, so its
+        write stays what it was. The host's is a journal: appending cannot
+        clobber a concurrent writer's ref either, which is the whole reason
+        `store_output` reloads the index before saving it.
+        """
+        if self.orchestrator:
+            self._save_index()
+            return
+        line = json.dumps({"ref_id": ref_id, **entry}) + "\n"
+        try:
+            with open(self.index_journal_file, "a") as journal:
+                journal.write(line)
+        except Exception as exc:
+            raise OSError(f"failed to append output index entry: {exc}") from exc
+        self.index_bytes_written += len(line)
 
     def _write_container_text(self, path: str, content: str, *, append: bool = False) -> bool:
         # Delegate to the shared writer: it keeps the fast single-command heredoc
@@ -455,10 +532,16 @@ class OutputStorageManager:
         # agent's output_search returns "No output found" and it cannot diagnose the
         # build. Refresh from disk so we add to the union, never overwrite it. The
         # jsonl is global/append-only, so the line_number below stays valid.
-        self.current_index = self._load_index()
+        #
+        # The host store appends its entry instead of rewriting the file, so it
+        # cannot clobber anybody and has nothing to merge first — and reading the
+        # whole index per stored component is the other half of the cost this
+        # journal exists to remove.
+        if self.orchestrator:
+            self.current_index = self._load_index()
 
         # Update index with searchable metadata
-        self.current_index[ref_id] = {
+        entry = {
             "task_id": task_id,
             "tool_name": tool_name,
             "timestamp": timestamp,
@@ -468,9 +551,10 @@ class OutputStorageManager:
             "last_100_chars": output[-100:] if len(output) > 100 else output,
             "metadata": metadata,
         }
+        self.current_index[ref_id] = entry
 
         try:
-            self._save_index()
+            self._record_index_entry(ref_id, entry)
         except OSError as exc:
             recovered = self._rebuild_index_from_storage()
             if ref_id not in recovered:
@@ -606,8 +690,9 @@ class OutputStorageManager:
         # retrieval path; this index row only avoids a pre-filter filesystem
         # scan after restart.
         try:
-            self.current_index = self._load_index()
-            self.current_index[ref_id] = {
+            if self.orchestrator:
+                self.current_index = self._load_index()
+            entry = {
                 "task_id": task_id,
                 "tool_name": tool_name,
                 "timestamp": timestamp,
@@ -618,7 +703,8 @@ class OutputStorageManager:
                 "metadata": metadata,
                 "storage_mode": "emergency",
             }
-            self._save_index()
+            self.current_index[ref_id] = entry
+            self._record_index_entry(ref_id, entry)
         except Exception as exc:
             # The content-addressed emergency record still round-trips by ref.
             # Search has a bounded legacy-record scan as a secondary recovery

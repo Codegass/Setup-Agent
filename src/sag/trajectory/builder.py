@@ -563,8 +563,9 @@ def _turn_refs(turns: list[Turn]) -> tuple[list[str], list[str]]:
     In first-seen order, and in two lists: the `output_`-prefixed handles the
     store was built to resolve, and the ones it was not. The second list is not
     a discard pile — a `job:` handle names a detached job's books, which live
-    in the job ledger — and dropping it here is what made those observations
-    silently byte-less at the full tier.
+    in the job ledger, and a `window_truncated:<n>` marker names the components
+    a record could not state — and dropping either here is what would make them
+    silently absent at the full tier.
 
     Envelope ids (`call.params_ref`) are in neither: they are the ledger's own
     handles, resolvable from `control_events.jsonl`, and no reader has ever
@@ -575,6 +576,11 @@ def _turn_refs(turns: list[Turn]) -> tuple[list[str], list[str]]:
     for turn in turns:
         candidates = [
             turn.window_ref,
+            # [A] whole. The quad view expands the array, not its last line, so
+            # every component the record named is resolved — and the
+            # `window_truncated:<n>` marker among them names a CUT rather than
+            # bytes, so it lands in the second list and is declared there.
+            *(turn.window_components or ()),
             turn.observation.ref if turn.observation else None,
             # What the TOOL wrote, when that is not what the model read. A
             # reader expanding the row wants both copies, so the full tier

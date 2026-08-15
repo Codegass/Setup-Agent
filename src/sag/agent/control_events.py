@@ -49,6 +49,16 @@ WINDOW_DIGEST_MAX_COMPONENTS = 2048
 #: resolves it, and the full tier declares it out-of-store by name instead of
 #: handing a reader bytes that are not the window's.
 WINDOW_TRUNCATION_REF = "window_truncated:{dropped}"
+#: The answer a call gets when the batch it was in ended before its turn. One
+#: code, because one thing happened to it; the reason it was given is the
+#: observation it was answered with, sealed as that turn's [C].
+#:
+#: It lives here, beside the kinds, because it is the ONE refusal that is owed
+#: no `loop_decision` — the recurrence ladder reads outcomes and a cancelled
+#: call produced none — which makes it the `#cancelled` term of the
+#: conservation formula (§2.2 rule 5). The engine that writes it and the
+#: reducer that counts it must mean the same string.
+CANCELLED_CALL_REFUSAL_CODE = "CALL_NOT_EXECUTED"
 
 
 def _reject_duplicate_json_keys(json_data: str | bytes | bytearray) -> None:

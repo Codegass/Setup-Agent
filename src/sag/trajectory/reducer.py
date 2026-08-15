@@ -76,6 +76,16 @@ last word made a doubly-graded turn indistinguishable from a singly-graded one
 (rocketmq-externals seq 87 then 90: accepted false, then true, neither carrying
 a `decision_id`).
 
+**The ledger is counted as well as paired.** Spec §2.2 rule 5 equates three
+sides — the calls opened, the calls answered, the calls decided — and this
+module states any shortfall as a `conservation_violation` naming which side
+came up short and by how much. The count is a second, independent reading of
+the same holes the per-turn pairing finds: kafka's ten silent phase calls are
+ten `missing_loop_decision` rows AND a decided side nine short. It is taken
+over the calls the ledger has FINISHED writing, because between an envelope
+and its answer every side legitimately disagrees, and the turn still in flight
+already states its own holes.
+
 **Warnings are statements, and a statement can stop being true.** Turn-level
 warnings are recomputed from turn state, never stored at seal time: a hole is a
 claim about the ledger AS IT STANDS. Each is claimed the moment it is true —
@@ -94,7 +104,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from sag.agent.control_events import CONTROL_EVENT_KINDS
+from sag.agent.control_events import CANCELLED_CALL_REFUSAL_CODE, CONTROL_EVENT_KINDS
 from sag.trajectory.schema import (
     Annotation,
     CallInfo,
@@ -117,6 +127,25 @@ KNOWN_EVENT_KINDS = frozenset(CONTROL_EVENT_KINDS)
 #: What a turn's phase is called before any event has said which phase it is in.
 UNKNOWN_PHASE = "unknown"
 
+#: The three sides of spec §2.2 rule 5, each named by the counters that add up
+#: to it. Every side counts CALLS, and the same number of calls, which is the
+#: whole content of the fence:
+#:
+#:     #action_envelope + #forced_action + #refusal_record
+#:       == #tool_result + #refusal_record
+#:       == #loop_decision + #cancelled
+#:
+#: A refusal record stands in both of the places its call never reached, so it
+#: appears on the first two sides. `cancelled` counts the one exception: a call
+#: a batch break cancelled dispatched nothing, so it has no envelope and no
+#: result, and it emits no `loop_decision` either, because the recurrence
+#: ladder reads outcomes and this call produced none.
+_CONSERVATION_SIDES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("opened", ("action_envelope", "forced_action", "refusal_record")),
+    ("answered", ("tool_result", "refusal_record")),
+    ("decided", ("loop_decision", "cancelled")),
+)
+
 
 @dataclass
 class _TurnState:
@@ -131,6 +160,7 @@ class _TurnState:
     observation: ObservationInfo | None = None
     gate: GateInfo | None = None
     window_ref: str | None = None
+    window_components: list[str] | None = None
     tokens: TokenUsage | None = None
     t0: str | None = None
     t1: str | None = None
@@ -156,6 +186,10 @@ class _TurnState:
     #: read — the ones refused inside the executor — still carry their decision
     #: and record it, which is why this exempts rather than replaces.
     refused: bool = False
+    #: What this turn contributes to each side of the conservation formula
+    #: (§2.2 rule 5), keyed by the counter names of `_CONSERVATION_SIDES`. Held
+    #: per turn so the count fence can exclude the call still in flight.
+    counts: dict[str, int] = field(default_factory=dict)
 
     def touch(self, sequence: int | None) -> None:
         if sequence is not None and sequence not in self.control_seq:
@@ -172,6 +206,9 @@ class _TurnState:
             iteration=self.iteration,
             actor=self.actor,
             window_ref=self.window_ref,
+            window_components=(
+                list(self.window_components) if self.window_components is not None else None
+            ),
             call=self.call,
             observation=self.observation,
             gate=self.gate,
@@ -218,6 +255,13 @@ class TrajectoryReducer:
         #: set only when the ledger is closed, and stating the difference is
         #: the whole job.
         self._last_sealed_turn_id = 0
+        #: Every counted event of the run, by counter name. The conservation
+        #: fence subtracts the OPEN turn's own counts from these, so a call
+        #: still in flight is not read as a ledger that does not balance.
+        self._counted: dict[str, int] = {}
+        #: The imbalance last stated, so a statement that stops being true is
+        #: withdrawn rather than left standing.
+        self._conservation: Warning | None = None
         self._run_id: str | None = None
         self._first_timestamp: str | None = None
         self._last_timestamp: str | None = None
@@ -296,9 +340,72 @@ class TrajectoryReducer:
     # ---- warnings -----------------------------------------------------
 
     def _all_warnings(self) -> list[Warning]:
+        standing = self._conservation_statement()
         return order_warnings(
-            list(self._event_warnings) + [w for turn in self._turns for w in _turn_warnings(turn)]
+            list(self._event_warnings)
+            + [w for turn in self._turns for w in _turn_warnings(turn)]
+            + ([standing] if standing is not None else [])
         )
+
+    # ---- the conservation fence (spec §2.2 rule 5) --------------------
+
+    def _count(self, turn: _TurnState, *counters: str) -> None:
+        """Attribute one event to its call, on every side of the fence it feeds.
+
+        Counting is per TURN, not per line, so an event that belongs to no call
+        — an `orphan_tool_result`, an answer to a call this ledger never
+        recorded making — is stated by its own warning and never silently
+        pushed onto a side of the formula.
+        """
+        for counter in counters:
+            turn.counts[counter] = turn.counts.get(counter, 0) + 1
+            self._counted[counter] = self._counted.get(counter, 0) + 1
+
+    def _conservation_statement(self) -> Warning | None:
+        """Do the three sides count the same calls? Name the ones that fall short.
+
+        The fence is over the calls the ledger has FINISHED writing: the open
+        turn's own events are subtracted, because between an envelope and its
+        answer every side disagrees and the turn's own holes already say so.
+        Once the turn closes, whatever it never got is arithmetic.
+
+        A statement about the run as a whole names no turn and no sequence —
+        there is no single line to point at, and a detail that moved with the
+        counts would read as a fresh claim on every event.
+        """
+        open_counts = self._open_turn.counts if self._open_turn is not None else {}
+        totals = []
+        for name, counters in _CONSERVATION_SIDES:
+            value = sum(
+                self._counted.get(counter, 0) - open_counts.get(counter, 0) for counter in counters
+            )
+            totals.append((name, counters, value))
+        accounted = max(value for _name, _counters, value in totals)
+        short = [
+            f"{name} ({' + '.join(counters)}) by {accounted - value}"
+            for name, counters, value in totals
+            if value < accounted
+        ]
+        if not short:
+            return None
+        return Warning(
+            code="conservation_violation",
+            detail=(
+                f"the ledger accounts for {accounted} closed call(s) on its fullest side, "
+                f"and is short: {'; '.join(short)}"
+            ),
+            control_seq=None,
+        )
+
+    def _restate_conservation(self, collector: "_Delta") -> None:
+        current = self._conservation_statement()
+        held, self._conservation = self._conservation, current
+        if current == held:
+            return
+        if current is not None:
+            collector.state([current])
+        if held is not None:
+            collector.withdraw([held])
 
     def _restate(self, collector: "_Delta", turn: _TurnState) -> None:
         """Ship the difference between this turn's holes and its last claim."""
@@ -411,6 +518,7 @@ class TrajectoryReducer:
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
         turn.touch(sequence)
+        self._count(turn, "action_envelope")
         if envelope_id:
             self._by_envelope[envelope_id] = turn
         collector.touched(turn)
@@ -430,6 +538,7 @@ class TrajectoryReducer:
         turn.envelope_id = envelope_id
         turn.t0 = timestamp
         turn.touch(sequence)
+        self._count(turn, "forced_action")
         if envelope_id:
             self._by_envelope[envelope_id] = turn
         self._adopt_phase(turn, phase)
@@ -500,7 +609,20 @@ class TrajectoryReducer:
             turn.tokens = TokenUsage(input=tokens_in, output=tokens_out)
         delivered = _text(payload.get("observation_ref"))
         if delivered:
-            turn.observation = _delivered_observation(turn.observation, delivered)
+            turn.observation, displaced = _delivered_observation(turn.observation, delivered)
+            if displaced is not None:
+                collector.warn(
+                    "observation_ref_dropped",
+                    (
+                        f"turn {turn.turn_id} names three observation refs and a row carries "
+                        f"two: {displaced} is not carried"
+                    ),
+                    sequence,
+                    turn_id=turn.turn_id,
+                )
+        components = _window_components(payload.get("window_digest"))
+        if components is not None:
+            turn.window_components = components
         turn.window_ref = _window_ref(payload.get("window_digest")) or turn.window_ref
         turn.touch(sequence)
         self._check_sealed_sequence(collector, payload.get("turn_id"), sequence)
@@ -537,6 +659,7 @@ class TrajectoryReducer:
         for what happened to a turn rather than for what is missing from it.
         """
         tool = _text(payload.get("tool")) or "unknown"
+        refusal_code = _text(payload.get("refusal_code"))
         turn = self._open(collector, actor="model", phase=None)
         turn.call = CallInfo(tool=tool, params_ref=None)
         turn.t0 = timestamp
@@ -544,6 +667,11 @@ class TrajectoryReducer:
         turn.has_result = True
         turn.refused = True
         turn.touch(sequence)
+        self._count(turn, "refusal_record")
+        if refusal_code == CANCELLED_CALL_REFUSAL_CODE:
+            # The one call that is owed no `loop_decision`: it dispatched
+            # nothing, so it produced no outcome for the ladder to read.
+            self._count(turn, "cancelled")
         collector.annotate(
             "refusal",
             turn.turn_id,
@@ -579,6 +707,7 @@ class TrajectoryReducer:
         turn.has_result = True
         turn.t1 = timestamp
         turn.touch(sequence)
+        self._count(turn, "tool_result")
         self._adopt_phase(turn, payload.get("source_phase"))
         collector.touched(turn)
 
@@ -605,6 +734,7 @@ class TrajectoryReducer:
             turn = self._open(collector, actor="model", phase=None)
 
         turn.has_decision = True
+        self._count(turn, "loop_decision")
         iteration = event.get("iteration")
         if isinstance(iteration, int):
             turn.iteration = iteration
@@ -813,9 +943,16 @@ class _Delta:
         self._annotations: list[Annotation] = []
         self._session_patch: dict[str, Any] = {}
 
-    def warn(self, code: str, detail: str, control_seq: int | None) -> None:
+    def warn(
+        self,
+        code: str,
+        detail: str,
+        control_seq: int | None,
+        *,
+        turn_id: int | None = None,
+    ) -> None:
         """State something about THIS line. A line does not change its mind."""
-        warning = Warning(code=code, detail=detail, control_seq=control_seq)
+        warning = Warning(code=code, detail=detail, control_seq=control_seq, turn_id=turn_id)
         self._reducer._event_warnings.append(warning)
         self._stated.append(warning)
 
@@ -847,6 +984,7 @@ class _Delta:
         reducer = self._reducer
         for turn in self._touched:
             reducer._restate(self, turn)
+        reducer._restate_conservation(self)
         patch = dict(self._session_patch)
         if reducer._wall_clock != reducer._told_wall_clock:
             reducer._told_wall_clock = reducer._wall_clock
@@ -922,29 +1060,39 @@ def _sealed_turn_warnings(turn: _TurnState) -> list[Warning]:
     return holes
 
 
-def _window_ref(digest: Any) -> str | None:
-    """One handle into the window the record states, for a row that has one slot.
+def _window_components(digest: Any) -> list[str] | None:
+    """[A] whole: every component the record named, in the order it rendered them.
 
     The record states [A] as an ORDERED LIST of component refs, because bytes
-    are stored once and a window is many messages. A summary row cannot hold
-    the array, and never pretends to: the whole thing is one descent away, in
-    the `turn_record` this turn's `control_seq` names.
+    are stored once and a window is many messages. Resolving the list in order
+    reproduces the array, which is what the quad view expands — so the row
+    carries the list, not just a handle into it.
+
+    A digest with no components states no window (a controller was shown none,
+    or a component would not store): that is an absent list, never an empty
+    one, because "shown nothing" and "shown a window of no messages" are not
+    two facts a reader should have to tell apart.
+    """
+    if not isinstance(digest, dict):
+        return None
+    refs = digest.get("component_refs")
+    if not isinstance(refs, (list, tuple)):
+        return None
+    named = [ref for ref in (_text(item) for item in refs) if ref is not None]
+    return named or None
+
+
+def _window_ref(digest: Any) -> str | None:
+    """One handle into that window, for a row that has one slot.
 
     The handle is the list's LAST component — the newest message, the one thing
     in the window that this turn did not share with the turn before it. The
     head would be the system message, which every turn of a run resolves to the
     same bytes, and which the record already names by hash; a row keyed on it
     tells no two turns apart.
-
-    A digest with no components states no window (a controller was shown none,
-    or a component would not store), and an absent ref says exactly that.
     """
-    if not isinstance(digest, dict):
-        return None
-    refs = digest.get("component_refs")
-    if not isinstance(refs, (list, tuple)) or not refs:
-        return None
-    return _text(refs[-1])
+    components = _window_components(digest)
+    return components[-1] if components else None
 
 
 def _hole(turn: _TurnState, code: str, what: str) -> Warning:
@@ -1032,24 +1180,37 @@ def _merge_observation(
     )
 
 
-def _delivered_observation(existing: ObservationInfo | None, delivered: str) -> ObservationInfo:
-    """The record's [C] takes the row; whatever it displaces stays named.
+def _delivered_observation(
+    existing: ObservationInfo | None, delivered: str
+) -> tuple[ObservationInfo, str | None]:
+    """The record's [C] takes the row; whatever it displaces stays named — or is.
 
     The engine states the observation it DELIVERED — the text the model read —
     and that is what the row shows. The ref it displaces is the tool's own
     output, which does not disappear: it moves to `evidence_ref`, where a
     reader after the tool's bytes finds them.
+
+    Three refs do not fit two slots. When a `loop_decision` has already
+    contributed a second ref and the record then delivers a third, one of them
+    leaves — and it leaves NAMED, because a ref somebody wrote into the ledger
+    is the one thing this layer may not drop in silence. The second return
+    value is that ref, for the caller to state.
     """
     if existing is None:
-        return ObservationInfo(ref=delivered)
+        return ObservationInfo(ref=delivered), None
     evidence = existing.evidence_ref
+    displaced = None
     if existing.ref not in (None, delivered):
+        displaced = evidence if evidence not in (None, existing.ref) else None
         evidence = existing.ref
-    return ObservationInfo(
-        ref=delivered,
-        evidence_ref=evidence,
-        error_code=existing.error_code,
-        failure_signature=existing.failure_signature,
+    return (
+        ObservationInfo(
+            ref=delivered,
+            evidence_ref=evidence,
+            error_code=existing.error_code,
+            failure_signature=existing.failure_signature,
+        ),
+        displaced,
     )
 
 

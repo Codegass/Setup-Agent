@@ -28,7 +28,11 @@ import json
 
 import pytest
 
-from sag.agent.control_events import GateDecisionPayload, GateOutcomeRevisedPayload
+from sag.agent.control_events import (
+    GateDecisionPayload,
+    GateOutcomeRevisedPayload,
+    TurnRecordPayload,
+)
 from sag.trajectory.reducer import DeltaAccumulator, TrajectoryReducer
 
 # Sequences 3, 4 and 6 — one clone call: its envelope, its result, its decision.
@@ -178,6 +182,29 @@ SYNTHETIC_WORDLESS_REVISION_JSONL = (
     '"sequence":33,"source":null,"timestamp":"2026-08-14T11:29:19.410000Z"}'
 )
 
+#: SYNTHETIC. No archived session seals a `turn_record` — the kind landed with
+#: Stage B — so its bytes are built from `TurnRecordPayload`, and the fences
+#: below validate them against that class. The turn it seals is kafka's real
+#: clone call at seq 3, so the record chains onto archived bytes.
+SYNTHETIC_TURN_RECORD_JSONL = (
+    '{"event_id":"control-000007","kind":"turn_record","payload":'
+    '{"turn_id":1,"phase":"provision","iteration":1,"actor":"model",'
+    '"window_digest":{"system_prompt_sha256":"' + "a" * 64 + '",'
+    '"component_refs":["output_aaaaaaaaaaaa","output_bbbbbbbbbbbb","output_cccccccccccc"]},'
+    '"envelope_ref":"envelope-000003","observation_ref":"output_dddddddddddd",'
+    '"tokens_in":4134,"tokens_out":71,'
+    '"t0":"2026-08-14T11:28:36.915154Z","t1":"2026-08-14T11:28:49.760291Z"},'
+    '"sequence":7,"source":null,"timestamp":"2026-08-14T11:28:49.900000Z"}'
+)
+
+#: SYNTHETIC. The same record for a window the engine had to CUT: the first slot
+#: names how many older components it could not name (spec §7 amendment 6), and
+#: the rest are the newest ones that fit, in render order.
+SYNTHETIC_TRUNCATED_TURN_RECORD_JSONL = SYNTHETIC_TURN_RECORD_JSONL.replace(
+    '"component_refs":["output_aaaaaaaaaaaa"',
+    '"component_refs":["window_truncated:953","output_aaaaaaaaaaaa"',
+)
+
 #: SYNTHETIC, in field names only: the keys are the ones camel-quarkus seq 122
 #: actually wrote, with the bounded context trimmed to what this layer reads.
 SYNTHETIC_REPAIR_CONTEXT_JSONL = (
@@ -249,6 +276,9 @@ def test_an_envelope_never_gets_stapled_onto_a_decision_that_precedes_it():
         ("missing_envelope", 6),
         ("missing_tool_result", 6),
         ("missing_loop_decision", 3),
+        # And the arithmetic agrees with the pairing: one decision was made
+        # about a call this ledger neither enveloped nor answered.
+        ("conservation_violation", None),
     }
 
 
@@ -280,6 +310,9 @@ def test_a_refused_call_does_not_swallow_the_retry_that_followed_it():
     assert {(w.code, w.control_seq) for w in snap.warnings} == {
         ("missing_envelope", 124),
         ("missing_tool_result", 124),
+        # seq 124 is a decision about a call with no envelope and no result:
+        # the two sides that count calls come up one short of the decisions.
+        ("conservation_violation", None),
     }
 
 
@@ -302,6 +335,9 @@ def test_a_decision_with_no_result_states_its_holes_the_moment_it_opens():
     assert {(w.code, w.turn_id) for w in sealed.warnings} == {
         ("missing_envelope", 2),
         ("missing_tool_result", 2),
+        # Turn 1 stopped being the call in flight when turn 2 opened, so the
+        # count fence can finally say what its holes already said.
+        ("conservation_violation", None),
     }
     assert sealed.retracted_warnings == []  # turn 1's holes are still holes
     assert len(r.snapshot().turns) == 2
@@ -736,6 +772,97 @@ def test_a_repair_context_opened_before_any_turn_is_an_orphan():
 
     assert r.snapshot().annotations == []
     assert [(w.code, w.control_seq) for w in delta.warnings] == [("orphan_repair_context", 122)]
+
+
+def test_the_synthetic_turn_records_are_the_shape_the_engine_would_seal():
+    """Built bytes prove nothing about the engine unless the engine could seal them."""
+    for line in (SYNTHETIC_TURN_RECORD_JSONL, SYNTHETIC_TRUNCATED_TURN_RECORD_JSONL):
+        TurnRecordPayload.model_validate(json.loads(line)["payload"])
+
+
+def test_the_row_names_every_component_and_still_carries_one_handle():
+    """[A] is a list; the row keeps the list AND the one handle it had before.
+
+    `window_ref` answers "which window is this" in a table cell, and it stays
+    the primary handle. But the quad view resolves the whole array, and a row
+    that named only its last component made every earlier message of the window
+    unreachable without re-reading the ledger — which is the archaeology the
+    record exists to end.
+    """
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:
+        r.feed(line)
+    r.feed(SYNTHETIC_TRUNCATED_TURN_RECORD_JSONL)
+
+    turn = r.snapshot().turns[0]
+    assert turn.window_components == [
+        "window_truncated:953",
+        "output_aaaaaaaaaaaa",
+        "output_bbbbbbbbbbbb",
+        "output_cccccccccccc",
+    ]
+    # The newest message the model was shown — the one thing this turn did not
+    # share with the turn before it.
+    assert turn.window_ref == "output_cccccccccccc"
+
+
+def test_a_turn_that_names_no_component_claims_no_window_either():
+    """A controller answering from policy was shown nothing, and says so.
+
+    An empty list is not a window with nothing in it; it is a record stating no
+    components at all. `window_ref` has always read it that way, and the list
+    reads it the same, so a row never carries half a claim.
+    """
+    r = TrajectoryReducer()
+    r.feed(
+        SYNTHETIC_TURN_RECORD_JSONL.replace(
+            '"output_aaaaaaaaaaaa","output_bbbbbbbbbbbb","output_cccccccccccc"', ""
+        )
+    )
+
+    empty = r.snapshot().turns[-1]
+    assert empty.window_components is None and empty.window_ref is None
+
+
+def test_a_third_observation_ref_does_not_leave_without_saying_so():
+    """Three refs, two slots — and the one that cannot be carried is named.
+
+    A row holds what the model READ and what the tool WROTE. When a decision
+    has already contributed a second ref and the record then delivers a third,
+    one of them cannot be carried. It used to leave in silence, which is the
+    one thing a derivation may not do with a ref somebody wrote down.
+    """
+    envelope, result, decision = REAL_TRIPLE
+    second_ref = decision.replace(
+        '"evidence_ref":"output_6163859b019d"', '"evidence_ref":"output_9999abcd0000"'
+    )
+    assert second_ref != decision
+
+    r = TrajectoryReducer()
+    for line in (envelope, result, second_ref):
+        r.feed(line)
+    delta = r.feed(SYNTHETIC_TURN_RECORD_JSONL)
+
+    turn = r.snapshot().turns[0]
+    assert turn.observation.ref == "output_dddddddddddd"  # what the model read
+    assert turn.observation.evidence_ref == "output_6163859b019d"  # what the tool wrote
+    dropped = [w for w in delta.warnings if w.code == "observation_ref_dropped"]
+    assert len(dropped) == 1 and "output_9999abcd0000" in dropped[0].detail
+    assert dropped[0].turn_id == 1
+
+
+def test_a_call_still_in_flight_is_not_a_ledger_that_does_not_balance():
+    """The count fence is over the calls the ledger has FINISHED writing.
+
+    Between an envelope and its answer every side of §2.2 rule 5 disagrees, and
+    saying so on every event would state and withdraw a violation per call while
+    the turn's own holes already say the same thing better.
+    """
+    envelope, result, decision = REAL_TRIPLE
+    r = TrajectoryReducer()
+    for line in (envelope, result, decision):
+        r.feed(line)
+        assert [w for w in r.snapshot().warnings if w.code == "conservation_violation"] == []
 
 
 def test_the_reducer_has_no_detail_tier():

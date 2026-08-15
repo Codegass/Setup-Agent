@@ -139,6 +139,23 @@ def test_camel_quarkus_ten_silent_phase_calls_surface_as_warnings():
     assert len(silent) >= 10  # the ledger holes the slice campaign measured
 
 
+def test_kafkas_silent_calls_come_up_short_on_the_decided_side_of_the_fence():
+    """The count reaches the same verdict as the pairing, from the other end.
+
+    The per-turn holes name ten calls that emitted no `loop_decision`. The
+    conservation formula (§2.2 rule 5) counts calls instead of pairing them,
+    and finds the decided side short by nine — the tenth silent call is turn
+    24, the run's last, which is still in flight and therefore not yet counted.
+    Two independent readings of one measured hole.
+    """
+    snap = build_trajectory(KAFKA)
+    [violation] = [w for w in snap.warnings if w.code == "conservation_violation"]
+
+    assert "decided (loop_decision + cancelled) by 9" in violation.detail
+    silent = [w.turn_id for w in snap.warnings if w.code == "missing_loop_decision"]
+    assert len(silent) == 10 and silent[-1] == snap.turns[-1].turn_id == 24
+
+
 def test_camel_quarkus_silent_calls_are_the_phase_and_advisor_calls_the_slice_named():
     """The slice says which calls went silent; the derivation must agree."""
     snap = build_trajectory(CAMEL_QUARKUS)

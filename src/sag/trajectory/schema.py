@@ -112,6 +112,14 @@ class Turn(_TrajectoryModel):
     iteration: int | None = None
     actor: Actor
     window_ref: str | None = None
+    #: [A] whole: every component the turn's record named, in render order, so
+    #: resolving them in list order reproduces the messages array. `window_ref`
+    #: stays the row's primary handle — one cell holds one ref — and this is
+    #: what the full tier expands. `None` means no record stated a window; the
+    #: list is never empty, because a digest naming no component states no
+    #: window at all. A `window_truncated:<n>` entry names a CUT rather than
+    #: bytes, and is declared out of store rather than resolved.
+    window_components: list[str] | None = None
     call: CallInfo | None = None
     observation: ObservationInfo | None = None
     gate: GateInfo | None = None

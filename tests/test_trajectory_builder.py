@@ -11,15 +11,16 @@ import os
 from pathlib import Path
 
 import pytest
-
-from sag.trajectory.builder import build_trajectory, follow_trajectory
-from sag.trajectory.reducer import DeltaAccumulator
 from test_trajectory_reducer import (
     REAL_FAILED_CALL_JSONL,
     REAL_FORCED_ACTION_JSONL,
     REAL_TRIPLE_JSONL,
     REAL_TWO_DECISIONS_JSONL,
 )
+
+from sag.agent.output_storage import OBSERVABILITY_TASK_ID, OutputStorageManager
+from sag.trajectory.builder import build_trajectory, follow_trajectory
+from sag.trajectory.reducer import DeltaAccumulator
 
 #: root reads a mode-000 file regardless of its mode, so the permission fences
 #: below have nothing to measure when the suite runs as root.
@@ -479,6 +480,9 @@ def test_the_accumulated_follow_states_the_holes_of_the_turn_still_open(tmp_path
         ("missing_tool_result", 2, 11),
         # neither call reported back, so neither response's spend has an owner
         ("tokens_unattributed", None, None),
+        # turn 1 is no longer in flight and never got an answer or a decision,
+        # so the count fence says so too — turn 2 still can, and is not counted
+        ("conservation_violation", None, None),
     }
     assert accumulated == build_trajectory(session_dir)
 
@@ -642,3 +646,57 @@ def test_an_output_store_written_after_the_follow_started_still_resolves(tmp_pat
     assert snapshot.outputs["output_6163859b019d"].startswith("✅ Repository cloned")
     assert [w.code for w in snapshot.warnings if w.code == "missing_output_store"] == []
     assert snapshot == build_trajectory(session_dir, detail="full")
+
+
+def test_the_full_tier_resolves_the_whole_window_and_declares_the_cut(tmp_path):
+    """[A] is a list, and the quad view resolves all of it — marker included.
+
+    `window_ref` is one handle: the newest message. A reader expanding the row
+    wants the ARRAY, so the full tier resolves every component the record
+    names. The one entry that is not bytes is the truncation marker, which
+    names a cut rather than a body — declared out of store by name, exactly
+    like ignite's `job:` handle, and never handed to the resolver.
+    """
+    session_dir = _session(tmp_path)
+    store = OutputStorageManager(session_dir / "contexts")
+    bodies = [json.dumps({"role": "user", "content": f"message {index}"}) for index in range(3)]
+    refs = [
+        store.store_output(
+            task_id=OBSERVABILITY_TASK_ID,
+            tool_name="window_component",
+            output=body,
+            timestamp=f"2026-08-15T00:00:0{index}Z",
+        )
+        for index, body in enumerate(bodies)
+    ]
+    record = {
+        "event_id": "control-000001",
+        "kind": "turn_record",
+        "payload": {
+            "turn_id": 1,
+            "phase": "build",
+            "iteration": 4,
+            "actor": "model",
+            "window_digest": {
+                "system_prompt_sha256": "a" * 64,
+                "component_refs": ["window_truncated:953", *refs],
+            },
+            "t0": "2026-08-15T00:00:00Z",
+            "t1": "2026-08-15T00:00:01Z",
+        },
+        "sequence": 1,
+        "source": None,
+        "timestamp": "2026-08-15T00:00:01Z",
+    }
+    (session_dir / "control_events.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    snapshot = build_trajectory(session_dir, detail="full")
+
+    turn = snapshot.turns[0]
+    assert turn.window_components == ["window_truncated:953", *refs]
+    assert turn.window_ref == refs[-1]
+    assert [snapshot.outputs[ref] for ref in refs] == bodies
+    assert "window_truncated:953" not in snapshot.outputs
+    assert [(w.code, w.detail.split(" ", 1)[0]) for w in snapshot.warnings] == [
+        ("ref_out_of_store", "window_truncated:953")
+    ]

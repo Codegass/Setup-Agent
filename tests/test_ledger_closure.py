@@ -384,8 +384,7 @@ def test_the_refusal_is_sealed_before_the_decision_that_reads_it(closed_run):
     decision = next(
         row
         for row in rows
-        if row["kind"] == "loop_decision"
-        and row["payload"]["event"]["tool_name"] == "nosuchtool"
+        if row["kind"] == "loop_decision" and row["payload"]["event"]["tool_name"] == "nosuchtool"
     )
 
     assert refusal["sequence"] < decision["sequence"]
@@ -658,6 +657,65 @@ class _LosingSink:
         return getattr(self._inner, name)
 
 
+def _replayed_without(tmp_path, kind):
+    """Replay this run's ledger with its FIRST event of `kind` removed.
+
+    An injected fault, one side at a time. The removed event is the first of
+    its kind rather than the last, because the fence is over the calls the
+    ledger has finished writing — the call still in flight is stated by its own
+    turn's holes, not by the count.
+    """
+    lines = (tmp_path / "control_events.jsonl").read_text(encoding="utf-8").splitlines()
+    reducer = TrajectoryReducer()
+    dropped = False
+    for line in lines:
+        if not dropped and json.loads(line)["kind"] == kind:
+            dropped = True
+            continue
+        reducer.feed(line)
+    assert dropped, f"this run wrote no {kind} to drop"
+    return [
+        warning
+        for warning in reducer.snapshot().warnings
+        if warning.code == "conservation_violation"
+    ]
+
+
+def test_a_ledger_missing_an_envelope_says_the_opened_side_is_short(closed_run, tmp_path):
+    """§2.2 rule 5, first side: #action_envelope + #forced_action + #refusal_record.
+
+    Losing the envelope loses the record of the call being MADE. Its result
+    then answers a call this ledger never recorded, so it is an orphan rather
+    than an answer, and both of the first two sides come up short against the
+    decisions the run went on to make.
+    """
+    [violation] = _replayed_without(tmp_path, "action_envelope")
+
+    assert "opened" in violation.detail and "answered" in violation.detail
+    assert violation.turn_id is None and violation.control_seq is None
+
+
+def test_a_ledger_missing_a_result_says_the_answered_side_is_short(closed_run, tmp_path):
+    """Second side: #tool_result + #refusal_record. The call was made; nothing answered."""
+    [violation] = _replayed_without(tmp_path, "tool_result")
+
+    assert "answered" in violation.detail
+    assert "opened" not in violation.detail.split("short:", 1)[-1]
+
+
+def test_a_ledger_missing_a_decision_says_the_decided_side_is_short(closed_run, tmp_path):
+    """Third side: #loop_decision + #cancelled — the camel-quarkus silence, counted.
+
+    Half the formula was implemented: a dropped `tool_result` already produced
+    a per-turn hole, and every other imbalance passed in silence. Ten silent
+    phase calls balanced at zero against nothing.
+    """
+    [violation] = _replayed_without(tmp_path, "loop_decision")
+
+    assert "decided" in violation.detail
+    assert "loop_decision" in violation.detail and "cancelled" in violation.detail
+
+
 def test_a_turn_record_that_never_persisted_leaves_the_hole_it_is_looked_for_by(tmp_path):
     """Rule 5's hole check must be falsifiable, or it is true by construction.
 
@@ -727,9 +785,7 @@ def test_the_reducer_takes_the_turn_from_the_record_instead_of_inferring_it(clos
     assert [turn.window_ref for turn in snapshot.turns if turn.actor == "controller"] == [None]
 
 
-def test_the_row_shows_what_the_model_read_and_still_names_the_tools_bytes(
-    closed_run, tmp_path
-):
+def test_the_row_shows_what_the_model_read_and_still_names_the_tools_bytes(closed_run, tmp_path):
     """[C] is the DELIVERED text; the tool's own output stays named beside it.
 
     `tool_result.output_ref` names what the TOOL wrote. What the model read is
