@@ -36,6 +36,7 @@ from sag.agent.evidence_records import (
 )
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
+from sag.tools.internal.java_versions import java_major
 from sag.tools.internal.python_env import (
     _REPAIR_ACTION_PHRASE,
     ensure_venv_pip,
@@ -1182,20 +1183,6 @@ _JAVA_RUNTIME_PROBE = "command -v java 2>/dev/null; java -version 2>&1"
 # The named conflict for "the build is not running the runtime we registered".
 JAVA_RUNTIME_CONFLICT = "java_runtime_not_activated"
 
-# A registered runtime states its version however the registrar spelled it:
-# "21", "21.0.9" and the legacy "1.8" are all the same JDK to a build. The
-# comparison is between MAJORS, so a spelling difference is never a conflict.
-_JAVA_MAJOR_RE = re.compile(r"^(?:1\.)?(\d+)")
-
-
-def _java_major(version: Any) -> Optional[str]:
-    """The JDK major a version string names, or None."""
-    if version is None:
-        return None
-    match = _JAVA_MAJOR_RE.match(str(version).strip())
-    return match.group(1) if match else None
-
-
 def active_java_runtime(orchestrator) -> Dict[str, str]:
     """The `java` this container resolves right now.
 
@@ -1234,7 +1221,7 @@ def registered_java_runtime(orchestrator) -> Dict[str, str]:
     executable = str(candidate.get("executable") or "").strip()
     if executable:
         runtime["executable"] = executable
-    major = _java_major(candidate.get("version"))
+    major = java_major(candidate.get("version"))
     if major:
         runtime["major"] = major
     return runtime

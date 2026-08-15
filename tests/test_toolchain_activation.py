@@ -187,6 +187,10 @@ def test_env_registration_reaches_runtime_registry_and_resolution():
         action="register",
         tool="java",
         executable=JAVA_21,
+        # A requirement in force makes the observed version part of the ask:
+        # see tests/test_verified_version_seal.py (lucene registered
+        # `version: null` against `[21,24]` and the overlay sealed it).
+        version="21.0.9",
         requirement="21",
         env={
             "JAVA_HOME": "/usr/lib/jvm/java-21-openjdk-arm64",

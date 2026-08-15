@@ -8,6 +8,7 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
+from .java_versions import java_major, parse_java_verification
 
 
 class SystemTool(BaseTool):
@@ -333,8 +334,6 @@ class SystemTool(BaseTool):
             - matches: bool (whether current matches required)
             - raw_output: str (raw java -version output)
         """
-        import re
-
         result = {
             "installed": False,
             "current_version": None,
@@ -351,30 +350,19 @@ class SystemTool(BaseTool):
             logger.info("Java is not installed")
             return result
 
-        # Parse Java version from output
-        # Patterns for different Java version formats:
-        # OpenJDK: "openjdk version "17.0.8" 2023-07-18"
-        # Oracle: "java version "1.8.0_361""
-        # OpenJDK 11+: "openjdk version "11.0.20" 2023-07-18"
-        version_patterns = [
-            r'version "(\d+)\.[\d\._]+"',  # Java 9+ format (e.g., "17.0.8")
-            r'version "1\.(\d+)\.[\d_]+"',  # Java 8 and earlier (e.g., "1.8.0_361")
-            r'version "(\d+)"',  # Simple version format
-        ]
-
-        for pattern in version_patterns:
-            match = re.search(pattern, result["raw_output"])
-            if match:
-                version = match.group(1)
-                result["installed"] = True
-                result["current_version"] = version
-                result["matches"] = version == required_version
-                logger.info(f"Detected Java version: {version} (required: {required_version})")
-                break
-
-        if result["installed"] and not result["current_version"]:
-            # Java is installed but we couldn't parse the version
+        # One reader for every quoted JVM version string this tool meets:
+        # `openjdk version "17.0.8"`, `java version "1.8.0_361"` (major 8, not 1).
+        reported = parse_java_verification(result["raw_output"])["java_version"]
+        version = java_major(reported)
+        if version:
+            result["installed"] = True
+            result["current_version"] = version
+            result["matches"] = version == java_major(required_version)
+            logger.info(f"Detected Java version: {version} (required: {required_version})")
+        elif reported:
+            # Java answered with something this reader cannot major-ize.
             logger.warning(f"Could not parse Java version from: {result['raw_output']}")
+            result["installed"] = True
             result["current_version"] = "unknown"
 
         return result
@@ -593,6 +581,19 @@ class SystemTool(BaseTool):
         )
 
         if verify_result["exit_code"] == 0:
+            # The verification block is evidence, not decoration. Live
+            # camel-quarkus d2r3 (seq 127) sealed `java_version: "17"` over a
+            # block reading `openjdk version "11.0.31"` / `javac 11.0.31`,
+            # because only the exit code was read: `java` still resolved to the
+            # pre-existing JVM on PATH. A provision may not seal the version
+            # its own verification disproves.
+            contradiction = self._verification_contradiction(
+                java_version,
+                java_home,
+                verify_result["output"],
+            )
+            if contradiction is not None:
+                return contradiction
             self._register_java_runtime_overlay(java_home, java_version)
             return ToolResult.completed_success(
                 output=f"Successfully installed and configured Java {java_version}\n\n"
@@ -616,6 +617,79 @@ class SystemTool(BaseTool):
                     "Constraint: java and javac must both execute under the activated environment",
                 ],
             )
+
+    def _verification_contradiction(
+        self,
+        java_version: str,
+        java_home: str,
+        verification_output: str,
+    ) -> Optional[ToolResult]:
+        """Refuse the seal when the verification block does not confirm the claim.
+
+        A requested major is a version requirement, so the two ways it can go
+        unproven are refusals of the same family: a block naming a different
+        major, and a block naming no major at all.
+        """
+        observed = parse_java_verification(verification_output)
+        claimed_major = java_major(java_version)
+        # What the stored output must say on its own, months later: which
+        # version was asked for, and what the container answered.
+        stored_output = (
+            f"Java {java_version} was requested\n\n"
+            f"JAVA_HOME: {java_home}\n"
+            f"Verification:\n{verification_output}"
+        )
+        verified = {
+            name: version
+            for name, version in (
+                ("java", observed["java_version"]),
+                ("javac", observed["javac_version"]),
+            )
+            if version
+        }
+        metadata = {
+            "claimed_java_version": java_version,
+            "java_home": java_home,
+            "verified_java_version": observed["java_version"],
+            "verified_javac_version": observed["javac_version"],
+        }
+        if not verified:
+            return ToolResult.completed_failure(
+                output=stored_output,
+                error=(
+                    f"Java {java_version} installation is unverified: its own verification "
+                    "block names no version"
+                ),
+                error_code="JAVA_VERSION_UNVERIFIED",
+                suggestions=[
+                    "Observed fact: neither java -version nor javac -version named a version",
+                    f"Observed candidate JAVA_HOME: {java_home}",
+                    f"Constraint: the active runtime must be observed to report Java {java_version}",
+                ],
+                metadata=metadata,
+            )
+        disagreeing = {
+            name: version
+            for name, version in verified.items()
+            if java_major(version) != claimed_major
+        }
+        if not disagreeing:
+            return None
+        stated = ", ".join(f"{name} {version}" for name, version in sorted(disagreeing.items()))
+        return ToolResult.completed_failure(
+            output=stored_output,
+            error=(
+                f"Java provisioning claimed {java_version} but its verification reports {stated}"
+            ),
+            error_code="JAVA_VERSION_VERIFICATION_MISMATCH",
+            suggestions=[
+                f"Observed fact: verification under JAVA_HOME={java_home} reported {stated}",
+                f"Constraint: the requested Java major version is {java_version}",
+                "Observed fact: the requested JDK may be installed while the active java "
+                "on PATH is another one — verify the exact binary before registering it",
+            ],
+            metadata=metadata,
+        )
 
     def _register_java_runtime_overlay(self, java_home: str, java_version: str) -> None:
         """Register the Java runtime selected by a successful install."""

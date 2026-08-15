@@ -15,6 +15,7 @@ from sag.agent.loop_memory import COMPLETION_CLAIM_CAP
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
+from .java_versions import java_major
 from .toolchain_manager import (
     ToolchainManager,
     ToolVersionRequirement,
@@ -64,8 +65,10 @@ _EXECUTABLE_NOT_FOUND = "ENV_EXECUTABLE_NOT_FOUND"
 # ENV_RUNTIME_PROBE_UNAVAILABLE and ENV_EXECUTABLE_REALPATH_UNAVAILABLE (no
 # command executor at all), ENV_EXECUTABLE_REALPATH_FAILED (the executor
 # answered with something unreadable), ENV_ACTIVATION_NOT_CONFIRMED (overlay
-# state a retry can settle), ENV_RUNTIME_REQUIREMENT_MISMATCH (the observed
-# requirement set is mutable run state, not a property of the executable), and
+# state a retry can settle), ENV_RUNTIME_REQUIREMENT_MISMATCH and
+# ENV_RUNTIME_VERSION_UNVERIFIED (the observed requirement set is mutable run
+# state, not a property of the executable, and the very next call can state
+# the version this one omitted), and
 # the schema/exception codes ENV_MISSING_PARAMETER, ENV_INVALID_ACTION,
 # ENV_VALIDATION_ERROR, ENV_OPERATION_FAILED. The project facade's
 # PROJECT_ENV_ACTIVATION_REQUIRED never reaches this tool: project_tool.py
@@ -167,8 +170,9 @@ class EnvTool(BaseTool):
             description=(
                 "Manage runtime env overlay entries for tool executable paths, PATH prefixes, "
                 "and environment variables. Use bash to download or install runtimes, then use "
-                "env register after installation; Maven registration probes the executable and "
-                "can enforce requirement before persistence. Use env activate before retrying a build. Use "
+                "env register after installation; Maven registration probes the executable, and "
+                "any requirement in force is enforced against the registered version — which "
+                "must therefore be stated — before persistence. Use env activate before retrying a build. Use "
                 "env block for exact executable/version negative evidence from build errors. Do "
                 "not use env to edit project build files, and do not use env to install or "
                 "download software."
@@ -243,6 +247,18 @@ class EnvTool(BaseTool):
                     # `-version` output is the registration fact persisted for
                     # both resolution and reporting.
                     params["version"] = measured_version
+                if measured_version is None:
+                    # No probe measured this tool, so its version is a claim.
+                    # A requirement in force still decides — and an absent
+                    # version satisfies nothing.
+                    unproven = self._unproven_version_refusal(
+                        params["tool"],
+                        params["executable"],
+                        params.get("version"),
+                        params.get("requirement"),
+                    )
+                    if unproven is not None:
+                        return unproven
                 activate_requested = bool(params.get("activate", False))
                 overlay = self.store.register(
                     params["tool"],
@@ -910,6 +926,139 @@ class EnvTool(BaseTool):
             path for path in sorted((entry.get("candidates") or {}).keys()) if path not in blocked
         ]
 
+    def _unsatisfied_requirement(
+        self,
+        tool: str,
+        version: Optional[str],
+        requirement: Optional[str],
+    ) -> Optional[ToolVersionRequirement]:
+        """The first constraint in force this version fails, if any.
+
+        `matches_requirement` already answers the absence case the way this
+        tool must: a hard requirement is not satisfied by an unknown version,
+        while a merely preferred one is not a requirement at all.
+        """
+        explicit_requirement = ToolVersionRequirement.from_raw(
+            requirement,
+            source="tool_parameter",
+        )
+        observed_requirements = [
+            ToolVersionRequirement.from_raw(
+                record.get("raw"),
+                source="registered_state",
+            )
+            # Registration changes a process-wide active overlay.  A caller
+            # therefore cannot narrow persisted constraints by supplying an
+            # arbitrary working directory; the candidate must satisfy every
+            # observed contract for the tool.  Build-time resolution remains
+            # scoped.
+            for record in self.store.observed_requirements(tool)
+        ]
+        requirements: list[ToolVersionRequirement] = []
+        for candidate_requirement in [*observed_requirements, explicit_requirement]:
+            if candidate_requirement and candidate_requirement.raw not in {
+                item.raw for item in requirements
+            }:
+                requirements.append(candidate_requirement)
+        if not requirements:
+            return None
+
+        manager = ToolchainManager(getattr(self.store, "orchestrator", None))
+        return next(
+            (
+                candidate_requirement
+                for candidate_requirement in requirements
+                if not self._satisfies(manager, tool, version, candidate_requirement)
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _satisfies(
+        manager: ToolchainManager,
+        tool: str,
+        version: Optional[str],
+        requirement: ToolVersionRequirement,
+    ) -> bool:
+        """Whether one version meets one constraint, read as its tool reads it."""
+        if manager.matches_requirement(version, requirement):
+            return True
+        if tool != "java" or requirement.kind != "exact" or not version:
+            return False
+        # A Java requirement that names a bare major is met by any runtime of
+        # that major: "21" and "21.0.9" are one JDK, and "1.8" is major 8 —
+        # the same rule build_preflight compares activations with. Refusing
+        # `version="21.0.9"` against `requirement="21"` would refuse the one
+        # honest answer the model can give.
+        required_major = java_major(requirement.raw)
+        return bool(required_major) and java_major(version) == required_major
+
+    def _unproven_version_refusal(
+        self,
+        tool: str,
+        executable: str,
+        version: Optional[str],
+        requirement: Optional[str],
+    ) -> Optional[ToolResult]:
+        """Refuse a registration whose own requirement its version cannot meet.
+
+        Live lucene d2r2 (seq 86/88): `env register tool=java
+        executable=/usr/bin/java requirement="[21,24]" activate=true` returned
+        success and persisted `"version": null`.  The requirement was stated in
+        the same call and checked against nothing, so the overlay sealed — and
+        activated — a runtime that was already known to be Java 17.
+
+        Not a bounded-refusal code: the requirement set is mutable run state,
+        so provisioning a satisfying runtime makes the very same call succeed.
+        """
+        failed_requirement = self._unsatisfied_requirement(tool, version, requirement)
+        if failed_requirement is None:
+            return None
+        stated_version = str(version or "").strip()
+        raw_data = {
+            "executable": executable,
+            "tool": tool,
+            "version": stated_version or None,
+            "requirement": failed_requirement.raw,
+            "requirement_source": failed_requirement.source,
+        }
+        install_move = (
+            f"If no installed {tool} satisfies it, provision one: "
+            "project(action='provision', java_version='<major>')"
+            if tool == "java"
+            else f"If no installed {tool} satisfies it, install one before registering it"
+        )
+        if not stated_version:
+            return ToolResult.completed_failure(
+                output="",
+                error=(
+                    f"{tool} registration states no version to check against "
+                    f"{failed_requirement.raw}"
+                ),
+                error_code="ENV_RUNTIME_VERSION_UNVERIFIED",
+                suggestions=[
+                    f"Observe the runtime's own version and register it: run "
+                    f"`{executable} -version` in bash, then pass version=<observed>",
+                    f"Constraint: {failed_requirement.raw} is in force for {tool}, and an "
+                    "unstated version cannot satisfy it",
+                    install_move,
+                ],
+                raw_data=raw_data,
+                metadata={"action": "register"},
+            )
+        return ToolResult.completed_failure(
+            output="",
+            error=f"Registered {tool} {stated_version} does not satisfy {failed_requirement.raw}",
+            error_code="ENV_RUNTIME_REQUIREMENT_MISMATCH",
+            suggestions=[
+                f"Constraint: {failed_requirement.raw} is in force for {tool}; do not weaken "
+                "or omit the requirement",
+                install_move,
+            ],
+            raw_data=raw_data,
+            metadata={"action": "register"},
+        )
+
     def _probe_maven_runtime(
         self,
         executable: str,
@@ -978,36 +1127,10 @@ class EnvTool(BaseTool):
             )
 
         measured_version = match.group(1)
-        explicit_requirement = ToolVersionRequirement.from_raw(
+        failed_requirement = self._unsatisfied_requirement(
+            "maven",
+            measured_version,
             requirement,
-            source="tool_parameter",
-        )
-        observed_requirements = [
-            ToolVersionRequirement.from_raw(
-                record.get("raw"),
-                source="registered_state",
-            )
-            # Registration changes a process-wide active overlay.  A caller
-            # therefore cannot narrow persisted constraints by supplying an
-            # arbitrary working directory; the candidate must satisfy every
-            # observed Maven contract.  Build-time resolution remains scoped.
-            for record in self.store.observed_requirements("maven")
-        ]
-        requirements = []
-        for candidate_requirement in [*observed_requirements, explicit_requirement]:
-            if candidate_requirement and candidate_requirement.raw not in {
-                item.raw for item in requirements
-            }:
-                requirements.append(candidate_requirement)
-
-        manager = ToolchainManager(orchestrator)
-        failed_requirement = next(
-            (
-                candidate_requirement
-                for candidate_requirement in requirements
-                if not manager.matches_requirement(measured_version, candidate_requirement)
-            ),
-            None,
         )
         if failed_requirement:
             return None, self._count_refusal(
@@ -1088,7 +1211,12 @@ class EnvTool(BaseTool):
                 },
                 "version": {
                     "type": "string",
-                    "description": "Observed executable version.",
+                    "description": (
+                        "Observed executable version, as the executable itself reported it. "
+                        "Required whenever a version requirement is in force for the tool: an "
+                        "unstated version satisfies no requirement and the registration is "
+                        "refused."
+                    ),
                 },
                 "source": {
                     "type": "string",
