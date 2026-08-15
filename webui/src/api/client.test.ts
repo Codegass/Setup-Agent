@@ -140,6 +140,23 @@ describe("api client", () => {
     await expect(fetchDashboard()).rejects.toThrow("503 Service Unavailable")
   })
 
+  it("carries the server's own words when a refusal states why", async () => {
+    // A status line is not a reason. The trajectory endpoint refuses to attribute
+    // a session to a run when nothing names which run it is, and names the
+    // directories it could not decide between — a fact the reader can act on,
+    // and only if it survives the fetch.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(
+        { detail: "cannot be attributed to a run: 2 host session directories ran 'kafka'" },
+        { status: 409, statusText: "Conflict" },
+      ),
+    )
+
+    await expect(fetchTrajectory("S1")).rejects.toThrow(
+      "409 Conflict: cannot be attributed to a run: 2 host session directories ran 'kafka'",
+    )
+  })
+
   it("submits a project batch and returns the body with http status", async () => {
     const body = {
       batch_id: "BATCH-20260607-abcdef",

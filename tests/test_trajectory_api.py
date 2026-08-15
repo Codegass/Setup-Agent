@@ -284,6 +284,87 @@ def test_a_cut_carries_an_annotation_that_landed_on_an_older_turn(tmp_path):
     assert forced in cut["annotations"]
 
 
+def _second_run(logs: Path, fixture: Path, project: str) -> Path:
+    """A LATER host session directory that ran the same project.
+
+    The real state of this machine: `logs/` holds 183 session directories and
+    kafka, ignite, camel-quarkus and polaris each ran twice, both runs leaving a
+    ledger. Newest-by-mtime is therefore a choice between two runs, made every
+    time a session id is resolved.
+    """
+    later = logs / "session_20260814_074153_238028_5398df380672_24385"
+    later.mkdir(parents=True)
+    (later / f"command_project_{project}.log").write_text("setup\n", encoding="utf-8")
+    shutil.copy(fixture / "control_events.jsonl", later / "control_events.jsonl")
+    return later
+
+
+def _pin(mirror: Path, fixture: Path) -> None:
+    """The run-pin the container publishes at startup, as the mirror holds it."""
+    shutil.copy(fixture / "run-pin.json", mirror / ".setup_agent" / "run-pin.json")
+
+
+def test_the_run_the_id_names_is_the_run_that_answers(tmp_path):
+    """Two runs of one project, and the id resolves to the run it names.
+
+    `_matching_log_session_dir` picks the NEWEST host directory carrying this
+    project's command log. When the mirror's trunk lags the host logs — a stopped
+    container is mirrored once and never refetched — the id names the first run
+    while the newest directory holds the second, and the endpoint served the
+    second run's whole document under the first run's id: its run_id, its turns,
+    its warnings and, at `detail=full`, its BYTES.
+
+    The container publishes a run-pin at startup and the mirror carries it, so
+    the run this id names is stated rather than guessed. The directory that
+    answers is the one whose ledger claims that run.
+    """
+    logs, first, mirror = _mount(tmp_path)
+    _second_run(logs, IGNITE, "kafka")
+    _pin(mirror, KAFKA)
+
+    body = _client(logs, mirror).get(f"/api/sessions/{_session_id('kafka')}/trajectory").json()
+
+    assert body["session"]["run_id"] == "20260814_072758_651456_4d81644227c3_24117-7-b9b1b06dfff3"
+    assert sum(1 for turn in body["turns"] if turn["call"] is not None) == 24
+    assert body == build_trajectory(first).model_dump(mode="json")
+
+
+def test_a_run_nothing_names_is_refused_rather_than_guessed_at(tmp_path):
+    """Nothing states which run this id is, and two directories could answer.
+
+    Serving the newest of them is a guess, and a guess presented as a run's
+    evidence is the failure this program exists to end. The reader is told what
+    could not be decided, and which directories it was decided between.
+    """
+    logs, _, mirror = _mount(tmp_path)
+    later = _second_run(logs, IGNITE, "kafka")
+
+    response = _client(logs, mirror).get(f"/api/sessions/{_session_id('kafka')}/trajectory")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "session_20260814_072758_651456_4d81644227c3_24117" in detail
+    assert later.name in detail
+
+
+def test_the_containers_own_copy_answers_for_a_run_the_host_never_kept(tmp_path):
+    """The pin names a run no host directory holds — the mirror is that run.
+
+    A pin that matches nothing on the host is not a reason to serve a stranger's
+    ledger. The container mirrored its own control events, and those are the run
+    the id names.
+    """
+    logs, session_dir, mirror = _mount(tmp_path, ledger=False)
+    _ledger(session_dir, IGNITE)  # the host's only kafka directory is another run
+    _pin(mirror, KAFKA)
+    shutil.copy(KAFKA / "control_events.jsonl", mirror / ".setup_agent" / "control_events.jsonl")
+
+    body = _client(logs, mirror).get(f"/api/sessions/{_session_id('kafka')}/trajectory").json()
+
+    assert body["session"]["run_id"] == "20260814_072758_651456_4d81644227c3_24117-7-b9b1b06dfff3"
+    assert sum(1 for turn in body["turns"] if turn["call"] is not None) == 24
+
+
 def test_the_full_tier_is_asked_for_by_name(tmp_path):
     """`detail=full` is what makes the endpoint resolve refs to bytes at all."""
     logs, _, mirror = _mount(tmp_path)

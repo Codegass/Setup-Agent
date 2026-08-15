@@ -21,6 +21,7 @@ from sag.trajectory.schema import DETAIL_TIERS
 from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
 from sag.web.read_model import ReadModelBuilder
+from sag.web.session_registry import UnattributableSessionError
 from sag.web.task_runner import TaskRequest, TaskRunner
 from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
 from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
@@ -203,6 +204,12 @@ def create_app(
 
         try:
             session_dir = builder.session_dir(session_id)
+        except UnattributableSessionError as exc:
+            # The session exists and so does more than one run of its project,
+            # and nothing names which run this id is. A guess would attribute one
+            # run's turns, warnings and bytes to another run's id, so the reader
+            # is told what could not be decided instead.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(
                 status_code=404,

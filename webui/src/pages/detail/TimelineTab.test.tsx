@@ -271,6 +271,32 @@ describe("TimelineTab", () => {
     expect(screen.getByRole("button", { name: /^Turn 1/ })).toBeInTheDocument()
   })
 
+  it("shows why a session could not be attributed to a run", async () => {
+    // The endpoint refuses to serve one run's evidence under another run's id.
+    // The refusal names what could not be decided; a bare "409 Conflict" would
+    // leave the owner with a blank timeline and no idea what to look at.
+    vi.useFakeTimers()
+    const detail =
+      "Session SETUP-kafka-20260814-072758 cannot be attributed to a run: 2 host " +
+      "session directories ran 'kafka' (session_A, session_B) and nothing in the " +
+      "container names which run this session is."
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ detail }), {
+          headers: { "Content-Type": "application/json" },
+          status: 409,
+          statusText: "Conflict",
+        }),
+      ),
+    )
+
+    render(<TimelineTab live={false} sessionId="S1" />)
+    await settle()
+
+    expect(screen.getByText(/cannot be attributed to a run/)).toBeInTheDocument()
+    expect(screen.getByText(/session_A, session_B/)).toBeInTheDocument()
+  })
+
   it("surfaces a failed read and retries on demand", async () => {
     vi.useFakeTimers()
     const fetchMock = vi

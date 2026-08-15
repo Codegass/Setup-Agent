@@ -12,9 +12,28 @@ import type {
   TrajectoryDocument,
 } from "./types"
 
+/**
+ * What went wrong, in the server's own words when it wrote any.
+ *
+ * A status line names a class of failure, not the failure. The API refuses some
+ * reads for reasons only it can state — a session id that cannot be attributed
+ * to one run names the directories it could not decide between — and dropping
+ * that body leaves the reader with "409 Conflict" and nothing to act on.
+ */
+async function failureMessage(response: Response): Promise<string> {
+  const line = `${response.status} ${response.statusText}`
+  try {
+    const body = (await response.json()) as { detail?: unknown }
+    return typeof body.detail === "string" && body.detail ? `${line}: ${body.detail}` : line
+  } catch {
+    // Non-JSON error body (a proxy's HTML, an empty response); the line stands.
+    return line
+  }
+}
+
 async function readJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`)
+    throw new Error(await failureMessage(response))
   }
 
   return response.json() as Promise<T>

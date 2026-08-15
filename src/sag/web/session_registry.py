@@ -47,6 +47,14 @@ from sag.web.models import (
 from sag.web.verdict import compose_verdict
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
+#: The run-pin the agent publishes at startup, inside the container. It is the
+#: one artifact that says WHICH RUN a container's `.setup_agent/` belongs to,
+#: and the mirror carries it out with everything else (no exec).
+RUN_PIN_PATH = "/workspace/.setup_agent/run-pin.json"
+#: How far into a ledger to look for the run it belongs to. `evidence_store_bound`
+#: is the first event of every run and names it; the cap keeps a directory scan
+#: from reading megabytes to answer "whose run is this".
+_RUN_ID_SCAN_LINES = 200
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "failed", "blocked", "conflict", "unknown"}
 _EVIDENCE_STATUS_PRECEDENCE = (
     "failed",
@@ -112,6 +120,35 @@ def _resolve_logs_root() -> Path:
         if candidate.is_dir() and any(candidate.glob("session_*")):
             return candidate
     return Path("logs")
+
+
+class UnattributableSessionError(LookupError):
+    """Two host directories could be this id's run, and nothing says which.
+
+    Not a missing session — the session is right there, and so is more than one
+    run of its project. What is missing is the fact that would tell them apart:
+    the container publishes a `run-pin.json` naming its run, and without it (an
+    old run, a mirror that never carried the file) the only remaining rule is
+    "newest by mtime", which is a guess.
+
+    A guess is not servable here. Every consumer of this endpoint reads the
+    document as one run's evidence — its turns, its warnings, its bytes — and a
+    document attributed to the wrong id is the failure class this program was
+    built to end. The reader is told what could not be decided and between which
+    directories, which is a fact they can act on.
+    """
+
+    def __init__(self, session_id: str, project_name: str, candidates: list[Path]) -> None:
+        self.session_id = session_id
+        self.project_name = project_name
+        self.candidates = list(candidates)
+        named = ", ".join(candidate.name for candidate in self.candidates)
+        super().__init__(
+            f"Session {session_id} cannot be attributed to a run: "
+            f"{len(self.candidates)} host session directories ran {project_name!r} "
+            f"({named}) and nothing in the container names which run this session is. "
+            "Serving the newest would attribute one run's evidence to another run's id."
+        )
 
 
 class ContainerSessionRegistry:
@@ -198,11 +235,22 @@ class ContainerSessionRegistry:
         just never handed it out. The trajectory layer derives everything it
         shows from that ledger, so exposing the directory is all this layer owes
         it: no trajectory logic lives here, and nothing is written or copied.
+
+        Raises `UnattributableSessionError` when one workspace cannot decide
+        which of its project's runs this id is — and only after every other
+        workspace has been asked, because a workspace that CAN answer answers.
         """
+        unattributable: UnattributableSessionError | None = None
         for workspace in self._workspaces():
-            found = self.get_workspace_session_dir(workspace, session_id)
+            try:
+                found = self.get_workspace_session_dir(workspace, session_id)
+            except UnattributableSessionError as exc:
+                unattributable = exc
+                continue
             if found is not None:
                 return found
+        if unattributable is not None:
+            raise unattributable
         return None
 
     def get_workspace_session_dir(
@@ -227,6 +275,19 @@ class ContainerSessionRegistry:
 
         The mirror is also how the session is IDENTIFIED at all: the trunk
         context names the project, and the project names the host directory.
+
+        **The project does not name the RUN, and a project is run more than
+        once.** `_matching_log_session_dir` answers with the newest directory
+        carrying this project's command log, which is a different run's ledger
+        whenever the mirror's trunk lags the host logs — a stopped container is
+        mirrored once and then never refetched. So the run is asked for by name:
+        the container publishes a `run-pin.json` at startup naming its run, the
+        mirror carries it out, and the directory that answers is the one whose
+        own ledger claims that run. When no host directory does, the container's
+        mirrored copy of that run's events answers instead of a stranger's.
+
+        When nothing names the run and more than one directory could be it,
+        `UnattributableSessionError` says so rather than serving a guess.
         """
         orchestrator = self._reader(workspace)
         trunk = _read_latest_trunk(orchestrator)
@@ -238,7 +299,12 @@ class ContainerSessionRegistry:
         if found_id != session_id:
             return None
 
-        host = _matching_log_session_dir(self.logs_root, project_name)
+        named_run = _container_run_id(orchestrator)
+        candidates = _log_session_dirs(self.logs_root, project_name)
+        if named_run is None and len(candidates) > 1:
+            raise UnattributableSessionError(session_id, project_name, candidates)
+
+        host = _pick_log_session_dir(candidates, run_id=named_run)
         if host is not None and (host / CONTROL_EVENTS_NAME).is_file():
             return host
 
@@ -1631,14 +1697,29 @@ def _setup_logs(logs_root: Path, project_name: str) -> list[str]:
 
 
 def _matching_log_session_dir(logs_root: Path, project_name: str) -> Path | None:
-    # Pick the most recent host log session that ran this project, identified by
-    # its per-project command log. Ordering is by that file's mtime — an absolute
-    # epoch — rather than by parsing the session-dir name string. The dir name is
-    # host-local time while the setup's `created_at` is written inside the
-    # container (commonly UTC), so a name-vs-created comparison wrongly skips
-    # every dir on hosts east of UTC. mtime is timezone-independent.
+    """The newest host session directory that ran this project, or None.
+
+    "Newest" is a guess about WHICH RUN when a project ran more than once, which
+    is why a caller that knows the run resolves through `_log_session_dirs` and
+    `_pick_log_session_dir` instead. The callers left here — the raw setup log
+    and the verdict re-authorization, which compares run ids itself — want the
+    latest run of a project and say so.
+    """
+    return _pick_log_session_dir(_log_session_dirs(logs_root, project_name))
+
+
+def _log_session_dirs(logs_root: Path, project_name: str) -> list[Path]:
+    """Every host session directory that ran this project, newest first.
+
+    A directory is this project's when it holds the per-project command log.
+    Ordering is by that file's mtime — an absolute epoch — rather than by parsing
+    the session-dir name string. The dir name is host-local time while the
+    setup's `created_at` is written inside the container (commonly UTC), so a
+    name-vs-created comparison wrongly skips every dir on hosts east of UTC.
+    mtime is timezone-independent.
+    """
     if not logs_root.exists():
-        return None
+        return []
 
     candidates: list[tuple[float, Path]] = []
     for session_dir in logs_root.glob("session_*"):
@@ -1653,9 +1734,87 @@ def _matching_log_session_dir(logs_root: Path, project_name: str) -> Path | None
             continue
         candidates.append((mtime, session_dir))
 
-    if not candidates:
+    return [session_dir for _, session_dir in sorted(candidates, key=lambda row: -row[0])]
+
+
+def _pick_log_session_dir(candidates: list[Path], *, run_id: str | None = None) -> Path | None:
+    """Which of these directories is the run — by name when the run is named.
+
+    With a `run_id`, only a directory whose own ledger (or run-pin) claims that
+    run answers, and NOTHING answers when none does: a directory that states a
+    different run is not a fallback, it is another run's evidence. Without one,
+    the newest is all the ordering says.
+    """
+    if run_id is None:
+        return candidates[0] if candidates else None
+    for candidate in candidates:
+        if _session_dir_run_id(candidate) == run_id:
+            return candidate
+    return None
+
+
+def _session_dir_run_id(session_dir: Path) -> str | None:
+    """Which run this host directory holds, in its own words.
+
+    The ledger is asked first because it is what a reader of this directory is
+    served: the trajectory's `session.run_id` is the run_id these very events
+    state, so comparing against it is comparing against the document itself. The
+    run-pin answers for a directory whose ledger states no run.
+    """
+    stated = _ledger_run_id(session_dir / CONTROL_EVENTS_NAME)
+    if stated is not None:
+        return stated
+    return _run_pin_run_id(_read_text_file(session_dir / "run-pin.json"))
+
+
+def _ledger_run_id(control_events: Path) -> str | None:
+    """The run a control ledger belongs to, from the first event that names it."""
+    try:
+        with control_events.open("r", encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= _RUN_ID_SCAN_LINES:
+                    break
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                payload = event.get("payload")
+                run_id = payload.get("run_id") if isinstance(payload, dict) else None
+                if isinstance(run_id, str) and run_id:
+                    return run_id
+    except OSError:
         return None
-    return max(candidates, key=lambda candidate: candidate[0])[1]
+    return None
+
+
+def _container_run_id(orchestrator: Any) -> str | None:
+    """The run the CONTAINER says it holds — what a session id names.
+
+    Read from the run-pin the agent publishes at startup, through the same host
+    mirror every other read here uses (no exec). A container that never carried
+    a pin names no run, and the caller then has nothing to resolve against.
+    """
+    return _run_pin_run_id(_read_container_file(orchestrator, RUN_PIN_PATH))
+
+
+def _run_pin_run_id(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    try:
+        pin = RunPin.model_validate_json(raw)
+    except (TypeError, ValueError):
+        return None
+    run_id = pin.run_id
+    return run_id if isinstance(run_id, str) and run_id else None
+
+
+def _read_text_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def _read_log_file(path: Path, max_lines: int) -> list[str]:
