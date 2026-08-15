@@ -27,6 +27,17 @@ closes those holes, the warnings simply stop appearing.
   names; otherwise it opens a turn of its own, which is how a decision that no
   envelope accounts for still gets a row (and a `missing_envelope` warning)
   instead of being silently stapled onto somebody else's call.
+- `refusal_record` opens a turn and answers it in the same breath: a call that
+  never reached a tool has no envelope and no result, and the record stands in
+  both places. Such a turn is not a hole; it is a complete account of a call
+  that was refused, and the refusal is stated as an annotation.
+- `turn_record` SEALS the turn it belongs to. From then on the turn is stated
+  rather than inferred — its phase, iteration, span, bill and window come off
+  the record, and its holes are what the record leaves rather than what the
+  pairing could not find. The engine's own turn numbering is checked for holes
+  (`conservation_violation`) instead of being adopted as this view's row ids:
+  the two count the same things only when the ledger is closed, and saying so
+  when they differ is the job.
 - `gate_decision` / `gate_outcome_revised` attach the word the gate delivered
   to the turn that carried it, and to the phase band it graded. A
   `gate_outcome_revised` attaches to the turn that carried the word it
@@ -124,6 +135,15 @@ class _TurnState:
     t0: str | None = None
     t1: str | None = None
     control_seq: list[int] = field(default_factory=list)
+    #: Whether the ENGINE stated this turn (`turn_record`). A sealed turn is no
+    #: longer inferred: its identity, span, bill and window are read off the
+    #: record, and what counts as a hole in it is what the record leaves open
+    #: rather than what the inference could not pair.
+    sealed: bool = False
+    #: The envelope the record NAMED, which is not the same as the envelope the
+    #: reducer saw. A record naming one nobody opened is a hole; a record
+    #: naming none — a controller answering from policy — is not.
+    stated_envelope: str | None = None
     has_decision: bool = False
     #: Only a `tool_result` (or, after Pillar 1, a typed refusal) answers a
     #: call. A `loop_decision` may describe the answer, but it is not one — so
@@ -185,6 +205,13 @@ class TrajectoryReducer:
         #: What each turn's holes were the last time a delta said so. The diff
         #: against the turn's current holes is what a delta ships.
         self._claimed: dict[int, tuple[Warning, ...]] = {}
+        #: The last turn id the ENGINE sealed. The sequence it states is its
+        #: own, and it is checked for holes rather than adopted as this view's
+        #: row ids: a run seals a record for every turn it takes, and this view
+        #: derives a row for everything the ledger shows — which is the same
+        #: set only when the ledger is closed, and stating the difference is
+        #: the whole job.
+        self._last_sealed_turn_id = 0
         self._run_id: str | None = None
         self._first_timestamp: str | None = None
         self._last_timestamp: str | None = None
@@ -411,6 +438,82 @@ class TrajectoryReducer:
             },
         )
         collector.touched(turn)
+
+    def _on_turn_record(
+        self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
+    ) -> None:
+        """The engine states a turn it took; the inference steps aside.
+
+        A record arrives when its turn is over, so it seals the turn already
+        under construction rather than opening one — unless nothing under
+        construction is its turn, which is exactly the controller's case: an
+        engine-generated gate close takes a turn of its own while the model's
+        last turn, already sealed, is still the one the events point at. The
+        owner is found by the envelope it names, then by an unsealed open turn
+        of the same actor, and only then by opening a row for a turn the ledger
+        showed no other trace of.
+
+        What the record says wins over what was inferred, because the engine
+        was there: the phase and iteration it was in, the span it ran for, the
+        bill for it, and the window it answered from. The turn ids it states
+        are ITS sequence, and this view checks them for holes instead of
+        adopting them — the two count different things, and a run whose ledger
+        is closed is the run where they agree.
+        """
+        actor = payload.get("actor")
+        actor = actor if actor in ("model", "controller") else "model"
+        stated_envelope = _text(payload.get("envelope_ref"))
+
+        turn = None
+        if stated_envelope:
+            candidate = self._by_envelope.get(stated_envelope)
+            turn = candidate if candidate is not None and not candidate.sealed else None
+        if turn is None:
+            open_turn = self._open_turn
+            if open_turn is not None and not open_turn.sealed and open_turn.actor == actor:
+                turn = open_turn
+        if turn is None:
+            turn = self._open(collector, actor=actor, phase=None)
+
+        turn.sealed = True
+        turn.actor = actor
+        turn.stated_envelope = stated_envelope
+        self._adopt_phase(turn, payload.get("phase"))
+        iteration = payload.get("iteration")
+        if isinstance(iteration, int):
+            turn.iteration = iteration
+        t0 = _text(payload.get("t0"))
+        t1 = _text(payload.get("t1"))
+        if t0:
+            turn.t0 = t0
+        if t1:
+            turn.t1 = t1
+        tokens_in = payload.get("tokens_in")
+        tokens_out = payload.get("tokens_out")
+        if isinstance(tokens_in, int) and isinstance(tokens_out, int):
+            turn.tokens = TokenUsage(input=tokens_in, output=tokens_out)
+        turn.window_ref = _window_ref(payload.get("window_digest")) or turn.window_ref
+        turn.touch(sequence)
+        self._check_sealed_sequence(collector, payload.get("turn_id"), sequence)
+        collector.touched(turn)
+
+    def _check_sealed_sequence(
+        self, collector: "_Delta", stated: Any, sequence: int | None
+    ) -> None:
+        """The engine's turn ids are monotone by one, or the ledger lost a turn."""
+        if not isinstance(stated, int):
+            return
+        expected = self._last_sealed_turn_id + 1
+        if stated != expected:
+            collector.warn(
+                "conservation_violation",
+                (
+                    f"the engine sealed turn {stated} after turn "
+                    f"{self._last_sealed_turn_id}: the sealed turn sequence has a hole"
+                ),
+                sequence,
+            )
+        self._last_sealed_turn_id = max(stated, self._last_sealed_turn_id)
 
     def _on_refusal_record(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
@@ -678,6 +781,7 @@ class TrajectoryReducer:
         "evidence_store_bound": _on_evidence_store_bound,
         "action_envelope": _on_action_envelope,
         "forced_action": _on_forced_action,
+        "turn_record": _on_turn_record,
         "refusal_record": _on_refusal_record,
         "tool_result": _on_tool_result,
         "loop_decision": _on_loop_decision,
@@ -757,6 +861,8 @@ def _turn_warnings(turn: _TurnState) -> list[Warning]:
     statement whose text drifted (with the turn's phase, say) would read as a
     retraction and a fresh claim of the same hole every time the phase settled.
     """
+    if turn.sealed:
+        return _sealed_turn_warnings(turn)
     holes: list[Warning] = []
     if turn.call is None:
         holes.append(_hole(turn, "missing_envelope", "has a loop_decision but no action_envelope"))
@@ -771,6 +877,64 @@ def _turn_warnings(turn: _TurnState) -> list[Warning]:
             )
         )
     return holes
+
+
+def _sealed_turn_warnings(turn: _TurnState) -> list[Warning]:
+    """A stated turn's holes are what the RECORD leaves, not what pairing missed.
+
+    The inference has to treat a call-less turn as two holes at once, because
+    all it can see is a decision nothing accounts for. A record removes the
+    guess: a controller answering from policy made no call, so it is missing
+    neither an envelope nor an answer — while a record that NAMES an envelope
+    the ledger never opened is a hole exactly where the record says one is.
+    """
+    holes: list[Warning] = []
+    if turn.stated_envelope and turn.call is None:
+        holes.append(
+            _hole(
+                turn,
+                "missing_envelope",
+                f"names envelope {turn.stated_envelope!r}, which no action_envelope opened",
+            )
+        )
+    if turn.call is None:
+        return holes
+    if not turn.has_result:
+        holes.append(_hole(turn, "missing_tool_result", "has no tool_result and no typed refusal"))
+    if not turn.has_decision:
+        holes.append(
+            _hole(
+                turn,
+                "missing_loop_decision",
+                f"called {turn.call.tool!r} and emitted no loop_decision",
+            )
+        )
+    return holes
+
+
+def _window_ref(digest: Any) -> str | None:
+    """One handle into the window the record states, for a row that has one slot.
+
+    The record states [A] as an ORDERED LIST of component refs, because bytes
+    are stored once and a window is many messages. A summary row cannot hold
+    the array, and never pretends to: the whole thing is one descent away, in
+    the `turn_record` this turn's `control_seq` names.
+
+    The handle is the list's LAST component — the newest message, the one thing
+    in the window that this turn did not share with the turn before it. The
+    head would be the system message, which every turn of a run resolves to the
+    same bytes, and which the record already names by hash; a row keyed on it
+    tells no two turns apart.
+
+    A digest with no components states no window (a controller was shown none,
+    or a component would not store), and an absent ref says exactly that.
+    """
+    if not isinstance(digest, dict):
+        return None
+    refs = digest.get("component_refs")
+    if not isinstance(refs, (list, tuple)) or not refs:
+        return None
+    return _text(refs[-1])
 
 
 def _hole(turn: _TurnState, code: str, what: str) -> Warning:

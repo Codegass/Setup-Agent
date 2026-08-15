@@ -40,6 +40,7 @@ from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.token_tracker import TokenTracker
 from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.trajectory.builder import build_trajectory
+from sag.trajectory.reducer import DeltaAccumulator, TrajectoryReducer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
 
@@ -111,16 +112,22 @@ def closed_run(tmp_path):
 
 
 def test_every_dispatched_call_states_the_control_layers_reading_of_it(closed_run):
-    """The camel-quarkus hole: ten phase calls, not one `loop_decision`."""
+    """The camel-quarkus hole: ten phase calls, not one `loop_decision`.
+
+    The harness's own phase-entry advisor consult is in this list too — an
+    envelope and a result and no decision is the same silence whether the
+    model authored the call or the controller did.
+    """
     decisions = _events(closed_run, "loop_decision")
     tools = [row["payload"]["event"]["tool_name"] for row in decisions]
 
-    assert tools == ["phase", "nosuchtool", "phase"]
-    assert [row["payload"]["event"]["iteration"] for row in decisions] == [1, 2, 3]
+    assert tools == ["phase", "nosuchtool", "phase", "advisor"]
+    assert [row["payload"]["event"]["iteration"] for row in decisions] == [1, 2, 3, 3]
     assert [row["payload"]["event"]["phase"] for row in decisions] == [
         "provision",
         "analyze",
         "analyze",
+        "build",
     ]
 
 
@@ -363,6 +370,162 @@ def test_a_refusal_that_carried_no_intent_claims_none(closed_run):
     refusal = _events(closed_run, "refusal_record")[0]["payload"]
 
     assert "repair_intent" not in refusal
+
+
+# ---------------------------------------------------------------------------
+# Rule 5 — the ledger balances
+# ---------------------------------------------------------------------------
+
+
+def _kinds(engine):
+    counted = {}
+    for row in _events(engine):
+        counted[row["kind"]] = counted.get(row["kind"], 0) + 1
+    return counted
+
+
+def test_every_decision_has_its_envelope_and_its_answer(closed_run):
+    """#loop_decision == #envelope == #(tool_result ∪ refusal_record).
+
+    A refusal stands in both of the places its call never reached, so it is
+    counted on both sides of the equation and on neither twice.
+    """
+    counted = _kinds(closed_run)
+    decisions = counted.get("loop_decision", 0)
+    refusals = counted.get("refusal_record", 0)
+    opened = counted.get("action_envelope", 0) + counted.get("forced_action", 0) + refusals
+    answered = counted.get("tool_result", 0) + refusals
+
+    assert decisions == opened == answered
+    assert decisions == 4 and refusals == 1
+
+
+def test_the_turn_sequence_has_no_holes(closed_run):
+    """Three model turns and the controller's consult, in one sequence."""
+    records = _events(closed_run, "turn_record")
+    stated = [row["payload"]["turn_id"] for row in records]
+
+    assert stated == [1, 2, 3, 4]
+    assert [row["payload"]["actor"] for row in records] == [
+        "model",
+        "model",
+        "model",
+        "controller",
+    ]
+
+
+def test_a_closed_session_replays_with_nothing_left_to_state(closed_run, tmp_path):
+    """The whole point: a post-closure run derives without a single warning."""
+    snapshot = build_trajectory(tmp_path)
+
+    assert snapshot.warnings == []
+    assert [turn.turn_id for turn in snapshot.turns] == list(range(1, len(snapshot.turns) + 1))
+
+
+def test_the_reducer_takes_the_turn_from_the_record_instead_of_inferring_it(closed_run, tmp_path):
+    """Exact turns: the phase, the iteration, the bill and the window are stated."""
+    snapshot = build_trajectory(tmp_path)
+    model_turns = [turn for turn in snapshot.turns if turn.actor == "model"]
+
+    assert [turn.phase for turn in model_turns] == ["provision", "analyze", "analyze"]
+    assert [turn.iteration for turn in model_turns] == [1, 2, 3]
+    assert all(turn.tokens is not None for turn in model_turns)
+    # One handle per window, and a different one per turn: the newest message
+    # the model was shown, resolvable in the store the run wrote.
+    windows = [turn.window_ref for turn in model_turns]
+    assert all(windows) and len(set(windows)) == len(windows)
+    # The controller was shown no window and claims none.
+    assert [turn.window_ref for turn in snapshot.turns if turn.actor == "controller"] == [None]
+
+
+def test_the_live_fold_and_the_replay_agree_on_a_closed_session(closed_run, tmp_path):
+    """Idempotence, with records and a refusal in the stream (spec §1).
+
+    Sealing a turn withdraws the statements the inference had made about it, so
+    the accumulated deltas and the snapshot can only match if the retraction is
+    shipped as carefully as the claim was.
+    """
+    reducer = TrajectoryReducer()
+    accumulator = DeltaAccumulator()
+    for line in (tmp_path / "control_events.jsonl").read_text(encoding="utf-8").splitlines():
+        accumulator.feed(reducer.feed(line))
+
+    assert accumulator.snapshot() == reducer.snapshot()
+
+
+def test_a_controller_close_takes_a_turn_of_its_own(tmp_path):
+    """An engine-generated gate seals a record while the model's turn is done.
+
+    The open turn is the model's, already sealed, so the controller's record
+    cannot be folded into it — it is a turn of its own, and a turn that made no
+    call is missing neither an envelope nor an answer.
+    """
+    reducer = TrajectoryReducer()
+    reducer.feed(
+        json.dumps(
+            {
+                "sequence": 1,
+                "kind": "turn_record",
+                "payload": {
+                    "turn_id": 1,
+                    "phase": "test",
+                    "actor": "model",
+                    "window_digest": {"system_prompt_sha256": "a" * 64},
+                    "t0": "2026-08-15T00:00:00Z",
+                    "t1": "2026-08-15T00:00:01Z",
+                },
+            }
+        )
+    )
+    reducer.feed(
+        json.dumps(
+            {
+                "sequence": 2,
+                "kind": "turn_record",
+                "payload": {
+                    "turn_id": 2,
+                    "phase": "test",
+                    "actor": "controller",
+                    "gate_decision_id": "gate-1",
+                    "window_digest": {"system_prompt_sha256": "a" * 64},
+                    "t0": "2026-08-15T00:00:02Z",
+                    "t1": "2026-08-15T00:00:02Z",
+                },
+            }
+        )
+    )
+    snapshot = reducer.snapshot()
+
+    assert [turn.actor for turn in snapshot.turns] == ["model", "controller"]
+    assert snapshot.warnings == []
+
+
+def test_a_turn_id_that_jumps_is_stated_as_a_conservation_violation():
+    reducer = TrajectoryReducer()
+    for turn_id in (1, 3):
+        reducer.feed(
+            json.dumps(
+                {
+                    "sequence": turn_id,
+                    "kind": "turn_record",
+                    "payload": {
+                        "turn_id": turn_id,
+                        "phase": "build",
+                        "actor": "controller",
+                        "window_digest": {"system_prompt_sha256": "a" * 64},
+                        "t0": "2026-08-15T00:00:00Z",
+                        "t1": "2026-08-15T00:00:01Z",
+                    },
+                }
+            )
+        )
+
+    violations = [
+        warning
+        for warning in reducer.snapshot().warnings
+        if warning.code == "conservation_violation"
+    ]
+    assert len(violations) == 1 and "3" in violations[0].detail
 
 
 def test_the_archived_sessions_keep_the_holes_their_bytes_recorded():

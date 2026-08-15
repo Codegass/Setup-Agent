@@ -6708,7 +6708,14 @@ class ReActEngine(UIEventEmitter):
         whose id the harness mints, answered immediately by its observation, so
         the pairing invariant and the evidence trail hold without a second code
         path. The result is `consult_advisor()`'s — the identical contract the
-        model's own `advisor()` call gets, cap accounting included."""
+        model's own `advisor()` call gets, cap accounting included.
+
+        And the identical LEDGER contract too (spec §2.2 rule 5): this call had
+        an envelope and a result and no `loop_decision` at all, which is the
+        same silence the phase tool was measured in — with the harness as the
+        author instead of the model. It is a controller move, so it seals a
+        controller turn, in the same sequence as every other turn."""
+        turn_started = self._turn_stamp()
         result = self.consult_advisor()
         call = ToolCall(
             name="advisor",
@@ -6746,18 +6753,28 @@ class ReActEngine(UIEventEmitter):
         )
         # The ACTION step is appended first on purpose: the envelope keys off
         # the newest ACTION identity, exactly as a model-issued call does.
+        envelope_id = self._emit_control_action_envelope("advisor", {})
         self._emit_control_tool_result(
-            envelope_id=self._emit_control_action_envelope("advisor", {}),
+            envelope_id=envelope_id,
             execution_id=execution_id,
             tool="advisor",
             params={},
             result=recorded,
             actual_executions=actual_executions,
         )
-        self._append_native_observation(
+        self._apply_tool_execution_loop_effects(execution)
+        observation_step = self._append_native_observation(
             entry_call_id,
             execution.observation_text,
             source_tool="advisor",
+        )
+        self._seal_turn_record(
+            actor="controller",
+            t0=turn_started,
+            t1=self._turn_stamp(),
+            envelope_ref=envelope_id,
+            observation_ref=self._delivered_observation_ref(observation_step),
+            iteration=getattr(self, "current_iteration", None),
         )
 
     def _advisor_messages(self) -> List[Dict[str, str]]:

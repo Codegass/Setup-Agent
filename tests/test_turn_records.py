@@ -214,9 +214,20 @@ def sealed_run(tmp_path):
     return engine
 
 
+def _model_records(engine):
+    """The model's turns, which the controller's share a sequence with."""
+    return [row for row in _events(engine, "turn_record") if row["payload"]["actor"] == "model"]
+
+
 def test_every_model_turn_seals_exactly_one_record(sealed_run):
-    """One call, one sealed turn — and the numbering has no holes."""
+    """One call, one sealed turn — and the numbering has no holes.
+
+    The controller's own moves (this run's two phase-entry advisor consults)
+    take turns in the SAME sequence, so the model's ids are the subsequence
+    left when they are removed, and the sequence as a whole is unbroken.
+    """
     records = _events(sealed_run, "turn_record")
+    model_records = _model_records(sealed_run)
     envelopes = _events(sealed_run, "action_envelope")
 
     model_calls = [
@@ -225,19 +236,18 @@ def test_every_model_turn_seals_exactly_one_record(sealed_run):
         if str(row["payload"].get("tool_call_id", "")).startswith("call_")
     ]
 
-    assert len(records) == len(model_calls) == 5
-    assert [row["payload"]["turn_id"] for row in records] == [1, 2, 3, 4, 5]
-    assert {row["payload"]["actor"] for row in records} == {"model"}
-    assert [row["payload"]["iteration"] for row in records] == [1, 2, 3, 4, 5]
+    assert len(model_records) == len(model_calls) == 5
+    assert [row["payload"]["turn_id"] for row in records] == list(range(1, len(records) + 1))
+    assert [row["payload"]["iteration"] for row in model_records] == [1, 2, 3, 4, 5]
     # The phase the call was MADE in, which is the phase it closed.
-    assert [row["payload"]["phase"] for row in records] == [
+    assert [row["payload"]["phase"] for row in model_records] == [
         "provision",
         "analyze",
         "build",
         "test",
         "report",
     ]
-    assert [row["payload"]["envelope_ref"] for row in records] == model_calls
+    assert [row["payload"]["envelope_ref"] for row in model_records] == model_calls
     assert all(row["payload"]["t1"] >= row["payload"]["t0"] for row in records)
 
 
@@ -250,7 +260,7 @@ def test_a_sealed_window_resolves_to_the_bytes_the_model_saw(sealed_run):
     order, and what comes out is the exact messages array the client received.
     """
     storage = sealed_run.output_storage
-    records = _events(sealed_run, "turn_record")
+    records = _model_records(sealed_run)
 
     assert len(records) == len(sealed_run.llm_client.requests)
     for record, request in zip(records, sealed_run.llm_client.requests):
@@ -266,7 +276,7 @@ def test_a_sealed_window_resolves_to_the_bytes_the_model_saw(sealed_run):
 
 def test_the_windows_bytes_are_stored_once_and_the_order_carries_the_repeat(sealed_run):
     """Every turn re-sends the system prompt; the store keeps one copy of it."""
-    records = _events(sealed_run, "turn_record")
+    records = _model_records(sealed_run)
     first_components = [row["payload"]["window_digest"]["component_refs"][0] for row in records]
     referenced = [
         ref for row in records for ref in row["payload"]["window_digest"]["component_refs"]
@@ -283,17 +293,22 @@ def test_the_bill_joins_in_process_never_from_the_csv(sealed_run, tmp_path):
     for it would seal blank for the whole run — which is precisely why the join
     is in-process.
     """
-    records = _events(sealed_run, "turn_record")
+    records = _model_records(sealed_run)
 
     assert [row["payload"]["tokens_in"] for row in records] == [PROMPT_TOKENS] * 5
     assert [row["payload"]["tokens_out"] for row in records] == [COMPLETION_TOKENS] * 5
+    # The harness's own turns are never billed the model's response.
+    controller = [
+        row for row in _events(sealed_run, "turn_record") if row["payload"]["actor"] == "controller"
+    ]
+    assert controller and all(row["payload"]["tokens_in"] is None for row in controller)
     assert not list(tmp_path.rglob("token_usage.csv"))
 
 
 def test_a_sealed_turn_states_the_observation_it_delivered(sealed_run):
     """[C] is resolvable too: the ref names the text the model actually read."""
     storage = sealed_run.output_storage
-    records = _events(sealed_run, "turn_record")
+    records = _model_records(sealed_run)
     delivered = [
         step.content for step in sealed_run.steps if getattr(step, "tool_call_id", None) == "call_5"
     ]
