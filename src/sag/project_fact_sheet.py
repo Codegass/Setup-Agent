@@ -306,6 +306,13 @@ def _test_catalog_summary(analysis: Mapping[str, Any]) -> dict[str, Any]:
         if clean:
             summary["by_module"] = clean
         summary["by_module_total"] = len(by_module)
+        if clean and len(clean) < len(by_module):
+            # What the modules NAMED here add up to. The bounded projection
+            # keeps the first eight of twenty modules, and polaris's record
+            # then showed `total_count: 1347` above a list adding to 593 with
+            # nothing saying where the other 754 went (#39 §2.1). The gap is
+            # truncation, not a missing suite — but only if the record says so.
+            summary["by_module_measured"] = sum(clean.values())
     return summary
 
 

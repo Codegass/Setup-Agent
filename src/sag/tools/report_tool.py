@@ -12,6 +12,7 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
+from sag.case_census import census_from_catalog_summary
 from sag.evidence import (
     EvidenceAssessment,
     EvidenceStatus,
@@ -1747,8 +1748,17 @@ class ReportTool(BaseTool, UIEventEmitter):
             try:
                 trunk_context = self.context_manager.load_trunk_context()
                 if trunk_context and trunk_context.environment_summary:
-                    # Get the static test method count collected during analysis
-                    static_test_count = trunk_context.environment_summary.get("static_test_count")
+                    # The static test method count collected during analysis,
+                    # read through the ONE census producer (#39 §2.1): the
+                    # trunk carries a bare total beside the module breakdown
+                    # that should explain it, and polaris sealed 1,347 next to
+                    # a module list adding to 593. The per-module sum is the
+                    # auditable number, so the report cannot render a total no
+                    # module list in the record accounts for.
+                    static_test_count = census_from_catalog_summary(
+                        trunk_context.environment_summary.get("test_catalog_summary"),
+                        bare_total=trunk_context.environment_summary.get("static_test_count"),
+                    ).discovered
                     # Get the method count for comparison
                     method_count = trunk_context.environment_summary.get("method_count")
                     # Get parameterized test breakdown

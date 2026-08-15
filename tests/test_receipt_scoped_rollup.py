@@ -705,6 +705,11 @@ def test_an_unreceipted_rollup_states_the_partition_it_came_from(bigtop, monkeyp
     beside a zero headline. Archived replay fixtures are unaffected: they
     replay the rollups their own runs recorded, and every optional key here is
     still absent-when-unobserved.
+
+    `denominator_basis` is NOT one of the optional keys: every run states what
+    its denominator covers, and `none` — no census exists — is a statement,
+    not an absence (#39 §2.2). Bigtop's fixture has no module census, so the
+    module arithmetic behind the word stays absent beside it.
     """
     _bind_primary_coordinate(monkeypatch, bigtop)
     validator, orchestrator = _validator(bigtop)
@@ -714,6 +719,7 @@ def test_an_unreceipted_rollup_states_the_partition_it_came_from(bigtop, monkeyp
 
     assert set(rollup) == {
         "discovered",
+        "denominator_basis",
         "unique",
         "raw",
         "flaky_count",
@@ -723,6 +729,7 @@ def test_an_unreceipted_rollup_states_the_partition_it_came_from(bigtop, monkeyp
         "receipt_scoped",
         "auxiliary_test_stats",
     }
+    assert rollup["denominator_basis"] == "none"
     assert rollup["receipt_scoped"] is True
     assert rollup["unique"]["executed"] == 0
     assert rollup["auxiliary_test_stats"]["executed"] == 54

@@ -13,12 +13,14 @@ from typing import Any, Literal, cast
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
+from sag.case_census import BASIS_COMPLETE, BASIS_PARTIAL, CENSUS_BASES
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import rescue_blocked_build, run_verdict
 from sag.verdict_rates import (
     UNATTRIBUTED_CONFLICT,
+    UNBOUNDED_REASON,
     UNREADABLE_REPORT_CONFLICT,
     GrainRate,
     band_for,
@@ -94,6 +96,19 @@ class SnapshotTestStats(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     discovered: int | None = None
+    # WHAT the denominator covers, sealed beside it (#39 §2.2). A census with
+    # no statement of coverage reads as a complete survey even when twelve of
+    # twenty modules were never counted; `partial` says the number is a FLOOR
+    # and carries the module arithmetic behind that word, and `none` is the
+    # honest answer for a repository with no unified census at all. Absent =
+    # the run predates the census producer, which claims nothing either way.
+    denominator_basis: Literal["complete", "partial", "none"] | None = None
+    denominator_unmeasured_modules: int | None = None
+    denominator_module_total: int | None = None
+    # The count a module list did not explain (polaris's 1,347 against a module
+    # sum of 593). Banned from BEING the denominator, kept as evidence so the
+    # sealed conflict names both numbers.
+    denominator_bare_total: int | None = None
     unique: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     raw: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     flaky_count: int = 0
@@ -130,6 +145,10 @@ class SnapshotTestStats(BaseModel):
         absent keys, so recorded replay fixtures keep verifying unchanged."""
         data = handler(self)
         for key in (
+            "denominator_basis",
+            "denominator_unmeasured_modules",
+            "denominator_module_total",
+            "denominator_bare_total",
             "collection_errors",
             "collection_errors_skipped",
             "collection_error_summary",
@@ -622,6 +641,12 @@ def _nonnegative_int(value: Any) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def _census_basis(value: Any) -> str | None:
+    """Admit only the three words a census may call itself (#39 §2.2)."""
+    basis = str(value or "").strip().lower()
+    return basis if basis in CENSUS_BASES else None
+
+
 def _first_count(sources: tuple[dict[str, Any], ...], *keys: str) -> int | None:
     for source in sources:
         for key in keys:
@@ -782,6 +807,20 @@ def _fold_test_stats(
         return (
             SnapshotTestStats(
                 discovered=_nonnegative_int(validated_rollup.get("discovered")),
+                # The census is a DISCOVERY fact, not an execution one: it
+                # survives the fallback-parity rerouting above exactly as
+                # `discovered` does, so a zeroed headline still says what was
+                # surveyed and how completely.
+                denominator_basis=_census_basis(validated_rollup.get("denominator_basis")),
+                denominator_unmeasured_modules=_nonnegative_int(
+                    validated_rollup.get("denominator_unmeasured_modules")
+                ),
+                denominator_module_total=_nonnegative_int(
+                    validated_rollup.get("denominator_module_total")
+                ),
+                denominator_bare_total=_nonnegative_int(
+                    validated_rollup.get("denominator_bare_total")
+                ),
                 unique=validated_unique,
                 raw=validated_raw,
                 flaky_count=flaky_count,
@@ -989,6 +1028,66 @@ def _excluded_volume_clauses(
     return clauses
 
 
+def _census_clauses(stats: SnapshotTestStats) -> list[str]:
+    """What the denominator says about itself, in the grain that uses it.
+
+    Two statements, and they are mutually exclusive on purpose (#39 §2.2/§2.4):
+
+    * a PARTIAL census names how many modules are missing from it, because the
+      number is a floor and the reader has to be able to see that it is one;
+    * a COMPLETE census that the numerator exceeds names the EXPANSION, because
+      a complete declaration count exceeded by receipt-backed executions can
+      only have been expanded (parameterization, factories, repeats).
+
+    Naming expansion over a partial census would assert a cause the unmeasured
+    modules explain just as well, so it stays unsaid there. A basis this
+    snapshot does not carry says nothing at all: a replayed pre-census run has
+    no coverage statement to make and must not have one invented for it.
+    """
+    clauses: list[str] = []
+    discovered = stats.discovered or 0
+    if stats.denominator_basis == BASIS_PARTIAL:
+        missing = stats.denominator_unmeasured_modules
+        total = stats.denominator_module_total
+        if missing:
+            clauses.append(
+                f"{missing:,} of {total:,} modules unmeasured"
+                if total
+                else f"{missing:,} modules unmeasured"
+            )
+        else:
+            clauses.append("some modules unmeasured")
+    elif stats.denominator_basis == BASIS_COMPLETE and stats.unique.executed > discovered > 0:
+        clauses.append(f"parameterized expansion over {discovered:,} declared")
+    bare_total = stats.denominator_bare_total
+    if bare_total is not None and bare_total != discovered:
+        # The rejected number, in the sentence that rejected it. The conflict
+        # id says the sources disagreed; only this says by how much, and a
+        # reader who cannot see 1,347 beside 593 cannot audit the choice.
+        clauses.append(f"{bare_total:,} claimed with no module list to explain it")
+    return clauses
+
+
+def _cases_reason(stats: SnapshotTestStats, excluded: str) -> str | None:
+    """The one sentence the cases grain carries beside its fraction.
+
+    An UNBOUNDED grain opens with the band's own sentence: its numbers are on
+    the line already, so repeating them would say the ratio twice and the
+    reason not at all. Every other grain opens with the counts, because a
+    clause about excluded volume beside a bare fraction leaves a reader
+    guessing which of the two numbers it belongs to.
+    """
+    clauses = _census_clauses(stats)
+    if excluded:
+        clauses.append(excluded)
+    if not clauses:
+        return None
+    body = "; ".join(clauses)
+    if stats.unique.executed > (stats.discovered or 0):
+        return f"{UNBOUNDED_REASON} — {body}"
+    return f"{stats.unique.executed}/{stats.discovered} — {body}"
+
+
 def test_grain_rates(
     stats: SnapshotTestStats,
     driven_modules: set[str],
@@ -1013,9 +1112,7 @@ def test_grain_rates(
         cases = GrainRate(
             numerator=stats.unique.executed,
             denominator=stats.discovered,
-            reason=(
-                f"{stats.unique.executed}/{stats.discovered} — {excluded}" if excluded else None
-            ),
+            reason=_cases_reason(stats, excluded),
         )
     else:
         # Both volumes or neither: without a denominator the grain shows no

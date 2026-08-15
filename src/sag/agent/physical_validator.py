@@ -45,6 +45,7 @@ from sag.agent.evidence_records import (
 )
 from sag.agent.receipt_structure import dispatch_terminated as _dispatch_terminated
 from sag.agent.receipt_structure import module_key as _receipt_module_key
+from sag.case_census import TestCensus, census_from_catalog_summary, produce_census
 from sag.config.settings import DEFAULT_BUILD_COVERAGE_THRESHOLD
 from sag.runtime.container_io import (
     ContainerFileReadError,
@@ -67,6 +68,25 @@ from sag.testcases.results import (
     canonical_test_identity,
 )
 from sag.verdict_rates import STALE_CONFLICT, execution_sentence, no_execution_sentence
+
+
+def _census_facts(census: TestCensus) -> Dict[str, Any]:
+    """The census as sealable facts — absent keys for what it never measured.
+
+    Absent-when-inapplicable is the established convention on this path
+    (``receipt_scoped`` and friends): a run with no module dimension grows no
+    null module fields, so recorded snapshots keep verifying byte-identically.
+    """
+    facts: Dict[str, Any] = {"denominator_basis": census.basis}
+    if census.unmeasured_modules:
+        facts["denominator_unmeasured_modules"] = census.unmeasured_modules
+        facts["denominator_module_total"] = census.total_modules
+    if census.conflicts and census.bare_total is not None:
+        # Only the rejected total needs sealing; a total the module sum agrees
+        # with is the same number the grain already shows.
+        facts["denominator_bare_total"] = census.bare_total
+    return facts
+
 
 # top_level.txt names that are install tooling, never the project under test —
 # a second deny-list layer under the record selection in
@@ -5430,21 +5450,28 @@ class PhysicalValidator:
         collection_error_summary = test_metrics.get("collection_error_summary")
 
         failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
-        # Python projects: python_tool's pytest --collect-only denominator is
-        # ground truth from the actual runner and takes PRIORITY over any
-        # static heuristic the runner metrics may carry (live 2026-07-10 click
-        # run: a static scan that swept the .venv reported 32927 while pytest
-        # collected 1927). The metrics chain stays the fallback when no
-        # collected count exists; _python_collected_count is None outside
-        # python, so maven/gradle priority order is unchanged.
-        discovered = self._python_collected_count(project_name) or (
-            test_metrics.get("discovered")
-            or test_metrics.get("discovered_tests")
-            or test_metrics.get("static_test_count")
-            or test_metrics.get("catalog_test_count")
+        # ONE census producer decides the denominator (#39 §2.1). Python
+        # projects: python_tool's pytest --collect-only rows are ground truth
+        # from the actual runner and take PRIORITY over any static heuristic
+        # the runner metrics may carry (live 2026-07-10 click run: a static
+        # scan that swept the .venv reported 32927 while pytest collected
+        # 1927), which is also what keeps a Java @Test scan out of a Python
+        # denominator. Otherwise the module breakdown is the auditable
+        # producer and its sum wins: polaris sealed 1,347 beside a module list
+        # that explained 593, and the OR-chain that used to stand here picked
+        # whichever source answered first with no provenance either way.
+        census = produce_census(
+            by_module=test_metrics.get("catalog_by_module"),
+            module_total=test_metrics.get("catalog_module_total"),
+            bare_total=(
+                test_metrics.get("discovered")
+                or test_metrics.get("discovered_tests")
+                or test_metrics.get("static_test_count")
+                or test_metrics.get("catalog_test_count")
+            ),
+            collected=self._python_collected_count(project_name),
         )
-        if type(discovered) is int and discovered <= 0:
-            discovered = None
+        discovered = census.discovered
 
         # One decision, three fields (spec §2.3). The pass rate is reported as a
         # fact below; it decides nothing here.
@@ -5486,6 +5513,9 @@ class PhysicalValidator:
         if has_test_count_evidence and test_metrics.get("valid", False):
             test_stats = {
                 "discovered": discovered,
+                # The census travels WITH the number it produced, or the
+                # denominator arrives downstream as a bare integer again.
+                **_census_facts(census),
                 "executed": test_metrics.get("total_tests", 0),
                 "passed": test_metrics.get("passed_tests", 0),
                 "failed": failed_count,
@@ -5505,7 +5535,7 @@ class PhysicalValidator:
                 ),
             }
         report_files = test_metrics.get("report_files", [])
-        conflicts = []
+        conflicts = list(census.conflicts)
         if test_metrics.get("failed_tests", 0):
             conflicts.append("test_failures_detected")
         if test_metrics.get("error_tests", 0):
@@ -5572,6 +5602,10 @@ class PhysicalValidator:
             # collect-only fallback) — consumers like the report snapshot's
             # execution-coverage gate read this even when test_stats is None.
             "static_test_count": discovered,
+            # ... and what that denominator covers, for the same reason: a
+            # consumer reading the number without the basis cannot tell a
+            # complete survey from a floor.
+            **_census_facts(census),
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(report_files) or [project_dir],
         }
@@ -5668,12 +5702,21 @@ class PhysicalValidator:
                     trunk_data = json.loads(load_result["output"])
                     env_summary = trunk_data.get("environment_summary", {})
 
-                    # Check for static test count
-                    static_test_count = env_summary.get("static_test_count")
+                    # Check for static test count. The trunk carries a BARE
+                    # total beside the module breakdown that should explain it;
+                    # both go through the one census producer here, so this
+                    # read can never be the second source that contradicts the
+                    # sealed denominator (#39 §2.1).
+                    census = census_from_catalog_summary(
+                        env_summary.get("test_catalog_summary"),
+                        bare_total=env_summary.get("static_test_count"),
+                    )
+                    static_test_count = census.discovered
                     if static_test_count is not None:
                         result["has_static_test_count"] = True
                         result["static_test_count"] = static_test_count
                         result["analyzed"] = True
+                        result.update(_census_facts(census))
                         logger.info(
                             f"✅ Project analysis found: {static_test_count} static tests detected"
                         )
@@ -5865,8 +5908,14 @@ class PhysicalValidator:
 
         # Add catalog metadata to result if available
         if test_catalog:
+            by_module = test_catalog.to_dict()["by_module"]
             result["catalog_test_count"] = test_catalog.count()
-            result["catalog_by_module"] = test_catalog.to_dict()["by_module"]
+            result["catalog_by_module"] = by_module
+            # How many modules the catalog HOLDS, beside how many it names
+            # here. They differ only where a bounded projection dropped the
+            # tail, and that difference is exactly what makes the denominator
+            # a floor rather than a survey (#39 §2.2).
+            result["catalog_module_total"] = len(by_module)
 
         return result
 

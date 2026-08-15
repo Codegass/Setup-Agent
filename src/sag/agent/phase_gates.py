@@ -1585,6 +1585,27 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
         **{
             key: value
             for key, value in {
+                # #39: the denominator's basis travels with the denominator.
+                # A number sealed without it reads as a complete survey even
+                # when twelve of twenty modules were never counted.
+                "denominator_basis": (
+                    str(
+                        status.get("denominator_basis") or test_stats.get("denominator_basis") or ""
+                    ).strip()
+                    or None
+                ),
+                "denominator_unmeasured_modules": _first_nonnegative_int(
+                    status.get("denominator_unmeasured_modules"),
+                    test_stats.get("denominator_unmeasured_modules"),
+                ),
+                "denominator_module_total": _first_nonnegative_int(
+                    status.get("denominator_module_total"),
+                    test_stats.get("denominator_module_total"),
+                ),
+                "denominator_bare_total": _first_nonnegative_int(
+                    status.get("denominator_bare_total"),
+                    test_stats.get("denominator_bare_total"),
+                ),
                 "collection_errors": _first_nonnegative_int(
                     status.get("collection_errors"), test_stats.get("collection_errors")
                 ),

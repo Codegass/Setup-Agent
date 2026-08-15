@@ -8,6 +8,7 @@ announced as a clean success."""
 
 from typing import Iterable, Optional
 
+from sag.case_census import CENSUS_CONFLICT
 from sag.verdict_rates import UNCOUNTED_REPORT_CONFLICTS
 
 VERDICT_ORDER = ["failed", "partial", "success"]
@@ -45,13 +46,26 @@ _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 #     Anti-fabrication is EXCLUSION, and exclusion is untouched: none of these
 #     volumes is ever counted. All three stay named, pathed, counted and spoken
 #     in the cases grain (spec 2026-08-14 amendment items 4, 7 and 12).
+#   * test_census_sources_disagree names a DISCOVERY-side bookkeeping split —
+#     polaris's analyzer wrote 1,347 beside a module list explaining 593 — and
+#     it is fully adjudicated where it is raised: the module sum wins, the
+#     basis says what that number covers, and both numbers are sealed. It
+#     states nothing about what the run EXECUTED, and no dispatch the run could
+#     make would clear it, so capping on it would tax a static property of the
+#     repository with no remedy available. The census is a floor; saying so is
+#     observability, and observability never ends a run (#39 §2.1).
 #
 # The cap stays where deletion cannot buy it: an evidence-CLOSURE failure whose
 # removal takes the headline's authority with it (test_receipt_unreadable —
 # without the ledger nothing is attributed and the headline is 0), never a
 # report file a run can delete without changing a single execution it ran.
 ADJUDICATED_CONFLICTS = frozenset(
-    {"test_failures_detected", "test_errors_detected", *UNCOUNTED_REPORT_CONFLICTS}
+    {
+        "test_failures_detected",
+        "test_errors_detected",
+        CENSUS_CONFLICT,
+        *UNCOUNTED_REPORT_CONFLICTS,
+    }
 )
 
 
