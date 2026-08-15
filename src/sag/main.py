@@ -1464,7 +1464,12 @@ def trajectory(session_dir, follow, detail):
     except KeyboardInterrupt:
         return  # a follower ends when whoever was watching stops watching
     except (FileNotFoundError, ValueError) as exc:
-        console.print(f"[bold red]❌ {exc}[/bold red]")
+        # STDOUT is this command's contract — `sag trajectory | jq` is the point
+        # of it — so a failure puts nothing there and the reason on stderr,
+        # beside click's own parser errors. Plain text, not a rich panel: a
+        # panel hard-wraps the path it is naming and colours a pipe nobody is
+        # reading with a terminal.
+        click.echo(f"❌ {exc}", err=True)
         sys.exit(1)
 
 

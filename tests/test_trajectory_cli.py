@@ -185,6 +185,31 @@ def test_a_session_directory_that_is_not_there_fails_without_a_traceback(tmp_pat
         json.loads(result.output)
 
 
+def test_an_error_is_written_to_stderr_because_stdout_is_the_contract(tmp_path):
+    """A failure must not put a single byte where the JSON goes.
+
+    `sag trajectory | jq` is the point of the command. A reader that pipes
+    stdout gets nothing on failure and the reason on its terminal — the same
+    bargain every other filter makes. Printing the error onto stdout instead
+    hands the parser a red panel and calls it a trajectory.
+    """
+    result = _run(str(tmp_path / "never-existed"))
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert "never-existed" in result.stderr
+
+
+def test_the_parsers_own_refusals_land_on_stderr_too(tmp_path):
+    """Consistency: click's rejections and the command's own use one channel."""
+    (tmp_path / "a-file").write_text("not a directory", encoding="utf-8")
+    result = _run(str(tmp_path / "a-file"))
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    assert "a-file" in result.stderr
+
+
 def test_the_command_writes_nothing_into_the_session_it_read(tmp_path):
     session_dir = _session_with_store(tmp_path)
     before = {p: p.stat().st_mtime_ns for p in sorted(session_dir.rglob("*"))}
