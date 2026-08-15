@@ -72,6 +72,22 @@ REAL_REFUSED_THEN_RETRY_JSONL = """\
 """
 
 
+# Sequences 116-160 of the kafka d2r3 session, in LEDGER order: the transition
+# into build, an advisor call made inside build, that call's result, the
+# transition into test, an advisor call made inside test, and the evidence_close
+# that ends the run's last banded phase. The fence below feeds them in a
+# different order — the result late — because that is the arrival order a slow
+# call produces and the one the run pointer has to survive.
+REAL_BUILD_TO_TEST_JSONL = """\
+{"event_id":"control-000116","kind":"phase_transition","payload":{"expected_kind":"advance","expected_reason_code":"analysis_ready","expected_target":"build","repair_request":null},"sequence":116,"source":null,"timestamp":"2026-08-14T11:30:09.629860Z"}
+{"event_id":"control-000117","kind":"action_envelope","payload":{"envelope_id":"envelope-000117","envelope_sha256":"d5e535e6ddc7bcb19b1deb321262684cd2941ab851bd687af28cc08bfff05455","exact_params":{},"tool":"advisor","tool_call_id":"advisor-entry-1"},"sequence":117,"source":null,"timestamp":"2026-08-14T11:30:13.900287Z"}
+{"event_id":"control-000118","kind":"tool_result","payload":{"actual_executions":[],"envelope_id":"envelope-000117","execution_id":"execution_42eedea8469644d8b7821a5252952c3d","output_sha256":"68088b458619e9f0383bb986dc96877ee76e97e7ecc17149d47031c4844522e4","params":{},"result":{"conflicts":[],"evidence_assessment":"success","evidence_refs":[],"evidence_status":"verified","facts":{},"invocation_status":"completed","metadata":{"advisor":"advice","advisor_call_index":1,"advisor_model":"gpt-5.4-mini"},"operation_outcome":"success","output":"stored as output_2c89f3a1127b","output_ref":"output_2c89f3a1127b","refs":[],"validator_findings":[]},"roles":[],"scope":"artifacts","source_attempt_id":"build-1","source_phase":"build","tool":"advisor"},"sequence":118,"source":null,"timestamp":"2026-08-14T11:30:13.922815Z"}
+{"event_id":"control-000138","kind":"phase_transition","payload":{"expected_kind":"advance","expected_reason_code":"test_entry_ready","expected_target":"test","repair_request":null},"sequence":138,"source":null,"timestamp":"2026-08-14T11:32:31.686985Z"}
+{"event_id":"control-000139","kind":"action_envelope","payload":{"envelope_id":"envelope-000139","envelope_sha256":"813ac72fccadcdbaa5e25e5c4dd93bd591af8aa4d2d5ce5575efdae5674563ac","exact_params":{},"tool":"advisor","tool_call_id":"advisor-entry-2"},"sequence":139,"source":null,"timestamp":"2026-08-14T11:32:36.541626Z"}
+{"event_id":"control-000160","kind":"phase_transition","payload":{"expected_kind":"evidence_close","expected_reason_code":"test_terminal","expected_target":null,"repair_request":null},"sequence":160,"source":null,"timestamp":"2026-08-14T11:40:43.104247Z"}
+"""
+
+
 def _lines(block: str) -> list[str]:
     return block.strip().splitlines()
 
@@ -304,6 +320,50 @@ def test_a_transition_closes_the_phase_the_run_is_in_not_the_last_band_appended(
     bands = {p.name: p.termination for p in r.snapshot().phases}
     assert bands["provision"] == "advance"  # the phase the run was actually in
     assert bands["build"] is None  # the stranger keeps its own (absent) ending
+
+
+def test_a_late_result_bands_its_own_turn_without_moving_the_run_backwards():
+    """Where the run IS is a transition's word; a turn's phase is its own event's.
+
+    A `tool_result` names the phase its CALL was made in, and that call can have
+    been made before the run left the phase — an advisor or build call whose
+    answer lands after the transition. Letting that late word move the run
+    pointer put the run back in `build` while it was executing `test`, so the
+    next transition closed the band it had already closed and `test` was left
+    open for the rest of the run. Two things must be true at once: the late
+    result bands ITS turn `build`, and the run is still in `test`.
+    """
+    into_build, call, answer, into_test, later_call, close = _lines(REAL_BUILD_TO_TEST_JSONL)
+    r = TrajectoryReducer()
+    for line in (into_build, call, into_test, answer, later_call, close):
+        r.feed(line)
+
+    snap = r.snapshot()
+    assert [t.call.params_ref for t in snap.turns] == ["envelope-000117", "envelope-000139"]
+    assert snap.turns[0].phase == "build"  # the late result banded its own turn
+    assert snap.turns[1].phase == "test"  # a turn opened after it is where the run is
+    assert {p.name: p.termination for p in snap.phases} == {
+        "build": "advance",
+        "test": "evidence_close",  # the band the run was actually in when it closed
+    }
+
+
+def test_the_run_pointer_is_seeded_by_the_phase_no_transition_ever_names():
+    """A run's opening phase is entered by starting, not by a transition.
+
+    Nothing announces `provision`: the first transition in every archived ledger
+    already names the phase being entered NEXT. So the pointer is seeded by the
+    first band that comes into existence while the run has not been placed —
+    which is not the pointer moving, it is the pointer being set — and that seed
+    is what lets `provision` be terminated by the transition that leaves it.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL):  # provision, then advance -> analyze
+        r.feed(line)
+    assert {p.name: p.termination for p in r.snapshot().phases} == {
+        "provision": "advance",
+        "analyze": None,
+    }
 
 
 def test_a_naive_timestamp_is_read_as_utc_instead_of_raising():

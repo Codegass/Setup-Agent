@@ -18,14 +18,16 @@ control stream does not carry:
 - **tokens** — `token_usage.csv` bills one row per model RESPONSE, keyed by
   `iteration`. One response can open several turns, so the row bills exactly
   one of them (the first) and the siblings ride along unbilled: the run paid
-  once. Controller turns are never billed — a forced action is the harness
-  moving, not the model. A row that bills no turn at all is stated as
-  `tokens_unattributed` rather than dropped, because unattributable spend is a
-  fact about the ledger's holes, not a rounding error. Advisor rows are that
-  advisor's own spend and never a turn's. The engine exports this file when the
-  ReAct loop EXITS, so live it lands AFTER every turn it pays for: the follower
-  therefore re-states a turn whose bill arrived late instead of leaving it
-  unbilled forever, which is the only way the two feeds can agree about spend.
+  once. A refusal is a response like any other and is billed like one, which is
+  why the rule needs no case for refusals. Controller turns are never billed —
+  a forced action is the harness moving, not the model. Every row that ends up
+  billing nobody is STATED rather than dropped: `tokens_unattributed` for a row
+  no turn claims, `tokens_duplicate_row` for a second row on an iteration the
+  first row already paid. Advisor rows are that advisor's own spend and never a
+  turn's. The engine exports this file when the ReAct loop EXITS, so live it
+  lands AFTER every turn it pays for: the follower therefore re-states a turn
+  whose bill arrived late instead of leaving it unbilled forever, which is the
+  only way the two feeds can agree about spend.
 - **verdict and rates** — `verdict.json` exists only once a run has finished,
   so its absence is the normal state of a live session, not a hole.
 - **project** — `project_meta.json` names the repository under test.
@@ -43,6 +45,11 @@ document that agrees about turns and diverges about everything else.
 A session that has not written its ledger yet is a running session, not an
 error: the trajectory comes back empty with a `missing_control_events` warning.
 A session directory that does not exist at all IS an error, and says so.
+
+A ledger whose last line has no newline is withheld by BOTH feeds — a line
+exists once its newline does — but only a live follow may withhold it in
+silence, because there the newline is still coming. A replay, and a follow that
+has been closed, say `ledger_tail_torn` and name the byte offset.
 """
 
 from __future__ import annotations
@@ -51,7 +58,8 @@ import csv
 import io
 import json
 import time
-from collections.abc import Callable, Iterator
+from collections import Counter
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -89,9 +97,10 @@ def build_trajectory(session_dir: Path | str, *, detail: str = "summary") -> Tra
     ledger = sources.control_events()
     if ledger is None:
         return sources.finish(reducer.snapshot(), extra=[_missing_ledger(sources.path)])
-    for line in _read_lines(ledger):
+    lines, torn = _read_lines(ledger)
+    for line in lines:
         reducer.feed(line)
-    return sources.finish(reducer.snapshot())
+    return sources.finish(reducer.snapshot(), extra=[torn] if torn is not None else [])
 
 
 def follow_trajectory(
@@ -100,36 +109,72 @@ def follow_trajectory(
     detail: str = "summary",
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
-) -> Iterator[TrajectoryDelta]:
+) -> "TrajectoryFollow":
     """Tail a session's ledger, yielding deltas as its events land.
 
-    The generator never ends on its own — a live run has no last line. Callers
-    stop by breaking out of the loop; tests stop by having `sleep` raise.
+    The stream never ends on its own — a live run has no last line. Callers stop
+    by breaking out of the loop and saying so with `close()`; tests stop by
+    having `sleep` raise.
 
     Folding every delta yielded here reproduces `build_trajectory` over the same
     bytes EXACTLY (`DeltaAccumulator` is the fold). One delta per event carries
     what that event changed; one further delta per poll carries what changed
     around the ledger — a verdict written, an output store that finally exists,
-    a token row that bills nobody yet.
+    a token row that bills nobody yet — and `close()` carries the one statement
+    that only the end of a follow can make.
     """
     sources = _SessionSources(session_dir, detail=detail)
+    tail = _FollowTail(sources)
+    return TrajectoryFollow(_following(sources, tail, poll_seconds, sleep), tail)
+
+
+def _following(
+    sources: "_SessionSources",
+    tail: "_FollowTail",
+    poll_seconds: float,
+    sleep: Callable[[float], None],
+) -> Generator[TrajectoryDelta, None, None]:
     reducer = TrajectoryReducer()
     joiner = _Joiner(sources)
-    tail: _LedgerTail | None = None
     while True:
-        if tail is None:
-            ledger = sources.control_events()
-            tail = _LedgerTail(ledger) if ledger is not None else None
-        joiner.poll(ledger_missing=tail is None)
-        if tail is not None:
-            for line in tail.drain():
-                decorated = joiner.wrap(reducer.feed(line))
-                if decorated is not None:
-                    yield decorated
+        joiner.poll(ledger_missing=not tail.open())
+        for line in tail.drain():
+            decorated = joiner.wrap(reducer.feed(line))
+            if decorated is not None:
+                yield decorated
         around = joiner.wrap(TrajectoryDelta())
         if around is not None:
             yield around
         sleep(poll_seconds)
+
+
+class TrajectoryFollow:
+    """A live follow: its deltas, and the statement only its ending can make.
+
+    Iterating is the whole API while a run is live. `close()` is the caller
+    saying it has stopped watching, and that is the only moment a WITHHELD tail
+    becomes a TORN one: mid-run, bytes without their newline are a line the
+    engine is still writing, and waiting is the correct answer — warning would
+    cry wolf on every poll that caught a `write` in progress. Once nobody is
+    waiting, the newline is not coming, and the follow says exactly what a
+    replay of those same bytes says.
+    """
+
+    def __init__(self, deltas: Generator[TrajectoryDelta, None, None], tail: "_FollowTail") -> None:
+        self._deltas = deltas
+        self._tail = tail
+
+    def __iter__(self) -> "TrajectoryFollow":
+        return self
+
+    def __next__(self) -> TrajectoryDelta:
+        return next(self._deltas)
+
+    def close(self) -> TrajectoryDelta | None:
+        """End the follow; hand back the last delta, if there is one left to send."""
+        self._deltas.close()
+        torn = self._tail.torn()
+        return None if torn is None else TrajectoryDelta(warnings=[torn])
 
 
 class _SessionSources:
@@ -291,6 +336,37 @@ class _LedgerTail:
         complete, self._partial = _complete_lines(self._partial + chunk)
         return complete
 
+    def torn(self) -> Warning | None:
+        """The withheld fragment, once withholding it has stopped being right."""
+        return _torn_tail(self._partial, self._offset - len(self._partial))
+
+
+class _FollowTail:
+    """The follower's reader: it opens the ledger when the ledger appears.
+
+    A live session may be attached to before it has written its first event, so
+    "there is no ledger yet" is a state to poll out of, not an error. Once a
+    ledger is found it is never looked up again — the follow reads the file it
+    started on.
+    """
+
+    def __init__(self, sources: "_SessionSources") -> None:
+        self._sources = sources
+        self._tail: _LedgerTail | None = None
+
+    def open(self) -> bool:
+        if self._tail is None:
+            ledger = self._sources.control_events()
+            if ledger is not None:
+                self._tail = _LedgerTail(ledger)
+        return self._tail is not None
+
+    def drain(self) -> list[str]:
+        return self._tail.drain() if self._tail is not None else []
+
+    def torn(self) -> Warning | None:
+        return self._tail.torn() if self._tail is not None else None
+
 
 def _complete_lines(buffer: bytes) -> tuple[list[str], bytes]:
     """Split off the lines that are finished, and keep the one that is not.
@@ -312,26 +388,60 @@ def _complete_lines(buffer: bytes) -> tuple[list[str], bytes]:
     return [raw.decode("utf-8", errors="replace") for raw in complete], partial
 
 
-def _read_lines(path: Path) -> list[str]:
+def _read_lines(path: Path) -> tuple[list[str], Warning | None]:
+    """The finished lines of an archived ledger, and its unfinished one if any."""
     try:
-        return _complete_lines(path.read_bytes())[0]
+        data = path.read_bytes()
     except OSError:
-        return []
+        return [], None
+    complete, partial = _complete_lines(data)
+    return complete, _torn_tail(partial, len(data) - len(partial))
+
+
+def _torn_tail(partial: bytes, offset: int) -> Warning | None:
+    """Name the bytes the split withheld, and where in the file they start.
+
+    Only a LIVE follow may withhold them silently, because there the missing
+    newline is a `write` still in flight. Every other reader is looking at a
+    file that has stopped growing, so the fragment is a line the run died in the
+    middle of — and a derivation that drops bytes without saying so disagrees
+    with the ledger's own size while claiming to be derived from it.
+    """
+    if not partial:
+        return None
+    return Warning(
+        code="ledger_tail_torn",
+        detail=(
+            f"{CONTROL_EVENTS_NAME} ends mid-line: {len(partial)} byte(s) "
+            f"from offset {offset} carry no newline yet"
+        ),
+        control_seq=None,
+    )
 
 
 def _read_token_usage(path: Path) -> tuple[dict[int, TokenUsage], list[Warning]]:
-    """Bill each iteration from its executor row; the first row wins."""
+    """Bill each iteration from its executor row; the first row wins, out loud.
+
+    One response, one bill: a second executor row for an iteration already billed
+    cannot be added (that would invent spend) and cannot replace the first
+    (that would make the bill depend on read order). So the first row keeps it —
+    and the ones that did not are STATED, on the same terms as the rows that
+    bill no turn at all. A total assembled by dropping rows in silence is the
+    same lie either way.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return {}, [_token_warning(f"{path.name} could not be read: {exc}")]
 
     billed: dict[int, TokenUsage] = {}
+    rows: Counter[int] = Counter()
     try:
         for row in csv.DictReader(io.StringIO(text)):
             if (row.get("type") or "").strip() != "executor":
                 continue
             iteration = int(str(row.get("iteration", "")).strip())
+            rows[iteration] += 1
             if iteration in billed:
                 continue
             billed[iteration] = TokenUsage(
@@ -340,11 +450,24 @@ def _read_token_usage(path: Path) -> tuple[dict[int, TokenUsage], list[Warning]]
             )
     except (ValueError, csv.Error) as exc:
         return {}, [_token_warning(f"{path.name} is not the expected token ledger: {exc}")]
-    return billed, []
+    return billed, [
+        _duplicate_rows(iteration, count) for iteration, count in sorted(rows.items()) if count > 1
+    ]
 
 
 def _token_warning(detail: str) -> Warning:
     return Warning(code="token_usage_unreadable", detail=detail, control_seq=None)
+
+
+def _duplicate_rows(iteration: int, count: int) -> Warning:
+    return Warning(
+        code="tokens_duplicate_row",
+        detail=(
+            f"{count - 1} duplicate executor row(s) for iteration {iteration} "
+            f"bill nothing; the first row keeps the bill"
+        ),
+        control_seq=None,
+    )
 
 
 def _output_refs(turns: list[Turn]) -> list[str]:
@@ -605,4 +728,9 @@ def _text(value: Any) -> str | None:
     return None
 
 
-__all__ = ["DEFAULT_POLL_SECONDS", "build_trajectory", "follow_trajectory"]
+__all__ = [
+    "DEFAULT_POLL_SECONDS",
+    "TrajectoryFollow",
+    "build_trajectory",
+    "follow_trajectory",
+]

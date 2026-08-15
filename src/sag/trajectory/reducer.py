@@ -40,6 +40,17 @@ timeline never draws a phantom segment and the run is never in two places at
 once. A phase genuinely re-entered gets its own segment, because a transition
 said so.
 
+**Where the run IS and where a turn BELONGS are two different questions.** Only
+a `phase_transition` moves the run pointer. A `tool_result` or `loop_decision`
+naming a phase bands THAT turn and nothing else: the phase it names is the phase
+its CALL was made in, which a slow call answers from after the run has already
+left. Letting that word move the pointer put the run back in a phase it had
+finished, and the next transition then closed a band that was already closed
+while the band actually being left stayed open for the rest of the run. The
+pointer is only ever SET by a band coming into existence while the run has not
+been placed at all — the opening phase no transition announces, and the phase
+after a transition that closes one without naming a successor.
+
 **Warnings are statements, and a statement can stop being true.** Turn-level
 warnings are recomputed from turn state, never stored at seal time: a hole is a
 claim about the ledger AS IT STANDS. Each is claimed the moment it is true —
@@ -148,7 +159,10 @@ class TrajectoryReducer:
         self._turns: list[_TurnState] = []
         self._by_envelope: dict[str, _TurnState] = {}
         self._phases: list[_PhaseState] = []
-        self._phase: str = UNKNOWN_PHASE
+        #: Where the RUN is: the band a `phase_transition` will terminate. `None`
+        #: means the run has not been placed — before its first phase is banded,
+        #: and after a transition that closed one without naming a successor.
+        self._phase: str | None = None
         self._annotations: list[Annotation] = []
         self._event_warnings: list[Warning] = []
         #: What each turn's holes were the last time a delta said so. The diff
@@ -266,7 +280,7 @@ class TrajectoryReducer:
         return turn
 
     def _current_phase(self) -> str:
-        return self._phase
+        return self._phase or UNKNOWN_PHASE
 
     def _phase_band(self, name: str, *, open_segment: bool = False) -> _PhaseState:
         """The band a phase's events belong to, opening a segment only on demand.
@@ -276,6 +290,14 @@ class TrajectoryReducer:
         phase — including one that arrives after the phase closed — lands on
         that phase's most recent segment, because bands are contiguous stretches
         of the run and a stray late event does not start a new stretch.
+
+        A band coming into existence while the run has not been placed SETS the
+        pointer, which is not the same thing as moving it. No transition names
+        the phase a run opens in (the first one in every archived ledger already
+        names the phase being entered next), and a transition that closes a phase
+        without naming a successor leaves the run between phases; in both cases
+        the next phase to appear is where the run is, and terminating it later
+        depends on having said so.
         """
         if not open_segment:
             for phase in reversed(self._phases):
@@ -283,17 +305,26 @@ class TrajectoryReducer:
                     return phase
         band = _PhaseState(name=name)
         self._phases.append(band)
+        if self._phase is None:
+            self._phase = name
         return band
 
     def _enter(self, name: str, *, open_segment: bool = False) -> _PhaseState:
         """Say where the run is now, and hand back the band it is in."""
+        band = self._phase_band(name, open_segment=open_segment)
         self._phase = name
-        return self._phase_band(name, open_segment=open_segment)
+        return band
 
     def _adopt_phase(self, turn: _TurnState, phase: Any) -> None:
+        """Band THIS turn, and leave the run where the last transition put it.
+
+        The phase a `tool_result` or a `loop_decision` names is the phase its
+        CALL was made in, not where the run is now — the two differ for every
+        call whose answer outlives the transition that followed it.
+        """
         if isinstance(phase, str) and phase:
             turn.phase = phase
-            self._enter(phase)
+            self._phase_band(phase)
 
     # ---- handlers -----------------------------------------------------
 
@@ -505,6 +536,11 @@ class TrajectoryReducer:
         was appended last": a gate can band a phase no turn has entered, and
         terminating that stranger left the phase actually being left open for
         the rest of the run.
+
+        A transition with no target — `evidence_close`, `flow_close` — closes a
+        phase without naming a successor, so it leaves the run unplaced rather
+        than parked on the band it just closed. Whatever phase appears next is
+        where the run went, and it is a band that can still be terminated.
         """
         kind = _text(payload.get("expected_kind"))
         leaving = next((band for band in reversed(self._phases) if band.name == self._phase), None)
@@ -513,6 +549,8 @@ class TrajectoryReducer:
         target = _text(payload.get("expected_target"))
         if target:
             self._enter(target, open_segment=True)
+        else:
+            self._phase = None
 
     def _on_repair_context_opened(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict

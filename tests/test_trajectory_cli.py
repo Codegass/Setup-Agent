@@ -151,6 +151,32 @@ def test_follow_prints_one_json_delta_per_line_until_interrupted(monkeypatch):
     assert Path(seen["session_dir"]) == KAFKA and seen["detail"] == "summary"
 
 
+def test_follow_prints_what_the_end_of_the_follow_had_left_to_say(tmp_path, monkeypatch):
+    """A statement made by stopping still belongs on stdout, in the same shape.
+
+    The torn tail of a ledger is only knowable once the follow ends, so it never
+    rides an event's delta. A consumer parsing one delta per line must get it on
+    the same terms as the rest, or the one statement the live mode can only make
+    at the end is the one statement a pipe never sees.
+    """
+    torn = TrajectoryDelta(warnings=[{"code": "ledger_tail_torn", "detail": "offset 42"}])
+
+    class _Stream:
+        def __iter__(self):
+            return iter([TrajectoryDelta(session_patch={"run_id": "r-1"})])
+
+        def close(self):
+            return torn
+
+    monkeypatch.setattr("sag.main.follow_trajectory", lambda session_dir, **kwargs: _Stream())
+    result = _run(str(KAFKA), "--follow")
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert TrajectoryDelta.model_validate_json(lines[-1]) == torn
+    assert len(lines) == 2
+
+
 def test_follow_passes_the_detail_tier_through(monkeypatch):
     seen = {}
 

@@ -22,9 +22,17 @@ layer is wrong:
   calls spec §0 measured — not swallowed. Stated at the right sequence, too: a
   count alone would pass while every hole pointed one event past the call it
   belongs to, so the refusals are pinned to 124/138/216 by number and each
-  turn's observation is checked against the call it claims to describe.
+  turn's observation is checked against the call it claims to describe. Its
+  token ledger is here as well, because refusals are where the billing rule is
+  hardest to state and this is the archive that has them.
+- **ignite** (`session_20260814_074153_238028_5398df380672_24385`) — the one
+  archived session with a real `forced_action` (seq 235, the forced test
+  dispatch its slice reconstructs in Part 2). The controller's turns are the
+  half of the vocabulary the other two fixtures never exercise: derived like any
+  other turn, annotated as forced, and never billed for a model response the
+  model did not make.
 
-Both fixtures are pre-closure sessions. Their warnings are the point: when
+All three fixtures are pre-closure sessions. Their warnings are the point: when
 Pillar 1 lands, new sessions stop producing them, and these archived ones keep
 theirs, because the bytes never change.
 """
@@ -42,6 +50,7 @@ from sag.trajectory.schema import Trajectory
 FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
 KAFKA = FIXTURES / "kafka-d2r3"
 CAMEL_QUARKUS = FIXTURES / "camel-quarkus-d2r3"
+IGNITE = FIXTURES / "ignite-d2r3"
 
 #: The warning codes that name a call the ledger never fully accounted for.
 SILENT_CALL_CODES = ("missing_loop_decision", "missing_tool_result")
@@ -197,7 +206,7 @@ def test_live_accumulation_equals_batch_replay(tmp_path):
     warnings — because a fence that stripped the parts the two feeds compute
     differently would be measuring the parts that never differed.
     """
-    for session_dir in (KAFKA, CAMEL_QUARKUS):
+    for session_dir in (KAFKA, CAMEL_QUARKUS, IGNITE):
         assert _accumulated(session_dir, tmp_path) == build_trajectory(session_dir)
 
 
@@ -244,6 +253,114 @@ def test_an_executor_row_bills_exactly_one_turn():
     assert sum(t.tokens.output for t in billed) == sum(int(r["completion_tokens"]) for r in joined)
     assert all(t.actor == "model" for t in billed)
     assert len(billed) == 11  # 24 calls, 19 executor rows, 11 that join a model turn
+
+
+def test_camel_quarkus_bills_a_refusal_to_the_response_that_was_refused():
+    """A refused response cost tokens, and the run paid for it exactly once.
+
+    The three refusals (seq 124, 138, 216) are the hard case for the billing
+    rule, because a refusal is a model turn with no call, and its retry is a
+    different response with a bill of its own:
+
+    - seq 124 is iteration 17 and the retry at seq 125 is iteration 18. Two
+      responses, two rows, two bills — the refusal is not the retry's cost and
+      the retry is not free.
+    - seq 216 is iteration 43, the SAME response that opened the `search` call
+      at seq 213. One response, two turns: the row bills the first of them and
+      the refusal rides along, exactly as any pair of sibling calls does.
+
+    Nothing about a refusal is special to the biller, and that is the claim: the
+    bill follows the RESPONSE, so the rule needs no case for refusals at all.
+    """
+    snap = build_trajectory(CAMEL_QUARKUS)
+    opened = {turn.control_seq[0]: turn for turn in snap.turns if turn.control_seq}
+
+    refusal, retry = opened[124], opened[125]
+    assert (refusal.iteration, retry.iteration) == (17, 18)
+    assert refusal.call is None and refusal.tokens.input == 16220  # row: iteration 17
+    assert retry.tokens.input == 16393  # row: iteration 18, the retry's own response
+
+    assert opened[138].iteration == 21 and opened[138].tokens.input == 15820
+    assert opened[139].iteration == 22 and opened[139].tokens.input == 14613
+
+    sibling, shared_refusal = opened[213], opened[216]
+    assert sibling.iteration == shared_refusal.iteration == 43
+    assert sibling.tokens is not None and shared_refusal.tokens is None
+
+
+def test_camel_quarkus_bills_every_response_once_and_no_response_twice():
+    """Sum conservation over the real ledger: what was billed is what was spent.
+
+    A per-turn join is only honest if it adds up. Every billed turn's tokens
+    must come from an executor row of its own iteration, no iteration may be
+    billed twice, and the total over the turns must equal the total over exactly
+    the rows that joined them — the rest being the `tokens_unattributed` spend
+    the ledger's silent calls left ownerless.
+    """
+    snap = build_trajectory(CAMEL_QUARKUS)
+    billed = [t for t in snap.turns if t.tokens is not None]
+    iterations = [t.iteration for t in billed]
+    rows = _executor_rows(CAMEL_QUARKUS)
+    joined = [r for r in rows if int(r["iteration"]) in set(iterations)]
+
+    assert iterations == sorted(set(iterations))  # billed once, in ledger order
+    assert all(t.actor == "model" for t in billed)
+    assert sum(t.tokens.input for t in billed) == sum(int(r["prompt_tokens"]) for r in joined)
+    assert sum(t.tokens.output for t in billed) == sum(int(r["completion_tokens"]) for r in joined)
+    assert len(billed) == 37 and len(rows) == 55
+    assert [w.detail for w in snap.warnings if w.code == "tokens_unattributed"] == [
+        "18 executor row(s) bill no turn: iteration(s) "
+        "2, 4, 6, 16, 20, 29, 34, 42, 44, 46, 48, 49, 50, 51, 52, 53, 54, 55"
+    ]
+
+
+def test_ignites_forced_dispatch_is_a_controller_turn_on_the_record():
+    """The forced test dispatch of the ignite slice, derived rather than dug up.
+
+    The slice's Part 2 reconstructs seq 235 by hand: "The dispatch was not a
+    model call: `intent_source` is `controller` and the envelope id is
+    `forced-000235`", phase `test`, attempt `test-1`, model iteration 28. The
+    trajectory must say all of that without an archaeologist, and say WHY the
+    turn exists — the policy and trigger that produced it — through the `forced`
+    annotation rather than by leaving the row indistinguishable from a model's.
+    """
+    snap = build_trajectory(IGNITE)
+    controller = [t for t in snap.turns if t.actor == "controller"]
+    assert len(controller) == 1
+    turn = controller[0]
+
+    assert turn.call.tool == "build" and turn.call.params_ref == "forced-000235"
+    assert turn.phase == "test" and turn.iteration == 28
+    assert turn.control_seq == [235, 238, 239]  # the dispatch, its result, its decision
+    assert turn.observation.ref == "job:2c4d56b2fdca"  # the job the dispatch created
+
+    forced = [a for a in snap.annotations if a.kind == "forced" and a.turn_id == turn.turn_id]
+    assert len(forced) == 1
+    assert forced[0].data == {
+        "policy": "test_attempt_required",
+        "trigger": "termination_refusal",
+        "reason_code": "test_receipt_missing",
+        "source_attempt_id": "test-1",
+    }
+    assert len(snap.turns) == 35  # slice census: 34 action_envelope + 1 forced_action
+
+
+def test_ignites_forced_dispatch_is_never_billed_for_the_model_response_it_rode():
+    """The harness moved; the model was not charged for it.
+
+    A forced action carries the iteration of the loop it interrupted — 28, the
+    response whose refusal triggered it — so an iteration-keyed join hands the
+    controller the model's bill unless the actor is checked. The row for that
+    response then bills nobody, and says so out loud rather than being quietly
+    dropped into the controller's row.
+    """
+    snap = build_trajectory(IGNITE)
+    turn = next(t for t in snap.turns if t.actor == "controller")
+    assert turn.iteration == 28 and turn.tokens is None
+    assert any(int(r["iteration"]) == 28 for r in _executor_rows(IGNITE))  # the row exists
+    assert [w.detail for w in snap.warnings if w.code == "tokens_unattributed"] == [
+        "6 executor row(s) bill no turn: iteration(s) 5, 9, 10, 14, 16, 28"
+    ]
 
 
 def test_the_executor_rows_that_bill_nobody_are_counted_out_loud():

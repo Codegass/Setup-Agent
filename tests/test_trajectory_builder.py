@@ -111,6 +111,44 @@ def test_a_controller_turn_is_never_billed_for_a_response_the_model_did_not_make
     assert [w.code for w in snap.warnings] == ["tokens_unattributed"]
 
 
+def test_a_second_executor_row_for_one_iteration_is_stated_not_dropped(tmp_path):
+    """Two rows for one response is a fact about the ledger, not a rounding step.
+
+    The join has to pick one — billing both would invent spend — and it picks
+    the first, which is deterministic and the same in both feeds. What it may
+    not do is pick silently: `tokens_unattributed` already says out loud when a
+    row bills nobody, and a row that bills nobody because another row got there
+    first is the same kind of statement. Whoever reads the total is entitled to
+    know the ledger disagreed with itself.
+    """
+    duplicate = "1,2026-08-14T07:28:41.000000,executor,project,gpt-5.4-mini,9999,9000,999,0,999\n"
+    tokens = REAL_TOKEN_CSV + duplicate
+    session_dir = _session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=tokens)
+
+    snap = build_trajectory(session_dir)
+    assert snap.turns[0].tokens.input == 4134  # the first row keeps the bill
+    assert [(w.code, w.detail) for w in snap.warnings] == [
+        (
+            "tokens_duplicate_row",
+            "1 duplicate executor row(s) for iteration 1 bill nothing; "
+            "the first row keeps the bill",
+        )
+    ]
+
+
+def test_a_duplicate_row_is_stated_to_a_live_watcher_too(tmp_path):
+    """The two feeds disagree about nothing, including what the ledger got wrong."""
+    duplicate = "1,2026-08-14T07:28:41.000000,executor,project,gpt-5.4-mini,9999,9000,999,0,999\n"
+    session_dir = _session(tmp_path, events="")
+    accumulated = _accumulate_then_bill(
+        session_dir,
+        [line + "\n" for line in EVENT_LINES],
+        tokens=REAL_TOKEN_CSV + duplicate,
+    )
+    assert [w.code for w in accumulated.warnings] == ["tokens_duplicate_row"]
+    assert accumulated == build_trajectory(session_dir)
+
+
 def test_a_turn_whose_iteration_never_billed_carries_no_tokens(tmp_path):
     one_row = "\n".join(REAL_TOKEN_CSV.splitlines()[:2]) + "\n"
     snap = build_trajectory(
@@ -372,6 +410,80 @@ def test_batch_withholds_a_torn_tail_exactly_as_follow_does(tmp_path):
     live_root.mkdir()
     live_dir = _session(live_root, events="", tokens=REAL_TOKEN_CSV)
     assert _accumulate(live_dir, [torn]).turns == snap.turns
+
+
+def test_an_archived_ledger_that_ends_mid_line_says_so(tmp_path):
+    """Withholding a fragment is right; withholding that there IS one is not.
+
+    A replay is reading a file nobody is appending to any more, so the missing
+    newline is never coming: those bytes are a line the run died in the middle
+    of writing. Dropping them silently is the trajectory quietly disagreeing
+    with the ledger's own byte count, which is the one thing an evidence layer
+    may not do. The offset says exactly where to look.
+    """
+    whole = "\n".join(EVENT_LINES) + "\n"
+    fragment = EVENT_LINES[0][:200]
+    session_dir = _session(tmp_path, events=whole + fragment, tokens=REAL_TOKEN_CSV)
+
+    snap = build_trajectory(session_dir)
+    assert len(snap.turns) == 2  # the fragment is still not an event
+    assert [w.code for w in snap.warnings] == ["ledger_tail_torn"]
+    assert snap.warnings[0].detail == (
+        f"control_events.jsonl ends mid-line: 200 byte(s) from offset "
+        f"{len(whole.encode())} carry no newline yet"
+    )
+
+
+def test_a_follow_withholds_a_torn_tail_while_live_and_states_it_when_finalized(tmp_path):
+    """Live, the newline is coming. Once nobody is watching, it never was.
+
+    These are the same bytes reported two ways on purpose: mid-run a fragment is
+    a line being written and warning about it would cry wolf on every poll that
+    caught the engine mid-`write`. The follow's END is the moment that stops
+    being true, so `close()` — the caller saying it has stopped watching — is
+    where the statement belongs, and it is the same statement a replay of those
+    bytes makes.
+    """
+    whole = "\n".join(EVENT_LINES) + "\n"
+    session_dir = _session(tmp_path, events="", tokens=REAL_TOKEN_CSV)
+    events = session_dir / "control_events.jsonl"
+    pending = [whole, EVENT_LINES[0][:200]]
+    accumulator = DeltaAccumulator()
+
+    def fake_sleep(seconds: float) -> None:
+        if not pending:
+            raise _NoMoreLines
+        with events.open("a", encoding="utf-8") as handle:
+            handle.write(pending.pop(0))
+
+    follow = follow_trajectory(session_dir, poll_seconds=0.01, sleep=fake_sleep)
+    with pytest.raises(_NoMoreLines):
+        for delta in follow:
+            accumulator.feed(delta)
+    assert all(w.code != "ledger_tail_torn" for w in accumulator.snapshot().warnings)
+
+    final = follow.close()
+    assert [w.code for w in final.warnings] == ["ledger_tail_torn"]
+    accumulator.feed(final)
+    assert accumulator.snapshot() == build_trajectory(session_dir)
+
+
+def test_a_follow_that_ends_on_a_whole_ledger_has_nothing_left_to_say(tmp_path):
+    """`close()` is a question, not an announcement: an intact tail answers None."""
+    session_dir = _session(tmp_path, events="", tokens=REAL_TOKEN_CSV)
+    events = session_dir / "control_events.jsonl"
+    pending = ["\n".join(EVENT_LINES) + "\n"]
+
+    def fake_sleep(seconds: float) -> None:
+        if not pending:
+            raise _NoMoreLines
+        events.write_text(pending.pop(0), encoding="utf-8")
+
+    follow = follow_trajectory(session_dir, poll_seconds=0.01, sleep=fake_sleep)
+    with pytest.raises(_NoMoreLines):
+        for _ in follow:
+            pass
+    assert follow.close() is None
 
 
 def test_an_output_store_written_after_the_follow_started_still_resolves(tmp_path):

@@ -7,7 +7,7 @@ console log — control events and the other authoritative artifacts are the
 only inputs.
 """
 
-from sag.trajectory.builder import build_trajectory, follow_trajectory
+from sag.trajectory.builder import TrajectoryFollow, build_trajectory, follow_trajectory
 from sag.trajectory.reducer import TrajectoryReducer
 from sag.trajectory.schema import (
     DETAIL_TIERS,
@@ -43,6 +43,7 @@ __all__ = [
     "TokenUsage",
     "Trajectory",
     "TrajectoryDelta",
+    "TrajectoryFollow",
     "TrajectoryReducer",
     "Turn",
     "Warning",

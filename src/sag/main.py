@@ -1457,8 +1457,17 @@ def trajectory(session_dir, follow, detail):
     """
     try:
         if follow:
-            for delta in follow_trajectory(session_dir, detail=detail):
-                click.echo(delta.model_dump_json())
+            stream = follow_trajectory(session_dir, detail=detail)
+            try:
+                for delta in stream:
+                    click.echo(delta.model_dump_json())
+            finally:
+                # Ending the follow is what turns a withheld tail into a torn
+                # one, so the last delta is produced by stopping, not by an
+                # event. It goes out through the same channel as every other.
+                final = stream.close()
+                if final is not None:
+                    click.echo(final.model_dump_json())
             return
         click.echo(build_trajectory(session_dir, detail=detail).model_dump_json())
     except KeyboardInterrupt:
