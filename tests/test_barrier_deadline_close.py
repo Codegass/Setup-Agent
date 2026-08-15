@@ -169,6 +169,32 @@ def test_a_disclosed_job_leaves_the_gate_barrier_but_keeps_the_settlement_cap():
     assert gate.code != "job_controller_barrier"
 
 
+def test_a_report_claim_after_the_deadline_close_is_gradable_on_sealed_evidence():
+    """The live shape: evidence is sealed, the job is still in the ledger, and
+    the report phase still has to close on a claim the gate can grade."""
+    orchestrator = SettlementOrchestrator(terminated=False)
+    claim = PhaseClaim(phase="report", claimed_outcome=PhaseOutcome.UNKNOWN)
+
+    waiting = phase_gates.check_phase_claim(
+        "report", claim, None, orchestrator, "polaris", sealed=True
+    )
+    assert waiting.accepted is False
+    assert waiting.code == "job_controller_barrier"
+
+    graded = phase_gates.check_phase_claim(
+        "report",
+        claim,
+        None,
+        orchestrator,
+        "polaris",
+        sealed=True,
+        disclosed_job_ids=(SETTLEMENT_JOB,),
+    )
+    assert graded.accepted
+    assert graded.code != "job_controller_barrier"
+    assert graded.validated_facts[OPEN_OBLIGATIONS_FACT] == [SETTLEMENT_JOB]
+
+
 def test_the_undisclosed_job_still_holds_the_gate_barrier():
     orchestrator = SettlementOrchestrator(terminated=False)
 
