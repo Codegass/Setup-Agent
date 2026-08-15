@@ -63,14 +63,18 @@ two campaign conclusions).
 
 ### 2.1 Turn records become first-class
 
-Every model turn seals one `turn_record` in the authoritative layer:
+Every assistant response seals one `turn_record` in the authoritative layer —
+including a response that calls no tool (amendment 2):
 
 - `turn_id` (monotone within the run), `phase`, `iteration`;
 - `window_digest` — component-level references for the EXACT messages array
   sent to the model: system-prompt version hash, history slice refs,
-  observation refs. Bytes are stored once (full_outputs-style store); the
-  turn record carries refs only. This turns "[A] what did the model see"
-  from archaeology into a lookup;
+  observation refs. Bytes are stored once, content-addressed, in a HOST
+  full_outputs-style store beside the ledger (amendment 1); the turn record
+  carries refs only. This turns "[A] what did the model see" from archaeology
+  into a lookup. A turn taken before this run rendered anything carries
+  `window_digest: None` (amendment 3), and a window longer than the record may
+  name is cut with a marker naming the drop (amendment 6);
 - envelope ref for the call, delivered-observation ref, the gate word if
   this turn carried a gate decision (with `decision_id`), token usage
   (in/out), start/end timestamps.
@@ -88,10 +92,31 @@ turn records with `actor: controller` in the same sequence.
    (seatunnel d2r2).
 4. A refused call gets a `tool_result` or an explicit typed refusal record —
    never silence (cassandra, tapestry-5, camel-quarkus seq 124/138/216).
-5. **Conservation fence:** `#loop_decision == #envelope == #(tool_result ∪
-   typed_refusal)`, and the `turn_id` sequence has no holes. Violation is a
-   red test, and the reducer surfaces any live violation as a `warnings[]`
-   entry rather than crashing.
+5. **Conservation fence (as built).** The ledger balances per CALL, with one
+   named exception:
+
+   ```
+   #action_envelope + #forced_action + #refusal_record
+     ==  #tool_result + #refusal_record
+     ==  #loop_decision + #cancelled
+   ```
+
+   A refusal record stands in both of the places its call never reached, which
+   is why it appears on the first two sides. `#cancelled` counts the exception:
+   a call CANCELLED by a batch break — a phase transition applied, a loop-driven
+   close, a live job barrier — dispatched nothing, so it has no envelope and no
+   `tool_result`, and it emits no `loop_decision` either, because the recurrence
+   ladder reads outcomes and this call produced none. Fabricating one would feed
+   the ladder an execution that never happened. Its record is a
+   `refusal_record{refusal_code: CALL_NOT_EXECUTED}` plus the turn it took, and
+   the refusal the model actually read is that turn's `observation_ref`.
+
+   Turn records are counted by NOBODY in this formula. Every assistant response
+   seals one, including a response that called nothing (amendment 2), so the
+   turn sequence is checked for HOLES — `turn_id` monotone by one, spent at
+   seal time — rather than against the call counts. Violation is a red test,
+   and the reducer surfaces any live violation as a `warnings[]` entry rather
+   than crashing.
 
 RunEvidenceState stays engine-written; turn records are sealed by the
 engine only, through the same publication authority as other control
@@ -165,3 +190,59 @@ real sessions in the first increment; Pillar 1 then closes the holes under
 it; Pillar 3 consumes the reducer. Implementation runs under ultracode with
 Opus agents; the Pillar 1 engine contract is decision-gated by the owner
 side.
+
+## 7. Amendments
+
+### 2026-08-15 — Stage B round 2 (owner decisions, as built)
+
+1. **A record's bytes are HOST bytes.** Window components and delivered
+   observations are written to `contexts/full_outputs.jsonl` of the SESSION
+   directory — never through the container-backed output store. They are bytes
+   the engine rendered; the container never had them, and routing them there
+   cost a write plus an index read and rewrite per component, on a window that
+   re-renders every turn. Measured on a 20-turn synthetic run, container-side
+   against host-side: 150 → 0 execs for sealing (7.5/turn → 0), 55,184 → 0
+   bytes of the container's `full_outputs.jsonl`, whole-run container execs
+   362 → 102, `turn_record` ledger growth unchanged at 966 B/turn, host store
+   56,224 B in 65 records for 422 refs named (one record per distinct body).
+   Storage is content-addressed by sha256, so the system prompt is written
+   once per run and an observation already written when it was delivered is
+   referenced by every later window that carries it.
+
+   ONE ref namespace: a session may hold two `full_outputs.jsonl` files — the
+   engine's (host, live) and the container's (recorded under `.setup_agent/` by
+   `--record`) — and the full tier asks every store the session has, because a
+   ref never says which file answers it.
+
+2. **Every assistant response seals a turn record**, thought-only turns
+   included: `envelope_ref: None`, `observation_ref` naming the continuation
+   cue the model read next. Conservation counts CALLS (§2.2 rule 5), so such a
+   turn adds nothing to either side of the fence and breaks nothing.
+
+3. **A turn taken before any model render carries `window_digest: None`**, not
+   sha256 of the empty string: an empty-string hash is a 64-hex prompt identity
+   nobody observed, which resolves to nothing and compares equal across every
+   run that ever sealed one. A controller turn beside a rendered window still
+   names that prompt, with no components.
+
+4. **The row's [C] is what the model READ.** The reducer adopts
+   `turn_record.observation_ref` (the delivered text) as `observation.ref`, and
+   the tool's own `output_ref` moves to `observation.evidence_ref` rather than
+   being dropped. The full tier resolves both copies.
+
+5. **Arming discipline.** The outside-ladder guard in `LoopMemory.observe`
+   runs before any state is read or written, so a call outside the ladder can
+   never disarm `force_break_armed`/`_armed_key`. Membership is by TOOL for
+   `phase`/`manage_context`/`report`, and by the engine's own statement
+   (`LoopEvent.outside_ladder`, recorded in the event so replay re-derives it)
+   for the phase-entry advisor consult — the harness authoring a question
+   between two of the model's calls may not cancel the break the model's own
+   repetition armed. An advisor call the MODEL made is read by the ladder as
+   before.
+
+6. **A window over 2,048 components is cut, never refused.** The record keeps
+   the newest components that fit, in render order, and spends its first slot
+   on a `window_truncated:<n>` marker naming how many older ones it could not
+   name, with a warning-grade log. Sealing runs inside the loop's exception
+   handler, so raising there ended the run — an observability record may never
+   do that (§3).
