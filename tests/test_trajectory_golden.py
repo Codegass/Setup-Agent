@@ -29,10 +29,14 @@ Pillar 1 lands, new sessions stop producing them, and these archived ones keep
 theirs, because the bytes never change.
 """
 
+import csv
+import io
 from pathlib import Path
 
-from sag.trajectory.builder import build_trajectory
-from sag.trajectory.reducer import TrajectoryReducer
+import pytest
+
+from sag.trajectory.builder import build_trajectory, follow_trajectory
+from sag.trajectory.reducer import DeltaAccumulator
 from sag.trajectory.schema import Trajectory
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
@@ -43,19 +47,45 @@ CAMEL_QUARKUS = FIXTURES / "camel-quarkus-d2r3"
 SILENT_CALL_CODES = ("missing_loop_decision", "missing_tool_result")
 
 
-def _tokenless(trajectory: Trajectory) -> dict:
-    """Strip the builder-only token join, leaving the reducer's own output."""
-    document = trajectory.model_dump()
-    for turn in document["turns"]:
-        turn["tokens"] = None
-    return document
+class _EndOfLedger(Exception):
+    """Raised by the injected clock once the archived file is fully replayed."""
 
 
-def _replayed(session_dir: Path) -> TrajectoryReducer:
-    reducer = TrajectoryReducer()
-    for line in (session_dir / "control_events.jsonl").read_text(encoding="utf-8").splitlines():
-        reducer.feed(line)
-    return reducer
+def _accumulated(session_dir: Path, tmp_path: Path, *, chunk: int = 40) -> Trajectory:
+    """Replay an archived ledger THROUGH `follow_trajectory`, folding its deltas.
+
+    The archived bytes are copied into a growing file so the live path — the
+    tail reader, the incremental joins, the warning retractions — is the code
+    actually under test. Hand-feeding the reducer would fence the reducer
+    against itself and leave everything the follower adds unmeasured.
+    """
+    live = tmp_path / session_dir.name
+    live.mkdir(parents=True, exist_ok=True)
+    for artifact in session_dir.iterdir():
+        if artifact.name != "control_events.jsonl":
+            (live / artifact.name).write_bytes(artifact.read_bytes())
+    events = live / "control_events.jsonl"
+    events.write_bytes(b"")
+
+    lines = (session_dir / "control_events.jsonl").read_bytes().split(b"\n")
+    pending = [b"\n".join(lines[i : i + chunk]) + b"\n" for i in range(0, len(lines) - 1, chunk)]
+    accumulator = DeltaAccumulator()
+
+    def fake_sleep(seconds: float) -> None:
+        if not pending:
+            raise _EndOfLedger
+        with events.open("ab") as handle:
+            handle.write(pending.pop(0))
+
+    with pytest.raises(_EndOfLedger):
+        for delta in follow_trajectory(live, poll_seconds=0.01, sleep=fake_sleep):
+            accumulator.feed(delta)
+    return accumulator.snapshot()
+
+
+def _executor_rows(session_dir: Path) -> list[dict]:
+    text = (session_dir / "token_usage.csv").read_text(encoding="utf-8")
+    return [r for r in csv.DictReader(io.StringIO(text)) if r["type"] == "executor"]
 
 
 def test_kafka_d2r3_replays_to_exactly_24_calls():
@@ -142,17 +172,61 @@ def test_a_hole_is_a_warning_and_never_a_lost_turn():
     assert all(t.turn_id == i + 1 for i, t in enumerate(snap.turns))
 
 
-def test_live_accumulation_equals_batch_replay():
-    """The idempotence fence: one fold, whether the lines arrive live or archived."""
+def test_live_accumulation_equals_batch_replay(tmp_path):
+    """The idempotence fence, over the live path: one fold, one document.
+
+    Spec §5 asks that live-accumulated == batch-replayed per session. The
+    comparison is the WHOLE document — turns, phases, annotations, session,
+    warnings — because a fence that stripped the parts the two feeds compute
+    differently would be measuring the parts that never differed.
+    """
     for session_dir in (KAFKA, CAMEL_QUARKUS):
-        batch = build_trajectory(session_dir)
-        assert _tokenless(_replayed(session_dir).snapshot()) == _tokenless(batch)
+        assert _accumulated(session_dir, tmp_path) == build_trajectory(session_dir)
 
 
-def test_the_token_join_is_the_only_thing_batch_replay_adds_here():
-    """`_tokenless` must not be papering over a difference that matters."""
-    batch = build_trajectory(KAFKA)
-    live = _replayed(KAFKA).snapshot()
-    assert any(t.tokens is not None for t in batch.turns)
-    assert all(t.tokens is None for t in live.turns)
-    assert live.warnings == batch.warnings and live.session == batch.session
+def test_the_follow_of_kafka_says_everything_the_replay_says(tmp_path):
+    """The equality above is not two empty documents agreeing."""
+    accumulated = _accumulated(KAFKA, tmp_path)
+    assert len(accumulated.turns) == 24
+    assert [w.code for w in accumulated.warnings].count("missing_loop_decision") == 10
+    assert any(t.tokens is not None for t in accumulated.turns)
+    assert accumulated.session.run_id.endswith("b9b1b06dfff3")
+
+
+def test_an_executor_row_bills_exactly_one_turn():
+    """Tokens are a bill, and a bill is paid once.
+
+    `iteration` is not a turn key: one model response can open several turns
+    (kafka bills iterations 1, 3 and 6 for two calls each), and copying the
+    row into every turn that carries the iteration invented spend the run never
+    paid. The row bills the FIRST model turn of its iteration — the turn that
+    response opened — and the siblings ride along unbilled.
+    """
+    snap = build_trajectory(KAFKA)
+    billed = [t for t in snap.turns if t.tokens is not None]
+    iterations = [t.iteration for t in billed]
+    joined = [r for r in _executor_rows(KAFKA) if int(r["iteration"]) in set(iterations)]
+
+    assert iterations == sorted(set(iterations))  # no iteration billed twice
+    assert sum(t.tokens.input for t in billed) == sum(int(r["prompt_tokens"]) for r in joined)
+    assert sum(t.tokens.output for t in billed) == sum(int(r["completion_tokens"]) for r in joined)
+    assert all(t.actor == "model" for t in billed)
+    assert len(billed) == 11  # 24 calls, 19 executor rows, 11 that join a model turn
+
+
+def test_the_executor_rows_that_bill_nobody_are_counted_out_loud():
+    """42% of kafka's rows join no turn; silence about that is a lie by omission.
+
+    Every unattributed row is a call the ledger left silent — the ten phase and
+    advisor calls that emit no `loop_decision`. Until Pillar 1 closes that hole
+    the spend is real and unattributable, and the trajectory says so rather than
+    presenting a token total that quietly omits a third of the run.
+    """
+    snap = build_trajectory(KAFKA)
+    unattributed = [w for w in snap.warnings if w.code == "tokens_unattributed"]
+    billed_iterations = {t.iteration for t in snap.turns if t.tokens is not None}
+    orphans = [r for r in _executor_rows(KAFKA) if int(r["iteration"]) not in billed_iterations]
+
+    assert len(unattributed) == 1
+    assert str(len(orphans)) in unattributed[0].detail
+    assert len(orphans) == 8 and len(_executor_rows(KAFKA)) == 19

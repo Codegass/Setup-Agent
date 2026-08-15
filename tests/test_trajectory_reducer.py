@@ -13,7 +13,7 @@ wrote; nothing here is invented.
 
 import pytest
 
-from sag.trajectory.reducer import TrajectoryReducer
+from sag.trajectory.reducer import DeltaAccumulator, TrajectoryReducer
 
 # Sequences 3, 4 and 6 — one clone call: its envelope, its result, its decision.
 # Note the order the engine actually writes: the envelope opens the call, the
@@ -164,16 +164,46 @@ def test_a_refused_call_does_not_swallow_the_retry_that_followed_it():
     }
 
 
-def test_a_decision_with_no_result_seals_a_warning_when_the_next_turn_opens():
+def test_a_decision_with_no_result_states_its_holes_the_moment_it_opens():
+    """A hole is a statement about the ledger as it stands, not as it ends.
+
+    Waiting for the next turn to open is what made the LAST open turn's holes
+    unsayable in a live follow — the run's most interesting turn is exactly the
+    one still running. So the claim is made immediately and withdrawn if the
+    missing piece arrives.
+    """
     first, second = _lines(REAL_TWO_DECISIONS_JSONL)
     r = TrajectoryReducer()
     opened = r.feed(first)
-    assert opened.warnings == []  # nothing is missing until the turn is over
+    assert {(w.code, w.control_seq, w.turn_id) for w in opened.warnings} == {
+        ("missing_envelope", 6, 1),
+        ("missing_tool_result", 6, 1),
+    }
     sealed = r.feed(second)
-    codes = {w.code for w in sealed.warnings}
-    assert codes == {"missing_envelope", "missing_tool_result"}
-    assert all(w.control_seq == 6 for w in sealed.warnings)
+    assert {(w.code, w.turn_id) for w in sealed.warnings} == {
+        ("missing_envelope", 2),
+        ("missing_tool_result", 2),
+    }
+    assert sealed.retracted_warnings == []  # turn 1's holes are still holes
     assert len(r.snapshot().turns) == 2
+
+
+def test_a_hole_that_fills_is_retracted_and_never_survives_in_the_accumulation():
+    """The delta protocol: a statement is added when true, withdrawn when not."""
+    envelope, result, decision = REAL_TRIPLE
+    r = TrajectoryReducer()
+
+    opened = r.feed(envelope)
+    assert {w.code for w in opened.warnings} == {"missing_tool_result", "missing_loop_decision"}
+    assert opened.retracted_warnings == []
+
+    answered = r.feed(result)
+    assert answered.warnings == []
+    assert {w.code for w in answered.retracted_warnings} == {"missing_tool_result"}
+
+    decided = r.feed(decision)
+    assert {w.code for w in decided.retracted_warnings} == {"missing_loop_decision"}
+    assert r.snapshot().warnings == []
 
 
 def test_an_unknown_kind_is_a_warning_never_an_exception():
@@ -235,6 +265,60 @@ def test_a_phase_transition_bands_the_phases():
     assert phases[1].termination is None and phases[1].gates == []
 
 
+def test_a_phase_named_again_after_it_closed_reuses_its_band():
+    """Only a transition opens a segment; a stray later mention joins the old one.
+
+    After `provision` closes, the ledger keeps naming it — a late `loop_decision`
+    for a call made before the transition, for instance. Appending a second
+    `provision` band for that would put the run in two places at once and hand
+    the timeline a phantom segment to draw. Bands are contiguous segments of the
+    run, so the late mention attaches to the segment that already exists.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL):  # ends by transitioning to analyze
+        r.feed(line)
+    r.feed(REAL_TRIPLE[2])  # a loop_decision naming phase "provision", after it closed
+
+    phases = r.snapshot().phases
+    assert [p.name for p in phases] == ["provision", "analyze"]
+    assert phases[0].termination == "advance"  # the late mention does not un-close it
+
+
+def test_a_transition_closes_the_phase_the_run_is_in_not_the_last_band_appended():
+    """A gate naming a phase the run has not reached must not steal the closure.
+
+    `gate_decision` bands the phase it graded, which can be a phase no turn has
+    entered. When the closing transition then arrived, terminating "whatever
+    band was appended last" wrote the termination onto that stranger and left
+    the phase actually being left open forever.
+    """
+    stray_gate = _lines(REAL_SILENT_PHASE_CALL_JSONL)[3].replace(
+        '"phase":"provision"', '"phase":"build"'
+    )
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:  # the run is in provision
+        r.feed(line)
+    r.feed(stray_gate)  # a gate grading "build", which nothing has entered
+    r.feed(_lines(REAL_SILENT_PHASE_CALL_JSONL)[4])  # advance -> analyze
+
+    bands = {p.name: p.termination for p in r.snapshot().phases}
+    assert bands["provision"] == "advance"  # the phase the run was actually in
+    assert bands["build"] is None  # the stranger keeps its own (absent) ending
+
+
+def test_a_naive_timestamp_is_read_as_utc_instead_of_raising():
+    """Ledgers mix aware and naive stamps; a wall clock is not allowed to crash."""
+    bound = (
+        '{"event_id":"control-000001","kind":"evidence_store_bound","payload":'
+        '{"run_id":"r-1","store_identity":"docker:abc"},"sequence":1,'
+        '"source":null,"timestamp":"%s"}'
+    )
+    r = TrajectoryReducer()
+    r.feed(bound % "2026-08-14T11:28:33.753666")  # naive
+    r.feed(bound % "2026-08-14T11:29:33.753666Z")  # aware
+    assert r.snapshot().session.wall_clock_seconds == 60.0
+
+
 def test_a_forced_action_opens_a_controller_turn():
     r = TrajectoryReducer()
     for line in _lines(REAL_FORCED_ACTION_JSONL):
@@ -267,23 +351,44 @@ def test_the_store_binding_names_the_run():
         '"source":null,"timestamp":"2026-08-14T11:28:33.753666Z"}'
     )
     assert delta.warnings == []
-    assert delta.session_patch == {"run_id": "r-1"}
+    assert delta.session_patch == {"run_id": "r-1", "wall_clock_seconds": 0.0}
     assert r.snapshot().session.run_id == "r-1"
 
 
-def test_accumulated_deltas_reproduce_the_snapshot():
-    """Upserting delta turns by turn_id is the same fold as snapshotting."""
+def test_accumulated_deltas_reproduce_the_snapshot_exactly():
+    """The delta stream is the snapshot, told one event at a time.
+
+    Not "the same turns" — the SAME DOCUMENT: turns, phases, annotations,
+    session, and the warnings, which are the part that used to drift because a
+    turn's holes only shipped when the next turn opened.
+    """
     r = TrajectoryReducer()
-    accumulated: dict[int, object] = {}
+    accumulator = DeltaAccumulator()
     for block in (REAL_TRIPLE_JSONL, REAL_FAILED_CALL_JSONL, REAL_SILENT_PHASE_CALL_JSONL):
         for line in _lines(block):
-            for turn in r.feed(line).turns:
-                accumulated[turn.turn_id] = turn
-    snap = r.snapshot()
-    assert [accumulated[t.turn_id] for t in snap.turns] == snap.turns
+            accumulator.feed(r.feed(line))
+    assert accumulator.snapshot() == r.snapshot()
 
 
-def test_the_detail_tier_is_summary_or_full_and_nothing_else():
-    assert TrajectoryReducer(detail="full").detail == "full"
-    with pytest.raises(ValueError):
-        TrajectoryReducer(detail="verbose")
+def test_the_last_open_turn_ships_its_holes_like_every_other_turn():
+    """The turn still running is the one a live watcher most needs stated."""
+    r = TrajectoryReducer()
+    accumulator = DeltaAccumulator()
+    for line in _lines(REAL_TRIPLE_JSONL) + [_lines(REAL_FAILED_CALL_JSONL)[0]]:
+        accumulator.feed(r.feed(line))
+    assert [(w.code, w.turn_id) for w in accumulator.snapshot().warnings] == [
+        ("missing_loop_decision", 2),
+        ("missing_tool_result", 2),
+    ]
+    assert accumulator.snapshot() == r.snapshot()
+
+
+def test_the_reducer_has_no_detail_tier():
+    """Tiers are a reader's concern; the fold is the same either way.
+
+    `detail` selects how much a CONSUMER is handed (spec §3) — the builder
+    resolves bytes, the CLI names the tier. The reducer never resolved a ref in
+    its life, so carrying the word only invited a caller to believe it did.
+    """
+    with pytest.raises(TypeError):
+        TrajectoryReducer(detail="full")

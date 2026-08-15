@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 
 from sag.trajectory.builder import build_trajectory, follow_trajectory
-from test_trajectory_reducer import REAL_FAILED_CALL_JSONL, REAL_TRIPLE_JSONL
+from sag.trajectory.reducer import DeltaAccumulator
+from test_trajectory_reducer import (
+    REAL_FAILED_CALL_JSONL,
+    REAL_FORCED_ACTION_JSONL,
+    REAL_TRIPLE_JSONL,
+    REAL_TWO_DECISIONS_JSONL,
+)
 
 # The real header of `token_usage.csv`, with this run's first two executor rows.
 REAL_TOKEN_CSV = (
@@ -66,6 +72,43 @@ def test_only_executor_rows_may_claim_a_turns_tokens(tmp_path):
     )
     snap = build_trajectory(_session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=tokens))
     assert snap.turns[0].tokens.input == 4134
+
+
+def test_two_calls_from_one_model_response_are_billed_once_between_them(tmp_path):
+    """`iteration` counts model responses, not turns; the bill follows the response.
+
+    Both decisions below carry iteration 1 — one response, two calls. Copying
+    the row onto both turns doubles spend that was charged once.
+    """
+    events = "\n".join(_lines(REAL_TWO_DECISIONS_JSONL)) + "\n"
+    snap = build_trajectory(_session(tmp_path, events=events, tokens=REAL_TOKEN_CSV))
+
+    assert [t.iteration for t in snap.turns] == [1, 1]
+    assert snap.turns[0].tokens.input == 4134
+    assert snap.turns[1].tokens is None
+    assert [w.detail for w in snap.warnings if w.code == "tokens_unattributed"] == [
+        "1 executor row(s) bill no turn: iteration(s) 2"
+    ]
+
+
+def test_a_controller_turn_is_never_billed_for_a_response_the_model_did_not_make(tmp_path):
+    """A forced action is the harness moving; the model was not charged for it.
+
+    The forced turn below carries iteration 13 — the controller's decision names
+    the loop it interrupted — so an iteration-keyed join would hand it the
+    model's bill for that response.
+    """
+    tokens = (
+        "iteration,timestamp,type,tool_name,model,total_tokens,prompt_tokens,"
+        "completion_tokens,reasoning_tokens,actual_output_tokens\n"
+        "13,2026-08-14T00:31:44.000000,executor,project,gpt-5.4-mini,7985,7868,117,0,117\n"
+    )
+    events = "\n".join(_lines(REAL_FORCED_ACTION_JSONL)) + "\n"
+    snap = build_trajectory(_session(tmp_path, events=events, tokens=tokens))
+
+    assert [t.actor for t in snap.turns] == ["controller"]
+    assert snap.turns[0].iteration == 13 and snap.turns[0].tokens is None
+    assert [w.code for w in snap.warnings] == ["tokens_unattributed"]
 
 
 def test_a_turn_whose_iteration_never_billed_carries_no_tokens(tmp_path):
@@ -200,3 +243,107 @@ def test_follow_carries_the_tokens_batch_replay_would_have_joined(tmp_path):
 def test_the_detail_tier_is_checked_before_any_file_is_opened(tmp_path):
     with pytest.raises(ValueError):
         build_trajectory(_session(tmp_path, events=""), detail="verbose")
+
+
+def _accumulate(session_dir: Path, pending: list[str], **kwargs):
+    """Follow a session that grows one line per poll, and fold what it yields."""
+    events = session_dir / "control_events.jsonl"
+    accumulator = DeltaAccumulator()
+
+    def fake_sleep(seconds: float) -> None:
+        if not pending:
+            raise _NoMoreLines
+        with events.open("a", encoding="utf-8") as handle:
+            handle.write(pending.pop(0))
+
+    with pytest.raises(_NoMoreLines):
+        for delta in follow_trajectory(session_dir, poll_seconds=0.01, sleep=fake_sleep, **kwargs):
+            accumulator.feed(delta)
+    return accumulator.snapshot()
+
+
+def test_the_accumulated_follow_is_the_batch_replay_document(tmp_path):
+    """Not "the same turns": the same document, warnings and all.
+
+    Live and post-hoc are one fold (spec §1), so a watcher who folds every
+    delta must end holding exactly what a replay of the finished file produces.
+    Anything the follow cannot say — a hole in the turn still open, a token row
+    that billed nobody — is a claim the batch view makes and the live view does
+    not, which is two derivations wearing one name.
+    """
+    session_dir = _session(tmp_path, events="", tokens=REAL_TOKEN_CSV)
+    accumulated = _accumulate(session_dir, [line + "\n" for line in EVENT_LINES])
+    assert accumulated == build_trajectory(session_dir)
+
+
+def test_the_accumulated_follow_states_the_holes_of_the_turn_still_open(tmp_path):
+    """The half-told turn at the tail is the live view's whole point."""
+    session_dir = _session(tmp_path, events="", tokens=REAL_TOKEN_CSV)
+    accumulated = _accumulate(session_dir, [EVENT_LINES[0] + "\n", EVENT_LINES[3] + "\n"])
+    assert {(w.code, w.turn_id, w.control_seq) for w in accumulated.warnings} == {
+        ("missing_loop_decision", 1, 3),
+        ("missing_tool_result", 1, 3),
+        ("missing_loop_decision", 2, 11),
+        ("missing_tool_result", 2, 11),
+        # neither call reported back, so neither response's spend has an owner
+        ("tokens_unattributed", None, None),
+    }
+    assert accumulated == build_trajectory(session_dir)
+
+
+def test_batch_withholds_a_torn_tail_exactly_as_follow_does(tmp_path):
+    """A line without its newline is a line still being written, in both feeds.
+
+    This is the one case that only happens live, so it is the one case the two
+    feeds must not disagree on: batch read the fragment as an event and called
+    it malformed, while follow — correctly — waited for the newline.
+    """
+    torn = "\n".join(EVENT_LINES) + "\n" + EVENT_LINES[0][:200]
+    session_dir = _session(tmp_path, events=torn, tokens=REAL_TOKEN_CSV)
+
+    snap = build_trajectory(session_dir)
+    assert [w.code for w in snap.warnings if w.code == "malformed_event_line"] == []
+    assert len(snap.turns) == 2
+
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    live_dir = _session(live_root, events="", tokens=REAL_TOKEN_CSV)
+    assert _accumulate(live_dir, [torn]).turns == snap.turns
+
+
+def test_an_output_store_written_after_the_follow_started_still_resolves(tmp_path):
+    """A live session writes its bytes as it goes; one absent look is not forever.
+
+    Attaching to a session before `contexts/full_outputs.jsonl` exists is the
+    normal way to watch a run start. Remembering "no store" from that first look
+    meant the full tier resolved nothing for the rest of the session.
+    """
+    from test_trajectory_cli import REAL_FULL_OUTPUT_RECORD
+
+    session_dir = _session(tmp_path, events="", tokens=REAL_TOKEN_CSV)
+    contexts = session_dir / ".setup_agent" / "contexts"
+    events = session_dir / "control_events.jsonl"
+    pending = [line + "\n" for line in EVENT_LINES[:3]]
+    accumulator = DeltaAccumulator()
+
+    def fake_sleep(seconds: float) -> None:
+        if not pending:
+            raise _NoMoreLines
+        if not contexts.exists() and len(pending) == 1:  # the store lands mid-run
+            contexts.mkdir(parents=True)
+            (contexts / "full_outputs.jsonl").write_text(
+                REAL_FULL_OUTPUT_RECORD + "\n", encoding="utf-8"
+            )
+        with events.open("a", encoding="utf-8") as handle:
+            handle.write(pending.pop(0))
+
+    with pytest.raises(_NoMoreLines):
+        for delta in follow_trajectory(
+            session_dir, detail="full", poll_seconds=0.01, sleep=fake_sleep
+        ):
+            accumulator.feed(delta)
+
+    snapshot = accumulator.snapshot()
+    assert snapshot.outputs["output_6163859b019d"].startswith("✅ Repository cloned")
+    assert [w.code for w in snapshot.warnings if w.code == "missing_output_store"] == []
+    assert snapshot == build_trajectory(session_dir, detail="full")

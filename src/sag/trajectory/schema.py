@@ -133,17 +133,48 @@ class Warning(_TrajectoryModel):  # noqa: A001 - the schema's own word for a hol
 
     Warnings are how the derivation stays honest about pre-closure sessions:
     the reducer states the gap and keeps folding, and never raises.
+
+    A warning is a STATEMENT about the ledger as it stands, so it is frozen and
+    compared by value: the same hole stated twice is one hole, and a hole that
+    fills is withdrawn (`TrajectoryDelta.retracted_warnings`) rather than
+    edited. `turn_id` names the turn the statement is about, when it is about a
+    turn; a statement about one line carries `control_seq` instead, and one
+    about the run as a whole carries neither.
     """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     code: str
     detail: str
     control_seq: int | None = None
+    turn_id: int | None = None
+
+
+def warning_order(warning: Warning) -> tuple[Any, ...]:
+    """The one order warnings are listed in, wherever they are assembled.
+
+    Batch replay sorts a list it built in one pass; a live consumer sorts a set
+    it accumulated over a session of additions and retractions. The two can only
+    be compared if the order is TOTAL — a key that leaves ties would let the same
+    set of statements render as two different documents.
+    """
+    return (
+        warning.control_seq is None,
+        warning.control_seq or 0,
+        warning.turn_id is None,
+        warning.turn_id or 0,
+        warning.code,
+        warning.detail,
+    )
 
 
 class Trajectory(_TrajectoryModel):
     """The whole derived view of one session at one moment."""
 
-    schema_version: int = SCHEMA_VERSION
+    #: Pinned, not merely defaulted: a document claiming a version this code does
+    #: not implement must fail loudly instead of being read for the fields that
+    #: happen to overlap.
+    schema_version: Literal[1] = SCHEMA_VERSION
     session: SessionInfo
     phases: list[PhaseInfo] = Field(default_factory=list)
     turns: list[Turn] = Field(default_factory=list)
@@ -159,15 +190,30 @@ class Trajectory(_TrajectoryModel):
 class TrajectoryDelta(_TrajectoryModel):
     """What one fed event changed.
 
-    `turns` carries the full current state of every turn the event touched;
-    consumers upsert by `turn_id`. Accumulating deltas that way reproduces the
-    snapshot exactly — which is what makes live follow and batch replay the
-    same fold.
+    Accumulating every delta of a session reproduces `Trajectory` EXACTLY —
+    that is the contract, and `sag.trajectory.reducer.DeltaAccumulator` is its
+    reference implementation. Four accumulation rules, one per field:
+
+    - `turns` carries the full current state of every turn the event touched;
+      consumers upsert by `turn_id`.
+    - `annotations` are appended; an annotation is a fact about an event that
+      already happened, and facts do not change their minds.
+    - `warnings` are ADDED to the set of statements currently held, and
+      `retracted_warnings` are removed from it. A hole is claimed the moment it
+      is true — including on the turn still open, which is the one a live
+      watcher most needs stated — and withdrawn when the missing piece arrives.
+      Statements are compared by value, so restating one changes nothing.
+    - `phases` is the complete banding whenever any band changed, and `None`
+      when it did not; the list is small and wholly restated rather than
+      diffed.
+    - `session_patch` carries only the session fields whose value changed.
     """
 
     turns: list[Turn] = Field(default_factory=list)
+    phases: list[PhaseInfo] | None = None
     annotations: list[Annotation] = Field(default_factory=list)
     warnings: list[Warning] = Field(default_factory=list)
+    retracted_warnings: list[Warning] = Field(default_factory=list)
     session_patch: dict[str, Any] = Field(default_factory=dict)
     #: The full tier's bytes for the refs THIS delta's turns name, on the same
     #: terms as `Trajectory.outputs`. A follower that upserts turns by id can
@@ -192,4 +238,5 @@ __all__ = [
     "TrajectoryDelta",
     "Turn",
     "Warning",
+    "warning_order",
 ]
