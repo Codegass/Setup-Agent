@@ -1559,6 +1559,68 @@ class ReActEngine(UIEventEmitter):
                 )
                 state.record_conflict(f"job_live_at_close:{job_id}")
 
+    #: One heartbeat in this many otherwise-identical waits (~5 minutes at the
+    #: 30s cadence). A bound on the record, never on the poll.
+    _BARRIER_WAIT_EVERY = 10
+
+    def _record_job_barrier_waits(
+        self,
+        job_ids: Sequence[str],
+        *,
+        progress_states: Dict[str, Dict[str, Any]],
+        job_records: Mapping[str, Mapping[str, Any]],
+        remaining: float,
+        observed_at: float,
+    ) -> None:
+        """Give the wait a voice in the authoritative stream (task #53).
+
+        p7d camel's controller polled 160 times over 5,033.9s and wrote nothing:
+        every job kind on this path is exceptional, so forensics had to read
+        console logs to learn the barrier had run at all — and the shape of the
+        hang (a log frozen at 186,675,667 bytes, one 10ms CPU tick every few
+        probes) was legible nowhere while it was happening.
+
+        Bounded, so 160 identical probes are not 160 rows: the first wait for a
+        job, any wait whose physical observation changed, and one in every
+        `_BARRIER_WAIT_EVERY` after that. It concludes nothing and ends nothing
+        — `_emit_control_event` swallows a sink failure for this kind, because
+        observability never ends a run.
+        """
+        for job_id in job_ids:
+            state = progress_states.setdefault(job_id, {})
+            waits = int(state.get("waits") or 0) + 1
+            state["waits"] = waits
+            state.setdefault("first_wait_at", observed_at)
+            snapshot = state.get("snapshot")
+            snapshot = snapshot if isinstance(snapshot, JobProgressSnapshot) else None
+            digest = canonical_sha256(snapshot.as_dict() if snapshot is not None else {})
+            changed = digest != state.get("wait_digest")
+            state["wait_digest"] = digest
+            if not (changed or waits % self._BARRIER_WAIT_EVERY == 1):
+                continue
+            record = job_records.get(job_id) or {}
+            payload = {
+                "job_id": job_id,
+                "obligation_ref": (
+                    "unpersisted"
+                    if record.get("_ephemeral") is True
+                    else f"{OBLIGATION_DIR}/{job_id}.json"
+                ),
+                "waits": waits,
+                "waited_seconds": max(int(observed_at - float(state["first_wait_at"])), 0),
+                "remaining_seconds": max(int(remaining), 0),
+                # An unobserved wait says so rather than borrowing the last
+                # snapshot's state: a schema-v1 obligation has no diagnostic
+                # identity and this row must not imply one.
+                "process_state": snapshot.process_state if snapshot is not None else "unobserved",
+                "log_size": snapshot.log_size if snapshot is not None else 0,
+                "cpu_ticks_delta": snapshot.cpu_ticks_delta if snapshot is not None else 0,
+                "artifact_sha256": snapshot.artifact_sha256 if snapshot is not None else "",
+                "report_sha256": snapshot.report_sha256 if snapshot is not None else "",
+                "progressing": state.get("last_progress_at") == observed_at,
+            }
+            self._emit_control_event("job_barrier_wait", payload)
+
     def _record_job_barrier_integrity_failure(self, failures: Sequence[str]) -> None:
         """Persist the controller failure in the same shape replay rebuilds."""
         normalized = tuple(
@@ -2010,6 +2072,13 @@ class ReActEngine(UIEventEmitter):
             logger.info(
                 f"controller job barrier waiting for {', '.join(running)}: "
                 f"{remaining:.0f}s remain before the report reserve"
+            )
+            self._record_job_barrier_waits(
+                running,
+                progress_states=progress_states,
+                job_records=job_records,
+                remaining=remaining,
+                observed_at=observed_at,
             )
             sleep(min(self._OBLIGATION_POLL_SECONDS, remaining))
 

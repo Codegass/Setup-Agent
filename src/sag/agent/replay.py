@@ -163,6 +163,13 @@ _POST_CLOSE_PUBLICATION_KINDS = frozenset({"run_pin", "report_metrics"})
 #: `unsupported event kind` on an honest ledger: an integrity-family abort on
 #: every post-closure session that sealed a turn or refused a call.
 _DERIVED_RECORD_KINDS = frozenset({"turn_record", "refusal_record"})
+#: Bounded observations of a wait in progress (task #53). A heartbeat states
+#: what the controller SAW while it was still waiting; it decides nothing, and
+#: the lifecycle words that do decide (`job_settled`, `job_terminal_observed`,
+#: `job_live_at_close`) are walked in their own branches. A walk that raised on
+#: it would turn observability into an integrity-family abort — exactly the
+#: inversion "observability never ends a run" forbids.
+_OBSERVATION_RECORD_KINDS = frozenset({"job_barrier_wait"})
 
 
 def _observe_evidence_publication(
@@ -2311,6 +2318,12 @@ class ControlReplayRunner:
                     # invalidates a transcript that is otherwise exact. Both
                     # payloads are already validated by `ControlEvent`, and
                     # their bytes still enter the produced digest below.
+                    pass
+                elif event.kind in _OBSERVATION_RECORD_KINDS:
+                    # A wait in progress. It moves no lifecycle state — the job
+                    # it names is still exactly as open as the last decision
+                    # left it — and its bytes still enter the produced digest,
+                    # so the record is verified without being re-derived.
                     pass
                 else:  # pragma: no cover - ControlEvent validation owns this
                     raise ReplayValidationError(f"unsupported event kind: {event.kind}")

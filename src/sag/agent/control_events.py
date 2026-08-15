@@ -130,6 +130,10 @@ CONTROL_EVENT_KINDS = (
     # Spec 2026-08-14 §2.2 rule 4: a call that never reached a tool says so.
     # Appended for the same positional reason.
     "refusal_record",
+    # Task #53: the controller barrier's own voice. Every other job kind on the
+    # barrier path is exceptional, so a run that waited 5,033.9s across 160
+    # probes wrote nothing at all. Appended for the same positional reason.
+    "job_barrier_wait",
 )
 ControlEventKind = Literal[
     "planner_response",
@@ -157,6 +161,7 @@ ControlEventKind = Literal[
     "gate_outcome_revised",
     "turn_record",
     "refusal_record",
+    "job_barrier_wait",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -1279,6 +1284,29 @@ class JobLiveAtClosePayload(_StrictPayload):
     close_reason: str = Field(min_length=1)
 
 
+class JobBarrierWaitPayload(_StrictPayload):
+    """One bounded heartbeat from the controller-owned wait.
+
+    It states what the barrier saw and how much of its own budget is left, and
+    it concludes nothing: a wait is not a diagnosis. `progressing` is the
+    controller's own progress predicate for THIS observation, carried so a
+    frozen log with a live CPU tick is legible in the stream while it happens
+    rather than only in a post-mortem.
+    """
+
+    job_id: str = Field(min_length=1)
+    obligation_ref: str = Field(min_length=1)
+    waits: int = Field(ge=1)
+    waited_seconds: int = Field(ge=0)
+    remaining_seconds: int = Field(ge=0)
+    process_state: str = Field(min_length=1)
+    log_size: int = Field(ge=0)
+    cpu_ticks_delta: int = Field(ge=0)
+    artifact_sha256: str = ""
+    report_sha256: str = ""
+    progressing: bool = False
+
+
 class JobBarrierIntegrityFailurePayload(_StrictPayload):
     """Bounded controller failures that prevented safe barrier reconciliation."""
 
@@ -1394,6 +1422,7 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "job_terminal_unpersisted": JobTerminalUnpersistedPayload,
     "job_live_at_close": JobLiveAtClosePayload,
     "job_barrier_integrity_failure": JobBarrierIntegrityFailurePayload,
+    "job_barrier_wait": JobBarrierWaitPayload,
     "completion_claim_decision": CompletionClaimDecisionPayload,
     "job_stall_observed": JobStallObservedPayload,
     "evidence_publication": EvidencePublicationPayload,

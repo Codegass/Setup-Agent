@@ -79,7 +79,8 @@ def test_turn_record_is_appended_to_the_vocabulary_never_inserted():
     assert CONTROL_EVENT_KINDS[22] == "gate_outcome_revised"
     assert CONTROL_EVENT_KINDS[23] == "turn_record"
     assert CONTROL_EVENT_KINDS[24] == "refusal_record"
-    assert len(CONTROL_EVENT_KINDS) == 25
+    assert CONTROL_EVENT_KINDS[25] == "job_barrier_wait"
+    assert len(CONTROL_EVENT_KINDS) == 26
 
 
 def test_a_sealed_turn_states_what_it_saw_said_and_heard():

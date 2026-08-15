@@ -311,7 +311,8 @@ def test_the_ledger_says_which_calls_the_ladder_was_never_going_to_count(closed_
 def test_the_refusal_kind_is_appended_to_the_vocabulary_never_inserted():
     assert CONTROL_EVENT_KINDS[23] == "turn_record"
     assert CONTROL_EVENT_KINDS[24] == "refusal_record"
-    assert len(CONTROL_EVENT_KINDS) == 25
+    assert CONTROL_EVENT_KINDS[25] == "job_barrier_wait"
+    assert len(CONTROL_EVENT_KINDS) == 26
 
 
 def test_a_refusal_states_the_call_it_refused():
