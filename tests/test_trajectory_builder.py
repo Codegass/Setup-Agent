@@ -6,6 +6,7 @@ header and first rows. Batch replay and tail-follow are asserted to produce the
 same turns, which is the idempotence fence of spec §5 in seed form.
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,13 @@ from test_trajectory_reducer import (
     REAL_FORCED_ACTION_JSONL,
     REAL_TRIPLE_JSONL,
     REAL_TWO_DECISIONS_JSONL,
+)
+
+#: root reads a mode-000 file regardless of its mode, so the permission fences
+#: below have nothing to measure when the suite runs as root.
+not_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a mode-000 file is readable by root, so there is no unreadable ledger to fence",
 )
 
 # The real header of `token_usage.csv`, with this run's first two executor rows.
@@ -189,6 +197,43 @@ def test_an_unreadable_token_ledger_is_a_warning_not_a_crash(tmp_path):
     snap = build_trajectory(session_dir)
     assert [w.code for w in snap.warnings] == ["token_usage_unreadable"]
     assert len(snap.turns) == 2 and snap.turns[0].tokens is None
+
+
+@not_root
+def test_a_ledger_that_cannot_be_read_is_a_warning_not_an_empty_document(tmp_path):
+    """A ledger the reader may not open is not a run that did nothing.
+
+    Swallowing the `OSError` and returning no lines produced a trajectory
+    indistinguishable from a session that never called a tool — zero turns, no
+    warnings, and a document a consumer would have every right to believe. The
+    file is right there and full of events; what is missing is permission, so
+    the derivation says which errno stopped it and keeps its "0 turns" honest.
+    """
+    session_dir = _session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=REAL_TOKEN_CSV)
+    (session_dir / "control_events.jsonl").chmod(0o000)
+
+    snap = build_trajectory(session_dir)
+
+    assert snap.turns == []
+    unreadable = [w for w in snap.warnings if w.code == "ledger_unreadable"]
+    assert len(unreadable) == 1
+    assert "errno 13" in unreadable[0].detail  # EACCES, named rather than implied
+    # the ledger is present, so this is not the "not written yet" state
+    assert [w.code for w in snap.warnings if w.code == "missing_control_events"] == []
+
+
+@not_root
+def test_a_follower_that_cannot_read_the_ledger_says_the_same_thing(tmp_path):
+    """Both feeds state the same hole, or the live view is a second derivation."""
+    session_dir = _session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=REAL_TOKEN_CSV)
+    (session_dir / "control_events.jsonl").chmod(0o000)
+    accumulated = _accumulate(session_dir, [])
+
+    assert accumulated.turns == []
+    assert [w.code for w in accumulated.warnings if w.code == "ledger_unreadable"] == [
+        "ledger_unreadable"
+    ]
+    assert accumulated == build_trajectory(session_dir)
 
 
 def test_a_missing_session_directory_is_an_error_not_an_empty_trajectory(tmp_path):
@@ -466,6 +511,35 @@ def test_a_follow_withholds_a_torn_tail_while_live_and_states_it_when_finalized(
     assert [w.code for w in final.warnings] == ["ledger_tail_torn"]
     accumulator.feed(final)
     assert accumulator.snapshot() == build_trajectory(session_dir)
+
+
+def test_closing_a_follow_twice_states_the_torn_tail_once(tmp_path):
+    """`close()` is idempotent, because a statement made twice is two statements.
+
+    A caller that closes in a `finally` and again on the way out — or a CLI that
+    closes the stream it also broke out of — would otherwise be handed the torn
+    tail a second time and print it twice. Warnings are compared by value, so a
+    folding consumer survives that; a consumer printing one delta per line does
+    not, and the ledger did not end mid-line twice.
+    """
+    whole = "\n".join(EVENT_LINES) + "\n"
+    session_dir = _session(tmp_path, events="", tokens=REAL_TOKEN_CSV)
+    events = session_dir / "control_events.jsonl"
+    pending = [whole + EVENT_LINES[0][:200]]
+
+    def fake_sleep(seconds: float) -> None:
+        if not pending:
+            raise _NoMoreLines
+        events.write_text(pending.pop(0), encoding="utf-8")
+
+    follow = follow_trajectory(session_dir, poll_seconds=0.01, sleep=fake_sleep)
+    with pytest.raises(_NoMoreLines):
+        for _ in follow:
+            pass
+
+    first = follow.close()
+    assert [w.code for w in first.warnings] == ["ledger_tail_torn"]
+    assert follow.close() is None
 
 
 def test_a_follow_that_ends_on_a_whole_ledger_has_nothing_left_to_say(tmp_path):

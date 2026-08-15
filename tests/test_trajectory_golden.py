@@ -66,6 +66,7 @@ def _accumulated(
     *,
     chunk: int = 40,
     withheld: tuple[str, ...] = (),
+    detail: str = "summary",
 ) -> Trajectory:
     """Replay an archived ledger THROUGH `follow_trajectory`, folding its deltas.
 
@@ -104,7 +105,7 @@ def _accumulated(
             raise _EndOfLedger
 
     with pytest.raises(_EndOfLedger):
-        for delta in follow_trajectory(live, poll_seconds=0.01, sleep=fake_sleep):
+        for delta in follow_trajectory(live, detail=detail, poll_seconds=0.01, sleep=fake_sleep):
             accumulator.feed(delta)
     return accumulator.snapshot()
 
@@ -343,6 +344,60 @@ def test_ignites_forced_dispatch_is_a_controller_turn_on_the_record():
         "source_attempt_id": "test-1",
     }
     assert len(snap.turns) == 35  # slice census: 34 action_envelope + 1 forced_action
+
+
+def test_ignites_job_ref_is_declared_out_of_store_instead_of_silently_absent():
+    """`job:2c4d56b2fdca` is a real ref that `full_outputs.jsonl` has never held.
+
+    The forced dispatch at seq 235 returned a detached job, and its observation
+    ref is the job handle — `job:`-prefixed, not `output_`-prefixed. The full
+    tier resolves output-store refs, so this one resolves to nothing, and the
+    ref filter used to drop it before the resolver ever saw it. A reader
+    expanding that row then got a turn whose observation names a ref and an
+    `outputs` map that does not mention it, with nothing anywhere saying why.
+
+    The rule is stated instead: a ref the output store was never asked to hold
+    is declared out-of-store, by name, and the resolver is left alone.
+    """
+    snap = build_trajectory(IGNITE, detail="full")
+    turn = next(t for t in snap.turns if t.actor == "controller")
+    assert turn.observation.ref == "job:2c4d56b2fdca"
+
+    declared = [w for w in snap.warnings if w.code == "ref_out_of_store"]
+    assert [w.detail.split(" ", 1)[0] for w in declared] == ["job:2c4d56b2fdca"]
+    assert "job:2c4d56b2fdca" not in (snap.outputs or {})
+    # not an unresolved lookup: the store was never asked about a non-store ref
+    assert [w for w in snap.warnings if w.code == "unresolved_output_ref"] == []
+
+
+def test_the_summary_tier_declares_nothing_out_of_store_because_it_resolves_nothing():
+    """The declaration is about bytes, and the summary tier never asks for bytes."""
+    snap = build_trajectory(IGNITE)
+    assert [w for w in snap.warnings if w.code == "ref_out_of_store"] == []
+
+
+def test_a_live_watcher_hears_the_out_of_store_declaration_too(tmp_path):
+    """One derivation: the full-tier follow says what the full-tier replay says.
+
+    The one statement the two feeds legitimately word differently is
+    `missing_output_store`, which names the directory it looked in — and the
+    follow looks in a copy of the fixture, because that is what growing a
+    ledger under a live reader requires. It is dropped from both sides rather
+    than papered over, and everything else must match whole.
+    """
+
+    def without_the_path(document):
+        kept = [w for w in document.warnings if w.code != "missing_output_store"]
+        assert len(kept) == len(document.warnings) - 1  # it was there, on both sides
+        return document.model_copy(update={"warnings": kept})
+
+    accumulated = _accumulated(IGNITE, tmp_path, detail="full")
+    assert [w.code for w in accumulated.warnings if w.code == "ref_out_of_store"] == [
+        "ref_out_of_store"
+    ]
+    assert without_the_path(accumulated) == without_the_path(
+        build_trajectory(IGNITE, detail="full")
+    )
 
 
 def test_ignites_forced_dispatch_is_never_billed_for_the_model_response_it_rode():

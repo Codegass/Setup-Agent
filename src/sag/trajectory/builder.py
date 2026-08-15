@@ -35,7 +35,12 @@ control stream does not carry:
   the refs stand for. It is read through `OutputStorageManager`, the component
   that already owns that file's layout; this module never parses it itself.
   The summary tier never opens it, which is what keeps the timeline's main view
-  cheap.
+  cheap. A turn may also name a ref the output store has never heard of —
+  ignite's `job:2c4d56b2fdca`, the handle of a detached job — and the full tier
+  DECLARES those out-of-store by name instead of dropping them before the
+  resolver sees them. A reader expanding that row is otherwise handed an
+  observation with a ref and an `outputs` map that does not mention it, with
+  nothing anywhere saying why.
 
 Both feeds apply those joins by the same rules, in `_Joiner` for the follower
 and `_SessionSources.finish` for the replay, so that accumulating a session's
@@ -50,6 +55,12 @@ A ledger whose last line has no newline is withheld by BOTH feeds — a line
 exists once its newline does — but only a live follow may withhold it in
 silence, because there the newline is still coming. A replay, and a follow that
 has been closed, say `ledger_tail_torn` and name the byte offset.
+
+A ledger that cannot be READ is not a run that did nothing. Swallowing the
+`OSError` returned zero lines, and zero lines is a document a consumer has
+every right to believe: no turns, no warnings, no run. Both feeds state
+`ledger_unreadable` and name the errno instead, so "0 turns" stays a fact about
+this reader rather than a claim about the session.
 """
 
 from __future__ import annotations
@@ -97,10 +108,10 @@ def build_trajectory(session_dir: Path | str, *, detail: str = "summary") -> Tra
     ledger = sources.control_events()
     if ledger is None:
         return sources.finish(reducer.snapshot(), extra=[_missing_ledger(sources.path)])
-    lines, torn = _read_lines(ledger)
+    lines, unread = _read_lines(ledger)
     for line in lines:
         reducer.feed(line)
-    return sources.finish(reducer.snapshot(), extra=[torn] if torn is not None else [])
+    return sources.finish(reducer.snapshot(), extra=unread)
 
 
 def follow_trajectory(
@@ -137,8 +148,12 @@ def _following(
     reducer = TrajectoryReducer()
     joiner = _Joiner(sources)
     while True:
-        joiner.poll(ledger_missing=not tail.open())
-        for line in tail.drain():
+        # The ledger is read BEFORE the joins are recomputed, because whether
+        # this cycle could read it at all is one of the things the joins state.
+        opened = tail.open()
+        lines = tail.drain()
+        joiner.poll(ledger_missing=not opened, unreadable=tail.unreadable())
+        for line in lines:
             decorated = joiner.wrap(reducer.feed(line))
             if decorated is not None:
                 yield decorated
@@ -158,11 +173,18 @@ class TrajectoryFollow:
     cry wolf on every poll that caught a `write` in progress. Once nobody is
     waiting, the newline is not coming, and the follow says exactly what a
     replay of those same bytes says.
+
+    Saying it once is the whole of it. A caller that closes in a `finally` and
+    again on the way out, or a CLI that closes the stream it also broke out of,
+    got the torn tail handed back a second time — and a consumer printing one
+    delta per line then printed a ledger that ended mid-line twice. A closed
+    follow has nothing further to say.
     """
 
     def __init__(self, deltas: Generator[TrajectoryDelta, None, None], tail: "_FollowTail") -> None:
         self._deltas = deltas
         self._tail = tail
+        self._closed = False
 
     def __iter__(self) -> "TrajectoryFollow":
         return self
@@ -172,6 +194,9 @@ class TrajectoryFollow:
 
     def close(self) -> TrajectoryDelta | None:
         """End the follow; hand back the last delta, if there is one left to send."""
+        if self._closed:
+            return None
+        self._closed = True
         self._deltas.close()
         torn = self._tail.torn()
         return None if torn is None else TrajectoryDelta(warnings=[torn])
@@ -224,8 +249,12 @@ class _SessionSources:
         biller = _TokenBiller()
         turns = [biller.bill(turn, tokens) for turn in snapshot.turns]
         unattributed = biller.unattributed(tokens)
-        refs = _output_refs(turns)
-        resolved, output_warnings = self.outputs.resolve(refs) if self.full else (None, [])
+        refs, elsewhere = _turn_refs(turns)
+        resolved: dict[str, str] | None = None
+        output_warnings: list[Warning] = []
+        if self.full:
+            resolved, output_warnings = self.outputs.resolve(refs)
+            output_warnings = output_warnings + [_out_of_store(ref) for ref in elsewhere]
         return snapshot.model_copy(
             update={
                 "session": snapshot.session.model_copy(
@@ -322,6 +351,10 @@ class _LedgerTail:
         self._path = path
         self._offset = 0
         self._partial = b""
+        #: Why the last drain read nothing, when it was not "nothing was there".
+        #: Held rather than raised, and cleared by the first read that works —
+        #: a mode or a mount can be fixed under a running follow.
+        self.unreadable: Warning | None = None
 
     def drain(self) -> list[str]:
         try:
@@ -329,8 +362,10 @@ class _LedgerTail:
                 handle.seek(self._offset)
                 chunk = handle.read()
                 self._offset = handle.tell()
-        except OSError:
+        except OSError as exc:
+            self.unreadable = _unreadable_ledger(exc)
             return []
+        self.unreadable = None
         if not chunk:
             return []
         complete, self._partial = _complete_lines(self._partial + chunk)
@@ -364,6 +399,9 @@ class _FollowTail:
     def drain(self) -> list[str]:
         return self._tail.drain() if self._tail is not None else []
 
+    def unreadable(self) -> Warning | None:
+        return self._tail.unreadable if self._tail is not None else None
+
     def torn(self) -> Warning | None:
         return self._tail.torn() if self._tail is not None else None
 
@@ -388,14 +426,30 @@ def _complete_lines(buffer: bytes) -> tuple[list[str], bytes]:
     return [raw.decode("utf-8", errors="replace") for raw in complete], partial
 
 
-def _read_lines(path: Path) -> tuple[list[str], Warning | None]:
-    """The finished lines of an archived ledger, and its unfinished one if any."""
+def _read_lines(path: Path) -> tuple[list[str], list[Warning]]:
+    """The finished lines of an archived ledger, and what it would not say."""
     try:
         data = path.read_bytes()
-    except OSError:
-        return [], None
+    except OSError as exc:
+        return [], [_unreadable_ledger(exc)]
     complete, partial = _complete_lines(data)
-    return complete, _torn_tail(partial, len(data) - len(partial))
+    torn = _torn_tail(partial, len(data) - len(partial))
+    return complete, [torn] if torn is not None else []
+
+
+def _unreadable_ledger(exc: OSError) -> Warning:
+    """The ledger is there and the reader cannot open it — a fact about US.
+
+    The errno is the whole content of the statement: `EACCES` means a mode or
+    an owner to fix, `EIO` a mount to look at, `ENOENT` a file that vanished
+    between the look and the read. A message that only said "unreadable" would
+    send whoever reads it back to the shell to find out which.
+    """
+    return Warning(
+        code="ledger_unreadable",
+        detail=f"{CONTROL_EVENTS_NAME} could not be read: errno {exc.errno} ({exc.strerror})",
+        control_seq=None,
+    )
 
 
 def _torn_tail(partial: bytes, offset: int) -> Warning | None:
@@ -470,20 +524,41 @@ def _duplicate_rows(iteration: int, count: int) -> Warning:
     )
 
 
-def _output_refs(turns: list[Turn]) -> list[str]:
-    """Every output-store ref these turns name, in first-seen order.
+def _turn_refs(turns: list[Turn]) -> tuple[list[str], list[str]]:
+    """Every ref these turns name, split by whether the output store can answer.
 
-    Envelope ids (`call.params_ref`) are deliberately not in scope: they are
-    the ledger's own handles, resolvable from `control_events.jsonl`, and the
-    output store has never heard of them.
+    In first-seen order, and in two lists: the `output_`-prefixed handles the
+    store was built to resolve, and the ones it was not. The second list is not
+    a discard pile — a `job:` handle names a detached job's books, which live
+    in the job ledger — and dropping it here is what made those observations
+    silently byte-less at the full tier.
+
+    Envelope ids (`call.params_ref`) are in neither: they are the ledger's own
+    handles, resolvable from `control_events.jsonl`, and no reader has ever
+    expected the output store to carry one.
     """
-    refs: list[str] = []
+    in_store: list[str] = []
+    elsewhere: list[str] = []
     for turn in turns:
         candidates = [turn.window_ref, turn.observation.ref if turn.observation else None]
         for ref in candidates:
-            if ref and is_output_storage_ref(ref) and ref not in refs:
-                refs.append(ref)
-    return refs
+            if not ref:
+                continue
+            bucket = in_store if is_output_storage_ref(ref) else elsewhere
+            if ref not in bucket:
+                bucket.append(ref)
+    return in_store, elsewhere
+
+
+def _out_of_store(ref: str) -> Warning:
+    return Warning(
+        code="ref_out_of_store",
+        detail=(
+            f"{ref} is not an output-store handle; the full tier resolves "
+            f"{CONTEXTS_DIR}/{FULL_OUTPUTS_NAME} refs only"
+        ),
+        control_seq=None,
+    )
 
 
 class _TokenBiller:
@@ -576,14 +651,16 @@ class _Joiner:
         self._reledgered = False
         self._token_warnings: list[Warning] = []
         self._ledger_missing = True
+        self._unreadable: Warning | None = None
         self._refs: list[str] = []
+        self._out_of_store: list[str] = []
         self._sent: set[str] = set()
         self._held: tuple[Warning, ...] = ()
         self._around: dict[str, Any] = _session_join("", sources)
         self._reduced: dict[str, Any] = {}
         self._told: dict[str, Any] = {}
 
-    def poll(self, *, ledger_missing: bool) -> None:
+    def poll(self, *, ledger_missing: bool, unreadable: Warning | None = None) -> None:
         """Re-read the artifacts that live beside the ledger, once per cycle.
 
         Once per cycle, not once per event: a verdict is written when a run
@@ -591,6 +668,7 @@ class _Joiner:
         every line would buy nothing and cost a file read per event.
         """
         self._ledger_missing = ledger_missing
+        self._unreadable = unreadable
         tokens, self._token_warnings = self._sources.token_ledger()
         self._reledgered = self._reledgered or tokens != self._tokens
         self._tokens = tokens
@@ -599,9 +677,13 @@ class _Joiner:
     def wrap(self, delta: TrajectoryDelta) -> TrajectoryDelta | None:
         turns = [self._bill(turn) for turn in delta.turns]
         turns.extend(self._rebilled({turn.turn_id for turn in turns}))
-        for ref in _output_refs(turns):
+        in_store, elsewhere = _turn_refs(turns)
+        for ref in in_store:
             if ref not in self._refs:
                 self._refs.append(ref)
+        for ref in elsewhere:
+            if ref not in self._out_of_store:
+                self._out_of_store.append(ref)
         outputs, unresolved = self._resolve()
         stated = self._restate(unresolved)
         self._reduced.update(delta.session_patch)
@@ -667,7 +749,10 @@ class _Joiner:
         pending = [ref for ref in self._refs if ref not in self._sent]
         fresh, warnings = self._sources.outputs.resolve(pending)
         self._sent.update(fresh)
-        return fresh, warnings
+        # Out-of-store refs are restated every cycle, never "sent": they are a
+        # standing declaration about what the store was never asked to hold,
+        # which is `finish`'s rule too, so the two feeds hold the same set.
+        return fresh, warnings + [_out_of_store(ref) for ref in self._out_of_store]
 
     def _restate(self, unresolved: list[Warning]) -> tuple[list[Warning], list[Warning]]:
         current = list(self._token_warnings)
@@ -676,6 +761,8 @@ class _Joiner:
             current.append(orphans)
         if self._ledger_missing:
             current.append(_missing_ledger(self._sources.path))
+        if self._unreadable is not None:
+            current.append(self._unreadable)
         current.extend(unresolved)
         held, self._held = self._held, tuple(current)
         return [w for w in current if w not in held], [w for w in held if w not in current]

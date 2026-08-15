@@ -1472,12 +1472,18 @@ def trajectory(session_dir, follow, detail):
         click.echo(build_trajectory(session_dir, detail=detail).model_dump_json())
     except KeyboardInterrupt:
         return  # a follower ends when whoever was watching stops watching
-    except (FileNotFoundError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         # STDOUT is this command's contract — `sag trajectory | jq` is the point
         # of it — so a failure puts nothing there and the reason on stderr,
         # beside click's own parser errors. Plain text, not a rich panel: a
         # panel hard-wraps the path it is naming and colours a pipe nobody is
         # reading with a terminal.
+        #
+        # OSError, not FileNotFoundError: a missing directory is one of many
+        # ways the I/O this command does can fail, and `--follow` runs for the
+        # length of a run, so the terminal or the mount underneath it can go
+        # away mid-stream. Every one of those used to escape as a traceback
+        # onto the stream that promised JSON. (Click retires EPIPE on its own.)
         click.echo(f"❌ {exc}", err=True)
         sys.exit(1)
 

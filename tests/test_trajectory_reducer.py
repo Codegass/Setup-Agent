@@ -1,18 +1,34 @@
 """The reducer folds real control events into turns, and never raises.
 
-Every fixture below is bytes lifted verbatim out of an archived session — the
-kafka d2r3 run at
+Every ARCHIVED fixture below is bytes lifted verbatim out of a recorded session
+— the kafka d2r3 run at
 `logs/session_20260814_072758_651456_4d81644227c3_24117/control_events.jsonl`,
 for the controller turn the httpcomponents-client run at
 `logs/session_20260813_202604_931286_731b3b90c419_2417/control_events.jsonl`,
-and for the refused call the camel-quarkus d2r3 run at
-`logs/session_20260814_093336_763203_12dba3497295_26013/control_events.jsonl`.
+for the refused call the camel-quarkus d2r3 run at
+`logs/session_20260814_093336_763203_12dba3497295_26013/control_events.jsonl`,
+and for the silently replaced gate the rocketmq-externals run at
+`logs/session_20260813_203227_051092_171f42548985_2604/control_events.jsonl`.
 The field names the reducer joins on are the field names those runs actually
-wrote; nothing here is invented.
+wrote; nothing there is invented.
+
+A handful of fixtures are marked SYNTHETIC. They exist because no archived
+ledger exercises the path at all: `gate_outcome_revised` was never emitted by
+any of the 27 recorded runs, and the orphan branches fire only on an ordering
+no complete session produces. Each synthetic line is built from the payload
+class in `sag.agent.control_events` that the engine would seal — and
+`test_the_synthetic_gate_lines_are_the_shape_the_engine_would_seal` validates
+them against that class, so a fixture cannot drift into a shape the engine
+could never write. The DEGRADED lines are the exception, and deliberately so:
+they are payloads this schema version cannot read whole, which is the input the
+"warnings, never exceptions" rule exists for.
 """
+
+import json
 
 import pytest
 
+from sag.agent.control_events import GateDecisionPayload, GateOutcomeRevisedPayload
 from sag.trajectory.reducer import DeltaAccumulator, TrajectoryReducer
 
 # Sequences 3, 4 and 6 — one clone call: its envelope, its result, its decision.
@@ -86,6 +102,93 @@ REAL_BUILD_TO_TEST_JSONL = """\
 {"event_id":"control-000139","kind":"action_envelope","payload":{"envelope_id":"envelope-000139","envelope_sha256":"813ac72fccadcdbaa5e25e5c4dd93bd591af8aa4d2d5ce5575efdae5674563ac","exact_params":{},"tool":"advisor","tool_call_id":"advisor-entry-2"},"sequence":139,"source":null,"timestamp":"2026-08-14T11:32:36.541626Z"}
 {"event_id":"control-000160","kind":"phase_transition","payload":{"expected_kind":"evidence_close","expected_reason_code":"test_terminal","expected_target":null,"repair_request":null},"sequence":160,"source":null,"timestamp":"2026-08-14T11:40:43.104247Z"}
 """
+
+
+# Sequences 84, 87 and 90 of the archived rocketmq-externals run
+# (logs/session_20260813_203227_051092_171f42548985_2604): one `phase` call, and
+# TWO gate decisions for the same `build` phase landing on the turn it opened.
+# Neither grading carries a `decision_id` and neither names a `supersedes`, so
+# the second one is not a chain — it is the ledger changing its mind (accepted
+# false -> true) with nothing in the record connecting the two words.
+REAL_SILENT_GATE_REPLACEMENT_JSONL = """\
+{"event_id":"control-000084","kind":"action_envelope","payload":{"action_fingerprint":"act-8dce3dd6e3276294945acb4f313a3814226c98a3fbb62eb05376cd22ecc8d9a1","envelope_id":"envelope-000084","envelope_sha256":"9effe6fcfa1cce98a7a35a84e334bfda3059cc1ee2ed631fe8ed021f8ca533be","exact_params":{"action":"blocked","evidence":["output_2ba10334c186","output_531e62e1640f","output_227e4c9296d5","output_f71a16515207","output_e90f4d1d80e8"],"outcome":"unknown","reason":"Maven executable could not be located in the container filesystem search scope, and the build facade previously refused dispatch because no valid registered runtime was available. Without a discoverable mvn binary, I cannot produce the required terminal build attempt receipt for this phase."},"intent_id":"intent-748afcc92ca9","intent_source":"model","tool":"phase","tool_call_id":"call_kXNfRcjHjCHS2LJGOWeBsdZa"},"sequence":84,"source":null,"timestamp":"2026-08-14T00:34:38.737018Z"}
+{"event_id":"control-000087","kind":"gate_decision","payload":{"blocker_owner":"harness","claimed_outcome":"unknown","code":"repair_assessment_persist_failed","control_disposition":"harness_recovery_required","evidence_refs":["output_2ba10334c186","output_531e62e1640f","output_227e4c9296d5","output_f71a16515207","output_e90f4d1d80e8"],"expected_accepted":false,"expected_outcome":"unknown","key_results":"","phase":"build","reason":"Build phase has no terminal build attempt receipt; no project outcome can be claimed yet.; controller could not persist the judge-owned repair context (repair_assessment_persist_failed)","signal":"blocked","source_attempt_id":"build-1","validated_facts":{"build_attempt_requirement":{"manifest_status":"unavailable","reason_code":"build_attempt_missing","receipt_binding_status":"project_root_missing","terminal_build_receipts":0}},"validator_state":"unavailable"},"sequence":87,"source":null,"timestamp":"2026-08-14T00:34:39.044425Z"}
+{"event_id":"control-000090","kind":"gate_decision","payload":{"blocker_owner":"unknown","claimed_outcome":"unknown","code":"repair_assessment_persist_failed","control_disposition":"terminal_claimable","evidence_refs":["output_2ba10334c186","output_531e62e1640f","output_227e4c9296d5","output_f71a16515207","output_e90f4d1d80e8"],"expected_accepted":true,"expected_outcome":"unknown","key_results":"","phase":"build","reason":"repair_assessment_persist_failed; Build phase has no terminal build attempt receipt; no project outcome can be claimed yet.; controller could not persist the judge-owned repair context (repair_assessment_persist_failed)","signal":"blocked","source_attempt_id":"build-1","validated_facts":{"build_attempt_requirement":{"manifest_status":"unavailable","reason_code":"build_attempt_missing","receipt_binding_status":"project_root_missing","terminal_build_receipts":0}},"validator_state":"unavailable"},"sequence":90,"source":null,"timestamp":"2026-08-14T00:34:39.224468Z"}
+"""
+
+#: SYNTHETIC. `gate_outcome_revised` appears in no archived ledger, so its bytes
+#: are built from `GateOutcomeRevisedPayload` — every field it declares, and the
+#: two-distinct-gradings rule its validator enforces. The word it revises is
+#: kafka's real provision gate `gate-9b1f0f4ef4bcd390c47fa6c892ca4f89`, so the
+#: fixture chains onto archived bytes rather than onto more invention.
+SYNTHETIC_GATE_REVISION_JSONL = (
+    '{"event_id":"control-000029","kind":"gate_outcome_revised","payload":'
+    '{"phase":"provision","delivered_decision_id":"gate-9b1f0f4ef4bcd390c47fa6c892ca4f89",'
+    '"revised_decision_id":"gate-e2a70c5b6d1f4a8390b4c7d2e5f60189",'
+    '"delivered_outcome":"success","revised_outcome":"partial",'
+    '"delivered_accepted":true,"revised_accepted":false,'
+    '"reason":"the workspace check read a mount that had been replaced",'
+    '"code":"workspace_stale","observation_text":"Gate outcome revised for provision: '
+    'success -> partial","source_attempt_id":"provision-1"},'
+    '"sequence":29,"source":null,"timestamp":"2026-08-14T11:29:17.010000Z"}'
+)
+
+#: SYNTHETIC. The third link: a `gate_decision` that names the revision in its
+#: `supersedes`, which is the chain `GateDecisionPayload.supersedes` documents.
+SYNTHETIC_GATE_AFTER_REVISION_JSONL = (
+    '{"event_id":"control-000030","kind":"gate_decision","payload":'
+    '{"claimed_outcome":"partial","code":"workspace_present",'
+    '"decision_id":"gate-77c1d4e9a05b46f2ac83be91d6407f52","evidence_refs":["/workspace/kafka"],'
+    '"expected_accepted":true,"expected_outcome":"success","key_results":"",'
+    '"phase":"provision","reason":"workspace re-verified after the revision",'
+    '"signal":"done","source_attempt_id":"provision-1",'
+    '"supersedes":"gate-e2a70c5b6d1f4a8390b4c7d2e5f60189",'
+    '"validated_facts":{"provision.workspace_ready":true},"validator_state":"green"},'
+    '"sequence":30,"source":null,"timestamp":"2026-08-14T11:29:17.400000Z"}'
+)
+
+#: SYNTHETIC. A revision naming a grading no gate in this run ever delivered —
+#: the shape `sag.agent.replay` rejects outright ("gate_outcome_revised names a
+#: word that was never delivered"). Replay may abort on it; a read-only
+#: derivation may not, so this layer states it instead.
+SYNTHETIC_ORPHAN_REVISION_JSONL = (
+    '{"event_id":"control-000031","kind":"gate_outcome_revised","payload":'
+    '{"phase":"provision","delivered_decision_id":"gate-000000000000000000000000000000ff",'
+    '"revised_decision_id":"gate-e2a70c5b6d1f4a8390b4c7d2e5f60189",'
+    '"delivered_outcome":"success","revised_outcome":"partial",'
+    '"delivered_accepted":true,"revised_accepted":false,"reason":"",'
+    '"code":"workspace_stale","observation_text":"Gate outcome revised for provision: '
+    'success -> partial","source_attempt_id":"provision-1"},'
+    '"sequence":31,"source":null,"timestamp":"2026-08-14T11:29:18.010000Z"}'
+)
+
+#: SYNTHETIC and DEGRADED — a gate event carrying no word at all. No engine
+#: writes this (both payload classes require the outcome); it stands for a
+#: payload this schema version cannot read whole, which is exactly the input
+#: the "warnings, never exceptions" rule of spec §3 exists for.
+SYNTHETIC_WORDLESS_GATE_JSONL = (
+    '{"event_id":"control-000032","kind":"gate_decision","payload":'
+    '{"phase":"provision","decision_id":"gate-77c1d4e9a05b46f2ac83be91d6407f52"},'
+    '"sequence":32,"source":null,"timestamp":"2026-08-14T11:29:19.010000Z"}'
+)
+SYNTHETIC_WORDLESS_REVISION_JSONL = (
+    '{"event_id":"control-000033","kind":"gate_outcome_revised","payload":'
+    '{"phase":"provision","delivered_decision_id":"gate-9b1f0f4ef4bcd390c47fa6c892ca4f89",'
+    '"revised_decision_id":"gate-e2a70c5b6d1f4a8390b4c7d2e5f60189"},'
+    '"sequence":33,"source":null,"timestamp":"2026-08-14T11:29:19.410000Z"}'
+)
+
+#: SYNTHETIC, in field names only: the keys are the ones camel-quarkus seq 122
+#: actually wrote, with the bounded context trimmed to what this layer reads.
+SYNTHETIC_REPAIR_CONTEXT_JSONL = (
+    '{"event_id":"control-000122","kind":"repair_context_opened","payload":'
+    '{"context":{"blocker_owner":"project","domain_id":"test:/workspace",'
+    '"repair_context_id":"rcx-b41b0c9c98cd","trigger_assessment_id":'
+    '"asm-gate_assessment_303c17e7af6aa2bd-tests_not_executed-4bd3544f"},'
+    '"context_sha256":"c84b49273a784b202e98f5db59b5674c690cba905bca10d2142be1b05b16415f",'
+    '"source_gate_sequence":121,"source_phase_attempt_id":"test-1"},'
+    '"sequence":122,"source":null,"timestamp":"2026-08-14T13:56:10.000000Z"}'
+)
 
 
 def _lines(block: str) -> list[str]:
@@ -441,6 +544,198 @@ def test_the_last_open_turn_ships_its_holes_like_every_other_turn():
         ("missing_tool_result", 2),
     ]
     assert accumulator.snapshot() == r.snapshot()
+
+
+def _walk(gates, start):
+    """Follow `supersedes` back from one gate, gathering the chain it names."""
+    by_id = {gate.decision_id: gate for gate in gates if gate.decision_id}
+    chain = [start]
+    while chain[-1].supersedes is not None:
+        previous = by_id.get(chain[-1].supersedes)
+        assert previous is not None, f"the chain breaks at {chain[-1].supersedes}"
+        chain.append(previous)
+    return chain
+
+
+def test_the_synthetic_gate_lines_are_the_shape_the_engine_would_seal():
+    """A fixture the engine could never write proves nothing about the engine.
+
+    `gate_outcome_revised` is emitted by no archived run, so its fences are
+    built rather than lifted. That is only honest while the built bytes still
+    validate as the payload `react_engine._emit_gate_outcome_revised` seals —
+    including the rule that a revision must name two distinct gradings and a
+    word that actually moved.
+    """
+    for line in (SYNTHETIC_GATE_REVISION_JSONL, SYNTHETIC_ORPHAN_REVISION_JSONL):
+        GateOutcomeRevisedPayload.model_validate(json.loads(line)["payload"])
+    GateDecisionPayload.model_validate(json.loads(SYNTHETIC_GATE_AFTER_REVISION_JSONL)["payload"])
+
+
+def test_a_second_gate_that_supersedes_nothing_replaces_the_first_out_loud():
+    """rocketmq-externals seq 87 then 90: two words, one turn, no chain.
+
+    Both gradings name phase `build`, land on the turn `envelope-000084`
+    opened, and disagree — `expected_accepted` false, then true. Neither
+    carries a `decision_id` and neither names a `supersedes`, so nothing in the
+    record connects them. Holding only the last one made the trajectory report
+    a run that was graded once, which the ledger's own bytes contradict; the
+    turn keeps the word that was delivered last AND the replacement is stated,
+    because both are facts.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_GATE_REPLACEMENT_JSONL):
+        r.feed(line)
+    snap = r.snapshot()
+
+    assert len(snap.turns) == 1
+    turn = snap.turns[0]
+    assert turn.gate.word == "unknown" and turn.gate.decision_id is None
+    assert turn.control_seq == [84, 87, 90]
+
+    replaced = [w for w in snap.warnings if w.code == "gate_replaced_without_supersedes"]
+    assert len(replaced) == 1
+    assert replaced[0].control_seq == 90  # the event that did the replacing
+    assert replaced[0].detail == (
+        "turn 1 held gate None and a second gate None replaced it "
+        "without naming it in supersedes"
+    )
+
+
+def test_a_gate_that_names_the_word_it_supersedes_replaces_it_in_silence():
+    """The designed chain is not a defect, so it does not get a warning."""
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL)[:4]:  # the call, its result, its gate
+        r.feed(line)
+    r.feed(SYNTHETIC_GATE_REVISION_JSONL)
+    r.feed(SYNTHETIC_GATE_AFTER_REVISION_JSONL)
+    snap = r.snapshot()
+
+    assert [w for w in snap.warnings if w.code == "gate_replaced_without_supersedes"] == []
+    assert snap.turns[0].gate.decision_id == "gate-77c1d4e9a05b46f2ac83be91d6407f52"
+
+
+def test_a_revision_attaches_to_the_turn_that_carried_the_word_it_revises():
+    """A revision revises a delivered word, not whichever turn happens to be open.
+
+    By the time the engine may revise an outcome, the model has acted on the
+    first word and the run has moved on — the open turn is a later call that
+    was never graded. Stapling the revision there would put a gate on a turn
+    that never had one and leave the turn that WAS graded showing a word the
+    record has already replaced.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL)[:4]:
+        r.feed(line)
+    r.feed(_lines(REAL_FAILED_CALL_JSONL)[0])  # a later call opens turn 2
+    delta = r.feed(SYNTHETIC_GATE_REVISION_JSONL)
+    snap = r.snapshot()
+
+    assert len(snap.turns) == 2
+    assert snap.turns[1].gate is None  # the open turn was never graded
+    revised = snap.turns[0].gate
+    assert revised.word == "partial"  # the outcome now in force, not the delivered one
+    assert revised.decision_id == "gate-e2a70c5b6d1f4a8390b4c7d2e5f60189"
+    assert revised.supersedes == "gate-9b1f0f4ef4bcd390c47fa6c892ca4f89"
+    assert 29 in snap.turns[0].control_seq
+    assert [t.turn_id for t in delta.turns] == [1]  # the delta restates the owner
+
+
+def test_the_supersedes_chain_is_walkable_from_the_last_word_to_the_first():
+    """Three gradings, one phase: a reader walks the chain instead of guessing.
+
+    `GateInfo.supersedes` is only worth carrying if every link it names is
+    findable. The band holds every word delivered in the phase, in the order
+    the gate layer delivered them, so walking back from the turn's current
+    gate reaches the original grading and stops there.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL)[:4]:
+        r.feed(line)
+    r.feed(SYNTHETIC_GATE_REVISION_JSONL)
+    r.feed(SYNTHETIC_GATE_AFTER_REVISION_JSONL)
+    snap = r.snapshot()
+
+    band = next(p for p in snap.phases if p.name == "provision")
+    assert [g.word for g in band.gates] == ["success", "partial", "success"]
+
+    chain = _walk(band.gates, snap.turns[0].gate)
+    assert [g.decision_id for g in chain] == [
+        "gate-77c1d4e9a05b46f2ac83be91d6407f52",
+        "gate-e2a70c5b6d1f4a8390b4c7d2e5f60189",
+        "gate-9b1f0f4ef4bcd390c47fa6c892ca4f89",
+    ]
+
+
+def test_a_revision_of_a_word_no_gate_delivered_is_an_orphan_not_a_guess():
+    """`sag.agent.replay` aborts on this shape; a derivation states it and folds on.
+
+    Replay is an integrity check and may refuse a stream that revises a word it
+    never saw delivered. This layer is read-only observation: it has to keep
+    folding, so the revision gets no owner, no turn is invented for it, and the
+    band records that a word was delivered whose chain leads nowhere.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_SILENT_PHASE_CALL_JSONL)[:4]:
+        r.feed(line)
+    held = r.snapshot().turns[0].gate
+    delta = r.feed(SYNTHETIC_ORPHAN_REVISION_JSONL)
+    snap = r.snapshot()
+
+    assert snap.turns[0].gate == held  # the graded turn keeps the word it was given
+    assert delta.turns == []
+    orphan = [w for w in snap.warnings if w.code == "orphan_gate_revision"]
+    assert len(orphan) == 1 and orphan[0].control_seq == 31
+    assert "gate-000000000000000000000000000000ff" in orphan[0].detail
+    band = next(p for p in snap.phases if p.name == "provision")
+    assert [g.decision_id for g in band.gates][-1] == "gate-e2a70c5b6d1f4a8390b4c7d2e5f60189"
+
+
+def test_a_tool_result_for_an_envelope_no_turn_opened_is_stated():
+    """[C] with no [B]: an answer to a call this ledger never recorded making."""
+    r = TrajectoryReducer()
+    delta = r.feed(REAL_TRIPLE[1])  # the kafka result, with its envelope withheld
+
+    assert r.snapshot().turns == []
+    assert [(w.code, w.control_seq) for w in delta.warnings] == [("orphan_tool_result", 4)]
+    assert "envelope-000003" in delta.warnings[0].detail
+
+
+def test_a_gate_event_carrying_no_word_is_stated_and_grades_nothing():
+    """A gate whose outcome this version cannot read is a hole, not a crash."""
+    r = TrajectoryReducer()
+    for line in REAL_TRIPLE:
+        r.feed(line)
+    wordless = r.feed(SYNTHETIC_WORDLESS_GATE_JSONL)
+    wordless_revision = r.feed(SYNTHETIC_WORDLESS_REVISION_JSONL)
+
+    assert [(w.code, w.control_seq) for w in wordless.warnings] == [("gate_without_a_word", 32)]
+    assert [(w.code, w.control_seq) for w in wordless_revision.warnings] == [
+        ("gate_without_a_word", 33)
+    ]
+    assert r.snapshot().turns[0].gate is None
+    # the band the call's own decision opened is there; no gate was added to it
+    assert [(p.name, p.gates) for p in r.snapshot().phases] == [("provision", [])]
+
+
+def test_a_gate_delivered_before_any_turn_opened_is_an_orphan():
+    """A word with nothing to attach it to still bands its phase and says so."""
+    r = TrajectoryReducer()
+    delta = r.feed(_lines(REAL_SILENT_PHASE_CALL_JSONL)[3])  # the gate, alone
+
+    assert r.snapshot().turns == []
+    assert [(w.code, w.control_seq) for w in delta.warnings] == [("orphan_gate_decision", 27)]
+    assert "'success'" in delta.warnings[0].detail
+    band = r.snapshot().phases[0]
+    assert band.name == "provision" and len(band.gates) == 1
+
+
+def test_a_repair_context_opened_before_any_turn_is_an_orphan():
+    """A repair context annotates the turn that provoked it; with none, it says so."""
+    r = TrajectoryReducer()
+    delta = r.feed(SYNTHETIC_REPAIR_CONTEXT_JSONL)
+
+    assert r.snapshot().annotations == []
+    assert [(w.code, w.control_seq) for w in delta.warnings] == [("orphan_repair_context", 122)]
 
 
 def test_the_reducer_has_no_detail_tier():

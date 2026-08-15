@@ -236,6 +236,38 @@ def test_the_parsers_own_refusals_land_on_stderr_too(tmp_path):
     assert "a-file" in result.stderr
 
 
+def test_an_oserror_that_is_not_a_missing_file_still_lands_on_stderr(monkeypatch):
+    """Two error families were named; the I/O this command does has many more.
+
+    `--follow` is built to run for the length of a run, so the terminal or the
+    mount underneath it can disappear mid-stream: a pty that has gone away
+    answers a write with `OSError(EIO)`, and a stale mount answers a read the
+    same way. Neither is a `FileNotFoundError` and neither is a `ValueError`,
+    so both escaped as tracebacks — the same broken bargain as printing an
+    error onto stdout, since a caller parsing this command's output gets
+    Python's diagnostics where a trajectory was promised. (Click handles the
+    one OSError it knows, `EPIPE`, on its own; every other one is ours.)
+    """
+    import errno
+
+    import click
+
+    real_echo = click.echo
+
+    def dead_terminal(message=None, *args, err=False, **kwargs):
+        if not err:  # the stdout end is gone; stderr is still someone's console
+            raise OSError(errno.EIO, "Input/output error")
+        return real_echo(message, *args, err=err, **kwargs)
+
+    monkeypatch.setattr("sag.main.click.echo", dead_terminal)
+    result = _run(str(KAFKA))
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert result.stdout == ""
+    assert "Input/output error" in result.stderr
+
+
 def test_the_command_writes_nothing_into_the_session_it_read(tmp_path):
     session_dir = _session_with_store(tmp_path)
     before = {p: p.stat().st_mtime_ns for p in sorted(session_dir.rglob("*"))}

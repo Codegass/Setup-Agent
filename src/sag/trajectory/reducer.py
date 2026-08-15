@@ -28,7 +28,10 @@ closes those holes, the warnings simply stop appearing.
   envelope accounts for still gets a row (and a `missing_envelope` warning)
   instead of being silently stapled onto somebody else's call.
 - `gate_decision` / `gate_outcome_revised` attach the word the gate delivered
-  to the turn that carried it, and to the phase band it graded.
+  to the turn that carried it, and to the phase band it graded. A
+  `gate_outcome_revised` attaches to the turn that carried the word it
+  REVISES, which by then is rarely the open one — the model has already acted
+  on the delivered outcome and the run has moved on.
 - `phase_transition` closes the band of the phase the run is in and opens a new
   segment for the phase it names.
 
@@ -50,6 +53,17 @@ while the band actually being left stayed open for the rest of the run. The
 pointer is only ever SET by a band coming into existence while the run has not
 been placed at all — the opening phase no transition announces, and the phase
 after a transition that closes one without naming a successor.
+
+**A turn holds one gate, and a second word does not arrive quietly.** The turn
+keeps the word delivered LAST, because that is the word in force. Whether the
+replacement was designed or not is a separate fact, and it is stated: a gate
+whose `supersedes` names the word it displaces is the chain spec §3.1 defines
+and passes in silence; anything else replaced a grading the record does not
+connect it to, and `gate_replaced_without_supersedes` names both decision ids
+so the reader can see whether either was identified at all. Holding only the
+last word made a doubly-graded turn indistinguishable from a singly-graded one
+(rocketmq-externals seq 87 then 90: accepted false, then true, neither carrying
+a `decision_id`).
 
 **Warnings are statements, and a statement can stop being true.** Turn-level
 warnings are recomputed from turn state, never stored at seal time: a hole is a
@@ -158,6 +172,9 @@ class TrajectoryReducer:
     def __init__(self) -> None:
         self._turns: list[_TurnState] = []
         self._by_envelope: dict[str, _TurnState] = {}
+        #: Which turn carried each grading, so a revision of a word delivered
+        #: long ago finds its owner instead of landing on whatever is open.
+        self._by_decision: dict[str, _TurnState] = {}
         self._phases: list[_PhaseState] = []
         #: Where the RUN is: the band a `phase_transition` will terminate. `None`
         #: means the run has not been placed — before its first phase is banded,
@@ -494,6 +511,18 @@ class TrajectoryReducer:
     def _on_gate_outcome_revised(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
     ) -> None:
+        """Replace a word already delivered, on the turn that was given it.
+
+        A revision exists precisely because the model has already acted on the
+        first word, so the turn that carried it is behind the one now open.
+        Attaching to the open turn would hand a gate to a call nobody graded and
+        leave the graded turn showing an outcome the record has withdrawn.
+
+        The owner is found by `delivered_decision_id`. When no gate in this run
+        delivered that id, the revision has no owner and none is guessed: it is
+        an orphan, which `sag.agent.replay` treats as an integrity failure and
+        this read-only layer states as a warning (spec §3).
+        """
         word = _text(payload.get("revised_outcome"))
         if word is None:
             collector.warn(
@@ -502,20 +531,39 @@ class TrajectoryReducer:
                 sequence,
             )
             return
+        delivered = _text(payload.get("delivered_decision_id"))
         gate = GateInfo(
             word=word,
             decision_id=_text(payload.get("revised_decision_id")),
-            supersedes=_text(payload.get("delivered_decision_id")),
+            supersedes=delivered,
         )
-        self._attach_gate(collector, gate, sequence, payload.get("phase"))
+        owner = self._by_decision.get(delivered) if delivered else None
+        if owner is None:
+            self._band_gate(gate, payload.get("phase"))
+            collector.warn(
+                "orphan_gate_revision",
+                f"a revision replaces {delivered!r}, which no gate in this run delivered",
+                sequence,
+            )
+            return
+        self._attach_gate(collector, gate, sequence, payload.get("phase"), owner=owner)
+
+    def _band_gate(self, gate: GateInfo, phase: Any) -> None:
+        """Record the word in its phase's band — every grading the run made."""
+        if isinstance(phase, str) and phase:
+            self._phase_band(phase).gates.append(gate)
 
     def _attach_gate(
-        self, collector: "_Delta", gate: GateInfo, sequence: int | None, phase: Any
+        self,
+        collector: "_Delta",
+        gate: GateInfo,
+        sequence: int | None,
+        phase: Any,
+        *,
+        owner: _TurnState | None = None,
     ) -> None:
-        band = self._phase_band(phase) if isinstance(phase, str) and phase else None
-        if band is not None:
-            band.gates.append(gate)
-        turn = self._open_turn
+        self._band_gate(gate, phase)
+        turn = owner or self._open_turn
         if turn is None:
             collector.warn(
                 "orphan_gate_decision",
@@ -523,7 +571,22 @@ class TrajectoryReducer:
                 sequence,
             )
             return
+        held = turn.gate
+        # A chain is a word naming the word it replaces. `supersedes` unset names
+        # nothing, so it never counts as one — which is the whole rocketmq-externals
+        # case, where neither grading carried a `decision_id` either.
+        if held is not None and not (gate.supersedes and gate.supersedes == held.decision_id):
+            collector.warn(
+                "gate_replaced_without_supersedes",
+                (
+                    f"turn {turn.turn_id} held gate {held.decision_id!r} and a second gate "
+                    f"{gate.decision_id!r} replaced it without naming it in supersedes"
+                ),
+                sequence,
+            )
         turn.gate = gate
+        if gate.decision_id:
+            self._by_decision[gate.decision_id] = turn
         turn.touch(sequence)
         collector.touched(turn)
 
