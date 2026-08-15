@@ -160,7 +160,9 @@ def test_the_full_tier_reads_every_store_the_session_has(tmp_path):
 
     assert snap.outputs["output_6163859b019d"].startswith("✅ Repository cloned")
     assert snap.outputs["output_bbab28ecefd9"].startswith("Env overlay executable")
-    assert [w.code for w in snap.warnings if w.code.startswith(("missing_output", "unresolved"))] == []
+    assert [
+        w.code for w in snap.warnings if w.code.startswith(("missing_output", "unresolved"))
+    ] == []
 
 
 def test_a_second_executor_row_for_one_iteration_is_stated_not_dropped(tmp_path):

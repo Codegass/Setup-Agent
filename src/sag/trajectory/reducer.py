@@ -1032,9 +1032,7 @@ def _merge_observation(
     )
 
 
-def _delivered_observation(
-    existing: ObservationInfo | None, delivered: str
-) -> ObservationInfo:
+def _delivered_observation(existing: ObservationInfo | None, delivered: str) -> ObservationInfo:
     """The record's [C] takes the row; whatever it displaces stays named.
 
     The engine states the observation it DELIVERED — the text the model read —

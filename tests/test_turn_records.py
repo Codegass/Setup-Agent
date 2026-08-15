@@ -534,8 +534,10 @@ def test_a_response_that_called_nothing_still_seals_its_turn(tmp_path):
     assert thought["envelope_ref"] is None
     # It was billed like any other response, and it was answered.
     assert thought["tokens_in"] == PROMPT_TOKENS and thought["tokens_out"] == COMPLETION_TOKENS
-    assert _turn_store(engine).retrieve_output(thought["observation_ref"]).startswith(
-        "No tool was called."
+    assert (
+        _turn_store(engine)
+        .retrieve_output(thought["observation_ref"])
+        .startswith("No tool was called.")
     )
     # And its window is the array that response answered from.
     assert thought["window_digest"]["component_refs"], "the turn claims no window"
@@ -554,9 +556,7 @@ def test_a_thought_only_turn_leaves_the_ledger_balanced(tmp_path):
     envelopes = _events(engine, "action_envelope")
     results = _events(engine, "tool_result")
     model_calls = [
-        row
-        for row in envelopes
-        if str(row["payload"].get("tool_call_id", "")).startswith("call_")
+        row for row in envelopes if str(row["payload"].get("tool_call_id", "")).startswith("call_")
     ]
 
     # Every call still has its envelope and its answer — the fence's two sides.
@@ -757,9 +757,7 @@ def test_an_engine_close_seals_the_word_it_sealed(tmp_path):
     assert sealed["gate_decision_id"] == gate.decision_id
     assert sealed["envelope_ref"] is None
     # The word the close delivered is resolvable, like any other observation.
-    assert "phase floor exhausted" in _turn_store(engine).retrieve_output(
-        sealed["observation_ref"]
-    )
+    assert "phase floor exhausted" in _turn_store(engine).retrieve_output(sealed["observation_ref"])
 
 
 def test_the_controller_and_the_model_share_one_turn_sequence(tmp_path):
