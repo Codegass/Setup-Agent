@@ -16,8 +16,9 @@ closes those holes, the warnings simply stop appearing.
 
 **Turn assembly.** A turn is one call and everything the ledger says about it:
 
-- `action_envelope` (or `forced_action`) opens a turn and supplies [B], the
-  call. The turn stays open until the next one opens.
+- `action_envelope` (or `forced_action`) ALWAYS opens a turn and supplies [B],
+  the call; it never joins a turn already open. The turn stays open until the
+  next one opens.
 - `tool_result` joins its turn by `envelope_id` and supplies [C], the
   observation.
 - `loop_decision` attaches the control layer's reading of that call — the
@@ -86,7 +87,6 @@ class _TurnState:
     t0: str | None = None
     t1: str | None = None
     control_seq: list[int] = field(default_factory=list)
-    decision_tool: str | None = None
     has_decision: bool = False
     #: Only a `tool_result` (or, after Pillar 1, a typed refusal) answers a
     #: call. A `loop_decision` may describe the answer, but it is not one — so
@@ -296,21 +296,21 @@ class TrajectoryReducer:
         envelope_id = payload.get("envelope_id")
         envelope_id = envelope_id if isinstance(envelope_id, str) and envelope_id else None
 
-        open_turn = self._open_turn
-        adoptable = (
-            open_turn is not None
-            and open_turn.call is None
-            and (open_turn.decision_tool is None or open_turn.decision_tool == tool)
-        )
-        # A decision-first stream opens the turn before its envelope arrives;
-        # that turn adopts this call rather than being sealed as envelope-less.
-        turn = open_turn if adoptable and open_turn is not None else None
-        if turn is None:
-            turn = self._open(collector, actor=actor, phase=None)
+        # An envelope ALWAYS opens a turn. It never joins one already open, not
+        # even a call-less one naming the same tool: this engine writes
+        # envelope→result→decision (measured across all 27 archived ledgers, 763
+        # envelopes, zero results preceding their envelope), so a still-open
+        # call-less turn is an orphan `loop_decision` — a refusal of an EARLIER
+        # call — and folding this envelope into it would assert that THIS
+        # envelope returned that refusal's error code and evidence ref. In a
+        # repair retry the two tool names match BY CONSTRUCTION, so tool-name
+        # adoption corrupts exactly the shape it looks safest on (camel-quarkus
+        # seq 124→125 and 138→139; the slice corpus pins the holes at the
+        # refusals, seq 124/138/216, not at the retries).
+        turn = self._open(collector, actor=actor, phase=None)
         turn.call = CallInfo(tool=tool, params_ref=envelope_id)
         turn.envelope_id = envelope_id
-        if turn.t0 is None:
-            turn.t0 = timestamp
+        turn.t0 = timestamp
         turn.touch(sequence)
         if envelope_id:
             self._by_envelope[envelope_id] = turn
@@ -395,7 +395,6 @@ class TrajectoryReducer:
             turn = self._open(collector, actor="model", phase=None)
 
         turn.has_decision = True
-        turn.decision_tool = tool_name
         iteration = event.get("iteration")
         if isinstance(iteration, int):
             turn.iteration = iteration

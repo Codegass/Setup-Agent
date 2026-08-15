@@ -19,7 +19,10 @@ layer is wrong:
   call emit no `loop_decision`" and "Three `loop_decision` events (seq 124, 138,
   216) carry a refusal and have no `tool_result`". Pre-Pillar-1 those are
   warnings, and the fence is that they are *stated* — at least the ten silent
-  calls spec §0 measured — not swallowed.
+  calls spec §0 measured — not swallowed. Stated at the right sequence, too: a
+  count alone would pass while every hole pointed one event past the call it
+  belongs to, so the refusals are pinned to 124/138/216 by number and each
+  turn's observation is checked against the call it claims to describe.
 
 Both fixtures are pre-closure sessions. Their warnings are the point: when
 Pillar 1 lands, new sessions stop producing them, and these archived ones keep
@@ -91,6 +94,45 @@ def test_camel_quarkus_silent_calls_are_the_phase_and_advisor_calls_the_slice_na
     tools = {snap.turns[turn_id - 1].call.tool for turn_id in silent_turns}
     assert tools <= {"phase", "advisor", "report"}
     assert "phase" in tools
+
+
+def test_camel_quarkus_refusal_holes_sit_where_the_slice_pinned_them():
+    """seq 124, 138, 216 — the three refusals, and no others.
+
+    The slice states it in words (`slices/camel-quarkus.md:1249`): "Three
+    `loop_decision` events (seq 124, 138, 216) carry a refusal and have no
+    `tool_result`". A hole reported one event later would name the model's
+    retry instead of the refused call — the same archaeology, re-derived.
+    """
+    snap = build_trajectory(CAMEL_QUARKUS)
+    assert [w.control_seq for w in snap.warnings if w.code == "missing_envelope"] == [124, 138, 216]
+    for sequence in (124, 138, 216):
+        codes = {w.code for w in snap.warnings if w.control_seq == sequence}
+        assert codes == {"missing_envelope", "missing_tool_result"}
+
+
+def test_camel_quarkus_refusals_never_borrow_the_next_call_envelope():
+    """The refused call has no envelope; the retry that followed keeps its own."""
+    snap = build_trajectory(CAMEL_QUARKUS)
+    opened = {turn.control_seq[0]: turn for turn in snap.turns if turn.control_seq}
+
+    refusal = opened[124]
+    assert refusal.call is None  # nothing to borrow — seq 125 is the retry, not this call
+    assert refusal.iteration == 17
+    assert refusal.observation.error_code == "REPAIR_INTENT_REQUIRED"
+    assert refusal.observation.ref == "output_8a2db03465f6"
+
+    retry = opened[125]
+    assert retry.call.params_ref == "envelope-000125" and retry.iteration == 18
+    assert retry.observation.ref == "output_8351840c096f"  # seq 127: operation_outcome success
+    assert retry.observation.error_code is None
+    assert retry.control_seq == [125, 127, 128]
+
+    # seq 138 shifted five turns' worth of decisions when it was adopted; the
+    # first of them is the fence for the whole cascade.
+    assert opened[138].call is None and opened[138].iteration == 21
+    assert opened[139].call.params_ref == "envelope-000139" and opened[139].iteration == 22
+    assert opened[139].observation.error_code is None
 
 
 def test_a_hole_is_a_warning_and_never_a_lost_turn():

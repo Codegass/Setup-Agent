@@ -2,9 +2,11 @@
 
 Every fixture below is bytes lifted verbatim out of an archived session — the
 kafka d2r3 run at
-`logs/session_20260814_072758_651456_4d81644227c3_24117/control_events.jsonl`
-and, for the controller turn, the httpcomponents-client run at
-`logs/session_20260813_202604_931286_731b3b90c419_2417/control_events.jsonl`.
+`logs/session_20260814_072758_651456_4d81644227c3_24117/control_events.jsonl`,
+for the controller turn the httpcomponents-client run at
+`logs/session_20260813_202604_931286_731b3b90c419_2417/control_events.jsonl`,
+and for the refused call the camel-quarkus d2r3 run at
+`logs/session_20260814_093336_763203_12dba3497295_26013/control_events.jsonl`.
 The field names the reducer joins on are the field names those runs actually
 wrote; nothing here is invented.
 """
@@ -56,6 +58,20 @@ REAL_FORCED_ACTION_JSONL = """\
 """
 
 
+# Sequences 124, 125, 127 and 128 of the archived camel-quarkus d2r3 session
+# (logs/session_20260814_093336_763203_12dba3497295_26013): a refused call whose
+# `loop_decision` is its only trace, then the retry that answered the refusal —
+# same tool, its own envelope, its own result, its own decision. The slice corpus
+# (logs/d2r3-serial-20260814/slices/camel-quarkus.md:47,1249) pins seq 124 as one
+# of the three refusals with no `tool_result`.
+REAL_REFUSED_THEN_RETRY_JSONL = """\
+{"event_id":"control-000124","kind":"loop_decision","payload":{"event":{"args":{"action":"provision","java_version":"17"},"attempt_id":"test-1","error_code":"REPAIR_INTENT_REQUIRED","evidence_ref":"output_8a2db03465f6","failure_signature":"REPAIR_INTENT_REQUIRED:111ba7480a39738a","invocation_status":"completed","iteration":17,"job_id":"","operation_outcome":"failed","output_cursor":"","phase":"test","recurrence_count":1,"relevant_scopes":[],"relevant_state":{"artifacts":2,"dependencies":0,"environment":1,"project_analysis":8,"test_runtime":7},"tool_name":"project"},"expected_decision":"continue","expected_reason_code":"new_recurrence_chain"},"sequence":124,"source":null,"timestamp":"2026-08-14T13:56:12.989548Z"}
+{"event_id":"control-000125","kind":"action_envelope","payload":{"action_fingerprint":"act-9e03092a3260efbd58df6f98f08f152ce5f85d183a53d23442102aecc1d6d0d8","blocking_fact_refs":["/workspace/camel-quarkus","asm-gate_assessment_303c17e7af6aa2bd-tests_not_executed-4bd3544f"],"domain_id":"test:/workspace","envelope_id":"envelope-000125","envelope_sha256":"60e753fd2fefee761227b84b5fa9a1852700f6a9f7e0479fdcfb1281eac9d4d7","exact_params":{"action":"provision","java_version":"17"},"expected_observation":["job_lifecycle_transition","receipt_assessment","tool_result"],"intent_id":"intent-f19aec72dbd1","intent_source":"model","next_action_kind":"provision","repair_context_id":"rcx-b41b0c9c98cd","repair_context_sha256":"c84b49273a784b202e98f5db59b5674c690cba905bca10d2142be1b05b16415f","repair_hypothesis":"The test run was blocked because the active runtime was Java 11 while the project\u2019s formatter plugin requires Java 17. Provisioning JDK 17 should satisfy the plugin prerequisite and allow the Maven wrapper test goal to start and produce runner receipts.","stop_condition":"Stop once Java 17 is provisioned and the next test dispatch can be attempted with the wrapper.","tool":"project","tool_call_id":"call_VWISTioI2BXdf64WnF7mRqsB","trigger_assessment_id":"asm-gate_assessment_303c17e7af6aa2bd-tests_not_executed-4bd3544f"},"sequence":125,"source":null,"timestamp":"2026-08-14T13:56:16.047479Z"}
+{"event_id":"control-000127","kind":"tool_result","payload":{"actual_executions":[{"execution_id":"execution_2758f01a8bf9449b8c3a6e06c727d2ea","params":{"action":"provision","java_version":"17"},"result":{"conflicts":[],"evidence_assessment":"success","evidence_refs":[],"evidence_status":"verified","facts":{},"invocation_status":"completed","metadata":{"architecture":"arm64","duration_ms":2992.069959640503,"java_home":"/usr/lib/jvm/java-17-openjdk-arm64","java_version":"17","package":"openjdk-17-jdk"},"operation_outcome":"success","output":"stored as output_8351840c096f","output_ref":"output_8351840c096f","refs":[],"validator_findings":[]},"roles":[],"scope":"environment","tool":"project"}],"envelope_id":"envelope-000125","execution_id":"execution_2758f01a8bf9449b8c3a6e06c727d2ea","output_sha256":"b334750081117ddb2fe8cf5a00a8f0fa3aff049286e9c2c7ccd6d0d796339c2f","params":{"action":"provision","java_version":"17"},"result":{"conflicts":[],"evidence_assessment":"success","evidence_refs":[],"evidence_status":"verified","facts":{},"invocation_status":"completed","metadata":{"architecture":"arm64","duration_ms":2992.069959640503,"java_home":"/usr/lib/jvm/java-17-openjdk-arm64","java_version":"17","package":"openjdk-17-jdk"},"operation_outcome":"success","output":"stored as output_8351840c096f","output_ref":"output_8351840c096f","refs":[],"validator_findings":[]},"roles":[],"scope":"environment","source_attempt_id":"test-1","source_phase":"test","tool":"project"},"sequence":127,"source":null,"timestamp":"2026-08-14T13:56:19.830252Z"}
+{"event_id":"control-000128","kind":"loop_decision","payload":{"event":{"args":{"action":"provision","java_version":"17"},"attempt_id":"test-1","error_code":"","evidence_ref":"output_8351840c096f","failure_signature":"","invocation_status":"completed","iteration":18,"job_id":"","operation_outcome":"success","output_cursor":"","phase":"test","recurrence_count":1,"relevant_scopes":[],"relevant_state":{"artifacts":2,"dependencies":0,"environment":1,"project_analysis":8,"test_runtime":7},"tool_name":"project"},"expected_decision":"continue","expected_reason_code":"outcome_not_loop_candidate"},"sequence":128,"source":null,"timestamp":"2026-08-14T13:56:19.849063Z"}
+"""
+
+
 def _lines(block: str) -> list[str]:
     return block.strip().splitlines()
 
@@ -91,19 +107,61 @@ def test_the_triple_joins_on_the_field_names_the_engine_actually_wrote():
     assert t.t1 == "2026-08-14T11:28:49.545505Z"  # the result closed it
 
 
-def test_the_order_of_the_triple_does_not_change_the_turn():
-    """The engine writes envelope-first; a decision-first stream folds the same."""
+def test_an_envelope_never_gets_stapled_onto_a_decision_that_precedes_it():
+    """A decision with no envelope behind it is a refusal of an EARLIER call.
+
+    The engine writes envelope→result→decision (see `REAL_TRIPLE`), so a
+    decision arriving first is never "this envelope, early" — it is a call the
+    ledger never enveloped. Adopting the next envelope into it would assert that
+    that envelope returned the refusal, which is exactly the archaeology this
+    layer exists to end (spec §0). Each keeps its own row, and each says what it
+    is missing.
+    """
     envelope, result, decision = REAL_TRIPLE
-    forward = TrajectoryReducer()
-    for line in (envelope, result, decision):
-        forward.feed(line)
-    reordered = TrajectoryReducer()
+    r = TrajectoryReducer()
     for line in (decision, envelope, result):
-        reordered.feed(line)
-    assert len(reordered.snapshot().turns) == 1
-    assert reordered.snapshot().turns[0].call == forward.snapshot().turns[0].call
-    assert reordered.snapshot().turns[0].observation == forward.snapshot().turns[0].observation
-    assert reordered.snapshot().warnings == []
+        r.feed(line)
+    snap = r.snapshot()
+    assert len(snap.turns) == 2
+    orphan, call = snap.turns
+    assert orphan.call is None and orphan.control_seq == [6]
+    assert call.call.params_ref == "envelope-000003" and call.control_seq == [3, 4]
+    assert {(w.code, w.control_seq) for w in snap.warnings} == {
+        ("missing_envelope", 6),
+        ("missing_tool_result", 6),
+        ("missing_loop_decision", 3),
+    }
+
+
+def test_a_refused_call_does_not_swallow_the_retry_that_followed_it():
+    """camel-quarkus seq 124: the refusal is its own row, the retry is its own.
+
+    Both name the `project` tool, and the retry is the model answering the
+    refusal — which is precisely when a same-tool adoption rule would fuse them
+    and report that `envelope-000125` returned `REPAIR_INTENT_REQUIRED`. The
+    ledger says `envelope-000125` succeeded.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_REFUSED_THEN_RETRY_JSONL):
+        r.feed(line)
+    snap = r.snapshot()
+    assert len(snap.turns) == 2
+
+    refusal, retry = snap.turns
+    assert refusal.call is None  # seq 124 has no envelope at all
+    assert refusal.iteration == 17 and refusal.control_seq == [124]
+    assert refusal.observation.error_code == "REPAIR_INTENT_REQUIRED"
+    assert refusal.observation.ref == "output_8a2db03465f6"
+
+    assert retry.call.tool == "project" and retry.call.params_ref == "envelope-000125"
+    assert retry.iteration == 18 and retry.control_seq == [125, 127, 128]
+    assert retry.observation.ref == "output_8351840c096f"  # what the retry actually returned
+    assert retry.observation.error_code is None  # tool_result says operation_outcome=success
+
+    assert {(w.code, w.control_seq) for w in snap.warnings} == {
+        ("missing_envelope", 124),
+        ("missing_tool_result", 124),
+    }
 
 
 def test_a_decision_with_no_result_seals_a_warning_when_the_next_turn_opens():
