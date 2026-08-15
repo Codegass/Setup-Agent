@@ -108,6 +108,9 @@ CONTROL_EVENT_KINDS = (
     # turn, stating the exact window the model saw. Appended last, like every
     # kind before it, so no reader keyed on position moves.
     "turn_record",
+    # Spec 2026-08-14 §2.2 rule 4: a call that never reached a tool says so.
+    # Appended for the same positional reason.
+    "refusal_record",
 )
 ControlEventKind = Literal[
     "planner_response",
@@ -134,6 +137,7 @@ ControlEventKind = Literal[
     "evidence_store_bound",
     "gate_outcome_revised",
     "turn_record",
+    "refusal_record",
 ]
 
 _SENSITIVE_CONFIG_KEY = re.compile(
@@ -1075,6 +1079,30 @@ class TurnRecordPayload(_StrictPayload):
         return self
 
 
+class RefusalRecordPayload(_StrictPayload):
+    """A call that never reached a tool, stated instead of dropped (§2.2 rule 4).
+
+    Measured silence: a refused call left a `loop_decision` describing an
+    execution that never happened, and nothing else — no envelope, because
+    nothing was dispatched, and no `tool_result`, because nothing answered
+    (cassandra ×2, samza-hello, camel, tapestry-5, camel-quarkus seq
+    124/138/216). Every derived turn inherited a hole where a decision was.
+
+    This record stands in BOTH empty places at once. It is the envelope of a
+    call nobody accepted — hence `exact_params_sha256`, which is what the
+    envelope would have committed, in the one form that stays bounded and lets
+    a refusal be compared with the retry that follows it (camel-quarkus seq
+    124→125 and 138→139 are the same parameters twice) — and it is the answer
+    that call received, which is `refusal_code`: the reason, from the refusal
+    itself, never inferred from what happened next.
+    """
+
+    tool: str = Field(min_length=1, max_length=256)
+    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    refusal_code: str = Field(min_length=1, max_length=256)
+    exact_params_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class EvidenceClosePayload(_StrictPayload):
     reason: Literal[
         "test_terminated",
@@ -1325,6 +1353,7 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "evidence_store_bound": EvidenceStoreBoundPayload,
     "gate_outcome_revised": GateOutcomeRevisedPayload,
     "turn_record": TurnRecordPayload,
+    "refusal_record": RefusalRecordPayload,
 }
 
 
@@ -1603,6 +1632,7 @@ __all__ = [
     "EVIDENCE_PUBLICATION_MAX_RECORD_BYTES",
     "EvidencePublicationPayload",
     "EvidenceStoreBoundPayload",
+    "RefusalRecordPayload",
     "RunPin",
     "SourceExcerpt",
     "SourceFileManifest",

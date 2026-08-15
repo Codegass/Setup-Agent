@@ -50,6 +50,7 @@ from .attempt_policy import (
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
     ControlEventSink,
+    RefusalRecordPayload,
     TurnRecordPayload,
     WindowDigestPayload,
     action_envelope_sha256,
@@ -4232,6 +4233,74 @@ class ReActEngine(UIEventEmitter):
             projection["test_stats"] = result.test_stats.model_dump(mode="json")
         return projection
 
+    #: The typed markers a refusal leaves on its result when it carries no
+    #: `error_code` of its own. Ordered, so one refusal always names itself the
+    #: same way; a second marker on the same result never renames the first.
+    _REFUSAL_MARKERS = (
+        "execution_refused",
+        "report_refused",
+        "report_delivery_failure",
+        "advisor_redirect",
+    )
+
+    @classmethod
+    def _refusal_code(cls, execution: ToolExecution) -> str:
+        """Why this call was refused, in the refusal's own words.
+
+        Never inferred from what happened afterwards: the code the refusal
+        stated is the code the record carries, and a refusal that stated none
+        is named by its typed marker rather than given a plausible one.
+        """
+        result = execution.result
+        code = str(getattr(result, "error_code", "") or "").strip()
+        if code:
+            return code
+        metadata = result.metadata or {}
+        for marker in cls._REFUSAL_MARKERS:
+            value = str(metadata.get(marker) or "").strip()
+            if value:
+                return f"{marker}:{value}"
+        return str(execution.status or "").strip() or "refused"
+
+    def _emit_control_refusal_record(
+        self,
+        call: ToolCall,
+        execution: ToolExecution,
+        params: Dict[str, Any],
+        *,
+        tool_call_id: str | None = None,
+    ) -> None:
+        """Seal the call nobody accepted (spec §2.2 rule 4).
+
+        A refused call has no envelope, because nothing was dispatched, and no
+        `tool_result`, because nothing answered. Until this record it therefore
+        appeared in the ledger only as a `loop_decision` describing an execution
+        that never happened — the exact shape five projects were measured in.
+
+        The parameters are committed as a digest rather than a copy: the refusal
+        of a call and the envelope of its retry then compare directly, which is
+        what camel-quarkus seq 124→125 needed and could not do. Never raises —
+        a run does not end because its record of a refusal would not validate.
+        """
+        sink = getattr(self, "control_event_sink", None)
+        if sink is None:
+            return
+        try:
+            exact_params = bounded_exact_params(params or {})
+        except (TypeError, ValueError) as exc:
+            logger.debug(f"refused call parameters were not recordable: {exc}")
+            exact_params = {}
+        try:
+            payload = RefusalRecordPayload(
+                tool=str(call.name or "") or "unknown",
+                tool_call_id=str(tool_call_id or "") or None,
+                refusal_code=self._refusal_code(execution),
+                exact_params_sha256=canonical_sha256(exact_params),
+            )
+            self._emit_control_event("refusal_record", payload.model_dump(mode="json"))
+        except Exception as exc:  # observability never ends a run
+            logger.warning(f"refusal record was not sealed: {exc}")
+
     def _emit_control_tool_result(
         self,
         *,
@@ -6112,8 +6181,14 @@ class ReActEngine(UIEventEmitter):
         # no tool can report, because it happens in another tool's runner.
         self._relay_material_recurrence_marker(execution)
         self._release_material_recurrence_on_build(execution)
+        # EVERY dispatched call is read here, claim tools included (spec §2.2
+        # rule 1): camel-quarkus recorded ten phase calls with no `loop_decision`
+        # at all, and their turn numbers had to be recovered by matching
+        # parameters. LoopMemory itself decides which tools its recurrence
+        # ladder COUNTS (`TOOLS_OUTSIDE_THE_LADDER`); the engine's job is to ask
+        # about all of them and record the answer.
         memory = getattr(self, "loop_memory", None)
-        if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
+        if memory is None:
             return None
         loop_event = self._loop_event_for_execution(execution)
         decision = memory.observe(loop_event)
@@ -7018,6 +7093,17 @@ class ReActEngine(UIEventEmitter):
                     call.name,
                     control_params,
                     intent=call.action_intent,
+                )
+            if control_envelope_id is None:
+                # Nothing was dispatched, so nothing will answer: the refusal is
+                # this call's envelope and its result at once (spec §2.2 rule 4).
+                # Sealed HERE, before the loop decision below reads the call, so
+                # the record opens the turn that decision closes.
+                self._emit_control_refusal_record(
+                    call,
+                    execution,
+                    control_params,
+                    tool_call_id=native_call_id,
                 )
             self._emit_control_tool_result(
                 envelope_id=control_envelope_id,

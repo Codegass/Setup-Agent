@@ -412,6 +412,37 @@ class TrajectoryReducer:
         )
         collector.touched(turn)
 
+    def _on_refusal_record(
+        self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
+    ) -> None:
+        """A call that never reached a tool: its own turn, and no hole in it.
+
+        The record stands where an envelope and a result would have stood, so
+        it opens a turn exactly as an envelope does and answers it in the same
+        breath. The turn is not a hole — it is a complete account of a call
+        that was refused, which is what spec §2.2 rule 4 asked the ledger for —
+        and the refusal itself is stated as an annotation, where a reader looks
+        for what happened to a turn rather than for what is missing from it.
+        """
+        tool = _text(payload.get("tool")) or "unknown"
+        turn = self._open(collector, actor="model", phase=None)
+        turn.call = CallInfo(tool=tool, params_ref=None)
+        turn.t0 = timestamp
+        turn.t1 = timestamp
+        turn.has_result = True
+        turn.touch(sequence)
+        collector.annotate(
+            "refusal",
+            turn.turn_id,
+            {
+                "tool": tool,
+                "refusal_code": payload.get("refusal_code"),
+                "exact_params_sha256": payload.get("exact_params_sha256"),
+                "tool_call_id": payload.get("tool_call_id"),
+            },
+        )
+        collector.touched(turn)
+
     def _on_tool_result(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
     ) -> None:
@@ -647,6 +678,7 @@ class TrajectoryReducer:
         "evidence_store_bound": _on_evidence_store_bound,
         "action_envelope": _on_action_envelope,
         "forced_action": _on_forced_action,
+        "refusal_record": _on_refusal_record,
         "tool_result": _on_tool_result,
         "loop_decision": _on_loop_decision,
         "gate_decision": _on_gate_decision,

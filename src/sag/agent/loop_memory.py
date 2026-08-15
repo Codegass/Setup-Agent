@@ -14,6 +14,19 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 # bound cannot invent a second number and drift away from it.
 COMPLETION_CLAIM_CAP = 3
 
+# Tools whose repetition this ladder does not bound. The ladder answers one
+# question — "did the same ACTION fail the same way while nothing moved?" — and
+# these three do not make project actions: `phase` states a terminal claim,
+# already bounded at COMPLETION_CLAIM_CAP by `observe_completion_claim`;
+# `manage_context` and `report` deliver the run's own bookkeeping. Counting them
+# here would put two instruments on one phase for one reason, and would let a
+# claim between two identical failing builds disarm the break those builds
+# armed. They are still OBSERVED, because spec §2.2 rule 1 requires every call
+# to state the control layer's reading of it (camel-quarkus: ten silent phase
+# calls, recoverable only by matching parameters by hand) — observed, recorded,
+# and never counted.
+TOOLS_OUTSIDE_THE_LADDER = frozenset({"phase", "manage_context", "report"})
+
 _STATE_SCOPES = (
     "environment",
     "dependencies",
@@ -769,6 +782,21 @@ class LoopMemory:
             event.relevant_state,
             _relevant_scopes(event),
         )
+        if _normalize_text(event.tool_name) in TOOLS_OUTSIDE_THE_LADDER:
+            # Before any state is read or written, so parity in the ledger can
+            # never become interference in the loop breaker: no chain, no armed
+            # key, no diversity census, no history row. The decision is real —
+            # `sag.agent.replay` re-derives it from the recorded event and
+            # compares — and it says exactly what happened, which is nothing.
+            return self._decision(
+                "continue",
+                action_key=action_key,
+                outcome_key=outcome_key,
+                vector=vector,
+                chain=_RecurrenceChain(vector=vector),
+                event=event,
+                reason_code="tool_outside_recurrence_ladder",
+            )
         base_key = (action_key, outcome_key)
         current_state = {
             _enum_text(scope): int(value) for scope, value in event.relevant_state.items()
