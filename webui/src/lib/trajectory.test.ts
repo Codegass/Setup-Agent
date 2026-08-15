@@ -13,7 +13,6 @@ import {
   formatSeq,
   gateChain,
   latestControlSeq,
-  latestTurnId,
   mergeTrajectory,
   recurrenceCount,
   rowsByTurn,
@@ -115,16 +114,6 @@ describe("mergeTrajectory", () => {
   it("takes the whole incoming document when nothing is held yet", () => {
     const polled = doc({ turns: [turn(7)] })
     expect(mergeTrajectory(null, polled)).toEqual(polled)
-  })
-})
-
-describe("latestTurnId", () => {
-  it("is the highest turn the document states", () => {
-    expect(latestTurnId(doc({ turns: [turn(1), turn(9), turn(4)] }))).toBe(9)
-  })
-
-  it("is null before any turn — a poller must not cut at zero by accident", () => {
-    expect(latestTurnId(doc())).toBeNull()
   })
 })
 

@@ -56,17 +56,6 @@ export function mergeTrajectory(
   }
 }
 
-/** The highest turn id the document states, or null when it states no turn. */
-export function latestTurnId(doc: TrajectoryDocument): number | null {
-  let latest: number | null = null
-  for (const turn of doc.turns) {
-    if (latest === null || turn.turn_id > latest) {
-      latest = turn.turn_id
-    }
-  }
-  return latest
-}
-
 /**
  * The cut to poll from next: the last ledger line this document was folded from.
  *

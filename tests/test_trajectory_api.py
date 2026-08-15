@@ -240,6 +240,41 @@ def test_a_late_fold_onto_a_turn_reaches_the_poller_the_turn_cut_lost(tmp_path):
     assert [turn["turn_id"] for turn in by_seq["turns"]] == [dispatch["turn_id"]]
 
 
+def test_polling_a_growing_ledger_converges_on_the_run(tmp_path):
+    """The fence the cut exists for: a poller ends up holding the whole run.
+
+    kafka's ledger is replayed a slice at a time, exactly as a live run appends
+    it, and each poll asks for the turns touched since the last line the consumer
+    held — merging as the timeline merges: upsert turns by id, replace everything
+    else. What the poller is left with must be the document a replay of the
+    finished file derives, turn for turn, byte for byte. Under a turn-id cut this
+    diverged on every turn that was ever caught in flight.
+    """
+    logs, session_dir, mirror = _mount(tmp_path)
+    total = _ledger(session_dir, KAFKA)
+    client = _client(logs, mirror)
+    session = _session_id("kafka")
+
+    held: dict | None = None
+    for stop in (*range(1, total, 11), total):
+        _ledger(session_dir, KAFKA, lines=stop)
+        watermark = (
+            max((seq for turn in held["turns"] for seq in turn["control_seq"]), default=None)
+            if held
+            else None
+        )
+        query = "" if watermark is None else f"?since_seq={watermark}"
+        polled = client.get(f"/api/sessions/{session}/trajectory{query}").json()
+        if held is None:
+            held = polled
+            continue
+        turns = {turn["turn_id"]: turn for turn in held["turns"]}
+        turns.update({turn["turn_id"]: turn for turn in polled["turns"]})
+        held = {**polled, "turns": [turns[key] for key in sorted(turns)]}
+
+    assert held == client.get(f"/api/sessions/{session}/trajectory").json()
+
+
 def test_two_cuts_at_once_are_refused_by_name(tmp_path):
     """One read, one watermark. A response cut two ways states neither."""
     logs, _, mirror = _mount(tmp_path)
