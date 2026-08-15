@@ -498,6 +498,9 @@ class TrajectoryReducer:
         tokens_out = payload.get("tokens_out")
         if isinstance(tokens_in, int) and isinstance(tokens_out, int):
             turn.tokens = TokenUsage(input=tokens_in, output=tokens_out)
+        delivered = _text(payload.get("observation_ref"))
+        if delivered:
+            turn.observation = _delivered_observation(turn.observation, delivered)
         turn.window_ref = _window_ref(payload.get("window_digest")) or turn.window_ref
         turn.touch(sequence)
         self._check_sealed_sequence(collector, payload.get("turn_id"), sequence)
@@ -1012,13 +1015,43 @@ def _merge_observation(
 
     Whichever event speaks first wins: the result and the decision describe the
     same observation, and neither is allowed to erase a field the other filled.
+    A ref that arrives while a DIFFERENT one is already held is kept as the
+    evidence ref rather than dropped — two events naming two byte strings for
+    one observation is information, not noise.
     """
     if existing is None:
         return ObservationInfo(ref=ref, error_code=error_code, failure_signature=failure_signature)
+    displaced = existing.evidence_ref
+    if displaced is None and ref is not None and existing.ref not in (None, ref):
+        displaced = ref
     return ObservationInfo(
         ref=existing.ref or ref,
+        evidence_ref=displaced,
         error_code=existing.error_code or error_code,
         failure_signature=existing.failure_signature or failure_signature,
+    )
+
+
+def _delivered_observation(
+    existing: ObservationInfo | None, delivered: str
+) -> ObservationInfo:
+    """The record's [C] takes the row; whatever it displaces stays named.
+
+    The engine states the observation it DELIVERED — the text the model read —
+    and that is what the row shows. The ref it displaces is the tool's own
+    output, which does not disappear: it moves to `evidence_ref`, where a
+    reader after the tool's bytes finds them.
+    """
+    if existing is None:
+        return ObservationInfo(ref=delivered)
+    evidence = existing.evidence_ref
+    if existing.ref not in (None, delivered):
+        evidence = existing.ref
+    return ObservationInfo(
+        ref=delivered,
+        evidence_ref=evidence,
+        error_code=existing.error_code,
+        failure_signature=existing.failure_signature,
     )
 
 

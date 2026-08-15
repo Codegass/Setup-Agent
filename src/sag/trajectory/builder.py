@@ -573,7 +573,14 @@ def _turn_refs(turns: list[Turn]) -> tuple[list[str], list[str]]:
     in_store: list[str] = []
     elsewhere: list[str] = []
     for turn in turns:
-        candidates = [turn.window_ref, turn.observation.ref if turn.observation else None]
+        candidates = [
+            turn.window_ref,
+            turn.observation.ref if turn.observation else None,
+            # What the TOOL wrote, when that is not what the model read. A
+            # reader expanding the row wants both copies, so the full tier
+            # resolves both.
+            turn.observation.evidence_ref if turn.observation else None,
+        ]
         for ref in candidates:
             if not ref:
                 continue

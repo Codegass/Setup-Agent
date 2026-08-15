@@ -64,9 +64,18 @@ class CallInfo(_TrajectoryModel):
 
 
 class ObservationInfo(_TrajectoryModel):
-    """[C] of the quad: what came back, and how it failed if it failed."""
+    """[C] of the quad: what came back, and how it failed if it failed.
+
+    `ref` is what the model READ — the observation the engine delivered, which
+    is the tool's text plus whatever the engine appended to it. `evidence_ref`
+    is what the TOOL wrote, when the two are not the same bytes. Both are
+    named, because a reader investigating an observation wants the copy the
+    model saw and the copy the tool produced, and neither stands in for the
+    other.
+    """
 
     ref: str | None = None
+    evidence_ref: str | None = None
     error_code: str | None = None
     failure_signature: str | None = None
 

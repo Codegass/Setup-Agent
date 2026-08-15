@@ -640,6 +640,50 @@ def test_the_reducer_takes_the_turn_from_the_record_instead_of_inferring_it(clos
     assert [turn.window_ref for turn in snapshot.turns if turn.actor == "controller"] == [None]
 
 
+def test_the_row_shows_what_the_model_read_and_still_names_the_tools_bytes(
+    closed_run, tmp_path
+):
+    """[C] is the DELIVERED text; the tool's own output stays named beside it.
+
+    `tool_result.output_ref` names what the TOOL wrote. What the model read is
+    the observation the engine delivered — the tool's text plus whatever the
+    engine appended to it (a settlement notice, a carried gate word) — and the
+    record names exactly that. A row whose [C] resolved to the tool's bytes
+    showed a reader something the model was never shown, which is the
+    reconstruction tax this layer exists to end (spec §0).
+
+    The evidence ref is not displaced into nothing: it moves one field over,
+    where a reader who wants the tool's own output finds it named.
+    """
+    snapshot = build_trajectory(tmp_path)
+    delivered = {
+        row["payload"]["envelope_ref"]: row["payload"]["observation_ref"]
+        for row in _events(closed_run, "turn_record")
+        if row["payload"]["envelope_ref"]
+    }
+    produced = {
+        row["payload"]["envelope_id"]: row["payload"]["result"].get("output_ref")
+        for row in _events(closed_run, "tool_result")
+    }
+    answered = [
+        turn
+        for turn in snapshot.turns
+        if turn.call and turn.call.params_ref in delivered and produced.get(turn.call.params_ref)
+    ]
+
+    assert answered, "no turn in this run both delivered and produced bytes"
+    for turn in answered:
+        envelope = turn.call.params_ref
+        assert turn.observation.ref == delivered[envelope]
+        assert turn.observation.evidence_ref == produced[envelope]
+        assert turn.observation.ref != turn.observation.evidence_ref
+    # And the full tier resolves both, because both are bytes this run wrote.
+    full = build_trajectory(tmp_path, detail="full")
+    for turn in answered:
+        assert full.outputs[turn.observation.ref]
+        assert full.outputs[turn.observation.evidence_ref]
+
+
 def test_the_live_fold_and_the_replay_agree_on_a_closed_session(closed_run, tmp_path):
     """Idempotence, with records and a refusal in the stream (spec §1).
 
