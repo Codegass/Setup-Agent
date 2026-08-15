@@ -5613,7 +5613,7 @@ class ReActEngine(UIEventEmitter):
             component_refs=tuple(refs),
         )
 
-    def _window_for(self, actor: str) -> WindowDigestPayload:
+    def _window_for(self, actor: str) -> Optional[WindowDigestPayload]:
         """The window a turn answered from — and for the controller, none.
 
         A forced action and an engine close are answers to POLICY, not to a
@@ -5621,13 +5621,18 @@ class ReActEngine(UIEventEmitter):
         components would state that it did. The controller's row still carries
         the run's prompt identity, so a reader can place it, and the window in
         force is one turn away — it is the model turn beside it.
+
+        Before the first render there is no prompt identity either, and a turn
+        sealed there claims NO window. Hashing the empty string was a fact
+        nobody observed: sha256("") resolves to nothing, reads like any other
+        prompt hash, and is the same 64 hex characters in every run that ever
+        sealed one.
         """
         digest = getattr(self, "_window_digest", None)
-        prompt = (
-            digest.system_prompt_sha256 if digest is not None else hashlib.sha256(b"").hexdigest()
-        )
-        if actor == "controller" or digest is None:
-            return WindowDigestPayload(system_prompt_sha256=prompt)
+        if digest is None:
+            return None
+        if actor == "controller":
+            return WindowDigestPayload(system_prompt_sha256=digest.system_prompt_sha256)
         return digest
 
     def _turn_bill(self, iteration: Optional[int]) -> tuple[Optional[int], Optional[int]]:

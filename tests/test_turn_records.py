@@ -136,6 +136,20 @@ def test_a_turn_cannot_end_before_it_began():
         )
 
 
+def test_a_turn_that_saw_no_window_states_none_rather_than_an_empty_hash():
+    """`window_digest: None` is a fact; sha256("") is a fact nobody observed.
+
+    A controller turn taken before the model has been shown anything answered
+    from no window at all. Sealing it with the hash of the empty string put a
+    64-hex prompt identity on the record — one that resolves to nothing, that
+    reads like any other prompt hash, and that compares EQUAL across every run
+    that ever sealed one.
+    """
+    sealed = TurnRecordPayload.model_validate(_payload(actor="controller", window_digest=None))
+
+    assert sealed.window_digest is None
+
+
 def test_a_controller_turn_needs_no_envelope_no_result_and_no_bill():
     sealed = TurnRecordPayload.model_validate(
         _payload(
@@ -594,9 +608,31 @@ def test_a_forced_action_seals_a_controller_turn(tmp_path):
     assert sealed["envelope_ref"] == forced[0]["payload"]["envelope_id"]
     # The harness's move is never billed the model's response.
     assert sealed["tokens_in"] is None and sealed["tokens_out"] is None
-    # A controller answers from policy, not from a window: no components are
-    # claimed for a turn nobody was shown.
-    assert sealed["window_digest"]["component_refs"] == []
+    # A controller answers from policy, not from a window — and this run has
+    # rendered none at all, so the record claims no window instead of hashing
+    # the empty string into something that looks like a prompt identity.
+    assert sealed["window_digest"] is None
+
+
+def test_a_controller_turn_beside_a_rendered_window_names_that_prompt(sealed_run):
+    """Once a window exists, the controller's row can be placed in the run.
+
+    The harness answered from policy, so it claims no components — but the
+    prompt build in force is a fact about this run, and naming it is what lets
+    a reader put the controller's row beside the model turn it interrupted.
+    """
+    controller = [
+        row["payload"]
+        for row in _events(sealed_run, "turn_record")
+        if row["payload"]["actor"] == "controller"
+    ]
+    model = _model_records(sealed_run)
+    prompts = {row["payload"]["window_digest"]["system_prompt_sha256"] for row in model}
+
+    assert controller, "this run took no controller turn"
+    assert all(row["window_digest"] is not None for row in controller)
+    assert all(row["window_digest"]["component_refs"] == [] for row in controller)
+    assert {row["window_digest"]["system_prompt_sha256"] for row in controller} <= prompts
 
 
 def test_a_forced_observation_reaches_the_branch_history(tmp_path):

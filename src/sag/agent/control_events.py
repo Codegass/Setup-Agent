@@ -1046,15 +1046,20 @@ class TurnRecordPayload(_StrictPayload):
     stop being invisible next to the model's.
 
     Absence is stated, never implied: a turn whose call was refused before an
-    envelope existed carries `envelope_ref: None`, and a turn nobody was billed
-    for carries no tokens. What a record never does is end before it began.
+    envelope existed carries `envelope_ref: None`, a turn nobody was billed for
+    carries no tokens, and a turn taken before this run rendered anything at
+    all — a controller move ahead of the first model window — carries
+    `window_digest: None`. Hashing the empty string instead would have put a
+    64-hex prompt identity on the record that resolves to nothing, reads like
+    any other prompt hash, and compares equal across every run that sealed one.
+    What a record never does is end before it began.
     """
 
     turn_id: int = Field(ge=1)
     phase: str = Field(min_length=1)
     iteration: int | None = Field(default=None, ge=0)
     actor: Literal["model", "controller"]
-    window_digest: WindowDigestPayload
+    window_digest: WindowDigestPayload | None = None
     envelope_ref: str | None = Field(default=None, min_length=1)
     observation_ref: str | None = Field(default=None, min_length=1)
     gate_decision_id: str | None = Field(default=None, min_length=1)
