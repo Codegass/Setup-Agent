@@ -4039,6 +4039,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "unsettled_jobs": None,
                 "cleanup_escalations": None,
                 "midrun_human_approvals": 0,
+                "close_reason": "",
             }
         from pathlib import Path
 
@@ -4126,11 +4127,35 @@ class ReportTool(BaseTool, UIEventEmitter):
                 }
             )
 
+        def close_reason() -> str:
+            """The reason the engine sealed evidence with, from the seal itself.
+
+            Read here rather than from the verdict snapshot because the
+            snapshot has no such field: the metrics `terminal_reason` said
+            `evidence_close_unavailable` in every run for want of one line.
+            The LAST close is the one that stands — a re-close after a sealed
+            verdict restates the same reason, never a new one.
+            """
+            if events is None or "evidence_close" not in CONTROL_EVENT_KINDS:
+                return ""
+            for event in reversed(events):
+                if event.get("kind") != "evidence_close":
+                    continue
+                payload = event.get("payload")
+                if isinstance(payload, dict):
+                    return str(payload.get("reason") or "").strip()
+            return ""
+
         return {
             "terminal_refusal_recurrences": completion_recurrences(),
             "unsettled_jobs": occurrences(("job_live_at_close", "job_unsettled"), unique_jobs=True),
             "cleanup_escalations": cleanup_escalations(),
             "midrun_human_approvals": 0,
+            # Not a control COUNT — `_control_surface` projects only the four
+            # counters above — but the same single stream read answers it, and
+            # a second read of the same file to ask one more question of it is
+            # the duplication this codebase keeps refusing.
+            "close_reason": close_reason(),
         }
 
     def _assemble_report_metrics_artifact(
@@ -4153,6 +4178,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # count as complete.
         receipt_records = self._read_live_metrics_receipts()
         obligation_records = self._read_live_metrics_obligations()
+        control = self._metrics_control_surface()
         return assemble_report_metrics(
             snapshot=snapshot,
             build_evidence=build_evidence,
@@ -4167,8 +4193,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                 obligation_records=obligation_records,
                 run_id=run_pin.get("run_id"),
             ),
-            control=self._metrics_control_surface(),
+            control=control,
             receipt_records=receipt_records,
+            close_reason=str(control.get("close_reason") or ""),
         )
 
     def finalize_metrics_v2(self, snapshot: Any) -> dict[str, Any]:

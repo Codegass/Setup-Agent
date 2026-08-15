@@ -814,6 +814,9 @@ def test_container_control_mirror_cannot_supply_metrics_kpis():
         "unsettled_jobs": None,
         "cleanup_escalations": None,
         "midrun_human_approvals": 0,
+        # A mirror supplies no reason either: the close it cannot be trusted
+        # to count is the close it cannot be trusted to name.
+        "close_reason": "",
     }
 
 
@@ -906,4 +909,6 @@ def test_control_surface_counts_host_events_without_duplicates(tmp_path):
         "unsettled_jobs": 2,
         "cleanup_escalations": 1,
         "midrun_human_approvals": 0,
+        # This stream never closed evidence, so it names no reason.
+        "close_reason": "",
     }

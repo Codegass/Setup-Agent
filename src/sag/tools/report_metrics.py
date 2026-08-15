@@ -974,7 +974,7 @@ def _run_surface(run_pin: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _outcome_surface(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def _outcome_surface(snapshot: Mapping[str, Any], *, close_reason: str = "") -> dict[str, Any]:
     canonical = _canonical_snapshot(snapshot)
     verdict = canonical.get("verdict")
     if not isinstance(verdict, str):
@@ -994,7 +994,17 @@ def _outcome_surface(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "verdict": verdict if verdict in {"success", "partial", "failed", "unknown"} else "unknown",
         "build_state": str(build.get("judgment") or status.get("overall") or "unavailable"),
         "test_state": str(tests.get("judgment") or status.get("overall") or "unavailable"),
-        "terminal_reason": str(canonical.get("close_reason") or "evidence_close_unavailable"),
+        # The seal's own word for why the run closed. The verdict snapshot has
+        # no `close_reason` field, so reading only there made this fallback the
+        # answer in EVERY run — a field that said "unavailable" about a reason
+        # that was known, sealed, and written to the control stream. It is read
+        # from the snapshot first in case a future schema carries it, then from
+        # the `evidence_close` event, and only then does absence stay absent.
+        "terminal_reason": str(
+            canonical.get("close_reason")
+            or str(close_reason or "").strip()
+            or "evidence_close_unavailable"
+        ),
     }
 
 
@@ -1108,6 +1118,7 @@ def assemble_report_metrics(
     coverage: Optional[Mapping[str, Any]] = None,
     control: Optional[Mapping[str, Any]] = None,
     receipt_records: Optional[Sequence[Mapping[str, Any]]] = (),
+    close_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the sole forward metrics contract.
 
@@ -1133,7 +1144,7 @@ def assemble_report_metrics(
         run_id=(run_pin or {}).get("run_id"),
         run_target_sha=(run_pin or {}).get("target_repo_sha"),
     )
-    outcome = _outcome_surface(snapshot)
+    outcome = _outcome_surface(snapshot, close_reason=str(close_reason or ""))
     evidence = _evidence_surface(conflicts, persistence or {})
     receipt_execution_count = tests.get("claimed", {}).get("receipt_executions", {}).get("executed")
     if (
