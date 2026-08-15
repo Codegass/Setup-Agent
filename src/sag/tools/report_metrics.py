@@ -72,6 +72,11 @@ _EVIDENCE_FIELDS = frozenset(
         "conflict_count",
     }
 )
+# How many observability fields this run's receipts DECLARED they could not
+# carry (`evidence_omissions` on the receipt). Optional and positive: a run
+# whose receipts omitted nothing writes no key, so every artifact written
+# before this surface existed stays exactly as valid as it was.
+_EVIDENCE_OPTIONAL_FIELDS = frozenset({"evidence_omissions"})
 _CLAIMED_FIELDS = frozenset({"latest_subjects", "latest_cases", "receipt_executions"})
 _TEST_FIELDS = frozenset(
     {
@@ -123,8 +128,14 @@ def _require_exact_fields(
     expected: frozenset[str],
     *,
     label: str,
+    optional: frozenset[str] = frozenset(),
 ) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != set(expected):
+    """Every expected field, no unknown ones, and only the named optionals.
+
+    An optional field is one whose ABSENCE is itself the fact ("no receipt
+    declared an omission"); it is never a silently missing count.
+    """
+    if not isinstance(value, Mapping) or set(value) - optional != set(expected):
         raise MetricsContractError(f"{label} fields are not the strict metrics-v2 schema")
     return value
 
@@ -253,10 +264,17 @@ def validate_report_metrics_v2(payload: Any) -> dict[str, Any]:
         _strict_nonempty_text(outcome.get(field), label=f"report metrics outcome {field}")
 
     evidence = _require_exact_fields(
-        top.get("evidence"), _EVIDENCE_FIELDS, label="report metrics evidence"
+        top.get("evidence"),
+        _EVIDENCE_FIELDS,
+        label="report metrics evidence",
+        optional=_EVIDENCE_OPTIONAL_FIELDS,
     )
     if evidence.get("integrity") not in {"complete", "degraded", "failed", "unavailable"}:
         raise MetricsContractError("report metrics evidence integrity is invalid")
+    if "evidence_omissions" in evidence:
+        omissions = evidence.get("evidence_omissions")
+        if type(omissions) is not int or omissions <= 0:
+            raise MetricsContractError("report metrics evidence omissions must be positive")
     expected_receipts = _strict_nonnegative_int_or_none(
         evidence.get("receipts_expected"), label="report metrics receipts expected"
     )
@@ -1053,6 +1071,36 @@ def _evidence_surface(
     }
 
 
+def _declared_omission_count(
+    receipts: Sequence[Mapping[str, Any]] | None,
+    *,
+    run_id: Any,
+) -> int:
+    """How many evidence fields this run's receipts said they could not carry.
+
+    The receipt is the only record that knows the difference between a field
+    that had nothing to say and a field whose value it had to drop, so the
+    count comes from the receipts' own `evidence_omissions` declarations and
+    from nothing else.
+    """
+    active_run = _nonempty_text(run_id)
+    if not receipts or not active_run:
+        return 0
+    total = 0
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping) or _nonempty_text(receipt.get("run_id")) != active_run:
+            continue
+        entries = receipt.get("evidence_omissions")
+        if not isinstance(entries, list):
+            continue
+        total += sum(
+            1
+            for entry in entries
+            if isinstance(entry, Mapping) and _nonempty_text(entry.get("field"))
+        )
+    return total
+
+
 def _coverage_surface(snapshot: Mapping[str, Any], tests: Mapping[str, Any]) -> dict[str, Any]:
     canonical = _canonical_snapshot(snapshot)
     build = canonical.get("build_evidence")
@@ -1146,6 +1194,15 @@ def assemble_report_metrics(
     )
     outcome = _outcome_surface(snapshot, close_reason=str(close_reason or ""))
     evidence = _evidence_surface(conflicts, persistence or {})
+    # What THIS run's receipts declared they could not carry. Scoped to the run
+    # like every other receipt-derived number here: a reused container's older
+    # receipts state their own run's holes, never this one's.
+    declared_omissions = _declared_omission_count(
+        receipt_records,
+        run_id=(run_pin or {}).get("run_id"),
+    )
+    if declared_omissions:
+        evidence["evidence_omissions"] = declared_omissions
     receipt_execution_count = tests.get("claimed", {}).get("receipt_executions", {}).get("executed")
     if (
         isinstance(receipt_execution_count, int)

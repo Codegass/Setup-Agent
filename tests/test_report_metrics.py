@@ -140,6 +140,64 @@ def test_absent_measurements_are_null_not_zero():
     }
 
 
+def _receipt(receipt_id, *, omissions=None):
+    payload = {
+        "schema_version": 2,
+        "receipt_id": receipt_id,
+        "run_id": "run-current",
+        "target_sha": "a" * 40,
+        "tool": "maven",
+        "requested_action": "test",
+        "effective_action": "verify",
+        "argv": "mvn verify",
+        "working_directory": "/workspace/p",
+        "outcome": "completed",
+        "report_delta": {"new": [], "changed": []},
+    }
+    if omissions:
+        payload["evidence_omissions"] = list(omissions)
+    return payload
+
+
+_OMISSION = {
+    "field": "testcase_execution_rows",
+    "status": "unavailable",
+    "reasons": ["receipt testcase_execution_rows.rows is invalid"],
+}
+
+
+def test_declared_evidence_omissions_are_counted_on_the_metrics_surface():
+    """A receipt that dropped an observability field is a fact about the run.
+
+    Metrics carry the VOLUME (which layer names it is the gate's and the
+    dispatch observation's job): a campaign reading only this artifact must be
+    able to tell a run whose evidence had holes from one whose evidence was
+    whole.
+    """
+    metrics = _assemble(
+        _snapshot(receipt_scoped=True),
+        run_pin={"run_id": "run-current", "target_repo_sha": "a" * 40},
+        receipt_records=[
+            _receipt("inv-maven-1-0001", omissions=[_OMISSION]),
+            _receipt("inv-maven-1-0002"),
+        ],
+    )
+
+    assert metrics["evidence"]["evidence_omissions"] == 1
+
+
+def test_a_foreign_run_receipts_omission_is_not_this_runs_hole():
+    metrics = _assemble(
+        _snapshot(receipt_scoped=True),
+        run_pin={"run_id": "run-current", "target_repo_sha": "a" * 40},
+        receipt_records=[
+            {**_receipt("inv-maven-1-0001", omissions=[_OMISSION]), "run_id": "run-earlier"},
+        ],
+    )
+
+    assert "evidence_omissions" not in metrics["evidence"]
+
+
 def test_execution_metrics_never_reappear_as_unversioned_flat_aliases():
     metrics = _assemble(
         _snapshot(receipt_scoped=True),

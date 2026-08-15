@@ -1828,10 +1828,17 @@ class _DomainDerivation:
     ``states`` is ``None`` when no build domains were surveyed; conflicts are
     reported either way, because an unreadable evidence record is a fact about
     the run whether or not the project decomposes into domains.
+
+    ``omissions`` is what the receipts themselves declared they could not
+    carry (``<receipt_id>:<field>``). It is not a conflict: the record is
+    intact and readable, and it is stating its own hole — but a rollup built
+    over a receipt that dropped its testcase rows must not read like a rollup
+    over a dispatch that ran no tests.
     """
 
     states: dict[str, dict[str, str]] | None = None
     conflicts: tuple[str, ...] = ()
+    omissions: tuple[str, ...] = ()
 
 
 def _condemned_receipt_ids(
@@ -1895,6 +1902,25 @@ def _is_production_action(value: Any) -> bool:
     return any(first.startswith(prefix) for prefix in _PRODUCTION_ACTION_PREFIXES)
 
 
+def _declared_evidence_omissions(receipts: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
+    """``<receipt_id>:<field>`` for every field a receipt says it could not carry.
+
+    Read from the receipts themselves, not inferred from an absent key: only
+    the receipt knows the difference between "this dispatch observed nothing"
+    and "this dispatch observed something the receipt could not represent".
+    """
+    named: list[str] = []
+    for receipt in receipts:
+        receipt_id = str(receipt.get("receipt_id") or "").strip() or "unidentified_receipt"
+        for entry in receipt.get("evidence_omissions") or ():
+            if not isinstance(entry, Mapping):
+                continue
+            field = str(entry.get("field") or "").strip()
+            if field:
+                named.append(f"{receipt_id}:{field}")
+    return tuple(sorted(dict.fromkeys(named)))
+
+
 def _domain_states(
     requirements: Mapping[str, Any] | None,
     receipts: Iterable[Mapping[str, Any]],
@@ -1924,9 +1950,10 @@ def _domain_states(
     """
     receipts = tuple(receipts)
     condemned, conflicts = _condemned_receipt_ids(receipts, assessments)
+    omissions = _declared_evidence_omissions(receipts)
     roots = _surveyed_domain_roots(requirements)
     if not roots:
-        return _DomainDerivation(None, conflicts)
+        return _DomainDerivation(None, conflicts, omissions)
     blockers = _domain_blockers(requirements)
     attempted: dict[str, str] = {}
     for receipt in sorted(receipts, key=_receipt_order):
@@ -1976,7 +2003,7 @@ def _domain_states(
         if blocker:
             entry["blocker"] = blocker
         states[root] = entry
-    return _DomainDerivation(states, conflicts)
+    return _DomainDerivation(states, conflicts, omissions)
 
 
 def _gate_domain_states(
@@ -2259,6 +2286,13 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         # dropped. Absent when the read was clean, so single-domain and
         # recorded-replay runs seal the pre-Plan-6 fact set byte-identically.
         validated_facts["build.evidence_conflicts"] = list(derived.conflicts)
+    if derived.omissions:
+        # What the receipts declared they could not carry. A hole a receipt
+        # STATES is not an integrity failure — the gate keeps grading — but it
+        # is the difference between "no rows were observed" and "rows were
+        # observed and could not be written down", and only the receipt knows
+        # which one this is.
+        validated_facts["build.evidence_omissions"] = list(derived.omissions)
     evidence_integrity_failure = any(
         conflict.startswith(("build_requirements_", "receipt_", "assessment_"))
         for conflict in derived.conflicts

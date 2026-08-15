@@ -501,6 +501,32 @@ def test_gradle_install_that_cannot_publish_narrates_the_substitution():
     assert "maven-publish" in first
 
 
+def test_gradle_narration_names_the_task_selection_the_argv_actually_carries():
+    """The delta line describes the argv, not the pre-suppression task string.
+
+    Construction routes the task set through `gradle_task_tokens`, which drops
+    a default the caller's own args already narrowed (`:spark:assemble` is not
+    joined by a project-wide `assemble`). The narration read `params["tasks"]`
+    verbatim, so a dispatch scoped to one subproject announced the whole
+    project's task — the exact overclaim the shared producer exists to remove.
+    """
+    params = {"tasks": "assemble", "gradle_args": ":spark:assemble -x test"}
+
+    executed = GradleBackend.executed_action("install", params, ":spark:assemble")
+
+    assert executed.argv_fragment == ":spark:assemble -x test"
+    assert GradleBackend.expected_argv(params) == ":spark:assemble -x test"
+
+
+def test_gradle_narration_is_unchanged_when_the_caller_narrowed_nothing():
+    params = {"tasks": "assemble", "gradle_args": "-x test"}
+
+    executed = GradleBackend.executed_action("install", params, None)
+
+    assert executed.argv_fragment == "assemble -x test"
+    assert "maven-publish" in " ".join(executed.reasons)
+
+
 def test_plain_compile_to_compile_java_gets_no_delta_line():
     orchestrator = ProbeOrchestrator(markers=["/workspace/p/build.gradle"])
     gradle = RecordingBackendTool(orchestrator=orchestrator)

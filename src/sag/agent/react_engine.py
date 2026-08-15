@@ -1249,7 +1249,10 @@ class ReActEngine(UIEventEmitter):
             and poll_ref == f"job:{job_id}"
         )
         if is_existing_job_poll:
-            records = read_obligations(getattr(self, "orchestrator", None))
+            # The same reader the rest of this method uses: a job the run has
+            # already disclosed as live at close is no longer owed, so it can
+            # no longer back a barrier claim either.
+            records = self._obligations_still_owed(getattr(self, "orchestrator", None))
             if records is None:
                 self._record_job_barrier_integrity_failure(
                     (f"detached_result_poll_ledger_unreadable:{job_id}",)
@@ -1617,7 +1620,13 @@ class ReActEngine(UIEventEmitter):
                 "cpu_ticks_delta": snapshot.cpu_ticks_delta if snapshot is not None else 0,
                 "artifact_sha256": snapshot.artifact_sha256 if snapshot is not None else "",
                 "report_sha256": snapshot.report_sha256 if snapshot is not None else "",
-                "progressing": state.get("last_progress_at") == observed_at,
+                # The predicate the controller actually formed this iteration —
+                # never re-derived from the stall clock. `last_progress_at` is
+                # SEEDED on absence so the stall window can start, and reading
+                # that seed back made the first row of every job announce
+                # progress it had never observed.  None means no predicate: no
+                # prior sample to compare with, or no observation at all.
+                "progressing": state.get("progressing"),
             }
             self._emit_control_event("job_barrier_wait", payload)
 
@@ -1981,12 +1990,19 @@ class ReActEngine(UIEventEmitter):
                 due_for_confirmation = handoff_stall
 
                 if not handoff_stall:
+                    # A progress predicate is a COMPARISON. Whether one was
+                    # available this iteration is decided here, before the
+                    # sample that becomes the next one's predecessor, and it is
+                    # what the barrier's wait row states — the stall clock
+                    # below is seeded on absence and can never answer it.
+                    comparable = previous_snapshot is not None
                     progress = probe_job_progress(
                         execute,
                         job,
                         previous=previous_snapshot,
                     )
                     if progress.code != "observed":
+                        progress_state["progressing"] = None
                         failures_seen = int(progress_state.get("probe_failures") or 0) + 1
                         progress_state["probe_failures"] = failures_seen
                         if failures_seen >= self._JOB_INTEGRITY_RETRIES:
@@ -1995,6 +2011,9 @@ class ReActEngine(UIEventEmitter):
                             )
                         continue
                     progress_state["probe_failures"] = 0
+                    progress_state["progressing"] = (
+                        bool(progress.progressing) if comparable else None
+                    )
                     progress_state["snapshot"] = progress.snapshot
                     previous_snapshot = progress.snapshot
                     if progress.snapshot.process_state == "terminal":
@@ -2036,6 +2055,9 @@ class ReActEngine(UIEventEmitter):
                 if result.progress is not None and result.progress.code == "observed":
                     progress_state["snapshot"] = result.progress.snapshot
                 if result.code == "progress_observed":
+                    # The confirmation compared two samples of its own and saw
+                    # the job move; that IS this iteration's predicate.
+                    progress_state["progressing"] = True
                     progress_state["last_progress_at"] = now()
                     continue
                 if result.code == "terminal_no_wait":

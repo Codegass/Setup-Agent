@@ -1158,6 +1158,26 @@ class _SettlementAttempt:
     integrity_failure: str = ""
 
 
+def _receipt_evidence_omissions(receipt: Mapping[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    """``(field, reason)`` for each observability field the receipt dropped.
+
+    The receipt already records this (`build_receipt` refuses to let one
+    unrepresentable field void the exit code, the argv and the report delta),
+    and nothing read it back. It is bounded by construction: only the four
+    omittable evidence fields can appear, each once.
+    """
+    omissions: list[Tuple[str, str]] = []
+    for entry in (receipt or {}).get("evidence_omissions") or ():
+        if not isinstance(entry, Mapping):
+            continue
+        field = _text(entry.get("field"))
+        if not field:
+            continue
+        reasons = [_text(reason) for reason in entry.get("reasons") or () if _text(reason)]
+        omissions.append((field, "; ".join(reasons) or "no reason stated"))
+    return tuple(omissions)
+
+
 @dataclass(frozen=True)
 class Settlement:
     """What one settled obligation did, for the notice and the event."""
@@ -1168,6 +1188,7 @@ class Settlement:
     claimed_paths: int
     excluded_claimed_paths: int = 0
     contract_id: str = ""
+    evidence_omissions: Tuple[Tuple[str, str], ...] = ()
 
     def notice(self) -> str:
         """The ONE bounded line the next observation carries (spec §3.2.7).
@@ -1187,6 +1208,11 @@ class Settlement:
             # takes it (Category 3 — the harness never states a fact that is
             # not true).
             line += f" ({self.excluded_claimed_paths} already claimed by an intervening receipt)"
+        for field, reason in self.evidence_omissions:
+            # The dispatch OBSERVED this and the receipt could not carry it.
+            # Silence here is what made a receipt with no module list read like
+            # a build that named one module.
+            line += f"; {field} was observed but not recorded on the receipt ({reason})"
         return line
 
     def event_payload(self) -> Dict[str, Any]:
@@ -1366,6 +1392,7 @@ def settlement_from_ledger(
         claimed_paths=len(_delta_paths(receipt.get("report_delta"))),
         excluded_claimed_paths=int(receipt.get("excluded_claimed_paths") or 0),
         contract_id=_text(obligation.get("contract_id")),
+        evidence_omissions=_receipt_evidence_omissions(receipt),
     )
 
 
@@ -1691,6 +1718,7 @@ def _finalize_settlement(
             claimed_paths=len(mine),
             excluded_claimed_paths=int(receipt.get("excluded_claimed_paths") or 0),
             contract_id=_text(obligation.get("contract_id")),
+            evidence_omissions=_receipt_evidence_omissions(receipt),
         )
     )
 

@@ -685,6 +685,76 @@ def test_a_clean_run_publishes_no_evidence_conflicts_key(tmp_path):
     assert "build.evidence_conflicts" not in gate.validated_facts
 
 
+OMISSION = {
+    "field": "testcase_execution_rows",
+    "status": "unavailable",
+    "reasons": ["receipt testcase_execution_rows.rows is invalid"],
+}
+
+
+def test_a_receipt_that_dropped_an_evidence_field_says_so_at_the_gate(tmp_path):
+    """The receipt's own declaration finally reaches a reader.
+
+    `build_receipt` drops an unrepresentable observability field alone and
+    records WHY on the receipt — and nothing read it back, so a rollup built
+    from a receipt with no testcase rows looked exactly like a rollup built
+    from a dispatch that ran no tests.
+    """
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(
+        {
+            **scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"),
+            "evidence_omissions": [OMISSION],
+        }
+    )
+
+    gate = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=GreenValidator(),
+        orchestrator=orch,
+        project_name=None,
+    )
+
+    assert gate.validated_facts["build.evidence_omissions"] == [
+        "inv-gradle-1-0001:testcase_execution_rows"
+    ]
+    # An omission is not a conflict: the receipt is intact and readable, and it
+    # states the hole itself.
+    assert "build.evidence_conflicts" not in gate.validated_facts
+
+
+def test_a_run_whose_receipts_omitted_nothing_publishes_no_omission_key(tmp_path):
+    orch = EvidenceOrch(tmp_path)
+    orch.write_receipt(scoped_receipt("inv-gradle-1-0001", PRODUCER, "completed"))
+
+    gate = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=GreenValidator(),
+        orchestrator=orch,
+        project_name=None,
+    )
+
+    assert "build.evidence_omissions" not in gate.validated_facts
+
+
+def test_a_single_domain_project_still_names_its_evidence_omissions(tmp_path):
+    """cli/tvm survey no domains; a dropped evidence field is still a fact."""
+    orch = EvidenceOrch(tmp_path, domains=None)
+    orch.write_receipt(
+        {
+            **scoped_receipt("inv-python-1-0001", PRODUCER, "completed"),
+            "evidence_omissions": [OMISSION],
+        }
+    )
+
+    derived = _gate_domain_states(orch)
+
+    assert derived.states is None
+    assert derived.omissions == ("inv-python-1-0001:testcase_execution_rows",)
+
+
 def test_a_single_domain_project_still_names_its_evidence_conflicts(tmp_path):
     """cli/tvm survey no domains, but an unreadable receipt is still a fact."""
     orch = EvidenceOrch(tmp_path, domains=None)

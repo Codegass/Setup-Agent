@@ -284,6 +284,65 @@ def test_the_same_jdk_spelled_at_two_precisions_satisfies_the_requirement():
     assert result.succeeded is True
 
 
+def test_a_dotted_requirement_is_not_met_by_a_different_patch_runtime():
+    """`21.0.1` and `21.0.9` are two runtimes, and the requirement named one.
+
+    The major fallback exists for the BARE spelling only. Majoring both sides
+    of a dotted requirement accepted any 21.x for `21.0.1` — a silent widening
+    of the constraint the caller stated, in the one code path whose whole job
+    is to refuse a version its own requirement disproves.
+    """
+    orchestrator = FakeJavaOverlayOrchestrator()
+    tool = EnvTool(orchestrator)
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/lib/jvm/java-21-openjdk-arm64/bin/java",
+        version="21.0.9",
+        requirement="21.0.1",
+        activate=True,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "ENV_RUNTIME_REQUIREMENT_MISMATCH"
+    assert result.raw_data["requirement"] == "21.0.1"
+    assert DEFAULT_OVERLAY_JSON not in orchestrator.files
+
+
+def test_a_dotted_requirement_is_met_by_the_runtime_it_names():
+    orchestrator = FakeJavaOverlayOrchestrator()
+    tool = EnvTool(orchestrator)
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/lib/jvm/java-21-openjdk-arm64/bin/java",
+        version="21.0.1",
+        requirement="21.0.1",
+        activate=True,
+    )
+
+    assert result.succeeded is True
+
+
+def test_a_legacy_bare_major_requirement_keeps_its_major_match():
+    """`1.8` names major 8 and nothing narrower: `1.8.0_361` satisfies it."""
+    orchestrator = FakeJavaOverlayOrchestrator()
+    tool = EnvTool(orchestrator)
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/lib/jvm/java-8-openjdk-arm64/bin/java",
+        version="1.8.0_361",
+        requirement="1.8",
+        activate=True,
+    )
+
+    assert result.succeeded is True
+
+
 def test_env_register_without_any_requirement_is_unchanged():
     """No requirement in force means no version to disprove — the old path stands."""
     orchestrator = FakeJavaOverlayOrchestrator()

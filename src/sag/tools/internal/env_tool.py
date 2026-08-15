@@ -15,7 +15,7 @@ from sag.agent.loop_memory import COMPLETION_CLAIM_CAP
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
-from .java_versions import java_major
+from .java_versions import java_major, names_bare_java_major
 from .toolchain_manager import (
     ToolchainManager,
     ToolVersionRequirement,
@@ -985,11 +985,20 @@ class EnvTool(BaseTool):
             return True
         if tool != "java" or requirement.kind != "exact" or not version:
             return False
-        # A Java requirement that names a bare major is met by any runtime of
+        # A Java requirement that names a BARE major is met by any runtime of
         # that major: "21" and "21.0.9" are one JDK, and "1.8" is major 8 —
         # the same rule build_preflight compares activations with. Refusing
         # `version="21.0.9"` against `requirement="21"` would refuse the one
         # honest answer the model can give.
+        #
+        # A DOTTED requirement is a different statement, and this fallback used
+        # to major BOTH sides of it: "21.0.1" accepted 21.0.9. An exact
+        # requirement is read exactly (`ToolchainManager._matches_requirement`
+        # -> `_same_version`), and a minimum has its own spelling (">=21.0.1"),
+        # so widening the caller's constraint here would be this tool refusing
+        # to enforce the one it was handed.
+        if not names_bare_java_major(requirement.raw):
+            return False
         required_major = java_major(requirement.raw)
         return bool(required_major) and java_major(version) == required_major
 

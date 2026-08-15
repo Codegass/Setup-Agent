@@ -17,7 +17,11 @@ from sag.agent.invocation_contracts import (
 )
 from sag.runtime.container_io import read_container_text
 from sag.tools.base import ActualToolExecution, OutputPersistenceError, ToolResult
-from sag.tools.internal.dispatch_argv import gradle_task_tokens, maven_action_tokens
+from sag.tools.internal.dispatch_argv import (
+    gradle_task_selections,
+    gradle_task_tokens,
+    maven_action_tokens,
+)
 
 # Verbs that produce local artifacts. Packaging is NOT a test owner — the `test`
 # verb is the only one (live bigtop: a naked `mvn install` ran environment-
@@ -507,17 +511,34 @@ class GradleBackend:
 
     @staticmethod
     def executed_action(verb: str, params: Dict[str, Any], args: Optional[str]) -> ExecutedAction:
-        """The gradle tasks actually dispatched, and their semantic delta."""
-        tasks = str(params.get("tasks") or verb)
+        """The gradle tasks actually dispatched, and their semantic delta.
+
+        Read from the SAME producer construction uses (`gradle_task_tokens`),
+        never from `params["tasks"]` verbatim: a default the caller's own args
+        already narrowed is dropped there, so narrating the raw task string
+        announced `assemble` for a dispatch that asks gradle only for
+        `:spark:assemble`. When the suppression leaves nothing to append, the
+        tasks that run are the caller's own selections — which is what the argv
+        carries and therefore what this line must name.
+        """
+        gradle_args = params.get("gradle_args")
+        materialized = str(params.get("tasks") or verb)
+        tokens = gradle_task_tokens(materialized, gradle_args) or gradle_task_selections(
+            gradle_args
+        )
+        tasks = " ".join(tokens)
         added = (
             GRADLE_EXCLUDE_TEST_ARGS
-            if _backend_added(params.get("gradle_args"), args, GRADLE_EXCLUDE_TEST_ARGS)
+            if _backend_added(gradle_args, args, GRADLE_EXCLUDE_TEST_ARGS)
             else ""
         )
         reasons: List[str] = []
         if added:
             reasons.append(_TEST_OWNERSHIP_REASON)
-        if verb == "install" and tasks == "assemble":
+        # The substitution is a fact about the task this backend MATERIALIZED —
+        # `_install_task` found no maven-publish plugin — and stays true however
+        # the caller then narrowed it.
+        if verb == "install" and materialized == "assemble":
             reasons.append(
                 "no maven-publish plugin — assemble builds the jars but publishes "
                 "nothing to the local maven repo"

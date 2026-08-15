@@ -1183,6 +1183,7 @@ _JAVA_RUNTIME_PROBE = "command -v java 2>/dev/null; java -version 2>&1"
 # The named conflict for "the build is not running the runtime we registered".
 JAVA_RUNTIME_CONFLICT = "java_runtime_not_activated"
 
+
 def active_java_runtime(orchestrator) -> Dict[str, str]:
     """The `java` this container resolves right now.
 

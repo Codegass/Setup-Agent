@@ -1291,7 +1291,9 @@ class JobBarrierWaitPayload(_StrictPayload):
     it concludes nothing: a wait is not a diagnosis. `progressing` is the
     controller's own progress predicate for THIS observation, carried so a
     frozen log with a live CPU tick is legible in the stream while it happens
-    rather than only in a post-mortem.
+    rather than only in a post-mortem. It is null when the controller formed no
+    predicate — the first sample for a job has nothing to compare against, and
+    a wait that observed nothing at all states nothing.
     """
 
     job_id: str = Field(min_length=1)
@@ -1304,7 +1306,7 @@ class JobBarrierWaitPayload(_StrictPayload):
     cpu_ticks_delta: int = Field(ge=0)
     artifact_sha256: str = ""
     report_sha256: str = ""
-    progressing: bool = False
+    progressing: bool | None = None
 
 
 class JobBarrierIntegrityFailurePayload(_StrictPayload):

@@ -33,6 +33,17 @@ def java_major(version: Any) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def names_bare_java_major(version: Any) -> bool:
+    """Whether a version string names a MAJOR and nothing narrower.
+
+    `21` and the legacy `1.8` name a major; `21.0.1` and `1.8.0_361` name one
+    particular runtime within it. The distinction is what keeps "the same JDK
+    spelled at two precisions" from turning into "any patch of that major
+    satisfies a requirement that named one".
+    """
+    return _JAVA_MAJOR_RE.fullmatch(str(version or "").strip()) is not None
+
+
 def parse_java_verification(output: str) -> Dict[str, Optional[str]]:
     """Read the runtime and compiler versions out of one verification block.
 

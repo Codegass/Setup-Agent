@@ -38,6 +38,7 @@ from sag.agent.evidence_publications import (
 )
 from sag.agent.invocation_receipts import (
     RECEIPT_DIR,
+    RECEIPT_MODULE_OUTCOMES_MAX_ITEMS,
     build_receipt,
     next_sequence,
     write_receipt,
@@ -986,3 +987,48 @@ def test_the_notice_states_the_exclusion_when_there_was_one():
     (settlement,) = settle_open_obligations(orchestrator)
 
     assert settlement.notice().endswith("1 already claimed by an intervening receipt)")
+
+
+# ---------------------------------------------------------------------------
+# the notice states an evidence field the receipt could not carry
+# ---------------------------------------------------------------------------
+
+# One task row per module, past the receipt's reactor bound: a real (if huge)
+# gradle log whose module list the receipt cannot represent.
+OVERSIZED_REACTOR_LOG = (
+    "\n".join(
+        f"> Task :module{index:05d}:test" for index in range(RECEIPT_MODULE_OUTCOMES_MAX_ITEMS + 1)
+    )
+    + "\nBUILD SUCCESSFUL in 41m 3s\n"
+)
+
+
+def test_the_notice_names_an_evidence_field_the_receipt_had_to_drop():
+    """The receipt's own declaration is the model's observation too.
+
+    `build_receipt` drops an unrepresentable observability field alone rather
+    than voiding the exit code, the argv and the report delta with it — and
+    the model, whose next turn reads only this line, was told nothing. A
+    settled dispatch that could not carry its module list looked exactly like
+    one that ran a single module.
+    """
+    orchestrator = _with_obligation(_orchestrator(files={LOG_PATH: OVERSIZED_REACTOR_LOG}))
+
+    (settlement,) = settle_open_obligations(orchestrator)
+
+    receipt = _settled_receipt(orchestrator)
+    assert "module_outcomes" not in receipt
+    assert [entry["field"] for entry in receipt["evidence_omissions"]] == ["module_outcomes"]
+    notice = settlement.notice()
+    assert "module_outcomes" in notice
+    assert "receipt module_outcomes is invalid" in notice
+    assert "\n" not in notice
+
+
+def test_a_settlement_that_carried_everything_says_nothing_extra():
+    orchestrator = _with_obligation(_orchestrator())
+
+    (settlement,) = settle_open_obligations(orchestrator)
+
+    assert settlement.evidence_omissions == ()
+    assert settlement.notice().endswith("2 report paths claimed")

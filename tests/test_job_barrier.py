@@ -1,6 +1,7 @@
 """WS2: a registered job is controller-owned until lifecycle settlement resolves."""
 
 import json
+from types import SimpleNamespace
 
 from test_job_settlement import (
     CONTAINER_ID,
@@ -24,6 +25,7 @@ from sag.agent.job_obligations import (
     write_obligation,
 )
 from sag.agent.react_llm import NativeToolCall, NativeTurn
+from sag.agent.react_types import StepType
 from sag.agent.output_storage import OutputStorageManager
 from sag.agent.stall_diagnostics import (
     CleanupResult,
@@ -644,3 +646,46 @@ def test_close_unsettled_scan_does_not_treat_unknown_ledger_as_empty(monkeypatch
     assert not any(
         fact.key.startswith("job_live_at_close.") for fact in engine.run_evidence_state.facts
     )
+
+
+def _search_poll_engine(monkeypatch, records):
+    """An engine whose last ACTION step is a `search` poll of a live job."""
+    engine = _engine([_text_turn()], max_iterations=1)
+    engine.orchestrator = object()
+    poll = ToolResult(
+        invocation_status=InvocationStatus.PENDING,
+        operation_outcome=OperationOutcome.UNKNOWN,
+        evidence_status=EvidenceStatus.UNKNOWN,
+        poll_ref=f"job:{JOB}",
+        output="",
+        metadata={"dispatch_status": "running_detached", "job_id": JOB},
+    )
+    engine.steps = [
+        SimpleNamespace(step_type=StepType.ACTION, tool_name="search", tool_result=poll)
+    ]
+    monkeypatch.setattr(react_engine_module, "read_obligations", lambda _o: list(records))
+    return engine
+
+
+def test_an_existing_job_poll_reads_the_obligations_still_owed(monkeypatch):
+    """One reader for "is this job still ours".
+
+    The poll branch read the RAW ledger while every other ledger question in
+    the same method goes through `_obligations_still_owed`, so a job the run
+    had already disclosed as live at close — the controller's last word on it —
+    still answered "backed by an owed obligation" here.
+    """
+    live = _obligation()
+    engine = _search_poll_engine(monkeypatch, [live])
+    engine._assessment_guard("_announced_jobs_live_at_close").add(JOB)
+
+    assert engine._capture_job_barrier_from_result() is True
+    failures = engine.run_evidence_state.fact_value("job_barrier_integrity_failure")["failures"]
+    assert f"detached_result_poll_obligation_missing:{JOB}" in failures
+
+
+def test_an_existing_job_poll_of_an_owed_obligation_stays_silent(monkeypatch):
+    engine = _search_poll_engine(monkeypatch, [_obligation()])
+
+    assert engine._capture_job_barrier_from_result() is True
+    assert "job_barrier_integrity_failure" not in engine.run_evidence_state.conflicts

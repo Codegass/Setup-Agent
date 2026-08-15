@@ -125,6 +125,42 @@ def test_an_unchanged_observation_is_reported_on_a_bounded_cadence():
     assert len({wait["log_size"] for wait in waits}) == 1
 
 
+def test_the_first_wait_states_an_unknown_progress_predicate():
+    """A seeded stall clock is not an observation of progress.
+
+    `last_progress_at` is seeded on ABSENCE (react_engine.py:2017-2018) so the
+    stall window starts at the first probe. The wait row compared that seed to
+    its own `observed_at` and read `progressing: true` back out of it — for a
+    job the controller had sampled exactly once, with no prior sample to
+    compare against. The first row now says so: unknown, not progressing.
+    """
+    container = WaitingContainer(polls_until_exit=10_000)
+    write_obligation(container.execute_command, waiting_obligation())
+    engine, events = _recording_engine(container)
+    engine._OBLIGATION_POLL_SECONDS = 30
+    engine._BARRIER_WAIT_EVERY = 2
+    clock = [0.0]
+
+    def tick(_seconds):
+        clock[0] += 30.0
+        if clock[0] >= 150.0:
+            raise StopIteration
+
+    engine._hold_deadline = lambda: 6_000.0
+    try:
+        engine._drain_job_barrier(now=lambda: clock[0], sleep=tick)
+    except StopIteration:
+        pass
+
+    waits = [payload for kind, payload in events if kind == "job_barrier_wait"]
+    assert [wait["waits"] for wait in waits] == [1, 3, 5]
+    # The container's probe reports a live CPU tick on every sample, so every
+    # wait that HAD a predecessor to compare with states the predicate it
+    # computed. Only the first one has nothing to compare.
+    assert waits[0]["progressing"] is None
+    assert [wait["progressing"] for wait in waits[1:]] == [True, True]
+
+
 def test_a_failing_event_sink_never_ends_the_wait():
     """Observability never ends a run: the emission is not on the wait's path."""
     container = WaitingContainer(polls_until_exit=3)
