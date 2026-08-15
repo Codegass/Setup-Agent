@@ -182,6 +182,14 @@ _STRICT_LINEAGE_CONTROL_KINDS = frozenset(
         # long window would come back short — a digest that reconstructs a
         # DIFFERENT array than the model saw, silently.
         "turn_record",
+        # For the same reason, one field further in: a refusal record carries
+        # the repair intent the model SUBMITTED, and the submission schema
+        # allows 4,096 characters a field. The compactor clips strings at 512
+        # and appends an ellipsis, so a stated hypothesis came back as a
+        # paraphrase of itself with nothing marking the record lossy. The
+        # payload bounds itself through `bounded_exact_params`; that is the
+        # bound, and it is the only one that may speak.
+        "refusal_record",
     }
 )
 _REPAIR_GUIDANCE_MAX_BYTES = 32 * 1024

@@ -366,6 +366,35 @@ def test_a_refused_repair_action_seals_the_intent_that_was_refused(tmp_path):
     )
 
 
+def test_a_refused_intent_is_sealed_whole_or_it_is_not_what_was_submitted(tmp_path):
+    """The model may state 4,096 chars a field; the record kept 512 of them.
+
+    `refusal_record` was left out of the strict-lineage set, so its payload went
+    through `compact_control_value` on the way to the sink — which clips every
+    string at 512 characters and appends an ellipsis. A stated hypothesis longer
+    than that was sealed as a paraphrase of itself, with no marker anywhere that
+    the authoritative record was lossy, under a docstring promising what the
+    model SUBMITTED. The payload already bounds itself through
+    `bounded_exact_params`; a second, silent bound is the one that lies.
+    """
+    submission = _repair_intent()
+    submission["repair_hypothesis"] = "the generator root shadows the compile classpath. " * 30
+    submission["stop_condition"] = "stop after one terminal receipt for the module. " * 28
+    assert len(submission["repair_hypothesis"]) > 512
+    turns = [
+        _phase_turn(1),
+        _tool_turn(2, "phase", {"action": "done", "outcome": "success"}),
+        _phase_turn(3),
+    ]
+    turns[1].tool_calls[0].arguments["repair_intent"] = submission
+    engine = _closure_engine(tmp_path, turns, pre_dispatch_control=True)
+    engine.run_setup_loop("set up the project", max_iterations=3)
+
+    refusal = _events(engine, "refusal_record")[0]["payload"]
+
+    assert refusal["repair_intent"] == submission
+
+
 def test_a_refusal_that_carried_no_intent_claims_none(closed_run):
     refusal = _events(closed_run, "refusal_record")[0]["payload"]
 
