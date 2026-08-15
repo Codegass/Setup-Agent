@@ -1101,6 +1101,27 @@ class RefusalRecordPayload(_StrictPayload):
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     refusal_code: str = Field(min_length=1, max_length=256)
     exact_params_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Spec §2.2 rule 3. A dispatched repair action states its intent in its
+    # envelope's own fields; a REFUSED one has no envelope, and the model's
+    # whole stated hypothesis lived in branch history and nowhere in the
+    # authoritative layer (six calls across the archives, all refused before
+    # dispatch). What is recorded here is what the model SUBMITTED — not a
+    # validated projection of it, because the reason the call was refused is
+    # usually that the submission was not valid.
+    repair_intent: dict[str, Any] | None = None
+
+    @field_validator("repair_intent", mode="before")
+    @classmethod
+    def _submitted_intent_is_bounded(cls, value: Any) -> Any:
+        return None if value is None else bounded_exact_params(value)
+
+    @model_serializer(mode="wrap")
+    def _an_intent_nobody_submitted_stays_absent(self, handler):
+        data = handler(self)
+        for field in ("tool_call_id", "repair_intent"):
+            if field not in self.model_fields_set:
+                data.pop(field, None)
+        return data
 
 
 class EvidenceClosePayload(_StrictPayload):

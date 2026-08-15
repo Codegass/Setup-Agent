@@ -4279,27 +4279,48 @@ class ReActEngine(UIEventEmitter):
 
         The parameters are committed as a digest rather than a copy: the refusal
         of a call and the envelope of its retry then compare directly, which is
-        what camel-quarkus seq 124→125 needed and could not do. Never raises —
-        a run does not end because its record of a refusal would not validate.
+        what camel-quarkus seq 124→125 needed and could not do. A submitted
+        `repair_intent` is carried whole, because no envelope will (spec §2.2
+        rule 3). Never raises — a run does not end because its record of a
+        refusal would not validate.
         """
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return
         try:
-            exact_params = bounded_exact_params(params or {})
-        except (TypeError, ValueError) as exc:
-            logger.debug(f"refused call parameters were not recordable: {exc}")
-            exact_params = {}
-        try:
             payload = RefusalRecordPayload(
                 tool=str(call.name or "") or "unknown",
                 tool_call_id=str(tool_call_id or "") or None,
                 refusal_code=self._refusal_code(execution),
-                exact_params_sha256=canonical_sha256(exact_params),
+                exact_params_sha256=self._refused_params_digest(params),
+                **self._submitted_repair_intent(call),
             )
             self._emit_control_event("refusal_record", payload.model_dump(mode="json"))
         except Exception as exc:  # observability never ends a run
             logger.warning(f"refusal record was not sealed: {exc}")
+
+    @staticmethod
+    def _refused_params_digest(params: Dict[str, Any] | None) -> str:
+        """What was asked, in the one form that always fits.
+
+        The exact form is the digest an envelope commits, so a refusal and the
+        envelope of its retry compare. A parameter set too large or too exotic
+        to commit exactly could never have produced that envelope either, so it
+        is digested from its bounded projection instead — which still tells one
+        refused call from another, and never claims the call had no parameters.
+        """
+        try:
+            return canonical_sha256(bounded_exact_params(params or {}))
+        except (TypeError, ValueError):
+            return canonical_sha256(compact_control_value(params or {}))
+
+    @staticmethod
+    def _submitted_repair_intent(call: ToolCall) -> Dict[str, Any]:
+        """The model's own repair block, kept absent when it submitted none."""
+        submission = getattr(call, "repair_intent_submission", None)
+        if not isinstance(submission, Mapping):
+            return {}
+        return {"repair_intent": dict(submission)}
 
     def _emit_control_tool_result(
         self,

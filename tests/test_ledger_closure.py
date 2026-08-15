@@ -22,6 +22,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from test_native_loop_engine import _engine, _phase_turn
+from test_terminal_claim_convergence import _engine as _repair_engine
+from test_terminal_claim_convergence import _open_repair, _repair_call
 from test_turn_records import _BillingClient, _events
 
 from sag.agent.control_events import (
@@ -31,10 +33,12 @@ from sag.agent.control_events import (
     RefusalRecordPayload,
     canonical_sha256,
 )
+from sag.agent.invocation_contracts import clear_action_context
 from sag.agent.loop_memory import LoopEvent, LoopMemory
 from sag.agent.output_storage import OutputStorageManager
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.token_tracker import TokenTracker
+from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.trajectory.builder import build_trajectory
 
 FIXTURES = Path(__file__).parent / "fixtures" / "trajectory"
@@ -56,14 +60,35 @@ def _tool_turn(index, name, arguments):
     )
 
 
-def _closure_engine(tmp_path, turns):
-    """The native-loop harness with a real ledger, store, and loop memory."""
+def _closure_engine(tmp_path, turns, *, pre_dispatch_control=False):
+    """The native-loop harness with a real ledger, store, and loop memory.
+
+    `pre_dispatch_control` wires the real intent-minting boundary in front of
+    the tools, which is where a repair intent is accepted or refused.
+    """
     engine = _engine(turns)
     engine.control_event_sink = ControlEventSink(tmp_path / "control_events.jsonl")
     engine.output_storage = OutputStorageManager(tmp_path / "contexts")
     engine.token_tracker = TokenTracker()
     engine.loop_memory = LoopMemory()
     engine.llm_client = _BillingClient(turns, engine.token_tracker)
+    if pre_dispatch_control:
+        engine._pending_repair_context = None
+        engine._last_invocation_contract_id = None
+        orchestrator = ToolOrchestrator(
+            tools=engine.tools,
+            context_manager=engine.context_manager,
+            recent_tool_executions=engine.recent_tool_executions,
+            successful_states=engine.successful_states,
+            repository_url=engine.repository_url,
+            track_tool_execution=lambda *a, **k: None,
+            update_successful_states=lambda *a, **k: None,
+            add_system_guidance=lambda *a, **k: None,
+            get_timestamp=lambda: "2026-08-15T00:00:00Z",
+            output_storage=None,
+            before_tool_execute=engine._prepare_control_action,
+        )
+        engine._get_tool_orchestrator = lambda: orchestrator
     return engine
 
 
@@ -266,6 +291,78 @@ def test_the_reducer_reads_a_refusal_as_an_annotation_not_a_hole(closed_run, tmp
     ]
     assert annotations and annotations[0].data["refusal_code"] == "UNKNOWN_TOOL"
     assert [warning for warning in snapshot.warnings if warning.turn_id == refused[0].turn_id] == []
+
+
+# ---------------------------------------------------------------------------
+# Rule 3 — repair intent survives from the model's hand to the sealed record
+# ---------------------------------------------------------------------------
+
+
+def _repair_intent():
+    return {
+        "blocking_fact_refs": ["asm-gate_1ab4d6d4-build_red-ea9e5b34"],
+        "repair_hypothesis": "a formatting-only violation blocks the compile",
+        "next_action_kind": "compile",
+        "expected_observation": ["receipt_assessment"],
+        "stop_condition": "stop after one terminal receipt",
+    }
+
+
+def test_a_dispatched_repair_action_seals_the_intent_the_model_submitted():
+    """The accepted half, pinned: seatunnel seq 85 carries all five fields."""
+    engine = _repair_engine()
+    prepared = _open_repair(engine)
+    engine._active_native_tool_call_id = "model-repair"
+    call = _repair_call(prepared.context)
+
+    engine._prepare_control_action(call, {"action": "deps"})
+
+    envelope = [
+        event for event in engine.control_event_sink.events if event.kind == "action_envelope"
+    ][-1]
+    submitted = call.repair_intent_submission
+    assert envelope.payload["repair_hypothesis"] == submitted["repair_hypothesis"]
+    assert envelope.payload["blocking_fact_refs"] == submitted["blocking_fact_refs"]
+    assert envelope.payload["next_action_kind"] == submitted["next_action_kind"]
+    assert envelope.payload["expected_observation"] == submitted["expected_observation"]
+    assert envelope.payload["stop_condition"] == submitted["stop_condition"]
+    clear_action_context()
+
+
+def test_a_refused_repair_action_seals_the_intent_that_was_refused(tmp_path):
+    """The measured half (seatunnel shape, six calls across the archives).
+
+    A `repair_intent` submitted without an active judge context is refused
+    before dispatch, so no envelope was ever going to carry it — and until the
+    refusal became a record, the model's whole stated hypothesis lived in the
+    branch history and nowhere in the authoritative layer.
+    """
+    submission = _repair_intent()
+    turns = [
+        _phase_turn(1),
+        _tool_turn(2, "phase", {"action": "done", "outcome": "success"}),
+        _phase_turn(3),
+    ]
+    turns[1].tool_calls[0].arguments["repair_intent"] = submission
+    engine = _closure_engine(tmp_path, turns, pre_dispatch_control=True)
+    engine.run_setup_loop("set up the project", max_iterations=3)
+
+    refusals = _events(engine, "refusal_record")
+    assert len(refusals) == 1
+    refusal = refusals[0]["payload"]
+    assert refusal["refusal_code"] == "REPAIR_CONTEXT_NOT_ACTIVE"
+    assert refusal["repair_intent"] == submission
+    # And the parameters it names are the tool's own, so the digest still
+    # compares with the envelope of a retry that drops the intent.
+    assert refusal["exact_params_sha256"] == canonical_sha256(
+        {"action": "done", "outcome": "success", "key_results": ""}
+    )
+
+
+def test_a_refusal_that_carried_no_intent_claims_none(closed_run):
+    refusal = _events(closed_run, "refusal_record")[0]["payload"]
+
+    assert "repair_intent" not in refusal
 
 
 def test_the_archived_sessions_keep_the_holes_their_bytes_recorded():
