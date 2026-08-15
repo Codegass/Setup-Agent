@@ -50,6 +50,15 @@ export function statusMeta(status: string): StatusMeta {
   }
 }
 
+/** Whether a session's status means the run is still moving — the one place
+ *  that question is answered, so the dashboard's poll and the timeline's
+ *  `since=` follow can never disagree about what "live" means. */
+export function isLiveSessionStatus(status?: string | null): boolean {
+  return ["active", "pending", "queued", "running", "in_progress"].includes(
+    (status ?? "").trim().toLowerCase(),
+  )
+}
+
 export function isUsefulEvidenceStatus(status?: string | null): boolean {
   const normalized = status?.trim().toLowerCase()
   return Boolean(normalized && !["unknown", "none"].includes(normalized))

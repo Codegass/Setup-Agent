@@ -2,6 +2,7 @@ import { Activity, Box, FileText, Layers, Sparkles, Terminal } from "lucide-reac
 import type { LucideIcon } from "lucide-react"
 
 import type { ExecutionSessionDetail, SubmitTaskResponse, Tone } from "@/api/types"
+import { isLiveSessionStatus } from "@/components/common/status"
 import { BuildFacet } from "@/components/session/BuildFacet"
 import { ContextTrace } from "@/components/session/ContextTrace"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
@@ -12,6 +13,7 @@ import { TestFacet } from "@/components/session/TestFacet"
 
 import { FlowTab } from "./FlowTab"
 import { OverviewTab } from "./OverviewTab"
+import { TimelineTab } from "./TimelineTab"
 
 export type FacetId = "build" | "test" | "flow" | "evidence" | "files" | "report" | "logs"
 
@@ -76,6 +78,7 @@ export function FacetBody({ id, detail }: { id: FacetId; detail: ExecutionSessio
 
 export type TabId =
   | "overview"
+  | "timeline"
   | "flow"
   | "tests"
   | "build"
@@ -98,7 +101,13 @@ export interface TabMeta {
  * data exists (mirroring `buildDetailFacets` gating). Order matches the design template.
  */
 export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
-  const tabs: TabMeta[] = [{ id: "overview", label: "Overview" }]
+  // Timeline leads the panels because it is the run itself, turn by turn, and
+  // it is never gated on data being present: it derives from the control ledger
+  // every run writes, and a run with no ledger yet says so in its own words.
+  const tabs: TabMeta[] = [
+    { id: "overview", label: "Overview" },
+    { id: "timeline", label: "Timeline" },
+  ]
 
   if (d.context) {
     tabs.push({ id: "flow", label: "Flow" })
@@ -152,6 +161,8 @@ export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
   switch (tabId) {
     case "overview":
       return <OverviewTab detail={detail} onOpenFlow={onOpenFlow ?? (() => {})} />
+    case "timeline":
+      return <TimelineTab live={isLiveSessionStatus(detail.status)} sessionId={detail.id} />
     case "flow":
       return <FlowTab detail={detail} />
     case "tests":

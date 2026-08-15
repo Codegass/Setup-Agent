@@ -383,6 +383,107 @@ export interface ReportDocument {
   blocks: Array<Record<string, unknown>>
 }
 
+// ── trajectory-v1 ────────────────────────────────────────────────────────────
+// One vocabulary with `src/sag/trajectory/schema.py`, which is why these fields
+// are snake_case where the rest of this file is camelCase: the trajectory
+// endpoint serves the reducer's own document unaliased, and renaming it here
+// would put a second name on every field a warning or a CLI dump already uses.
+
+export type TrajectoryDetail = "summary" | "full"
+export type TrajectoryActor = "model" | "controller"
+export type TrajectoryAnnotationKind =
+  | "refusal"
+  | "forced"
+  | "repair_context"
+  | "recurrence"
+  | "conflict"
+
+export interface TrajectorySession {
+  run_id: string
+  project?: string | null
+  verdict?: string | null
+  rates?: Record<string, unknown> | null
+  wall_clock_seconds?: number | null
+}
+
+/** [B] of the quad: what was asked of the tool. `params_ref` names an envelope
+ *  in `control_events.jsonl`, not an output-store handle. */
+export interface TrajectoryCall {
+  tool: string
+  params_ref?: string | null
+}
+
+/** [C] of the quad. `ref` is what the model READ; `evidence_ref` is what the
+ *  tool WROTE, when those are not the same bytes. */
+export interface TrajectoryObservation {
+  ref?: string | null
+  evidence_ref?: string | null
+  error_code?: string | null
+  failure_signature?: string | null
+}
+
+export interface TrajectoryGate {
+  word: string
+  decision_id?: string | null
+  supersedes?: string | null
+}
+
+export interface TrajectoryTokens {
+  input: number
+  output: number
+}
+
+export interface TrajectoryTurn {
+  turn_id: number
+  phase: string
+  iteration?: number | null
+  actor: TrajectoryActor
+  window_ref?: string | null
+  /** [A] whole, in render order. A `window_truncated:<n>` entry names a CUT
+   *  rather than bytes and resolves to nothing on purpose. */
+  window_components?: string[] | null
+  call?: TrajectoryCall | null
+  observation?: TrajectoryObservation | null
+  gate?: TrajectoryGate | null
+  tokens?: TrajectoryTokens | null
+  t0?: string | null
+  t1?: string | null
+  control_seq: number[]
+}
+
+export interface TrajectoryPhase {
+  name: string
+  termination?: string | null
+  /** Every grading the phase made, superseded ones included — which is what
+   *  makes a supersedes chain walkable from the document alone. */
+  gates: TrajectoryGate[]
+}
+
+export interface TrajectoryAnnotation {
+  kind: TrajectoryAnnotationKind
+  turn_id: number
+  data: Record<string, unknown>
+}
+
+export interface TrajectoryWarning {
+  code: string
+  detail: string
+  control_seq?: number | null
+  turn_id?: number | null
+}
+
+export interface TrajectoryDocument {
+  schema_version: number
+  session: TrajectorySession
+  phases: TrajectoryPhase[]
+  turns: TrajectoryTurn[]
+  annotations: TrajectoryAnnotation[]
+  warnings: TrajectoryWarning[]
+  /** Full tier only: every resolvable ref mapped to its verbatim bytes. `null`
+   *  means the tier was not asked for; `{}` means it was and nothing resolved. */
+  outputs?: Record<string, string> | null
+}
+
 export interface LaunchProjectRowInput {
   repo_url: string
   name?: string | null

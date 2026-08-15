@@ -8,6 +8,8 @@ import type {
   LaunchQueueState,
   SubmitTaskResponse,
   SystemSummary,
+  TrajectoryDetail,
+  TrajectoryDocument,
 } from "./types"
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -33,6 +35,33 @@ export function fetchSystem(): Promise<SystemSummary> {
 export function fetchSession(sessionId: string): Promise<ExecutionSessionDetail> {
   return getJson<ExecutionSessionDetail>(
     `/api/sessions/${encodeURIComponent(sessionId)}`,
+  )
+}
+
+/**
+ * One session's trajectory-v1 document.
+ *
+ * `since` is the poller's cut and it cuts TURNS ONLY: the response still
+ * restates `session`, `phases`, `annotations` and `warnings` whole, because a
+ * warning can be withdrawn and an annotation can land on a turn far below the
+ * cut, and a cut has no channel for a retraction. Consumers upsert turns by id
+ * and REPLACE the rest — see `mergeTrajectory`.
+ *
+ * `detail=full` additionally resolves every ref to its bytes; it is not the
+ * tier to poll with, since `outputs` is whole on every response.
+ */
+export function fetchTrajectory(
+  sessionId: string,
+  options?: { detail?: TrajectoryDetail; since?: number },
+): Promise<TrajectoryDocument> {
+  const query = new URLSearchParams({ detail: options?.detail ?? "summary" })
+  // `since=0` is a real cut (drop nothing, and say so), not a missing option.
+  if (options?.since != null) {
+    query.set("since", String(options.since))
+  }
+
+  return getJson<TrajectoryDocument>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/trajectory?${query.toString()}`,
   )
 }
 

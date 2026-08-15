@@ -5,6 +5,7 @@ import {
   fetchDashboard,
   fetchLaunchQueue,
   fetchSession,
+  fetchTrajectory,
   submitProjectBatch,
   submitTask,
 } from "./client"
@@ -49,6 +50,38 @@ describe("api client", () => {
     await fetchSession("S 1/?")
 
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S%201%2F%3F")
+  })
+
+  it("asks for a trajectory at the summary tier by default", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ schema_version: 1, turns: [] }))
+
+    await fetchTrajectory("S1")
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=summary")
+  })
+
+  it("carries the detail tier and the since cut into the query", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ schema_version: 1, turns: [] }))
+
+    await fetchTrajectory("S 1/?", { detail: "full", since: 12 })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/S%201%2F%3F/trajectory?detail=full&since=12",
+    )
+  })
+
+  it("sends since=0 rather than dropping it — zero is a cut, not an absence", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ schema_version: 1, turns: [] }))
+
+    await fetchTrajectory("S1", { since: 0 })
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=summary&since=0")
   })
 
   it("submits a task with the backend source_session field", async () => {

@@ -63,6 +63,16 @@ describe("buildDetailTabs", () => {
     expect(tabs.map((t) => t.id)).toContain("flow")
   })
 
+  it("puts the timeline right after overview, for every session", () => {
+    expect(buildDetailTabs(detail()).map((t) => t.id).slice(0, 2)).toEqual([
+      "overview",
+      "timeline",
+    ])
+    // Unlike flow, it does not wait on a context trace: the timeline is derived
+    // from the control ledger, which every run writes.
+    expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("timeline")
+  })
+
   it("always includes core tabs and surfaces tests count + red tone when failing", () => {
     const tabs = buildDetailTabs(
       detail({ test: { state: "partial", pass: 8, fail: 2, skip: 0, total: 10 } }),

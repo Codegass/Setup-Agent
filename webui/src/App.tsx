@@ -20,6 +20,7 @@ import type {
 } from "@/api/types"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
+import { isLiveSessionStatus } from "@/components/common/status"
 import { NavBar } from "@/components/NavBar"
 import { Tooltip } from "@/components/ui/tooltip"
 import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
@@ -27,11 +28,10 @@ import { RailSkeleton } from "@/pages/RailSkeleton"
 import { WorkspaceRail } from "@/pages/WorkspaceRail"
 import { sortByAttentionFirst } from "@/pages/dashboardAttention"
 import { DetailPane } from "@/pages/detail/DetailPane"
+import { DASHBOARD_POLL_MS, SESSION_DETAIL_POLL_MS } from "@/lib/polling"
 import { readStored, writeStored } from "@/lib/safeStorage"
 import { cn } from "@/lib/utils"
 
-const DASHBOARD_POLL_MS = 5000
-const SESSION_DETAIL_POLL_MS = 3000
 const LAUNCH_HIGHLIGHT_MS = 8000
 
 export function App() {
@@ -416,11 +416,5 @@ export function App() {
         />
       ) : null}
     </div>
-  )
-}
-
-function isLiveSessionStatus(status: string): boolean {
-  return ["active", "pending", "queued", "running", "in_progress"].includes(
-    status.trim().toLowerCase(),
   )
 }
