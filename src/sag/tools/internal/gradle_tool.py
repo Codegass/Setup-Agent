@@ -38,6 +38,7 @@ from .build_utils import (
     detached_poll_ref,
     dispatch_hold_policy,
 )
+from .dispatch_argv import gradle_task_tokens
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 # Gradle prints no reactor summary; what it prints is per-task outcomes:
@@ -966,15 +967,17 @@ class GradleTool(BaseTool):
                     prop = f"-P{prop}"
                 cmd_parts.append(prop)
 
-        # Add gradle arguments
+        # Add gradle arguments verbatim — the caller's quoting is the caller's
+        # (`--tests "*ProducerTest*"`), and re-splitting it here would rewrite
+        # a vector the contract already froze.
         if gradle_args:
             cmd_parts.append(gradle_args)
 
-        # Add tasks (default to 'build' if none specified)
-        if tasks:
-            cmd_parts.extend(tasks.split())
-        else:
-            cmd_parts.append("build")
+        # The contracted task set (dispatch_argv is the single producer, shared
+        # with GradleBackend.expected_argv): a scoped selection the caller
+        # already made is never joined by its bare superset, and `build` stands
+        # in only when neither side names a task.
+        cmd_parts.extend(gradle_task_tokens(tasks, gradle_args))
 
         return " ".join(cmd_parts)
 

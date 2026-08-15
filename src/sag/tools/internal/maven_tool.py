@@ -40,6 +40,7 @@ from .build_utils import (
     dispatch_hold_policy,
 )
 from .command_tracker import CommandTracker
+from .dispatch_argv import maven_action_tokens
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
 # The reactor summary Maven prints at the end of every multi-module build:
@@ -1217,20 +1218,11 @@ class MavenTool(BaseTool):
         if pom_file:
             cmd_parts.extend(["-f", pom_file])
 
-        # Add command and goals as real argv tokens
-        if isinstance(command, list):
-            cmd_parts.extend(str(part) for part in command)
-        else:
-            cmd_parts.extend(shlex.split(str(command or "")))
-        if goals:
-            cmd_parts.extend(shlex.split(str(goals)))
-
-        # Extra args appended verbatim after main command
-        if extra_args:
-            if isinstance(extra_args, list):
-                cmd_parts.extend(str(arg) for arg in extra_args)
-            else:
-                cmd_parts.extend(shlex.split(extra_args))
+        # The contracted action set, in the contracted order (dispatch_argv is
+        # the single producer, shared with MavenBackend.expected_argv): the
+        # lifecycle first, then goals, then the extra args — nothing appended,
+        # nothing reordered.
+        cmd_parts.extend(maven_action_tokens(command, goals, extra_args))
 
         # Quote every token at the single shell boundary: the detached runner
         # embeds this string in bash -c. Raw joins let internally generated

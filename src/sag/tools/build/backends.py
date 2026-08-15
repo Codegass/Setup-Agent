@@ -17,6 +17,7 @@ from sag.agent.invocation_contracts import (
 )
 from sag.runtime.container_io import read_container_text
 from sag.tools.base import ActualToolExecution, OutputPersistenceError, ToolResult
+from sag.tools.internal.dispatch_argv import gradle_task_tokens, maven_action_tokens
 
 # Verbs that produce local artifacts. Packaging is NOT a test owner — the `test`
 # verb is the only one (live bigtop: a naked `mvn install` ran environment-
@@ -185,14 +186,17 @@ class MavenBackend:
     def expected_argv(params: Dict[str, Any]) -> Optional[str]:
         """The argument vector these params materialize, runner excluded.
 
-        Token order mirrors `MavenTool._build_maven_command`: the fail-at-end
-        flag, the lifecycle, then the extra args. Which `mvn` binary the
-        toolchain resolves is the runner's own resolution, so the head token
-        is not part of the frozen vector (see `compliance_class`).
+        The fail-at-end flag, then the action set `maven_action_tokens`
+        produces — the SAME producer `MavenTool._build_maven_command` reads, so
+        the prediction and the physical command cannot state different orders.
+        Which `mvn` binary the toolchain resolves is the runner's own
+        resolution, so the head token is not part of the frozen vector (see
+        `compliance_class`).
         """
         tokens = ["--fail-at-end"] if params.get("fail_at_end") else []
-        tokens.extend(shlex.split(str(params.get("command") or "")))
-        tokens.extend(shlex.split(str(params.get("extra_args") or "")))
+        tokens.extend(
+            maven_action_tokens(params.get("command"), extra_args=params.get("extra_args"))
+        )
         return " ".join(shlex.quote(token) for token in tokens) or None
 
     def materialize(
@@ -532,14 +536,17 @@ class GradleBackend:
     def expected_argv(params: Dict[str, Any]) -> Optional[str]:
         """The argument vector these params materialize, runner excluded.
 
-        Token order mirrors `GradleTool._build_gradle_command`: `--continue`,
-        the gradle args, then the tasks. Which gradle binary runs (`./gradlew`
-        or a resolved distribution) is the runner's own resolution, so the head
-        token is not part of the frozen vector (see `compliance_class`).
+        `--continue`, the gradle args, then the task set `gradle_task_tokens`
+        produces — the SAME producer `GradleTool._build_gradle_command` reads,
+        so a task the caller already scoped cannot be predicted here and
+        appended there. Which gradle binary runs (`./gradlew` or a resolved
+        distribution) is the runner's own resolution, so the head token is not
+        part of the frozen vector (see `compliance_class`).
         """
         tokens = ["--continue"] if params.get("fail_at_end") else []
-        tokens.extend(shlex.split(str(params.get("gradle_args") or "")))
-        tokens.extend(str(params.get("tasks") or "").split())
+        gradle_args = params.get("gradle_args")
+        tokens.extend(shlex.split(str(gradle_args or "")))
+        tokens.extend(gradle_task_tokens(params.get("tasks"), gradle_args))
         return " ".join(shlex.quote(token) for token in tokens) or None
 
     def materialize(
