@@ -428,6 +428,69 @@ def test_the_store_grows_by_net_new_bytes_only(sealed_run, tmp_path):
     assert {row["ref_id"] for row in records} >= set(named)
 
 
+def test_a_response_that_called_nothing_still_seals_its_turn(tmp_path):
+    """The model answered: that is a turn, tool call or no tool call.
+
+    A thought-only response read a rendered window, cost the run tokens, and
+    was answered with the continuation cue — [A], the bill and [C] all exist,
+    and only [B] does not. Leaving it unsealed made the sealed sequence skip a
+    model response, so anyone counting turns against responses found a gap
+    with nothing lost in it.
+
+    Conservation counts CALLS, not turns (spec §2.2 rule 5): this turn adds no
+    envelope and no `loop_decision`, and balances every side at zero.
+    """
+    from sag.agent.react_llm import NativeTurn
+
+    toolless = NativeTurn(
+        text="I should think about this some more.", tool_calls=(), model_used="scripted-model"
+    )
+    turns = [toolless, *[_phase_turn(index) for index in range(1, 6)]]
+    engine = _sealing_engine(tmp_path, turns)
+
+    engine.run_setup_loop("set up the project", max_iterations=12)
+
+    records = _events(engine, "turn_record")
+    model = _model_records(engine)
+    thought = model[0]["payload"]
+
+    assert len(model) == 6, "the thought-only response sealed no turn"
+    assert [row["payload"]["turn_id"] for row in records] == list(range(1, len(records) + 1))
+    assert thought["iteration"] == 1
+    assert thought["envelope_ref"] is None
+    # It was billed like any other response, and it was answered.
+    assert thought["tokens_in"] == PROMPT_TOKENS and thought["tokens_out"] == COMPLETION_TOKENS
+    assert _turn_store(engine).retrieve_output(thought["observation_ref"]).startswith(
+        "No tool was called."
+    )
+    # And its window is the array that response answered from.
+    assert thought["window_digest"]["component_refs"], "the turn claims no window"
+
+
+def test_a_thought_only_turn_leaves_the_ledger_balanced(tmp_path):
+    """No envelope, no decision, no result: nothing to conserve, nothing broken."""
+    from sag.agent.react_llm import NativeTurn
+
+    toolless = NativeTurn(text="Thinking.", tool_calls=(), model_used="scripted-model")
+    turns = [toolless, *[_phase_turn(index) for index in range(1, 6)]]
+    engine = _sealing_engine(tmp_path, turns)
+
+    engine.run_setup_loop("set up the project", max_iterations=12)
+
+    envelopes = _events(engine, "action_envelope")
+    results = _events(engine, "tool_result")
+    model_calls = [
+        row
+        for row in envelopes
+        if str(row["payload"].get("tool_call_id", "")).startswith("call_")
+    ]
+
+    # Every call still has its envelope and its answer — the fence's two sides.
+    assert len(envelopes) == len(results)
+    # And the model's turns are its calls plus the response that made none.
+    assert len(_model_records(engine)) == len(model_calls) + 1
+
+
 # ---------------------------------------------------------------------------
 # Task 8 — the controller's turns, observations included
 # ---------------------------------------------------------------------------

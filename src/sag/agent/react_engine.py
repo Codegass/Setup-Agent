@@ -3516,6 +3516,7 @@ class ReActEngine(UIEventEmitter):
                 # iteration opens refers to THIS array, because this is the
                 # array the model answered from.
                 self._window_digest = self._seal_window_digest(system_prompt, messages)
+                turn_started = self._turn_stamp()
                 try:
                     turn = self._native_turn_with_retry(messages)
                 except Exception as exc:
@@ -3544,18 +3545,40 @@ class ReActEngine(UIEventEmitter):
                             )
                         )
                     if completion_mode != "setup":
-                        # Run-task mode: a text answer ends the task.
+                        # Run-task mode: a text answer ends the task. Nothing is
+                        # delivered back to a model that is finished, so the
+                        # record states an answer of None rather than inventing
+                        # one — but the response itself is still a turn.
+                        self._seal_turn_record(
+                            actor="model",
+                            t0=turn_started,
+                            t1=self._turn_stamp(),
+                            iteration=getattr(self, "current_iteration", None),
+                        )
                         self._export_token_usage_csv()
                         return True
-                    self.steps.append(
-                        ReActStep(
-                            step_type=StepType.SYSTEM_GUIDANCE,
-                            content=(
-                                "No tool was called. Continue with a tool call, "
-                                "or close the phase honestly via phase(...)."
-                            ),
-                            timestamp=self._get_timestamp(),
-                        )
+                    cue = ReActStep(
+                        step_type=StepType.SYSTEM_GUIDANCE,
+                        content=(
+                            "No tool was called. Continue with a tool call, "
+                            "or close the phase honestly via phase(...)."
+                        ),
+                        timestamp=self._get_timestamp(),
+                    )
+                    self.steps.append(cue)
+                    # A response with no tool call is still a turn: the model
+                    # read a rendered window, the run was billed for it, and the
+                    # continuation cue is the [C] it read next. Only [B] is
+                    # missing, and the record says so with `envelope_ref: None`.
+                    # Conservation counts CALLS (spec §2.2 rule 5), so a turn
+                    # that made none adds nothing to either side of the fence.
+                    self._seal_turn_record(
+                        actor="model",
+                        t0=turn_started,
+                        t1=self._turn_stamp(),
+                        envelope_ref=None,
+                        observation_ref=self._delivered_observation_ref(cue),
+                        iteration=getattr(self, "current_iteration", None),
                     )
                     if phase_mode:
                         self._record_context_journal(
