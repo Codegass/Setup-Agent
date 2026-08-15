@@ -150,6 +150,12 @@ class _TurnState:
     #: a turn whose result never came still says so, even when the decision
     #: told us its error code.
     has_result: bool = False
+    #: Whether a `refusal_record` opened this turn. A refused call reached no
+    #: tool, so there was no execution for the recurrence ladder to read: it is
+    #: not missing a `loop_decision`, it was never owed one. Refusals that WERE
+    #: read — the ones refused inside the executor — still carry their decision
+    #: and record it, which is why this exempts rather than replaces.
+    refused: bool = False
 
     def touch(self, sequence: int | None) -> None:
         if sequence is not None and sequence not in self.control_seq:
@@ -533,6 +539,7 @@ class TrajectoryReducer:
         turn.t0 = timestamp
         turn.t1 = timestamp
         turn.has_result = True
+        turn.refused = True
         turn.touch(sequence)
         collector.annotate(
             "refusal",
@@ -868,7 +875,7 @@ def _turn_warnings(turn: _TurnState) -> list[Warning]:
         holes.append(_hole(turn, "missing_envelope", "has a loop_decision but no action_envelope"))
     if not turn.has_result:
         holes.append(_hole(turn, "missing_tool_result", "has no tool_result and no typed refusal"))
-    if turn.call is not None and not turn.has_decision:
+    if turn.call is not None and not turn.has_decision and not turn.refused:
         holes.append(
             _hole(
                 turn,
@@ -901,7 +908,7 @@ def _sealed_turn_warnings(turn: _TurnState) -> list[Warning]:
         return holes
     if not turn.has_result:
         holes.append(_hole(turn, "missing_tool_result", "has no tool_result and no typed refusal"))
-    if not turn.has_decision:
+    if not turn.has_decision and not turn.refused:
         holes.append(
             _hole(
                 turn,

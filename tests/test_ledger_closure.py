@@ -61,6 +61,29 @@ def _tool_turn(index, name, arguments):
     )
 
 
+def _batch_breaking_turn(index):
+    """One assistant turn whose FIRST call ends the batch the second was in."""
+    arguments = {"action": "done", "outcome": "success"}
+    return NativeTurn(
+        text=f"Closing this phase, then asking again ({index}).",
+        tool_calls=(
+            NativeToolCall(
+                id=f"call_{index}a",
+                name="phase",
+                arguments=dict(arguments),
+                raw_arguments=json.dumps(arguments),
+            ),
+            NativeToolCall(
+                id=f"call_{index}b",
+                name="search",
+                arguments={"pattern": "spotless"},
+                raw_arguments=json.dumps({"pattern": "spotless"}),
+            ),
+        ),
+        model_used="scripted-model",
+    )
+
+
 def _closure_engine(tmp_path, turns, *, pre_dispatch_control=False):
     """The native-loop harness with a real ledger, store, and loop memory.
 
@@ -364,6 +387,102 @@ def test_a_refused_repair_action_seals_the_intent_that_was_refused(tmp_path):
     assert refusal["exact_params_sha256"] == canonical_sha256(
         {"action": "done", "outcome": "success", "key_results": ""}
     )
+
+
+@pytest.fixture
+def broken_batch(tmp_path):
+    """Three assistant turns of two calls, each broken by its own first call."""
+    turns = [_batch_breaking_turn(index) for index in range(1, 4)]
+    engine = _closure_engine(tmp_path, turns)
+    engine.run_setup_loop("set up the project", max_iterations=3)
+    return engine, turns
+
+
+def test_a_call_the_batch_never_reached_is_a_record_not_a_silence(broken_batch):
+    """The measured hole with the fence's own name on it.
+
+    When a batch break fires — a phase transition accepted, a loop-driven
+    close, a live job barrier — every remaining call of that assistant turn is
+    answered "[not executed: ...]" and used to get NOTHING else: no envelope,
+    because nothing dispatched; no `tool_result`, because nothing ran; no
+    `loop_decision`, no refusal record, no turn record. A delivered refusal with
+    no record of it: exactly the silence spec §2.2 rule 4 forbids.
+
+    It is a refusal, so it is a `refusal_record` — standing, as every refusal
+    does, in both of the places its call never reached.
+    """
+    engine, turns = broken_batch
+    refusals = [row["payload"] for row in _events(engine, "refusal_record")]
+
+    assert [row["tool_call_id"] for row in refusals] == ["call_1b", "call_2b", "call_3b"]
+    assert [row["tool"] for row in refusals] == ["search"] * 3
+    assert {row["refusal_code"] for row in refusals} == {"CALL_NOT_EXECUTED"}
+    assert {row["exact_params_sha256"] for row in refusals} == {
+        canonical_sha256({"pattern": "spotless"})
+    }
+
+
+def test_the_fence_counts_the_calls_the_model_made_not_the_events_that_exist(broken_batch):
+    """The counting trick, closed.
+
+    `#loop_decision == #envelope == #(tool_result ∪ refusal)` equates only the
+    events that EXIST, so a call emitting none of them balanced at zero on
+    every side and was invisible to the fence and to the reducer alike: ten
+    model calls, five in the ledger, and a green conservation check. A fence
+    over a ledger cannot be the ledger's own oracle. The count that binds is
+    the one the model made.
+
+    A cancelled call has no `loop_decision` because it had no execution to
+    read; fabricating one would feed the recurrence ladder an outcome that
+    never happened. That is why the decision side is short by exactly the
+    cancellations, and why it is stated here rather than balanced away.
+    """
+    engine, turns = broken_batch
+    asked = [call.id for turn in turns for call in turn.tool_calls]
+    opened = {
+        row["payload"].get("tool_call_id")
+        for kind in ("action_envelope", "refusal_record")
+        for row in _events(engine, kind)
+    }
+    counted = _kinds(engine)
+    cancelled = sum(
+        1
+        for row in _events(engine, "refusal_record")
+        if row["payload"]["refusal_code"] == "CALL_NOT_EXECUTED"
+    )
+
+    assert len(asked) == 6
+    assert set(asked) <= opened, "the model made a call the ledger never mentions"
+    refusals = counted.get("refusal_record", 0)
+    assert (
+        counted.get("action_envelope", 0) + counted.get("forced_action", 0) + refusals
+        == counted.get("tool_result", 0) + refusals
+        == counted.get("loop_decision", 0) + cancelled
+    )
+    assert cancelled == 3
+
+
+def test_a_cancelled_call_takes_a_turn_and_states_the_answer_it_delivered(broken_batch, tmp_path):
+    """[C] of a turn that ran nothing is still the text the model read.
+
+    The turn is the model's — it was in the same rendered window as the call
+    beside it — and its observation ref resolves to the refusal the model was
+    actually handed, reason and all. The reducer then reads a complete account
+    of a refused call rather than a hole, which is what rule 4 asked for.
+    """
+    engine, _turns = broken_batch
+    store = engine.output_storage
+    sealed = [row["payload"] for row in _events(engine, "turn_record")]
+    cancelled = [row for row in sealed if row["envelope_ref"] is None and row["actor"] == "model"]
+
+    assert len(cancelled) == 3
+    assert [store.retrieve_output(row["observation_ref"]) for row in cancelled] == [
+        "[not executed: a done phase transition is being processed]"
+    ] * 3
+    snapshot = build_trajectory(tmp_path)
+    assert snapshot.warnings == []
+    assert [turn.turn_id for turn in snapshot.turns] == list(range(1, len(snapshot.turns) + 1))
+    assert len([note for note in snapshot.annotations if note.kind == "refusal"]) == 3
 
 
 def test_a_refused_intent_is_sealed_whole_or_it_is_not_what_was_submitted(tmp_path):

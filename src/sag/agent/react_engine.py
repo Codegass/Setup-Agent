@@ -4296,6 +4296,27 @@ class ReActEngine(UIEventEmitter):
         rule 3). Never raises — a run does not end because its record of a
         refusal would not validate.
         """
+        self._seal_refusal_record(
+            call,
+            refusal_code=self._refusal_code(execution),
+            params=params,
+            tool_call_id=tool_call_id,
+        )
+
+    def _seal_refusal_record(
+        self,
+        call: ToolCall,
+        *,
+        refusal_code: str,
+        params: Dict[str, Any] | None,
+        tool_call_id: str | None,
+    ) -> None:
+        """Write one refusal into the ledger, whoever refused the call.
+
+        A tool that does not exist, a repair context that is not open, a batch
+        that broke before this call's turn came — the record is the same shape
+        because the fact is the same fact: the model asked, and nothing ran.
+        """
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return
@@ -4303,7 +4324,7 @@ class ReActEngine(UIEventEmitter):
             payload = RefusalRecordPayload(
                 tool=str(call.name or "") or "unknown",
                 tool_call_id=str(tool_call_id or "") or None,
-                refusal_code=self._refusal_code(execution),
+                refusal_code=refusal_code,
                 exact_params_sha256=self._refused_params_digest(params),
                 **self._submitted_repair_intent(call),
             )
@@ -7559,6 +7580,58 @@ class ReActEngine(UIEventEmitter):
             step.tool_call_id = tool_call_id
         return step
 
+    #: The answer a call gets when the batch it was in ended before its turn.
+    #: One code, because one thing happened to it; the reason it was given is
+    #: the observation it was answered with, sealed as that turn's [C].
+    CANCELLED_CALL_REFUSAL_CODE = "CALL_NOT_EXECUTED"
+
+    def _seal_cancelled_call(self, step: ReActStep, reason: str) -> None:
+        """Answer the call the batch broke over — and record that answer.
+
+        A phase transition being applied, a loop-driven close, a live job
+        barrier: each stops the batch, and every remaining call of that
+        assistant turn is answered "[not executed: ...]" so the provider's
+        tool_use/tool_result pairing holds. That answer used to be the call's
+        ONLY trace. No envelope, because nothing dispatched; no `tool_result`,
+        because nothing ran; no `loop_decision`, because there was no execution
+        to read; no refusal record and no turn. A delivered refusal with nothing
+        recording it is precisely the silence spec §2.2 rule 4 forbids — and it
+        was invisible to the conservation fence, which equates the events that
+        EXIST, so a call emitting none of them balanced at zero on every side.
+
+        It is a refusal, so it seals a refusal record, standing as every refusal
+        does in both of the places its call never reached. It seals a turn too:
+        the model asked from a rendered window and was answered, which is a
+        turn whatever came of it, and its observation ref is the refusal the
+        model actually read, reason and all.
+
+        There is still no `loop_decision`, and that is the honest part: the
+        recurrence ladder reads outcomes, and this call produced none.
+        Fabricating one would feed the ladder an execution that never happened.
+        """
+        started = self._turn_stamp()
+        call = self._build_tool_call_from_step(step)
+        self._seal_refusal_record(
+            call,
+            refusal_code=self.CANCELLED_CALL_REFUSAL_CODE,
+            params=call.raw_params,
+            tool_call_id=step.tool_call_id,
+        )
+        observation = self._append_native_observation(
+            step.tool_call_id, f"[not executed: {reason}]"
+        )
+        self._seal_turn_record(
+            actor="model",
+            t0=started,
+            t1=self._turn_stamp(),
+            envelope_ref=None,
+            observation_ref=self._delivered_observation_ref(observation),
+            # A call that ran nothing sealed no gate: the word in force belongs
+            # to the turn that actually closed the phase, one row above.
+            gate_decision_id=None,
+            iteration=getattr(self, "current_iteration", None),
+        )
+
     def _execute_native_calls(self, turn) -> List[ReActStep]:
         """Execute every tool call of one assistant turn, in order.
 
@@ -7566,7 +7639,9 @@ class ReActEngine(UIEventEmitter):
         refusal, or a cancellation — because Anthropic rejects an assistant
         tool_use that no tool_result answers (anatomy map risk 5). A phase
         signal or a loop force-break stops execution but never stops the
-        answering."""
+        answering. And every answer is a record: a cancellation the model was
+        told about and the ledger was not is the silence spec §2.2 rule 4
+        forbids."""
         executed: List[ReActStep] = []
         cancelled_reason: Optional[str] = None
 
@@ -7584,7 +7659,7 @@ class ReActEngine(UIEventEmitter):
             self.steps.append(step)
 
             if cancelled_reason is not None:
-                self._append_native_observation(call.id, f"[not executed: {cancelled_reason}]")
+                self._seal_cancelled_call(step, cancelled_reason)
                 continue
 
             batch_break_reason = self._execute_action_step(step)
