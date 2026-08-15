@@ -21,6 +21,8 @@ import pytest
 from pydantic import ValidationError
 from test_native_loop_engine import _engine, _phase_turn
 
+from sag.agent.attempt_policy import TestAttemptRequirement as AttemptRequirement
+from sag.agent.attempt_policy import TestCandidateResolution as CandidateResolution
 from sag.agent.control_events import (
     CONTROL_EVENT_KINDS,
     ControlEvent,
@@ -29,7 +31,13 @@ from sag.agent.control_events import (
     WindowDigestPayload,
 )
 from sag.agent.output_storage import OutputStorageManager
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
+from sag.agent.react_engine import ReActEngine
+from sag.agent.react_types import ReActStep, StepType
 from sag.agent.token_tracker import TokenTracker
+from sag.agent.tool_orchestration import ToolExecution
+from sag.tools.base import ToolResult
 
 SHA = "a" * 64
 PROMPT_TOKENS = 4134
@@ -259,7 +267,9 @@ def test_the_windows_bytes_are_stored_once_and_the_order_carries_the_repeat(seal
     """Every turn re-sends the system prompt; the store keeps one copy of it."""
     records = _events(sealed_run, "turn_record")
     first_components = [row["payload"]["window_digest"]["component_refs"][0] for row in records]
-    referenced = [ref for row in records for ref in row["payload"]["window_digest"]["component_refs"]]
+    referenced = [
+        ref for row in records for ref in row["payload"]["window_digest"]["component_refs"]
+    ]
 
     assert len(set(first_components)) == 1, "the system prompt was stored more than once"
     assert len(referenced) > len(set(referenced)), "no component was reused across turns"
@@ -290,3 +300,189 @@ def test_a_sealed_turn_states_the_observation_it_delivered(sealed_run):
     refs = [row["payload"]["observation_ref"] for row in records]
     assert all(ref for ref in refs)
     assert storage.retrieve_output(refs[-1]) in delivered
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — the controller's turns, observations included
+# ---------------------------------------------------------------------------
+
+
+class _BranchHistory:
+    """The context manager, reduced to the one fact this task is about."""
+
+    def __init__(self):
+        self.current_task_id = "task-test-1"
+        self.entries = []
+
+    def add_to_branch_history(self, task_id, entry):
+        self.entries.append((task_id, entry))
+
+
+def _requirement():
+    return AttemptRequirement(
+        root="/workspace/demo",
+        system="gradle",
+        required_action={
+            "tool": "build",
+            "params": {"action": "test", "working_directory": "/workspace/demo"},
+        },
+    )
+
+
+def _forcing_engine(tmp_path):
+    """A harness that forces one required test attempt, on a real ledger."""
+    requirement = _requirement()
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = PhaseMachine(start_phase="test")
+    engine.steps = []
+    engine.tools = {}
+    engine.current_iteration = 7
+    engine.config = SimpleNamespace(verbose=False)
+    engine.orchestrator = None
+    engine.context_manager = _BranchHistory()
+    engine.control_event_sink = ControlEventSink(tmp_path / "control_events.jsonl")
+    engine.output_storage = OutputStorageManager(tmp_path / "contexts")
+    engine.token_tracker = TokenTracker()
+    engine._last_test_candidate_resolution = CandidateResolution(
+        status="available",
+        candidates=(requirement,),
+        project_root="/workspace/demo",
+        workspace_root="/workspace",
+        primary=requirement,
+    )
+    engine._get_timestamp = lambda: "2026-08-15T00:00:00Z"
+
+    result = ToolResult.completed_success(
+        output="50 tests passed",
+        metadata={"command": "./gradlew test", "runner_dispatched": True, "exit_code": 0},
+    )
+
+    def execute(call):
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="success",
+            raw_params=call.raw_params,
+            validated_params=dict(call.raw_params),
+            observation_text="50 tests passed",
+            attempted_execution=True,
+        )
+
+    def add_observation_step(observation):
+        step = ReActStep(
+            step_type=StepType.OBSERVATION,
+            content=observation,
+            timestamp="2026-08-15T00:00:00Z",
+        )
+        engine.steps.append(step)
+        return step
+
+    engine._execute_tool_call = execute
+    engine._mark_forced_test_refusals = lambda execution, requirement: None
+    engine._record_execution_bundle = lambda execution, call: (
+        execution.result,
+        "forced-execution-1",
+        [],
+    )
+    engine._emit_control_tool_result = lambda **kwargs: None
+    engine._apply_tool_execution_loop_effects = lambda execution: None
+    engine._add_observation_step = add_observation_step
+    return engine, requirement
+
+
+def test_a_forced_action_seals_a_controller_turn(tmp_path):
+    engine, requirement = _forcing_engine(tmp_path)
+
+    assert engine._force_required_test_attempt(requirement, trigger="phase_floor") is True
+
+    records = _events(engine, "turn_record")
+    forced = _events(engine, "forced_action")
+    assert len(records) == len(forced) == 1
+    sealed = records[0]["payload"]
+    assert sealed["actor"] == "controller"
+    assert sealed["turn_id"] == 1
+    assert sealed["phase"] == "test"
+    assert sealed["envelope_ref"] == forced[0]["payload"]["envelope_id"]
+    # The harness's move is never billed the model's response.
+    assert sealed["tokens_in"] is None and sealed["tokens_out"] is None
+    # A controller answers from policy, not from a window: no components are
+    # claimed for a turn nobody was shown.
+    assert sealed["window_digest"]["component_refs"] == []
+
+
+def test_a_forced_observation_reaches_the_branch_history(tmp_path):
+    """The cayenne/ignite/polaris/camel gap (spec §2.2 rule 2).
+
+    A forced attempt wrote its ACTION and its observation into the window and
+    nowhere else, so the phase history the next context read — and every
+    post-hoc reconstruction of it — was missing the harness's evidence
+    entirely.
+    """
+    engine, requirement = _forcing_engine(tmp_path)
+
+    engine._force_required_test_attempt(requirement, trigger="phase_floor")
+
+    assert engine.context_manager.entries, "the forced observation never reached branch history"
+    task_id, entry = engine.context_manager.entries[-1]
+    assert task_id == "task-test-1"
+    assert entry["type"] == "action"
+    assert entry["tool_name"] == "build"
+    assert entry["observation"] == "50 tests passed"
+    assert entry["iteration"] == 7
+
+    sealed = _events(engine, "turn_record")[0]["payload"]
+    assert engine.output_storage.retrieve_output(sealed["observation_ref"]) == "50 tests passed"
+
+
+def test_an_engine_close_seals_the_word_it_sealed(tmp_path):
+    """An engine-generated gate is a controller turn, on the same sequence."""
+    engine, _ = _forcing_engine(tmp_path)
+    engine._add_system_guidance = lambda text, priority=0: None
+    engine._current_attempt_id = lambda: "test-1"
+    sealed_gates = []
+
+    def emit_gate(claim, gate):
+        sealed_gates.append(gate)
+        engine._last_sealed_decision_id = gate.decision_id
+        return SimpleNamespace(sequence=1)
+
+    engine._emit_control_gate = emit_gate
+
+    claim = PhaseClaim(
+        phase="test",
+        signal="done",
+        claimed_outcome=PhaseOutcome.FAILED,
+        key_results="the floor was never reached",
+    )
+    gate = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.FAILED,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.RED,
+        reason="phase floor exhausted",
+        claim=claim,
+    )
+
+    engine._seal_engine_gate(claim, gate)
+
+    records = _events(engine, "turn_record")
+    assert len(records) == 1
+    sealed = records[0]["payload"]
+    assert sealed["actor"] == "controller"
+    assert sealed["gate_decision_id"] == gate.decision_id
+    assert sealed["envelope_ref"] is None
+    # The word the close delivered is resolvable, like any other observation.
+    assert "phase floor exhausted" in engine.output_storage.retrieve_output(
+        sealed["observation_ref"]
+    )
+
+
+def test_the_controller_and_the_model_share_one_turn_sequence(tmp_path):
+    """Two controller moves, two turn ids, no holes and no restarts."""
+    engine, requirement = _forcing_engine(tmp_path)
+
+    engine._force_required_test_attempt(requirement, trigger="phase_floor")
+    engine._forcing_required_test_attempt = False
+    engine._force_required_test_attempt(requirement, trigger="loop_close")
+
+    assert [row["payload"]["turn_id"] for row in _events(engine, "turn_record")] == [1, 2]

@@ -2399,6 +2399,8 @@ class ReActEngine(UIEventEmitter):
         machine = getattr(self, "phase_machine", None)
         if machine is None or machine.current_phase != "test":
             return False
+        turn_started = self._turn_stamp()
+        branch_task_id = getattr(getattr(self, "context_manager", None), "current_task_id", None)
         resolution = getattr(self, "_last_test_candidate_resolution", None)
         if not isinstance(resolution, TestCandidateResolution):
             resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
@@ -2538,10 +2540,28 @@ class ReActEngine(UIEventEmitter):
             )
             self._observe_action_intent_progress(execution)
             self._apply_tool_execution_loop_effects(execution)
-            self._append_native_observation(
+            observation_step = self._append_native_observation(
                 forced_call_id,
                 execution.observation_text,
                 source_tool=tool,
+            )
+            # The harness's evidence goes where every other action's evidence
+            # goes. Writing it into the window alone left four projects with a
+            # phase history that never mentioned the attempt (spec §2.2 rule 2).
+            self._persist_action_to_branch_history(
+                branch_task_id,
+                tool_name=tool,
+                tool_params=dict(exact_params),
+                result=result,
+                observation_text=execution.observation_text,
+            )
+            self._seal_turn_record(
+                actor="controller",
+                t0=turn_started,
+                t1=self._turn_stamp(),
+                envelope_ref=envelope_id,
+                observation_ref=self._delivered_observation_ref(observation_step),
+                iteration=getattr(self, "current_iteration", None),
             )
             return True
         finally:
@@ -4564,13 +4584,33 @@ class ReActEngine(UIEventEmitter):
         with no window reset to survive, a carried copy is a word left waiting
         for the next transition to speak it out of turn.
         """
+        turn_started = self._turn_stamp()
         event = self._emit_control_gate(claim, gate)
+        observation_ref = None
         if deliver:
             text = gate_observation_text(gate, phase=claim.phase, origin="engine_close")
             if carry:
                 self._deliver_gate_observation(text, priority=8, decision_id=gate.decision_id)
             else:
                 self._state_gate_observation_now(text, priority=8)
+            observation_ref = self._store_bytes_once(text, label="delivered_observation")
+        # The controller graded this phase itself: no model turn carried the
+        # word, so the word gets a turn of its own in the same sequence. The
+        # id is CLAIMED so a model turn still in flight cannot also report it —
+        # one grading belongs to one turn (spec §2.1).
+        claims = getattr(self, "_turn_gate_claims", None)
+        if claims is None:
+            claims = set()
+            self._turn_gate_claims = claims
+        claims.add(gate.decision_id)
+        self._seal_turn_record(
+            actor="controller",
+            t0=turn_started,
+            t1=self._turn_stamp(),
+            gate_decision_id=gate.decision_id,
+            observation_ref=observation_ref,
+            iteration=getattr(self, "current_iteration", None),
+        )
         return event
 
     def _deliver_gate_observation(self, text: str, *, priority: int, decision_id: str) -> None:
@@ -5388,6 +5428,23 @@ class ReActEngine(UIEventEmitter):
             component_refs=tuple(refs),
         )
 
+    def _window_for(self, actor: str) -> WindowDigestPayload:
+        """The window a turn answered from — and for the controller, none.
+
+        A forced action and an engine close are answers to POLICY, not to a
+        rendered array: the harness read no window, and lending it the model's
+        components would state that it did. The controller's row still carries
+        the run's prompt identity, so a reader can place it, and the window in
+        force is one turn away — it is the model turn beside it.
+        """
+        digest = getattr(self, "_window_digest", None)
+        prompt = (
+            digest.system_prompt_sha256 if digest is not None else hashlib.sha256(b"").hexdigest()
+        )
+        if actor == "controller" or digest is None:
+            return WindowDigestPayload(system_prompt_sha256=prompt)
+        return digest
+
     def _turn_bill(self, iteration: Optional[int]) -> tuple[Optional[int], Optional[int]]:
         """The response's own row, joined in process — never re-read from the CSV.
 
@@ -5448,9 +5505,7 @@ class ReActEngine(UIEventEmitter):
         if sink is None:
             return
         machine = getattr(self, "phase_machine", None)
-        digest = window_digest or getattr(self, "_window_digest", None)
-        if digest is None:
-            digest = WindowDigestPayload(system_prompt_sha256=hashlib.sha256(b"").hexdigest())
+        digest = window_digest or self._window_for(actor)
         try:
             turn_id = int(getattr(self, "_sealed_turn_count", 0)) + 1
             payload = TurnRecordPayload(
@@ -7018,102 +7073,13 @@ class ReActEngine(UIEventEmitter):
                 )
 
         # Log to branch context if we're in one
-        if branch_task_id:
-            # Add action result to branch history using new context management system
-            try:
-                output_to_store = result.output if result.output else ""
-                from datetime import datetime
-
-                timestamp = datetime.now().isoformat()
-                fact_sheet_identity = project_fact_sheet_identity(result.metadata)
-
-                # Store full output and get reference if output is large
-                stored_output_refs = []
-                if (
-                    len(output_to_store) > 800
-                    and self.output_storage is not None
-                    and not result.output_ref
-                ):
-                    # Store the full output
-                    ref_id = self.output_storage.store_output(
-                        task_id=self.context_manager.current_task_id,
-                        tool_name=step.tool_name,
-                        output=output_to_store,
-                        timestamp=timestamp,
-                        metadata={
-                            "invocation_status": result.invocation_status.value,
-                            "operation_outcome": result.operation_outcome.value,
-                            "evidence_status": result.evidence_status.value,
-                            "iteration": self.current_iteration,
-                            "action": (step.tool_params or {}).get("action"),
-                            **fact_sheet_identity,
-                        },
-                    )
-                    stored_output_refs.append(ref_id)
-
-                    # Get truncated version with reference
-                    output_to_store = self.output_storage.get_truncation_with_reference(
-                        output=output_to_store,
-                        ref_id=ref_id,
-                        max_length=800,
-                        tool_name=step.tool_name,
-                    )
-                elif fact_sheet_identity and result.output_ref and len(output_to_store) > 800:
-                    # The durable evidence path may already have persisted this
-                    # fact sheet. Branch history still gets a bounded preview,
-                    # never a second multi-kilobyte JSON copy.
-                    output_to_store = self.output_storage.get_truncation_with_reference(
-                        output=output_to_store,
-                        ref_id=result.output_ref,
-                        max_length=800,
-                        tool_name=step.tool_name,
-                    )
-
-                observation_to_store = execution.observation_text
-                if fact_sheet_identity and len(observation_to_store) > 6_000:
-                    ref = result.output_ref or "structured fact-sheet metadata"
-                    suffix = (
-                        "\n… [engine project-fact projection truncated in branch history; "
-                        f"source: {ref}]"
-                    )
-                    observation_to_store = observation_to_store[: 6_000 - len(suffix)] + suffix
-
-                history_entry = {
-                    "type": "action",
-                    "iteration": self.current_iteration,
-                    "tool_name": step.tool_name,
-                    "parameters": step.tool_params or {},
-                    "succeeded": result.succeeded,
-                    "invocation_status": result.invocation_status.value,
-                    "operation_outcome": result.operation_outcome.value,
-                    "evidence_status": result.evidence_status.value,
-                    "output": output_to_store,
-                    "observation": observation_to_store,
-                    "output_refs": self._dedupe_strings(
-                        [
-                            *stored_output_refs,
-                            result.output_ref,
-                            *self._output_refs_from_text(output_to_store),
-                        ]
-                    ),
-                }
-                if fact_sheet_identity:
-                    history_entry["metadata"] = fact_sheet_identity
-                for field_name in ("failure_signature", "error_tail_preview"):
-                    value = getattr(result, field_name)
-                    if value:
-                        history_entry[field_name] = value
-                # A pending dispatch is not build-execution evidence;
-                # completion gates must be able to tell.
-                dispatch_status = (result.metadata or {}).get("dispatch_status")
-                if dispatch_status:
-                    history_entry["dispatch_status"] = dispatch_status
-                self.context_manager.add_to_branch_history(
-                    branch_task_id,
-                    history_entry,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to log action to branch history: {e}")
+        self._persist_action_to_branch_history(
+            branch_task_id,
+            tool_name=step.tool_name,
+            tool_params=step.tool_params,
+            result=result,
+            observation_text=execution.observation_text,
+        )
 
         if (
             loop_decision is not None
@@ -7131,6 +7097,123 @@ class ReActEngine(UIEventEmitter):
             return f"a {phase_signal} phase transition is being processed"
 
         return None
+
+    def _persist_action_to_branch_history(
+        self,
+        branch_task_id: Optional[str],
+        *,
+        tool_name: Optional[str],
+        tool_params: Optional[Dict[str, Any]],
+        result,
+        observation_text: str,
+    ) -> None:
+        """Write one executed action into the phase history it belongs to.
+
+        Every action, whoever authored it. A forced attempt used to write its
+        ACTION and its observation into the window and nowhere else, so the
+        phase history — the record the next context reads, and the one every
+        post-hoc reconstruction reads — was missing the harness's own evidence
+        (cayenne, ignite, polaris, camel; spec §2.2 rule 2).
+
+        Never raises: history is a projection, and a projection that fails must
+        not take the run with it.
+        """
+        if not branch_task_id:
+            return
+        try:
+            output_to_store = result.output if result.output else ""
+            from datetime import datetime
+
+            timestamp = datetime.now().isoformat()
+            fact_sheet_identity = project_fact_sheet_identity(result.metadata)
+
+            # Store full output and get reference if output is large
+            stored_output_refs = []
+            if (
+                len(output_to_store) > 800
+                and self.output_storage is not None
+                and not result.output_ref
+            ):
+                # Store the full output
+                ref_id = self.output_storage.store_output(
+                    task_id=self.context_manager.current_task_id,
+                    tool_name=tool_name,
+                    output=output_to_store,
+                    timestamp=timestamp,
+                    metadata={
+                        "invocation_status": result.invocation_status.value,
+                        "operation_outcome": result.operation_outcome.value,
+                        "evidence_status": result.evidence_status.value,
+                        "iteration": self.current_iteration,
+                        "action": (tool_params or {}).get("action"),
+                        **fact_sheet_identity,
+                    },
+                )
+                stored_output_refs.append(ref_id)
+
+                # Get truncated version with reference
+                output_to_store = self.output_storage.get_truncation_with_reference(
+                    output=output_to_store,
+                    ref_id=ref_id,
+                    max_length=800,
+                    tool_name=tool_name,
+                )
+            elif fact_sheet_identity and result.output_ref and len(output_to_store) > 800:
+                # The durable evidence path may already have persisted this
+                # fact sheet. Branch history still gets a bounded preview,
+                # never a second multi-kilobyte JSON copy.
+                output_to_store = self.output_storage.get_truncation_with_reference(
+                    output=output_to_store,
+                    ref_id=result.output_ref,
+                    max_length=800,
+                    tool_name=tool_name,
+                )
+
+            observation_to_store = observation_text
+            if fact_sheet_identity and len(observation_to_store) > 6_000:
+                ref = result.output_ref or "structured fact-sheet metadata"
+                suffix = (
+                    "\n… [engine project-fact projection truncated in branch history; "
+                    f"source: {ref}]"
+                )
+                observation_to_store = observation_to_store[: 6_000 - len(suffix)] + suffix
+
+            history_entry = {
+                "type": "action",
+                "iteration": self.current_iteration,
+                "tool_name": tool_name,
+                "parameters": tool_params or {},
+                "succeeded": result.succeeded,
+                "invocation_status": result.invocation_status.value,
+                "operation_outcome": result.operation_outcome.value,
+                "evidence_status": result.evidence_status.value,
+                "output": output_to_store,
+                "observation": observation_to_store,
+                "output_refs": self._dedupe_strings(
+                    [
+                        *stored_output_refs,
+                        result.output_ref,
+                        *self._output_refs_from_text(output_to_store),
+                    ]
+                ),
+            }
+            if fact_sheet_identity:
+                history_entry["metadata"] = fact_sheet_identity
+            for field_name in ("failure_signature", "error_tail_preview"):
+                value = getattr(result, field_name)
+                if value:
+                    history_entry[field_name] = value
+            # A pending dispatch is not build-execution evidence;
+            # completion gates must be able to tell.
+            dispatch_status = (result.metadata or {}).get("dispatch_status")
+            if dispatch_status:
+                history_entry["dispatch_status"] = dispatch_status
+            self.context_manager.add_to_branch_history(
+                branch_task_id,
+                history_entry,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log action to branch history: {e}")
 
     def _answered_action_result(self):
         """The tool result of the ACTION step this observation answers.
