@@ -6,6 +6,7 @@ import re
 import shlex
 import time
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
@@ -49,7 +50,10 @@ from .attempt_policy import (
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
     ControlEventSink,
+    TurnRecordPayload,
+    WindowDigestPayload,
     action_envelope_sha256,
+    canonical_json,
     canonical_sha256,
     compact_control_value,
     forced_action_sha256,
@@ -172,6 +176,11 @@ _STRICT_LINEAGE_CONTROL_KINDS = frozenset(
         "repair_context_opened",
         "phase_transition",
         "evidence_close",
+        # A turn record carries the ORDERED refs of the window it sealed.
+        # `compact_control_value` keeps the first 128 items of a list, so a
+        # long window would come back short — a digest that reconstructs a
+        # DIFFERENT array than the model saw, silently.
+        "turn_record",
     }
 )
 _REPAIR_GUIDANCE_MAX_BYTES = 32 * 1024
@@ -3471,6 +3480,10 @@ class ReActEngine(UIEventEmitter):
                 self.token_tracker.set_iteration(self.current_iteration)
 
                 messages = render_messages(system_prompt, self.steps)
+                # [A], sealed before the request goes out: every turn this
+                # iteration opens refers to THIS array, because this is the
+                # array the model answered from.
+                self._window_digest = self._seal_window_digest(system_prompt, messages)
                 try:
                     turn = self._native_turn_with_retry(messages)
                 except Exception as exc:
@@ -5283,6 +5296,13 @@ class ReActEngine(UIEventEmitter):
             getattr(scope, "value", str(scope)): value
             for scope, value in event.relevant_state.items()
         }
+        # LoopMemory's own chain count, verified against a re-run of production
+        # LoopMemory by `sag.agent.replay`. Measured across 54 archived ledgers
+        # it reads 1 in all 1,032 rows, and honestly so: 840 outcomes were not
+        # recurrence candidates at all, 184 opened a chain nothing repeated, 4
+        # were poll progress, 4 diversity advisories. Not one decision reached
+        # the branch that increments — no chain in any archived run survived to
+        # a second link. The wire is here; there is no second counter to build.
         event_payload["recurrence_count"] = decision.recurrence_count
         self._emit_control_event(
             "loop_decision",
@@ -5292,6 +5312,198 @@ class ReActEngine(UIEventEmitter):
                 "expected_reason_code": decision.reason_code,
             },
         )
+
+    # ---- sealed turns (spec §2.1) -------------------------------------
+
+    @staticmethod
+    def _turn_stamp() -> str:
+        """One clock for turn records: UTC, ISO-8601, the sink's own shape."""
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _store_bytes_once(self, body: str, *, label: str) -> Optional[str]:
+        """Persist one immutable byte string and hand back its ref, once per run.
+
+        Window components repeat: every turn re-sends the system prompt and the
+        whole history behind it. Storing them per turn would multiply the store
+        by the window length; storing them once and referencing them is what
+        makes a component-level digest affordable (spec §2.1).
+
+        Returns None when the bytes could not be stored, or when the ref that
+        came back is already held for DIFFERENT bytes — an unresolvable or
+        ambiguous ref in a window digest is worse than an absent one, because
+        it reconstructs a window the model never saw.
+        """
+        storage = getattr(self, "output_storage", None)
+        if storage is None:
+            return None
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        held = getattr(self, "_stored_byte_refs", None)
+        if held is None:
+            held = {}
+            self._stored_byte_refs = held
+        if digest in held:
+            return held[digest]
+        try:
+            ref = storage.store_output(
+                task_id="turn_records",
+                tool_name=label,
+                output=body,
+                timestamp=self._turn_stamp(),
+                metadata={"sha256": digest, "kind": label},
+            )
+        except Exception as exc:
+            logger.debug(f"turn-record bytes were not stored ({label}): {exc}")
+            return None
+        if not ref or ref in held.values():
+            return None
+        held[digest] = ref
+        return ref
+
+    def _seal_window_digest(
+        self,
+        system_prompt: str,
+        messages: List[Dict[str, Any]],
+    ) -> WindowDigestPayload:
+        """State [A] as components: which prompt spoke, and every message after it.
+
+        One ref per rendered message, in render order, so resolving the refs and
+        concatenating them in list order reproduces the exact array that went to
+        the provider. Identical messages share one ref and still occupy their two
+        positions — the order is the record.
+
+        A component that will not store makes the WHOLE list a lie, so the
+        digest keeps its prompt hash and drops the refs rather than claiming a
+        window with a hole in it.
+        """
+        refs: List[str] = []
+        for message in messages:
+            ref = self._store_bytes_once(canonical_json(message), label="window_component")
+            if ref is None:
+                logger.debug("window digest sealed without components: a component did not store")
+                refs = []
+                break
+            refs.append(ref)
+        return WindowDigestPayload(
+            system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            component_refs=tuple(refs),
+        )
+
+    def _turn_bill(self, iteration: Optional[int]) -> tuple[Optional[int], Optional[int]]:
+        """The response's own row, joined in process — never re-read from the CSV.
+
+        `token_usage.csv` is exported when the loop EXITS, so a record that
+        waited for the file would seal blank for the entire run. The row lives
+        in the tracker the moment the response lands, keyed by the iteration
+        the loop set on it.
+
+        One response, one bill: a response that asks for two tools opens two
+        turns, and the row bills the FIRST of them while the siblings ride
+        along. Copying it onto both would invent spend — the same rule the
+        trajectory builder applies to the exported rows, so both feeds bill the
+        same turn.
+        """
+        if iteration is None:
+            return None, None
+        claimed = getattr(self, "_turn_bills_claimed", None)
+        if claimed is None:
+            claimed = set()
+            self._turn_bills_claimed = claimed
+        if iteration in claimed:
+            return None, None
+        records = getattr(getattr(self, "token_tracker", None), "token_records", None) or ()
+        row = next(
+            (
+                record
+                for record in records
+                if record.get("type") == "executor" and record.get("iteration") == iteration
+            ),
+            None,
+        )
+        if row is None:
+            return None, None
+        claimed.add(iteration)
+        return row.get("prompt_tokens"), row.get("completion_tokens")
+
+    def _seal_turn_record(
+        self,
+        *,
+        actor: str,
+        t0: str,
+        t1: str,
+        envelope_ref: Optional[str] = None,
+        observation_ref: Optional[str] = None,
+        gate_decision_id: Optional[str] = None,
+        iteration: Optional[int] = None,
+        window_digest: Optional[WindowDigestPayload] = None,
+    ) -> None:
+        """Seal one turn through the same publication path as every other event.
+
+        Never raises. A turn record is a statement ABOUT a run, and a run that
+        died because its observability record would not validate would be the
+        one failure this layer must never cause. A record that does not appear
+        becomes a hole the trajectory states as a warning (spec §3), which is
+        exactly what a hole is supposed to look like.
+        """
+        sink = getattr(self, "control_event_sink", None)
+        if sink is None:
+            return
+        machine = getattr(self, "phase_machine", None)
+        digest = window_digest or getattr(self, "_window_digest", None)
+        if digest is None:
+            digest = WindowDigestPayload(system_prompt_sha256=hashlib.sha256(b"").hexdigest())
+        try:
+            turn_id = int(getattr(self, "_sealed_turn_count", 0)) + 1
+            payload = TurnRecordPayload(
+                turn_id=turn_id,
+                phase=(getattr(machine, "current_phase", "") or "") or "unknown",
+                iteration=iteration,
+                actor=actor,
+                window_digest=digest,
+                envelope_ref=envelope_ref or None,
+                observation_ref=observation_ref or None,
+                gate_decision_id=gate_decision_id or None,
+                tokens_in=None,
+                tokens_out=None,
+                t0=t0,
+                t1=t1,
+            )
+            if actor == "model":
+                tokens_in, tokens_out = self._turn_bill(iteration)
+                payload = payload.model_copy(
+                    update={"tokens_in": tokens_in, "tokens_out": tokens_out}
+                )
+            self._emit_control_event("turn_record", payload.model_dump(mode="json"))
+            self._sealed_turn_count = turn_id
+        except Exception as exc:  # observability never ends a run
+            logger.warning(f"turn record was not sealed: {exc}")
+
+    def _delivered_observation_ref(self, step: Any) -> Optional[str]:
+        """[C] as the model read it, not as the tool returned it.
+
+        The delivered text is what the observation step carries: the tool's
+        own text plus whatever the engine appended to it (a settlement notice,
+        a carried gate word). A ref to the tool's raw output would name bytes
+        the model was never shown, and the whole point of a sealed turn is that
+        [A] and [C] are the model's copies.
+        """
+        content = getattr(step, "content", None)
+        if not isinstance(content, str) or not content:
+            return None
+        return self._store_bytes_once(content, label="delivered_observation")
+
+    def _claim_turn_gate(self, before: Optional[str]) -> Optional[str]:
+        """The gate this turn sealed, if it sealed one and nobody else claimed it.
+
+        `_last_sealed_decision_id` is the word the record now stands behind. A
+        turn carried a gate when that word changed while the turn was running —
+        unless a controller turn (an engine close) already sealed it, in which
+        case the word belongs to the controller's record, not the model's.
+        """
+        current = getattr(self, "_last_sealed_decision_id", None)
+        if not current or current == before:
+            return None
+        claimed = getattr(self, "_turn_gate_claims", None) or set()
+        return None if current in claimed else current
 
     def _canonicalize_tool_action(
         self,
@@ -6715,6 +6927,11 @@ class ReActEngine(UIEventEmitter):
             self._log_react_step_verbose(step)
 
         branch_task_id = getattr(self.context_manager, "current_task_id", None)
+        # The turn opens when the call starts and closes when its record is
+        # sealed — the same span the derived view reads off envelope→result, so
+        # both feeds bound a turn the same way.
+        turn_started = self._turn_stamp()
+        gate_before_turn = getattr(self, "_last_sealed_decision_id", None)
         call = self._build_tool_call_from_step(step)
         # Legacy protocol steps carry no id; native ones do.
         native_call_id = getattr(step, "tool_call_id", None)
@@ -6761,7 +6978,7 @@ class ReActEngine(UIEventEmitter):
         # Preserve native tool-call pairing: the tool result must immediately
         # answer its ACTION before a newly opened RepairContext can append
         # system guidance for the next model turn.
-        self._append_native_observation(
+        observation_step = self._append_native_observation(
             native_call_id,
             execution.observation_text,
             source_tool=call.name,
@@ -6769,6 +6986,20 @@ class ReActEngine(UIEventEmitter):
         completion_closed_phase = self._apply_rejected_completion_control(rejected_completion)
         loop_decision = self._apply_tool_execution_loop_effects(execution)
         self._note_advisor_execution(execution, loop_decision)
+        # The call, its answer and the control layer's reading of both are on
+        # the record; the turn can now say what it saw, said and heard. Sealed
+        # here rather than after the batch so a turn that ends the batch — a
+        # closure, a phase signal, a forced attempt below — is still recorded,
+        # and so turn ids follow the order the calls actually ran in.
+        self._seal_turn_record(
+            actor="model",
+            t0=turn_started,
+            t1=self._turn_stamp(),
+            envelope_ref=control_envelope_id,
+            observation_ref=self._delivered_observation_ref(observation_step),
+            gate_decision_id=self._claim_turn_gate(gate_before_turn),
+            iteration=getattr(self, "current_iteration", None),
+        )
 
         # Log tool result in verbose mode
         if self.config.verbose:

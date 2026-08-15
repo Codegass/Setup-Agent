@@ -1116,8 +1116,13 @@ def test_report_construction_persistence_failure_completes_without_mutating_verd
 
     persistence_attempts = {"primary": 0, "emergency": 0}
 
+    # The DURABLE-RESULT path's attempts, not every write the run makes to the
+    # same store: turn records seal their window components through
+    # `store_output` too (`task_id="turn_records"`), and counting those here
+    # would read an unrelated caller as a retry of this report.
     def fail_primary(**kwargs):
-        persistence_attempts["primary"] += 1
+        if kwargs.get("task_id") != "turn_records":
+            persistence_attempts["primary"] += 1
         return ""
 
     def fail_emergency(**kwargs):
