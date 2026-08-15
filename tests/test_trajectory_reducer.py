@@ -12,11 +12,24 @@ and for the silently replaced gate the rocketmq-externals run at
 The field names the reducer joins on are the field names those runs actually
 wrote; nothing there is invented.
 
+Two anomaly fixtures come from elsewhere in the archive: the exit-137 kill from
+the ignite d2r2 run at
+`logs/session_20260813_191756_199185_4c25d0d90e87_99496/control_events.jsonl`,
+and the detached job the run never heard the end of from the committed ignite
+d2r3 fixture, `tests/fixtures/trajectory/ignite-d2r3/control_events.jsonl`.
+Both are real bytes TRIMMED — by deletion only, never by edit — because one of
+those `tool_result` lines is 50 KB of runner receipt and this layer reads eight
+of its keys. `test_the_trimmed_anomaly_lines_are_the_shape_the_engine_would_seal`
+validates what survives against the payload classes the engine seals, and
+`tests/test_trajectory_golden.py` runs the job fence again over the UNTRIMMED
+fixture, so a trim can never be what makes a fence pass.
+
 A handful of fixtures are marked SYNTHETIC. They exist because no archived
 ledger exercises the path at all: `gate_outcome_revised` was never emitted by
-any of the 27 recorded runs, and the orphan branches fire only on an ordering
-no complete session produces. Each synthetic line is built from the payload
-class in `sag.agent.control_events` that the engine would seal — and
+any of the 27 recorded runs, `job_settled` appears once and settled cleanly, and
+the orphan branches fire only on an ordering no complete session produces. Each
+synthetic line is built from the payload class in `sag.agent.control_events`
+that the engine would seal — and
 `test_the_synthetic_gate_lines_are_the_shape_the_engine_would_seal` validates
 them against that class, so a fixture cannot drift into a shape the engine
 could never write. The DEGRADED lines are the exception, and deliberately so:
@@ -31,6 +44,9 @@ import pytest
 from sag.agent.control_events import (
     GateDecisionPayload,
     GateOutcomeRevisedPayload,
+    JobLiveAtClosePayload,
+    JobSettledPayload,
+    ToolResultPayload,
     TurnRecordPayload,
 )
 from sag.trajectory.reducer import DeltaAccumulator, TrajectoryReducer
@@ -215,6 +231,56 @@ SYNTHETIC_REPAIR_CONTEXT_JSONL = (
     '"context_sha256":"c84b49273a784b202e98f5db59b5674c690cba905bca10d2142be1b05b16415f",'
     '"source_gate_sequence":121,"source_phase_attempt_id":"test-1"},'
     '"sequence":122,"source":null,"timestamp":"2026-08-14T13:56:10.000000Z"}'
+)
+
+
+#: Sequences 156, 160 and 161 of the ignite d2r2 run
+#: (logs/session_20260813_191756_199185_4c25d0d90e87_99496): the `build` test
+#: dispatch whose reactor was KILLED — `metadata.exit_code` 137, which is the
+#: 128+9 the OOM killer leaves. Seq 160 is trimmed by DELETION only: its 50 KB
+#: of runner receipt is cut to the keys this layer reads, and the fence below
+#: validates what is left against `ToolResultPayload`. The result's own prose
+#: says the same thing ("Maven build failed with exit code 137"), which is
+#: exactly what this layer does NOT read — the number it reads is the field.
+#: The block is raw because that prose carries a `\n` the JSON must keep as two
+#: characters rather than as a line break.
+REAL_OOM_KILLED_CALL_JSONL = r"""
+{"event_id":"control-000156","kind":"action_envelope","payload":{"action_fingerprint":"act-a110583841dbf4cb812c0d943a6ed33bdba0ec08bb99bb4527caa30ed2b9b560","envelope_id":"envelope-000156","envelope_sha256":"ef624bc359e01db7169fd79e9cfd78c8474c62ef1b4bf7dc3d988e0b12e90cdf","exact_params":{"action":"test","timeout":1200,"working_directory":"/workspace/ignite"},"intent_id":"intent-233b9dcc0195","intent_source":"model","tool":"build","tool_call_id":"call_IuqpdyySFEMTvdt1KRKnonrK"},"sequence":156,"source":null,"timestamp":"2026-08-13T23:21:56.246609Z"}
+{"event_id":"control-000160","kind":"tool_result","payload":{"actual_executions":[],"envelope_id":"envelope-000156","execution_id":"execution_43d54e4db65143c795b24d7a8de0ef2d","output_sha256":"2cc14ce9183e48f96dfecf88d3c3a63e47300eb3f85002c639600dfb750db334","params":{"action":"test","timeout":1200,"working_directory":"/workspace/ignite"},"result":{"conflicts":[],"error":"Maven build failed with exit code 137\nTest failures: 0, Test errors: 8","error_code":"TEST_FAILURE","evidence_assessment":"blocked","evidence_refs":["output_db4439ba1695"],"evidence_status":"verified","facts":{"action":"test","effective_action":"test","executed":37,"failed":8,"pass_rate":78.4,"passed":29,"requested_action":"test","skipped":0,"system":"maven"},"failure_signature":"TEST_FAILURE:fd8029e0893bf47d","invocation_status":"completed","metadata":{"command":"/workspace/ignite/mvnw --fail-at-end -Dmaven.test.failure.ignore=true verify","dispatch_status":"completed_detached","duration_ms":552751.0442733765,"error_type":"TEST_FAILURE","exit_code":137,"final_runner_dispatched":true,"receipt_id":"inv-maven-1-6ac31414a343-0001","working_directory":"/workspace/ignite"},"operation_outcome":"failed","output":"stored as output_db4439ba1695","output_ref":"output_db4439ba1695","refs":["job:5ae0f09281e9","output_db4439ba1695"],"validator_findings":[]},"roles":["test"],"scope":"test_runtime","source_attempt_id":"build-1","source_phase":"build","tool":"build"},"sequence":160,"source":null,"timestamp":"2026-08-13T23:31:40.797028Z"}
+{"event_id":"control-000161","kind":"loop_decision","payload":{"event":{"args":{"action":"test","timeout":1200,"working_directory":"/workspace/ignite"},"attempt_id":"build-1","error_code":"TEST_FAILURE","evidence_ref":"output_db4439ba1695","failure_signature":"TEST_FAILURE:fd8029e0893bf47d","invocation_status":"completed","iteration":7,"job_id":"","operation_outcome":"failed","output_cursor":"","phase":"build","recurrence_count":1,"relevant_scopes":[],"relevant_state":{"artifacts":4,"dependencies":0,"environment":1,"project_analysis":11,"test_runtime":0},"tool_name":"build"},"expected_decision":"continue","expected_reason_code":"new_recurrence_chain"},"sequence":161,"source":null,"timestamp":"2026-08-13T23:31:54.618605Z"}
+"""
+
+#: Sequences 235, 238, 239 and 240 of the ignite d2r3 fixture: the forced test
+#: dispatch, the result that handed its work to a DETACHED job, its decision,
+#: and the close boundary that found that job still running. Seq 238 is trimmed
+#: by deletion on the same terms; the other three are verbatim. The golden
+#: fences replay the same four events out of the untrimmed file, so the trim is
+#: never what makes this pass.
+REAL_JOB_LEFT_RUNNING_JSONL = """\
+{"event_id":"control-000235","kind":"forced_action","payload":{"action_fingerprint":"act-15d48e74110ea9e73ed5568edc6ee4f0ec1516b679361e058260870831027085","action_sha256":"db2cc51f750282dae76a40c8930db00eccebfee13d1489e7bcaeaa61656412fa","candidate_resolution":{"candidates":[{"root":"/workspace/ignite","system":"maven"}],"primary":{"root":"/workspace/ignite","system":"maven"},"project_root":"/workspace/ignite","status":"available","workspace_root":"/workspace"},"candidate_root":"/workspace/ignite","candidate_system":"maven","envelope_id":"forced-000235","exact_params":{"action":"test","working_directory":"/workspace/ignite"},"intent_id":"intent-700393dbdf18","intent_source":"controller","parent_execution_id":null,"phase":"test","policy":"test_attempt_required","reason_code":"test_receipt_missing","source_attempt_id":"test-1","tool":"build","trigger":"termination_refusal"},"sequence":235,"source":null,"timestamp":"2026-08-14T11:54:03.882923Z"}
+{"event_id":"control-000238","kind":"tool_result","payload":{"actual_executions":[],"envelope_id":"forced-000235","execution_id":"execution_a8cc3d81059f437abdb2f04444ecb4cf","output_sha256":"bcf9bbc41c31d10d8a2a8ca9e60dcf23d7835724906392e6dfc45f14cc17d177","params":{"action":"test","working_directory":"/workspace/ignite"},"result":{"conflicts":[],"evidence_assessment":"unknown","evidence_refs":[],"evidence_status":"unknown","facts":{"action":"test","effective_action":"test","requested_action":"test","system":"maven"},"invocation_status":"pending","metadata":{"command":"/workspace/ignite/mvnw --fail-at-end -Dmaven.test.failure.ignore=true verify","dispatch_status":"running_detached","duration_ms":902917.0989990234,"handoff_reason":"window","job_id":"2c4d56b2fdca","log_path":"/tmp/sag_jobs/2c4d56b2fdca.log","soft_timeout":900,"started":true,"terminal_authority":"docker_exec_inspect_v1","tool":"maven"},"operation_outcome":"unknown","output":"stored as job:2c4d56b2fdca","poll_ref":"job:2c4d56b2fdca","refs":["job:2c4d56b2fdca"],"validator_findings":[]},"roles":[],"scope":"test_runtime","source_attempt_id":"test-1","source_phase":"test","tool":"build"},"sequence":238,"source":null,"timestamp":"2026-08-14T12:09:10.565532Z"}
+{"event_id":"control-000239","kind":"loop_decision","payload":{"event":{"args":{"action":"test","working_directory":"/workspace/ignite"},"attempt_id":"test-1","error_code":"","evidence_ref":"job:2c4d56b2fdca","failure_signature":"","invocation_status":"pending","iteration":28,"job_id":"job:2c4d56b2fdca","operation_outcome":"unknown","output_cursor":"","phase":"test","recurrence_count":1,"relevant_scopes":[],"relevant_state":{"artifacts":7,"dependencies":0,"environment":4,"project_analysis":14,"test_runtime":19},"tool_name":"build"},"expected_decision":"continue","expected_reason_code":"poll_lifecycle_progress"},"sequence":239,"source":null,"timestamp":"2026-08-14T12:09:10.635417Z"}
+{"event_id":"control-000240","kind":"job_live_at_close","payload":{"close_reason":"deadline","job_id":"2c4d56b2fdca","log_ref":"/tmp/sag_jobs/2c4d56b2fdca.log","obligation_ref":"/workspace/.setup_agent/job_obligations/2c4d56b2fdca.json"},"sequence":240,"source":null,"timestamp":"2026-08-14T13:33:04.543982Z"}
+"""
+
+#: SYNTHETIC. `job_settled` appears once in the whole archive and settled at
+#: exit 1, so a job KILLED after its call had already returned is a shape no
+#: recorded ledger holds. Its bytes are built from `JobSettledPayload`, and the
+#: job it settles is ignite's real `2c4d56b2fdca` — the one
+#: `REAL_JOB_LEFT_RUNNING_JSONL` dispatches — so the fixture chains onto
+#: archived bytes rather than onto more invention.
+SYNTHETIC_JOB_KILLED_AFTER_HANDOFF_JSONL = (
+    '{"event_id":"control-000241","kind":"job_settled","payload":'
+    '{"job_id":"2c4d56b2fdca","receipt_id":"inv-maven-1-2c4d56b2fdca-0001",'
+    '"exit_code":137},'
+    '"sequence":241,"source":null,"timestamp":"2026-08-14T13:33:05.010000Z"}'
+)
+
+#: SYNTHETIC, and the other half of the same fence: the same job, settled the
+#: way the archive's one real `job_settled` settled — with a status, not a
+#: signal. Nothing about it is an anomaly, and nothing about it is a hole.
+SYNTHETIC_JOB_SETTLED_CLEAN_JSONL = SYNTHETIC_JOB_KILLED_AFTER_HANDOFF_JSONL.replace(
+    '"exit_code":137', '"exit_code":1'
 )
 
 
@@ -863,6 +929,196 @@ def test_a_call_still_in_flight_is_not_a_ledger_that_does_not_balance():
     for line in (envelope, result, decision):
         r.feed(line)
         assert [w for w in r.snapshot().warnings if w.code == "conservation_violation"] == []
+
+
+def test_the_trimmed_anomaly_lines_are_the_shape_the_engine_would_seal():
+    """A trimmed line is still the engine's line, or it proves nothing about it.
+
+    Both anomaly blocks cut real `tool_result` bytes down to the keys this layer
+    reads — one of them from 50 KB. A cut that removed a required field, or left
+    a shape `ToolResultPayload` would reject, would be a fixture the engine could
+    never have written, and the fence over it would be about nothing.
+    """
+    for block in (REAL_OOM_KILLED_CALL_JSONL, REAL_JOB_LEFT_RUNNING_JSONL):
+        for line in _lines(block):
+            event = json.loads(line)
+            if event["kind"] == "tool_result":
+                ToolResultPayload.model_validate(event["payload"])
+            if event["kind"] == "job_live_at_close":
+                JobLiveAtClosePayload.model_validate(event["payload"])
+    for line in (SYNTHETIC_JOB_KILLED_AFTER_HANDOFF_JSONL, SYNTHETIC_JOB_SETTLED_CLEAN_JSONL):
+        JobSettledPayload.model_validate(json.loads(line)["payload"])
+
+
+def test_a_call_whose_process_was_killed_is_marked_on_the_row_it_killed():
+    """ignite d2r2 seq 160: exit 137, which is a kill and not a verdict.
+
+    The run reads it as `TEST_FAILURE` because that is what the reactor
+    reported, and the row keeps saying so. But 137 is 128+9 — the process did
+    not finish and fail, it was killed, which on this machine is the OOM
+    killer — and a reader scanning a timeline for where the run BLED needs that
+    said out loud rather than left inside a metadata blob nobody expands.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_OOM_KILLED_CALL_JSONL):
+        r.feed(line)
+    snap = r.snapshot()
+
+    assert len(snap.turns) == 1
+    assert snap.turns[0].observation.error_code == "TEST_FAILURE"  # still the run's own word
+    anomalies = [a for a in snap.annotations if a.kind == "conflict"]
+    assert len(anomalies) == 1
+    assert anomalies[0].turn_id == 1
+    assert anomalies[0].data == {
+        "anomaly": "killed_by_signal",
+        "exit_code": 137,
+        "signal": 9,
+        "stated_by": "tool_result",
+    }
+    # An anomaly is a fact the ledger STATED. Only a hole is a warning.
+    assert snap.warnings == []
+
+
+def test_an_ordinary_nonzero_exit_is_a_failure_and_not_a_kill():
+    """Exit 1 is a build that failed; 127 is a command that was not there.
+
+    Both are real codes this corpus holds (camel-quarkus seq 196 exited 127),
+    and neither is a process that was killed. The same real call is replayed
+    with only that one number changed, so nothing but the number can be what
+    decides.
+    """
+    for ordinary in ('"exit_code":1', '"exit_code":127'):
+        replayed = REAL_OOM_KILLED_CALL_JSONL.replace('"exit_code":137', ordinary)
+        assert replayed != REAL_OOM_KILLED_CALL_JSONL
+
+        r = TrajectoryReducer()
+        for line in _lines(replayed):
+            r.feed(line)
+        snap = r.snapshot()
+
+        assert snap.turns[0].observation.error_code == "TEST_FAILURE"
+        assert [a for a in snap.annotations if a.kind == "conflict"] == []
+
+
+def test_a_job_the_run_never_heard_the_end_of_lands_on_the_turn_that_started_it():
+    """ignite d2r3 seq 240: the close found `2c4d56b2fdca` still running.
+
+    The turn that dispatched it is seq 235's forced action, and the join is the
+    ledger's own: the result names the job in `metadata.job_id` and `poll_ref`,
+    the decision names it in `event.job_id`, and the close names it as
+    `job_id`. The mark belongs on THAT row — the row a reader would otherwise
+    read as a dispatch that simply had not answered yet — and the close's own
+    sequence joins the row so the badge can be descended to its bytes.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_JOB_LEFT_RUNNING_JSONL):
+        r.feed(line)
+    snap = r.snapshot()
+
+    assert len(snap.turns) == 1
+    turn = snap.turns[0]
+    assert turn.actor == "controller" and turn.call.params_ref == "forced-000235"
+    assert turn.control_seq == [235, 238, 239, 240]
+
+    anomalies = [a for a in snap.annotations if a.kind == "conflict"]
+    assert len(anomalies) == 1
+    assert anomalies[0].turn_id == turn.turn_id
+    assert anomalies[0].data == {
+        "anomaly": "job_never_settled",
+        "job_id": "2c4d56b2fdca",
+        "close_reason": "deadline",
+        "log_ref": "/tmp/sag_jobs/2c4d56b2fdca.log",
+        "obligation_ref": "/workspace/.setup_agent/job_obligations/2c4d56b2fdca.json",
+        "stated_by": "job_live_at_close",
+    }
+
+
+def test_a_close_naming_a_job_no_turn_dispatched_is_stated_not_guessed():
+    """No turn to mark is not the same as nothing to say (spec §3)."""
+    r = TrajectoryReducer()
+    delta = r.feed(_lines(REAL_JOB_LEFT_RUNNING_JSONL)[-1])  # the close, alone
+
+    assert r.snapshot().annotations == []
+    assert [(w.code, w.control_seq) for w in delta.warnings] == [("orphan_job_anomaly", 240)]
+    assert "2c4d56b2fdca" in delta.warnings[0].detail
+
+
+def test_a_job_killed_after_its_call_returned_still_finds_the_turn_that_started_it():
+    """A detached job's exit code arrives long after the call that dispatched it.
+
+    ignite seq 238 handed its work to a job and returned `pending`: the exit
+    code exists nowhere in that result, and `job_settled` is the only event that
+    ever states it. A kill stated there is the same kill — it just lands on a
+    turn that closed twenty events ago.
+    """
+    r = TrajectoryReducer()
+    for line in _lines(REAL_JOB_LEFT_RUNNING_JSONL)[:-1]:  # dispatch, result, decision
+        r.feed(line)
+    delta = r.feed(SYNTHETIC_JOB_KILLED_AFTER_HANDOFF_JSONL)
+    snap = r.snapshot()
+
+    assert [a.data for a in snap.annotations if a.kind == "conflict"] == [
+        {
+            "anomaly": "killed_by_signal",
+            "exit_code": 137,
+            "signal": 9,
+            "job_id": "2c4d56b2fdca",
+            "stated_by": "job_settled",
+        }
+    ]
+    assert [t.turn_id for t in delta.turns] == [1]  # the delta restates the row it marked
+    assert 241 in snap.turns[0].control_seq
+
+
+def test_a_job_that_settled_with_a_status_is_no_anomaly_and_no_hole():
+    """The archive's one real `job_settled` exited 1. Nothing is marked for that."""
+    r = TrajectoryReducer()
+    for line in _lines(REAL_JOB_LEFT_RUNNING_JSONL)[:-1]:
+        r.feed(line)
+    delta = r.feed(SYNTHETIC_JOB_SETTLED_CLEAN_JSONL)
+
+    assert delta.annotations == [] and delta.warnings == []
+    assert [a for a in r.snapshot().annotations if a.kind == "conflict"] == []
+
+
+def test_the_same_kill_stated_twice_is_marked_once():
+    """`job_terminal_observed` and `job_settled` state one exit code, in turn.
+
+    The engine observes a job's terminal exit first and settles its receipt
+    after, so a killed job is stated twice by design. Two badges on one row
+    would read as two kills.
+    """
+    observed = SYNTHETIC_JOB_KILLED_AFTER_HANDOFF_JSONL.replace(
+        '"kind":"job_settled"', '"kind":"job_terminal_observed"'
+    ).replace(
+        '"receipt_id":"inv-maven-1-2c4d56b2fdca-0001"',
+        '"marker_ref":"/tmp/sag_jobs/2c4d56b2fdca.log.exit",'
+        '"observed_at":"2026-08-14T13:33:04.900000Z",'
+        '"obligation_ref":"/workspace/.setup_agent/job_obligations/2c4d56b2fdca.json"',
+    )
+    r = TrajectoryReducer()
+    for line in _lines(REAL_JOB_LEFT_RUNNING_JSONL)[:-1]:
+        r.feed(line)
+    r.feed(observed)
+    r.feed(SYNTHETIC_JOB_KILLED_AFTER_HANDOFF_JSONL)
+
+    marks = [a for a in r.snapshot().annotations if a.kind == "conflict"]
+    assert len(marks) == 1
+    assert marks[0].data["stated_by"] == "job_terminal_observed"  # the first to say it
+
+
+def test_an_anomaly_ships_in_its_delta_and_survives_the_accumulation():
+    """A live watcher folds deltas; the badge has to arrive that way too."""
+    r = TrajectoryReducer()
+    accumulator = DeltaAccumulator()
+    for block in (REAL_OOM_KILLED_CALL_JSONL, REAL_JOB_LEFT_RUNNING_JSONL):
+        for line in _lines(block):
+            accumulator.feed(r.feed(line))
+
+    assert accumulator.snapshot() == r.snapshot()
+    assert [
+        a.data["anomaly"] for a in accumulator.snapshot().annotations if a.kind == "conflict"
+    ] == ["killed_by_signal", "job_never_settled"]
 
 
 def test_the_reducer_has_no_detail_tier():

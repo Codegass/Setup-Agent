@@ -86,6 +86,32 @@ over the calls the ledger has FINISHED writing, because between an envelope
 and its answer every side legitimately disagrees, and the turn still in flight
 already states its own holes.
 
+**Where the run BLED is marked, and only where the ledger says so.** Two facts
+in the authoritative layer are not holes and not ordinary outcomes, and a reader
+scanning a timeline needs them found rather than expanded into:
+
+- a process that did not finish and fail but was KILLED — an exit in the 128+N
+  range, of which 137 is the OOM killer's SIGKILL (ignite d2r2 seq 160). It is
+  read off `metadata.exit_code` (and `metadata.execution.exit_code`), never out
+  of the result's prose, and never out of a log;
+- a detached job the run never heard the end of — `job_live_at_close`, and its
+  historical spelling `job_unsettled`. The mark lands on the turn that STARTED
+  the job, joined by the job id the ledger itself writes in three places
+  (`metadata.job_id`, `poll_ref`, `loop_decision.event.job_id`), because that
+  dispatch otherwise reads as a call that merely had not answered yet.
+
+Both are `Annotation(kind="conflict")` — a fact ABOUT a turn, never a `Warning`,
+which is this layer's word for a hole in the ledger. The event that states one
+joins the marked turn's `control_seq`, so a badge can always be descended to the
+bytes behind it.
+
+The third anomaly spec §4 names — a provider 5xx retried into success — is NOT
+derived here, because nothing in the authoritative layer records it: the retry
+is `react_engine._native_turn_with_retry`'s business and it survives only as a
+console-log warning, which is never an input (§1). Deriving it would mean
+reading a render, and the trajectory would be claiming a fact the ledger does
+not hold. It becomes derivable when the engine seals it, not before.
+
 **Warnings are statements, and a statement can stop being true.** Turn-level
 warnings are recomputed from turn state, never stored at seal time: a hole is a
 claim about the ledger AS IT STANDS. Each is claimed the moment it is true —
@@ -145,6 +171,17 @@ _CONSERVATION_SIDES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("answered", ("tool_result", "refusal_record")),
     ("decided", ("loop_decision", "cancelled")),
 )
+
+#: A process that exits 128+N was killed by signal N — the convention every
+#: shell writes terminal signals with, and the one Docker reports a killed
+#: container's exit with. 137 is 128+9, SIGKILL, which is what an OOM kill
+#: leaves behind. This is a READING of the number rather than a second fact the
+#: ledger states, which is why the exit code itself is carried beside it: a
+#: reader who thinks a program simply chose to exit 137 can say so.
+_SIGNAL_EXIT_FLOOR = 128
+#: Linux defines 64 signals; past 128+64 the convention has nothing to say, and
+#: a status that high is a program's own number.
+_SIGNAL_EXIT_CEILING = 192
 
 
 @dataclass
@@ -238,6 +275,13 @@ class TrajectoryReducer:
         #: Which turn carried each grading, so a revision of a word delivered
         #: long ago finds its owner instead of landing on whatever is open.
         self._by_decision: dict[str, _TurnState] = {}
+        #: Which turn STARTED each detached job, so a job event that lands after
+        #: the run has moved on marks the dispatch rather than the open turn.
+        self._by_job: dict[str, _TurnState] = {}
+        #: Every anomaly already drawn, as (turn, anomaly, what it is about). A
+        #: killed job is stated twice by design — observed, then settled — and
+        #: two badges on one row would read as two kills.
+        self._marked: set[tuple[Any, ...]] = set()
         self._phases: list[_PhaseState] = []
         #: Where the RUN is: the band a `phase_transition` will terminate. `None`
         #: means the run has not been placed — before its first phase is banded,
@@ -483,7 +527,154 @@ class TrajectoryReducer:
             turn.phase = phase
             self._phase_band(phase)
 
+    # ---- anomalies (spec §4: where the run bled) ----------------------
+
+    def _index_job(self, turn: _TurnState, *candidates: Any) -> None:
+        """Remember which turn STARTED a job, under every name the ledger uses.
+
+        The first turn to name a job is the one that dispatched it; a later poll
+        of the same job names it again, and marking that turn would point a
+        reader at the call that merely asked after the job rather than the call
+        that started it.
+        """
+        for candidate in candidates:
+            key = _job_key(candidate)
+            if key and key not in self._by_job:
+                self._by_job[key] = turn
+
+    def _mark(
+        self,
+        collector: "_Delta",
+        turn: _TurnState,
+        about: Any,
+        data: dict[str, Any],
+        sequence: int | None,
+    ) -> None:
+        """Draw one anomaly on one turn, once, and let the row reach its bytes."""
+        key = (turn.turn_id, data["anomaly"], about)
+        if key in self._marked:
+            return
+        self._marked.add(key)
+        collector.annotate("conflict", turn.turn_id, data)
+        turn.touch(sequence)
+        collector.touched(turn)
+
+    def _mark_job(
+        self,
+        collector: "_Delta",
+        sequence: int | None,
+        kind: str,
+        job_id: str | None,
+        about: Any,
+        data: dict[str, Any],
+    ) -> None:
+        """Mark the turn that started this job, or say that none did."""
+        turn = self._by_job.get(job_id) if job_id else None
+        if turn is None:
+            collector.warn(
+                "orphan_job_anomaly",
+                f"{kind} names job {job_id!r}, which no turn in this ledger dispatched",
+                sequence,
+            )
+            return
+        self._mark(collector, turn, about, data, sequence)
+
+    def _note_kill(
+        self, collector: "_Delta", turn: _TurnState, result: Any, sequence: int | None
+    ) -> None:
+        """A call whose process was killed says so where the row can be read."""
+        for code in _exit_codes(result):
+            signal = _signal_of(code)
+            if signal is None:
+                continue
+            self._mark(
+                collector,
+                turn,
+                code,
+                {
+                    "anomaly": "killed_by_signal",
+                    "exit_code": code,
+                    "signal": signal,
+                    "stated_by": "tool_result",
+                },
+                sequence,
+            )
+
+    def _job_exit(
+        self, collector: "_Delta", sequence: int | None, payload: dict, kind: str
+    ) -> None:
+        """The terminal exit code of a job, stated after its call had returned.
+
+        A dispatch that hands its work to a detached job returns `pending` and
+        carries no exit code at all; these two kinds are the only place one is
+        ever written. A kill stated here is the same kill — it just lands on a
+        turn that closed long ago.
+        """
+        code = payload.get("exit_code")
+        if not isinstance(code, int) or isinstance(code, bool):
+            return
+        signal = _signal_of(code)
+        if signal is None:
+            return
+        job_id = _job_key(payload.get("job_id"))
+        self._mark_job(
+            collector,
+            sequence,
+            kind,
+            job_id,
+            code,
+            {
+                "anomaly": "killed_by_signal",
+                "exit_code": code,
+                "signal": signal,
+                "job_id": job_id,
+                "stated_by": kind,
+            },
+        )
+
+    def _job_unfinished(
+        self, collector: "_Delta", sequence: int | None, payload: dict, kind: str
+    ) -> None:
+        """A job the run never heard the end of, marked on the turn that started it."""
+        job_id = _job_key(payload.get("job_id"))
+        self._mark_job(
+            collector,
+            sequence,
+            kind,
+            job_id,
+            job_id,
+            {
+                "anomaly": "job_never_settled",
+                "job_id": job_id,
+                "close_reason": _text(payload.get("close_reason")),
+                "log_ref": _text(payload.get("log_ref")),
+                "obligation_ref": _text(payload.get("obligation_ref")),
+                "evidence_ref": _text(payload.get("evidence_ref")),
+                "stated_by": kind,
+            },
+        )
+
     # ---- handlers -----------------------------------------------------
+
+    def _on_job_settled(
+        self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
+    ) -> None:
+        self._job_exit(collector, sequence, payload, "job_settled")
+
+    def _on_job_terminal_observed(
+        self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
+    ) -> None:
+        self._job_exit(collector, sequence, payload, "job_terminal_observed")
+
+    def _on_job_live_at_close(
+        self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
+    ) -> None:
+        self._job_unfinished(collector, sequence, payload, "job_live_at_close")
+
+    def _on_job_unsettled(
+        self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
+    ) -> None:
+        self._job_unfinished(collector, sequence, payload, "job_unsettled")
 
     def _on_evidence_store_bound(
         self, collector: "_Delta", sequence: int | None, timestamp: str | None, payload: dict
@@ -709,6 +900,13 @@ class TrajectoryReducer:
         turn.touch(sequence)
         self._count(turn, "tool_result")
         self._adopt_phase(turn, payload.get("source_phase"))
+        metadata = result.get("metadata")
+        self._index_job(
+            turn,
+            metadata.get("job_id") if isinstance(metadata, dict) else None,
+            result.get("poll_ref"),
+        )
+        self._note_kill(collector, turn, result, sequence)
         collector.touched(turn)
 
     def _on_loop_decision(
@@ -750,6 +948,7 @@ class TrajectoryReducer:
         if turn.t1 is None:
             turn.t1 = timestamp
         turn.touch(sequence)
+        self._index_job(turn, event.get("job_id"))
 
         recurrence = event.get("recurrence_count")
         if isinstance(recurrence, int) and recurrence > 1:
@@ -929,6 +1128,10 @@ class TrajectoryReducer:
         "gate_outcome_revised": _on_gate_outcome_revised,
         "phase_transition": _on_phase_transition,
         "repair_context_opened": _on_repair_context_opened,
+        "job_settled": _on_job_settled,
+        "job_terminal_observed": _on_job_terminal_observed,
+        "job_live_at_close": _on_job_live_at_close,
+        "job_unsettled": _on_job_unsettled,
     }
 
 
@@ -1218,6 +1421,47 @@ def _text(value: Any) -> str | None:
     """Empty strings in the ledger mean "not stated"; say so as None."""
     if isinstance(value, str) and value:
         return value
+    return None
+
+
+def _job_key(value: Any) -> str | None:
+    """One job, one key: the ledger writes both `2c4d56b2fdca` and `job:2c4d56b2fdca`.
+
+    A `tool_result` names a job bare in `metadata.job_id` and prefixed in
+    `poll_ref`; a `loop_decision` names it prefixed; the job events name it
+    bare. Two spellings of one id would leave a close unable to find the
+    dispatch it is about.
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    return _text(text[4:]) if text.startswith("job:") else text
+
+
+def _exit_codes(result: Any) -> list[int]:
+    """Every exit code this result STATES, in the two places the engine writes one.
+
+    `metadata.exit_code` is the tool's own reading; `metadata.execution` carries
+    the runner's, and a result may hold either or both. The prose in `error` is
+    not read: this layer takes numbers from fields, never from sentences.
+    """
+    if not isinstance(result, dict):
+        return []
+    metadata = result.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    execution = metadata.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    codes: list[int] = []
+    for value in (metadata.get("exit_code"), execution.get("exit_code")):
+        if isinstance(value, int) and not isinstance(value, bool) and value not in codes:
+            codes.append(value)
+    return codes
+
+
+def _signal_of(code: int) -> int | None:
+    """The signal a 128+N exit names, or None for a status a program chose."""
+    if _SIGNAL_EXIT_FLOOR < code <= _SIGNAL_EXIT_CEILING:
+        return code - _SIGNAL_EXIT_FLOOR
     return None
 
 

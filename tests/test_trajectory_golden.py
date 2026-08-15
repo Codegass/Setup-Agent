@@ -349,7 +349,10 @@ def test_ignites_forced_dispatch_is_a_controller_turn_on_the_record():
 
     assert turn.call.tool == "build" and turn.call.params_ref == "forced-000235"
     assert turn.phase == "test" and turn.iteration == 28
-    assert turn.control_seq == [235, 238, 239]  # the dispatch, its result, its decision
+    # The dispatch, its result, its decision — and seq 240, the close that found
+    # the job it started still running, which is folded into this turn because
+    # it is a fact ABOUT this turn (see the anomaly fence below).
+    assert turn.control_seq == [235, 238, 239, 240]
     assert turn.observation.ref == "job:2c4d56b2fdca"  # the job the dispatch created
 
     forced = [a for a in snap.annotations if a.kind == "forced" and a.turn_id == turn.turn_id]
@@ -361,6 +364,50 @@ def test_ignites_forced_dispatch_is_a_controller_turn_on_the_record():
         "source_attempt_id": "test-1",
     }
     assert len(snap.turns) == 35  # slice census: 34 action_envelope + 1 forced_action
+
+
+def test_ignites_run_ended_with_its_test_job_still_running_and_says_so():
+    """The ignite slice's last fact, derived: the run closed on a live job.
+
+    Seq 240 is the archive's only `job_live_at_close` — the deadline boundary
+    finding `2c4d56b2fdca`, the job the forced dispatch at seq 235 started, with
+    no terminal marker. Read as a row alone, that dispatch looks like a call
+    that merely had not answered yet; the mark is what tells a reader the answer
+    never came, and it lands on the turn that started the job because the ledger
+    itself joins them by job id.
+
+    This is the same fence `tests/test_trajectory_reducer.py` runs over the four
+    events pasted into it, replayed here over the UNTRIMMED file, so no trim can
+    be what makes either pass.
+    """
+    snap = build_trajectory(IGNITE)
+    turn = next(t for t in snap.turns if t.actor == "controller")
+
+    anomalies = [a for a in snap.annotations if a.kind == "conflict"]
+    assert len(anomalies) == 1  # one bleed in the whole run, and it is this one
+    assert anomalies[0].turn_id == turn.turn_id
+    assert anomalies[0].data == {
+        "anomaly": "job_never_settled",
+        "job_id": "2c4d56b2fdca",
+        "close_reason": "deadline",
+        "log_ref": "/tmp/sag_jobs/2c4d56b2fdca.log",
+        "obligation_ref": "/workspace/.setup_agent/job_obligations/2c4d56b2fdca.json",
+        "stated_by": "job_live_at_close",
+    }
+    # A mark is a fact the ledger stated; it never becomes a hole in the ledger.
+    assert [w for w in snap.warnings if w.code == "orphan_job_anomaly"] == []
+
+
+def test_kafka_and_camel_quarkus_bled_nowhere_the_ledger_can_name():
+    """No mark is drawn on a run that stated no exit code out of range.
+
+    Both fixtures fail plenty — camel-quarkus exits 127 twice and 1 five times —
+    and neither run was killed or left a job unsettled. A badge on those rows
+    would be this layer inventing a severity the ledger never wrote.
+    """
+    for fixture in (KAFKA, CAMEL_QUARKUS):
+        snap = build_trajectory(fixture)
+        assert [a for a in snap.annotations if a.kind == "conflict"] == []
 
 
 def test_ignites_job_ref_is_declared_out_of_store_instead_of_silently_absent():

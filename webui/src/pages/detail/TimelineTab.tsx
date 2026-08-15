@@ -7,6 +7,7 @@ import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
 import type { BytesStatus } from "@/components/trajectory/RefDescent"
 import { TrajectoryTimeline } from "@/components/trajectory/TrajectoryTimeline"
+import { TurnSparkline } from "@/components/trajectory/TurnSparkline"
 import { DASHBOARD_POLL_MS } from "@/lib/polling"
 import { latestTurnId, mergeTrajectory } from "@/lib/trajectory"
 
@@ -46,6 +47,11 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
   const held = useRef<TrajectoryDocument | null>(null)
   const resolvedThrough = useRef<number | null>(null)
   const bytesStatus = useRef<BytesStatus>("absent")
+  // A read of a long ledger can outlast the heartbeat. A poll that fired anyway
+  // put one request per tick on the wire and let an older answer land after a
+  // newer one — a document going backwards. The heartbeat skips instead; a read
+  // the OWNER asked for is never skipped, because they are waiting for it.
+  const reading = useRef(false)
 
   const apply = useCallback((incoming: TrajectoryDocument) => {
     const merged = mergeTrajectory(held.current, incoming)
@@ -55,6 +61,10 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
 
   const load = useCallback(
     async (options?: { whole?: boolean; silent?: boolean }) => {
+      if (options?.silent && reading.current) {
+        return
+      }
+      reading.current = true
       if (!options?.silent) {
         setLoading(true)
       }
@@ -69,6 +79,7 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
       } catch (err) {
         setError(message(err))
       } finally {
+        reading.current = false
         if (!options?.silent) {
           setLoading(false)
         }
@@ -185,10 +196,19 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
             {`${doc.warnings.length} hole${doc.warnings.length === 1 ? "" : "s"} stated`}
           </span>
         ) : null}
-        {live ? (
+        {/* The pill is a claim about freshness. A green "following" over a poll
+            that last failed would say the rows are current when they are the
+            run as it stood; the follow keeps trying, and says which it is. */}
+        {live && !error ? (
           <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-status-running">
             <span className="h-1.5 w-1.5 rounded-full bg-status-running" />
             following
+          </span>
+        ) : null}
+        {live && error ? (
+          <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-status-attention">
+            <span className="h-1.5 w-1.5 rounded-full bg-status-attention" />
+            retrying
           </span>
         ) : null}
         <Button
@@ -213,6 +233,8 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
           {`The bytes could not be fetched: ${bytesError}`}
         </div>
       ) : null}
+
+      <TurnSparkline doc={doc} />
 
       {runWide.length ? (
         <ul className="space-y-1 rounded-lg border border-status-attention-border bg-status-attention-soft/40 px-3 py-2">

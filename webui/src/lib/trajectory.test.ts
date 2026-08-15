@@ -8,6 +8,7 @@ import type {
 } from "@/api/types"
 
 import {
+  anomalies,
   bandTurns,
   formatSeq,
   gateChain,
@@ -15,6 +16,8 @@ import {
   mergeTrajectory,
   recurrenceCount,
   rowsByTurn,
+  seriesPeak,
+  sparkColumns,
   truncationMarker,
   turnDurationMs,
   unresolvedRefs,
@@ -312,5 +315,97 @@ describe("formatSeq and turnDurationMs", () => {
   it("is null when either end is missing or unparseable", () => {
     expect(turnDurationMs(turn(1, { t0: "2026-08-14T11:28:36.000Z" }))).toBeNull()
     expect(turnDurationMs(turn(1, { t0: "nope", t1: "also nope" }))).toBeNull()
+  })
+})
+
+describe("anomalies", () => {
+  const mark = (data: Record<string, unknown>): TrajectoryAnnotation => ({
+    kind: "conflict",
+    turn_id: 1,
+    data,
+  })
+
+  it("phrases a kill from the fields the reducer stated", () => {
+    const [killed] = anomalies([
+      mark({ anomaly: "killed_by_signal", exit_code: 137, signal: 9, stated_by: "tool_result" }),
+    ])
+
+    expect(killed.label).toBe("killed · exit 137")
+    expect(killed.detail).toContain("it was killed by signal 9")
+    expect(killed.detail).toContain("stated by tool_result")
+  })
+
+  it("phrases a job that never reported its end, naming the job", () => {
+    const [job] = anomalies([
+      mark({
+        anomaly: "job_never_settled",
+        job_id: "2c4d56b2fdca",
+        close_reason: "deadline",
+        stated_by: "job_live_at_close",
+      }),
+    ])
+
+    expect(job.label).toBe("job never settled")
+    expect(job.detail).toContain("2c4d56b2fdca")
+    expect(job.detail).toContain("deadline")
+  })
+
+  it("draws a mark this build has never heard of under its own name", () => {
+    // A reducer that learns to state something new must not be swallowed by an
+    // older view that only knows two words.
+    expect(anomalies([mark({ anomaly: "clock_went_backwards" })])[0]).toMatchObject({
+      kind: "clock_went_backwards",
+      label: "clock_went_backwards",
+    })
+  })
+
+  it("ignores annotations that are not marks", () => {
+    expect(anomalies([{ kind: "recurrence", turn_id: 1, data: { recurrence_count: 3 } }])).toEqual(
+      [],
+    )
+  })
+})
+
+describe("sparkColumns and seriesPeak", () => {
+  const billed = turn(1, {
+    tokens: { input: 4134, output: 71 },
+    t0: "2026-08-14T11:28:36.000Z",
+    t1: "2026-08-14T11:28:49.500Z",
+  })
+  const unbilled = turn(2, { t0: "2026-08-14T11:29:00.000Z" })
+
+  it("carries tokens and duration per turn, in turn order", () => {
+    const columns = sparkColumns(doc({ turns: [unbilled, billed] }))
+
+    expect(columns.map((c) => c.turnId)).toEqual([1, 2])
+    expect(columns[0]).toMatchObject({ tokens: 4205, durationMs: 13500 })
+  })
+
+  it("carries an unstated bill as null, never as zero", () => {
+    // The token ledger is exported at loop exit, so a live run's last turns are
+    // routinely unbilled. A zero-height bar would read as a free turn.
+    const [, open] = sparkColumns(doc({ turns: [billed, unbilled] }))
+    expect(open.tokens).toBeNull()
+    expect(open.durationMs).toBeNull()
+  })
+
+  it("hands each column the marks the reducer drew on its turn", () => {
+    const columns = sparkColumns(
+      doc({
+        turns: [billed, unbilled],
+        annotations: [{ kind: "conflict", turn_id: 2, data: { anomaly: "killed_by_signal" } }],
+      }),
+    )
+
+    expect(columns[0].anomalies).toEqual([])
+    expect(columns[1].anomalies[0].kind).toBe("killed_by_signal")
+  })
+
+  it("peaks over the values a series states, and is null when none does", () => {
+    const columns = sparkColumns(doc({ turns: [billed, unbilled] }))
+
+    expect(seriesPeak(columns, (c) => c.tokens)).toBe(4205)
+    expect(seriesPeak([], (c) => c.tokens)).toBeNull()
+    expect(seriesPeak(sparkColumns(doc({ turns: [unbilled] })), (c) => c.tokens)).toBeNull()
   })
 })

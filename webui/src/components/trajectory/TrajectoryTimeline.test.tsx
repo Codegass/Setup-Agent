@@ -59,6 +59,11 @@ const doc: TrajectoryDocument = {
   annotations: [
     { kind: "recurrence", turn_id: 1, data: { recurrence_count: 3 } },
     { kind: "forced", turn_id: 2, data: { policy: "phase_floor" } },
+    {
+      kind: "conflict",
+      turn_id: 1,
+      data: { anomaly: "killed_by_signal", exit_code: 137, signal: 9, stated_by: "tool_result" },
+    },
   ],
   warnings: [
     { code: "missing_loop_decision", detail: "turn 2 called 'phase' and emitted no loop_decision", control_seq: 24, turn_id: 2 },
@@ -115,6 +120,18 @@ describe("TrajectoryTimeline", () => {
     expect(within(row).getByText("ENV_EXECUTABLE_NOT_FOUND")).toBeInTheDocument()
     expect(within(row).getByText(/836b0507d4ef8e5a/)).toBeInTheDocument()
     expect(within(row).getByText("×3")).toBeInTheDocument()
+  })
+
+  it("badges an anomaly the reducer marked, saying what the ledger said", () => {
+    render(<TrajectoryTimeline doc={doc} />)
+
+    const row = screen.getByTestId("turn-row-1")
+    const mark = within(row).getByText("killed · exit 137")
+    expect(mark).toBeInTheDocument()
+    expect(mark).toHaveAttribute("title", expect.stringContaining("killed by signal 9"))
+    // A mark is a fact about the turn, not a hole in the ledger: it is never
+    // drawn where the warnings are.
+    expect(within(row).queryByText("conflict")).not.toBeInTheDocument()
   })
 
   it("badges the gate word and expands the chain it superseded", () => {

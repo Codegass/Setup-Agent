@@ -155,6 +155,71 @@ describe("TimelineTab", () => {
     expect(screen.getByText(/no ledger has been written yet/)).toBeInTheDocument()
   })
 
+  it("heads the tab with the per-turn cost of the turns it holds", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(
+        json(
+          doc({
+            turns: [
+              turn(1, {
+                tokens: { input: 4000, output: 205 },
+                t0: "2026-08-14T11:28:36.000Z",
+                t1: "2026-08-14T11:28:49.500Z",
+              }),
+            ],
+          }),
+        ),
+      ),
+    )
+
+    render(<TimelineTab live={false} sessionId="S1" />)
+    await settle()
+
+    expect(screen.getByRole("img", { name: /tokens per turn/i })).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /duration per turn/i })).toBeInTheDocument()
+  })
+
+  it("never stacks a poll on a poll that has not answered", async () => {
+    // A read of a long ledger can outlast the 5s heartbeat. Firing anyway put
+    // one request per tick on the wire and let an older answer land after a
+    // newer one, which is a document going backwards.
+    vi.useFakeTimers()
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => Promise.resolve(json(doc())))
+      .mockImplementation(() => new Promise<Response>(() => {}))
+
+    render(<TimelineTab live sessionId="S1" />)
+    await settle()
+    await settle(5000)
+    await settle(5000)
+    await settle(5000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2) // the mount read, and one poll
+  })
+
+  it("says it is retrying rather than following when a poll fails", async () => {
+    // The pill is a claim about freshness. A green "following" over a poll that
+    // last failed says the rows are current when they are the run as it stood.
+    vi.useFakeTimers()
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => Promise.resolve(json(doc())))
+      .mockImplementation(() => Promise.reject(new Error("connection reset")))
+
+    render(<TimelineTab live sessionId="S1" />)
+    await settle()
+    expect(screen.getByText(/following/i)).toBeInTheDocument()
+
+    await settle(5000)
+
+    expect(screen.queryByText(/following/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/retrying/i)).toBeInTheDocument()
+    expect(screen.getByText(/connection reset/)).toBeInTheDocument()
+    // and the rows it already held are still on screen
+    expect(screen.getByRole("button", { name: /^Turn 1/ })).toBeInTheDocument()
+  })
+
   it("surfaces a failed read and retries on demand", async () => {
     vi.useFakeTimers()
     const fetchMock = vi

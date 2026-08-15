@@ -9,6 +9,7 @@
  */
 
 import type {
+  TrajectoryActor,
   TrajectoryAnnotation,
   TrajectoryDocument,
   TrajectoryGate,
@@ -264,4 +265,134 @@ export function turnDurationMs(turn: TrajectoryTurn): number | null {
     return null
   }
   return end - start
+}
+
+/** A turn's wall time, as every view of it prints it. */
+export function formatDuration(ms: number): string {
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
+/** A token count, short enough for an axis label. Exact counts live in titles. */
+export function formatTokens(tokens: number): string {
+  return tokens < 1000 ? `${tokens}` : `${(tokens / 1000).toFixed(1)}k`
+}
+
+/** One mark the reducer drew on a turn: where the run bled, in its own words. */
+export interface TurnAnomaly {
+  /** The reducer's `data.anomaly`, or `"conflict"` when the mark names none. */
+  kind: string
+  /** What the badge says. */
+  label: string
+  /** What the badge's tooltip says. */
+  detail: string
+}
+
+function text(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null
+}
+
+function count(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+/**
+ * The anomaly marks on one turn, phrased for a badge.
+ *
+ * The reducer states these as `conflict` annotations carrying an `anomaly`
+ * discriminator (a killed process, a detached job that never reported its end).
+ * Nothing is inferred here: the phrasing arranges fields the annotation already
+ * carries, and a mark whose `anomaly` this build has never heard of is drawn
+ * under its own name rather than dropped — a future reducer must be able to
+ * state something new without this view silently swallowing it.
+ */
+export function anomalies(annotations: TrajectoryAnnotation[]): TurnAnomaly[] {
+  const marks: TurnAnomaly[] = []
+  for (const annotation of annotations) {
+    if (annotation.kind !== "conflict") {
+      continue
+    }
+    const data = annotation.data ?? {}
+    const kind = text(data.anomaly) ?? "conflict"
+    const statedBy = text(data.stated_by)
+    const job = text(data.job_id)
+    const source = statedBy ? ` (stated by ${statedBy})` : ""
+
+    if (kind === "killed_by_signal") {
+      const exit = count(data.exit_code)
+      const signal = count(data.signal)
+      marks.push({
+        kind,
+        label: exit == null ? "killed" : `killed · exit ${exit}`,
+        detail:
+          `the process did not exit, it was killed` +
+          (signal == null ? "" : ` by signal ${signal}`) +
+          (job ? `; job ${job}` : "") +
+          source,
+      })
+      continue
+    }
+
+    if (kind === "job_never_settled") {
+      const reason = text(data.close_reason)
+      marks.push({
+        kind,
+        label: "job never settled",
+        detail:
+          `job ${job ?? "(unnamed)"} never reported a terminal exit` +
+          (reason ? `; the run closed on ${reason}` : "") +
+          source,
+      })
+      continue
+    }
+
+    marks.push({ kind, label: kind, detail: `the ledger marked this turn ${kind}${source}` })
+  }
+  return marks
+}
+
+/** One turn's column in the header sparkline. */
+export interface SparkColumn {
+  turnId: number
+  phase: string
+  actor: TrajectoryActor
+  /** Prompt + completion tokens, or null when no bill has been stated yet. */
+  tokens: number | null
+  /** Wall time, or null when the turn has only one of its two stamps. */
+  durationMs: number | null
+  /** The marks the reducer drew on this turn, if any. */
+  anomalies: TurnAnomaly[]
+}
+
+/**
+ * The document as columns, in turn order — the shape the sparkline draws.
+ *
+ * `null` is carried rather than collapsed to zero. A turn whose bill has not
+ * landed (the token ledger is exported at loop exit) and a turn that cost
+ * nothing are different facts, and a zero-height bar tells them apart from
+ * neither. The view draws an absence as an absence.
+ */
+export function sparkColumns(doc: TrajectoryDocument): SparkColumn[] {
+  const marks = rowsByTurn(doc.annotations)
+  return [...doc.turns]
+    .sort((a, b) => a.turn_id - b.turn_id)
+    .map((turn) => ({
+      turnId: turn.turn_id,
+      phase: turn.phase,
+      actor: turn.actor,
+      tokens: turn.tokens ? turn.tokens.input + turn.tokens.output : null,
+      durationMs: turnDurationMs(turn),
+      anomalies: anomalies(marks.get(turn.turn_id) ?? []),
+    }))
+}
+
+/** The largest value a column series states, or null when none states one. */
+export function seriesPeak(columns: SparkColumn[], pick: (c: SparkColumn) => number | null) {
+  let peak: number | null = null
+  for (const column of columns) {
+    const value = pick(column)
+    if (value != null && (peak === null || value > peak)) {
+      peak = value
+    }
+  }
+  return peak
 }

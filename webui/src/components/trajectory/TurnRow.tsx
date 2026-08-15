@@ -8,6 +8,8 @@ import type {
   TrajectoryWarning,
 } from "@/api/types"
 import {
+  anomalies,
+  formatDuration,
   formatSeq,
   gateChain,
   recurrenceCount,
@@ -37,10 +39,7 @@ function gateTone(word: string): string {
 
 function durationLabel(turn: TrajectoryTurn): string | null {
   const ms = turnDurationMs(turn)
-  if (ms === null) {
-    return null
-  }
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+  return ms === null ? null : formatDuration(ms)
 }
 
 /** The gate word, and the chain it replaced when it replaced one. The chain is
@@ -133,6 +132,7 @@ export function TurnRow({
   const [open, setOpen] = useState(false)
   const controller = turn.actor === "controller"
   const recurrence = recurrenceCount(annotations)
+  const marks = anomalies(annotations)
   const quadId = `turn-quad-${turn.turn_id}`
   const duration = durationLabel(turn)
 
@@ -194,6 +194,18 @@ export function TurnRow({
         </button>
 
         <div className="flex flex-wrap items-center gap-1.5">
+          {/* Where the run BLED, in the ledger's own words. A mark is a fact
+              about the turn, so it sits with the badges and never with the
+              warnings underneath, which are this layer's word for a hole. */}
+          {marks.map((mark) => (
+            <span
+              className="whitespace-nowrap rounded-full border border-status-failed-border bg-status-failed-soft px-2 py-0.5 font-mono text-[10.5px] font-semibold text-status-failed"
+              key={`${mark.kind}-${mark.label}`}
+              title={mark.detail}
+            >
+              {mark.label}
+            </span>
+          ))}
           {turn.observation?.error_code ? (
             <span className="whitespace-nowrap rounded-full border border-status-failed-border bg-status-failed-soft px-2 py-0.5 font-mono text-[10.5px] text-status-failed">
               {turn.observation.error_code}
