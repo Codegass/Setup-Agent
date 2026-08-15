@@ -93,7 +93,11 @@ from .loop_memory import (
     LoopMemory,
 )
 from .native_messages import render_messages
-from .output_storage import OutputStorageManager, attach_durable_output_ref
+from .output_storage import (
+    OBSERVABILITY_TASK_ID,
+    OutputStorageManager,
+    attach_durable_output_ref,
+)
 from .phase_gates import (
     GATE_ASSESSMENT_SUBJECT_PREFIX,
     JOB_BARRIER_FACT,
@@ -5470,6 +5474,12 @@ class ReActEngine(UIEventEmitter):
         came back is already held for DIFFERENT bytes — an unresolvable or
         ambiguous ref in a window digest is worse than an absent one, because
         it reconstructs a window the model never saw.
+
+        The namespace is what keeps this off the model's desk: these bytes are
+        addressed by the refs a record names, and `search_outputs` hands them to
+        nobody who did not ask for them by name. The store is shared with the
+        model's own `output_search`, and an observability feature must not
+        change what the model can find.
         """
         storage = getattr(self, "output_storage", None)
         if storage is None:
@@ -5483,7 +5493,7 @@ class ReActEngine(UIEventEmitter):
             return held[digest]
         try:
             ref = storage.store_output(
-                task_id="turn_records",
+                task_id=OBSERVABILITY_TASK_ID,
                 tool_name=label,
                 output=body,
                 timestamp=self._turn_stamp(),

@@ -43,6 +43,21 @@ _SEARCH_METADATA_KEYS = (
 )
 _EMERGENCY_SEARCH_LIMIT = 256
 
+#: The task id the observability layer stores its bytes under — the window
+#: components and delivered observations a `turn_record` names (spec §2.1).
+#: They live in the same JSONL and the same index as tool output, because that
+#: is where the full tier resolves them, and they are ADDRESSED BY REF: a
+#: record holds the handle, and `retrieve_output` answers it.
+#:
+#: They are not search results. `output_search` reads this index, scanning it
+#: newest-first with no default filter, and a window component is a JSON copy
+#: of a message carrying prior observations and build text — nearly any
+#: pattern matches one. At about two new components an iteration they consume
+#: the model's default limit before it reaches the build log it asked for. An
+#: observability feature must not change what the model can find, so a caller
+#: that did not ask for this namespace by name is never handed it.
+OBSERVABILITY_TASK_ID = "turn_records"
+
 
 def _storage_metadata(metadata: Any) -> Dict[str, Any]:
     """Copy durable metadata while bounding the newly indexed action scalar."""
@@ -724,12 +739,18 @@ class OutputStorageManager:
         if self._index_may_be_stale():
             self.current_index = self._rebuild_index_from_storage()
 
+        # The observability layer's own bytes answer to their refs, not to
+        # questions the model asked; a caller naming the namespace still gets it.
+        unasked_namespace = None if task_id == OBSERVABILITY_TASK_ID else OBSERVABILITY_TASK_ID
+
         # First, filter by index criteria
         candidates = []
         # Newest first: callers looking for the current action receipt should
         # not be shadowed by an older record for the same task/tool.
         for ref_id, info in reversed(self.current_index.items()):
             if task_id and info.get("task_id") != task_id:
+                continue
+            if info.get("task_id") == unasked_namespace:
                 continue
             if tool_name and info.get("tool_name") != tool_name:
                 continue
@@ -751,6 +772,8 @@ class OutputStorageManager:
             if ref_id in indexed_refs:
                 continue
             if task_id and record.get("task_id") != task_id:
+                continue
+            if record.get("task_id") == unasked_namespace:
                 continue
             if tool_name and record.get("tool_name") != tool_name:
                 continue

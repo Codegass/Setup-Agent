@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
+from sag.agent.output_storage import (
+    OBSERVABILITY_TASK_ID,
+    OutputStorageManager,
+    attach_durable_output_ref,
+)
 from sag.evidence import OperationOutcome
 from sag.project_fact_sheet import with_project_fact_sheet_identity
 from sag.tools.base import ToolResult
@@ -334,6 +338,43 @@ def test_metadata_filter_applies_before_result_limit(tmp_path):
         metadata_match=target_metadata,
     )
     assert found["ref_id"] == target_ref
+
+
+def test_the_observability_namespace_is_addressable_but_never_a_search_result(tmp_path):
+    """The store a turn record writes into is the store `output_search` reads.
+
+    Window components are JSON copies of messages carrying prior observations
+    and build text, so nearly any pattern matches one, and there are about two
+    new ones an iteration. Left in the searchable index they consume the
+    default limit before the model reaches the build log it asked for — an
+    observability feature changing what the model can find.
+
+    The bytes stay exactly where the full tier resolves them, addressed by the
+    ref a record names, and a caller that asks for the namespace by name still
+    gets it. What changes is that nobody is handed it unasked.
+    """
+    storage = OutputStorageManager(tmp_path)
+    build_log = storage.store_output(
+        task_id="phase_build",
+        tool_name="maven",
+        output="[ERROR] BUILD FAILURE: package org.example does not exist",
+    )
+    component = storage.store_output(
+        task_id=OBSERVABILITY_TASK_ID,
+        tool_name="window_component",
+        output='{"content":"[ERROR] BUILD FAILURE: package org.example does not exist"}',
+    )
+
+    searched = storage.search_outputs(pattern="BUILD FAILURE", limit=10)
+    listed = storage.search_outputs(limit=10)
+
+    assert [row["ref_id"] for row in searched] == [build_log]
+    assert [row["ref_id"] for row in listed] == [build_log]
+    # Addressable by ref, and by name for a caller that means it.
+    assert storage.retrieve_output(component)
+    assert [row["ref_id"] for row in storage.search_outputs(task_id=OBSERVABILITY_TASK_ID)] == [
+        component
+    ]
 
 
 def test_search_metadata_is_whitelisted_and_value_bounded(tmp_path):

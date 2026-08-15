@@ -318,6 +318,35 @@ def test_a_sealed_turn_states_the_observation_it_delivered(sealed_run):
     assert storage.retrieve_output(refs[-1]) in delivered
 
 
+def test_sealing_a_turn_never_changes_what_the_model_can_find(sealed_run):
+    """The store a record writes into is the store `output_search` reads.
+
+    The engine's `OutputStorageManager` and the search tool's point at the same
+    `contexts/full_outputs.jsonl` and `output_index.json` by construction, and
+    `search_outputs` scans that index newest-first with no default filter. Every
+    rendered message and every delivered observation is a row in it — about two
+    an iteration — and a window component is a JSON copy of a message full of
+    prior observations and build text, so nearly any pattern matches one. Left
+    searchable they consume the model's limit before it reaches the log it
+    asked for.
+
+    An observability feature must not change what the model can find. The bytes
+    stay where the record's refs resolve them; they are simply not answers to a
+    question the model asked.
+    """
+    store = sealed_run.output_storage
+    sealed = _model_records(sealed_run)[-1]["payload"]
+
+    searched = store.search_outputs(pattern="advisor", limit=10)
+    listed = store.search_outputs(limit=10)
+
+    assert searched and [row["tool_name"] for row in searched] == ["advisor"] * len(searched)
+    assert listed and [row["tool_name"] for row in listed] == ["advisor"] * len(listed)
+    # And [A] and [C] are still one lookup away for the reader who holds the ref.
+    assert store.retrieve_output(sealed["window_digest"]["component_refs"][0])
+    assert store.retrieve_output(sealed["observation_ref"])
+
+
 # ---------------------------------------------------------------------------
 # Task 8 — the controller's turns, observations included
 # ---------------------------------------------------------------------------
