@@ -27,6 +27,7 @@ from sag.agent.phase_gates import (
     GateResult,
     ValidatorState,
     check_phase_claim,
+    disclosed_live_job_ids,
     gate_observation_text,
     settlement_capped_outcome,
 )
@@ -88,6 +89,7 @@ class PhaseTool(BaseTool):
             self.orchestrator,
             self.project_name,
             sealed=sealed,
+            disclosed_job_ids=disclosed_live_job_ids(self.run_evidence_state),
         )
         gate = gate if gate.claim is not None else gate.with_claim(claim)
         callback = self._analysis_facts_recovery
@@ -118,6 +120,7 @@ class PhaseTool(BaseTool):
             self.orchestrator,
             self.project_name,
             sealed=sealed,
+            disclosed_job_ids=disclosed_live_job_ids(self.run_evidence_state),
         )
         final_gate = final_gate if final_gate.claim is not None else final_gate.with_claim(claim)
         after_code = final_gate.code or "unclassified"

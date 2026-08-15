@@ -38,7 +38,17 @@ class GateRecorder:
             suggestions=tuple(suggestions or ()),
         )
 
-    def __call__(self, phase, claim, validator, orchestrator, project_name, *, sealed=False):
+    def __call__(
+        self,
+        phase,
+        claim,
+        validator,
+        orchestrator,
+        project_name,
+        *,
+        sealed=False,
+        disclosed_job_ids=(),
+    ):
         self.calls.append(phase)
         self.sealed = sealed
         return self.result.with_claim(claim)
@@ -296,7 +306,17 @@ def test_analysis_facts_missing_gets_one_controller_survey_and_one_final_gate():
         def __init__(self):
             self.calls = 0
 
-        def __call__(self, phase, claim, validator, orchestrator, project_name, *, sealed=False):
+        def __call__(
+            self,
+            phase,
+            claim,
+            validator,
+            orchestrator,
+            project_name,
+            *,
+            sealed=False,
+            disclosed_job_ids=(),
+        ):
             self.calls += 1
             if self.calls == 1:
                 return GateResult(
@@ -346,7 +366,17 @@ def test_analysis_facts_recovery_is_one_shot_and_failed_gate_has_no_phase_signal
         def __init__(self):
             self.calls = 0
 
-        def __call__(self, phase, claim, validator, orchestrator, project_name, *, sealed=False):
+        def __call__(
+            self,
+            phase,
+            claim,
+            validator,
+            orchestrator,
+            project_name,
+            *,
+            sealed=False,
+            disclosed_job_ids=(),
+        ):
             self.calls += 1
             return GateResult(
                 accepted=False,

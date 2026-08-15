@@ -115,6 +115,7 @@ from .phase_gates import (
     check_phase_claim,
     claim_identity,
     claimable_outcome,
+    disclosed_live_job_ids,
     gate_observation_text,
     validate_phase_claim,
 )
@@ -1375,7 +1376,7 @@ class ReActEngine(UIEventEmitter):
         orchestrator = getattr(self, "orchestrator", None)
         if orchestrator is None:
             return False
-        records = read_obligations(orchestrator)
+        records = self._obligations_still_owed(orchestrator)
         if records is None:
             self._record_job_barrier_integrity_failure(("ledger_unreadable_after_tool_result",))
             return True
@@ -1585,6 +1586,37 @@ class ReActEngine(UIEventEmitter):
             )
             state.record_conflict("job_barrier_integrity_failure")
 
+    def _disclosed_live_jobs(self) -> set:
+        """Jobs this run has already disclosed as live at the report reserve.
+
+        The in-process announcement guard and the durable run-state conflict
+        say the same thing; a resumed run has only the second, so both are read.
+        """
+        disclosed = set(self._assessment_guard("_announced_jobs_live_at_close"))
+        disclosed.update(disclosed_live_job_ids(getattr(self, "run_evidence_state", None)))
+        return disclosed
+
+    def _obligations_still_owed(self, orchestrator) -> Optional[List[Dict[str, Any]]]:
+        """The ledger records the controller is still answerable for.
+
+        A disclosure is the LAST lifecycle word about a job: after
+        `job_live_at_close` the controller neither waits on it nor settles it,
+        because `job_settled` (or a terminal observation) after that disclosure
+        is not a lifecycle any reader — replay included — can walk. The run
+        keeps the honest conflict it already recorded instead.
+
+        None still means "the ledger could not be read"; it never means empty.
+        """
+        records = read_obligations(orchestrator)
+        if records is None:
+            return None
+        disclosed = self._disclosed_live_jobs()
+        if not disclosed:
+            return records
+        return [
+            record for record in records if str(record.get("job_id") or "").strip() not in disclosed
+        ]
+
     def _job_barrier_progress_states(self) -> Dict[str, Dict[str, Any]]:
         states = getattr(self, "_job_barrier_progress_by_job", None)
         if states is None:
@@ -1695,7 +1727,10 @@ class ReActEngine(UIEventEmitter):
 
         deadline = self._hold_deadline()
         for _ in range(self._JOB_MARKER_RECONCILE_ATTEMPTS):
-            reconciliation = reconcile_job_obligations(self.orchestrator)
+            reconciliation = reconcile_job_obligations(
+                self.orchestrator,
+                obligations=self._obligations_still_owed(self.orchestrator),
+            )
             self._announce_job_reconciliation(reconciliation)
             if reconciliation.terminal_unpersisted or getattr(
                 self, "_job_barrier_evidence_unpersisted", False
@@ -1734,7 +1769,7 @@ class ReActEngine(UIEventEmitter):
                 )
                 return "integrity_failure"
             return "cleared"
-        records = read_obligations(orchestrator)
+        records = self._obligations_still_owed(orchestrator)
         ephemeral = bool(self._ephemeral_job_handles())
         if records == [] and not ephemeral:
             return "cleared"
@@ -1755,11 +1790,14 @@ class ReActEngine(UIEventEmitter):
             int(getattr(getattr(self, "config", None), "dispatch_stall_seconds", 600)),
         )
         while True:
-            reconciliation = reconcile_job_obligations(orchestrator)
+            reconciliation = reconcile_job_obligations(
+                orchestrator,
+                obligations=self._obligations_still_owed(orchestrator),
+            )
             self._announce_job_reconciliation(reconciliation)
             ephemeral_running, ephemeral_failures = self._reconcile_ephemeral_jobs()
             running = tuple(sorted(set(reconciliation.running_job_ids + ephemeral_running)))
-            durable_records = read_obligations(orchestrator)
+            durable_records = self._obligations_still_owed(orchestrator)
             failures = list(reconciliation.integrity_failures) + list(ephemeral_failures)
             if durable_records is None:
                 failures.append("ledger_unreadable_after_reconciliation")
@@ -3082,6 +3120,7 @@ class ReActEngine(UIEventEmitter):
             orchestrator=getattr(validator, "docker_orchestrator", None),
             project_name=project_name,
             sealed=self._evidence_is_sealed(),
+            disclosed_job_ids=sorted(self._disclosed_live_jobs()),
         )
 
     NUDGE_EVERY = 15
@@ -3129,6 +3168,108 @@ class ReActEngine(UIEventEmitter):
                 content="\n".join(lines),
                 timestamp=self._get_timestamp(),
             )
+        )
+        return True
+
+    def _close_phase_at_barrier_deadline(self) -> bool:
+        """Close the open attempt BLOCKED when a job is still live at the reserve.
+
+        The controller waited as long as its own budget allowed, verified the
+        job live at `_hold_deadline()`, and disclosed it. What remains is a
+        phase that cannot be finished, which is an ordinary blocked close —
+        the containment #45 built for a control-persist exhaustion, reused:
+        the phase ends, dependents skip, evidence closes and the report
+        delivers. Nothing here weakens a claim: the disclosed job is still an
+        open obligation, so the §3.3 cap still denies `success`, and the
+        verdict still carries `job_live_at_close:<id>` as a conflict.
+
+        Returns False when there is nothing honest to say — no disclosure, a
+        sealed run, or a machine that is already complete — and the caller's
+        abort stands.
+        """
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if machine is None or state is None or state.sealed or machine.is_complete:
+            return False
+        disclosed = sorted(self._disclosed_live_jobs())
+        if not disclosed:
+            return False
+        phase = machine.current_phase
+        named = ", ".join(disclosed[:3])
+        if len(disclosed) > 3:
+            named += f" (+{len(disclosed) - 3} more)"
+        probe = self._phase_gate_check(phase)
+        validator_state = ValidatorState(
+            probe.get("validator_state", ValidatorState.UNAVAILABLE.value)
+        )
+        validated_facts = dict(probe.get("validated_facts") or {})
+        refs = tuple(probe.get("evidence_refs") or ())
+        reserve = self._REPORT_RESERVE_SECONDS
+        sentence = (
+            f"job {named} was still live at the report reserve; the controller "
+            f"stopped waiting with {reserve}s reserved for the report and no "
+            "terminal runner receipt"
+        )
+        state.record_blocker(
+            failure_signature=f"job_live_at_report_reserve:{machine.current_attempt_id}:{named}",
+            category="harness_control",
+            error_code="job_live_at_report_reserve",
+            evidence_refs=refs,
+            source_phase=phase,
+            source_attempt_id=machine.current_attempt_id,
+        )
+        claim = PhaseClaim(
+            phase=phase,
+            signal="blocked",
+            claimed_outcome=claimable_outcome(validator_state, validated_facts),
+            key_results=sentence,
+            reason=sentence,
+            evidence_refs=refs,
+        )
+        gate = validate_phase_claim(
+            claim,
+            validator_state,
+            reason=" · ".join(
+                part for part in (str(probe.get("reason") or "").strip(), sentence) if part
+            ),
+            evidence_refs=refs,
+            suggestions=tuple(probe.get("suggestions") or ()),
+            code="job_live_at_report_reserve",
+            validated_facts=validated_facts,
+            control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
+            blocker_owner=BlockerOwner.HARNESS,
+        )
+        if not gate.accepted:
+            # UNKNOWN is always claimable; the close must never fail closed
+            # into the abort it exists to replace.
+            claim = PhaseClaim(
+                phase=phase,
+                signal="blocked",
+                claimed_outcome=PhaseOutcome.UNKNOWN,
+                key_results=sentence,
+                reason=sentence,
+                evidence_refs=refs,
+            )
+            gate = validate_phase_claim(
+                claim,
+                validator_state,
+                reason=sentence,
+                evidence_refs=refs,
+                code="job_live_at_report_reserve",
+                validated_facts=validated_facts,
+                control_disposition=GateControlDisposition.TERMINAL_CLAIMABLE,
+                blocker_owner=BlockerOwner.HARNESS,
+            )
+            if not gate.accepted:
+                return False
+        self._seal_engine_gate(claim, gate)
+        self._record_gate_facts(phase, gate)
+        record = machine.close_attempt(gate)
+        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+        decision = policy.decide(record, state=state, budgets=self._repair_budgets())
+        self._apply_phase_decision(record, decision)
+        getattr(self, "agent_logger", logger).warning(
+            f"Closed {phase} blocked at the report reserve: {sentence}"
         )
         return True
 
@@ -3493,6 +3634,20 @@ class ReActEngine(UIEventEmitter):
 
                 barrier_status = self._drain_job_barrier()
                 if barrier_status != "cleared":
+                    # `live_at_deadline` is a BUDGET outcome, not an integrity
+                    # failure: the wall guard verified the job live at the
+                    # report reserve and said so. Aborting here threw away the
+                    # reserve `_hold_deadline` had just spent the whole wait
+                    # defending (p7d camel: 84 minutes defended, then discarded
+                    # unspent, the phase recorded `aborted` with a null claim
+                    # and the report phase never entered). Every other status
+                    # is an integrity family and keeps abort semantics.
+                    if phase_mode and barrier_status == "live_at_deadline":
+                        if self._close_phase_at_barrier_deadline():
+                            if self.phase_machine.is_complete:
+                                self._export_token_usage_csv()
+                                return self._close_flow(RunTerminationStatus.COMPLETED)
+                            continue
                     self._export_token_usage_csv()
                     if phase_mode:
                         return self.abort(reason=f"job barrier {barrier_status}")
@@ -7603,7 +7758,7 @@ class ReActEngine(UIEventEmitter):
             # ONE ledger read per batch: the common case is a run that never
             # detached anything, and it must not pay two round trips to be
             # told so twice.
-            records = read_obligations(orchestrator)
+            records = self._obligations_still_owed(orchestrator)
             if records is None:
                 self._record_job_barrier_integrity_failure(
                     ("ledger_unreadable_after_action_batch",)

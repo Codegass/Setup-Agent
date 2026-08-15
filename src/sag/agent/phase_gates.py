@@ -120,6 +120,11 @@ PHYSICAL_STATE_FACT = "run.physical_validator_state"
 # discharged; see `settled_validator_state`.
 EVIDENCE_SEALED_FACT = "run.evidence_sealed"
 ANALYSIS_RECOVERY_FACT = "run.analysis_recovery"
+# The conflict the controller records when it discloses a job as still live at
+# the report reserve (`_record_live_jobs_at_close`). It is the durable, replayed
+# form of that disclosure, which is why the gate reads it from run state rather
+# than from an engine-held set: a resumed run must release the same jobs.
+LIVE_AT_CLOSE_CONFLICT_PREFIX = "job_live_at_close:"
 # How many job ids a capped reason spells out before it says "+N more". The
 # count itself is never dropped: a bound on a message is not a bound on a fact.
 _MAX_NAMED_JOBS = 3
@@ -688,6 +693,28 @@ class _ValidatorObservation:
         refuse_direction_contradiction(self.state, self.reason, self.code)
 
 
+def disclosed_live_job_ids(state: Any) -> tuple[str, ...]:
+    """The jobs this run has already disclosed as live at the report reserve.
+
+    A disclosure ends the controller's wait for that job: the barrier stops
+    polling it and the gate stops calling it a barrier, so a report phase
+    entered at the reserve can be graded at all. It does NOT discharge the
+    obligation — the job stays an open obligation and keeps the §3.3 cap, which
+    is the whole difference between "the run stopped waiting" and "the job
+    finished".
+    """
+    conflicts = getattr(state, "conflicts", ()) or ()
+    disclosed: list[str] = []
+    for conflict in conflicts:
+        text = str(conflict)
+        if not text.startswith(LIVE_AT_CLOSE_CONFLICT_PREFIX):
+            continue
+        job_id = text[len(LIVE_AT_CLOSE_CONFLICT_PREFIX) :].strip()
+        if job_id:
+            disclosed.append(job_id)
+    return tuple(dict.fromkeys(disclosed))
+
+
 @dataclass(frozen=True)
 class _JobLedgerObservation:
     """The control-relevant result of reconciling the obligation ledger."""
@@ -696,6 +723,10 @@ class _JobLedgerObservation:
     settlement_pending_job_ids: tuple[str, ...] = ()
     terminal_unpersisted: tuple[Mapping[str, Any], ...] = ()
     integrity_failures: tuple[str, ...] = ()
+    #: Open obligations the controller already disclosed at the report reserve.
+    #: They are open (they cap the claim) and they are not a wait (they do not
+    #: hold the barrier); no other lifecycle state is both.
+    disclosed_job_ids: tuple[str, ...] = ()
 
     @property
     def barrier_entries(self) -> tuple[Mapping[str, str], ...]:
@@ -724,6 +755,7 @@ class _JobLedgerObservation:
                     *self.running_job_ids,
                     *self.settlement_pending_job_ids,
                     *self.terminal_unpersisted_job_ids,
+                    *self.disclosed_job_ids,
                 )
             )
         )
@@ -1008,16 +1040,28 @@ def check_phase_claim(
     project_name: Optional[str],
     *,
     sealed: bool = False,
+    disclosed_job_ids: Iterable[str] = (),
 ) -> GateResult:
     """Inspect physical evidence and validate one terminal phase claim.
 
     `sealed` is the run's evidence seal: a sealed run accepts no further
     evidence, so the gate grades the ledger it finds without settling it (see
     :func:`_settle_before_grading`).
+
+    `disclosed_job_ids` are the jobs the controller already disclosed as live
+    at the report reserve: still open (so still capping this claim), no longer
+    a wait (so no longer ungradable).
     """
     if claim.phase != phase:
         raise ValueError(f"claim for {claim.phase!r} cannot validate phase {phase!r}")
-    observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
+    observation = _inspect_phase(
+        phase,
+        validator,
+        orchestrator,
+        project_name,
+        sealed=sealed,
+        disclosed_job_ids=disclosed_job_ids,
+    )
     return validate_phase_claim(
         claim,
         observation.state,
@@ -1038,6 +1082,7 @@ def check_phase_done(
     project_name: Optional[str],
     *,
     sealed: bool = False,
+    disclosed_job_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Read-only compatibility projection for engine nudges during WS3.
 
@@ -1055,7 +1100,14 @@ def check_phase_done(
     engine's starved-phase floor reads this same dict, and it closes
     unconditionally, so its probe must carry the cap and the sentence too.
     """
-    observation = _inspect_phase(phase, validator, orchestrator, project_name, sealed=sealed)
+    observation = _inspect_phase(
+        phase,
+        validator,
+        orchestrator,
+        project_name,
+        sealed=sealed,
+        disclosed_job_ids=disclosed_job_ids,
+    )
     state, reason = settled_observation(
         observation.state, observation.reason, observation.validated_facts
     )
@@ -1161,7 +1213,12 @@ def _classify_sealed_obligations(
     )
 
 
-def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerObservation:
+def _settle_before_grading(
+    orchestrator,
+    *,
+    sealed: bool = False,
+    disclosed_job_ids: Iterable[str] = (),
+) -> _JobLedgerObservation:
     """Settle the job ledger, then classify its control state. Never raises.
 
     Plan 8 §3.2 trigger 2. The polaris build gate (p7d,
@@ -1175,6 +1232,10 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerO
     any stale live/pending record remains a controller barrier and any durable
     terminal-unpersisted record remains an evidence-integrity cap.
 
+    A job already DISCLOSED live at the report reserve is settled no further
+    either: `job_live_at_close` is the last lifecycle word the run may speak
+    about it, so it is classified as an open obligation and nothing else.
+
     A run that never detached anything costs one glob `cat` that matches no
     file, and states no fact.
     """
@@ -1186,6 +1247,9 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerO
         reconcile_job_obligations,
     )
 
+    disclosed = tuple(
+        dict.fromkeys(str(job_id).strip() for job_id in disclosed_job_ids if str(job_id).strip())
+    )
     try:
         records = read_obligations(orchestrator)
         if records is None:
@@ -1194,11 +1258,27 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerO
             return _JobLedgerObservation(integrity_failures=("ledger_unreadable",))
         if not records:
             return _JobLedgerObservation()
+        released = tuple(
+            job_id
+            for job_id in disclosed
+            if any(str(record.get("job_id") or "").strip() == job_id for record in records)
+        )
+        if released:
+            records = [
+                record
+                for record in records
+                if str(record.get("job_id") or "").strip() not in set(released)
+            ]
+            if not records:
+                return _JobLedgerObservation(disclosed_job_ids=released)
         if sealed:
             execute = getattr(orchestrator, "execute_command", None)
             if not callable(execute) and callable(orchestrator):
                 execute = orchestrator
-            return _classify_sealed_obligations(records, execute=execute)
+            return replace(
+                _classify_sealed_obligations(records, execute=execute),
+                disclosed_job_ids=released,
+            )
 
         existing_unpersisted = {
             str(record.get("job_id") or "").strip(): _terminal_unpersisted_record(record)
@@ -1215,6 +1295,7 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerO
                 existing_unpersisted[job_id] for job_id in sorted(existing_unpersisted)
             ),
             integrity_failures=tuple(reconciliation.integrity_failures),
+            disclosed_job_ids=released,
         )
     except Exception as exc:  # the ledger never becomes a project failure
         logger.warning(f"job obligations were not settled before grading: {exc}")
@@ -1224,9 +1305,19 @@ def _settle_before_grading(orchestrator, *, sealed: bool = False) -> _JobLedgerO
 
 
 def _inspect_phase(
-    phase, validator, orchestrator, project_name, *, sealed: bool = False
+    phase,
+    validator,
+    orchestrator,
+    project_name,
+    *,
+    sealed: bool = False,
+    disclosed_job_ids: Iterable[str] = (),
 ) -> _ValidatorObservation:
-    jobs = _settle_before_grading(orchestrator, sealed=sealed)
+    jobs = _settle_before_grading(
+        orchestrator,
+        sealed=sealed,
+        disclosed_job_ids=disclosed_job_ids,
+    )
     lifecycle_facts = jobs.validated_facts()
     if jobs.integrity_failures:
         return _ValidatorObservation(
@@ -1249,7 +1340,22 @@ def _inspect_phase(
 
     observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
     if not jobs.terminal_unpersisted:
-        return observation
+        if not jobs.disclosed_job_ids:
+            return observation
+        # A disclosed job stopped being a wait; it did not stop being an open
+        # obligation. Carrying its fact here is what keeps the §3.3 cap on a
+        # phase the run graded WITHOUT the receipt it is still owed — the
+        # difference between "the controller stopped waiting" and "the job
+        # finished", stated where the cap can read it.
+        return replace(
+            observation,
+            validated_facts={
+                **dict(observation.validated_facts),
+                **lifecycle_facts,
+                PHYSICAL_STATE_FACT: ValidatorState(observation.state).value,
+                EVIDENCE_SEALED_FACT: bool(sealed),
+            },
+        )
 
     # A missing receipt may cap a physical observation only when that
     # observation exists.  Never let the lifecycle wrapper rename an analysis
