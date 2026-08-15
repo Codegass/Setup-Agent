@@ -850,11 +850,14 @@ def test_write_receipt_refuses_a_receipt_without_an_id():
 )
 def test_write_receipt_refuses_unsafe_ids_before_any_container_io(receipt_id):
     execute = FakeExecute()
+    # An otherwise complete receipt, so the refusal is the ID and the typed
+    # code names the ID — `invalid_arguments` alone cannot be repaired.
+    payload = {**minimal_valid_receipt("inv-python-0001", tool="python"), "receipt_id": receipt_id}
 
-    result = write_receipt_result(execute, {"receipt_id": receipt_id})
+    result = write_receipt_result(execute, payload)
 
     assert result.persisted is False
-    assert result.code == "invalid_arguments"
+    assert result.code == "invalid_arguments:receipt_id"
     assert execute.commands == []
 
 

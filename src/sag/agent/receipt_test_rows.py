@@ -310,8 +310,14 @@ def diagnostic_testcase_outcomes(
     for raw in parsed.get("rows") or ():
         if not isinstance(raw, Mapping):
             continue
-        name = str(raw.get("name") or "").strip()
-        classname = str(raw.get("classname") or "").strip()
+        # Collapse whitespace exactly as `reason` is collapsed four lines down,
+        # and for the same reason: a JUnit display name may legally carry a
+        # newline (surefire writes it as `&#10;`, and the in-container parser
+        # unescapes it), while a receipt identifier may not carry control text.
+        # The legacy tag-stream parser this replaced sanitized here; live kafka
+        # lost its whole terminal receipt to the omission.
+        name = " ".join(str(raw.get("name") or "").split())
+        classname = " ".join(str(raw.get("classname") or "").split())
         status = str(raw.get("outcome") or "").strip()
         if not name or status not in _DIAGNOSTIC_ORDER:
             continue

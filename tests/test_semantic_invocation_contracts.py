@@ -191,7 +191,7 @@ def test_receipt_reader_and_writer_enforce_transport_bounds_and_same_validator()
     malformed = {**valid, "report_delta": {"new": "truthy", "changed": []}}
     result = write_receipt_result(lambda command: calls.append(command), malformed)
     assert result.persisted is False
-    assert result.code == "invalid_arguments"
+    assert result.code == "invalid_arguments:report_delta"
     assert calls == []
 
 

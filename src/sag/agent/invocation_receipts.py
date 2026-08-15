@@ -62,6 +62,7 @@ from sag.agent.receipt_test_rows import (
 from sag.runtime.container_io import resolve_control_execute
 from sag.utils.container_io import (
     WRITE_COMPARE_CONFLICT,
+    WRITE_INVALID_ARGUMENTS,
     ContainerWriteResult,
     compare_publish_container_text_atomic,
 )
@@ -75,6 +76,14 @@ RECEIPT_MAX_RAW_BYTES = 20 * 1024 * 1024
 RECEIPT_TEXT_MAX_BYTES = 4096
 RECEIPT_ARGV_MAX_BYTES = 1 << 20
 RECEIPT_SEQUENCE_MAX_ITEMS = 256
+# `module_outcomes` is the ONE receipt sequence whose length is set by the
+# project, not by us: it is the build system's own reactor summary. Camel's
+# reactor prints 652 rows, and the generic 256 bound refused them — on the
+# DETACHED path only, because the synchronous monitor hands back a clipped log
+# that parses to 31. A reactor bound has to be a reactor's size. 4096 rows
+# serialize to roughly 250 KB against a 16 MB canonical budget, so nothing
+# downstream of it is threatened.
+RECEIPT_MODULE_OUTCOMES_MAX_ITEMS = 4096
 # Heredoc delimiter for the atomic write. The body is single-line JSON, so no
 # receipt content can ever collide with it.
 RECEIPT_HEREDOC = "SAGRECEIPT"
@@ -171,9 +180,23 @@ _RECEIPT_V2_OPTIONAL_FIELDS = frozenset(
         "capability_observations",
         "module_outcomes",
         "excluded_claimed_paths",
+        "evidence_omissions",
     }
 )
 _RECEIPT_V2_FIELDS = _RECEIPT_V2_REQUIRED_FIELDS | _RECEIPT_V2_OPTIONAL_FIELDS
+# The OBSERVABILITY fields. Each one describes the dispatch; none of them IS
+# the dispatch. When a producer hands one over in a shape the receipt cannot
+# carry, `build_receipt` drops that field alone and records WHY here, rather
+# than letting the write-time validator void the exit code, the argv, the
+# contract binding and the report delta along with it.
+_RECEIPT_OMITTABLE_EVIDENCE_FIELDS = frozenset(
+    {
+        "testcase_outcomes",
+        "testcase_execution_rows",
+        "capability_observations",
+        "module_outcomes",
+    }
+)
 _RECEIPT_V1_FIELDS = frozenset(
     {
         "schema_version",
@@ -1409,14 +1432,58 @@ def _validate_report_delta(value: Any) -> set[tuple[str, str]]:
             path = _receipt_text(entry.get("path"), "report_delta.path")
             digest = _receipt_text(entry.get("sha256"), "report_delta.sha256", lowercase=True)
             if not path.startswith("/") or posixpath.normpath(path) != path:
-                raise ValueError("receipt report path must be absolute and canonical")
+                raise ValueError("receipt report_delta path must be absolute and canonical")
             if _SHA256_RE.fullmatch(digest) is None:
-                raise ValueError("receipt report hash is invalid")
+                raise ValueError("receipt report_delta hash is invalid")
             claim = (path, digest)
             if claim in claims or any(existing[0] == path for existing in claims):
                 raise ValueError("receipt report_delta contains duplicate paths")
             claims.add(claim)
     return claims
+
+
+# A refusal has to be actionable. Live camel (an over-cap reactor list) and
+# live kafka (a node id carrying raw newlines) failed for two unrelated
+# reasons and reported the same word: `invalid_arguments`. Both the dropped
+# evidence field's stated reason and the persistence code below carry the
+# refusal itself, so the failing ARGUMENT is named at both boundaries.
+OMISSION_REASON_MAX_CHARS = 200
+_RECEIPT_MESSAGE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+# Receipt refusals name their field in the singular when they speak about one
+# entry ("testcase_outcome.node_id"); the receipt carries the plural.
+_RECEIPT_FIELD_ALIASES = {
+    "id": "receipt_id",
+    "testcase_outcome": "testcase_outcomes",
+    "capability_observation": "capability_observations",
+    "module_outcome": "module_outcomes",
+    "evidence_omission": "evidence_omissions",
+}
+
+
+def _omission_reason(exc: BaseException) -> str:
+    """One canonical line stating why a field could not be carried."""
+
+    text = " ".join(str(exc).split())[:OMISSION_REASON_MAX_CHARS].strip()
+    return text or "receipt evidence field is unrepresentable"
+
+
+def receipt_refusal_code(exc: BaseException) -> str:
+    """`invalid_arguments:<argument>` for one schema refusal.
+
+    The field is read from the refusal's own text, which every raise in this
+    module writes in the canonical `receipt <field> ...` shape. A refusal that
+    names no field still carries its reason rather than the bare word, because
+    a caller who cannot tell WHICH argument was refused cannot repair it.
+    """
+
+    message = " ".join(str(exc).split())
+    for token in _RECEIPT_MESSAGE_TOKEN_RE.findall(message):
+        root = token.split(".", 1)[0]
+        field = _RECEIPT_FIELD_ALIASES.get(root, root)
+        if field in _RECEIPT_V2_FIELDS:
+            return f"{WRITE_INVALID_ARGUMENTS}:{field}"
+    detail = re.sub(r"_+", "_", _slug(message)).strip("_")[:96]
+    return f"{WRITE_INVALID_ARGUMENTS}:{detail or 'unnamed_argument'}"
 
 
 def _validate_testcase_outcomes(value: Any) -> None:
@@ -1428,22 +1495,85 @@ def _validate_testcase_outcomes(value: Any) -> None:
     seen = set()
     for node in nodes:
         if not isinstance(node, Mapping) or not {"node_id", "status"}.issubset(node):
-            raise ValueError("receipt testcase outcome node is invalid")
+            raise ValueError("receipt testcase_outcomes node is invalid")
         if set(node) - {"node_id", "status", "reason"}:
-            raise ValueError("receipt testcase outcome node has unknown fields")
+            raise ValueError("receipt testcase_outcomes node has unknown fields")
         identifier = _receipt_text(node.get("node_id"), "testcase_outcome.node_id")
         status = _receipt_text(node.get("status"), "testcase_outcome.status", lowercase=True)
         if status not in _STATUS_PRIORITY:
-            raise ValueError("receipt testcase outcome status is invalid")
+            raise ValueError("receipt testcase_outcome.status is invalid")
         if "reason" in node:
             reason = _receipt_text(node.get("reason"), "testcase_outcome.reason")
             if len(reason) > SKIP_REASON_MAX_CHARS:
-                raise ValueError("receipt testcase outcome reason is oversized")
+                raise ValueError("receipt testcase_outcome.reason is oversized")
         if identifier in seen:
-            raise ValueError("receipt testcase outcomes contain duplicate nodes")
+            raise ValueError("receipt testcase_outcomes contains duplicate nodes")
         seen.add(identifier)
     if "truncated" in value and value.get("truncated") is not True:
         raise ValueError("receipt testcase_outcomes.truncated must be true when present")
+
+
+def _validate_capability_observations(value: Any) -> None:
+    if not isinstance(value, list) or not value or len(value) > RECEIPT_SEQUENCE_MAX_ITEMS:
+        raise ValueError("receipt capability_observations is invalid")
+    features = set()
+    for observation in value:
+        if not isinstance(observation, Mapping) or not {"feature", "probe"}.issubset(observation):
+            raise ValueError("receipt capability_observations entry shape is invalid")
+        if set(observation) - {"feature", "probe", "probe_exit_code", "observation"}:
+            raise ValueError("receipt capability_observations entry has unknown fields")
+        for key, item in observation.items():
+            _receipt_text(item, f"capability_observation.{key}")
+        if observation["feature"] in features:
+            raise ValueError("receipt capability_observations duplicate a feature")
+        features.add(observation["feature"])
+
+
+def _validate_module_outcomes(value: Any) -> None:
+    """The reactor summary, bounded by what a reactor can actually print.
+
+    This list is the coverage DENOMINATOR, so it is never clipped to fit: a
+    module the build never tried is untried, not missing, and a truncated list
+    would state a smaller reactor than the one that ran.
+    """
+
+    if not isinstance(value, list) or not value or len(value) > RECEIPT_MODULE_OUTCOMES_MAX_ITEMS:
+        raise ValueError("receipt module_outcomes is invalid")
+    for module in value:
+        if not isinstance(module, Mapping) or set(module) != {"module", "status"}:
+            raise ValueError("receipt module_outcomes entry shape is invalid")
+        _receipt_text(module.get("module"), "module_outcomes.module")
+        _receipt_text(module.get("status"), "module_outcomes.status")
+
+
+def _validate_evidence_omissions(value: Any, *, receipt: Mapping[str, Any]) -> None:
+    """Each entry names one observability field this receipt could not carry.
+
+    An omission is a STATEMENT, not a shrug: it names the field, marks it
+    unavailable, and gives the refusal that produced it. An omission naming a
+    field the receipt does carry is a contradiction and is refused.
+    """
+
+    if not isinstance(value, list) or not value or len(value) > RECEIPT_SEQUENCE_MAX_ITEMS:
+        raise ValueError("receipt evidence_omissions is invalid")
+    named = set()
+    for entry in value:
+        if not isinstance(entry, Mapping) or set(entry) != {"field", "status", "reasons"}:
+            raise ValueError("receipt evidence_omissions entry shape is invalid")
+        field = _receipt_text(entry.get("field"), "evidence_omissions.field")
+        if field not in _RECEIPT_OMITTABLE_EVIDENCE_FIELDS:
+            raise ValueError("receipt evidence_omissions names a field that cannot be omitted")
+        if field in receipt:
+            raise ValueError("receipt evidence_omissions contradicts a field the receipt carries")
+        if entry.get("status") != "unavailable":
+            raise ValueError("receipt evidence_omissions status must be unavailable")
+        reasons = entry.get("reasons")
+        if not isinstance(reasons, list) or not reasons:
+            raise ValueError("receipt evidence_omissions states no reason")
+        _receipt_text_list(reasons, "evidence_omissions.reasons")
+        if field in named:
+            raise ValueError("receipt evidence_omissions duplicate a field")
+        named.add(field)
 
 
 def _validate_testcase_envelope(
@@ -1469,10 +1599,12 @@ def _validate_testcase_envelope(
     _receipt_text_list(reasons, "testcase_execution_rows.reasons")
     if status == "unavailable":
         if rows or not reasons:
-            raise ValueError("unavailable testcase rows require no rows and stated reasons")
+            raise ValueError(
+                "receipt testcase_execution_rows unavailable envelope needs stated reasons"
+            )
         return
     if reasons:
-        raise ValueError("complete testcase rows cannot state unavailability reasons")
+        raise ValueError("receipt testcase_execution_rows complete envelope cannot state reasons")
     for raw in rows:
         try:
             normalized = validate_testcase_execution_row(
@@ -1484,9 +1616,9 @@ def _validate_testcase_envelope(
                 report_claims=report_claims,
             )
         except TestcaseRowContractError as exc:
-            raise ValueError(f"receipt testcase execution row is invalid: {exc}") from exc
+            raise ValueError(f"receipt testcase_execution_rows row is invalid: {exc}") from exc
         if normalized != raw:
-            raise ValueError("receipt testcase execution row is not canonical")
+            raise ValueError("receipt testcase_execution_rows row is not canonical")
 
 
 def validate_receipt_v2(
@@ -1546,7 +1678,7 @@ def validate_receipt_v2(
             raise ValueError("historical receipt exceeds its canonical byte limit")
         return receipt
     if type(schema) is not int or schema != RECEIPT_SCHEMA_VERSION:
-        raise ValueError("live receipt schema must be v2")
+        raise ValueError("receipt schema_version must be v2 when live")
     unknown = set(receipt) - _RECEIPT_V2_FIELDS
     missing = _RECEIPT_V2_REQUIRED_FIELDS - set(receipt)
     if unknown or missing:
@@ -1694,43 +1826,15 @@ def validate_receipt_v2(
             report_claims=report_claims,
         )
     if "capability_observations" in receipt:
-        observations = receipt.get("capability_observations")
-        if (
-            not isinstance(observations, list)
-            or not observations
-            or len(observations) > RECEIPT_SEQUENCE_MAX_ITEMS
-        ):
-            raise ValueError("receipt capability_observations is invalid")
-        features = set()
-        for observation in observations:
-            if not isinstance(observation, Mapping) or not {"feature", "probe"}.issubset(
-                observation
-            ):
-                raise ValueError("receipt capability observation shape is invalid")
-            if set(observation) - {"feature", "probe", "probe_exit_code", "observation"}:
-                raise ValueError("receipt capability observation has unknown fields")
-            for key, value in observation.items():
-                _receipt_text(value, f"capability_observation.{key}")
-            if observation["feature"] in features:
-                raise ValueError("receipt capability observations duplicate a feature")
-            features.add(observation["feature"])
+        _validate_capability_observations(receipt.get("capability_observations"))
     if "module_outcomes" in receipt:
-        modules = receipt.get("module_outcomes")
-        if (
-            not isinstance(modules, list)
-            or not modules
-            or len(modules) > RECEIPT_SEQUENCE_MAX_ITEMS
-        ):
-            raise ValueError("receipt module_outcomes is invalid")
-        for module in modules:
-            if not isinstance(module, Mapping) or set(module) != {"module", "status"}:
-                raise ValueError("receipt module outcome shape is invalid")
-            _receipt_text(module.get("module"), "module_outcomes.module")
-            _receipt_text(module.get("status"), "module_outcomes.status")
+        _validate_module_outcomes(receipt.get("module_outcomes"))
     if "excluded_claimed_paths" in receipt:
         excluded = receipt.get("excluded_claimed_paths")
         if type(excluded) is not int or excluded <= 0:
             raise ValueError("receipt excluded_claimed_paths must be positive")
+    if "evidence_omissions" in receipt:
+        _validate_evidence_omissions(receipt.get("evidence_omissions"), receipt=receipt)
 
     canonical = json.dumps(
         receipt, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -1879,14 +1983,53 @@ def build_receipt(
         receipt["producer_observations_sha256"] = producer_observations_sha256(
             normalized_observations
         )
+    # Every OPTIONAL evidence field below is attached through one gate that
+    # validates it FIRST. A field the receipt cannot carry is dropped alone and
+    # its refusal recorded in `evidence_omissions` — never allowed to reach
+    # `write_receipt_result`, where a single raise voids the whole receipt and
+    # takes the exit code, the argv, the contract binding and the report delta
+    # down with it (live camel and kafka, both on the detached path, both
+    # reported as a bare `invalid_arguments`).
+    omissions: List[Dict[str, Any]] = []
+    # The row envelope is checked against THIS receipt's own claims. A delta
+    # the writer will refuse anyway is not attributed to the envelope: the
+    # write-time refusal already names `report_delta`.
+    try:
+        attached_report_claims = _validate_report_delta(receipt["report_delta"])
+    except (TypeError, ValueError):
+        attached_report_claims = set()
+
+    def _attach(field: str, value: Any, validator: Callable[[Any], Any]) -> None:
+        try:
+            validator(value)
+        except (TypeError, ValueError) as exc:
+            logger.debug(f"receipt evidence field {field} is unrepresentable: {exc}")
+            omissions.append(
+                {
+                    "field": field,
+                    "status": "unavailable",
+                    "reasons": [_omission_reason(exc)],
+                }
+            )
+            return
+        receipt[field] = value
+
     if testcase_outcomes:
-        receipt["testcase_outcomes"] = dict(testcase_outcomes)
+        _attach("testcase_outcomes", dict(testcase_outcomes), _validate_testcase_outcomes)
     if testcase_execution_rows:
         # Exact, module-qualified physical rows parsed while the report bytes
         # still match this receipt's delta.  This is separate from the bounded
         # diagnostic ``testcase_outcomes`` list above: metrics must never turn
         # a 50-row diagnostic sample into a project-wide identity rollup.
-        receipt["testcase_execution_rows"] = dict(testcase_execution_rows)
+        _attach(
+            "testcase_execution_rows",
+            dict(testcase_execution_rows),
+            lambda value: _validate_testcase_envelope(
+                value,
+                receipt=receipt,
+                report_claims=attached_report_claims,
+            ),
+        )
     # Spec §C8: what a PHYSICAL probe observed about a resolved capability.
     # A dispatch that probed nothing states nothing — the key is absent, never
     # an empty list, because "no capability was probed" and "a probe found
@@ -1897,7 +2040,7 @@ def build_receipt(
         if isinstance(entry, Mapping) and entry
     ]
     if observations:
-        receipt["capability_observations"] = observations
+        _attach("capability_observations", observations, _validate_capability_observations)
     # What THIS invocation attempted, module by module, in the build system's
     # own words (Maven's reactor summary; the modules whose tasks Gradle ran).
     # The coverage denominator is built from this: a module the build never
@@ -1910,7 +2053,7 @@ def build_receipt(
         if isinstance(entry, Mapping) and entry.get("module")
     ]
     if modules:
-        receipt["module_outcomes"] = modules
+        _attach("module_outcomes", modules, _validate_module_outcomes)
     # Plan 8 §3.2. A dispatch that settled LATE states how much of its own
     # write window an intervening receipt had already claimed — first claim
     # wins, and the loss is counted rather than hidden. Absent (never zero) on
@@ -1919,6 +2062,8 @@ def build_receipt(
     if isinstance(excluded_claimed_paths, int) and not isinstance(excluded_claimed_paths, bool):
         if excluded_claimed_paths > 0:
             receipt["excluded_claimed_paths"] = excluded_claimed_paths
+    if omissions:
+        receipt["evidence_omissions"] = sorted(omissions, key=lambda entry: entry["field"])
     return receipt
 
 
@@ -1946,7 +2091,7 @@ def write_receipt_result(
         body = json.dumps(validated, sort_keys=True)
     except (TypeError, ValueError) as exc:
         logger.debug(f"invocation receipt is invalid: {exc}")
-        return ContainerWriteResult(False, "invalid_arguments")
+        return ContainerWriteResult(False, receipt_refusal_code(exc))
     final = f"{RECEIPT_DIR}/{receipt_id}.json"
     try:
         result = compare_publish_container_text_atomic(
