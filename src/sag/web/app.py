@@ -9,13 +9,15 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from loguru import logger
 
 from sag import __version__
+from sag.trajectory.builder import build_trajectory
+from sag.trajectory.schema import DETAIL_TIERS
 from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
 from sag.web.read_model import ReadModelBuilder
@@ -118,6 +120,81 @@ def create_app(
             ) from exc
 
         return detail.model_dump(mode="json", by_alias=True)
+
+    @app.get("/api/sessions/{session_id}/trajectory")
+    def get_session_trajectory(
+        session_id: str,
+        detail: str = "summary",
+        since: int | None = Query(default=None, ge=0),
+    ) -> dict:
+        """One session's trajectory-v1 document — whole, or since a turn.
+
+        The body is exactly what `sag trajectory` prints and what
+        `build_trajectory` derives: `{schema_version, session, phases, turns,
+        annotations, warnings, outputs}`, no aliases, one vocabulary for the CLI
+        and the timeline. There is no second derivation in the web layer
+        (spec §4), and nothing here writes, copies, or `docker exec`s: a live
+        session is read through the host mirror that `session_mirror` maintains.
+
+        `detail=summary` (the default) carries names, codes, timing and tokens
+        and leaves `outputs` null; `detail=full` additionally resolves every ref
+        the turns name to its verbatim bytes. Summary is the polling tier.
+
+        **The `since=<turn_id>` delta contract**, which the frontend polls:
+
+        - the response is the SAME document with one thing removed — the turns
+          whose `turn_id <= since`. `since` is exclusive, and it cuts turns and
+          nothing else;
+        - `annotations` and `warnings` are the CURRENT WHOLE state on every
+          response, not an increment, so a consumer REPLACES them rather than
+          appending. This is `DeltaAccumulator`'s rule read through a stateless
+          GET: a warning is withdrawn when its hole fills and an annotation can
+          land on a turn far below the cut (a recurrence names the turn it
+          repeats), and a cut has no channel for a retraction. Whole state is
+          the only rule under which a poller converges;
+        - `session` and `phases` are restated whole for the same reason; they
+          are small and are rewritten, not appended to;
+        - `turns` are upserted by `turn_id`;
+        - `outputs` (full tier only) is whole as well: refs are content-addressed
+          and SHARED — every window names the same system prompt — so it is a
+          map to merge, not a list to append. It is also why `full` is not the
+          tier to poll with.
+
+        A turn at or below the cut is never restated, and a turn's state can
+        still change after it is first sent: the token ledger is exported when
+        the loop exits, so the bill for the last turns lands after they do. A
+        consumer that wants those joins re-reads without `since` — at the
+        summary tier that is a cheap replay of a file it is already tailing.
+        """
+        if detail not in DETAIL_TIERS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown detail tier: {detail}. Use one of {', '.join(DETAIL_TIERS)}.",
+            )
+
+        try:
+            session_dir = builder.session_dir(session_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            ) from exc
+
+        try:
+            trajectory = build_trajectory(session_dir, detail=detail)
+        except FileNotFoundError as exc:
+            # The directory was resolved and then went away — a deleted run, a
+            # mirror pruned mid-poll. That is a missing session, not a 500.
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session directory is gone: {session_dir}",
+            ) from exc
+
+        document = trajectory.model_dump(mode="json")
+        if since is None:
+            return document
+        document["turns"] = [turn for turn in document["turns"] if turn["turn_id"] > since]
+        return document
 
     @app.get("/api/stream/dashboard")
     def stream_dashboard() -> StreamingResponse:

@@ -28,6 +28,7 @@ from sag.agent.verdict_finalizer import (
     read_live_verdict_snapshot,
 )
 from sag.runtime.container_io import resolve_control_execute
+from sag.trajectory.builder import CONTROL_EVENTS_NAME
 from sag.web.context_trace import ContextTraceBuilder
 from sag.web.models import (
     BuildSummary,
@@ -188,6 +189,63 @@ class ContainerSessionRegistry:
 
         context = _read_context_trace(orchestrator)
         return _session_detail(item, workspace.id, context)
+
+    def get_session_dir(self, session_id: str) -> Path | None:
+        """The directory a session's trajectory is derived from, or None.
+
+        The registry already knows this path — `_read_setup_verdict_snapshot`
+        reads `control_events.jsonl` out of it to re-authorize a verdict — it
+        just never handed it out. The trajectory layer derives everything it
+        shows from that ledger, so exposing the directory is all this layer owes
+        it: no trajectory logic lives here, and nothing is written or copied.
+        """
+        for workspace in self._workspaces():
+            found = self.get_workspace_session_dir(workspace, session_id)
+            if found is not None:
+                return found
+        return None
+
+    def get_workspace_session_dir(
+        self,
+        workspace: WorkspaceSummary,
+        session_id: str,
+    ) -> Path | None:
+        """This workspace's session directory, if this session is the one it ran.
+
+        Two directories can answer, and they are asked in that order:
+
+        - the HOST session directory, where the engine wrote the ledger it
+          publishes from, alongside the token ledger and the byte store holding
+          what the model was shown. That copy is the authoritative one;
+        - failing that, the container's `.setup_agent/` as the host mirror holds
+          it. The engine mirrors every control event into the container as it
+          appends it, and `ensure_mirror` brings that copy out with
+          `get_archive` — no exec, and a stopped container is never revived. A
+          UI running from a checkout that never held the run's logs still has a
+          trajectory to serve, and `contexts/full_outputs.jsonl` is there too,
+          which is where a tool's own bytes live.
+
+        The mirror is also how the session is IDENTIFIED at all: the trunk
+        context names the project, and the project names the host directory.
+        """
+        orchestrator = self._reader(workspace)
+        trunk = _read_latest_trunk(orchestrator)
+        if trunk is None:
+            return None
+
+        trunk_path, trunk_data = trunk
+        found_id, project_name = _setup_identity(trunk_path, trunk_data, workspace.id)
+        if found_id != session_id:
+            return None
+
+        host = _matching_log_session_dir(self.logs_root, project_name)
+        if host is not None and (host / CONTROL_EVENTS_NAME).is_file():
+            return host
+
+        mirror = getattr(orchestrator, "mirror", None)
+        if mirror is not None and (Path(mirror) / ".setup_agent" / CONTROL_EVENTS_NAME).is_file():
+            return Path(mirror)
+        return host
 
     def _reader(self, workspace: WorkspaceSummary) -> Any:
         """A reader for a workspace's result files. Tests inject a fake via
@@ -615,7 +673,7 @@ def _read_setup_verdict_snapshot(
 
     if logs_root is not None and project_name:
         session_dir = _matching_log_session_dir(logs_root, project_name)
-        control_path = session_dir / "control_events.jsonl" if session_dir is not None else None
+        control_path = session_dir / CONTROL_EVENTS_NAME if session_dir is not None else None
         run_pin_path = session_dir / "run-pin.json" if session_dir is not None else None
         pin_raw: bytes | None = None
         expected_run_id: str | None = None
@@ -731,10 +789,7 @@ def _setup_artifact_item(
         return None
 
     trunk_path, trunk_data = trunk
-    project_name = _text(
-        trunk_data.get("project_name"),
-        default=workspace_id.removeprefix("sag-"),
-    )
+    session_id, project_name = _setup_identity(trunk_path, trunk_data, workspace_id)
     snapshot, snapshot_status = _read_setup_verdict_snapshot(
         orchestrator,
         logs_root=logs_root,
@@ -793,9 +848,8 @@ def _setup_artifact_item(
         verdict_source = "snapshot"
         rates = None
 
-    context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     return {
-        "id": _setup_session_id(context_id, created, workspace_id),
+        "id": session_id,
         "workspace": workspace_id,
         "title": _text(trunk_data.get("goal"), default="Project setup"),
         "status": status,
@@ -1095,6 +1149,28 @@ def _setup_session_id(context_id: str, created: str, workspace_id: str) -> str:
         return f"SETUP-{label}-{parsed.strftime('%Y%m%d-%H%M%S')}"
 
     return f"SETUP-{label}-latest"
+
+
+def _setup_identity(
+    trunk_path: str,
+    trunk_data: dict[str, Any],
+    workspace_id: str,
+) -> tuple[str, str]:
+    """What a setup run is ADDRESSED by, and which project it ran on.
+
+    Both come out of the same trunk context, and both are needed by two callers
+    now: the detail item that lists a session, and the trajectory lookup that
+    has to turn one of those ids back into a directory on disk. Deriving the id
+    twice would be a rule with two copies, and the copies would drift the first
+    time the trunk grew a better timestamp.
+    """
+    project_name = _text(
+        trunk_data.get("project_name"),
+        default=workspace_id.removeprefix("sag-"),
+    )
+    context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
+    created = _text(trunk_data.get("created_at"), default="")
+    return _setup_session_id(context_id, created, workspace_id), project_name
 
 
 def _read_report_metrics(orchestrator: Any) -> Any:

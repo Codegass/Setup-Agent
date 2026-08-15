@@ -108,6 +108,26 @@ class ReadModelBuilder:
 
         raise KeyError(f"Session detail is not available yet for {session_id}")
 
+    def session_dir(self, session_id: str) -> Path:
+        """The session directory whose ledger a trajectory is derived from.
+
+        A path, not a read model: the trajectory layer owns every rule about
+        what that directory means, and this builder's job is only to say which
+        directory belongs to which session id. Demo mode has no ledger anywhere,
+        so it has no trajectory to point at either.
+        """
+        if self.demo_mode:
+            raise KeyError(f"Demo sessions have no trajectory: {session_id}")
+
+        registry = self._session_registry()
+        get_session_dir = getattr(registry, "get_session_dir", None)
+        if get_session_dir is not None:
+            found = get_session_dir(session_id)
+            if found is not None:
+                return Path(found)
+
+        raise KeyError(f"Session not found: {session_id}")
+
     def _session_registry(self) -> object:
         if self.session_registry is None:
             self.session_registry = ContainerSessionRegistry()
