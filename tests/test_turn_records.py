@@ -26,10 +26,12 @@ from sag.agent.attempt_policy import TestAttemptRequirement as AttemptRequiremen
 from sag.agent.attempt_policy import TestCandidateResolution as CandidateResolution
 from sag.agent.control_events import (
     CONTROL_EVENT_KINDS,
+    WINDOW_DIGEST_MAX_COMPONENTS,
     ControlEvent,
     ControlEventSink,
     TurnRecordPayload,
     WindowDigestPayload,
+    canonical_json,
 )
 from sag.agent.output_storage import OBSERVABILITY_TASK_ID, OutputStorageManager
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
@@ -227,6 +229,22 @@ def _sealing_engine(tmp_path, turns, *, container=None):
 def _turn_store(engine):
     """The store a record's refs resolve in, opened the way any reader opens it."""
     return OutputStorageManager(Path(engine.control_event_sink.path).parent / "contexts")
+
+
+def _content_addressed_store(engine):
+    """`_store_bytes_once`'s contract without its filesystem: body in, one ref out.
+
+    A window of thousands of components is about which ones the record NAMES;
+    storing every one of them for real would measure the store's index rewrite
+    and nothing else.
+    """
+    refs: dict[str, str] = {}
+
+    def store(body, *, label):
+        return refs.setdefault(body, f"output_{len(refs):012d}")
+
+    engine._store_bytes_once = store
+    return refs
 
 
 def _events(engine, kind=None):
@@ -440,6 +458,48 @@ def test_the_store_grows_by_net_new_bytes_only(sealed_run, tmp_path):
     assert len(bodies) == len(set(bodies)), "the same body was written twice"
     assert len(named) > len(set(named)), "no bytes were shared across turns"
     assert {row["ref_id"] for row in records} >= set(named)
+
+
+def test_a_window_longer_than_the_record_can_state_names_what_it_dropped(tmp_path):
+    """Sealing never ends a run — not even a run with a 3,000-message window.
+
+    `component_refs` is bounded at 2,048 like every other strict field, and the
+    bound used to be enforced by RAISING: the digest is sealed in the loop body,
+    where the engine's own handler turns any exception into an aborted run. A
+    record about a run may not end it (spec §3), and a long window is exactly
+    the run whose window is worth reading.
+
+    So the record states what it can and names what it cannot: the newest
+    components in render order, and one marker in the first slot saying how
+    many older ones are not here. A reader sees a window that says where it
+    was cut, rather than a short one claiming to be whole.
+    """
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    refs = _content_addressed_store(engine)
+    messages = [{"role": "user", "content": f"message {index}"} for index in range(3000)]
+
+    digest = engine._seal_window_digest("SYSTEM PROMPT", messages)
+
+    assert len(digest.component_refs) == WINDOW_DIGEST_MAX_COMPONENTS
+    assert digest.component_refs[0] == "window_truncated:953"
+    assert 953 + (WINDOW_DIGEST_MAX_COMPONENTS - 1) == len(messages)
+    # The kept components are the NEWEST ones, still in render order.
+    assert digest.component_refs[1] == refs[canonical_json(messages[953])]
+    assert digest.component_refs[-1] == refs[canonical_json(messages[-1])]
+    assert digest.system_prompt_sha256 == hashlib.sha256(b"SYSTEM PROMPT").hexdigest()
+
+
+def test_a_window_that_fits_carries_no_truncation_marker(tmp_path):
+    """The marker is a statement about a cut, so it appears only where one happened."""
+    engine = _sealing_engine(tmp_path, [_phase_turn(1)])
+    messages = [{"role": "user", "content": f"message {index}"} for index in range(10)]
+
+    digest = engine._seal_window_digest("SYSTEM PROMPT", messages)
+    store = _turn_store(engine)
+
+    assert len(digest.component_refs) == 10
+    assert not any(ref.startswith("window_truncated") for ref in digest.component_refs)
+    assert json.loads(store.retrieve_output(digest.component_refs[-1])) == messages[-1]
 
 
 def test_a_response_that_called_nothing_still_seals_its_turn(tmp_path):

@@ -50,6 +50,8 @@ from .attempt_policy import (
 )
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
+    WINDOW_DIGEST_MAX_COMPONENTS,
+    WINDOW_TRUNCATION_REF,
     ControlEventSink,
     RefusalRecordPayload,
     TurnRecordPayload,
@@ -5599,19 +5601,43 @@ class ReActEngine(UIEventEmitter):
         A component that will not store makes the WHOLE list a lie, so the
         digest keeps its prompt hash and drops the refs rather than claiming a
         window with a hole in it.
+
+        A window longer than the record may name is CUT, never refused. The
+        bound used to be enforced by raising, and this runs in the loop body
+        where the engine's handler turns an exception into an aborted run — an
+        observability record ending the run whose window is most worth reading.
+        The newest components that fit are kept, in render order, and the first
+        slot names how many older ones are missing, so a short list never
+        passes for a whole window.
         """
+        prompt_sha256 = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+        kept = messages
+        marker: List[str] = []
+        if len(messages) > WINDOW_DIGEST_MAX_COMPONENTS:
+            kept = messages[-(WINDOW_DIGEST_MAX_COMPONENTS - 1) :]
+            dropped = len(messages) - len(kept)
+            marker = [WINDOW_TRUNCATION_REF.format(dropped=dropped)]
+            logger.warning(
+                f"window digest truncated: {dropped} of {len(messages)} components are not "
+                f"named by this record (limit {WINDOW_DIGEST_MAX_COMPONENTS})"
+            )
         refs: List[str] = []
-        for message in messages:
+        for message in kept:
             ref = self._store_bytes_once(canonical_json(message), label="window_component")
             if ref is None:
                 logger.debug("window digest sealed without components: a component did not store")
                 refs = []
+                marker = []
                 break
             refs.append(ref)
-        return WindowDigestPayload(
-            system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
-            component_refs=tuple(refs),
-        )
+        try:
+            return WindowDigestPayload(
+                system_prompt_sha256=prompt_sha256,
+                component_refs=tuple(marker + refs),
+            )
+        except Exception as exc:  # observability never ends a run
+            logger.warning(f"window digest sealed without components: {exc}")
+            return WindowDigestPayload(system_prompt_sha256=prompt_sha256)
 
     def _window_for(self, actor: str) -> Optional[WindowDigestPayload]:
         """The window a turn answered from — and for the controller, none.

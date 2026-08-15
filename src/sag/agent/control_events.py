@@ -40,6 +40,15 @@ CONTROL_EVENT_MAX_RAW_BYTES = 256 * 1024
 # live artifact class. The host event stores only its digest/length, but the
 # publication boundary must still accept those exact already-bounded bytes.
 EVIDENCE_PUBLICATION_MAX_RECORD_BYTES = 32 * 1024 * 1024
+#: How many components one `window_digest` may name. A window longer than this
+#: is stated by its newest components plus a marker for the rest (spec §2.1) —
+#: the bound is a bound on the RECORD, and a record about a run never ends it.
+WINDOW_DIGEST_MAX_COMPONENTS = 2048
+#: The first slot of a truncated window, naming how many older components the
+#: record could not name. It is deliberately not an `output_` handle: nothing
+#: resolves it, and the full tier declares it out-of-store by name instead of
+#: handing a reader bytes that are not the window's.
+WINDOW_TRUNCATION_REF = "window_truncated:{dropped}"
 
 
 def _reject_duplicate_json_keys(json_data: str | bytes | bytearray) -> None:
@@ -1025,8 +1034,10 @@ class WindowDigestPayload(_StrictPayload):
 
     system_prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     # Bounded like every other strict field. A window longer than this cannot
-    # be stated exactly, and a record that cannot be exact states nothing.
-    component_refs: tuple[str, ...] = Field(default=(), max_length=2048)
+    # be stated exactly; the engine keeps the newest components that fit and
+    # spends the first slot on a `window_truncated:<n>` marker naming how many
+    # older ones are not here, so a short list never passes for a whole window.
+    component_refs: tuple[str, ...] = Field(default=(), max_length=WINDOW_DIGEST_MAX_COMPONENTS)
 
     @field_validator("component_refs")
     @classmethod
@@ -1663,6 +1674,8 @@ __all__ = [
     "SourceExcerpt",
     "SourceFileManifest",
     "TurnRecordPayload",
+    "WINDOW_DIGEST_MAX_COMPONENTS",
+    "WINDOW_TRUNCATION_REF",
     "WindowDigestPayload",
     "action_envelope_sha256",
     "job_stall_transition",
