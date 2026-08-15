@@ -262,6 +262,69 @@ def _accumulate(session_dir: Path, pending: list[str], **kwargs):
     return accumulator.snapshot()
 
 
+def _accumulate_then_bill(session_dir: Path, pending: list[str], tokens: str = REAL_TOKEN_CSV):
+    """Follow a session that writes its token ledger only once the run has ended.
+
+    This is the engine's real order, not a pessimistic one: every
+    `_export_token_usage_csv` call site in `react_engine.py` sits on a
+    termination path, so no live follow ever sees a token row while a turn is
+    still being emitted. Writing the ledger up front — as the golden helper did
+    — hands the follower a finished artifact and measures nothing about lateness.
+    """
+    events = session_dir / "control_events.jsonl"
+    ledger = session_dir / "token_usage.csv"
+    accumulator = DeltaAccumulator()
+
+    def fake_sleep(seconds: float) -> None:
+        if pending:
+            with events.open("a", encoding="utf-8") as handle:
+                handle.write(pending.pop(0))
+        elif not ledger.exists():
+            ledger.write_text(tokens, encoding="utf-8")  # the loop exits, the bill lands
+        else:
+            raise _NoMoreLines
+
+    with pytest.raises(_NoMoreLines):
+        for delta in follow_trajectory(session_dir, poll_seconds=0.01, sleep=fake_sleep):
+            accumulator.feed(delta)
+    return accumulator.snapshot()
+
+
+def test_a_token_ledger_written_after_the_last_event_still_bills_its_turns(tmp_path):
+    """The bill arrives after the turns it pays for, and still finds them.
+
+    A join that only ever looks at the turns in the delta in front of it bills
+    nothing at all live, because the ledger it consults is empty every time a
+    turn passes. The accumulated document then disagrees with the replay about
+    every token joined AND about which rows billed nobody — in exactly the mode
+    spec §0 names the primary consumer.
+    """
+    session_dir = _session(tmp_path, events="")
+    accumulated = _accumulate_then_bill(session_dir, [line + "\n" for line in EVENT_LINES])
+
+    assert [t.tokens.input for t in accumulated.turns if t.tokens is not None] == [4134, 4463]
+    assert [w.code for w in accumulated.warnings] == []
+    assert accumulated == build_trajectory(session_dir)
+
+
+def test_a_late_bill_pays_the_turn_the_replay_pays_not_the_one_in_flight(tmp_path):
+    """One response, two turns: the row pays the first, whenever it lands.
+
+    The claim on an iteration is made when the TURN appears, not when its row
+    does. Deferring the claim until a row exists would hand the bill to
+    whichever sibling turn the follower happened to be holding when the ledger
+    finally landed, and the run would be billed on a different turn than the
+    replay of the same bytes bills.
+    """
+    events = "\n".join(_lines(REAL_TWO_DECISIONS_JSONL)) + "\n"
+    session_dir = _session(tmp_path, events="")
+    accumulated = _accumulate_then_bill(session_dir, [line + "\n" for line in events.splitlines()])
+
+    assert [t.iteration for t in accumulated.turns] == [1, 1]
+    assert [t.turn_id for t in accumulated.turns if t.tokens is not None] == [1]
+    assert accumulated == build_trajectory(session_dir)
+
+
 def test_the_accumulated_follow_is_the_batch_replay_document(tmp_path):
     """Not "the same turns": the same document, warnings and all.
 

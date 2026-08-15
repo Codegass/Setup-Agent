@@ -51,31 +51,48 @@ class _EndOfLedger(Exception):
     """Raised by the injected clock once the archived file is fully replayed."""
 
 
-def _accumulated(session_dir: Path, tmp_path: Path, *, chunk: int = 40) -> Trajectory:
+def _accumulated(
+    session_dir: Path,
+    tmp_path: Path,
+    *,
+    chunk: int = 40,
+    withheld: tuple[str, ...] = (),
+) -> Trajectory:
     """Replay an archived ledger THROUGH `follow_trajectory`, folding its deltas.
 
     The archived bytes are copied into a growing file so the live path — the
     tail reader, the incremental joins, the warning retractions — is the code
     actually under test. Hand-feeding the reducer would fence the reducer
     against itself and leave everything the follower adds unmeasured.
+
+    `withheld` names the artifacts a live run does not write until it ends, so
+    the follow sees them land AFTER its last event rather than before its first
+    poll. Copying everything up front would hand the follower a finished session
+    wearing a growing ledger — the one arrangement in which a join that only
+    ever looks forward still passes.
     """
     live = tmp_path / session_dir.name
     live.mkdir(parents=True, exist_ok=True)
     for artifact in session_dir.iterdir():
-        if artifact.name != "control_events.jsonl":
+        if artifact.name != "control_events.jsonl" and artifact.name not in withheld:
             (live / artifact.name).write_bytes(artifact.read_bytes())
     events = live / "control_events.jsonl"
     events.write_bytes(b"")
 
     lines = (session_dir / "control_events.jsonl").read_bytes().split(b"\n")
     pending = [b"\n".join(lines[i : i + chunk]) + b"\n" for i in range(0, len(lines) - 1, chunk)]
+    late = list(withheld)
     accumulator = DeltaAccumulator()
 
     def fake_sleep(seconds: float) -> None:
-        if not pending:
+        if pending:
+            with events.open("ab") as handle:
+                handle.write(pending.pop(0))
+        elif late:
+            name = late.pop(0)
+            (live / name).write_bytes((session_dir / name).read_bytes())
+        else:
             raise _EndOfLedger
-        with events.open("ab") as handle:
-            handle.write(pending.pop(0))
 
     with pytest.raises(_EndOfLedger):
         for delta in follow_trajectory(live, poll_seconds=0.01, sleep=fake_sleep):
@@ -191,6 +208,21 @@ def test_the_follow_of_kafka_says_everything_the_replay_says(tmp_path):
     assert [w.code for w in accumulated.warnings].count("missing_loop_decision") == 10
     assert any(t.tokens is not None for t in accumulated.turns)
     assert accumulated.session.run_id.endswith("b9b1b06dfff3")
+
+
+def test_kafkas_token_ledger_lands_after_its_last_event_and_still_bills(tmp_path):
+    """The real write order: the engine exports `token_usage.csv` when it exits.
+
+    Every `_export_token_usage_csv` call site in the ReAct engine is a
+    termination path, so a `sag trajectory --follow` attached to a running
+    kafka sees no token ledger at all while its twenty-four turns are emitted —
+    the file appears after the last event. Replayed that way, the follow used to
+    bill zero of the eleven turns the replay bills and to claim nineteen
+    unattributed rows where the replay claims eight: two documents, one name.
+    """
+    accumulated = _accumulated(KAFKA, tmp_path, withheld=("token_usage.csv",))
+    assert len([t for t in accumulated.turns if t.tokens is not None]) == 11
+    assert accumulated == build_trajectory(KAFKA)
 
 
 def test_an_executor_row_bills_exactly_one_turn():

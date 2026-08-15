@@ -22,7 +22,10 @@ control stream does not carry:
   moving, not the model. A row that bills no turn at all is stated as
   `tokens_unattributed` rather than dropped, because unattributable spend is a
   fact about the ledger's holes, not a rounding error. Advisor rows are that
-  advisor's own spend and never a turn's.
+  advisor's own spend and never a turn's. The engine exports this file when the
+  ReAct loop EXITS, so live it lands AFTER every turn it pays for: the follower
+  therefore re-states a turn whose bill arrived late instead of leaving it
+  unbilled forever, which is the only way the two feeds can agree about spend.
 - **verdict and rates** — `verdict.json` exists only once a run has finished,
   so its absence is the normal state of a live session, not a hole.
 - **project** — `project_meta.json` names the repository under test.
@@ -380,13 +383,29 @@ class _TokenBiller:
     def __init__(self) -> None:
         self._claimed: dict[int, int] = {}
 
+    def claims(self, turn: Turn) -> bool:
+        """Whether this turn is the one its response's row bills, row or no row.
+
+        The claim is recorded when the TURN appears, never when a row for it
+        arrives. `token_usage.csv` is written at loop exit, so a follower meets
+        every turn before any row: a claim that waited for its row would fall to
+        whichever sibling turn happened to be in flight when the file landed —
+        a different turn from the one the replay bills, for the same run.
+        Claiming on sight makes the claimant the same turn in both feeds, and
+        costs the replay nothing, since a claim on an unbilled iteration bills
+        no one and leaves `unattributed` untouched.
+        """
+        iteration = turn.iteration
+        if iteration is None or turn.actor != "model":
+            return False
+        return self._claimed.setdefault(iteration, turn.turn_id) == turn.turn_id
+
     def bill(self, turn: Turn, billed: dict[int, TokenUsage]) -> Turn:
         iteration = turn.iteration
-        if iteration is None or turn.actor != "model" or iteration not in billed:
+        if iteration is None or not self.claims(turn):
             return turn
-        if self._claimed.setdefault(iteration, turn.turn_id) != turn.turn_id:
-            return turn
-        return turn.model_copy(update={"tokens": billed[iteration]})
+        usage = billed.get(iteration)
+        return turn if usage is None else turn.model_copy(update={"tokens": usage})
 
     def unattributed(self, billed: dict[int, TokenUsage]) -> Warning | None:
         """Name the rows that billed nobody. Unattributable spend is a finding.
@@ -413,15 +432,25 @@ class _Joiner:
 
     A replay computes the joins over a finished session; a follower recomputes
     them as the session grows and says only what moved — added statements, the
-    statements no longer true, the session fields that changed, and the bytes
-    not sent yet. The rules are the ones `finish` uses, which is what makes the
-    accumulated stream and the replay the same document.
+    statements no longer true, the session fields that changed, the bytes not
+    sent yet, and the turns whose bill arrived after they did. The rules are the
+    ones `finish` uses, which is what makes the accumulated stream and the
+    replay the same document.
+
+    Every join here is retried, because every artifact beside the ledger is
+    written on its own schedule and none of them are written on the turns'. The
+    output store lands mid-run; the token ledger lands after the run's last
+    event. A join that only ever looked at the delta in front of it would be
+    permanently wrong about whichever artifact was late — which, for tokens, is
+    every artifact of every live session.
     """
 
     def __init__(self, sources: "_SessionSources") -> None:
         self._sources = sources
         self._biller = _TokenBiller()
         self._tokens: dict[int, TokenUsage] = {}
+        self._claimants: dict[int, Turn] = {}
+        self._reledgered = False
         self._token_warnings: list[Warning] = []
         self._ledger_missing = True
         self._refs: list[str] = []
@@ -439,11 +468,14 @@ class _Joiner:
         every line would buy nothing and cost a file read per event.
         """
         self._ledger_missing = ledger_missing
-        self._tokens, self._token_warnings = self._sources.token_ledger()
+        tokens, self._token_warnings = self._sources.token_ledger()
+        self._reledgered = self._reledgered or tokens != self._tokens
+        self._tokens = tokens
         self._around = _session_join("", self._sources)
 
     def wrap(self, delta: TrajectoryDelta) -> TrajectoryDelta | None:
-        turns = [self._biller.bill(turn, self._tokens) for turn in delta.turns]
+        turns = [self._bill(turn) for turn in delta.turns]
+        turns.extend(self._rebilled({turn.turn_id for turn in turns}))
         for ref in _output_refs(turns):
             if ref not in self._refs:
                 self._refs.append(ref)
@@ -460,6 +492,45 @@ class _Joiner:
             }
         )
         return None if _is_empty(joined) else joined
+
+    def _bill(self, turn: Turn) -> Turn:
+        """Bill a turn by `finish`'s rules, and remember it if it is a claimant.
+
+        Only a claimant's bill can ever change, so only a claimant is worth
+        holding on to: its sibling turns ride along unbilled forever and a
+        controller turn is never billed at all.
+        """
+        billed = self._biller.bill(turn, self._tokens)
+        iteration = turn.iteration
+        if iteration is not None and self._biller.claims(turn):
+            self._claimants[iteration] = billed
+        return billed
+
+    def _rebilled(self, sent: set[int]) -> list[Turn]:
+        """The turns already sent whose bill the token ledger has since changed.
+
+        This is the token join's retry, and the engine's write timing is why it
+        must exist: `token_usage.csv` is exported only on the loop's termination
+        paths, so a followed turn is ALWAYS emitted before the row that pays for
+        it. Sending the turn once and never looking again left every live
+        trajectory billing nobody while its replay billed eleven of kafka's
+        twenty-four turns.
+
+        The scan runs only when a poll actually read a different ledger — an
+        unchanged file cannot have changed anyone's bill — and skips the turns
+        this same delta already carries, so no turn is ever stated twice at once.
+        """
+        if not self._reledgered:
+            return []
+        self._reledgered = False
+        restated: list[Turn] = []
+        for iteration, turn in list(self._claimants.items()):
+            usage = self._tokens.get(iteration)
+            if usage == turn.tokens or turn.turn_id in sent:
+                continue
+            restated.append(turn.model_copy(update={"tokens": usage}))
+            self._claimants[iteration] = restated[-1]
+        return restated
 
     def _resolve(self) -> tuple[dict[str, str] | None, list[Warning]]:
         """Bytes for the refs not sent yet — which is also the retry list.
