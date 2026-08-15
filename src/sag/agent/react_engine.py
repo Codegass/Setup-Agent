@@ -7,6 +7,7 @@ import shlex
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
@@ -574,8 +575,6 @@ class ReActEngine(UIEventEmitter):
         self.agent_logger = create_agent_logger("react_engine")
 
         # Initialize output storage manager
-        from pathlib import Path
-
         contexts_dir = (
             Path(self.context_manager.contexts_dir)
             if hasattr(self.context_manager, "contexts_dir")
@@ -5483,26 +5482,60 @@ class ReActEngine(UIEventEmitter):
         """One clock for turn records: UTC, ISO-8601, the sink's own shape."""
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    def _turn_byte_store(self) -> Optional[OutputStorageManager]:
+        """The HOST store a sealed record's bytes live in — never the container's.
+
+        Window components and delivered observations are bytes this process
+        RENDERED. The container never had them, and sending them there costs a
+        write, an index read and a full index rewrite per component, on a
+        window that re-renders every turn: on a 20-turn synthetic run that was
+        150 execs and 55 KB of the container's `full_outputs.jsonl` — 7.5 execs
+        and 2.8 KB a turn — for bytes nothing in the container reads. It also
+        put them in the one file `output_search` reads, where an observability
+        feature has no business.
+
+        They go beside the LEDGER instead, in `contexts/full_outputs.jsonl` of
+        the session directory — the same store shape, the same `output_` ref
+        namespace, and exactly where the trajectory's full tier already looks
+        for the bytes a turn names (spec §3). One namespace, two files: the
+        host's for what the engine rendered, the container's for what a tool
+        produced, and a reader resolves a ref without knowing which is which.
+
+        No sink means no session directory and no records at all, so there is
+        nowhere to put bytes nobody will name.
+        """
+        store = getattr(self, "_turn_bytes_store", None)
+        if store is not None:
+            return store
+        path = getattr(getattr(self, "control_event_sink", None), "path", None)
+        if path is None:
+            return None
+        try:
+            store = OutputStorageManager(Path(path).parent / "contexts")
+        except Exception as exc:  # observability never ends a run
+            logger.warning(f"turn-record byte store unavailable: {exc}")
+            return None
+        self._turn_bytes_store = store
+        return store
+
     def _store_bytes_once(self, body: str, *, label: str) -> Optional[str]:
         """Persist one immutable byte string and hand back its ref, once per run.
 
         Window components repeat: every turn re-sends the system prompt and the
         whole history behind it. Storing them per turn would multiply the store
         by the window length; storing them once and referencing them is what
-        makes a component-level digest affordable (spec §2.1).
+        makes a component-level digest affordable (spec §2.1). The identity is
+        the CONTENT — its sha256 — so the system prompt is written once per run
+        and an observation already written when it was delivered is referenced
+        by every later window that carries it, never written again. The store
+        grows by the run's net-new bytes and by nothing else.
 
         Returns None when the bytes could not be stored, or when the ref that
         came back is already held for DIFFERENT bytes — an unresolvable or
         ambiguous ref in a window digest is worse than an absent one, because
         it reconstructs a window the model never saw.
-
-        The namespace is what keeps this off the model's desk: these bytes are
-        addressed by the refs a record names, and `search_outputs` hands them to
-        nobody who did not ask for them by name. The store is shared with the
-        model's own `output_search`, and an observability feature must not
-        change what the model can find.
         """
-        storage = getattr(self, "output_storage", None)
+        storage = self._turn_byte_store()
         if storage is None:
             return None
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -8243,9 +8276,6 @@ class ReActEngine(UIEventEmitter):
                 csv_path = session_logger.session_log_dir / "token_usage.csv"
             else:
                 # Fallback to logs directory
-                from datetime import datetime
-                from pathlib import Path
-
                 logs_dir = Path("logs")
                 logs_dir.mkdir(exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

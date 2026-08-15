@@ -32,10 +32,14 @@ control stream does not carry:
   so its absence is the normal state of a live session, not a hole.
 - **project** — `project_meta.json` names the repository under test.
 - **bytes, at the full tier only** — `contexts/full_outputs.jsonl` holds what
-  the refs stand for. It is read through `OutputStorageManager`, the component
-  that already owns that file's layout; this module never parses it itself.
-  The summary tier never opens it, which is what keeps the timeline's main view
-  cheap. A turn may also name a ref the output store has never heard of —
+  the refs stand for, and a session has up to two of them under one ref
+  namespace: the engine's own, written host-side beside the ledger (the window
+  components and delivered observations a `turn_record` names), and the
+  container's, which lands under `.setup_agent/` when `--record` copies it in.
+  Both are read through `OutputStorageManager`, the component that already owns
+  that file's layout; this module never parses it itself. The summary tier
+  never opens either, which is what keeps the timeline's main view cheap. A
+  turn may also name a ref no output store has ever heard of —
   ignite's `job:2c4d56b2fdca`, the handle of a detached job — and the full tier
   DECLARES those out-of-store by name instead of dropping them before the
   resolver sees them. A reader expanding that row is otherwise handed an
@@ -224,8 +228,20 @@ class _SessionSources:
     def control_events(self) -> Path | None:
         return self._locate(CONTROL_EVENTS_NAME)
 
-    def output_store(self) -> Path | None:
-        return self._locate(f"{CONTEXTS_DIR}/{FULL_OUTPUTS_NAME}")
+    def output_stores(self) -> tuple[Path, ...]:
+        """Every store this session has, in the order a reader should ask them.
+
+        A closed session has two: the engine's own, written host-side beside
+        the ledger while the run was live, and the container's, which lands
+        under `.setup_agent/` when `--record` copies it in. They share ONE ref
+        namespace, so the ref alone never says which file answers it.
+        """
+        found = []
+        for root in _ARTIFACT_ROOTS:
+            candidate = self.path / root / CONTEXTS_DIR / FULL_OUTPUTS_NAME
+            if candidate.is_file():
+                found.append(candidate)
+        return tuple(found)
 
     def token_ledger(self) -> tuple[dict[int, TokenUsage], list[Warning]]:
         path = self._locate(TOKEN_USAGE_NAME)
@@ -282,15 +298,21 @@ class _OutputResolver:
 
     The lookup goes through `OutputStorageManager`, which already knows how
     `contexts/full_outputs.jsonl` is laid out and how to recover a ref whose
-    index entry is stale. Two rules keep this read-only and honest:
+    index entry is stale. Three rules keep this read-only and honest:
 
     - the manager is constructed only over a store that already exists, because
       constructing one over a missing directory would CREATE it, and this layer
       never writes into a session it is reading;
-    - a store that is not there, and a ref the store does not carry, are
-      warnings. Bytes that have not been written yet are the normal state of a
-      live run, so nothing here raises and NOTHING NEGATIVE IS CACHED: the look
-      is repeated every time bytes are asked for while no store has been found.
+    - EVERY store the session has is asked, because they share one ref
+      namespace: the engine's own bytes (window components, delivered
+      observations) are written host-side beside the ledger, and a tool's are
+      the container's, recorded under `.setup_agent/`. A ref names neither file
+      — resolving against only the first store found meant that a session
+      carrying both answered for one of them;
+    - a session with no store at all, and a ref no store carries, are warnings.
+      Bytes that have not been written yet are the normal state of a live run,
+      so nothing here raises and NOTHING NEGATIVE IS CACHED: the look is
+      repeated every time bytes are asked for while no store has been found.
       Attaching to a session before it writes its first output is the ordinary
       way to watch a run start, and remembering that one absence would have
       meant the full tier resolved nothing for the rest of the session.
@@ -298,22 +320,26 @@ class _OutputResolver:
 
     def __init__(self, sources: "_SessionSources") -> None:
         self._sources = sources
-        self._manager: OutputStorageManager | None = None
+        self._managers: dict[Path, OutputStorageManager] = {}
         self._resolved: dict[str, str] = {}
 
-    def _store(self) -> OutputStorageManager | None:
-        if self._manager is None:
-            store = self._sources.output_store()
-            if store is not None:
-                self._manager = OutputStorageManager(store.parent)
-        return self._manager
+    def _stores(self) -> list[OutputStorageManager]:
+        """The managers over the stores that exist RIGHT NOW, first store first."""
+        managers = []
+        for store in self._sources.output_stores():
+            manager = self._managers.get(store)
+            if manager is None:
+                manager = OutputStorageManager(store.parent)
+                self._managers[store] = manager
+            managers.append(manager)
+        return managers
 
     def resolve(self, refs: list[str]) -> tuple[dict[str, str], list[Warning]]:
         """Resolve every output ref named; state whichever ones would not."""
         if not refs:
             return {}, []
-        manager = self._store()
-        if manager is None:
+        managers = self._stores()
+        if not managers:
             return {}, [
                 Warning(
                     code="missing_output_store",
@@ -329,7 +355,14 @@ class _OutputResolver:
         warnings: list[Warning] = []
         for ref in refs:
             if ref not in self._resolved:
-                text = manager.retrieve_output(ref)
+                text = next(
+                    (
+                        found
+                        for found in (manager.retrieve_output(ref) for manager in managers)
+                        if found is not None
+                    ),
+                    None,
+                )
                 if text is None:
                     warnings.append(
                         Warning(

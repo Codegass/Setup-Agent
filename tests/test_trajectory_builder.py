@@ -6,6 +6,7 @@ header and first rows. Batch replay and tail-follow are asserted to produce the
 same turns, which is the idempotence fence of spec §5 in seed form.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -117,6 +118,49 @@ def test_a_controller_turn_is_never_billed_for_a_response_the_model_did_not_make
     assert [t.actor for t in snap.turns] == ["controller"]
     assert snap.turns[0].iteration == 13 and snap.turns[0].tokens is None
     assert [w.code for w in snap.warnings] == ["tokens_unattributed"]
+
+
+def test_the_full_tier_reads_every_store_the_session_has(tmp_path):
+    """One ref namespace, two files — and a reader that asks both.
+
+    A sealed turn's bytes are the engine's own: the window it rendered and the
+    observation it delivered, written HOST-side beside the ledger while the run
+    is live. A tool's output is the container's, and reaches the session
+    directory only when `--record` copies `.setup_agent` in. Both are `output_`
+    handles from one namespace, and whoever holds one cannot tell which file
+    answers it — so the resolver asks every store the session has. Asking only
+    the first one found meant that the moment the engine began writing its own
+    store, every tool output in the session stopped resolving.
+    """
+    from test_trajectory_cli import REAL_FULL_OUTPUT_RECORD
+
+    session_dir = _session(tmp_path, events="\n".join(EVENT_LINES) + "\n", tokens=REAL_TOKEN_CSV)
+    recorded = session_dir / ".setup_agent" / "contexts"
+    recorded.mkdir(parents=True)
+    (recorded / "full_outputs.jsonl").write_text(REAL_FULL_OUTPUT_RECORD + "\n", encoding="utf-8")
+    sealed = session_dir / "contexts"
+    sealed.mkdir()
+    (sealed / "full_outputs.jsonl").write_text(
+        json.dumps(
+            {
+                "ref_id": "output_bbab28ecefd9",
+                "task_id": "turn_records",
+                "tool_name": "delivered_observation",
+                "timestamp": "2026-08-14T11:29:04.600000",
+                "output_length": 61,
+                "output": "Env overlay executable is not executable: /usr/bin/gradle",
+                "metadata": {"kind": "delivered_observation"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    snap = build_trajectory(session_dir, detail="full")
+
+    assert snap.outputs["output_6163859b019d"].startswith("✅ Repository cloned")
+    assert snap.outputs["output_bbab28ecefd9"].startswith("Env overlay executable")
+    assert [w.code for w in snap.warnings if w.code.startswith(("missing_output", "unresolved"))] == []
 
 
 def test_a_second_executor_row_for_one_iteration_is_stated_not_dropped(tmp_path):

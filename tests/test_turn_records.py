@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 from test_native_loop_engine import _engine, _phase_turn
+from test_output_storage import STORAGE_PATH, FakeOutputStorageOrchestrator
 
 from sag.agent.attempt_policy import TestAttemptRequirement as AttemptRequirement
 from sag.agent.attempt_policy import TestCandidateResolution as CandidateResolution
@@ -30,7 +31,7 @@ from sag.agent.control_events import (
     TurnRecordPayload,
     WindowDigestPayload,
 )
-from sag.agent.output_storage import OutputStorageManager
+from sag.agent.output_storage import OBSERVABILITY_TASK_ID, OutputStorageManager
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.react_engine import ReActEngine
@@ -191,14 +192,27 @@ class _BillingClient:
         return self.turns.pop(0)
 
 
-def _sealing_engine(tmp_path, turns):
-    """The native-loop harness with a real ledger, store, and token tracker."""
+def _sealing_engine(tmp_path, turns, *, container=None):
+    """The native-loop harness with a real ledger, store, and token tracker.
+
+    The MODEL's output store stands where the container's stands in production
+    — behind `docker exec`, and reachable only through it — while the turn
+    store is wherever the engine decides to put its records' bytes. Keeping the
+    two apart is what lets a fence say which one the sealed bytes went into.
+    """
     engine = _engine(turns)
     engine.control_event_sink = ControlEventSink(tmp_path / "control_events.jsonl")
-    engine.output_storage = OutputStorageManager(tmp_path / "contexts")
+    engine.output_storage = OutputStorageManager(
+        tmp_path / "container" / "contexts", orchestrator=container
+    )
     engine.token_tracker = TokenTracker()
     engine.llm_client = _BillingClient(turns, engine.token_tracker)
     return engine
+
+
+def _turn_store(engine):
+    """The store a record's refs resolve in, opened the way any reader opens it."""
+    return OutputStorageManager(Path(engine.control_event_sink.path).parent / "contexts")
 
 
 def _events(engine, kind=None):
@@ -259,7 +273,7 @@ def test_a_sealed_window_resolves_to_the_bytes_the_model_saw(sealed_run):
     components are resolved from the output store and concatenated in list
     order, and what comes out is the exact messages array the client received.
     """
-    storage = sealed_run.output_storage
+    storage = _turn_store(sealed_run)
     records = _model_records(sealed_run)
 
     assert len(records) == len(sealed_run.llm_client.requests)
@@ -307,7 +321,7 @@ def test_the_bill_joins_in_process_never_from_the_csv(sealed_run, tmp_path):
 
 def test_a_sealed_turn_states_the_observation_it_delivered(sealed_run):
     """[C] is resolvable too: the ref names the text the model actually read."""
-    storage = sealed_run.output_storage
+    storage = _turn_store(sealed_run)
     records = _model_records(sealed_run)
     delivered = [
         step.content for step in sealed_run.steps if getattr(step, "tool_call_id", None) == "call_5"
@@ -319,32 +333,99 @@ def test_a_sealed_turn_states_the_observation_it_delivered(sealed_run):
 
 
 def test_sealing_a_turn_never_changes_what_the_model_can_find(sealed_run):
-    """The store a record writes into is the store `output_search` reads.
+    """The model's store answers the model's questions, and holds nothing else.
 
-    The engine's `OutputStorageManager` and the search tool's point at the same
-    `contexts/full_outputs.jsonl` and `output_index.json` by construction, and
-    `search_outputs` scans that index newest-first with no default filter. Every
-    rendered message and every delivered observation is a row in it — about two
-    an iteration — and a window component is a JSON copy of a message full of
-    prior observations and build text, so nearly any pattern matches one. Left
-    searchable they consume the model's limit before it reaches the log it
-    asked for.
+    `search_outputs` scans the store's index newest-first with no default
+    filter. Every rendered message and every delivered observation would be a
+    row in it — about two an iteration — and a window component is a JSON copy
+    of a message full of prior observations and build text, so nearly any
+    pattern matches one. Left searchable they consume the model's limit before
+    it reaches the log it asked for.
 
-    An observability feature must not change what the model can find. The bytes
-    stay where the record's refs resolve them; they are simply not answers to a
-    question the model asked.
+    An observability feature must not change what the model can find. The
+    record's bytes live in the engine's own store, where its refs resolve them;
+    they are not answers to a question the model asked, and they are not even
+    in the file the question is asked of.
     """
-    store = sealed_run.output_storage
+    model_store = sealed_run.output_storage
     sealed = _model_records(sealed_run)[-1]["payload"]
 
-    searched = store.search_outputs(pattern="advisor", limit=10)
-    listed = store.search_outputs(limit=10)
+    searched = model_store.search_outputs(pattern="advisor", limit=10)
+    listed = model_store.search_outputs(limit=10)
 
     assert searched and [row["tool_name"] for row in searched] == ["advisor"] * len(searched)
     assert listed and [row["tool_name"] for row in listed] == ["advisor"] * len(listed)
+    assert model_store.search_outputs(task_id=OBSERVABILITY_TASK_ID, limit=10) == []
     # And [A] and [C] are still one lookup away for the reader who holds the ref.
+    store = _turn_store(sealed_run)
     assert store.retrieve_output(sealed["window_digest"]["component_refs"][0])
     assert store.retrieve_output(sealed["observation_ref"])
+
+
+def test_sealing_a_turn_never_reaches_into_the_container(tmp_path):
+    """Observability may not spend a `docker exec` per rendered message.
+
+    One `store_output` against a container-backed store is a write, an index
+    read and a full index rewrite — round-trips per component, on a window that
+    re-renders every turn. Measured on a 20-turn synthetic run, sealing through
+    the container store spent 150 execs and 55 KB of the container's
+    `full_outputs.jsonl` (7.5 execs and 2.8 KB a turn), and it put those bytes
+    in the one file `output_search` reads.
+
+    A window component and a delivered observation are HOST bytes: the engine
+    rendered them, and the container never had them. They are written beside
+    the ledger, in the session directory the trajectory already reads, and the
+    container is not asked anything at all.
+    """
+    container = FakeOutputStorageOrchestrator()
+    engine = _sealing_engine(
+        tmp_path, [_phase_turn(index) for index in range(1, 6)], container=container
+    )
+
+    engine.run_setup_loop("set up the project", max_iterations=12)
+
+    sealed = _model_records(engine)
+    assert sealed, "the run sealed no turn at all"
+    stored = [
+        json.loads(line) for line in container.files.get(STORAGE_PATH, "").splitlines() if line
+    ]
+    assert stored, "the tool path still stores its outputs in the container"
+    assert [row for row in stored if row["task_id"] == OBSERVABILITY_TASK_ID] == []
+    assert [command for command in container.commands if OBSERVABILITY_TASK_ID in command] == []
+    # The bytes are exactly where the trajectory's full tier looks for them.
+    assert (tmp_path / "contexts" / "full_outputs.jsonl").is_file()
+    store = _turn_store(engine)
+    last = sealed[-1]["payload"]
+    assert store.retrieve_output(last["observation_ref"])
+    assert store.retrieve_output(last["window_digest"]["component_refs"][-1])
+
+
+def test_the_store_grows_by_net_new_bytes_only(sealed_run, tmp_path):
+    """Content addressing, measured in the file: one record per distinct body.
+
+    Every turn re-sends the whole window, so a store that wrote what each
+    record NAMES would grow by the window's length per turn. Dedupe by sha256
+    makes the growth the run's net-new bytes: the system prompt is written
+    once, and an observation already written when it was delivered is
+    referenced by every later window that carries it.
+    """
+    lines = (tmp_path / "contexts" / "full_outputs.jsonl").read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines if line]
+    bodies = [row["output"] for row in records]
+    named = [
+        ref
+        for row in _model_records(sealed_run)
+        for ref in [
+            *row["payload"]["window_digest"]["component_refs"],
+            row["payload"]["observation_ref"],
+        ]
+        if ref
+    ]
+
+    assert records, "nothing was stored"
+    assert len(bodies) == len(set(bodies)), "the same body was written twice"
+    assert len(named) > len(set(named)), "no bytes were shared across turns"
+    assert {row["ref_id"] for row in records} >= set(named)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +467,7 @@ def _forcing_engine(tmp_path):
     engine.orchestrator = None
     engine.context_manager = _BranchHistory()
     engine.control_event_sink = ControlEventSink(tmp_path / "control_events.jsonl")
-    engine.output_storage = OutputStorageManager(tmp_path / "contexts")
+    engine.output_storage = OutputStorageManager(tmp_path / "container" / "contexts")
     engine.token_tracker = TokenTracker()
     engine._last_test_candidate_resolution = CandidateResolution(
         status="available",
@@ -476,7 +557,7 @@ def test_a_forced_observation_reaches_the_branch_history(tmp_path):
     assert entry["iteration"] == 7
 
     sealed = _events(engine, "turn_record")[0]["payload"]
-    assert engine.output_storage.retrieve_output(sealed["observation_ref"]) == "50 tests passed"
+    assert _turn_store(engine).retrieve_output(sealed["observation_ref"]) == "50 tests passed"
 
 
 def test_an_engine_close_seals_the_word_it_sealed(tmp_path):
@@ -517,7 +598,7 @@ def test_an_engine_close_seals_the_word_it_sealed(tmp_path):
     assert sealed["gate_decision_id"] == gate.decision_id
     assert sealed["envelope_ref"] is None
     # The word the close delivered is resolvable, like any other observation.
-    assert "phase floor exhausted" in engine.output_storage.retrieve_output(
+    assert "phase floor exhausted" in _turn_store(engine).retrieve_output(
         sealed["observation_ref"]
     )
 
