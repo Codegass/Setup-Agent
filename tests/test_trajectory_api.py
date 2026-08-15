@@ -446,6 +446,29 @@ def test_a_session_that_has_not_written_its_ledger_yet_is_a_warning_not_an_error
     assert [warning["code"] for warning in body["warnings"]] == ["missing_control_events"]
 
 
+def test_a_run_watched_from_its_first_second_is_a_200_even_with_no_host_logs(tmp_path):
+    """No host directory, no mirrored ledger yet — a session, not a stranger.
+
+    This is the UI attaching to a run it did not launch (another checkout, a
+    fresh container) in the seconds before the engine appends its first control
+    event. The session is IDENTIFIED — the trunk in the mirror named it, which
+    is the only reason this request got past the id check at all — so the answer
+    is the one the endpoint documents for a session with no ledger: an empty
+    trajectory that states the hole. A 404 says the session does not exist,
+    which is a different and false statement, and it makes the timeline flap
+    between "not found" and the run's first turns.
+    """
+    logs, session_dir, mirror = _mount(tmp_path, ledger=False)
+    shutil.rmtree(session_dir)  # the host never held this project's logs
+
+    response = _client(logs, mirror).get(f"/api/sessions/{_session_id('kafka')}/trajectory")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["turns"] == []
+    assert [warning["code"] for warning in body["warnings"]] == ["missing_control_events"]
+
+
 def test_when_the_host_kept_no_ledger_the_containers_mirrored_copy_answers(tmp_path):
     """The mirror is a session directory too — `.setup_agent/` is a root.
 

@@ -286,6 +286,9 @@ export interface ExecutionSessionDetail {
   context?: ContextTrace | null
   logs: string[]
   partial?: boolean
+  /** A fabricated session (`sag ui --demo`): it stands for no run, so no
+   *  control ledger exists for it and no trajectory can be derived. */
+  demo?: boolean
 }
 
 export interface FileChangeDigest {

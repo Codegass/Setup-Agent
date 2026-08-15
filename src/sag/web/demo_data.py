@@ -418,6 +418,10 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
             "02:16:41 mvn test completed: 312 passed, 8 HelpFormatter width failures",
         ],
         partial=True,
+        # This session never ran, so no ledger was ever written for it and no
+        # trajectory can be derived. The detail says so rather than letting the
+        # timeline offer a panel that could only answer "unavailable".
+        demo=True,
         verdict=VerdictSummary(
             tone="attention",
             headline=(

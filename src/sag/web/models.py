@@ -816,6 +816,12 @@ class ExecutionSessionDetail(WebModel):
     context: ContextTrace | None = None
     logs: list[str] = Field(default_factory=list)
     partial: bool = False
+    #: A fabricated session — `sag ui --demo`'s read models stand for no run.
+    #: Nothing wrote a control ledger for one, so `ReadModelBuilder.session_dir`
+    #: refuses to name a session directory for it, and the views derived from
+    #: that directory (the timeline) are not offered at all. A real session
+    #: never carries this, whatever state it is in.
+    demo: bool = False
     verdict: VerdictSummary | None = None
     model: str | None = None
     steps: int | None = None

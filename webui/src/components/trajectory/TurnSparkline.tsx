@@ -8,6 +8,8 @@ const GAP = 2
 const PITCH = COLUMN + GAP
 const PLOT = 26
 const MARKS = 10
+/** The shortest a column is ever drawn: a value stated, whatever its size. */
+const BASELINE = 1.5
 
 /**
  * What a series is: one measure, one scale, one label, one colour.
@@ -84,17 +86,23 @@ function Plot({ columns, series }: { columns: SparkColumn[]; series: Series }) {
             return (
               <rect
                 className="fill-muted-foreground/35"
-                height={1.5}
+                height={BASELINE}
                 key={column.turnId}
                 width={COLUMN}
                 x={x}
-                y={PLOT - 1.5}
+                y={PLOT - BASELINE}
               >
                 <title>{`turn ${column.turnId} · ${series.unstated}`}</title>
               </rect>
             )
           }
-          const height = Math.max(1.5, (value / peak) * PLOT)
+          // A peak of zero is a series every column of which stated zero — a
+          // run of cached turns, two stamps in the same millisecond. There is
+          // no scale to draw against, and dividing by it wrote NaN into the
+          // geometry, which is a plot that silently disappears. Every stated
+          // value gets the baseline instead: the ink says a value exists, and
+          // its own title says what it was.
+          const height = peak > 0 ? Math.max(BASELINE, (value / peak) * PLOT) : BASELINE
           return (
             <rect
               className={INK}

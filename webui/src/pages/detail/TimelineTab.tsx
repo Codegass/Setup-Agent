@@ -36,6 +36,16 @@ function message(error: unknown): string {
  *   view does not hold. It is never the polling tier: `outputs` comes back
  *   whole every time.
  *
+ * Only the heartbeat is skipped while a read is in flight. A byte read is
+ * issued the moment a row is expanded, because a reader is waiting for it, so
+ * the two reads DO overlap and a long byte read can answer after a poll that
+ * already moved the document on. What it then carries is the run as it stood
+ * before that poll, and `mergeTrajectory` orders the two by the same ledger
+ * watermark the poll cuts at: an answer behind the watermark already held
+ * contributes its bytes and nothing else. It never restores a warning the newer
+ * state withdrew, and never returns a turn to the half-stated row it was
+ * between its envelope and its result.
+ *
  * When the run stops, the timeline reads it whole once more: the token ledger is
  * exported at loop exit, so the last turns' bills land with no control event to
  * carry them, and no watermark cut can ask for a change the ledger never stated.
@@ -148,6 +158,12 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
     bytesStatus.current = "loading"
     setBytes("loading")
     setBytesError(null)
+    // This read is NOT skipped while a poll is in flight — the reader is
+    // waiting for these bytes — so it may answer after a newer poll has landed.
+    // `apply` refuses to let an answer behind the held watermark overwrite the
+    // newer state; the watermark it resolved through is recorded as its OWN, so
+    // a stale answer leaves the bytes of the turns that arrived after it still
+    // to fetch, and the next expansion asks again.
     void fetchTrajectory(sessionId, { detail: "full" })
       .then((full) => {
         apply(full)

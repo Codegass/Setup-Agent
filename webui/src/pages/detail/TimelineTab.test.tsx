@@ -186,6 +186,61 @@ describe("TimelineTab", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it("never lets a slow byte read overwrite a newer state of the ledger", async () => {
+    // The full tier is asked for outside the heartbeat's in-flight discipline,
+    // because a reader expanding a row is waiting for those bytes. So a long
+    // byte read can still be on the wire when the next poll lands, and the
+    // answer it eventually brings is the run as it stood BEFORE that poll:
+    // applying it whole put the turn back to half-stated, restored the warning
+    // the newer state had withdrawn, and dropped nothing visibly — the row just
+    // went backwards. The bytes are kept; the stale whole-state is not.
+    vi.useFakeTimers()
+    // The run as it stood when the row was expanded: turn 1 open, its hole
+    // stated, nothing after it.
+    const asItStood = doc({
+      turns: [turn(1, { control_seq: [1] })],
+      warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+    })
+    const stale = { ...asItStood, outputs: { output_1: "bash: mvn: not found" } }
+    const fresh = doc({
+      turns: [turn(1, { iteration: 4, control_seq: [1, 2, 3] }), turn(2, { control_seq: [4] })],
+      warnings: [],
+    })
+
+    let landFull = () => {}
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).includes("detail=full")) {
+        return new Promise<Response>((resolve) => {
+          landFull = () => resolve(json(stale))
+        })
+      }
+      return Promise.resolve(json(fetchMock.mock.calls.length > 1 ? fresh : asItStood))
+    })
+
+    render(<TimelineTab live sessionId="S1" />)
+    await settle()
+
+    // A row is expanded: the full tier is asked for, and does not answer yet.
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+    await settle()
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/sessions/S1/trajectory?detail=full")
+
+    // The ledger moves under it, and the poll lands first.
+    await settle(5000)
+    expect(screen.getByRole("button", { name: /^Turn 2/ })).toBeInTheDocument()
+
+    landFull()
+    await settle()
+
+    expect(screen.getByRole("button", { name: /^Turn 2/ })).toBeInTheDocument()
+    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("1·2·3")
+    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 4")
+    expect(screen.queryByText("missing_tool_result")).not.toBeInTheDocument()
+    // …and the bytes the reader was waiting for still landed.
+    fireEvent.click(screen.getByRole("button", { name: /output_1/ }))
+    expect(screen.getByText("bash: mvn: not found")).toBeInTheDocument()
+  })
+
   it("states the holes the reducer reported for the run as a whole", async () => {
     vi.useFakeTimers()
     vi.spyOn(globalThis, "fetch").mockImplementation(() =>

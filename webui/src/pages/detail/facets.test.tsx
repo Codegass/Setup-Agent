@@ -63,7 +63,7 @@ describe("buildDetailTabs", () => {
     expect(tabs.map((t) => t.id)).toContain("flow")
   })
 
-  it("puts the timeline right after overview, for every session", () => {
+  it("puts the timeline right after overview, for every session that ran", () => {
     expect(buildDetailTabs(detail()).map((t) => t.id).slice(0, 2)).toEqual([
       "overview",
       "timeline",
@@ -71,6 +71,15 @@ describe("buildDetailTabs", () => {
     // Unlike flow, it does not wait on a context trace: the timeline is derived
     // from the control ledger, which every run writes.
     expect(buildDetailTabs(detail({ context: ctx })).map((t) => t.id)).toContain("timeline")
+  })
+
+  it("omits the timeline for a demo session, which never ran and wrote no ledger", () => {
+    // `sag ui --demo` fabricates every read model; there is no session
+    // directory behind one, which is why the builder refuses to name one. The
+    // tab offered a reader a panel that could only ever say "unavailable".
+    const tabs = buildDetailTabs(detail({ demo: true })).map((t) => t.id)
+    expect(tabs).not.toContain("timeline")
+    expect(tabs[0]).toBe("overview")
   })
 
   it("always includes core tabs and surfaces tests count + red tone when failing", () => {

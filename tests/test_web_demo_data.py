@@ -57,6 +57,17 @@ def test_demo_session_detail_has_modules():
     assert detail.module_summary.modules_with_test_failures == 1
 
 
+def test_demo_session_says_it_is_a_demo_so_the_timeline_is_not_offered():
+    """A demo detail stands for no run, and says so.
+
+    `ReadModelBuilder.session_dir` refuses to name a directory under demo mode
+    — there is no ledger anywhere to derive a trajectory from — so the detail
+    carries the same fact and the frontend leaves the tab out instead of
+    offering a panel that can only ever answer "unavailable".
+    """
+    assert get_demo_session("CC-3").demo is True
+
+
 def test_demo_modules_carry_coverage():
     detail = get_demo_session("CC-3")
     by_path = {m.path: m for m in detail.modules}

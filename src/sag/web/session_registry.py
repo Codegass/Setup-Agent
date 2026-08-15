@@ -288,6 +288,15 @@ class ContainerSessionRegistry:
 
         When nothing names the run and more than one directory could be it,
         `UnattributableSessionError` says so rather than serving a guess.
+
+        **A directory with no ledger in it is still this session's directory.**
+        Attaching to a run in the seconds before the engine appends its first
+        control event is the ordinary way to watch one start, and the endpoint
+        documents that case: an empty trajectory carrying
+        `missing_control_events`. Answering `None` there instead makes it a 404
+        — "no such session" — about a session the trunk just named, and the
+        timeline flaps between "not found" and the run's first turns. So the
+        mirror answers whenever no host directory does, ledger or no ledger.
         """
         orchestrator = self._reader(workspace)
         trunk = _read_latest_trunk(orchestrator)
@@ -308,10 +317,14 @@ class ContainerSessionRegistry:
         if host is not None and (host / CONTROL_EVENTS_NAME).is_file():
             return host
 
-        mirror = getattr(orchestrator, "mirror", None)
-        if mirror is not None and (Path(mirror) / ".setup_agent" / CONTROL_EVENTS_NAME).is_file():
-            return Path(mirror)
-        return host
+        mirror = _mirror_dir(orchestrator)
+        if mirror is not None and (mirror / ".setup_agent" / CONTROL_EVENTS_NAME).is_file():
+            return mirror
+        # Neither copy holds a ledger yet. The session exists — the trunk named
+        # it — so a directory is handed back and the trajectory layer states the
+        # absence. Only a session nothing can name gets `None`, and only that is
+        # a 404.
+        return host if host is not None else mirror
 
     def _reader(self, workspace: WorkspaceSummary) -> Any:
         """A reader for a workspace's result files. Tests inject a fake via
@@ -1797,6 +1810,23 @@ def _container_run_id(orchestrator: Any) -> str | None:
     a pin names no run, and the caller then has nothing to resolve against.
     """
     return _run_pin_run_id(_read_container_file(orchestrator, RUN_PIN_PATH))
+
+
+def _mirror_dir(orchestrator: Any) -> Path | None:
+    """The host mirror of this workspace's container files, if there is one.
+
+    A reader that answers from the mirror names it; a reader that could not
+    fetch one is pointed at a path that was never created (`_reader`'s
+    `__missing__`), and a directory that does not exist is not a session
+    directory to hand anyone — the trajectory layer would raise on it and the
+    endpoint would report a session directory that went away, which is a
+    different and untrue statement about a session that simply has no mirror.
+    """
+    mirror = getattr(orchestrator, "mirror", None)
+    if mirror is None:
+        return None
+    path = Path(mirror)
+    return path if path.is_dir() else None
 
 
 def _run_pin_run_id(raw: str | None) -> str | None:

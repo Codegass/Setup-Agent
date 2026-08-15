@@ -53,6 +53,14 @@ export function TurnQuad({
   status: BytesStatus
 }) {
   const components = turn.window_components ?? []
+  // The row's handle into [A] is the record's own, and the record makes it the
+  // LAST component it named — the newest message, the one thing this turn did
+  // not share with the turn before it. So it is normally already in the list
+  // below, and drawing it above as well put one ref on screen twice and invited
+  // a reader to descend the same bytes from two places. It is marked where it
+  // lives instead, and keeps its own descent only when the list does not carry
+  // it — a record that named a handle and no components.
+  const handle = turn.window_ref == null ? -1 : components.lastIndexOf(turn.window_ref)
 
   return (
     <div className="grid gap-2.5 lg:grid-cols-2">
@@ -61,9 +69,9 @@ export function TurnQuad({
         testId={`quad-window-${turn.turn_id}`}
         title="[A] Window — what the model saw"
       >
-        {turn.window_ref ? (
+        {turn.window_ref && handle < 0 ? (
           <RefDescent
-            label="window"
+            label="window handle"
             outputs={outputs}
             refName={turn.window_ref}
             status={status}
@@ -80,7 +88,12 @@ export function TurnQuad({
                       {`${cut} older components the record could not name (window cut)`}
                     </span>
                   ) : (
-                    <RefDescent outputs={outputs} refName={component} status={status} />
+                    <RefDescent
+                      label={index === handle ? "window handle" : undefined}
+                      outputs={outputs}
+                      refName={component}
+                      status={status}
+                    />
                   )}
                 </li>
               )

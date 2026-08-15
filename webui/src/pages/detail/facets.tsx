@@ -102,12 +102,16 @@ export interface TabMeta {
  */
 export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
   // Timeline leads the panels because it is the run itself, turn by turn, and
-  // it is never gated on data being present: it derives from the control ledger
-  // every run writes, and a run with no ledger yet says so in its own words.
-  const tabs: TabMeta[] = [
-    { id: "overview", label: "Overview" },
-    { id: "timeline", label: "Timeline" },
-  ]
+  // for a real session it is never gated on data being present: it derives from
+  // the control ledger every run writes, and a run with no ledger YET says so
+  // in its own words. A demo session is the one case where there is no ledger
+  // to wait for — the read models are fabricated and stand for no run, which is
+  // why the builder refuses to name a session directory for one — so the tab is
+  // not offered rather than left to answer "unavailable" forever.
+  const tabs: TabMeta[] = [{ id: "overview", label: "Overview" }]
+  if (!d.demo) {
+    tabs.push({ id: "timeline", label: "Timeline" })
+  }
 
   if (d.context) {
     tabs.push({ id: "flow", label: "Flow" })

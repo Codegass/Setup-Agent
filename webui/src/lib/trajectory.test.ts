@@ -115,6 +115,44 @@ describe("mergeTrajectory", () => {
     const polled = doc({ turns: [turn(7)] })
     expect(mergeTrajectory(null, polled)).toEqual(polled)
   })
+
+  it("takes only the bytes from a response that lands behind the ledger held", () => {
+    // The full tier is read outside the poll's in-flight discipline — a reader
+    // expanding a row is waiting for those bytes — so a slow byte read can land
+    // after a poll that already moved the document forward. Applying it whole
+    // would restore the warning the newer state withdrew and put the turn back
+    // the way it stood before its result arrived. The watermark orders them:
+    // a response behind it contributes its bytes and nothing else.
+    const held = doc({ turns: [turn(1, { control_seq: [1, 2, 3] })], warnings: [] })
+    const late = doc({
+      turns: [turn(1, { control_seq: [1] })],
+      warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+      outputs: { output_a: "bash: mvn: not found" },
+    })
+
+    const merged = mergeTrajectory(held, late)
+
+    expect(merged.turns[0].control_seq).toEqual([1, 2, 3])
+    expect(merged.warnings).toEqual([])
+    expect(merged.outputs).toEqual({ output_a: "bash: mvn: not found" })
+  })
+
+  it("applies a response the watermark cannot order — a poll that saw no turn", () => {
+    // A cut poll over a ledger that has not moved carries no turn at all, so it
+    // names no sequence. That is not a stale response: it is the current whole
+    // state of everything a cut does not remove, and it is how a warning is
+    // withdrawn once its hole fills.
+    const held = doc({
+      turns: [turn(1, { control_seq: [1, 2, 3] })],
+      warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+    })
+    const polled = doc({ turns: [], warnings: [] })
+
+    const merged = mergeTrajectory(held, polled)
+
+    expect(merged.warnings).toEqual([])
+    expect(merged.turns[0].control_seq).toEqual([1, 2, 3])
+  })
 })
 
 describe("latestControlSeq", () => {
@@ -144,10 +182,23 @@ describe("latestControlSeq", () => {
 })
 
 describe("bandTurns", () => {
+  // The reducer states one `phases[]` entry per SEGMENT, not per phase name: a
+  // phase the run re-enters is appended a second time, and each entry carries
+  // the gates decided inside that stretch and the termination that ended it.
+  // provision is entered twice here, and the second visit is still open.
   const banded = doc({
     phases: [
-      { name: "provision", termination: "advance", gates: [] },
-      { name: "build", termination: "evidence_close", gates: [{ word: "partial" }] },
+      {
+        name: "provision",
+        termination: "advance",
+        gates: [{ word: "failed", decision_id: "g1", supersedes: null }],
+      },
+      { name: "build", termination: "evidence_close", gates: [] },
+      {
+        name: "provision",
+        termination: null,
+        gates: [{ word: "partial", decision_id: "g2", supersedes: "g1" }],
+      },
     ],
     turns: [
       turn(1, { phase: "provision" }),
@@ -170,11 +221,20 @@ describe("bandTurns", () => {
     expect(bands[0].key).not.toBe(bands[2].key)
   })
 
-  it("carries the termination onto the LAST band of that phase only", () => {
+  it("gives each band the termination of its OWN segment", () => {
+    // Keying the metadata by phase NAME showed the last visit's ending on the
+    // first band and left the visit that actually ended looking unfinished.
     const bands = bandTurns(banded)
-    expect(bands[0].termination).toBeNull()
-    expect(bands[2].termination).toBe("advance")
+    expect(bands[0].termination).toBe("advance")
     expect(bands[1].termination).toBe("evidence_close")
+    expect(bands[2].termination).toBeNull() // the run is still in the re-entry
+  })
+
+  it("gives each band the gates decided inside it, not another visit's", () => {
+    const bands = bandTurns(banded)
+    expect(bands[0].gates.map((g) => g.word)).toEqual(["failed"])
+    expect(bands[1].gates).toEqual([])
+    expect(bands[2].gates.map((g) => g.word)).toEqual(["partial"])
   })
 
   it("bands a phase the document never listed, rather than dropping its turns", () => {
@@ -182,6 +242,24 @@ describe("bandTurns", () => {
     expect(bands).toHaveLength(1)
     expect(bands[0].name).toBe("ghost")
     expect(bands[0].termination).toBeNull()
+    expect(bands[0].gates).toEqual([])
+  })
+
+  it("states nothing for a band the document names no segment for", () => {
+    // The turns show two visits and the document states one segment: whatever
+    // the second band is, it is not the first visit's ending repeated.
+    const bands = bandTurns(
+      doc({
+        phases: [{ name: "build", termination: "advance", gates: [] }],
+        turns: [
+          turn(1, { phase: "build" }),
+          turn(2, { phase: "test" }),
+          turn(3, { phase: "build" }),
+        ],
+      }),
+    )
+    expect(bands[0].termination).toBe("advance")
+    expect(bands[2].termination).toBeNull()
   })
 })
 

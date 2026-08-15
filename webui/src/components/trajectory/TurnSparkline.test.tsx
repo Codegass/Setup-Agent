@@ -96,6 +96,41 @@ describe("TurnSparkline", () => {
     expect(screen.queryByRole("img", { name: /anomaly/i })).not.toBeInTheDocument()
   })
 
+  it("draws a series whose peak is zero as a flat baseline, never as NaN", () => {
+    // A run states real zeroes: a cached turn billed nothing, a turn whose two
+    // stamps fall in the same millisecond. Scaling a column by a peak of 0 is
+    // 0/0, and the NaN it produced went straight into the rect's height and y —
+    // geometry no browser draws, so the whole plot vanished silently.
+    const { container } = render(
+      <TurnSparkline
+        doc={doc({
+          turns: [
+            turn(1, {
+              tokens: { input: 0, output: 0 },
+              t0: "2026-08-14T11:28:36.000Z",
+              t1: "2026-08-14T11:28:36.000Z",
+            }),
+            turn(2, {
+              tokens: { input: 0, output: 0 },
+              t0: "2026-08-14T11:29:00.000Z",
+              t1: "2026-08-14T11:29:00.000Z",
+            }),
+          ],
+        })}
+      />,
+    )
+
+    const rects = [...container.querySelectorAll("rect")]
+    expect(rects).toHaveLength(4) // two columns, two series
+    for (const rect of rects) {
+      expect(Number(rect.getAttribute("height"))).toBeGreaterThan(0)
+      expect(Number(rect.getAttribute("y"))).toBeGreaterThanOrEqual(0)
+    }
+    // And a stated zero still reads as a zero, not as an absent bill.
+    expect(screen.getByText(/turn 1 · 0 tokens/i)).toBeInTheDocument()
+    expect(screen.queryByText(/no tokens stated/i)).not.toBeInTheDocument()
+  })
+
   it("draws nothing at all before the first turn is on the record", () => {
     const { container } = render(<TurnSparkline doc={doc({ turns: [] })} />)
     expect(container).toBeEmptyDOMElement()

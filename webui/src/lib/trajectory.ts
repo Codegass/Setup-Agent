@@ -27,6 +27,19 @@ import type {
  * response and a cut has no channel for a retraction. `outputs` is merged: refs
  * are content-addressed and shared, so a map already holding the system prompt
  * keeps it when a later poll does not mention it.
+ *
+ * **A response that lands behind the ledger already held contributes its bytes
+ * and nothing else.** Two reads share this document and only one of them is
+ * serialized: the heartbeat skips while a poll is in flight, but a byte read is
+ * issued the moment a row is expanded, because a reader is waiting for it. A
+ * long byte read therefore lands after a poll that already moved the document
+ * on, carrying the run as it stood BEFORE that poll — and replacing whole state
+ * with it restores warnings the newer state withdrew and returns a turn to the
+ * half-stated row it was between its envelope and its result. The ledger
+ * watermark orders the two answers, and the older one may only add bytes, which
+ * is the one thing it was asked for. A response naming no sequence at all
+ * cannot be ordered and is applied: that is the shape of a cut poll over a
+ * ledger that has not moved, which is exactly how a filled hole is withdrawn.
  */
 export function mergeTrajectory(
   current: TrajectoryDocument | null,
@@ -36,6 +49,17 @@ export function mergeTrajectory(
     return incoming
   }
 
+  const outputs =
+    current.outputs || incoming.outputs
+      ? { ...(current.outputs ?? {}), ...(incoming.outputs ?? {}) }
+      : null
+
+  const held = latestControlSeq(current)
+  const landed = latestControlSeq(incoming)
+  if (held !== null && landed !== null && landed < held) {
+    return { ...current, outputs }
+  }
+
   const turns = new Map<number, TrajectoryTurn>()
   for (const turn of current.turns) {
     turns.set(turn.turn_id, turn)
@@ -43,11 +67,6 @@ export function mergeTrajectory(
   for (const turn of incoming.turns) {
     turns.set(turn.turn_id, turn)
   }
-
-  const outputs =
-    current.outputs || incoming.outputs
-      ? { ...(current.outputs ?? {}), ...(incoming.outputs ?? {}) }
-      : null
 
   return {
     ...incoming,
@@ -90,9 +109,10 @@ export interface PhaseBand {
   name: string
   /** 1 the first time the run entered this phase, 2 the next time, … */
   ordinal: number
-  /** How the phase ended — carried on its LAST band only, since the reducer
-   *  states one termination per phase name and a re-entry has not ended yet. */
+  /** How THIS visit ended, per the segment the reducer stated for it; null
+   *  while the visit is still open, or when no segment names it. */
   termination: string | null
+  /** The gates decided inside THIS visit — never another visit's. */
   gates: TrajectoryGate[]
   turns: TrajectoryTurn[]
 }
@@ -104,11 +124,25 @@ export interface PhaseBand {
  * into the first: the turns are not contiguous, and drawing them as one band
  * would claim an ordering the run did not have. A phase no `phases[]` entry
  * names still gets its band — a turn is never dropped for want of a header.
+ *
+ * Metadata is keyed by SEGMENT, not by phase name, because that is what the
+ * reducer states: re-entering a phase appends a second `phases[]` entry with
+ * the same name, carrying the gates decided inside that stretch and the
+ * termination that ended it. Keying by name kept only the last entry, so a
+ * run that returned to `provision` showed the second visit's gates on the first
+ * band and left the visit that actually ended looking unterminated. The Nth
+ * band of a name takes the Nth segment of that name; a band no segment names
+ * states nothing rather than borrowing another visit's ending.
  */
 export function bandTurns(doc: TrajectoryDocument): PhaseBand[] {
-  const meta = new Map<string, TrajectoryPhase>()
+  const segments = new Map<string, TrajectoryPhase[]>()
   for (const phase of doc.phases) {
-    meta.set(phase.name, phase)
+    const held = segments.get(phase.name)
+    if (held) {
+      held.push(phase)
+    } else {
+      segments.set(phase.name, [phase])
+    }
   }
 
   const bands: PhaseBand[] = []
@@ -122,21 +156,15 @@ export function bandTurns(doc: TrajectoryDocument): PhaseBand[] {
     }
     const ordinal = (seen.get(turn.phase) ?? 0) + 1
     seen.set(turn.phase, ordinal)
+    const segment = segments.get(turn.phase)?.[ordinal - 1] ?? null
     bands.push({
       key: `${turn.phase}#${ordinal}`,
       name: turn.phase,
       ordinal,
-      termination: null,
-      gates: meta.get(turn.phase)?.gates ?? [],
+      termination: segment?.termination ?? null,
+      gates: segment?.gates ?? [],
       turns: [turn],
     })
-  }
-
-  const lastOrdinal = seen
-  for (const band of bands) {
-    if (band.ordinal === lastOrdinal.get(band.name)) {
-      band.termination = meta.get(band.name)?.termination ?? null
-    }
   }
 
   return bands

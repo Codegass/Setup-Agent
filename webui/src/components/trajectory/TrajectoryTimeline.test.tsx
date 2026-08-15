@@ -180,6 +180,52 @@ describe("TrajectoryTimeline", () => {
     expect(screen.getByText("you are a setup agent")).toBeInTheDocument()
   })
 
+  it("draws the window handle once, marked inside the list it belongs to", () => {
+    // The record's handle into [A] IS the last component it named — the newest
+    // message, the one thing this turn did not share with the turn before it.
+    // Drawing it above the list and again inside it put one ref on screen
+    // twice and invited a reader to descend the same bytes from two places.
+    const handled = {
+      ...doc,
+      turns: [
+        {
+          ...doc.turns[0],
+          window_ref: "output_obs1",
+          window_components: ["output_sys", "output_obs1"],
+        },
+        doc.turns[1],
+      ],
+      outputs: withBytes.outputs,
+    }
+    render(<TrajectoryTimeline doc={handled} />)
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+
+    const window = screen.getByTestId("quad-window-1")
+    expect(within(window).getAllByRole("button", { name: /output_obs1/ })).toHaveLength(1)
+    expect(within(window).getByText(/handle/i)).toBeInTheDocument()
+    expect(within(window).getAllByRole("listitem")).toHaveLength(2)
+  })
+
+  it("still descends a handle the component list does not carry", () => {
+    // A record may name a window whose components it could not state. The
+    // handle is then the only way into [A], and it keeps its own descent.
+    const handleOnly = {
+      ...withBytes,
+      turns: [
+        { ...doc.turns[0], window_ref: "output_win1", window_components: null },
+        doc.turns[1],
+      ],
+    }
+    render(<TrajectoryTimeline doc={handleOnly} />)
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+
+    const window = screen.getByTestId("quad-window-1")
+    expect(within(window).getByRole("button", { name: /output_win1/ })).toBeInTheDocument()
+    expect(
+      within(window).queryByRole("list", { name: /window components/i }),
+    ).not.toBeInTheDocument()
+  })
+
   it("declares a cut instead of drawing it as bytes nobody has", () => {
     render(<TrajectoryTimeline doc={withBytes} />)
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
