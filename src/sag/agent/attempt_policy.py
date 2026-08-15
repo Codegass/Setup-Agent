@@ -41,6 +41,13 @@ ReceiptBindingStatus = Literal[
     "target_sha_missing",
 ]
 
+RunReceiptScopeName = Literal["project_root", "clone_root", "workspace_fallback"]
+
+WORKSPACE_ROOT = "/workspace"
+# The provision gate seals this fact with the probed clone directory as its
+# evidence ref, which `_record_gate_facts` stores as the fact's provenance.
+PROVISION_CLONE_ROOT_FACT = "provision.workspace_ready"
+
 
 @dataclass(frozen=True, slots=True)
 class TestAttemptRequirement:
@@ -173,6 +180,21 @@ class TestCandidateResolution:
             workspace_root=workspace_root,
             primary=primary,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RunReceiptScope:
+    """The directory a run-wide receipt count was taken over, and its name.
+
+    The name exists so no reader has to infer from a path whether the count was
+    bounded to this project or spans every checkout in the container.
+    """
+
+    root: str
+    name: RunReceiptScopeName
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {"name": self.name, "root": self.root}
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,10 +614,60 @@ def terminal_test_receipts(
     return (*direct, *terminal_polls)
 
 
+def provisioned_clone_root(state: RunEvidenceState | None) -> str | None:
+    """The clone root provision recorded for this run, or ``None``.
+
+    ``_inspect_provision`` probes ``/workspace/<project_name>`` and carries that
+    directory as the evidence ref of ``provision.workspace_ready``, so the run
+    state already holds the one project boundary an unresolvable survey cannot
+    supply. Two refs are not boundaries and are rejected here: the
+    ``validator:<phase>:<attempt>`` provenance ``_record_gate_facts`` falls back
+    to when a gate carries no refs, and a path outside the container workspace.
+    A ref that IS the workspace bounds nothing the fallback does not, so it is
+    reported as no clone root rather than as a boundary that narrows anything.
+    """
+    if state is None:
+        return None
+    try:
+        recorded = state.fact_provenance(PROVISION_CLONE_ROOT_FACT)
+    except Exception:
+        return None
+    root = _normalized_root(
+        recorded,
+        None,
+        enforce_project_boundary=False,
+        workspace_root=WORKSPACE_ROOT,
+    )
+    return root if root is not None and root != WORKSPACE_ROOT else None
+
+
+def run_test_receipt_scope(
+    state: RunEvidenceState | None,
+    *,
+    project_root: str | None = None,
+) -> RunReceiptScope:
+    """The directory the run-wide consult counts over, under its own name.
+
+    Ordered by how much the boundary proves about THIS project: the survey's
+    resolved project root, else the clone root provision recorded, else the
+    whole container workspace. The last is a real widening — it admits any
+    checkout sharing the container — so it is named rather than assumed, and
+    every caller that seals the count seals which of the three it took.
+    """
+    resolved = _normalized_absolute_path(project_root)
+    if resolved is not None:
+        return RunReceiptScope(root=resolved, name="project_root")
+    clone_root = provisioned_clone_root(state)
+    if clone_root is not None:
+        return RunReceiptScope(root=clone_root, name="clone_root")
+    return RunReceiptScope(root=WORKSPACE_ROOT, name="workspace_fallback")
+
+
 def run_test_receipts(
     state: RunEvidenceState | None,
     *,
     project_root: str | None = None,
+    scope: RunReceiptScope | None = None,
 ) -> tuple[ToolObservation, ...]:
     """Return terminal test-bearing receipts from ANY phase/attempt of this run.
 
@@ -605,12 +677,19 @@ def run_test_receipts(
     `_matches_candidate` is unconditionally False on an empty tuple. A
     ``build(action=test)`` receipt harvested in the build phase is the same
     physical fact as a test-phase one, so the only scoping left is this run and
-    the directory boundary — the resolved project root when the survey has one,
-    otherwise the container workspace, never nothing.
+    the directory boundary.
+
+    That boundary is :func:`run_test_receipt_scope`. It used to be the resolved
+    project root or, whenever coordinates were unresolvable, all of
+    ``/workspace`` — the exact state the close path fires in. A terminal test
+    dispatch in a sibling checkout or a vendored sample then satisfied "did this
+    project's test run?", lifting both the forced analyze and the resolution
+    cap. Pass ``scope`` to count over the same boundary a caller is about to
+    seal, so the count and the name beside it cannot disagree.
     """
     if state is None:
         return ()
-    root = str(project_root or "").strip() or "/workspace"
+    root = (scope or run_test_receipt_scope(state, project_root=project_root)).root
     receipts: list[ToolObservation] = []
     for observation in state.tool_observations:
         if not _is_test_dispatch(observation) or not observation.result.is_terminal:
@@ -1481,6 +1560,8 @@ __all__ = [
     "CurrentBuildReceiptScope",
     "IncompatibleDomainEdge",
     "ReceiptBindingStatus",
+    "RunReceiptScope",
+    "RunReceiptScopeName",
     "TestAttemptRequirement",
     "TestCandidateResolution",
     "UntriedIslandsRequirement",
@@ -1490,11 +1571,14 @@ __all__ = [
     "current_run_durable_receipt",
     "has_build_attempt_receipt",
     "local_prerequisite_signature",
+    "provisioned_clone_root",
     "required_test_attempt",
     "resolve_current_build_receipt_scope",
     "has_test_candidate_refresh_receipt",
     "forced_test_refusal_receipts",
     "resolve_survey_test_candidates",
+    "run_test_receipt_scope",
+    "run_test_receipts",
     "survey_test_candidates",
     "test_execution_binding",
     "test_execution_matches_candidate",

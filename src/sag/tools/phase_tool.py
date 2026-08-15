@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 from sag.agent.attempt_policy import (
     build_attempt_requirement,
     required_test_attempt,
+    run_test_receipt_scope,
     run_test_receipts,
     terminal_test_receipts,
     test_closure_survey,
@@ -164,9 +165,21 @@ class PhaseTool(BaseTool):
         ``resolved`` is the survey the REQUIREMENT was graded against, handed
         down by the caller. Re-probing it here asked the same question a second
         time and could have answered it differently.
+
+        The run-wide count also states the directory it counted over. It was
+        taken over all of ``/workspace`` unconditionally — this call passed no
+        boundary at all — so a sibling checkout's receipt was reported to the
+        model as this run's evidence. It is bounded now, and where the widest
+        boundary is still the only one available the fact says which one it was
+        rather than leaving a number that reads as narrower than it is.
         """
+        scope = run_test_receipt_scope(
+            self.run_evidence_state,
+            project_root=resolved.project_root if resolved is not None else None,
+        )
         facts: Dict[str, Any] = {
-            "run_wide_test_receipts": len(run_test_receipts(self.run_evidence_state)),
+            "run_wide_test_receipts": len(run_test_receipts(self.run_evidence_state, scope=scope)),
+            "run_wide_test_receipt_scope": scope.to_metadata(),
             "test_attempt_requirement": required_attempt.to_metadata(),
         }
         if resolved is not None and resolved.status == "available":

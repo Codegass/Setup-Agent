@@ -177,11 +177,294 @@ def test_an_undispatched_test_is_not_a_run_wide_receipt(result):
 
 
 def test_a_dispatch_outside_the_boundary_is_not_a_run_wide_receipt():
-    """An unresolvable coordinate still bounds the consult at the workspace."""
+    """An unresolvable coordinate with no recorded clone root bounds the consult
+    at the workspace — the widest bound this predicate may ever take."""
     state = _ready_state()
     _record_build_phase_test(state, root="/tmp/elsewhere")
 
     assert run_test_receipts(state) == ()
+
+
+# ---------------------------------------------------------------------------
+# Task #52 — the consult is bounded to the project, never to all of /workspace
+# ---------------------------------------------------------------------------
+SIBLING_ROOT = "/workspace/vendored-sample/bigtop-data-generators"
+
+
+def _provisioned(state: RunEvidenceState, clone_root: str = "/workspace/bigtop"):
+    """Record the clone root exactly as ``_record_gate_facts`` does at provision.
+
+    The provision gate's evidence ref IS the directory it probed for the clone
+    (``_inspect_provision``), so the run state already carries the one boundary
+    an unresolvable survey cannot supply.
+    """
+    state.set_fact(
+        "provision.workspace_ready",
+        True,
+        evidence_ref=clone_root,
+        source_phase="provision",
+        source_attempt_id="provision-1",
+    )
+    return state
+
+
+def test_a_sibling_checkout_receipt_does_not_satisfy_the_run_wide_predicate():
+    """The hole this closes: with coordinates unresolvable the consult fell back
+    to ALL of /workspace, so a terminal test dispatch in a sibling checkout or a
+    vendored sample — a directory this run never claims — answered "did THIS
+    project's test run?" with yes."""
+    state = _provisioned(_ready_state())
+    _record_build_phase_test(state, root=SIBLING_ROOT)
+
+    assert run_test_receipts(state) == ()
+
+
+def test_the_forced_analyze_survives_a_sibling_checkout_receipt():
+    """The control consequence: a receipt outside the clone root lifts neither
+    the forced survey refresh nor the resolution cap."""
+    state = _provisioned(_ready_state())
+    _record_build_phase_test(state, root=SIBLING_ROOT)
+
+    requirement = required_test_attempt(
+        state,
+        UnreadableManifestOrchestrator(),
+        phase="test",
+        attempt_id="test-1",
+    )
+
+    assert requirement is not None
+    assert requirement.reason_code == "manifest_unreadable"
+
+
+def test_the_recorded_clone_root_still_admits_the_projects_own_receipt():
+    """Bounding narrows the scope; it never deletes the run's own evidence."""
+    state = _provisioned(_ready_state())
+    _record_build_phase_test(state)
+
+    assert len(run_test_receipts(state)) == 1
+
+
+def test_the_scope_names_which_boundary_bounded_the_count():
+    """Three bounds, three names. A reader must never have to infer from a path
+    whether the count was bounded to the project or spans the whole container.
+    """
+    from sag.agent.attempt_policy import run_test_receipt_scope
+
+    survey_bound = run_test_receipt_scope(
+        _provisioned(_ready_state()),
+        project_root="/workspace/bigtop/bigtop-data-generators",
+    )
+    clone_bound = run_test_receipt_scope(_provisioned(_ready_state()))
+    unbound = run_test_receipt_scope(_ready_state())
+
+    assert (survey_bound.name, survey_bound.root) == (
+        "project_root",
+        "/workspace/bigtop/bigtop-data-generators",
+    )
+    assert (clone_bound.name, clone_bound.root) == ("clone_root", "/workspace/bigtop")
+    assert (unbound.name, unbound.root) == ("workspace_fallback", "/workspace")
+
+
+def test_a_provision_ref_that_is_not_a_clone_root_is_not_a_boundary():
+    """``_record_gate_facts`` falls back to a ``validator:<phase>:<attempt>``
+    provenance when a gate carries no evidence refs, and a path outside the
+    container workspace is not this run's clone either. Neither may be read as
+    a directory to count over: the honest answer is the named fallback."""
+    from sag.agent.attempt_policy import run_test_receipt_scope
+
+    for ref in ("validator:provision:provision-1", "/tmp/elsewhere", "/workspace"):
+        scope = run_test_receipt_scope(_provisioned(_ready_state(), clone_root=ref))
+
+        assert (scope.name, scope.root) == ("workspace_fallback", "/workspace")
+
+
+def test_the_provision_gate_records_a_ref_this_reader_accepts():
+    """The coupling fence. The boundary is only as good as the ref provision
+    writes, and that ref lives in another module: if the provision gate ever
+    stops naming the clone directory, this consult silently widens back to the
+    whole workspace with nothing to say it did."""
+    from sag.agent.attempt_policy import provisioned_clone_root
+    from sag.agent.evidence_records import (
+        frame_json_record_stream,
+        frame_named_json_record_stream,
+    )
+    from sag.agent.phase_gates import check_phase_claim
+
+    def execute_command(command, **kwargs):
+        if "SAG_NAMED_JSON_RECORD_END_V1" in command:
+            return {"exit_code": 0, "output": frame_named_json_record_stream([])}
+        if "SAG_JSON_RECORD_END_V1" in command:
+            return {"exit_code": 0, "output": frame_json_record_stream([])}
+        if "test -d" in command:
+            return {"exit_code": 0, "output": "exists"}
+        return {"exit_code": 0, "output": ""}
+
+    claim = PhaseClaim(phase="provision", claimed_outcome=PhaseOutcome.SUCCESS)
+    gate = check_phase_claim(
+        "provision",
+        claim,
+        validator=None,
+        orchestrator=SimpleNamespace(
+            execute_command=execute_command,
+            container_id="run-wide-scope-fixture",
+        ),
+        project_name="bigtop",
+    )
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = SimpleNamespace(current_attempt_id="provision-1")
+    engine.run_evidence_state = RunEvidenceState(run_id="provision-ref")
+
+    engine._record_gate_facts("provision", gate)
+
+    assert engine.run_evidence_state.fact_value("provision.workspace_ready") is True
+    assert provisioned_clone_root(engine.run_evidence_state) == "/workspace/bigtop"
+
+
+def test_the_workspace_fallback_seals_the_scope_it_counted_over():
+    """The residual widening is disclosed, never silent.
+
+    With neither a survey coordinate nor a recorded clone root the consult still
+    counts over /workspace — but the sealed fact says so, so the gate and the
+    trajectory can weigh a count taken over a boundary that proves nothing about
+    THIS project."""
+    state = _ready_state()
+    # A manifest with no survey boundary is never live authority: the read
+    # fails closed and hands the close no coordinate at all.
+    orchestrator = ManifestOrchestrator()
+    orchestrator.manifest["survey"] = {}
+    tool = PhaseTool(
+        machine=SimpleNamespace(
+            current_phase="test",
+            current_attempt_id="test-1",
+            is_complete=False,
+        ),
+        validator=None,
+        orchestrator=orchestrator,
+        project_name="bigtop",
+        gate_fn=AcceptingGate(),
+        run_evidence_state=state,
+    )
+
+    result = tool.execute(action="done", outcome="failed")
+
+    assert result.error_code == "TEST_ATTEMPT_REQUIRED"
+    assert result.facts["run_wide_test_receipts"] == 0
+    assert result.facts["run_wide_test_receipt_scope"] == {
+        "name": "workspace_fallback",
+        "root": "/workspace",
+    }
+
+
+def _boundless_survey():
+    orchestrator = ManifestOrchestrator()
+    orchestrator.manifest["survey"] = {}
+    return orchestrator
+
+
+@pytest.mark.parametrize(
+    ("orchestrator_factory", "state_factory", "expected"),
+    (
+        (ManifestOrchestrator, lambda: _ready_state(), "project_root"),
+        (_boundless_survey, lambda: _provisioned(_ready_state()), "clone_root"),
+        (_boundless_survey, lambda: _ready_state(), "workspace_fallback"),
+    ),
+    ids=("survey_coordinate", "provisioned_clone_root", "nothing_narrower"),
+)
+def test_the_sealed_count_never_travels_without_the_scope_it_counted_over(
+    orchestrator_factory, state_factory, expected
+):
+    """Whichever of the three boundaries the consult took, the count and that
+    boundary are sealed together. A bare number is exactly the shape that made
+    ``test_execution_receipts: 0`` readable as an answer to a question nobody
+    beside it had asked."""
+    tool = PhaseTool(
+        machine=SimpleNamespace(
+            current_phase="test",
+            current_attempt_id="test-1",
+            is_complete=False,
+        ),
+        validator=None,
+        orchestrator=orchestrator_factory(),
+        project_name="bigtop",
+        gate_fn=AcceptingGate(),
+        run_evidence_state=state_factory(),
+    )
+
+    result = tool.execute(action="done", outcome="failed")
+
+    assert result.error_code == "TEST_ATTEMPT_REQUIRED"
+    assert result.facts["run_wide_test_receipts"] == 0
+    assert result.facts["run_wide_test_receipt_scope"]["name"] == expected
+
+
+def test_the_sealed_count_excludes_a_sibling_checkouts_receipt():
+    """The same bounding on the sealed side: a resolved survey coordinate is the
+    boundary the count is taken over, so a receipt from a directory outside the
+    project is not reported to the model as this run's run-wide evidence."""
+    state = _provisioned(_ready_state())
+    _record_build_phase_test(state, root=SIBLING_ROOT)
+    tool = PhaseTool(
+        machine=SimpleNamespace(
+            current_phase="test",
+            current_attempt_id="test-1",
+            is_complete=False,
+        ),
+        validator=None,
+        orchestrator=ManifestOrchestrator(),
+        project_name="bigtop",
+        gate_fn=AcceptingGate(),
+        run_evidence_state=state,
+    )
+
+    result = tool.execute(action="done", outcome="failed")
+
+    assert result.error_code == "TEST_ATTEMPT_REQUIRED"
+    assert result.facts["run_wide_test_receipts"] == 0
+    assert result.facts["run_wide_test_receipt_scope"] == {
+        "name": "project_root",
+        "root": "/workspace/bigtop",
+    }
+
+
+def test_a_sibling_checkouts_receipt_cannot_lift_the_unavailable_cap():
+    """The other half of the widening: both close sites read
+    ``_unresolved_test_coordinates_after_refresh``, so an out-of-project receipt
+    lifted the UNAVAILABLE cap and let an unresolved coordinate seal green."""
+    state = _provisioned(_ready_state())
+    state.ingest_tool_result(
+        StateScope.PROJECT_ANALYSIS,
+        "project",
+        ToolResult.completed_failure(output="refresh failed", error="manifest unavailable"),
+        params={"action": "analyze"},
+        source_phase="test",
+        source_attempt_id="test-1",
+    )
+    _record_build_phase_test(state, root=SIBLING_ROOT)
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = SimpleNamespace(
+        current_phase="test",
+        current_attempt_id="test-1",
+        is_complete=False,
+    )
+    engine.run_evidence_state = state
+    engine.orchestrator = UnreadableManifestOrchestrator()
+    claim = PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS)
+    green = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        code="test_execution_observed",
+        claim=claim,
+    )
+
+    resolution = engine._unresolved_test_coordinates_after_refresh()
+    capped = engine._cap_unresolved_test_gate(claim, green)
+
+    assert resolution is not None
+    assert resolution.status == "manifest_unreadable"
+    assert capped.validator_state is ValidatorState.UNAVAILABLE
+    assert capped.code == "test_candidate_resolution_unavailable"
 
 
 def test_a_run_wide_receipt_makes_the_unavailable_close_unconstructible():
