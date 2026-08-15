@@ -12,7 +12,7 @@ Everything here opens files read-only. Nothing is written, moved, locked, or
 truncated, and console logs are never read — the inputs are the control ledger,
 the token ledger, the verdict, and the project record, all authoritative.
 
-Three joins happen above the reducer, because they come from artifacts the
+Four joins happen above the reducer, because they come from artifacts the
 control stream does not carry:
 
 - **tokens** — `token_usage.csv` bills one row per model call; its `executor`
@@ -21,6 +21,11 @@ control stream does not carry:
 - **verdict and rates** — `verdict.json` exists only once a run has finished,
   so its absence is the normal state of a live session, not a hole.
 - **project** — `project_meta.json` names the repository under test.
+- **bytes, at the full tier only** — `contexts/full_outputs.jsonl` holds what
+  the refs stand for. It is read through `OutputStorageManager`, the component
+  that already owns that file's layout; this module never parses it itself.
+  The summary tier never opens it, which is what keeps the timeline's main view
+  cheap.
 
 A session that has not written its ledger yet is a running session, not an
 error: the trajectory comes back empty with a `missing_control_events` warning.
@@ -37,6 +42,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from sag.agent.output_storage import OutputStorageManager
+from sag.tools.base import is_output_storage_ref
 from sag.trajectory.reducer import TrajectoryReducer
 from sag.trajectory.schema import (
     DETAIL_TIERS,
@@ -54,6 +61,8 @@ CONTROL_EVENTS_NAME = "control_events.jsonl"
 TOKEN_USAGE_NAME = "token_usage.csv"
 VERDICT_NAME = "verdict.json"
 PROJECT_META_NAME = "project_meta.json"
+FULL_OUTPUTS_NAME = "full_outputs.jsonl"
+CONTEXTS_DIR = "contexts"
 
 #: A session writes some artifacts at its root and some under `.setup_agent/`.
 #: Both are looked at, root first, and neither is required to exist.
@@ -108,8 +117,16 @@ def follow_trajectory(
                 delta = reducer.feed(line)
                 if _is_empty(delta):
                     continue
+                turns = [_with_tokens(turn, tokens) for turn in delta.turns]
+                resolved, output_warnings = (
+                    sources.outputs.resolve(turns) if sources.full else (None, [])
+                )
                 yield delta.model_copy(
-                    update={"turns": [_with_tokens(turn, tokens) for turn in delta.turns]}
+                    update={
+                        "turns": turns,
+                        "warnings": delta.warnings + output_warnings,
+                        "outputs": resolved,
+                    }
                 )
         sleep(poll_seconds)
 
@@ -124,6 +141,7 @@ class _SessionSources:
         if not self.path.is_dir():
             raise FileNotFoundError(f"session directory does not exist: {self.path}")
         self.detail = detail
+        self.outputs = _OutputResolver(self)
 
     def _locate(self, name: str) -> Path | None:
         for root in _ARTIFACT_ROOTS:
@@ -134,6 +152,9 @@ class _SessionSources:
 
     def control_events(self) -> Path | None:
         return self._locate(CONTROL_EVENTS_NAME)
+
+    def output_store(self) -> Path | None:
+        return self._locate(f"{CONTEXTS_DIR}/{FULL_OUTPUTS_NAME}")
 
     def token_ledger(self) -> tuple[dict[int, TokenUsage], list[Warning]]:
         path = self._locate(TOKEN_USAGE_NAME)
@@ -157,6 +178,9 @@ class _SessionSources:
         session = snapshot.session
         verdict = self._document(VERDICT_NAME) or {}
         meta = self._document(PROJECT_META_NAME) or {}
+        resolved, output_warnings = (
+            self.outputs.resolve(snapshot.turns) if self.full else (None, [])
+        )
         return snapshot.model_copy(
             update={
                 "session": session.model_copy(
@@ -170,9 +194,83 @@ class _SessionSources:
                     }
                 ),
                 "turns": [_with_tokens(turn, tokens) for turn in snapshot.turns],
-                "warnings": snapshot.warnings + token_warnings + list(extra or []),
+                "warnings": snapshot.warnings
+                + token_warnings
+                + output_warnings
+                + list(extra or []),
+                "outputs": resolved,
             }
         )
+
+    @property
+    def full(self) -> bool:
+        return self.detail == "full"
+
+
+class _OutputResolver:
+    """The full tier's [C]: what the refs stand for, in verbatim bytes.
+
+    The lookup goes through `OutputStorageManager`, which already knows how
+    `contexts/full_outputs.jsonl` is laid out and how to recover a ref whose
+    index entry is stale. Two rules keep this read-only and honest:
+
+    - the manager is constructed only over a store that already exists, because
+      constructing one over a missing directory would CREATE it, and this layer
+      never writes into a session it is reading;
+    - a store that is not there, and a ref the store does not carry, are
+      warnings. Bytes that have not been written yet are the normal state of a
+      live run, so nothing here raises and nothing negative is cached.
+    """
+
+    def __init__(self, sources: "_SessionSources") -> None:
+        self._sources = sources
+        self._manager: OutputStorageManager | None = None
+        self._looked = False
+        self._resolved: dict[str, str] = {}
+
+    def _store(self) -> OutputStorageManager | None:
+        if not self._looked:
+            self._looked = True
+            store = self._sources.output_store()
+            if store is not None:
+                self._manager = OutputStorageManager(store.parent)
+        return self._manager
+
+    def resolve(self, turns: list[Turn]) -> tuple[dict[str, str], list[Warning]]:
+        """Resolve every output ref these turns name; state what would not."""
+        refs = _output_refs(turns)
+        if not refs:
+            return {}, []
+        manager = self._store()
+        if manager is None:
+            return {}, [
+                Warning(
+                    code="missing_output_store",
+                    detail=(
+                        f"{CONTEXTS_DIR}/{FULL_OUTPUTS_NAME} is not in {self._sources.path}; "
+                        f"{len(refs)} ref(s) cannot be resolved to bytes"
+                    ),
+                    control_seq=None,
+                )
+            ]
+
+        resolved: dict[str, str] = {}
+        warnings: list[Warning] = []
+        for ref in refs:
+            if ref not in self._resolved:
+                text = manager.retrieve_output(ref)
+                if text is None:
+                    warnings.append(
+                        Warning(
+                            code="unresolved_output_ref",
+                            detail=ref,
+                            control_seq=None,
+                        )
+                    )
+                    continue
+                self._resolved[ref] = text
+            resolved[ref] = self._resolved[ref]
+        return resolved, warnings
 
 
 class _LedgerTail:
@@ -233,6 +331,22 @@ def _read_token_usage(path: Path) -> tuple[dict[int, TokenUsage], list[Warning]]
 
 def _token_warning(detail: str) -> Warning:
     return Warning(code="token_usage_unreadable", detail=detail, control_seq=None)
+
+
+def _output_refs(turns: list[Turn]) -> list[str]:
+    """Every output-store ref these turns name, in first-seen order.
+
+    Envelope ids (`call.params_ref`) are deliberately not in scope: they are
+    the ledger's own handles, resolvable from `control_events.jsonl`, and the
+    output store has never heard of them.
+    """
+    refs: list[str] = []
+    for turn in turns:
+        candidates = [turn.window_ref, turn.observation.ref if turn.observation else None]
+        for ref in candidates:
+            if ref and is_output_storage_ref(ref) and ref not in refs:
+                refs.append(ref)
+    return refs
 
 
 def _with_tokens(turn: Turn, billed: dict[int, TokenUsage]) -> Turn:

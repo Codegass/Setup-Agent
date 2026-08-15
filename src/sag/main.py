@@ -40,6 +40,8 @@ from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.runtime.container_io import read_container_text
 from sag.tools.module_metrics import MODULE_METRICS_PATH
+from sag.trajectory.builder import build_trajectory, follow_trajectory
+from sag.trajectory.schema import DETAIL_TIERS
 from sag.utils.git_utils import extract_project_name_from_url
 from sag.verdict_rates import render_rate_lines
 from sag.web.server import run_web_server
@@ -445,8 +447,13 @@ def cli(ctx, log_level, log_file, verbose, ui):
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
 
-    # Display welcome message for main commands (skip in UI mode, will be shown by UIManager)
-    if ctx.invoked_subcommand not in ["list"] and not config.verbose and not config.ui_mode:
+    # Display welcome message for main commands (skip in UI mode, will be shown by UIManager).
+    # `trajectory` is excluded because its stdout is JSON somebody parses.
+    if (
+        ctx.invoked_subcommand not in ["list", "trajectory"]
+        and not config.verbose
+        and not config.ui_mode
+    ):
         console.print(
             Panel.fit(
                 "[bold blue]SAG[/bold blue] - [dim]Setup Agent[/dim]\n"
@@ -1424,6 +1431,40 @@ def inspect(docker_name, phase, iteration, session_dir):
     except Exception as exc:  # never a traceback for a debugging command
         logger.debug(f"sag inspect failed: {exc}")
         console.print(f"[bold red]❌ Inspect failed: {exc}[/bold red]")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("session_dir", type=click.Path(file_okay=False, path_type=Path))
+@click.option(
+    "--follow",
+    is_flag=True,
+    help="Tail a running session: one JSON delta per line until interrupted",
+)
+@click.option(
+    "--detail",
+    type=click.Choice(DETAIL_TIERS),  # a tuple: `list` is a command in this module
+    default="summary",
+    show_default=True,
+    help="summary: names, codes, timing, tokens. full: also the bytes each ref names",
+)
+def trajectory(session_dir, follow, detail):
+    """Derive trajectory-v1 from a recorded session directory, as JSON on stdout.
+
+    SESSION_DIR is a --record artifact dir (e.g. logs/session_X) or a mirrored
+    live session. Nothing in it is written, moved, or locked, and console logs
+    are never read: the derivation folds the authoritative ledger only.
+    """
+    try:
+        if follow:
+            for delta in follow_trajectory(session_dir, detail=detail):
+                click.echo(delta.model_dump_json())
+            return
+        click.echo(build_trajectory(session_dir, detail=detail).model_dump_json())
+    except KeyboardInterrupt:
+        return  # a follower ends when whoever was watching stops watching
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red]❌ {exc}[/bold red]")
         sys.exit(1)
 
 

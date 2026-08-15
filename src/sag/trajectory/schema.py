@@ -149,6 +149,11 @@ class Trajectory(_TrajectoryModel):
     turns: list[Turn] = Field(default_factory=list)
     annotations: list[Annotation] = Field(default_factory=list)
     warnings: list[Warning] = Field(default_factory=list)
+    #: The full tier's bytes: every resolvable ref the turns name, mapped to
+    #: the verbatim output it stands for. `None` at the summary tier means "not
+    #: asked for"; an empty dict means "asked for, and nothing resolved" — a
+    #: distinction a reader needs, so the two are never collapsed.
+    outputs: dict[str, str] | None = None
 
 
 class TrajectoryDelta(_TrajectoryModel):
@@ -164,6 +169,10 @@ class TrajectoryDelta(_TrajectoryModel):
     annotations: list[Annotation] = Field(default_factory=list)
     warnings: list[Warning] = Field(default_factory=list)
     session_patch: dict[str, Any] = Field(default_factory=dict)
+    #: The full tier's bytes for the refs THIS delta's turns name, on the same
+    #: terms as `Trajectory.outputs`. A follower that upserts turns by id can
+    #: merge these the same way, and a summary follower never carries any.
+    outputs: dict[str, str] | None = None
 
 
 __all__ = [
