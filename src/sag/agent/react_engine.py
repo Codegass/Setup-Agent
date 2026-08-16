@@ -3052,7 +3052,13 @@ class ReActEngine(UIEventEmitter):
                 # seal would only repeat it. This branch routes no phase
                 # decision, so whichever word it states is stated HERE and
                 # carried nowhere.
-                self._seal_engine_gate(claim, gate, deliver=revision is None, carry=False)
+                self._seal_engine_gate(
+                    claim,
+                    gate,
+                    deliver=revision is None,
+                    carry=False,
+                    survey=survey,
+                )
                 if revision is not None:
                     self._state_gate_observation_now(revision, priority=9)
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
@@ -3075,7 +3081,7 @@ class ReActEngine(UIEventEmitter):
             )
             if revision is not None:
                 self._deliver_gate_observation(revision, priority=9, decision_id=gate.decision_id)
-            self._emit_control_gate(claim, gate)
+            self._emit_control_gate(claim, gate, survey=survey)
             self._record_gate_facts(claim.phase, gate)
             record = machine.close_attempt(gate)
             state = getattr(self, "run_evidence_state", None)
@@ -3466,7 +3472,7 @@ class ReActEngine(UIEventEmitter):
             ),
             validated_facts=validated_facts,
         )
-        self._seal_engine_gate(claim, gate)
+        self._seal_engine_gate(claim, gate, survey=survey)
         self._record_gate_facts(phase, gate)
         record = machine.close_attempt(gate)
         state = getattr(self, "run_evidence_state", None)
@@ -4862,7 +4868,23 @@ class ReActEngine(UIEventEmitter):
                 f"{gate.decision_id}"
             )
 
-    def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult):
+    def _emit_control_gate(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+        *,
+        survey: Callable[[], TestCandidateResolution] | None = None,
+    ):
+        """Seal one graded claim. ``survey`` is the close's shared reader.
+
+        The coordinates this event seals must be the coordinates the close was
+        GRADED against: a second read of the survey can answer differently (a
+        manifest rewritten between them, a symlink that now resolves
+        elsewhere), and the record would then show one close whose cap, whose
+        requirement and whose sealed `test_candidate_resolution` disagree. A
+        caller that opened no close survey (the report-reserve close) still
+        gets exactly one lazy read of its own.
+        """
         self._refuse_undelivered_word(claim, gate)
         # The word the record now stands behind. A carried observation about an
         # earlier grading is retired by this line, not by whoever remembers.
@@ -4899,9 +4921,9 @@ class ReActEngine(UIEventEmitter):
         if body.get("supersedes"):
             gate_payload["supersedes"] = body["supersedes"]
         if claim.phase == "test":
-            gate_payload["test_candidate_resolution"] = resolve_survey_test_candidates(
-                getattr(self, "orchestrator", None)
-            ).to_snapshot()
+            gate_payload["test_candidate_resolution"] = (
+                survey or self._test_candidate_survey()
+            )().to_snapshot()
         self._emit_control_event(
             "validator_observation",
             {
@@ -4966,6 +4988,7 @@ class ReActEngine(UIEventEmitter):
         *,
         deliver: bool = True,
         carry: bool = True,
+        survey: Callable[[], TestCandidateResolution] | None = None,
     ):
         """The engine's own closes state the word they seal (spec §3.2).
 
@@ -4977,9 +5000,12 @@ class ReActEngine(UIEventEmitter):
         `carry` is False for a caller that routes no phase decision after this:
         with no window reset to survive, a carried copy is a word left waiting
         for the next transition to speak it out of turn.
+
+        `survey` is the close's shared coordinate reader, passed through to the
+        seal so the sealed coordinates are the graded ones.
         """
         turn_started = self._turn_stamp()
-        event = self._emit_control_gate(claim, gate)
+        event = self._emit_control_gate(claim, gate, survey=survey)
         observation_ref = None
         if deliver:
             text = gate_observation_text(gate, phase=claim.phase, origin="engine_close")

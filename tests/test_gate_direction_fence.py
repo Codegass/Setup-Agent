@@ -541,6 +541,74 @@ def test_the_operator_markers_key_to_the_documented_heavy_red_rule(rate, marker,
             assert icon not in row, row
 
 
+def _observation_lines(status: dict) -> list:
+    """The Key Observations block for one status projection."""
+    from sag.tools.report_tool import ReportTool
+
+    tool = ReportTool.__new__(ReportTool)
+    tool.context_manager = None
+    tool.physical_validator = None
+    snapshot = {
+        "status": status,
+        "attention": {"raw": []},
+        "project": {"type": "Java", "build_system": "maven"},
+        "physical_evidence": {"build_system": "maven"},
+    }
+    rendered = ReportTool._render_issues_recommendations(tool, snapshot)
+    return [line for line in rendered if line.startswith("- ") and "**" in line]
+
+
+@pytest.mark.parametrize(
+    ("rate", "marker", "forbidden"),
+    (
+        (100.0, "✅", ("⚠️", "❌")),
+        (96.0, "⚠️", ("✅",)),
+        (78.0, "⚠️", ("✅",)),
+        (49.0, "❌", ("✅",)),
+    ),
+    ids=("complete", "above_the_old_95", "between_80_and_95", "heavy_red"),
+)
+def test_key_observations_grade_by_the_same_one_rule(rate, marker, forbidden):
+    """The last three invented cut-offs (task #38 item 3).
+
+    `_render_issues_recommendations` kept selecting operator PROSE at `>= 95`
+    ("High Pass Rate"), `< 90` ("Low Execution Rate") and `< 80` ("Incomplete
+    Coverage") after the five table markers were retired to `rate_marker` —
+    three more boundaries the harness documents nowhere, deciding a sentence
+    rather than grading an outcome. One rule now grades all of them, and the
+    adjectives that were the boundaries in prose form go with them.
+    """
+    lines = _observation_lines(
+        {
+            "pass_pct": rate,
+            "execution_rate": rate,
+            "modules_expected": 100,
+            "modules_seen": int(rate),
+        }
+    )
+
+    assert len(lines) == 3, lines
+    for line in lines:
+        assert marker in line, line
+        for icon in forbidden:
+            assert icon not in line, line
+    assert not [line for line in lines if "High " in line or "Low " in line]
+
+
+def test_a_measured_zero_pass_rate_is_stated_not_dropped():
+    """`if pass_rate and …` read a measured 0.0% as "no rate at all" and
+    printed nothing, so the one run whose every test failed said least."""
+    lines = _observation_lines({"pass_pct": 0.0, "execution_rate": 100.0})
+
+    assert [line for line in lines if "Pass Rate" in line and "❌" in line], lines
+
+
+def test_an_unmeasured_rate_stays_absent():
+    """📊 belongs to a table that must show a row. An observation nobody made
+    is not an observation: absence stays absence here."""
+    assert _observation_lines({}) == []
+
+
 def test_zero_execution_reads_as_zero_execution_not_as_a_failed_percentage():
     """geode §2: `Tests below the 80% pass threshold: 0/0 (0.0%)` is gone."""
     from sag.agent.physical_validator import PhysicalValidator

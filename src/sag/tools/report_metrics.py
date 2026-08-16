@@ -169,10 +169,21 @@ def _validate_count_bucket(
         expected = _COUNT_FIELDS_SET | {"availability", "reason"}
     else:
         raise MetricsContractError(f"{label}.availability is invalid")
+    # `unparseable` rides WITH the volume rather than instead of it, so it is
+    # legal beside available counts and beside unavailable ones alike. Absent
+    # means the destination reported none; a published zero would be a measured
+    # claim about files nobody counted, so zero is written as absence.
+    optional = {"unparseable"} if observation else set()
     if observation:
         expected |= {"report_file_count", "reason_counts"}
-    if set(value) != expected:
+    if set(value) - optional != expected:
         raise MetricsContractError(f"{label} fields are not canonical")
+    if "unparseable" in value:
+        unparseable = _strict_nonnegative_int_or_none(
+            value.get("unparseable"), label=f"{label}.unparseable"
+        )
+        if not unparseable:
+            raise MetricsContractError(f"{label}.unparseable must be a positive count")
 
     if availability == "available":
         counts: dict[str, int] = {}
@@ -443,6 +454,13 @@ def _excluded_volume(value: Mapping[str, Any] | None, *, basis: str) -> dict[str
     nobody measured, and indistinguishable from a destination where reports
     existed and genuinely ran nothing. Zero is a count; an unreadable report
     has none.
+
+    Count and marker are published SIDE BY SIDE, never either/or. A destination
+    holding six measured executions and one file nobody could open used to
+    publish the six and drop the one, so the same disclosure the sentence makes
+    ("6 executions … (1 unparseable report)") was absent from the metrics every
+    campaign KPI reads. The count states what was measured; the marker states
+    how much was not, and neither answers for the other.
     """
     if not isinstance(value, Mapping):
         return None
@@ -451,9 +469,11 @@ def _excluded_volume(value: Mapping[str, Any] | None, *, basis: str) -> dict[str
         return None
     unparseable = _int_or_none(value.get("unparseable")) or 0
     if unparseable and counts["executed"] == 0:
-        return _all_null_counts(
+        counts = _all_null_counts(
             reason=f"{unparseable} excluded report(s) could not be parsed; volume unmeasured"
         )
+    if unparseable:
+        counts = {**counts, "unparseable": unparseable}
     return counts
 
 

@@ -62,6 +62,22 @@ into the canonical verdict.
   physical_validator), the unformatted `toolchain_manager:resolve:194` log
   line, and the never-reproduced evidence_publications UnboundLocalError
   watch item.
+  - **2026-08-15 — the UnboundLocalError watch item is CLOSED, refuted.** The
+    sighting was against B1's in-flight copy, not the merged file. Evidence on
+    the merged file: `mypy --enable-error-code possibly-undefined` reports
+    nothing in `evidence_publications.py` (the whole-`src/sag` run's seven
+    findings are all elsewhere and all correlated-control-flow false
+    positives), and
+    `test_the_concurrent_publication_path_binds_every_name_it_reads` drives the
+    named path — eight threads publishing, revising, verifying and
+    snapshotting one authority — tolerating only the typed CAS conflict and
+    failing on any accident. Mutation-verified: an unbound name planted in
+    `publish_revision` fails it.
+  - **2026-08-15 — dead fail-closed fallbacks: two found and deleted**, both
+    the same `effective_action or requested_action` read (`attempt_policy`,
+    `physical_validator`); proof in the commit for task #38. `build_tool`'s
+    uncovered fail-closed branches were examined and KEPT: they guard an
+    `EnvOverlayStore` that really can raise, which no contract prevents.
 - Maven version-requirement UX: the model's self-authored `[3.9,)` was
   refused against apt's 3.8.7; honest, but the refusal could name the
   registered version and the requirement's source.

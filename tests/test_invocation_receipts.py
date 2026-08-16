@@ -1384,3 +1384,71 @@ def test_pytest_receipt_persistence_failure_never_masks_the_test_result(
     assert result.metadata["receipt_persisted"] is False
     assert result.metadata["receipt_persistence_code"] == "transport_write_failed"
     assert "receipt_id" not in result.metadata
+
+
+# ---------------------------------------------------------------------------
+# Task #38 item 1 — a `requested_action` fallback no admitted receipt can reach
+# ---------------------------------------------------------------------------
+def _canonical_receipt(**overrides):
+    payload = {
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "receipt_id": "receipt-000001",
+        "run_id": "run-20260815-000000-abcdef",
+        "tool": "maven",
+        "requested_action": "build",
+        "effective_action": "test",
+        "argv": "mvn test",
+        "working_directory": "/workspace/proj",
+        "actual_cwd": "/workspace/proj",
+        "outcome": "completed",
+        "exit_code": 0,
+        "report_delta": {"new": [], "changed": []},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_no_admitted_receipt_can_omit_its_effective_action():
+    """The dead fail-closed fallback both action readers carried.
+
+    ``attempt_policy._production_build_receipt`` and
+    ``physical_validator._read_python_producer_receipts`` each read
+    ``effective_action or requested_action``, a fallback the first one's own
+    docstring justified as "legacy receipts that predate it". No such receipt
+    exists at any door: BOTH schemas require ``effective_action`` and require
+    it non-empty, while ``requested_action`` is the one of the pair that may be
+    empty — so the fallback could only ever fire on a receipt no reader admits,
+    and it would fall back TO the weaker field. Every consumer of both
+    predicates loads through a validating reader (``read_receipt`` and
+    ``PhysicalValidator._read_live_invocation_receipts``, both
+    ``validate_receipt_v2``), so the branch is unreachable in the live loop.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    live = _canonical_receipt()
+    assert validate_receipt_v2(live)["effective_action"] == "test"
+    historical = {
+        field: value
+        for field, value in _canonical_receipt(schema_version=1).items()
+        if field not in {"run_id", "actual_cwd"}
+    }
+    assert validate_receipt_v2(historical, live=False)["effective_action"] == "test"
+
+    for missing in ("", None):
+        broken = dict(live)
+        broken["effective_action"] = missing
+        with pytest.raises(ValueError, match="effective_action"):
+            validate_receipt_v2(broken)
+        old = dict(historical)
+        old["effective_action"] = missing
+        with pytest.raises(ValueError, match="effective_action"):
+            validate_receipt_v2(old, live=False)
+    dropped = {k: v for k, v in live.items() if k != "effective_action"}
+    with pytest.raises(ValueError, match="missing="):
+        validate_receipt_v2(dropped)
+    # …and the surviving read is the EFFECTIVE one, in both directions: what
+    # physically ran decides, never what was asked for.
+    from sag.agent.attempt_policy import _production_build_receipt
+
+    assert _production_build_receipt({"effective_action": "test", "requested_action": "deps"})
+    assert not _production_build_receipt({"effective_action": "deps", "requested_action": "test"})

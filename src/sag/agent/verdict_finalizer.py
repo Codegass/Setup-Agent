@@ -17,7 +17,7 @@ from sag.case_census import BASIS_COMPLETE, BASIS_PARTIAL, CENSUS_BASES
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.utils.container_io import compare_publish_container_text_atomic
-from sag.verdict import rescue_blocked_build, run_verdict
+from sag.verdict import COUNT_DERIVED_CONFLICTS, rescue_blocked_build, run_verdict
 from sag.verdict_rates import (
     UNATTRIBUTED_CONFLICT,
     UNBOUNDED_REASON,
@@ -735,8 +735,9 @@ def _sum_excluded_counts(left: dict[str, int] | None, right: dict[str, int]) -> 
 # Conflicts a rollup DERIVES from its own headline counts. When those counts
 # leave the headline the statements about them leave with them: a sealed
 # `test_failures_detected` beside a headline of 0/0/0 states a red the snapshot
-# no longer carries, and a fact must not outlive its basis.
-_COUNT_DERIVED_CONFLICTS = frozenset({"test_failures_detected", "test_errors_detected"})
+# no longer carries, and a fact must not outlive its basis. One definition, so
+# the kernel that adjudicates them and the rollups that drop them cannot split.
+_COUNT_DERIVED_CONFLICTS = COUNT_DERIVED_CONFLICTS
 
 
 def _fold_test_stats(

@@ -14,14 +14,21 @@ from sag.verdict_rates import UNCOUNTED_REPORT_CONFLICTS
 VERDICT_ORDER = ["failed", "partial", "success"]
 _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 
+# The conflicts whose adjudication IS the headline counts: they say nothing the
+# counts beside them do not already say. A consumer holding NO counts holds no
+# adjudication either, and must state the uncertainty itself
+# (report_tool._derive_evidence_status_from_test_stats; the same rule
+# verdict_finalizer applies when counts leave a rollup).
+COUNT_DERIVED_CONFLICTS = frozenset({"test_failures_detected", "test_errors_detected"})
+
 # Conflicts that are already ADJUDICATED elsewhere, so capping on them would
 # either double-count a fact or move the verdict the wrong way.
 #
-#   * test_failures_detected / test_errors_detected merely RESTATE counted test
-#     failures. The project's red is an exact sealed fact and the physical
-#     verdict has already read it as execution (spec 2026-08-14 §2), so feeding
-#     it back into the conflict cap would demote every fully-executed run with
-#     any failing test to partial.
+#   * COUNT_DERIVED_CONFLICTS merely RESTATE counted test failures. The
+#     project's red is an exact sealed fact and the physical verdict has
+#     already read it as execution (spec 2026-08-14 §2), so feeding it back
+#     into the conflict cap would demote every fully-executed run with any
+#     failing test to partial.
 #   * UNCOUNTED_REPORT_CONFLICTS names every report fact the headline did not
 #     count, by all three doors: test_executions_unattributed_to_receipts
 #     (claimed by nobody), test_reports_stale (claimed, then rewritten) and
@@ -38,14 +45,17 @@ _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 #         report, capping only while a receipt claimed it.
 #     All of them are "removing evidence improved the verdict" (2026-07-29
 #     evidence-lifecycle spec, P4).
-#     The headline band derives from attributed counts alone, so a report the
-#     headline never counted has no second claim on the verdict to make; and the
-#     cap defended nothing it was reached for — a run that wants the volume
-#     uncapped need only dispatch through a non-receipting tool from the start,
-#     so the cap taxed the run that used the receipting tool first.
-#     Anti-fabrication is EXCLUSION, and exclusion is untouched: none of these
-#     volumes is ever counted. All three stay named, pathed, counted and spoken
-#     in the cases grain (spec 2026-08-14 amendment items 4, 7 and 12).
+#     The operative rule for all three is ATTRIBUTION, not readability: the
+#     headline band derives from attributed counts alone, so a report the
+#     headline never counted has no second claim on the verdict to make —
+#     whether it was never claimed, claimed and rewritten, or claimed and
+#     unopenable. The cap defended nothing it was reached for either: a run that
+#     wants such a report uncapped need only dispatch through a non-receipting
+#     tool from the start, so the cap taxed the run that used the receipting
+#     tool first. Anti-fabrication is EXCLUSION, and exclusion is untouched:
+#     none of these reports is ever counted. All three stay named, pathed,
+#     counted where a count exists, and spoken in the cases grain (spec
+#     2026-08-14 amendment items 4, 7 and 12).
 #   * test_census_sources_disagree names a DISCOVERY-side bookkeeping split —
 #     polaris's analyzer wrote 1,347 beside a module list explaining 593 — and
 #     it is fully adjudicated where it is raised: the module sum wins, the
@@ -61,8 +71,7 @@ _RANK = {v: i for i, v in enumerate(VERDICT_ORDER)}
 # report file a run can delete without changing a single execution it ran.
 ADJUDICATED_CONFLICTS = frozenset(
     {
-        "test_failures_detected",
-        "test_errors_detected",
+        *COUNT_DERIVED_CONFLICTS,
         CENSUS_CONFLICT,
         *UNCOUNTED_REPORT_CONFLICTS,
     }

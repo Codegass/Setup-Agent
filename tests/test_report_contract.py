@@ -1298,7 +1298,7 @@ def test_an_adjudicated_conflict_does_not_degrade_the_legacy_evidence_status():
     "something is wrong, call it partial" re-grades them behind the kernel's
     back, on the one surface that still derives its own word.
     """
-    from sag.verdict import ADJUDICATED_CONFLICTS
+    from sag.verdict import ADJUDICATED_CONFLICTS, COUNT_DERIVED_CONFLICTS
 
     tool = ReportTool()
     # The conflict list is consulted exactly where the counts decide nothing:
@@ -1310,7 +1310,10 @@ def test_an_adjudicated_conflict_does_not_degrade_the_legacy_evidence_status():
         tool._derive_evidence_status_from_test_stats(nothing_ran, sorted(ADJUDICATED_CONFLICTS))
         is None
     )
-    assert tool._derive_evidence_status_from_test_stats(None, sorted(ADJUDICATED_CONFLICTS)) is None
+    # With NO counts at all, the conflicts whose adjudication IS the counts no
+    # longer hold — see the fence below.
+    uncounted = sorted(ADJUDICATED_CONFLICTS - COUNT_DERIVED_CONFLICTS)
+    assert tool._derive_evidence_status_from_test_stats(None, uncounted) is None
     # A conflict nobody adjudicated still degrades exactly as before.
     assert (
         tool._derive_evidence_status_from_test_stats(nothing_ran, ["test_receipt_unreadable"])
@@ -1318,4 +1321,32 @@ def test_an_adjudicated_conflict_does_not_degrade_the_legacy_evidence_status():
     )
     assert tool._derive_evidence_status_from_test_stats(None, ["test_receipt_unreadable"]) == (
         "partial"
+    )
+
+
+def test_a_red_conflict_with_no_counts_behind_it_still_degrades():
+    """The adjudication rationale requires counts to stand on (task #38 item 6).
+
+    ``test_failures_detected`` / ``test_errors_detected`` are adjudicated
+    because they merely RESTATE counted failures the physical verdict already
+    read. Where the counts are ABSENT there is nothing restating anything: the
+    run sealed a red and no number carries it, which is the uncertainty this
+    derivation exists to state. Reading the conflict as "already graded" there
+    drops the last statement of the red on this surface.
+    """
+    from sag.verdict import COUNT_DERIVED_CONFLICTS
+
+    tool = ReportTool()
+
+    for conflict in sorted(COUNT_DERIVED_CONFLICTS):
+        assert tool._derive_evidence_status_from_test_stats(None, [conflict]) == "partial", conflict
+    # Counts present is the adjudicated case, unchanged: the red is the counts'
+    # to state and this word stays out of it.
+    red = TestStats(discovered=10, executed=10, passed=8, failed=2, skipped=0)
+    assert (
+        tool._derive_evidence_status_from_test_stats(red, ["test_failures_detected"]) == "partial"
+    )
+    green = TestStats(discovered=10, executed=10, passed=10, failed=0, skipped=0)
+    assert (
+        tool._derive_evidence_status_from_test_stats(green, ["test_failures_detected"]) == "success"
     )

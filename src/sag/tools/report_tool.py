@@ -31,7 +31,12 @@ _RECEIPT_RECORDS_UNSET = object()
 _OBLIGATION_RECORDS_UNSET = object()
 _REPORT_METRICS_PUBLICATION_LOCK = threading.RLock()
 from sag.ui.events import EventType, UIEventEmitter
-from sag.verdict import ADJUDICATED_CONFLICTS, rescue_blocked_build, run_verdict
+from sag.verdict import (
+    ADJUDICATED_CONFLICTS,
+    COUNT_DERIVED_CONFLICTS,
+    rescue_blocked_build,
+    run_verdict,
+)
 from sag.verdict_rates import (
     BAND_FEW,
     BAND_HALF,
@@ -822,7 +827,14 @@ class ReportTool(BaseTool, UIEventEmitter):
             conflict for conflict in (conflicts or ()) if conflict not in ADJUDICATED_CONFLICTS
         ]
         if not test_stats:
-            return "partial" if unsettled else None
+            # The counts are what adjudicates a red conflict, and there are
+            # none here: `test_failures_detected` with no numbers behind it is
+            # a sealed red nothing else on this surface states, so the
+            # degradation stands (task #38 item 6).
+            settled_by_counts = [
+                conflict for conflict in (conflicts or ()) if conflict in COUNT_DERIVED_CONFLICTS
+            ]
+            return "partial" if unsettled or settled_by_counts else None
         if test_stats.failed > 0 or test_stats.errors > 0:
             return "partial" if test_stats.passed > 0 else "blocked"
         if test_stats.executed > 0:
@@ -5201,20 +5213,26 @@ with open(lock_path,"a+b") as lock:
         exec_rate = status.get("execution_rate")
         expansion_factor = status.get("expansion_factor")
 
-        if pass_rate and pass_rate >= 95:
+        # The last three invented cut-offs: `>= 95` chose "High Pass Rate",
+        # `< 90` chose "Low Execution Rate" and `< 80` chose "Incomplete
+        # Coverage" — boundaries nothing in this harness documents, picking a
+        # SENTENCE where the five markers above had already stopped grading by
+        # them. One rule grades all of them now (`rate_marker`), and the
+        # adjectives go with the boundaries that produced them: the rate is
+        # stated and the marker says how it reads. A rate nobody measured is
+        # not an observation, so it stays absent rather than arriving as 📊 —
+        # but a measured 0.0% IS one, and `if pass_rate` dropped it.
+        if isinstance(pass_rate, (int, float)) and not isinstance(pass_rate, bool):
             lines.append(
-                f"- ✅ **High Pass Rate:** {format_percentage(pass_rate)} of executed tests passed"
-            )
-        elif pass_rate:
-            lines.append(
-                f"- ⚠️ **Pass Rate:** {format_percentage(pass_rate)} of executed tests passed"
+                f"- {rate_marker(pass_rate)} **Pass Rate:** "
+                f"{format_percentage(pass_rate)} of executed tests passed"
             )
 
-        if exec_rate:
-            if exec_rate < 90:
-                lines.append(
-                    f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run"
-                )
+        if isinstance(exec_rate, (int, float)) and not isinstance(exec_rate, bool):
+            lines.append(
+                f"- {rate_marker(exec_rate)} **Execution Rate:** "
+                f"{format_percentage(exec_rate)} of available tests were run"
+            )
 
         if expansion_factor and expansion_factor > 1:
             lines.append(
@@ -5225,10 +5243,10 @@ with open(lock_path,"a+b") as lock:
         modules_seen = status.get("modules_seen", 0)
         if modules_expected:
             coverage = modules_seen / modules_expected * 100
-            if coverage < 80:
-                lines.append(
-                    f"- ⚠️ **Incomplete Coverage:** {coverage:.0f}% of modules were tested"
-                )
+            lines.append(
+                f"- {rate_marker(coverage)} **Module Coverage:** "
+                f"{coverage:.0f}% of modules were tested"
+            )
 
         lines.append("")
 

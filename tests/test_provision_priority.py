@@ -279,7 +279,7 @@ def test_python_low_execution_rate_reports_gap_without_selecting_a_runner():
     snapshot = {
         "status": {
             "pass_pct": 100.0,
-            "execution_rate": 42.0,  # < 90 -> triggers the "increase rate" branch
+            "execution_rate": 42.0,
             "skipped_modules": ["mod_a", "mod_b"],
         },
         "attention": {
@@ -293,7 +293,9 @@ def test_python_low_execution_rate_reports_gap_without_selecting_a_runner():
     text = "\n".join(tool._render_issues_recommendations(snapshot))
     assert "mvn" not in text
     assert "pytest" not in text
-    assert "Low Execution Rate" in text
+    # The gap is still stated; what it is CALLED is now the one marker rule's
+    # to say (task #38 item 3 retired the invented `< 90` "Low" adjective).
+    assert "❌ **Execution Rate:** 42.0% of available tests were run" in text
     assert "no project command is inferred" in text
 
 

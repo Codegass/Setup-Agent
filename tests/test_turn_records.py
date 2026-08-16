@@ -757,7 +757,7 @@ def test_an_engine_close_seals_the_word_it_sealed(tmp_path):
     engine._current_attempt_id = lambda: "test-1"
     sealed_gates = []
 
-    def emit_gate(claim, gate):
+    def emit_gate(claim, gate, **_kwargs):
         sealed_gates.append(gate)
         engine._last_sealed_decision_id = gate.decision_id
         return SimpleNamespace(sequence=1)

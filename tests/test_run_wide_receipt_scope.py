@@ -1757,6 +1757,57 @@ def test_a_close_that_never_asks_still_spends_no_probe(monkeypatch):
     assert calls == []
 
 
+def test_the_sealed_gate_states_the_survey_the_close_was_graded_against(monkeypatch):
+    """The tail of "one question, one computation" (task #38 item 7).
+
+    `_emit_control_gate` read `resolve_survey_test_candidates` for itself, so
+    the `test_candidate_resolution` a test-phase `gate_decision` seals came
+    from a SECOND read of the survey the cap and the requirement had already
+    answered from. The record then shows one close whose grading and whose
+    sealed coordinates could disagree — the same fact/word split the shared
+    reader exists to prevent.
+    """
+    calls = _counted_survey(monkeypatch)
+    engine = _capping_engine()
+    claim = PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS)
+    green = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        code="test_execution_observed",
+        claim=claim,
+    )
+    survey = engine._test_candidate_survey()
+
+    engine._cap_unresolved_test_gate(claim, green, survey=survey)
+    engine._missing_required_test_attempt(survey=survey)
+    engine._emit_control_gate(claim, green, survey=survey)
+
+    assert len(calls) == 1
+
+
+def test_a_seal_handed_no_survey_still_answers_the_question_itself(monkeypatch):
+    """Threading is not a precondition: a caller that never opened a close
+    survey (the report-reserve close) still seals the coordinates, from its own
+    single lazy read."""
+    calls = _counted_survey(monkeypatch)
+    engine = _capping_engine()
+    claim = PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS)
+    green = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        code="test_execution_observed",
+        claim=claim,
+    )
+
+    engine._emit_control_gate(claim, green)
+
+    assert len(calls) == 1
+
+
 @pytest.fixture
 def bigtop_reports(tmp_path):
     workspace = ReceiptWorkspace(tmp_path)

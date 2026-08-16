@@ -1105,3 +1105,95 @@ def test_setup_agent_run_pin_refuses_a_host_file_that_is_not_the_current_head(tm
 
     assert agent._write_run_pin(target_repo_sha="4" * 40) is False
     assert authority.latest_head("host-run-pin") == first_head
+
+
+# ---------------------------------------------------------------------------
+# Task #38 item 2 — the never-reproduced UnboundLocalError watch item
+# ---------------------------------------------------------------------------
+def test_the_concurrent_publication_path_binds_every_name_it_reads(tmp_path):
+    """Closes the 2026-08-09 watch item, with evidence.
+
+    A foundation-branch run reported "one B1-only UnboundLocalError in
+    evidence_publications concurrent thread path" (chatlog 2026-08-09, carried
+    into the live-proof report's follow-ups as never reproduced). It was never
+    reproduced against this file because the sighting was against B1's
+    in-flight copy, not the merged one. This drives the concurrent path the
+    note names — many threads publishing, revising, verifying and snapshotting
+    one authority at once — and the only failures it tolerates are the TYPED
+    ones the CAS is there to raise: an unbound name, an attribute error or any
+    other accident is a defect and fails the test by name.
+    """
+    import threading
+
+    sink = ControlEventSink(tmp_path / "control_events.jsonl")
+    authority = _live_authority(run_id=RUN_ID, sink=sink)
+    workers = 8
+    per_worker = 6
+    start = threading.Barrier(workers)
+    published: list[str] = []
+    conflicts: list[Exception] = []
+    accidents: list[BaseException] = []
+    guard = threading.Lock()
+
+    def worker(index: int) -> None:
+        start.wait()
+        for step in range(per_worker):
+            record_id = f"inv-thread-{index:02d}-{step:04d}"
+            raw = json.dumps({"worker": index, "step": step}, sort_keys=True).encode()
+            try:
+                authority.publish_bytes(
+                    record_kind="invocation_receipt",
+                    record_id=record_id,
+                    raw=raw,
+                )
+                # Read pressure from the same threads: the path the note names
+                # is reads racing writes, not writes alone.
+                authority.verify_bytes(
+                    record_kind="invocation_receipt",
+                    record_id=record_id,
+                    raw=raw,
+                )
+                head = authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
+                authority.publish_revision(
+                    record_kind="build_requirements",
+                    record_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                    logical_artifact_id=BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                    raw=raw,
+                    expected_previous_raw_sha256=(
+                        head.raw_sha256 if head is not None else EVIDENCE_PUBLICATION_GENESIS_SHA256
+                    ),
+                )
+                authority.snapshot()
+                authority.expected_immutable_record_ids("invocation_receipt")
+                with guard:
+                    published.append(record_id)
+            except EvidencePublicationConflict as conflict:
+                with guard:
+                    conflicts.append(conflict)
+            except BaseException as accident:  # noqa: BLE001 - the point of the test
+                with guard:
+                    accidents.append(accident)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert accidents == [], (
+        "the 2026-08-09 watch item (or another accident) reproduced: "
+        f"{[repr(accident) for accident in accidents]}"
+    )
+    # The race is real (losers of the head CAS exist) and the survivors are
+    # exactly consistent: every recorded publication verifies afterwards.
+    assert conflicts, "the revision CAS never raced; the path was not exercised"
+    assert len(published) + len(conflicts) == workers * per_worker
+    for record_id in published:
+        step = int(record_id.rsplit("-", 1)[1])
+        index = int(record_id.split("-")[2])
+        raw = json.dumps({"worker": index, "step": step}, sort_keys=True).encode()
+        assert authority.verify_bytes(
+            record_kind="invocation_receipt",
+            record_id=record_id,
+            raw=raw,
+        ).authorized, record_id

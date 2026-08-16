@@ -1029,7 +1029,7 @@ def test_phase_floor_forced_refusal_runs_once_then_closes_honestly(tmp_path):
         "code": "green",
     }
     emitted: list[GateResult] = []
-    engine._emit_control_gate = lambda claim, gate: emitted.append(gate)
+    engine._emit_control_gate = lambda claim, gate, **_k: emitted.append(gate)
     engine._record_gate_facts = lambda phase, gate: None
     engine._apply_phase_decision = lambda record, decision: None
 

@@ -4261,9 +4261,10 @@ class PhysicalValidator:
                 continue
             if str(receipt.get("tool") or "").strip().lower() != "python":
                 continue
-            operation = str(
-                receipt.get("effective_action") or receipt.get("requested_action") or ""
-            ).strip()
+            # What physically ran, with no requested-action fallback behind it:
+            # `_read_live_invocation_receipts` admits only `validate_receipt_v2`
+            # records, and that schema requires a non-empty `effective_action`.
+            operation = str(receipt.get("effective_action") or "").strip()
             if operation not in candidates:
                 continue
             if type(receipt.get("schema_version")) is not int or (

@@ -332,7 +332,7 @@ def _starved_engine(phase, facts, *, iteration):
     }
     # A spy on the gate the floor actually built — not a re-implementation of
     # it. `_emit_control_gate` is the one seam both claim and gate pass through.
-    engine._emit_control_gate = lambda claim, gate: engine.gates.append((claim, gate))
+    engine._emit_control_gate = lambda claim, gate, **_k: engine.gates.append((claim, gate))
     return engine
 
 

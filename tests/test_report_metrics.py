@@ -101,6 +101,8 @@ def test_a_volume_the_parser_could_not_read_is_unmeasured_not_a_measured_zero():
         assert observed["availability"] == "unavailable", bucket
         assert observed["executed"] is None, bucket
         assert "could not be parsed" in observed["reason"], bucket
+        # The marker is a published number here too, not only prose in a reason.
+        assert observed["unparseable"] == 1, bucket
     # The files themselves stay counted: the run saw them, it just cannot say
     # what ran in them.
     assert metrics["tests"]["stale_observations"]["report_file_count"] == 1
@@ -118,7 +120,11 @@ def test_a_volume_the_parser_did_read_is_still_stated():
     )
 
     assert metrics["tests"]["quarantined_observations"]["executed"] == 6
+    # …and the unreadable neighbour is still published beside it: count AND
+    # marker, never either/or (task #38 item 4).
+    assert metrics["tests"]["quarantined_observations"]["unparseable"] == 1
     assert metrics["tests"]["stale_observations"]["executed"] == 6
+    assert "unparseable" not in metrics["tests"]["stale_observations"]
     assert metrics["tests"]["stale_observations"]["reason_counts"] == {
         "receipt_claim_superseded": 6
     }

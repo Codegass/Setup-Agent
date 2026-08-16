@@ -668,7 +668,7 @@ def test_agent_no_progress_close_cannot_manufacture_success():
         prepared = engine._prepare_rejected_completion(_rejected())
     claim, gate, _, decision = prepared
     recorded = {}
-    engine._emit_control_gate = lambda honest_claim, honest_gate: recorded.update(
+    engine._emit_control_gate = lambda honest_claim, honest_gate, **_k: recorded.update(
         claim=honest_claim, gate=honest_gate
     )
     engine._record_gate_facts = lambda phase, honest_gate: None
@@ -911,7 +911,7 @@ def test_no_op_convergence_in_the_test_phase_forces_the_floor_before_closing():
     )
     engine._add_system_guidance = lambda *_a, **_k: None
     recorded = {}
-    engine._emit_control_gate = lambda honest_claim, honest_gate: recorded.update(
+    engine._emit_control_gate = lambda honest_claim, honest_gate, **_k: recorded.update(
         gate=honest_gate
     )
     engine._record_gate_facts = lambda phase, honest_gate: None

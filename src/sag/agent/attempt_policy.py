@@ -1334,11 +1334,15 @@ def _production_build_receipt(receipt: Mapping[str, Any]) -> bool:
     """Whether one terminal receipt describes artifact/test-producing work.
 
     Dependency resolution is useful evidence but it does not try an island's
-    compile/test surface.  The effective action is what physically ran; the
-    requested action is only a fallback for legacy receipts that predate it.
+    compile/test surface, so what PHYSICALLY ran decides.  There is no
+    requested-action fallback behind this: both receipt schemas require
+    ``effective_action`` and require it non-empty, and every receipt reaching
+    here came through ``validate_receipt_v2`` — while ``requested_action`` is
+    the one of the pair a receipt may leave empty, so the fallback could only
+    fire on a receipt no reader admits, and only by weakening the answer.
     """
 
-    action = str(receipt.get("effective_action") or receipt.get("requested_action") or "").lower()
+    action = str(receipt.get("effective_action") or "").lower()
     tokens = tuple(token for token in re.split(r"[^a-z0-9_-]+", action) if token)
     return any(
         token.startswith(prefix) for token in tokens for prefix in _PRODUCTION_BUILD_ACTION_PREFIXES
