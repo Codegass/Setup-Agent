@@ -6980,6 +6980,12 @@ class ReActEngine(UIEventEmitter):
     _ADVISOR_UNAVAILABLE_TEXT = "advisor unavailable — proceed with your best judgment"
     _ADVISOR_TRANSCRIPT_HEADER = "PHASE TRANSCRIPT"
     _ADVISOR_DIGEST_HEADER = "EVIDENCE DIGEST"
+    # Says both things the jackrabbit/gora advisors got wrong: WHEN this was
+    # read, and that it outranks any toolchain failure stated above it.
+    _ADVISOR_TOOLCHAIN_PREFIX = (
+        "Toolchain state (env overlay, read at consult time; supersedes any "
+        "earlier toolchain failure in this digest): "
+    )
 
     def _reset_advisor_run_state(self) -> None:
         """Run-scoped advisor state: telemetry plus the recurrence redirect."""
@@ -7211,6 +7217,19 @@ class ReActEngine(UIEventEmitter):
             execution.observation_text,
             source_tool="advisor",
         )
+        # Closure-contract rule 2: a harness-authored observation persists where
+        # every other observation does. In d2r4 jackrabbit and gora the entry
+        # consult's advice — which the model then acted on — appeared in no
+        # `contexts/phase_build.json` history entry at all, only in
+        # `full_outputs.jsonl`, so the phase record showed a model reacting to
+        # advice the record never carried.
+        self._persist_action_to_branch_history(
+            getattr(getattr(self, "context_manager", None), "current_task_id", None),
+            tool_name="advisor",
+            tool_params={},
+            result=recorded,
+            observation_text=execution.observation_text,
+        )
         self._seal_turn_record(
             actor="controller",
             t0=turn_started,
@@ -7322,10 +7341,63 @@ class ReActEngine(UIEventEmitter):
                 parts.append(f"skip reasons: {'; '.join(reasons)}")
         return f"Native state: {', '.join(parts)}"
 
+    def _toolchain_state_line(self) -> str:
+        """What the env overlay says about the toolchain RIGHT NOW.
+
+        d2r4 jackrabbit: maven was installed, registered and activated, and the
+        provision gate accepted "Installed and activated Maven 3.8.7" — then the
+        build-entry advisor opened with "`/usr/bin/mvn` is missing", the
+        pre-provision `ENV_EXECUTABLE_NOT_FOUND` the handoff still carries under
+        LAST RELEVANT FAILURES. d2r4 gora is the same defect inverted: the
+        advisor sent the model to repair "the broken /usr/bin/mvn env overlay"
+        that no registration had ever written.
+
+        A superseded failure is not a current state, so the digest states the
+        current one beside it. The env overlay is the only host-published
+        toolchain record (``toolchains.json`` has no publication authority and
+        is excluded from resolution for exactly that reason), and it is read
+        here at consult time, never from a snapshot taken before provisioning.
+
+        Silent when there is no container to read and when the overlay cannot
+        be read: an unreadable overlay is not an empty one, and the digest may
+        not state a state it never read."""
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is None:
+            return ""
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        overlay = EnvOverlayStore(orchestrator).inspect()
+        if overlay.get("warnings"):
+            return ""
+        entries: List[str] = []
+        tools = overlay.get("tools") or {}
+        for name in sorted(tools):
+            entry = tools.get(name) or {}
+            candidates = entry.get("candidates") or {}
+            active = entry.get("active")
+            # Every registered candidate, the active one first: a runtime the
+            # overlay already holds is a move the model can make without
+            # installing anything, and the reviewer can only name it if the
+            # digest does.
+            ordered = [executable for executable in [active] if executable in candidates]
+            ordered += [executable for executable in sorted(candidates) if executable != active]
+            for executable in ordered:
+                candidate = candidates.get(executable) or {}
+                version = str(candidate.get("version") or "").strip()
+                entries.append(
+                    f"{name} {version + ' ' if version else ''}"
+                    f"{'active' if executable == active else 'registered'} at {executable}"
+                    f"{'' if executable == active else ' (not active)'}"
+                )
+        return self._ADVISOR_TOOLCHAIN_PREFIX + (
+            "; ".join(entries) or "no runtime is registered in the env overlay"
+        )
+
     def _advisor_evidence_digest(self) -> str:
-        """The deterministic evidence section: handoff projection, armed
-        recurrence guidance, the last test attempt's collection facts, and
-        (native projects only) the native state."""
+        """The deterministic evidence section: handoff projection, the toolchain
+        state the overlay holds at consult time, armed recurrence guidance, the
+        last test attempt's collection facts, and (native projects only) the
+        native state."""
         parts: List[str] = []
         handoff = getattr(self, "phase_handoff", None)
         if handoff is not None:
@@ -7336,6 +7408,16 @@ class ReActEngine(UIEventEmitter):
             except Exception as exc:
                 # A digest gap must not cost the run its advice.
                 self.agent_logger.warning(f"Advisor evidence digest unavailable: {exc}")
+        # After the handoff on purpose: the current state is what supersedes the
+        # superseded failure the projection above may still carry.
+        try:
+            toolchain_state = self._toolchain_state_line()
+        except Exception as exc:
+            # A digest gap must not cost the run its advice.
+            logger.warning(f"Advisor toolchain-state digest unavailable: {exc}")
+            toolchain_state = ""
+        if toolchain_state:
+            parts.append(toolchain_state)
         guidance = str(getattr(self, "_advisor_loop_guidance", "") or "").strip()
         if guidance and getattr(self, "_advisor_redirect_armed", False):
             parts.append(guidance)

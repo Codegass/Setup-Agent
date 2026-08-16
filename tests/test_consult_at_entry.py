@@ -20,6 +20,7 @@ phase cap both skip the entry consult entirely.
 from types import SimpleNamespace
 
 import pytest
+from test_env_overlay import FakeEnvOverlayOrchestrator
 from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authority
 
 import sag.agent.native_messages as native_messages
@@ -35,6 +36,7 @@ from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
 from sag.config.prompt_loader import load_react_engine_prompts
+from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
 from sag.tools.base import BaseTool, ToolResult
 
 ADVICE = "Compile the three untouched islands before you conclude anything."
@@ -60,12 +62,14 @@ class _ScriptedAdvisorClient:
     def __init__(self, advice=ADVICE):
         self.advice = advice
         self.calls = []
+        self.messages = []
 
     def capabilities_for(self, mode):
         return SimpleNamespace(model="scripted-action-model")
 
     def get_advisor_response(self, messages, *, model, max_tokens):
         self.calls.append(model)
+        self.messages.append([dict(message) for message in messages])
         return self.advice
 
 
@@ -285,6 +289,197 @@ def test_the_digest_has_no_test_attempt_line_without_one():
     engine.run_evidence_state = RunEvidenceState(run_id="digest-empty")
 
     assert "Last test attempt:" not in engine._advisor_evidence_digest()
+
+
+# --- (f) the digest reads the toolchain state AT CONSULT TIME --------------
+#
+# d2r4 jackrabbit: `apt-get install maven` succeeded, `project env` activated
+# /usr/bin/mvn and the provision gate accepted "Installed and activated Maven
+# 3.8.7". The build-entry advisor then told the model "`/usr/bin/mvn` is
+# missing" — it had read the pre-provision `ENV_EXECUTABLE_NOT_FOUND` failure
+# the handoff still carries, and nothing in the digest stated what the overlay
+# says NOW. d2r4 gora, the same shape from the other side: the advisor advised
+# repairing "the broken /usr/bin/mvn env overlay" that no registration ever
+# wrote. The overlay is the run's host-published toolchain state, so the digest
+# reads it at consult time — the `Native state:` precedent, which exists so the
+# reviewer can CORRECT a stale reading instead of echoing it.
+
+
+def _activated_overlay_orchestrator(
+    tool="maven",
+    executable="/usr/share/maven/bin/mvn",
+    version="3.8.7",
+):
+    orchestrator = FakeEnvOverlayOrchestrator()
+    EnvOverlayStore(orchestrator).register(
+        tool,
+        executable,
+        version=version,
+        activate=True,
+    )
+    return orchestrator
+
+
+class _StaleToolchainHandoff:
+    """The jackrabbit handoff: its only toolchain line is the failure that a
+    later successful activation superseded."""
+
+    text = (
+        "=== CUMULATIVE PHASE HANDOFF ===\n"
+        "LAST RELEVANT FAILURES:\n"
+        '- command="project env" code=ENV_EXECUTABLE_NOT_FOUND '
+        'tail="Env overlay executable is not executable or does not exist: /usr/bin/mvn"'
+    )
+
+    def project_for(self, target_phase, *, char_budget):
+        return SimpleNamespace(to_prompt_text=lambda: self.text)
+
+
+def test_the_digest_names_the_activated_runtime():
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = _activated_overlay_orchestrator()
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "Toolchain state (env overlay, read at consult time" in digest
+    assert "maven 3.8.7 active at /usr/share/maven/bin/mvn" in digest
+
+
+def test_an_entry_consult_after_a_successful_activation_names_the_activated_runtime():
+    """The jackrabbit fence: the consult that follows the activation reads the
+    overlay, not the pre-provision failure the handoff still carries."""
+    engine = _unit_engine(phase="build")
+    engine.phase_handoff = _StaleToolchainHandoff()
+    engine.orchestrator = _activated_overlay_orchestrator()
+
+    assert engine._maybe_consult_advisor_at_phase_entry() is True
+
+    consulted = engine.llm_client.messages[0][-1]["content"]
+    assert "maven 3.8.7 active at /usr/share/maven/bin/mvn" in consulted
+    # The superseded failure stays visible as history — it is stated BEFORE the
+    # current state, which says in its own words that it supersedes it.
+    assert consulted.index("ENV_EXECUTABLE_NOT_FOUND") < consulted.index("Toolchain state")
+
+
+def test_the_digest_names_a_registered_runtime_that_is_not_active():
+    orchestrator = FakeEnvOverlayOrchestrator()
+    EnvOverlayStore(orchestrator).register(
+        "maven",
+        "/opt/apache-maven-3.9.9/bin/mvn",
+        version="3.9.9",
+    )
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = orchestrator
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "maven 3.9.9 registered at /opt/apache-maven-3.9.9/bin/mvn (not active)" in digest
+
+
+def test_the_digest_names_the_active_runtime_first_and_the_alternative_after_it():
+    """A registered runtime the overlay already holds is a move that needs no
+    install — the reviewer can name it only if the digest does."""
+    orchestrator = _activated_overlay_orchestrator()
+    EnvOverlayStore(orchestrator).register(
+        "maven",
+        "/opt/apache-maven-3.9.9/bin/mvn",
+        version="3.9.9",
+    )
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = orchestrator
+
+    digest = engine._advisor_evidence_digest()
+
+    assert (
+        "maven 3.8.7 active at /usr/share/maven/bin/mvn; "
+        "maven 3.9.9 registered at /opt/apache-maven-3.9.9/bin/mvn (not active)"
+    ) in digest
+
+
+def test_the_digest_states_an_empty_overlay_as_no_registered_runtime():
+    """The gora fence: there is no broken overlay to repair, so the reviewer is
+    told the overlay registers nothing rather than left to invent one."""
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = FakeEnvOverlayOrchestrator()
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "no runtime is registered in the env overlay" in digest
+
+
+def test_the_digest_states_no_toolchain_line_it_could_not_read():
+    """An unreadable overlay is not an empty overlay: the digest says nothing
+    rather than claiming a state it never read."""
+    orchestrator = _activated_overlay_orchestrator()
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = "{ not json"
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = orchestrator
+
+    assert "Toolchain state" not in engine._advisor_evidence_digest()
+
+
+def test_the_digest_has_no_toolchain_line_without_a_container():
+    engine = _unit_engine(phase="build")
+
+    assert "Toolchain state" not in engine._advisor_evidence_digest()
+
+
+def test_a_broken_toolchain_read_never_costs_the_run_its_advice():
+    class _ExplodingOrchestrator:
+        def execute_command(self, *args, **kwargs):
+            raise RuntimeError("container is gone")
+
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = _ExplodingOrchestrator()
+
+    assert engine._maybe_consult_advisor_at_phase_entry() is True
+    assert ADVICE in _observations(engine)[0].content
+
+
+# --- (g) the entry consult persists to phase history ----------------------
+#
+# Closure-contract rule 2 (2026-08-14 observation-trajectory spec §2.2): a
+# harness-authored action's observation persists to branch history like any
+# other. d2r4 jackrabbit and gora both show `contexts/phase_build.json` with no
+# history entry for `advisor-entry-1` — the advice the model acted on lived only
+# in `contexts/full_outputs.jsonl`.
+
+
+class _RecordingContextManager:
+    def __init__(self, task_id="phase_build"):
+        self.current_task_id = task_id
+        self.entries = []
+
+    def add_to_branch_history(self, task_id, entry):
+        self.entries.append((task_id, entry))
+        return {"entry_count": len(self.entries)}
+
+
+def test_the_entry_consult_persists_to_phase_history():
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _RecordingContextManager()
+
+    assert engine._maybe_consult_advisor_at_phase_entry() is True
+
+    assert [task_id for task_id, _ in engine.context_manager.entries] == ["phase_build"]
+    entry = engine.context_manager.entries[0][1]
+    assert entry["type"] == "action"
+    assert entry["tool_name"] == "advisor"
+    assert entry["parameters"] == {}
+    assert ADVICE in entry["observation"]
+    assert entry["operation_outcome"] == "success"
+
+
+def test_a_history_write_failure_never_blocks_the_entry_consult():
+    class _BrokenContextManager(_RecordingContextManager):
+        def add_to_branch_history(self, task_id, entry):
+            raise RuntimeError("branch history is unavailable")
+
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _BrokenContextManager()
+
+    assert engine._maybe_consult_advisor_at_phase_entry() is True
+    assert ADVICE in _observations(engine)[0].content
 
 
 # --- (b) the bigtop regression: a 4-island batch survives phase entry ------
