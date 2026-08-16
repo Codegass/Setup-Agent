@@ -334,6 +334,44 @@ def classify_detached_completion(
     )
 
 
+# What a dispatch WROTE before it died, as opposed to how it ended. Everything
+# else the runner classifiers produce — the assessment, the outcome word, the
+# error code — is the verdict on the death and belongs to the result that seals
+# it (`classify_detached_completion`), never to the harvest.
+_DETACHED_HARVEST_FIELDS = ("test_stats", "evidence_refs", "conflicts")
+
+
+def harvest_detached_evidence(
+    result: ToolResult,
+    evidence_fields: Optional[Dict[str, Any]] = None,
+) -> ToolResult:
+    """Carry a dying dispatch's own evidence onto the result that seals it.
+
+    Live kafka (d2r4): gradle ran 13,132 tests, printed its own aggregate, and
+    then the build daemon disappeared. The detached classifier sealed
+    `DETACHED_OPERATION_FAILED` — correctly — and the runner's parsed
+    `test_results` stayed behind in `metadata.analysis`, so the sealed result
+    carried no counts at all and every downstream reader saw zeros next to a
+    6.2 MB log full of `PASSED`. The reports were already on disk and already
+    claimed by the receipt; only the harvest was dropped.
+
+    A crash is not a reason to stop reading what the run wrote, and a harvested
+    count is not a reason to soften the crash: the outcome, the error code and
+    the evidence assessment the classifier sealed are left exactly as they are.
+    """
+    for field in _DETACHED_HARVEST_FIELDS:
+        harvested = (evidence_fields or {}).get(field)
+        if not harvested:
+            continue
+        if isinstance(harvested, list):
+            existing = list(getattr(result, field) or [])
+            existing.extend(item for item in harvested if item not in existing)
+            setattr(result, field, existing)
+        elif getattr(result, field, None) is None:
+            setattr(result, field, harvested)
+    return result
+
+
 def _normalize_detached_runner(value: Any) -> str | None:
     text = str(value or "").strip().lower()
     aliases = {

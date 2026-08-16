@@ -37,6 +37,7 @@ from .build_utils import (
     detached_handoff_tool_result,
     detached_poll_ref,
     dispatch_hold_policy,
+    harvest_detached_evidence,
 )
 from .dispatch_argv import gradle_task_tokens
 from .toolchain_manager import ToolchainManager, ToolchainSpec
@@ -560,7 +561,14 @@ class GradleTool(BaseTool):
                         }
                     )
                     return self._finalize_main_result(
-                        detached_result,
+                        # A dispatch that died still wrote what it wrote: the
+                        # reports are on disk and claimed by this receipt, and
+                        # gradle's own aggregate is in the log the classifier
+                        # just sealed. The death stays the result's verdict.
+                        harvest_detached_evidence(
+                            detached_result,
+                            self._gradle_evidence_fields(analysis, ref_id),
+                        ),
                         preamble,
                         jdk_retry_meta,
                     )

@@ -38,6 +38,7 @@ from .build_utils import (
     detached_handoff_tool_result,
     detached_poll_ref,
     dispatch_hold_policy,
+    harvest_detached_evidence,
 )
 from .command_tracker import CommandTracker
 from .dispatch_argv import maven_action_tokens
@@ -787,7 +788,14 @@ class MavenTool(BaseTool):
                         }
                     )
                     return self._finalize_main_result(
-                        detached_result,
+                        # A vanished process wrote reports and surefire counts
+                        # before it vanished. They are harvested onto the
+                        # lifecycle failure the classifier sealed, which stays
+                        # exactly the failure it was.
+                        harvest_detached_evidence(
+                            detached_result,
+                            self._maven_evidence_fields(analysis, ref_id),
+                        ),
                         preamble,
                         jdk_retry_meta,
                     )
