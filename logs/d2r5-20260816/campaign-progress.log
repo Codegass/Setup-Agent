@@ -1,0 +1,20 @@
+03:33:50 D2R5 START: 5H + 4L, 2 class lanes, source 5488e7050a68
+03:33:50 START [H00] camel (ref=camel-4.20.0)
+03:33:50 START [L00] jackrabbit (ref=jackrabbit-2.22.3)
+03:44:45 DONE  [H00] camel exit=1 after 655s
+03:44:45 START [H01] kafka (ref=4.3.1)
+03:51:02 DONE  [L00] jackrabbit exit=1 after 1031s
+03:51:02 START [L01] gora (ref=apache-gora-0.9)
+04:11:14 DONE  [H01] kafka exit=1 after 1588s
+04:11:14 START [H02] ignite (ref=2.18.0)
+05:44:09 DONE  [L01] gora exit=1 after 6786s
+05:44:09 START [L02] kogito-examples (ref=1.44.1.Final)
+06:05:22 DONE  [H02] ignite exit=1 after 6847s
+06:05:22 START [H03] lucene (ref=releases/lucene/10.4.0)
+06:13:55 DONE  [L02] kogito-examples exit=1 after 1786s
+06:13:55 START [L03] httpcomponents-client (ref=rel/v5.6.1)
+06:17:43 DONE  [H03] lucene exit=1 after 740s
+06:17:43 START [H04] geode (ref=rel/v2.0.2)
+06:21:31 DONE  [L03] httpcomponents-client exit=1 after 456s
+06:31:26 DONE  [H04] geode exit=1 after 823s
+06:31:26 D2R5 COMPLETE: camel:1, jackrabbit:1, kafka:1, gora:1, ignite:1, kogito-examples:1, lucene:1, httpcomponents-client:1, geode:1

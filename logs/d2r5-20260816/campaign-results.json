@@ -1,0 +1,56 @@
+[
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "camel",
+    "seconds": 655
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "geode",
+    "seconds": 823
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "gora",
+    "seconds": 6786
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "httpcomponents-client",
+    "seconds": 456
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "ignite",
+    "seconds": 6847
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "jackrabbit",
+    "seconds": 1031
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "kafka",
+    "seconds": 1588
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "kogito-examples",
+    "seconds": 1786
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "lucene",
+    "seconds": 740
+  }
+]

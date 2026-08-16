@@ -1,0 +1,93 @@
+{
+  "campaign_id": "d2r5-20260816",
+  "campaign_kind": "d2r5-targeted-validation",
+  "contrast_baselines": [
+    "d2r4-20260815",
+    "d2r2-20260813",
+    "d2r3-serial-20260814"
+  ],
+  "coverage_pass": false,
+  "coverage_pass_rationale": "same as prior campaigns: coverage swept separately",
+  "lane_discipline": "heavy lane serial (5), light lane serial (4); never two heavies",
+  "lanes": 2,
+  "projects": [
+    {
+      "lane": "H",
+      "lane_index": 0,
+      "name": "camel",
+      "ref": "camel-4.20.0",
+      "url": "https://github.com/apache/camel.git"
+    },
+    {
+      "lane": "H",
+      "lane_index": 1,
+      "name": "kafka",
+      "ref": "4.3.1",
+      "url": "https://github.com/apache/kafka.git"
+    },
+    {
+      "lane": "H",
+      "lane_index": 2,
+      "name": "ignite",
+      "ref": "2.18.0",
+      "url": "https://github.com/apache/ignite.git"
+    },
+    {
+      "lane": "H",
+      "lane_index": 3,
+      "name": "lucene",
+      "ref": "releases/lucene/10.4.0",
+      "url": "https://github.com/apache/lucene.git"
+    },
+    {
+      "lane": "H",
+      "lane_index": 4,
+      "name": "geode",
+      "ref": "rel/v2.0.2",
+      "url": "https://github.com/apache/geode.git"
+    },
+    {
+      "lane": "L",
+      "lane_index": 0,
+      "name": "jackrabbit",
+      "ref": "jackrabbit-2.22.3",
+      "url": "https://github.com/apache/jackrabbit.git"
+    },
+    {
+      "lane": "L",
+      "lane_index": 1,
+      "name": "gora",
+      "ref": "apache-gora-0.9",
+      "url": "https://github.com/apache/gora.git"
+    },
+    {
+      "lane": "L",
+      "lane_index": 2,
+      "name": "kogito-examples",
+      "ref": "1.44.1.Final",
+      "url": "https://github.com/apache/incubator-kie-kogito-examples.git"
+    },
+    {
+      "lane": "L",
+      "lane_index": 3,
+      "name": "httpcomponents-client",
+      "ref": "rel/v5.6.1",
+      "url": "https://github.com/apache/httpcomponents-client.git"
+    }
+  ],
+  "prompt_bundle_sha256": "213690c0cede5de3cbc465f672728a812b51ec723098d13b681fde09d8a120f6",
+  "runs_per_project": 1,
+  "schema_version": 1,
+  "source": {
+    "dirty": false,
+    "git_sha": "5488e7050a680fd61e8033ccf7baf317ab30c7f8",
+    "tree_sha256": "72630a9010031f38cb06a1997ea3a03ff0a914aaaa57b14640a68af04b8fbeb9"
+  },
+  "validates": [
+    "#59",
+    "#60",
+    "#61",
+    "#62",
+    "#63"
+  ]
+}
