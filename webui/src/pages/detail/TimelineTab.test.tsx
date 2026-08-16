@@ -160,6 +160,80 @@ describe("TimelineTab", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it("re-reads the run whole once it stops, even with a poll still on the wire", async () => {
+    // The heartbeat skips while a read is in flight, and the run-stopped read
+    // borrowed that discipline: a poll still on the wire at the moment `live`
+    // flipped false made the one read that carries the exported token ledger
+    // return without reading. Nothing issued it again — the poll interval is
+    // gone with the run — so the last turns' bills never landed. It waits for
+    // the read in flight and asks again.
+    vi.useFakeTimers()
+    const unbilled = doc({ turns: [turn(1, { control_seq: [1] })] })
+    const billed = doc({
+      turns: [turn(1, { control_seq: [1], tokens: { input: 4000, output: 205 } })],
+    })
+    let landPoll = () => {}
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => Promise.resolve(json(unbilled)))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            landPoll = () => resolve(json(unbilled))
+          }),
+      )
+      .mockImplementation(() => Promise.resolve(json(billed)))
+
+    const view = render(<TimelineTab live sessionId="S1" />)
+    await settle()
+    // The heartbeat fires and does not answer.
+    await settle(5000)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    // The run stops while that poll is still out.
+    view.rerender(<TimelineTab live={false} sessionId="S1" />)
+    await settle()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    landPoll()
+    await settle()
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/sessions/S1/trajectory?detail=summary")
+    expect(screen.queryByText(/no turn has been billed yet/i)).not.toBeInTheDocument()
+    expect(screen.getByText("4.2k")).toBeInTheDocument()
+  })
+
+  it("reloads whole on demand even when the answer lands behind the ledger held", async () => {
+    // The watermark orders the view's own two reads against each other. The
+    // owner pressing "Reload whole" is not one of those reads: it is a person
+    // asking for the server's whole current answer, and the guard swallowed it
+    // whenever a poll had moved the document on while the reload was on the
+    // wire — the button did nothing, and said nothing about doing nothing.
+    vi.useFakeTimers()
+    const ahead = doc({
+      turns: [turn(1, { iteration: 4, control_seq: [1, 2, 3] })],
+      warnings: [],
+    })
+    const server = doc({
+      turns: [turn(1, { iteration: 1, control_seq: [1] })],
+      warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+    })
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(() => Promise.resolve(json(ahead)))
+      .mockImplementation(() => Promise.resolve(json(server)))
+
+    render(<TimelineTab live={false} sessionId="S1" />)
+    await settle()
+    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 4")
+
+    fireEvent.click(screen.getByRole("button", { name: /reload whole/i }))
+    await settle()
+
+    expect(screen.getByTestId("turn-row-1")).toHaveTextContent("iter 1")
+    expect(screen.getByText("missing_tool_result")).toBeInTheDocument()
+  })
+
   it("fetches the full tier when a row is expanded, and only once", async () => {
     vi.useFakeTimers()
     const fetchMock = vi

@@ -49,6 +49,14 @@ function message(error: unknown): string {
  * When the run stops, the timeline reads it whole once more: the token ledger is
  * exported at loop exit, so the last turns' bills land with no control event to
  * carry them, and no watermark cut can ask for a change the ledger never stated.
+ * That read WAITS for whatever is on the wire rather than skipping on it — it is
+ * not a heartbeat tick that another tick will follow, it is the only read that
+ * ever carries those bills, and the interval that would repeat it is gone with
+ * the run.
+ *
+ * "Reload whole" is the owner's read, and it is the one read the watermark does
+ * not order: a person asking for the server's whole current answer is not one of
+ * the two reads that race over this document.
  */
 export function TimelineTab({ sessionId, live }: { sessionId: string; live: boolean }) {
   const [doc, setDoc] = useState<TrajectoryDocument | null>(null)
@@ -68,38 +76,51 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
   // newer one — a document going backwards. The heartbeat skips instead; a read
   // the OWNER asked for is never skipped, because they are waiting for it.
   const reading = useRef(false)
+  // The read on the wire, so a caller that was skipped can be told WHEN it may
+  // ask again instead of only that it was skipped.
+  const inFlight = useRef<Promise<unknown> | null>(null)
 
-  const apply = useCallback((incoming: TrajectoryDocument) => {
-    const merged = mergeTrajectory(held.current, incoming)
+  const apply = useCallback((incoming: TrajectoryDocument, options?: { force?: boolean }) => {
+    const merged = mergeTrajectory(held.current, incoming, options)
     held.current = merged
     setDoc(merged)
   }, [])
 
+  /** Read the trajectory. Resolves `true` when it read, `false` when it was
+   *  skipped — and a skipped call resolves only once the read it stood down
+   *  for has settled, so a caller that must not be dropped can ask again. */
   const load = useCallback(
-    async (options?: { whole?: boolean; silent?: boolean }) => {
+    (options?: { whole?: boolean; silent?: boolean; force?: boolean }): Promise<boolean> => {
       if (options?.silent && reading.current) {
-        return
+        return (inFlight.current ?? Promise.resolve()).then(() => false)
       }
       reading.current = true
       if (!options?.silent) {
         setLoading(true)
       }
-      try {
-        const sinceSeq = options?.whole || !held.current ? null : latestControlSeq(held.current)
-        const incoming = await fetchTrajectory(
-          sessionId,
-          sinceSeq == null ? undefined : { sinceSeq },
-        )
-        apply(incoming)
-        setError(null)
-      } catch (err) {
-        setError(message(err))
-      } finally {
-        reading.current = false
-        if (!options?.silent) {
-          setLoading(false)
+      const read = async () => {
+        try {
+          const sinceSeq = options?.whole || !held.current ? null : latestControlSeq(held.current)
+          const incoming = await fetchTrajectory(
+            sessionId,
+            sinceSeq == null ? undefined : { sinceSeq },
+          )
+          apply(incoming, { force: options?.force })
+          setError(null)
+        } catch (err) {
+          setError(message(err))
+        } finally {
+          reading.current = false
+          inFlight.current = null
+          if (!options?.silent) {
+            setLoading(false)
+          }
         }
+        return true
       }
+      const running = read()
+      inFlight.current = running
+      return running
     },
     [apply, sessionId],
   )
@@ -127,12 +148,27 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
 
   // The run stopping is itself an event to read on: the token ledger is written
   // at loop exit, so the bills for the last turns exist only in a whole read.
+  // A poll on the wire at that moment makes this read stand down like any other
+  // silent one — and nothing would ever issue it again, because the interval
+  // that repeats a poll is cleared with the run. So it asks again as soon as
+  // the read it stood down for has settled, and keeps asking until it reads.
   const wasLive = useRef(live)
   useEffect(() => {
     const stopped = wasLive.current && !live
     wasLive.current = live
-    if (stopped) {
-      void load({ whole: true, silent: true })
+    if (!stopped) {
+      return
+    }
+    let abandoned = false
+    const readWhole = async () => {
+      let read = await load({ whole: true, silent: true })
+      while (!read && !abandoned) {
+        read = await load({ whole: true, silent: true })
+      }
+    }
+    void readWhole()
+    return () => {
+      abandoned = true
     }
   }, [live, load])
 
@@ -236,9 +272,11 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
             retrying
           </span>
         ) : null}
+        {/* The one read the watermark does not order: the owner asked for the
+            server's whole current answer, and gets it whatever is held. */}
         <Button
           className="ml-auto"
-          onClick={() => void load({ whole: true })}
+          onClick={() => void load({ whole: true, force: true })}
           type="button"
           variant="outline"
         >

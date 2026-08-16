@@ -1,0 +1,233 @@
+{
+    "schema_version": 1,
+    "session": {
+        "run_id": "",
+        "project": null,
+        "verdict": null,
+        "rates": null,
+        "wall_clock_seconds": 156.084846
+    },
+    "phases": [
+        {
+            "name": "provision",
+            "termination": "advance",
+            "gates": [
+                {
+                    "word": "success",
+                    "decision_id": "gate-provision-1",
+                    "supersedes": null
+                }
+            ]
+        },
+        {
+            "name": "build",
+            "termination": null,
+            "gates": [
+                {
+                    "word": "failed",
+                    "decision_id": "gate-build-0-revised",
+                    "supersedes": "gate-build-0"
+                }
+            ]
+        },
+        {
+            "name": "analyze",
+            "termination": "advance",
+            "gates": []
+        },
+        {
+            "name": "build",
+            "termination": "evidence_close",
+            "gates": [
+                {
+                    "word": "success",
+                    "decision_id": "gate-build-1",
+                    "supersedes": null
+                }
+            ]
+        }
+    ],
+    "turns": [
+        {
+            "turn_id": 1,
+            "phase": "provision",
+            "iteration": 1,
+            "actor": "model",
+            "window_ref": null,
+            "window_components": null,
+            "call": {
+                "tool": "project",
+                "params_ref": "envelope-000003"
+            },
+            "observation": {
+                "ref": "output_6163859b019d",
+                "evidence_ref": null,
+                "error_code": null,
+                "failure_signature": null
+            },
+            "gate": null,
+            "tokens": null,
+            "t0": "2026-08-14T11:28:36.915154Z",
+            "t1": "2026-08-14T11:28:49.545505Z",
+            "control_seq": [
+                3,
+                4,
+                6
+            ]
+        },
+        {
+            "turn_id": 2,
+            "phase": "provision",
+            "iteration": null,
+            "actor": "model",
+            "window_ref": null,
+            "window_components": null,
+            "call": {
+                "tool": "phase",
+                "params_ref": "envelope-000024"
+            },
+            "observation": null,
+            "gate": {
+                "word": "success",
+                "decision_id": "gate-provision-1",
+                "supersedes": null
+            },
+            "tokens": null,
+            "t0": "2026-08-14T11:29:15.711998Z",
+            "t1": null,
+            "control_seq": [
+                24,
+                27
+            ]
+        },
+        {
+            "turn_id": 3,
+            "phase": "analyze",
+            "iteration": null,
+            "actor": "model",
+            "window_ref": null,
+            "window_components": null,
+            "call": {
+                "tool": "bash",
+                "params_ref": "envelope-000030"
+            },
+            "observation": {
+                "ref": "output_a1b2c3d4e5f6",
+                "evidence_ref": null,
+                "error_code": null,
+                "failure_signature": null
+            },
+            "gate": null,
+            "tokens": null,
+            "t0": "2026-08-14T11:29:20.101000Z",
+            "t1": "2026-08-14T11:29:21.400000Z",
+            "control_seq": [
+                30,
+                31
+            ]
+        },
+        {
+            "turn_id": 4,
+            "phase": "build",
+            "iteration": null,
+            "actor": "model",
+            "window_ref": null,
+            "window_components": null,
+            "call": {
+                "tool": "bash",
+                "params_ref": "envelope-000040"
+            },
+            "observation": {
+                "ref": "output_ff00aa11bb22",
+                "evidence_ref": null,
+                "error_code": null,
+                "failure_signature": null
+            },
+            "gate": null,
+            "tokens": null,
+            "t0": "2026-08-14T11:30:12.000000Z",
+            "t1": "2026-08-14T11:31:02.000000Z",
+            "control_seq": [
+                40,
+                41
+            ]
+        },
+        {
+            "turn_id": 5,
+            "phase": "build",
+            "iteration": null,
+            "actor": "model",
+            "window_ref": null,
+            "window_components": null,
+            "call": {
+                "tool": "phase",
+                "params_ref": "envelope-000044"
+            },
+            "observation": null,
+            "gate": {
+                "word": "success",
+                "decision_id": "gate-build-1",
+                "supersedes": null
+            },
+            "tokens": null,
+            "t0": "2026-08-14T11:31:10.000000Z",
+            "t1": null,
+            "control_seq": [
+                44,
+                46
+            ]
+        }
+    ],
+    "annotations": [],
+    "warnings": [
+        {
+            "code": "missing_loop_decision",
+            "detail": "turn 2 called 'phase' and emitted no loop_decision",
+            "control_seq": 24,
+            "turn_id": 2
+        },
+        {
+            "code": "missing_tool_result",
+            "detail": "turn 2 has no tool_result and no typed refusal",
+            "control_seq": 24,
+            "turn_id": 2
+        },
+        {
+            "code": "orphan_gate_revision",
+            "detail": "a revision replaces 'gate-build-0', which no gate in this run delivered",
+            "control_seq": 26,
+            "turn_id": null
+        },
+        {
+            "code": "missing_loop_decision",
+            "detail": "turn 3 called 'bash' and emitted no loop_decision",
+            "control_seq": 30,
+            "turn_id": 3
+        },
+        {
+            "code": "missing_loop_decision",
+            "detail": "turn 4 called 'bash' and emitted no loop_decision",
+            "control_seq": 40,
+            "turn_id": 4
+        },
+        {
+            "code": "missing_loop_decision",
+            "detail": "turn 5 called 'phase' and emitted no loop_decision",
+            "control_seq": 44,
+            "turn_id": 5
+        },
+        {
+            "code": "missing_tool_result",
+            "detail": "turn 5 has no tool_result and no typed refusal",
+            "control_seq": 44,
+            "turn_id": 5
+        },
+        {
+            "code": "conservation_violation",
+            "detail": "the ledger accounts for 4 closed call(s) on its fullest side, and is short: answered (tool_result + refusal_record) by 1; decided (loop_decision + cancelled) by 3",
+            "control_seq": null,
+            "turn_id": null
+        }
+    ],
+    "outputs": null
+}

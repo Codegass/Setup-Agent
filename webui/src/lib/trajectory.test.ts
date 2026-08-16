@@ -7,6 +7,8 @@ import type {
   TrajectoryWarning,
 } from "@/api/types"
 
+import reduced from "@/test/fixtures/empty-segment/trajectory.json"
+
 import {
   anomalies,
   bandTurns,
@@ -137,6 +139,43 @@ describe("mergeTrajectory", () => {
     expect(merged.outputs).toEqual({ output_a: "bash: mvn: not found" })
   })
 
+  it("applies a forced reload whole, even from behind the watermark it holds", () => {
+    // The watermark orders two reads the VIEW issued against each other. It was
+    // never a rule about what the owner may ask for: "Reload whole" is a person
+    // saying take the server's answer over whatever you are holding, and a
+    // guard built for a byte-read race swallowed it whenever a poll had landed
+    // while the reload was on the wire — one button, no effect, nothing said.
+    const held = doc({
+      turns: [turn(1, { control_seq: [1, 2, 3] })],
+      warnings: [],
+    })
+    const behind = doc({
+      turns: [turn(1, { control_seq: [1] })],
+      warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+    })
+
+    const merged = mergeTrajectory(held, behind, { force: true })
+
+    expect(merged.turns[0].control_seq).toEqual([1])
+    expect(merged.warnings).toHaveLength(1)
+  })
+
+  it("forces nothing unless asked: a stale response still contributes bytes only", () => {
+    const held = doc({ turns: [turn(1, { control_seq: [1, 2, 3] })], warnings: [] })
+    const late = doc({
+      turns: [turn(1, { control_seq: [1] })],
+      warnings: [{ code: "missing_tool_result", detail: "turn 1", turn_id: 1 }],
+      outputs: { output_a: "bash: mvn: not found" },
+    })
+
+    for (const options of [undefined, { force: false }]) {
+      const merged = mergeTrajectory(held, late, options)
+      expect(merged.turns[0].control_seq).toEqual([1, 2, 3])
+      expect(merged.warnings).toEqual([])
+      expect(merged.outputs).toEqual({ output_a: "bash: mvn: not found" })
+    }
+  })
+
   it("applies a response the watermark cannot order — a poll that saw no turn", () => {
     // A cut poll over a ledger that has not moved carries no turn at all, so it
     // names no sequence. That is not a stale response: it is the current whole
@@ -243,6 +282,64 @@ describe("bandTurns", () => {
     expect(bands[0].name).toBe("ghost")
     expect(bands[0].termination).toBeNull()
     expect(bands[0].gates).toEqual([])
+  })
+
+  it("passes over a segment no turn carries, on the reducer's own output", () => {
+    // Not a hand-built shape: `test/fixtures/empty-segment/trajectory.json` is
+    // what `sag trajectory` answers for the ledger committed beside it, where
+    // an orphan gate revision bands `build` while the run is still in
+    // `provision` — the reducer's own "a gate can band a phase no turn has
+    // entered". The banding it states is
+    //   0 provision(advance)  1 build(EMPTY)  2 analyze(advance)  3 build(evidence_close)
+    // and the run's only `build` band is turns 4 and 5, which segment 3 ended.
+    // Counting segments by name handed that band segment 1: no termination at
+    // all, and a word decided for a visit that carried no turn.
+    const document = reduced as unknown as TrajectoryDocument
+    const bands = bandTurns(document)
+
+    expect(bands.map((b) => b.name)).toEqual(["provision", "analyze", "build"])
+    expect(bands.map((b) => b.turns.map((t) => t.turn_id))).toEqual([[1, 2], [3], [4, 5]])
+
+    const build = bands[2]
+    expect(build.termination).toBe("evidence_close")
+    expect(build.gates.map((g) => g.word)).toEqual(["success"])
+    // The empty segment's word belongs to no band on screen at all.
+    expect(bands.flatMap((b) => b.gates.map((g) => g.decision_id))).not.toContain(
+      "gate-build-0-revised",
+    )
+    // …and the bands before it are still their own segments, not shifted along.
+    expect(bands[0].termination).toBe("advance")
+    expect(bands[0].gates.map((g) => g.decision_id)).toEqual(["gate-provision-1"])
+    expect(bands[1].termination).toBe("advance")
+    expect(bands[1].gates).toEqual([])
+  })
+
+  it("gives a band the segment its turns are in, not the Nth of that name", () => {
+    // The same shift, in the small: `test` is stated twice and carries turns
+    // once, and the visit that carried them is the one a walk in document order
+    // reaches after `analyze` — the earlier one belongs to no band at all.
+    const bands = bandTurns(
+      doc({
+        phases: [
+          { name: "build", termination: "advance", gates: [] },
+          { name: "test", termination: "repair", gates: [] },
+          { name: "analyze", termination: "advance", gates: [] },
+          {
+            name: "test",
+            termination: "evidence_close",
+            gates: [{ word: "partial", decision_id: "g9", supersedes: null }],
+          },
+        ],
+        turns: [
+          turn(1, { phase: "build" }),
+          turn(2, { phase: "analyze" }),
+          turn(3, { phase: "test" }),
+        ],
+      }),
+    )
+
+    expect(bands.map((b) => b.termination)).toEqual(["advance", "advance", "evidence_close"])
+    expect(bands[2].gates.map((g) => g.word)).toEqual(["partial"])
   })
 
   it("states nothing for a band the document names no segment for", () => {

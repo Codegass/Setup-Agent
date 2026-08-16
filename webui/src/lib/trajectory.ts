@@ -40,10 +40,19 @@ import type {
  * is the one thing it was asked for. A response naming no sequence at all
  * cannot be ordered and is applied: that is the shape of a cut poll over a
  * ledger that has not moved, which is exactly how a filled hole is withdrawn.
+ *
+ * **`force` is the owner's answer, and it is not ordered against anything.**
+ * The watermark exists to order two reads the VIEW issued on its own; it was
+ * never a rule about what a person may ask for. "Reload whole" is a reader
+ * saying take the server's whole current answer over whatever is held, and
+ * behind that guard it did nothing whenever a poll had landed while the reload
+ * was on the wire — the one manual channel out of a wrong view, silently a
+ * no-op. Only that button passes `force`; every automatic read stays ordered.
  */
 export function mergeTrajectory(
   current: TrajectoryDocument | null,
   incoming: TrajectoryDocument,
+  options?: { force?: boolean },
 ): TrajectoryDocument {
   if (!current) {
     return incoming
@@ -56,7 +65,7 @@ export function mergeTrajectory(
 
   const held = latestControlSeq(current)
   const landed = latestControlSeq(incoming)
-  if (held !== null && landed !== null && landed < held) {
+  if (!options?.force && held !== null && landed !== null && landed < held) {
     return { ...current, outputs }
   }
 
@@ -130,23 +139,28 @@ export interface PhaseBand {
  * the same name, carrying the gates decided inside that stretch and the
  * termination that ended it. Keying by name kept only the last entry, so a
  * run that returned to `provision` showed the second visit's gates on the first
- * band and left the visit that actually ended looking unterminated. The Nth
- * band of a name takes the Nth segment of that name; a band no segment names
- * states nothing rather than borrowing another visit's ending.
+ * band and left the visit that actually ended looking unterminated.
+ *
+ * The two lists are aligned by WALKING them, not by counting names. `phases[]`
+ * states segments the turns cannot account for — a gate bands a phase no turn
+ * has entered, a transition opens a segment the run leaves before acting in it
+ * — and taking "the Nth segment named X for the Nth band named X" let one such
+ * segment shift every later band of that name along by one: the band was handed
+ * a visit that carried no turn, showing a termination and gates decided
+ * somewhere else, or none at all. Each band instead takes the next segment of
+ * its name at or after the last one claimed, so a segment no band reaches is
+ * passed over rather than handed to the next comer. A band with no segment
+ * ahead of it states nothing rather than borrowing another visit's ending.
+ *
+ * What no walk can settle is two segments of the SAME name in a row where only
+ * one is a band's: nothing in the document tells them apart, and the first is
+ * taken.
  */
 export function bandTurns(doc: TrajectoryDocument): PhaseBand[] {
-  const segments = new Map<string, TrajectoryPhase[]>()
-  for (const phase of doc.phases) {
-    const held = segments.get(phase.name)
-    if (held) {
-      held.push(phase)
-    } else {
-      segments.set(phase.name, [phase])
-    }
-  }
-
   const bands: PhaseBand[] = []
   const seen = new Map<string, number>()
+  // How far into `doc.phases` the walk has already claimed.
+  let claimed = 0
 
   for (const turn of [...doc.turns].sort((a, b) => a.turn_id - b.turn_id)) {
     const last = bands[bands.length - 1]
@@ -156,7 +170,16 @@ export function bandTurns(doc: TrajectoryDocument): PhaseBand[] {
     }
     const ordinal = (seen.get(turn.phase) ?? 0) + 1
     seen.set(turn.phase, ordinal)
-    const segment = segments.get(turn.phase)?.[ordinal - 1] ?? null
+
+    let at = claimed
+    while (at < doc.phases.length && doc.phases[at].name !== turn.phase) {
+      at += 1
+    }
+    const segment = at < doc.phases.length ? doc.phases[at] : null
+    if (segment) {
+      claimed = at + 1
+    }
+
     bands.push({
       key: `${turn.phase}#${ordinal}`,
       name: turn.phase,

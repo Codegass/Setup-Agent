@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { TrajectoryDocument } from "@/api/types"
+import reduced from "@/test/fixtures/empty-segment/trajectory.json"
 
 import { TrajectoryTimeline } from "./TrajectoryTimeline"
 
@@ -99,6 +100,29 @@ describe("TrajectoryTimeline", () => {
     const band = screen.getByRole("group", { name: /phase build/i })
     expect(within(band).getByText("advance")).toBeInTheDocument()
     expect(screen.getByRole("group", { name: /phase test/i })).toBeInTheDocument()
+  })
+
+  it("draws the reducer's own banding, segments no turn carries included", () => {
+    // End to end over `sag trajectory`'s answer for the ledger committed at
+    // `src/test/fixtures/empty-segment/`: the reducer states four segments —
+    // provision, an EMPTY build banded by an orphan gate revision, analyze, and
+    // the build the run actually worked in — and three bands' worth of turns.
+    // The build band must show how the visit its turns are in ended.
+    render(<TrajectoryTimeline doc={reduced as unknown as TrajectoryDocument} />)
+
+    const bands = screen.getAllByRole("group")
+    expect(bands.map((band) => band.getAttribute("aria-label"))).toEqual([
+      "Phase provision",
+      "Phase analyze",
+      "Phase build",
+    ])
+
+    const build = screen.getByRole("group", { name: /phase build/i })
+    expect(within(build).getByText("evidence_close")).toBeInTheDocument()
+    expect(within(build).getByText("1 gate")).toBeInTheDocument()
+    expect(within(build).getByText("2 turns")).toBeInTheDocument()
+    // No band claims a re-entry: the run entered `build` once with turns in it.
+    expect(screen.queryByText(/re-entry/i)).not.toBeInTheDocument()
   })
 
   it("styles a controller turn differently from a model turn", () => {
