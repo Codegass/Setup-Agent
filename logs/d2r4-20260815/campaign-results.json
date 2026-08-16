@@ -1,0 +1,140 @@
+[
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "camel",
+    "seconds": 1677
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "camel-quarkus",
+    "seconds": 1138
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "cassandra-java-driver",
+    "seconds": 695
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "cayenne",
+    "seconds": 622
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "commons-dbcp",
+    "seconds": 413
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "freemarker",
+    "seconds": 299
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "geode",
+    "seconds": 564
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "gora",
+    "seconds": 325
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "httpcomponents-client",
+    "seconds": 420
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "ignite",
+    "seconds": 571
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "jackrabbit",
+    "seconds": 297
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "kafka",
+    "seconds": 894
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "kogito-examples",
+    "seconds": 631
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "lucene",
+    "seconds": 329
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "ofbiz-plugins",
+    "seconds": 190
+  },
+  {
+    "exit_code": 1,
+    "lane": "H",
+    "project": "polaris",
+    "seconds": 611
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "rocketmq-externals",
+    "seconds": 183
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "samza",
+    "seconds": 1416
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "samza-hello-samza",
+    "seconds": 556
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "seatunnel-web",
+    "seconds": 799
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "spark-kubernetes-operator",
+    "seconds": 359
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "tapestry-5",
+    "seconds": 450
+  },
+  {
+    "exit_code": 1,
+    "lane": "L",
+    "project": "tomcat-jakartaee-migration",
+    "seconds": 246
+  }
+]
