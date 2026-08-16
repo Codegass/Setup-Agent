@@ -14,7 +14,8 @@ class ProjectTool(BaseTool):
             name="project",
             description=(
                 "Project lifecycle: action = clone (repo_url[, ref]) | "
-                "provision (install toolchain: java_version for a JDK, packages for apt) | "
+                "provision (install toolchain: java_version for a JDK, maven_version for an "
+                "Apache Maven distribution, packages for apt) | "
                 "analyze (survey the project; persist build facts) | "
                 "env (validate, register, and activate a runtime executable; "
                 "tool + executable [+ env])."
@@ -90,9 +91,33 @@ class ProjectTool(BaseTool):
             kwargs.setdefault("action", "clone")
             return delegate.execute(**kwargs)
         if verb == "provision":
-            # SystemTool's verbs are its own action vocabulary:
-            # install_java for JDKs, install for apt packages.
-            if "packages" in kwargs and "java_version" not in kwargs:
+            # SystemTool's verbs are its own action vocabulary: install_java
+            # for JDKs, install_maven for an Apache Maven distribution, install
+            # for apt packages. One call routes to exactly one of them, so a
+            # call naming two toolchains is refused rather than silently
+            # dropping one — a provision that seals a toolchain it never
+            # installed is the failure mode this whole path exists to avoid.
+            if "java_version" in kwargs and "maven_version" in kwargs:
+                return ToolResult.completed_failure(
+                    output="",
+                    error=(
+                        "project(action='provision') installs one toolchain per call: "
+                        "java_version and maven_version were both supplied"
+                    ),
+                    error_code="PROJECT_PROVISION_AMBIGUOUS",
+                    suggestions=[
+                        "Call project(action='provision', java_version=...) for the JDK",
+                        "Call project(action='provision', maven_version=...) for Apache Maven",
+                    ],
+                    raw_data={
+                        "action": "provision",
+                        "java_version": kwargs.get("java_version"),
+                        "maven_version": kwargs.get("maven_version"),
+                    },
+                )
+            if "maven_version" in kwargs:
+                kwargs.setdefault("action", "install_maven")
+            elif "packages" in kwargs and "java_version" not in kwargs:
                 kwargs.setdefault("action", "install")
             else:
                 kwargs.setdefault("action", "install_java")
@@ -164,6 +189,14 @@ class ProjectTool(BaseTool):
                 "ref": {"type": "string", "description": "clone: git ref (optional)"},
                 "project_path": {"type": "string", "description": "analyze: project directory"},
                 "java_version": {"type": "string", "description": "provision: JDK version"},
+                "maven_version": {
+                    "type": "string",
+                    "description": (
+                        "provision: Apache Maven version floor, spelled major[.minor[.patch]] "
+                        "(for example '3.9'). Installs the distribution under /opt, activates "
+                        "it, and verifies mvn -version in the domain dispatches resolve."
+                    ),
+                },
                 "packages": {"type": "array", "description": "provision: apt packages to install"},
                 "tool": {
                     "type": "string",

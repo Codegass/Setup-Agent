@@ -16,14 +16,13 @@ from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
 from .java_versions import java_major, names_bare_java_major
+from .maven_versions import parse_maven_version
 from .toolchain_manager import (
     ToolchainManager,
     ToolVersionRequirement,
     record_registered_runtime,
 )
 
-_MAVEN_VERSION_RE = re.compile(r"(?:^|\n)\s*Apache Maven\s+([0-9]+(?:\.[0-9]+){0,3})\b")
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _MAVEN_RUNTIME_ROOT_GROUPS = (
     ("/workspace",),
     ("/tmp",),
@@ -1217,8 +1216,8 @@ class EnvTool(BaseTool):
                 unusable="the runtime at this path fails its own version probe",
             )
 
-        match = _MAVEN_VERSION_RE.search(_ANSI_ESCAPE_RE.sub("", output))
-        if not match:
+        measured_version = parse_maven_version(output)
+        if not measured_version:
             return None, self._count_refusal(
                 ToolResult.completed_failure(
                     output=output,
@@ -1235,7 +1234,6 @@ class EnvTool(BaseTool):
                 unusable="the runtime at this path is not Apache Maven",
             )
 
-        measured_version = match.group(1)
         failed_requirement = self._unsatisfied_requirement(
             "maven",
             measured_version,

@@ -746,6 +746,30 @@ def test_a_model_asserted_requirement_is_not_reported_as_binding_on_any_retry():
     ), "a parameter the next call may omit does not bind the next call"
 
 
+def test_the_requirement_refusal_names_the_provision_that_holds_it():
+    """Task #61. The install exit used to read "download the distribution with
+    bash, then project(action='env', ...)" — a two-step the model has to
+    assemble, and the reason camel's run passed `maven_version` zero times.
+    `project(action='provision', maven_version=...)` is now the one call that
+    installs, activates and verifies it, so the refusal names THAT."""
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager)
+
+    provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
+    assert provision, "the refusal names the provision that holds the requirement"
+    assert "maven_version='3.9'" in provision[0], "with the floor the requirement states"
+
+
+def test_the_provision_exit_carries_the_floor_of_an_exact_requirement():
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager, requirement="3.9.6")
+
+    provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
+    assert provision and "maven_version='3.9.6'" in provision[0]
+
+
 def test_a_project_observed_requirement_keeps_binding_and_offers_no_drop_exit():
     """The exit is honest only because the requirement is the model's own. A
     constraint the project or a build error established is not lifted by

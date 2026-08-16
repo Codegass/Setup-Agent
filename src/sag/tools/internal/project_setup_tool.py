@@ -11,13 +11,15 @@ from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import PythonPreflight, read_live_build_requirements
+from .maven_versions import MAVEN_PROVISION_VERSION
 from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
 from .python_env import detect_installer, ensure_venv_pip, venv_repair_note
 
-# Standalone Maven version provisioned when a project enforces a minimum greater
-# than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
-# requireMavenVersion enforcement without waiting for build failures.
-MAVEN_PROVISION_VERSION = "3.9.9"
+# MAVEN_PROVISION_VERSION, imported above, is the standalone Maven this file
+# installs when a project enforces a minimum greater than the base image's
+# Maven (typically 3.8.7). It lives in `maven_versions` with the other
+# distributions `project(action='provision', maven_version=...)` can install,
+# so the two provisioning paths cannot drift to different tarballs.
 
 # Build-file basenames that mark a JVM (Java) binding when they appear in a
 # SUBDIRECTORY of a python-primary repo (e.g. TVM's jvm/pom.xml). Detecting one

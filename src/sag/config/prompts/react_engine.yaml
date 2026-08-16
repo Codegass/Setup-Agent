@@ -99,7 +99,7 @@ initial_system:
       • Long builds enter a controller-owned job barrier; waiting and settlement are automatic - do not poll or start other work
     - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
       • clone: Clone the repository (repo_url, optional ref)
-      • provision: Install system packages and JDKs (java_version for a JDK, packages for apt)
+      • provision: Install system toolchains (java_version for a JDK, maven_version for an Apache Maven distribution, packages for apt) — one toolchain per call
       • env: Validate, register, and activate installed/proven executables atomically so build, bash, validation, and report flows share the same runtime path
         - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime instead
         - Do not use project(action='env') to rewrite project build configuration; follow project build files as source of truth

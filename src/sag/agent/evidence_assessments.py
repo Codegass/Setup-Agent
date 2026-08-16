@@ -67,6 +67,7 @@ from sag.agent.invocation_receipts import (
     receipt_record_scope,
     validate_receipt_v2,
 )
+from sag.tools.internal.maven_versions import parse_maven_version, satisfies_maven_floor
 from sag.utils.container_io import (
     WRITE_COMPARE_CONFLICT,
     compare_publish_container_text_atomic,
@@ -1350,6 +1351,7 @@ def assess_dispatch(
     assessments.extend(capability_absences(receipt))
     assessments.extend(dependency_incompatibilities(receipt))
     assessments.extend(java_version_mismatch(receipt, output))
+    assessments.extend(maven_extension_incompatibility(receipt, output))
     return [assessment for assessment in assessments if write_assessment(execute, assessment)]
 
 
@@ -1381,6 +1383,83 @@ def java_version_mismatch(
             )
         ]
     return []
+
+
+def maven_extension_incompatibility(
+    receipt: Optional[Mapping[str, Any]],
+    output: Optional[str],
+) -> List[ReceiptAssessment]:
+    """`maven_extension_incompatible` when a build extension crashed on the resolver API.
+
+    Live camel d2r4 (`logs/d2r4-20260815/slices/camel.md` slice 5, receipt
+    `inv-maven-1-0420ee7725d8-0002`): the reactor printed `BUILD SUCCESS` and
+    then died —
+
+        Exception in thread "main" java.lang.NoSuchMethodError: 'java.lang.Object
+        org.eclipse.aether.SessionData.computeIfAbsent(...)'
+            at eu.maveniverse.maven.nisse.extension3.internal.NissePropertyInliner...
+            at org.apache.maven.DefaultMaven.afterSessionEnd(DefaultMaven.java:360)
+
+    exit 1, no report paths, `compiled_classes 0`. The repo pins those
+    extensions; apt's Maven 3.8.7 ships the older `maven-resolver` that has no
+    such method. Nothing in the run typed the failure, so nothing could propose
+    a repair, and the phase closed blocked with the model calling it an
+    "external toolchain/plugin incompatibility" — which it is, and which one
+    call now fixes.
+
+    The remedy is a version move, so it is withheld when the text states a
+    Maven that already clears the floor: the same crash there means something
+    else, and naming this provision for it would be inventing a diagnosis.
+    """
+    identifier = _text((receipt or {}).get("receipt_id"))
+    text = str(output or "")
+    if not identifier or not text:
+        return []
+    missing = _RESOLVER_NO_SUCH_METHOD.search(text)
+    if not missing:
+        return []
+    running = parse_maven_version(text)
+    if running and satisfies_maven_floor(running, MAVEN_EXTENSION_REMEDY_FLOOR):
+        return []
+    frame = _MAVEN_EXTENSION_FRAME.search(text)
+    if not frame:
+        return []
+    extension = ".".join(frame.group(1).split(".")[:_EXTENSION_COORDINATE_SEGMENTS])
+    return [
+        ReceiptAssessment(
+            receipt_id=identifier,
+            typed_code=MAVEN_EXTENSION_INCOMPATIBLE_CODE,
+            detail=(
+                f"maven extension {extension} hit NoSuchMethodError on {missing.group(1)}; "
+                f"project(action='provision', maven_version='{MAVEN_EXTENSION_REMEDY_FLOOR}')"
+            ),
+        )
+    ]
+
+
+# A build extension calling into `org.eclipse.aether` — the Maven resolver API
+# — and finding the method absent is a resolver-version fact, not a project
+# fact: the extension was compiled against a newer Maven than the one running
+# it. Any other NoSuchMethodError is ordinary project breakage and is left
+# alone.
+_RESOLVER_NO_SUCH_METHOD = re.compile(
+    r"NoSuchMethodError[^\n]*?(org\.eclipse\.aether\.[A-Za-z0-9_.$]+)\.[A-Za-z0-9_$]+\("
+)
+# The first stack frame beneath the JDK/Maven-core/plexus layer names who
+# called it. That is the extension, in its own coordinates.
+_MAVEN_EXTENSION_FRAME = re.compile(
+    r"\n\s*at ((?!java\.|jdk\.|javax\.|sun\.|org\.apache\.maven\.|org\.codehaus\.plexus\.)"
+    r"[a-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_$]+)+)\.[A-Za-z0-9_$]+\("
+)
+# Package segments kept when naming the extension: enough to identify the
+# project (`eu.maveniverse.maven.nisse`), not the internal class path.
+_EXTENSION_COORDINATE_SEGMENTS = 4
+# Maven 3.9 is the first line whose bundled maven-resolver carries the
+# `SessionData.computeIfAbsent` API these extensions are built against (camel's
+# own wrapper pins a 3.9 distribution). It is the floor the remedy names, and
+# the reason the remedy is withheld once a 3.9+ Maven is what ran.
+MAVEN_EXTENSION_REMEDY_FLOOR = "3.9"
+MAVEN_EXTENSION_INCOMPATIBLE_CODE = "maven_extension_incompatible"
 
 
 def _first_major(pattern: Any, text: str) -> Optional[int]:

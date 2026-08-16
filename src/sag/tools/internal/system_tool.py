@@ -9,6 +9,14 @@ from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
 from .java_versions import JAVA_VERIFICATION_SEPARATOR, java_major, parse_java_verification
+from .maven_versions import (
+    maven_distribution_for_floor,
+    maven_installable_floors,
+    normalize_maven_floor,
+    parse_maven_version,
+    satisfies_maven_floor,
+)
+from .toolchain_manager import record_registered_runtime
 
 # The verification a provision must pass is the one a dispatch would run: bare
 # `java` and `javac`, resolved through the same environment DockerOrchestrator
@@ -18,6 +26,14 @@ JAVA_DOMAIN_VERIFICATION = (
     "command -v java 2>/dev/null; "
     f"java -version 2>&1 && echo '{JAVA_VERIFICATION_SEPARATOR}' && javac -version 2>&1"
 )
+# The same law for Maven: bare `mvn`, resolved exactly as a dispatch resolves
+# it, plus the path that answered.
+MAVEN_DOMAIN_VERIFICATION = "command -v mvn 2>/dev/null; mvn -version 2>&1"
+# Apache publishes every Maven 3 binary distribution here. The containers this
+# harness runs clone repositories over the network from the same place a build
+# downloads its plugins, so a distribution is as reachable as a POM.
+MAVEN_ARCHIVE_BASE = "https://archive.apache.org/dist/maven"
+MAVEN_INSTALL_ROOT = "/opt"
 
 
 class SystemTool(BaseTool):
@@ -32,7 +48,11 @@ class SystemTool(BaseTool):
         self.docker_orchestrator = docker_orchestrator
 
     def execute(
-        self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None
+        self,
+        action: str,
+        packages: Optional[List[str]] = None,
+        java_version: Optional[str] = None,
+        maven_version: Optional[str] = None,
     ) -> ToolResult:
         """Execute system management operations."""
         # The base class now handles parameter validation automatically
@@ -44,9 +64,10 @@ class SystemTool(BaseTool):
             "install_missing",
             "install_java",
             "verify_java",
+            "install_maven",
         ]:
             raise ToolError(
-                message=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', 'install_java', or 'verify_java'",
+                message=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', 'install_java', 'install_maven', or 'verify_java'",
                 category="validation",
                 error_code="INVALID_ACTION",
                 suggestions=[
@@ -55,6 +76,7 @@ class SystemTool(BaseTool):
                     "Use 'detect_missing' to check for missing dependencies",
                     "Use 'install_missing' to automatically install missing dependencies",
                     "Use 'install_java' to install and configure a specific Java version",
+                    "Use 'install_maven' to install and activate a specific Maven version",
                     "Use 'verify_java' to check the current Java version",
                 ],
                 details={
@@ -65,6 +87,7 @@ class SystemTool(BaseTool):
                         "detect_missing",
                         "install_missing",
                         "install_java",
+                        "install_maven",
                         "verify_java",
                     ],
                 },
@@ -108,6 +131,20 @@ class SystemTool(BaseTool):
                         retryable=True,
                     )
                 return self._install_and_configure_java(java_version)
+
+            elif action == "install_maven":
+                if not maven_version:
+                    raise ToolError(
+                        message="Maven version is required for 'install_maven' action",
+                        category="validation",
+                        error_code="MISSING_VERSION",
+                        suggestions=[
+                            "Constraint: Maven provisioning requires an explicit maven_version",
+                            f"Observed installable Maven lines: {maven_installable_floors()}",
+                        ],
+                        retryable=True,
+                    )
+                return self._install_and_configure_maven(maven_version)
 
             elif action == "verify_java":
                 if not java_version:
@@ -592,6 +629,286 @@ class SystemTool(BaseTool):
             },
         )
 
+    def _install_and_configure_maven(self, maven_version: str) -> ToolResult:
+        """Install an Apache Maven distribution and make it the resolved runtime.
+
+        The wall this answers, twice over in d2r4. camel
+        (`logs/d2r4-20260815/slices/camel.md`): the repo pins the
+        `eu.maveniverse.maven.nisse` 0.8.4 build extensions, the container ran
+        apt's Maven 3.8.7, and the reactor printed BUILD SUCCESS and then died
+        with `NoSuchMethodError: org.eclipse.aether.SessionData.computeIfAbsent`
+        — exit 1, no reports, `compiled_classes 0`. jackrabbit and gora asked
+        for `[3.9,)` against the same 3.8.7. No call existed that could install
+        another Maven, so `maven_version` appears zero times in camel's entire
+        control-events file.
+
+        The discipline is task #59's, unchanged: probe the exact binary by path
+        before anything moves, land the switch in the persisted overlay —
+        DockerOrchestrator derives every project command's environment from it
+        — and verify with a bare `mvn` resolved exactly as a dispatch resolves
+        it. An activation the domain does not answer for is a refusal.
+        """
+        floor = normalize_maven_floor(maven_version)
+        if floor is None:
+            return ToolResult.completed_failure(
+                output="",
+                error=f"Maven version is not a version floor: {maven_version!r}",
+                error_code="MAVEN_VERSION_INVALID",
+                suggestions=[
+                    "Constraint: maven_version is a floor spelled major[.minor[.patch]], "
+                    "for example '3.9'",
+                    f"Observed installable Maven lines: {maven_installable_floors()}",
+                ],
+                metadata={"requested_maven_version": maven_version},
+            )
+        distribution = maven_distribution_for_floor(floor)
+        if distribution is None:
+            return ToolResult.completed_failure(
+                output="",
+                error=f"No Apache Maven distribution is known for floor {floor}",
+                error_code="MAVEN_DISTRIBUTION_UNKNOWN",
+                suggestions=[
+                    f"Observed installable Maven lines: {maven_installable_floors()}",
+                    "Constraint: a floor naming an exact patch (for example '3.9.11') "
+                    "installs exactly that distribution",
+                ],
+                metadata={"maven_version_floor": floor},
+            )
+
+        # What the container already resolves, asked the way a dispatch asks.
+        # A Maven that already satisfies the floor is the provision's answer;
+        # downloading over it would swap a working runtime for no reason.
+        current = self.docker_orchestrator.execute_command(MAVEN_DOMAIN_VERIFICATION)
+        active_version = parse_maven_version(current.get("output"))
+        if active_version and satisfies_maven_floor(active_version, floor):
+            return ToolResult.completed_success(
+                output=f"Maven {active_version} already satisfies {floor}\n\n"
+                f"Verification:\n{current.get('output', '')}",
+                metadata={
+                    "maven_version": active_version,
+                    "maven_version_floor": floor,
+                    "already_active": True,
+                    "verified_maven_version": active_version,
+                    "resolved_maven_executable": self._resolved_executable(
+                        current.get("output", "")
+                    ),
+                },
+            )
+
+        maven_home = f"{MAVEN_INSTALL_ROOT}/apache-maven-{distribution}"
+        maven_bin = f"{maven_home}/bin/mvn"
+        archive = f"/tmp/apache-maven-{distribution}-bin.tar.gz"
+        major = distribution.split(".")[0]
+        url = (
+            f"{MAVEN_ARCHIVE_BASE}/maven-{major}/{distribution}/binaries/"
+            f"apache-maven-{distribution}-bin.tar.gz"
+        )
+        install_result = self.docker_orchestrator.execute_command(
+            f"mkdir -p {MAVEN_INSTALL_ROOT} && "
+            f"(curl -fsSL {url} -o {archive} || wget -qO {archive} {url}) && "
+            f"tar -xzf {archive} -C {MAVEN_INSTALL_ROOT}"
+        )
+        if install_result.get("exit_code") != 0:
+            return ToolResult.completed_failure(
+                output=install_result.get("output", ""),
+                error=f"Failed to install Apache Maven {distribution}",
+                error_code="MAVEN_INSTALL_FAILED",
+                suggestions=[
+                    f"Observed fact: the distribution at {url} was not downloaded and extracted",
+                    "Relevant constraints: container network reachability and writable /opt",
+                ],
+                metadata={
+                    "maven_version_floor": floor,
+                    "requested_distribution": distribution,
+                    "distribution_url": url,
+                },
+            )
+
+        present = self.docker_orchestrator.execute_command(f"test -x {maven_bin} && echo 'present'")
+        if "present" not in present.get("output", ""):
+            return ToolResult.completed_failure(
+                output=present.get("output", ""),
+                error=f"Apache Maven {distribution} was installed but exposes no {maven_bin}",
+                error_code="MAVEN_BINARY_NOT_FOUND",
+                suggestions=[
+                    "Observed fact: the extracted distribution has no executable bin/mvn",
+                    f"Observed candidate MAVEN_HOME: {maven_home}",
+                ],
+                metadata={"maven_version_floor": floor, "maven_home": maven_home},
+            )
+
+        # What the exact binary says about itself, asked by path, before
+        # anything is switched. A refusal here leaves the container as found.
+        probe_result = self.docker_orchestrator.execute_command(f"{maven_bin} -version 2>&1")
+        if probe_result.get("exit_code") != 0:
+            return ToolResult.completed_failure(
+                output=probe_result.get("output", ""),
+                error=f"Apache Maven {distribution} installed but verification failed",
+                error_code="MAVEN_CONFIG_FAILED",
+                suggestions=[
+                    "Observed fact: the installed Maven failed its own post-install probe",
+                    f"Observed candidate MAVEN_HOME: {maven_home}",
+                ],
+                metadata={"maven_version_floor": floor, "maven_home": maven_home},
+            )
+        contradiction = self._maven_verification_contradiction(
+            floor,
+            maven_home,
+            probe_result.get("output", ""),
+        )
+        if contradiction is not None:
+            return contradiction
+
+        activation_failure = self._activate_maven_runtime(
+            maven_home,
+            maven_bin,
+            parse_maven_version(probe_result.get("output")),
+            floor,
+        )
+        if activation_failure is not None:
+            return activation_failure
+
+        verify_result = self.docker_orchestrator.execute_command(MAVEN_DOMAIN_VERIFICATION)
+        contradiction = self._maven_verification_contradiction(
+            floor,
+            maven_home,
+            verify_result.get("output", ""),
+        )
+        if contradiction is not None:
+            return contradiction
+
+        observed = parse_maven_version(verify_result.get("output"))
+        return ToolResult.completed_success(
+            output=f"Successfully installed and activated Apache Maven {observed} "
+            f"for floor {floor}\n\n"
+            f"MAVEN_HOME: {maven_home}\n"
+            f"Verification:\n{verify_result.get('output', '')}",
+            metadata={
+                "maven_version": observed,
+                "maven_version_floor": floor,
+                "maven_home": maven_home,
+                "distribution_url": url,
+                "verified_maven_version": observed,
+                "resolved_maven_executable": self._resolved_executable(
+                    verify_result.get("output", "")
+                ),
+                "already_active": False,
+            },
+        )
+
+    def _maven_verification_contradiction(
+        self,
+        floor: str,
+        maven_home: str,
+        verification_output: str,
+    ) -> Optional[ToolResult]:
+        """Refuse the seal when the verification block does not confirm the floor.
+
+        Two ways it can go unproven, and they are the same refusal: a block
+        naming a version below the floor — jackrabbit's 3.8.7 answering for
+        `[3.9,)` — and a block naming no Maven at all.
+        """
+        observed = parse_maven_version(verification_output)
+        stored_output = (
+            f"Maven {floor} was requested\n\n"
+            f"MAVEN_HOME: {maven_home}\n"
+            f"Verification:\n{verification_output}"
+        )
+        metadata = {
+            "maven_version_floor": floor,
+            "maven_home": maven_home,
+            "verified_maven_version": observed,
+        }
+        if not observed:
+            return ToolResult.completed_failure(
+                output=stored_output,
+                error=(
+                    f"Maven {floor} installation is unverified: its own verification "
+                    "block names no version"
+                ),
+                error_code="MAVEN_VERSION_UNVERIFIED",
+                suggestions=[
+                    "Observed fact: mvn -version named no Apache Maven version",
+                    f"Observed candidate MAVEN_HOME: {maven_home}",
+                    f"Constraint: the active runtime must be observed to report Maven >= {floor}",
+                ],
+                metadata=metadata,
+            )
+        if satisfies_maven_floor(observed, floor):
+            return None
+        return ToolResult.completed_failure(
+            output=stored_output,
+            error=f"Maven provisioning claimed {floor} but its verification reports {observed}",
+            error_code="MAVEN_VERSION_VERIFICATION_MISMATCH",
+            suggestions=[
+                f"Observed fact: verification under MAVEN_HOME={maven_home} reported "
+                f"Maven {observed}",
+                f"Constraint: the requested Maven floor is {floor}",
+                "Observed fact: a distribution can be installed while the mvn the domain "
+                "resolves is another one — the resolved executable is what a build runs",
+            ],
+            metadata=metadata,
+        )
+
+    def _activate_maven_runtime(
+        self,
+        maven_home: str,
+        maven_bin: str,
+        version: Optional[str],
+        floor: str,
+    ) -> Optional[ToolResult]:
+        """Make the proven distribution the Maven this container resolves.
+
+        The overlay is the resolution domain and the registry is the durable
+        runtime inventory resolution and reporting read; a registration that
+        reaches only one of them cannot reach the build. The registry write is
+        best effort — it never fails a switch that landed where it matters.
+        """
+        try:
+            EnvOverlayStore(self.docker_orchestrator).register(
+                "maven",
+                maven_bin,
+                version=version,
+                source="system_install",
+                env={"MAVEN_HOME": maven_home},
+                path_prepend=[f"{maven_home}/bin"],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register Maven env overlay: {exc}")
+            return ToolResult.completed_failure(
+                output=(
+                    f"Apache Maven {version or floor} was installed at {maven_home} "
+                    f"and not activated\n\n{exc}"
+                ),
+                error=(
+                    f"Apache Maven {version or floor} was installed but its activation "
+                    "did not persist"
+                ),
+                error_code="MAVEN_RUNTIME_ACTIVATION_FAILED",
+                suggestions=[
+                    f"Observed fact: the runtime overlay that resolves mvn did not accept "
+                    f"{maven_bin}",
+                    "Observed fact: until it is activated, every dispatch keeps resolving the "
+                    "previously active Maven",
+                    f"Constraint: a provisioned Maven {floor} must be the runtime later "
+                    "dispatches resolve",
+                ],
+                metadata={
+                    "maven_version_floor": floor,
+                    "maven_home": maven_home,
+                    "activation_error": str(exc),
+                },
+            )
+        record_registered_runtime(
+            self.docker_orchestrator,
+            "maven",
+            maven_bin,
+            version=version,
+            source="registered",
+        )
+        return None
+
     def _persist_java_home_profile(self, java_home: str) -> None:
         """Write the login-shell files. No runner sources them; they are forensic."""
         for command in (
@@ -987,6 +1304,7 @@ class SystemTool(BaseTool):
                         "detect_missing",
                         "install_missing",
                         "install_java",
+                        "install_maven",
                         "verify_java",
                     ],
                     "description": "The system operation to perform",
@@ -1000,6 +1318,14 @@ class SystemTool(BaseTool):
                 "java_version": {
                     "type": "string",
                     "description": "Java version to install or verify (for 'install_java' or 'verify_java' actions)",
+                    "default": None,
+                },
+                "maven_version": {
+                    "type": "string",
+                    "description": (
+                        "Apache Maven version floor to install and activate, spelled "
+                        "major[.minor[.patch]] (for the 'install_maven' action)"
+                    ),
                     "default": None,
                 },
             },

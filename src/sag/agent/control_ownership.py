@@ -37,6 +37,7 @@ _PROJECT_CODE_PREFIXES = (
     "dependency_incompatible_",
     "falsifier_",
     "java_version_mismatch",
+    "maven_extension_incompatible",
     "semantic_failure",
 )
 _PROJECT_CODES = frozenset({"expectation_unmet"})

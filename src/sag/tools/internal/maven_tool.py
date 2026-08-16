@@ -41,6 +41,7 @@ from .build_utils import (
 )
 from .command_tracker import CommandTracker
 from .dispatch_argv import maven_action_tokens
+from .maven_versions import floor_from_requirement
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
 # The reactor summary Maven prints at the end of every multi-module build:
@@ -1847,17 +1848,21 @@ class MavenTool(BaseTool):
         true: the next call may simply omit it. The model searched for a wrapper
         that did not exist and blocked the phase.
 
-        Both named exits were verified against the engine before being written.
+        Every named exit was verified against the engine before being written.
         Omitting the parameter leaves `contract_requirement` empty when nothing
         is persisted, and resolution then accepts the registered candidate —
-        which is what the requirement-free resolution above just proved. And
-        `project(action='env', tool='maven', executable=..., requirement=...)`
-        is the registration path that canonicalizes a distribution's bin/mvn
-        under /opt, /tmp, /usr or /workspace, probes `-version`, and enforces
-        the very requirement being held. No move is offered that would install
-        the wrong version: `project(action='provision', packages=['maven'])` is
-        deliberately NOT named here, because apt is what already produced the
-        3.8.7 that fails this constraint.
+        which is what the requirement-free resolution above just proved.
+        `project(action='provision', maven_version=<floor>)` (task #61) is the
+        one call that installs an Apache distribution for that floor under
+        /opt, activates it in the runtime overlay, and verifies `mvn -version`
+        in the domain later dispatches resolve; the floor it is given is the
+        one THIS requirement states. And `project(action='env', tool='maven',
+        executable=..., requirement=...)` registers a distribution that is
+        already on disk, canonicalizing its bin/mvn, probing `-version`, and
+        enforcing the very requirement being held. No move is offered that
+        would install the wrong version: `project(action='provision',
+        packages=['maven'])` is deliberately NOT named here, because apt is
+        what already produced the 3.8.7 that fails this constraint.
         """
         candidate = getattr(registered, "candidate", None)
         metadata: Dict[str, Any] = {
@@ -1893,12 +1898,19 @@ class MavenTool(BaseTool):
                     f"not a project-observed constraint — re-dispatch the same build with "
                     f"maven_version_requirement omitted to run on {stated}"
                 )
+        floor = floor_from_requirement(required_version.raw)
+        if floor:
             suggestions.append(
                 f"To hold {required_version.raw}, install a Maven that satisfies it: "
-                f"download the distribution with bash, then project(action='env', "
-                f"tool='maven', executable='<distribution>/bin/mvn', "
-                f"requirement='{required_version.raw}', activate=True)"
+                f"project(action='provision', maven_version='{floor}') installs the Apache "
+                f"distribution under /opt, activates it, and verifies mvn -version in the "
+                f"domain this build resolves"
             )
+        suggestions.append(
+            f"For a distribution already on disk, register it instead: "
+            f"project(action='env', tool='maven', executable='<distribution>/bin/mvn', "
+            f"requirement='{required_version.raw}', activate=True)"
+        )
         if not model_asserted:
             # True only of a constraint this call did not create: a persisted or
             # runner-observed requirement survives any retry that omits the
