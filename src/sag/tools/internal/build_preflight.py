@@ -1512,6 +1512,53 @@ def classify_version_error(output: str) -> Optional[str]:
     return None
 
 
+# Runner sentences that name the JDK major the build needs, in wordings
+# `_VERSION_ERROR_PATTERNS` does not carry. These are deliberately kept OUT of
+# that list: it authorizes an automatic re-provision, and a false positive there
+# swaps the JDK under a build that was working. Everything below only ever
+# produces a sentence for the model to read, so a looser shape is safe.
+_JAVA_REQUIREMENT_STEERING_PATTERNS = [
+    # Gradle plugin, live geode d2r4 (control_events seq 251, ref
+    # output_241868447b79): "Java version 17 or later required, but was 11.0.31"
+    re.compile(
+        r"java\s+version\s+(\d+)(?:\.\d+)*\s+or\s+(?:later|higher|newer)\s+(?:is\s+)?required",
+        re.IGNORECASE,
+    ),
+    # Gradle launcher script, live lucene d2r4 (ref output_966bb07875a6, the
+    # entire 61-character captured output): "ERROR: java version must be >= 21
+    # and <= 24, your version: 17"
+    re.compile(r"java\s+version\s+must\s+be\s*(?:>=|=>|>|=)?\s*(\d+)", re.IGNORECASE),
+    # The generic self-diagnosis. `evidence_assessments.JAVA_MISMATCH_PATTERNS`
+    # already trusts this exact shape to name the required half of a mismatch.
+    re.compile(r"requires\s+(?:at\s+least\s+)?java\s+(?:version\s+)?(\d+)", re.IGNORECASE),
+]
+
+
+def classify_runner_java_requirement(output: str) -> Optional[str]:
+    """The JDK major a runner said it needs — for steering text only.
+
+    Live geode d2r4: the Gradle plugin said "Java version 17 or later required,
+    but was 11.0.31" through build(action='test'), `classify_version_error`
+    matched nothing, and the model answered by env-registering
+    /usr/lib/jvm/java-17-openjdk-amd64/bin/java on an arm64 host. The engine
+    could read the sentence all along; nothing turned it into the one call that
+    installs a JDK.
+
+    The provisioning set is consulted FIRST so that, when both match, the
+    sentence and any automatic retry name the same major.
+    """
+    if not output:
+        return None
+    needed = classify_version_error(output)
+    if needed:
+        return needed
+    for pattern in _JAVA_REQUIREMENT_STEERING_PATTERNS:
+        match = pattern.search(output)
+        if match:
+            return match.group(1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Python pre-flight (spec 2026-07-07 Component 2): same PreflightOutcome
 # contract as JdkPreflight — check-and-fix, never raises, never blocks.

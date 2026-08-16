@@ -44,6 +44,7 @@ from sag.tools.internal.build_preflight import (
     JdkPreflight,
     active_java_major,
     active_java_runtime,
+    classify_runner_java_requirement,
     classify_version_error,
     read_live_build_requirements,
 )
@@ -1034,6 +1035,10 @@ class BuildTool(BaseTool):
                                 contract = retry_contract
                                 inner = actual_executions[-1].result
 
+        steering = self._java_provision_steering(inner, outcome, jdk_retry_meta)
+        if steering:
+            preamble_lines.append(steering)
+
         # --- contract-vs-receipt assessment (Plan 6 Stage C, spec §C5) ------
         # What the dispatch MEANT is decided here, against the contract that
         # authorized it — never inside the runner, which only knows what it did.
@@ -1063,6 +1068,53 @@ class BuildTool(BaseTool):
             jdk_retry_meta,
             contract,
         ).with_execution_trace(actual_executions)
+
+    @staticmethod
+    def _java_provision_steering(
+        inner: ToolResult,
+        outcome: Any,
+        jdk_retry: Optional[Dict[str, Optional[str]]],
+    ) -> str:
+        """One sentence when a runner named its JDK and the engine did not move.
+
+        Live geode d2r4: `build(action='test')` came back with the Gradle
+        plugin's own "Java version 17 or later required, but was 11.0.31", the
+        bounded retry above recognized no such wording, and the observation said
+        nothing about it. The model's next call was `project(action='env',
+        tool='gradle', executable='/usr/lib/jvm/java-17-openjdk-amd64/bin/java')`
+        — a guessed amd64 path on an arm64 host — while
+        `project(action='provision', java_version='17')`, the same call that had
+        installed Java 11 in that very run, was never tried.
+
+        It stays a sentence. Widening the automatic re-provision to these looser
+        wordings would let a stray phrase swap the JDK under a working build;
+        naming the call costs nothing and cannot corrupt runtime state. It is
+        withheld in the two cases where it would be false: a retry that already
+        moved to that major has done the thing, and a runtime that already IS
+        that major failed for some other reason.
+        """
+        if outcome is None or inner is None or inner.succeeded:
+            return ""
+        failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
+        needed = classify_runner_java_requirement(failure_text)
+        if not needed:
+            return ""
+        if jdk_retry and str(jdk_retry.get("to") or "") == needed:
+            return ""
+        active = str(getattr(outcome, "active_version", "") or "")
+        if active and active == needed:
+            return ""
+        # The prose and the typed fact are one statement: `_envelope` copies this
+        # metadata onto the result, so what the sentence says is assertable
+        # without reading the sentence.
+        inner.metadata["runner_java_requirement"] = {
+            "required_major": needed,
+            "source": "runner_output",
+        }
+        return (
+            f"[toolchain] the runner states it requires Java {needed}; provision it with "
+            f"project(action='provision', java_version='{needed}') and re-dispatch this build."
+        )
 
     # --- typed native affordance (spec §C8) ---------------------------------
 

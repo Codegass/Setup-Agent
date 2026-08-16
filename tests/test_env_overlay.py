@@ -1559,6 +1559,152 @@ def test_without_a_wrapper_the_refusal_still_routes_to_provision():
 
 
 # ---------------------------------------------------------------------------
+# Task #60 shape (a): a toolchain refusal that can see build coordinates names
+# the dispatch, because the dispatch is what acquires the toolchain.
+#
+# ignite d2r4 (logs/d2r4-20260815/slices/ignite.md): four env registrations for
+# one Maven — /usr/bin/mvn, the checkout's own ./mvnw, a /tmp/mvnshim/mvn
+# symlink to it, and /workspace/ignite/bin/mvn — and the run sealed
+# compiled_classes 0. ignite d2r3, same repo and ref, answered the SAME
+# ENV_EXECUTABLE_NOT_FOUND by dispatching build(action='compile'): the engine
+# ran the wrapper with _env_preflight:false, published env-overlay revision 2
+# itself (evidence_publication control-000169), auto-installed JDK 11 and
+# sealed 8,562 .class files. The move was always there; nothing named it.
+# ---------------------------------------------------------------------------
+
+IGNITE_WRAPPER = "/workspace/ignite/mvnw"
+
+
+class _IgniteCheckoutOrchestrator(FakeEnvOverlayOrchestrator):
+    """The d2r4 ignite container: the checkout ships ./mvnw, which canonicalizes
+    to a name Maven registration cannot accept."""
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        if command.startswith("find ") and "mvnw" in command:
+            self.commands.append((command, workdir, timeout))
+            return {"success": True, "output": f"{IGNITE_WRAPPER}\n", "exit_code": 0}
+        return super().execute_command(command, workdir, timeout)
+
+
+class _JackrabbitCheckoutOrchestrator(FakeEnvOverlayOrchestrator):
+    """The d2r4 jackrabbit container: no wrapper anywhere under the checkout
+    (the model's own search proved it), a Maven reactor root on disk, and
+    /usr/bin/mvn absent until apt installs it."""
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        if command.startswith(("test -x ", "realpath -e -- ")):
+            self.commands.append((command, workdir, timeout))
+            return {"success": False, "output": "", "exit_code": 1}
+        if command.startswith("find ") and "pom.xml" in command:
+            self.commands.append((command, workdir, timeout))
+            return {
+                "success": True,
+                "output": "/workspace/jackrabbit/pom.xml\n",
+                "exit_code": 0,
+            }
+        return super().execute_command(command, workdir, timeout)
+
+
+def _dispatch_move(result):
+    """The one suggestion that names a build dispatch, or ''."""
+    return next((s for s in (result.suggestions or ()) if "build(action=" in s), "")
+
+
+def test_a_wrapper_that_cannot_be_registered_names_the_dispatch_that_needs_no_registration():
+    """ignite d2r4 seq 25: `env register /workspace/ignite/mvnw` was refused
+    ENV_MAVEN_EXECUTABLE_NAME_MISMATCH with one suggestion — "Register the
+    distribution's exact canonical bin/mvn path" — which is a path this
+    container does not have. The refusal must name the call that ends the wall
+    instead: the dispatch, whose own pre-flight acquires the toolchain."""
+    tool = EnvTool(_IgniteCheckoutOrchestrator())
+
+    result = tool.execute(
+        action="register", tool="maven", executable=IGNITE_WRAPPER, activate=True
+    )
+
+    assert not result.succeeded
+    assert result.error_code == "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH"
+    move = _dispatch_move(result)
+    assert move, "a name-mismatch refusal states the productive move, not only the rule"
+    assert move == (result.suggestions or [None])[0], "and states it first"
+    assert "build(action='compile')" in move and "build(action='test')" in move
+    assert "/workspace/ignite" in move, "at the coordinates the harness can see"
+    assert "instead of registering" in move.lower(), "it redirects AWAY from registration"
+
+
+def test_the_dispatch_move_states_that_the_dispatch_itself_acquires_the_toolchain():
+    """The d2r3 proof is not "the wrapper exists" but "the dispatch provisions".
+    A refusal that only says "dispatch the build" leaves the model believing it
+    still owes a registration first — which is exactly the belief that produced
+    the /tmp/mvnshim symlink."""
+    tool = EnvTool(_IgniteCheckoutOrchestrator())
+
+    move = _dispatch_move(
+        tool.execute(action="register", tool="maven", executable=IGNITE_WRAPPER, activate=True)
+    )
+
+    assert "pre-flight" in move.lower(), "the refusal names the engine step that does the work"
+    assert "provision" in move.lower(), "which provisions the runtime the build asks for"
+    assert "overlay" in move.lower(), "and registers what it acquired, so nothing is owed"
+
+
+def test_a_checkout_without_a_wrapper_still_gets_its_build_root_named():
+    """jackrabbit d2r4: no mvnw under /workspace/jackrabbit, and the refusal for
+    the absent /usr/bin/mvn named only the apt route. The reactor root is on
+    disk either way, and a dispatch at it resolves Maven or installs one."""
+    tool = EnvTool(_JackrabbitCheckoutOrchestrator())
+
+    result = tool.execute(
+        action="register", tool="maven", executable="/usr/bin/mvn", activate=True
+    )
+
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    move = _dispatch_move(result)
+    assert "/workspace/jackrabbit" in move, "the build root the harness can see is named"
+    assert "build(action='compile')" in move
+    assert any(
+        "provision" in s and "maven" in s for s in (result.suggestions or [])
+    ), "and the install route it already had is not withdrawn"
+
+
+def test_a_container_with_no_visible_build_root_names_no_dispatch():
+    """A move is only offered when the harness can see where it would run.
+    Naming a dispatch with no coordinates would be the #19 defect class again:
+    guidance that cannot be acted on."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
+
+    result = tool.execute(
+        action="register", tool="maven", executable="/usr/bin/mvn", activate=True
+    )
+
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    assert _dispatch_move(result) == "", "no coordinates, no dispatch move"
+    assert any("provision" in s for s in (result.suggestions or [])), "the install route remains"
+
+
+def test_an_absent_java_is_provisioned_by_major_never_as_an_apt_package():
+    """geode d2r4 seq 227: the model registered
+    /usr/lib/jvm/java-17-openjdk-amd64/bin/java on an arm64 host. The refusal
+    answered with `project(action='provision', packages=['java'])` — apt has no
+    package by that name, so the one move offered could not succeed. The JDK
+    route the engine actually has is java_version."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        activate=True,
+    )
+
+    assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
+    provision = [s for s in (result.suggestions or ()) if "provision" in s]
+    assert provision, "a refusal must name a call that can succeed"
+    assert all("packages=['java']" not in s for s in provision), "apt has no package 'java'"
+    assert any("java_version=" in s for s in provision), "the JDK route is java_version"
+
+
+# ---------------------------------------------------------------------------
 # The third rung: a material action may not recur without bound (#42)
 # docs/superpowers/specs/2026-08-13-material-recurrence-bound-design.md §3
 # ---------------------------------------------------------------------------

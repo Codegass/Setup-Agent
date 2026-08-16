@@ -328,10 +328,20 @@ class MavenTool(BaseTool):
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         if contract_requirement and not resolved_maven:
+            # What WOULD resolve without the stated requirement is the only
+            # honest basis for naming the drop-it exit — and, when the container
+            # holds a registered Maven, for naming the version it holds.
+            # jackrabbit d2r4: Maven 3.8.7 was installed, registered and active,
+            # and the refusal for the model's own "[3.9,)" mentioned neither.
             return self._finalize_main_result(
                 self._maven_version_not_resolved_result(
                     required_version=contract_requirement,
                     working_directory=working_directory,
+                    registered=self._resolve_maven_executable(
+                        working_directory=working_directory,
+                        version_requirement=None,
+                        prefer_wrapper=prefer_wrapper,
+                    ),
                 ),
                 preamble,
             )
@@ -1822,24 +1832,84 @@ class MavenTool(BaseTool):
         self,
         required_version: ToolVersionRequirement,
         working_directory: str,
+        registered=None,
     ) -> ToolResult:
+        """Refuse the requirement, and name the exits the refusal actually has.
+
+        jackrabbit d2r4 (logs/d2r4-20260815/slices/jackrabbit.md slice 9): Maven
+        3.8.7 was installed by `project(action='provision', packages=['maven'])`,
+        registered and activated by `project(action='env', ...)` with a measured
+        version, and the build then asserted
+        `maven_version_requirement="[3.9,)"` — the model's own parameter,
+        recorded `source: "tool_parameter"`. The refusal named no registered
+        runtime and closed with "the same Maven requirement remains binding on
+        any retry", which for a requirement this call itself supplied is not
+        true: the next call may simply omit it. The model searched for a wrapper
+        that did not exist and blocked the phase.
+
+        Both named exits were verified against the engine before being written.
+        Omitting the parameter leaves `contract_requirement` empty when nothing
+        is persisted, and resolution then accepts the registered candidate —
+        which is what the requirement-free resolution above just proved. And
+        `project(action='env', tool='maven', executable=..., requirement=...)`
+        is the registration path that canonicalizes a distribution's bin/mvn
+        under /opt, /tmp, /usr or /workspace, probes `-version`, and enforces
+        the very requirement being held. No move is offered that would install
+        the wrong version: `project(action='provision', packages=['maven'])` is
+        deliberately NOT named here, because apt is what already produced the
+        3.8.7 that fails this constraint.
+        """
+        candidate = getattr(registered, "candidate", None)
+        metadata: Dict[str, Any] = {
+            "working_directory": working_directory,
+            "maven_version_requirement": {
+                "raw": required_version.raw,
+                "source": required_version.source,
+                "kind": required_version.kind,
+            },
+        }
+        suggestions = [f"No observed executable/version pair satisfies {required_version.raw}"]
+        model_asserted = required_version.source == "tool_parameter"
+        if candidate is None:
+            suggestions.append(
+                "A subsequent model-owned action must establish a matching executable "
+                "and version fact"
+            )
+        else:
+            version = str(getattr(candidate, "version", "") or "").strip()
+            stated = f"Maven {version}" if version else "a Maven of unstated version"
+            metadata["registered_maven"] = {
+                "executable": candidate.path,
+                "version": version or None,
+                "source": candidate.source,
+            }
+            suggestions.append(
+                f"Registered and resolvable without this requirement: {stated} at "
+                f"{candidate.path}"
+            )
+            if model_asserted:
+                suggestions.append(
+                    f"{required_version.raw} is this call's own maven_version_requirement, "
+                    f"not a project-observed constraint — re-dispatch the same build with "
+                    f"maven_version_requirement omitted to run on {stated}"
+                )
+            suggestions.append(
+                f"To hold {required_version.raw}, install a Maven that satisfies it: "
+                f"download the distribution with bash, then project(action='env', "
+                f"tool='maven', executable='<distribution>/bin/mvn', "
+                f"requirement='{required_version.raw}', activate=True)"
+            )
+        if not model_asserted:
+            # True only of a constraint this call did not create: a persisted or
+            # runner-observed requirement survives any retry that omits the
+            # parameter, because the parameter is not where it came from.
+            suggestions.append("The same Maven requirement remains binding on any retry")
         return ToolResult.completed_failure(
             output="",
             error=f"No Maven executable satisfies requested version {required_version.raw}",
             error_code="MAVEN_VERSION_NOT_RESOLVED",
-            suggestions=[
-                f"No observed executable/version pair satisfies {required_version.raw}",
-                "A subsequent model-owned action must establish a matching executable and version fact",
-                "The same Maven requirement remains binding on any retry",
-            ],
-            metadata={
-                "working_directory": working_directory,
-                "maven_version_requirement": {
-                    "raw": required_version.raw,
-                    "source": required_version.source,
-                    "kind": required_version.kind,
-                },
-            },
+            suggestions=suggestions,
+            metadata=metadata,
         )
 
     def _maven_executable_not_resolved_result(self, working_directory: str) -> ToolResult:

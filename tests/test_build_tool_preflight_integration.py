@@ -527,6 +527,125 @@ def test_no_rerun_when_reprovision_fails(monkeypatch):
     assert "retry 1/1" not in (result.output or "")
 
 
+# ---------------------------------------------------------------------------
+# Task #60 shape (c): a runner that diagnosed its own JDK need, and an engine
+# that did not act on it, still names the move that ends it.
+#
+# geode d2r4 (logs/d2r4-20260815/slices/geode.md): the Gradle plugin answered
+# "Java version 17 or later required, but was 11.0.31" twice — slice 3 via bash
+# and slice 8 through build(action='test') — and `classify_version_error` knows
+# none of that wording, so nothing was re-provisioned and nothing was said. The
+# model's answer was `project(action='env', tool='gradle',
+# executable='/usr/lib/jvm/java-17-openjdk-amd64/bin/java')`: a guessed amd64
+# path on an arm64 host (slice 5, ENV_EXECUTABLE_NOT_FOUND), while
+# `project(action='provision', java_version='17')` — the call that had already
+# installed Java 11 in the same run — was never tried. lucene d2r4 is the same
+# family in the Gradle launcher's wording: "ERROR: java version must be >= 21
+# and <= 24, your version: 17".
+# ---------------------------------------------------------------------------
+
+GEODE_PLUGIN_FAIL = (
+    "Caused by: org.gradle.api.GradleException: Java version 17 or later required, "
+    "but was 11.0.31\n\t... 191 more\n\nBUILD FAILED in 17s"
+)
+LUCENE_LAUNCHER_FAIL = "ERROR: java version must be >= 21 and <= 24, your version: 17"
+
+
+def _steering_lines(result):
+    return [line for line in (result.output or "").splitlines() if "[toolchain]" in line]
+
+
+def test_a_runner_that_names_the_java_it_needs_gets_the_provision_call_named():
+    gradle = ScriptedBackendTool(ToolResult.completed_failure(output=GEODE_PLUGIN_FAIL))
+    orch = ScriptedOrch(
+        java="11", manifest={}, markers=("/workspace/proj/build.gradle",)
+    )
+
+    result = _tool(orch, gradle=gradle).execute(
+        action="test", working_directory="/workspace/proj"
+    )
+
+    assert len(gradle.calls) == 1, "the sentence is steering, never a second dispatch"
+    lines = _steering_lines(result)
+    assert len(lines) == 1, "exactly one sentence"
+    assert "project(action='provision', java_version='17')" in lines[0]
+    assert "action='env'" not in lines[0], "never the registration that failed live"
+    assert result.metadata["runner_java_requirement"] == {
+        "required_major": "17",
+        "source": "runner_output",
+    }
+
+
+def test_the_launcher_wording_is_read_as_the_same_requirement():
+    gradle = ScriptedBackendTool(ToolResult.completed_failure(output=LUCENE_LAUNCHER_FAIL))
+    orch = ScriptedOrch(java="17", manifest={}, markers=("/workspace/proj/build.gradle",))
+
+    result = _tool(orch, gradle=gradle).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+
+    assert "project(action='provision', java_version='21')" in _steering_lines(result)[0]
+
+
+def test_the_engine_that_switched_the_runtime_itself_does_not_also_steer(monkeypatch):
+    """A retry that already moved to the named major has done the thing the
+    sentence would ask for. Saying it anyway would send the model to re-provision
+    what it is now running on."""
+    _patch_provision(monkeypatch)
+    maven = ScriptedBackendTool(
+        ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL),
+        ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL),
+    )
+    orch = ScriptedOrch(java="11", manifest={})
+
+    result = _tool(orch, maven=maven).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+
+    assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+    assert _steering_lines(result) == []
+
+
+def test_a_reprovision_that_could_not_happen_still_names_the_call(monkeypatch):
+    """The retry is the engine's own move and it failed; the model's move is
+    still available and is now the only one left."""
+    _patch_provision(monkeypatch, ok=False)
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL))
+    orch = ScriptedOrch(java="11", manifest={})
+
+    result = _tool(orch, maven=maven).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+
+    assert "jdk_retry" not in (result.metadata or {})
+    assert "project(action='provision', java_version='17')" in _steering_lines(result)[0]
+
+
+def test_a_build_that_succeeded_is_never_steered():
+    maven = ScriptedBackendTool(
+        ToolResult.completed_success(output="BUILD SUCCESS on Java 17 or later required")
+    )
+    orch = ScriptedOrch(java="17", manifest={})
+
+    result = _tool(orch, maven=maven).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+
+    assert _steering_lines(result) == []
+
+
+def test_a_runner_asking_for_the_major_already_active_is_not_steered():
+    """The runtime already IS 17; whatever failed, provisioning 17 is not it."""
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL))
+    orch = ScriptedOrch(java="17", manifest={})
+
+    result = _tool(orch, maven=maven).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+
+    assert _steering_lines(result) == []
+
+
 def test_scope_warning_when_explicit_workdir_deeper_than_build_root():
     orch = ScriptedOrch(
         java="17",
@@ -1146,9 +1265,14 @@ def test_real_build_and_maven_classes_preserve_requirement_at_resolution_seam():
 
     assert result.succeeded is False
     assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
-    assert len(manager.specs) == 1
     spec, workdir = manager.specs[0]
     assert workdir == "/workspace/proj"
     assert spec.version_requirement is not None
     assert spec.version_requirement.raw == "[3.9,4.0)"
     assert spec.version_requirement.kind == "range"
+    # The refusal then asks one further question — what resolves WITHOUT the
+    # stated requirement — because that is the only honest basis for naming the
+    # registered runtime and the omit-it exit (task #60 shape (b), jackrabbit
+    # d2r4). It is a resolution, never a dispatch, and the requirement itself
+    # crosses the seam unweakened above.
+    assert [spec.version_requirement for spec, _ in manager.specs[1:]] == [None]

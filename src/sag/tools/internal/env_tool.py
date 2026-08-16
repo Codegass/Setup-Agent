@@ -565,12 +565,24 @@ class EnvTool(BaseTool):
             )
 
         if posixpath.basename(canonical) != "mvn":
+            # The moves are computed at the FIRST refusal, not only at the bound.
+            # ignite d2r4 seq 25 refused /workspace/ignite/mvnw with one
+            # suggestion — "register the exact canonical bin/mvn path" — naming a
+            # file that container did not have; the model answered with a
+            # /tmp/mvnshim/mvn symlink, then /workspace/ignite/bin/mvn, and the
+            # run sealed zero classes. A wall this flat owes its way out on the
+            # first statement of it.
+            unusable = "this path does not resolve to an executable named mvn"
+            moves = self._remaining_moves(normalized_requested, "maven", unusable=unusable)
             return None, self._count_refusal(
                 ToolResult.completed_failure(
                     output="",
                     error=f"Canonical Maven executable must be named mvn: {canonical}",
                     error_code="ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
-                    suggestions=["Register the distribution's exact canonical bin/mvn path."],
+                    suggestions=[
+                        *moves,
+                        "Register the distribution's exact canonical bin/mvn path.",
+                    ],
                     raw_data={
                         "executable": normalized_requested,
                         "resolved_executable": canonical,
@@ -579,7 +591,8 @@ class EnvTool(BaseTool):
                 ),
                 executable=normalized_requested,
                 tool="maven",
-                unusable="this path does not resolve to an executable named mvn",
+                moves=moves,
+                unusable=unusable,
             )
         return canonical, None
 
@@ -659,22 +672,9 @@ class EnvTool(BaseTool):
         # the harness can SEE, productive move first.
         named_tool = tool or self._tool_from_executable(executable)
         wrapper = self._project_wrapper_for(named_tool)
-        if wrapper:
-            # The wrapper needs no network and is the runner the project itself
-            # ships — tapestry-5 had gradlew on disk while the model burned its
-            # run on a nonexistent /usr/bin/gradle.
-            moves.append(
-                # NOT offered as a registration: both build tools already prefer
-                # the wrapper on their own (maven_tool runs ./mvnw when
-                # use_wrapper is unset; gradle_tool defaults to it), and the
-                # Maven canonicalizer refuses any executable not named `mvn`.
-                # "Register the wrapper" was therefore unnecessary for Gradle
-                # and impossible for Maven — naming a move that does not serve
-                # the goal is the #19 defect class, in guidance I wrote myself.
-                f"This project ships its own {named_tool} wrapper at {wrapper}, and the "
-                f"build tool already uses it — dispatch the build instead of "
-                f"registering a runtime."
-            )
+        dispatch = self._build_dispatch_move(named_tool, wrapper)
+        if dispatch:
+            moves.append(dispatch)
         if candidates:
             moves.append("Already registered and executable: " + ", ".join(candidates[:6]))
         elif named_tool:
@@ -687,9 +687,101 @@ class EnvTool(BaseTool):
             moves.append(
                 f"No {named_tool} is registered and {unusable} — if "
                 f"{named_tool} is not installed in the container, install it first: "
-                f"project(action='provision', packages=['{named_tool}'])"
+                f"{self._install_call_for(named_tool)}"
             )
         return moves
+
+    @staticmethod
+    def _install_call_for(tool: str) -> str:
+        """The provision call that can actually install this tool.
+
+        geode d2r4 seq 227: the model registered
+        /usr/lib/jvm/java-17-openjdk-amd64/bin/java on an arm64 host and the
+        refusal answered `project(action='provision', packages=['java'])`. No
+        apt package is named `java`; that call installs nothing. SystemTool
+        routes a JDK by MAJOR (`install_java`) and apt packages by name
+        (`install`), and the facade picks the route from which parameter is
+        present — so the JDK's only working spelling is java_version.
+        """
+        if tool == "java":
+            return "project(action='provision', java_version='<major>')"
+        return f"project(action='provision', packages=['{tool}'])"
+
+    def _build_dispatch_move(self, tool: str, wrapper: str) -> str:
+        """The dispatch that acquires the toolchain this registration cannot.
+
+        Live proof, ignite d2r3 against d2r4 (logs/d2r4-20260815/slices/ignite.md
+        Part 5): one repo, one ref, one resolved commit. d2r4 spent four env
+        registrations on Maven — /usr/bin/mvn, the checkout's own ./mvnw, a
+        /tmp/mvnshim/mvn symlink to it, /workspace/ignite/bin/mvn — and sealed
+        compiled_classes 0. d2r3 answered the identical ENV_EXECUTABLE_NOT_FOUND
+        by dispatching build(action='compile'); the engine ran the wrapper with
+        `_env_preflight:false`, published env-overlay revision 2 itself
+        (evidence_publication control-000169), auto-installed JDK 11, and sealed
+        8,562 .class files. Nothing in the refusal named that move.
+
+        The three engine facts this sentence rests on, each verified in the
+        source before it was written: BuildTool runs `JdkPreflight` for every
+        compile/test/package/install dispatch and `_register_overlay` persists
+        what it provisions (build_tool.py, build_preflight.py); MavenTool calls
+        `_install_maven` when no candidate resolves and GradleTool calls
+        `_install_gradle`; and `build` really does take action='compile' and
+        action='test' (`_ACTIONS`).
+        """
+        build_root = self._build_root_for(tool, wrapper)
+        if not build_root:
+            # Nothing on disk says where a dispatch would run. Naming one anyway
+            # is the #19 defect class — guidance that cannot be acted on.
+            return ""
+        opening = (
+            # NOT offered as a registration: both build tools already prefer the
+            # wrapper on their own (maven_tool runs ./mvnw when use_wrapper is
+            # unset; gradle_tool defaults to it), and the Maven canonicalizer
+            # refuses any executable not named `mvn`.
+            f"This project ships its own {tool} wrapper at {wrapper}, and the build "
+            f"tool already uses it"
+            if wrapper
+            else f"This project's {tool} build coordinates are on disk"
+        )
+        return (
+            f"{opening} — dispatch the build instead of registering a runtime: "
+            f"build(action='compile') or build(action='test') at {build_root}. The "
+            f"build facade's own pre-flight provisions the JDK the build asks for, "
+            f"installs {tool} when no runtime resolves, and registers what it "
+            f"acquired in the runtime overlay — the dispatch acquires the toolchain, "
+            f"so no registration is owed first."
+        )
+
+    def _build_root_for(self, tool: Optional[str], wrapper: str) -> str:
+        """Where a dispatch for this tool would run, when the container says so.
+
+        The wrapper already answers it for a project that ships one, at no extra
+        probe. jackrabbit d2r4 shipped none — its own search proved
+        `mvnw|.mvn|apache-maven*|maven*` matched nothing under the checkout —
+        while /workspace/jackrabbit/pom.xml was the reactor root all along, so
+        the second look is what that project needed. Best effort and bounded:
+        one shallow find on an error path the caller was already paying for.
+        """
+        if wrapper:
+            return posixpath.dirname(wrapper)
+        names = self._TOOL_BUILD_FILES.get(str(tool or "").strip().lower())
+        orchestrator = getattr(self.store, "orchestrator", None)
+        if not names or orchestrator is None or not hasattr(orchestrator, "execute_command"):
+            return ""
+        expression = " -o ".join(f"-name {shlex.quote(name)}" for name in names)
+        try:
+            result = orchestrator.execute_command(
+                f"find /workspace -maxdepth 2 \\( {expression} \\) -type f -print -quit",
+                workdir=None,
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.debug(f"build-root probe unavailable: {exc}")
+            return ""
+        if not isinstance(result, dict) or result.get("exit_code") not in (0, None):
+            return ""
+        lines = str(result.get("output") or "").strip().splitlines()
+        return posixpath.dirname(lines[0].strip()) if lines else ""
 
     # ------------------------------------------------------------------
     # The third rung: a material action may not recur without bound (#42).
@@ -872,6 +964,14 @@ class EnvTool(BaseTool):
     _EXECUTABLE_TOOLS = {"gradle": "gradle", "mvn": "maven", "maven": "maven", "java": "java"}
     # The runner a project ships for itself, which needs no network at all.
     _TOOL_WRAPPERS = {"gradle": "gradlew", "maven": "mvnw"}
+    # The file that marks a root a dispatch can target when the project ships no
+    # wrapper. Only the two JVM build systems `build` dispatches by action have
+    # an entry; a tool with no entry gets no dispatch move, which is the honest
+    # answer for `java` (there is no build(action=...) that targets a JDK).
+    _TOOL_BUILD_FILES = {
+        "maven": ("pom.xml",),
+        "gradle": ("build.gradle", "build.gradle.kts", "settings.gradle"),
+    }
 
     @classmethod
     def _tool_from_executable(cls, executable: Any) -> str:

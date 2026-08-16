@@ -12,6 +12,7 @@ from sag.tools.internal.maven_tool import MavenTool
 from sag.tools.internal.toolchain_manager import (
     ResolvedToolExecutable,
     ToolExecutableCandidate,
+    ToolVersionRequirement,
 )
 
 pytestmark = pytest.mark.usefixtures("facade_contract_authority", "exact_internal_runner_authority")
@@ -140,10 +141,41 @@ class WrapperBuildToolOrchestrator(FakeBuildToolOrchestrator):
 class EmptyToolchainManager:
     def __init__(self):
         self.seen_spec = None
+        self.seen_specs = []
 
     def resolve(self, spec, working_directory="/workspace"):
         self.seen_spec = spec
+        self.seen_specs.append(spec)
         return None
+
+
+class RequirementFreeToolchainManager:
+    """Resolves nothing under a requirement and one registered Maven without it.
+
+    jackrabbit d2r4 exactly: `project(action='provision', packages=['maven'])`
+    installed 3.8.7, `project(action='env', ...)` registered and activated it,
+    and the build then asserted maven_version_requirement="[3.9,)".
+    """
+
+    def __init__(self, path="/usr/share/maven/bin/mvn", version="3.8.7"):
+        self.path = path
+        self.version = version
+        self.seen_specs = []
+
+    def resolve(self, spec, working_directory="/workspace"):
+        self.seen_specs.append(spec)
+        if spec.version_requirement is not None:
+            return None
+        return ResolvedToolExecutable(
+            candidate=ToolExecutableCandidate(
+                name=spec.name,
+                executable=spec.executable,
+                path=self.path,
+                version=self.version,
+                source="env_overlay",
+            ),
+            reason="registered and active",
+        )
 
 
 class SequencedToolchainManager:
@@ -635,12 +667,101 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
         for (command, workdir, timeout) in orchestrator.commands
         if not any(marker in command for marker in preflight_reads)
     ] == []
-    assert toolchain_manager.seen_spec.version_requirement.raw == "3.9.6"
+    assert toolchain_manager.seen_specs[0].version_requirement.raw == "3.9.6"
+    # The second question is what would resolve WITHOUT the stated requirement,
+    # which is the only way the refusal can honestly name the drop-it exit. It
+    # is a resolution, not a dispatch: `monitored_commands` above stays empty.
+    assert toolchain_manager.seen_specs[1].version_requirement is None
     assert result.metadata["maven_version_requirement"] == {
         "raw": "3.9.6",
         "source": "tool_parameter",
         "kind": "exact",
     }
+
+
+# ---------------------------------------------------------------------------
+# Task #60 shape (b): a model-asserted Maven requirement that nothing satisfies
+# names the registered runtime and both exits.
+#
+# jackrabbit d2r4 (logs/d2r4-20260815/slices/jackrabbit.md slice 9): Maven 3.8.7
+# was installed, registered and ACTIVE (`measured_version: "3.8.7"`), and the
+# build asserted maven_version_requirement="[3.9,)" — the model's own parameter,
+# `source: "tool_parameter"`, not a project constraint. The refusal said "No
+# observed executable/version pair satisfies [3.9,)" and "the same Maven
+# requirement remains binding on any retry". The model searched for a wrapper,
+# found none, and closed the phase blocked. Both exits existed the whole time.
+# ---------------------------------------------------------------------------
+
+
+def _requirement_refusal(manager, requirement="[3.9,)"):
+    orchestrator = FakeBuildToolOrchestrator()
+    tool = MavenTool(orchestrator, toolchain_manager=manager)
+    return tool.execute(
+        command="compile",
+        working_directory="/workspace/jackrabbit",
+        maven_version_requirement=requirement,
+    )
+
+
+def test_an_unsatisfied_model_asserted_requirement_names_the_registered_maven():
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager)
+
+    assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
+    assert result.metadata["registered_maven"] == {
+        "executable": "/usr/share/maven/bin/mvn",
+        "version": "3.8.7",
+        "source": "env_overlay",
+    }, "the runtime the container actually has is a typed fact, not only prose"
+    stated = " ".join(result.suggestions or ())
+    assert "3.8.7" in stated and "/usr/share/maven/bin/mvn" in stated
+
+
+def test_an_unsatisfied_model_asserted_requirement_names_both_exits():
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager)
+
+    suggestions = list(result.suggestions or ())
+    drop = [s for s in suggestions if "maven_version_requirement" in s]
+    assert drop, "exit one: the requirement is this call's own, so the call can omit it"
+    assert "3.8.7" in drop[0], "and it names what the build would then run on"
+    install = [s for s in suggestions if "action='env'" in s]
+    assert install, "exit two: hold the requirement by installing a Maven that meets it"
+    assert "[3.9,)" in install[0], "which stays the requirement, not a weakened one"
+    assert "bin/mvn" in install[0], "named as the canonicalizer will accept it"
+
+
+def test_a_model_asserted_requirement_is_not_reported_as_binding_on_any_retry():
+    """The old third line said the requirement "remains binding on any retry".
+    For a requirement that arrived as this call's own parameter that is false —
+    and it is the sentence that makes the drop-it exit look unavailable."""
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager)
+
+    assert not any(
+        "remains binding" in s for s in (result.suggestions or ())
+    ), "a parameter the next call may omit does not bind the next call"
+
+
+def test_a_project_observed_requirement_keeps_binding_and_offers_no_drop_exit():
+    """The exit is honest only because the requirement is the model's own. A
+    constraint the project or a build error established is not lifted by
+    omitting the parameter, so that exit must not be offered for it."""
+
+    class ObservedRequirementManager(RequirementFreeToolchainManager):
+        def observed_requirements(self, name, working_directory=None):
+            return [ToolVersionRequirement(raw="[3.9,)", source="build_error", kind="range")]
+
+    result = _requirement_refusal(ObservedRequirementManager(), requirement=None)
+
+    assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
+    assert not any(
+        "maven_version_requirement" in s for s in (result.suggestions or ())
+    ), "omitting a parameter cannot lift a constraint the parameter did not create"
+    assert any("remains binding" in s for s in (result.suggestions or ()))
 
 
 def test_maven_tool_installs_then_uses_resolved_default_executable():
