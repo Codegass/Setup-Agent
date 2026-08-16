@@ -105,9 +105,11 @@ class SnapshotTestStats(BaseModel):
     denominator_basis: Literal["complete", "partial", "none"] | None = None
     denominator_unmeasured_modules: int | None = None
     denominator_module_total: int | None = None
-    # The count a module list did not explain (polaris's 1,347 against a module
-    # sum of 593). Banned from BEING the denominator, kept as evidence so the
-    # sealed conflict names both numbers.
+    # The count the module sum disagrees with — smaller than the module list
+    # (polaris's 1,347 against 593 named modules) or larger than it
+    # (camel-quarkus's 2,765 against 3,282 in 384 modules, the live direction).
+    # Banned from BEING the denominator, kept as evidence so the sealed
+    # conflict names both numbers.
     denominator_bare_total: int | None = None
     unique: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     raw: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
@@ -1062,10 +1064,21 @@ def _census_clauses(stats: SnapshotTestStats) -> list[str]:
         clauses.append(f"parameterized expansion over {discovered:,} declared")
     bare_total = stats.denominator_bare_total
     if bare_total is not None and bare_total != discovered:
-        # The rejected number, in the sentence that rejected it. The conflict
-        # id says the sources disagreed; only this says by how much, and a
-        # reader who cannot see 1,347 beside 593 cannot audit the choice.
-        clauses.append(f"{bare_total:,} claimed with no module list to explain it")
+        # The rejected number beside the one that won. The conflict id says the
+        # sources disagreed; only this says by how much, and a reader who
+        # cannot see 1,347 beside 593 cannot audit the choice.
+        #
+        # BOTH numbers, and no direction asserted, because the record runs both
+        # ways. polaris's module list came to LESS than its bare total (593 of
+        # 1,347) — 12 of its 20 modules were truncated out of the breakdown.
+        # Every disagreement in the archived corpus runs the other way
+        # (camel-quarkus 3,282 across 384 modules against a bare 2,765, camel
+        # 27,073 vs 26,842, samza 2,279 vs 2,223, and four more): `count()`
+        # dedupes on package.class::method while the module index appends the
+        # key on every add, so one FQN reachable from two modules is one
+        # descriptor and two module entries. Calling the bare total the one no
+        # module list explains would state the opposite of those records.
+        clauses.append(f"{discovered:,} in the module list against a bare total of {bare_total:,}")
     return clauses
 
 

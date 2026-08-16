@@ -38,6 +38,10 @@ from sag.case_census import (
     produce_census,
 )
 from sag.project_fact_sheet import project_fact_sheet_metadata
+# Aliased: pytest tries to COLLECT any module-level name starting with `Test`,
+# and warns on both of these because they define `__init__`.
+from sag.testcases.catalog import TestCaseCatalog as CaseCatalog
+from sag.testcases.catalog import TestCaseDescriptor as CaseDescriptor
 from sag.verdict import ADJUDICATED_CONFLICTS
 from sag.verdict_rates import UNBOUNDED_CONFLICT
 
@@ -88,6 +92,20 @@ POLARIS_TRUNK_BY_MODULE = {
 
 TAPESTRY_DISCOVERED = 1614
 TAPESTRY_EXECUTED = 2417
+
+# camel-quarkus (d2r3, ``logs/session_20260814_093336_763203_12dba3497295_26013``,
+# ``.setup_agent/contexts/trunk_20260814_093418.json``): the analyzer sealed
+# ``total_tests: 2765`` beside a 384-module breakdown that sums to 3,282 — the
+# module list is LARGER than the bare total, the opposite of polaris, and it is
+# the only direction the live corpus ever disagrees in. Of the 22 distinct
+# census shapes archived in ``logs/``: 12 agree, 3 carry no module dimension at
+# all, and all 7 disagreements sum ABOVE their bare total (camel 26842/27073,
+# camel-quarkus 2765/3282, samza 2223/2279, kie-kogito 331/375, gora 275/297,
+# ignite 15085/15104, jackrabbit 2534/2543). That run executed nothing under a
+# receipt (``unique.executed: 0``).
+CAMEL_QUARKUS_BARE_TOTAL = 2765
+CAMEL_QUARKUS_MODULE_SUM = 3282
+CAMEL_QUARKUS_EXECUTED = 0
 
 
 def _stats(**kwargs) -> SnapshotTestStats:
@@ -248,12 +266,74 @@ def test_polaris_shape_one_denominator_a_named_floor_and_both_numbers():
     # The floor is named with the module count missing from it (§2.2) ...
     assert "12 of 20 modules unmeasured" in payload["reason"]
     # ... the rejected total stays visible beside the one that won (§2.1) ...
-    assert "1,347 claimed with no module list to explain it" in payload["reason"]
+    assert "593 in the module list against a bare total of 1,347" in payload["reason"]
     # ... and a partial census never claims the excess IS expansion (§2.4).
     assert "parameterized expansion" not in payload["reason"]
     # The grain states the disagreement; it does not re-derive the conflict,
     # which the producer raised once at the seam that resolved it.
     assert conflicts == ()
+
+
+def test_camel_quarkus_shape_names_both_totals_when_the_module_list_is_larger():
+    """The live direction: the module list explains MORE than the bare total.
+
+    A clause that says the bare total has "no module list to explain it" states
+    the opposite of this record — 384 modules explain 3,282 of a 2,765 claim.
+    Both numbers are named and neither is called the unexplained one, so the
+    sentence stays true whichever way the two producers disagree.
+    """
+    payload, conflicts = _cases(
+        _stats(
+            executed=CAMEL_QUARKUS_EXECUTED,
+            discovered=CAMEL_QUARKUS_MODULE_SUM,
+            denominator_basis=BASIS_COMPLETE,
+            denominator_bare_total=CAMEL_QUARKUS_BARE_TOTAL,
+        )
+    )
+
+    assert payload["denominator"] == CAMEL_QUARKUS_MODULE_SUM
+    assert "3,282 in the module list against a bare total of 2,765" in payload["reason"]
+    assert "no module list to explain" not in payload["reason"]
+    assert conflicts == ()
+
+
+def test_one_fqn_in_two_modules_puts_the_module_sum_above_the_total():
+    """Why the live direction exists, at the seam that produces both numbers.
+
+    ``count()`` dedupes on ``package.class::method``; ``_by_module`` appends the
+    key once per add. One test FQN reachable from two modules is therefore one
+    descriptor and two module entries — an arithmetic property of the catalog,
+    not a miscount to be explained away.
+    """
+    shared = {
+        "package": "org.apache.camel.quarkus.core",
+        "class_name": "CoreTest",
+        "method_name": "loads",
+        "file_path": "core/CoreTest.java",
+    }
+    catalog = CaseCatalog()
+    catalog.add(CaseDescriptor(**shared, module="extensions/core"))
+    catalog.add(CaseDescriptor(**shared, module="integration-tests/core"))
+    catalog.add(
+        CaseDescriptor(
+            package="org.apache.camel.quarkus.main",
+            class_name="MainTest",
+            method_name="starts",
+            file_path="main/MainTest.java",
+            module="extensions/main",
+        )
+    )
+
+    summary = catalog.to_dict()
+    assert summary["total_count"] == 2
+    assert sum(summary["by_module"].values()) == 3
+
+    census = census_from_catalog_summary(summary)
+    assert census.discovered == 3
+    assert census.bare_total == 2
+    assert census.discovered > census.bare_total
+    assert census.basis == BASIS_COMPLETE
+    assert census.conflicts == (CENSUS_CONFLICT,)
 
 
 def test_camel_shape_keeps_todays_unavailable_and_invents_nothing():

@@ -57,8 +57,10 @@ class TestCensus:
     basis: str
     measured_modules: int = 0
     total_modules: int = 0
-    # The count a module list did not explain, kept as evidence rather than
-    # dropped: banning a number is not the same as hiding it.
+    # The count the module sum disagrees with — in either direction, since a
+    # catalog that dedupes its total but appends per module lists one shared
+    # FQN twice — kept as evidence rather than dropped: banning a number from
+    # being the denominator is not the same as hiding it.
     bare_total: int | None = None
     conflicts: tuple[str, ...] = field(default_factory=tuple)
 
