@@ -56,10 +56,10 @@ class FakeSystemOrchestrator:
         if command.startswith("update-alternatives"):
             return {"success": True, "output": "", "exit_code": 0}
 
-        if command == (
-            f"export JAVA_HOME={JAVA_HOME} && java -version 2>&1 && echo '---' "
-            "&& javac -version 2>&1"
-        ):
+        # Both verifications this provision runs — the exact binaries it is
+        # about to activate, and the domain once the switch has landed — are
+        # this container answering for the same JDK.
+        if "java -version" in command:
             if self.verification_success:
                 return {
                     "success": True,

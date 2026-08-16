@@ -8,7 +8,16 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
-from .java_versions import java_major, parse_java_verification
+from .java_versions import JAVA_VERIFICATION_SEPARATOR, java_major, parse_java_verification
+
+# The verification a provision must pass is the one a dispatch would run: bare
+# `java` and `javac`, resolved through the same environment DockerOrchestrator
+# builds for every project command. `command -v` states WHICH binary answered,
+# so the stored block carries the resolution itself and not just a version.
+JAVA_DOMAIN_VERIFICATION = (
+    "command -v java 2>/dev/null; "
+    f"java -version 2>&1 && echo '{JAVA_VERIFICATION_SEPARATOR}' && javac -version 2>&1"
+)
 
 
 class SystemTool(BaseTool):
@@ -509,106 +518,16 @@ class SystemTool(BaseTool):
                     ],
                 )
 
-        # Step 6: Configure environment with better error handling
-        # First, check if alternatives are already registered
-        java_alternatives = self.docker_orchestrator.execute_command(
-            "update-alternatives --list java 2>/dev/null"
+        # Step 6: What the exact binaries say about themselves, asked by path,
+        # before anything is switched. A refusal here leaves the container
+        # exactly as it was found.
+        probe_result = self.docker_orchestrator.execute_command(
+            f"{java_bin} -version 2>&1 && echo '{JAVA_VERIFICATION_SEPARATOR}' "
+            f"&& {javac_bin} -version 2>&1"
         )
-        javac_alternatives = self.docker_orchestrator.execute_command(
-            "update-alternatives --list javac 2>/dev/null"
-        )
-
-        java_registered = java_bin in java_alternatives.get("output", "")
-        javac_registered = javac_bin in javac_alternatives.get("output", "")
-
-        config_commands = [
-            # Set JAVA_HOME in profile
-            f"echo 'export JAVA_HOME={java_home}' >> /etc/profile",
-            f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile",
-            # Set JAVA_HOME in bashrc
-            f"echo 'export JAVA_HOME={java_home}' >> /root/.bashrc",
-            f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /root/.bashrc",
-        ]
-
-        # Only install alternatives if not already registered
-        if not java_registered:
-            config_commands.append(
-                f"update-alternatives --install /usr/bin/java java {java_bin} 100"
-            )
-        else:
-            logger.info(f"Java alternative already registered: {java_bin}")
-
-        if not javac_registered:
-            config_commands.append(
-                f"update-alternatives --install /usr/bin/javac javac {javac_bin} 100"
-            )
-        else:
-            logger.info(f"Javac alternative already registered: {javac_bin}")
-
-        # Always try to set the alternatives (this is safe even if already set)
-        config_commands.extend(
-            [
-                f"update-alternatives --set java {java_bin}",
-                f"update-alternatives --set javac {javac_bin}",
-            ]
-        )
-
-        # Execute configuration commands with better error handling
-        for cmd in config_commands:
-            result = self.docker_orchestrator.execute_command(cmd)
-            if result["exit_code"] != 0:
-                # Check if it's an alternatives error
-                if "update-alternatives" in cmd and "not registered" in result.get("output", ""):
-                    logger.warning(
-                        f"Alternatives not registered properly, attempting to fix: {cmd}"
-                    )
-                    # Try to force install the alternative
-                    if "--set" in cmd:
-                        # Replace --set with --install then --set
-                        install_cmd = cmd.replace("--set", "--install /usr/bin/java") + " 100"
-                        self.docker_orchestrator.execute_command(install_cmd)
-                        # Retry the set command
-                        result = self.docker_orchestrator.execute_command(cmd)
-                        if result["exit_code"] == 0:
-                            logger.info(f"Fixed alternatives registration for: {cmd}")
-                            continue
-
-                logger.warning(f"Failed to execute: {cmd} - {result.get('output', '')[:100]}")
-
-        # Step 7: Verify installation
-        verify_result = self.docker_orchestrator.execute_command(
-            f"export JAVA_HOME={java_home} && java -version 2>&1 && echo '---' && javac -version 2>&1"
-        )
-
-        if verify_result["exit_code"] == 0:
-            # The verification block is evidence, not decoration. Live
-            # camel-quarkus d2r3 (seq 127) sealed `java_version: "17"` over a
-            # block reading `openjdk version "11.0.31"` / `javac 11.0.31`,
-            # because only the exit code was read: `java` still resolved to the
-            # pre-existing JVM on PATH. A provision may not seal the version
-            # its own verification disproves.
-            contradiction = self._verification_contradiction(
-                java_version,
-                java_home,
-                verify_result["output"],
-            )
-            if contradiction is not None:
-                return contradiction
-            self._register_java_runtime_overlay(java_home, java_version)
-            return ToolResult.completed_success(
-                output=f"Successfully installed and configured Java {java_version}\n\n"
-                f"JAVA_HOME: {java_home}\n"
-                f"Verification:\n{verify_result['output']}",
-                metadata={
-                    "java_version": java_version,
-                    "java_home": java_home,
-                    "package": java_package,
-                    "architecture": arch,
-                },
-            )
-        else:
+        if probe_result["exit_code"] != 0:
             return ToolResult.completed_failure(
-                output=verify_result["output"],
+                output=probe_result["output"],
                 error=f"Java {java_version} installed but verification failed",
                 error_code="JAVA_CONFIG_FAILED",
                 suggestions=[
@@ -617,6 +536,121 @@ class SystemTool(BaseTool):
                     "Constraint: java and javac must both execute under the activated environment",
                 ],
             )
+        # The verification block is evidence, not decoration. Live
+        # camel-quarkus d2r3 (seq 127) sealed `java_version: "17"` over a block
+        # reading `openjdk version "11.0.31"` / `javac 11.0.31`, because only
+        # the exit code was read. A provision may not seal the version its own
+        # verification disproves.
+        contradiction = self._verification_contradiction(
+            java_version,
+            java_home,
+            probe_result["output"],
+        )
+        if contradiction is not None:
+            return contradiction
+
+        # Step 7: Land the switch in the domain that resolves `java` — both
+        # halves of it. The /usr/bin links answer for anything that resolves
+        # through PATH's system directories; the persisted overlay is what
+        # DockerOrchestrator builds every project command's environment from,
+        # so it fronts both the verification shell and every later dispatch.
+        self._persist_java_home_profile(java_home)
+        alternatives = self._set_java_alternatives(java_bin, javac_bin)
+        activation_failure = self._activate_java_runtime(java_home, java_version)
+        if activation_failure is not None:
+            return activation_failure
+
+        # Step 8: Verify in THAT domain. Live lucene d2r4 (seq 93/94) asked for
+        # Java 21 with Java 17 active: the JDK 21 install was honest, JAVA_HOME
+        # named it, and the verification shell still resolved the java-17 bin
+        # directory the previous provision had made active — so an honest
+        # switch was refused and the build stayed on 17. What the provision
+        # claims and what the next dispatch runs are now one observation.
+        verify_result = self.docker_orchestrator.execute_command(JAVA_DOMAIN_VERIFICATION)
+        contradiction = self._verification_contradiction(
+            java_version,
+            java_home,
+            verify_result["output"],
+        )
+        if contradiction is not None:
+            return contradiction
+
+        observed = parse_java_verification(verify_result["output"])
+        return ToolResult.completed_success(
+            output=f"Successfully installed and configured Java {java_version}\n\n"
+            f"JAVA_HOME: {java_home}\n"
+            f"Verification:\n{verify_result['output']}",
+            metadata={
+                "java_version": java_version,
+                "java_home": java_home,
+                "package": java_package,
+                "architecture": arch,
+                "verified_java_version": observed["java_version"],
+                "verified_javac_version": observed["javac_version"],
+                "resolved_java_executable": self._resolved_executable(verify_result["output"]),
+                "alternatives_set": alternatives,
+            },
+        )
+
+    def _persist_java_home_profile(self, java_home: str) -> None:
+        """Write the login-shell files. No runner sources them; they are forensic."""
+        for command in (
+            f"echo 'export JAVA_HOME={java_home}' >> /etc/profile",
+            "echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile",
+            f"echo 'export JAVA_HOME={java_home}' >> /root/.bashrc",
+            "echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /root/.bashrc",
+        ):
+            result = self.docker_orchestrator.execute_command(command)
+            if result["exit_code"] != 0:
+                logger.warning(f"Failed to execute: {command} - {result.get('output', '')[:100]}")
+
+    def _set_java_alternatives(self, java_bin: str, javac_bin: str) -> Dict[str, bool]:
+        """Point each /usr/bin link at this JDK: java at java, javac at javac."""
+        outcome: Dict[str, bool] = {}
+        for name, binary in (("java", java_bin), ("javac", javac_bin)):
+            listed = self.docker_orchestrator.execute_command(
+                f"update-alternatives --list {name} 2>/dev/null"
+            )
+            if binary in listed.get("output", ""):
+                logger.info(f"{name} alternative already registered: {binary}")
+            else:
+                self.docker_orchestrator.execute_command(
+                    f"update-alternatives --install /usr/bin/{name} {name} {binary} 100"
+                )
+            outcome[name] = self._set_java_alternative(name, binary)
+        return outcome
+
+    def _set_java_alternative(self, name: str, binary: str) -> bool:
+        """Set one alternative, repairing only the link it belongs to.
+
+        The repair used to rewrite every failing `--set` into an `--install
+        /usr/bin/java`, so repairing `javac` registered the compiler against
+        the `java` link — the one link a JDK switch exists to point correctly.
+        """
+        set_command = f"update-alternatives --set {name} {binary}"
+        result = self.docker_orchestrator.execute_command(set_command)
+        if result["exit_code"] == 0:
+            return True
+        if "not registered" in result.get("output", ""):
+            logger.warning(f"Alternatives not registered properly, attempting to fix: {name}")
+            self.docker_orchestrator.execute_command(
+                f"update-alternatives --install /usr/bin/{name} {name} {binary} 100"
+            )
+            result = self.docker_orchestrator.execute_command(set_command)
+            if result["exit_code"] == 0:
+                logger.info(f"Fixed alternatives registration for: {set_command}")
+                return True
+        logger.warning(f"Failed to execute: {set_command} - {result.get('output', '')[:100]}")
+        return False
+
+    @staticmethod
+    def _resolved_executable(verification_output: str) -> str:
+        """The binary the domain named when it answered, or an empty string."""
+        for line in str(verification_output or "").splitlines():
+            candidate = line.strip()
+            if candidate.startswith("/"):
+                return candidate
+        return ""
 
     def _verification_contradiction(
         self,
@@ -691,8 +725,16 @@ class SystemTool(BaseTool):
             metadata=metadata,
         )
 
-    def _register_java_runtime_overlay(self, java_home: str, java_version: str) -> None:
-        """Register the Java runtime selected by a successful install."""
+    def _activate_java_runtime(self, java_home: str, java_version: str) -> Optional[ToolResult]:
+        """Make the proven JDK the runtime this container resolves.
+
+        The overlay is the resolution domain: DockerOrchestrator derives every
+        project command's environment from it, so an activation that did not
+        persist leaves the verification shell and every later dispatch on the
+        JDK this call was asked to replace. A switch that did not land is not
+        a configured runtime, and reporting it as one is how a run spends the
+        rest of itself building against the wrong JVM.
+        """
         java_home = java_home.rstrip("/")
         java_bin = f"{java_home}/bin/java"
         try:
@@ -707,6 +749,27 @@ class SystemTool(BaseTool):
             )
         except Exception as exc:
             logger.warning(f"Failed to register Java env overlay: {exc}")
+            return ToolResult.completed_failure(
+                output=(
+                    f"Java {java_version} was installed at {java_home} and not activated\n\n{exc}"
+                ),
+                error=f"Java {java_version} was installed but its activation did not persist",
+                error_code="JAVA_RUNTIME_ACTIVATION_FAILED",
+                suggestions=[
+                    "Observed fact: the runtime overlay that resolves java did not accept "
+                    f"{java_bin}",
+                    "Observed fact: until it is activated, every dispatch keeps resolving the "
+                    "previously active runtime",
+                    f"Constraint: a provisioned Java {java_version} must be the runtime later "
+                    "dispatches resolve",
+                ],
+                metadata={
+                    "claimed_java_version": java_version,
+                    "java_home": java_home,
+                    "activation_error": str(exc),
+                },
+            )
+        return None
 
     def _smart_install_commands(self, commands: List[str]) -> ToolResult:
         """

@@ -46,9 +46,6 @@ ARCH = "arm64"
 JAVA_HOME = f"/usr/lib/jvm/java-17-openjdk-{ARCH}"
 JAVA_BIN = f"{JAVA_HOME}/bin/java"
 JAVAC_BIN = f"{JAVA_HOME}/bin/javac"
-VERIFY_COMMAND = (
-    f"export JAVA_HOME={JAVA_HOME} && java -version 2>&1 && echo '---' && javac -version 2>&1"
-)
 
 # The stored output of camel-quarkus seq 127, verbatim below its header.
 CONTRADICTING_VERIFICATION = (
@@ -69,7 +66,15 @@ PREINSTALLED_JAVA_11 = 'openjdk version "11.0.31" 2026-04-21\n'
 
 
 class FakeProvisionOrchestrator:
-    """The container camel-quarkus provisioned into: Java 11 on PATH."""
+    """The container camel-quarkus provisioned into: Java 11 on PATH.
+
+    The provision now asks its question twice — once of the exact binaries it
+    is about to activate, once of the domain after the switch has landed — so
+    this container answers both with the same block. Whichever gate reads it
+    first, the rule under test is the same: a block that names another major
+    is a refusal, and the earliest gate is the one that runs before anything
+    is persisted or activated.
+    """
 
     def __init__(self, verification):
         self.verification = verification
@@ -84,7 +89,7 @@ class FakeProvisionOrchestrator:
             return {"success": True, "output": f"{ARCH}\n", "exit_code": 0}
         if command.startswith("test -f ") and command.endswith("&& echo 'exists'"):
             return {"success": True, "output": "exists", "exit_code": 0}
-        if command.startswith("export JAVA_HOME=") and "java -version" in command:
+        if "java -version" in command:
             return {"success": True, "output": self.verification, "exit_code": 0}
         return {"success": True, "output": "", "exit_code": 0}
 
