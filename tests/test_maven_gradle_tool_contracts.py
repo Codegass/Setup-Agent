@@ -9,7 +9,10 @@ from sag.tools.base import ToolResult
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
-from sag.tools.internal.maven_versions import nearest_installable_floor
+from sag.tools.internal.maven_versions import (
+    maven_distribution_for_floor,
+    nearest_installable_floor,
+)
 from sag.tools.internal.toolchain_manager import (
     ResolvedToolExecutable,
     ToolExecutableCandidate,
@@ -775,16 +778,38 @@ def test_the_provision_exit_carries_the_floor_of_an_exact_requirement():
     "floor, expected",
     [
         ("3.9", "3.9"),  # a line with its own distribution answers itself
-        ("3.9.6", "3.9.6"),  # a floor naming a patch names its own distribution
+        ("3.9.6", "3.9.6"),  # its line's release (3.9.9) satisfies the patch
         ("3.7", "3.8"),  # no 3.7 archive: the nearest line that satisfies it
+        ("3.7.1", "3.8"),  # nor does a patch of a line that does not exist
+        ("3.8.9", "3.9"),  # 3.8.8 is the last 3.8: the next line answers it
         ("3.4", "3.5"),
         ("3", "3"),  # a bare major resolves to the newest line of it
         ("4.0", None),  # nothing this harness installs satisfies it
+        ("3.9.10", None),  # a patch past the newest release this harness has
         ("", None),
     ],
 )
 def test_the_installable_floor_is_the_nearest_line_that_satisfies_the_ask(floor, expected):
     assert nearest_installable_floor(floor) == expected
+
+
+@pytest.mark.parametrize(
+    "floor, distribution",
+    [
+        ("3.9", "3.9.9"),
+        ("3.9.6", "3.9.9"),  # the line's release, which satisfies the patch
+        ("3.6.3", "3.6.3"),  # the line's release IS the patch asked for
+        ("3.7.1", None),  # no 3.7 line, so no archive answers this patch
+        ("3.8.9", None),  # the 3.8 line ended at 3.8.8
+        ("3", "3.9.9"),
+    ],
+)
+def test_a_patch_floor_resolves_through_the_same_line_table(floor, distribution):
+    """A 3-component floor used to be returned verbatim as its own distribution,
+    so `3.7.1` named `apache-maven-3.7.1-bin.tar.gz` — an archive Apache never
+    published — and `nearest_installable_floor` then reported it installable.
+    Every floor resolves through the lines this harness actually downloads."""
+    assert maven_distribution_for_floor(floor) == distribution
 
 
 def test_a_floor_no_distribution_answers_is_not_named_as_a_provision_move():
@@ -800,6 +825,20 @@ def test_a_floor_no_distribution_answers_is_not_named_as_a_provision_move():
     provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
     assert provision, "a floor above the apt Maven still has an install route"
     assert "maven_version='3.7'" not in provision[0], "no distribution answers 3.7"
+    assert "maven_version='3.8'" in provision[0], "the nearest line that satisfies it"
+
+
+def test_a_patch_floor_no_line_answers_is_not_named_as_a_provision_move():
+    """The same defect one component deeper: `[3.7.1,)` was handed back as
+    `maven_version='3.7.1'`, a move whose only reply is
+    MAVEN_DISTRIBUTION_UNKNOWN because no 3.7 archive exists to install."""
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager, requirement="[3.7.1,)")
+
+    provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
+    assert provision, "a patch floor above the apt Maven still has an install route"
+    assert "maven_version='3.7.1'" not in provision[0], "no distribution answers 3.7.1"
     assert "maven_version='3.8'" in provision[0], "the nearest line that satisfies it"
 
 

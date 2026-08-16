@@ -39,6 +39,7 @@ from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
 from sag.tools.base import BaseTool, ToolResult
+from sag.tools.context_tool import ContextTool
 
 ADVICE = "Compile the three untouched islands before you conclude anything."
 
@@ -559,9 +560,9 @@ def test_the_entry_consult_is_marked_as_advisor_prose_in_phase_history():
     assert is_advisor_history_entry(entry) is True
 
 
-def test_a_model_issued_action_carries_no_advisor_entry_kind():
-    """The mark identifies the harness's reviewer prose, nothing else: a tool
-    the model ran is evidence the gates must keep reading."""
+def test_a_non_advisor_action_carries_no_advisor_entry_kind():
+    """The mark identifies reviewer prose, nothing else: a tool that ran in the
+    container is evidence the gates must keep reading."""
     engine = _unit_engine(phase="build")
     engine.context_manager = _RecordingContextManager()
 
@@ -576,6 +577,92 @@ def test_a_model_issued_action_carries_no_advisor_entry_kind():
     entry = engine.context_manager.entries[0][1]
     assert "entry_kind" not in entry
     assert is_advisor_history_entry(entry) is False
+
+
+def test_a_model_issued_consult_is_marked_the_same_prose_as_the_harness_one():
+    """The kind states WHAT the entry is, not who asked for it.
+
+    `advisor()` is a model-callable tool, and a model-issued call persists
+    through the ordinary tool-execution write — the same reviewer prose, in the
+    same phase history, reached by a different path. Marking only the harness's
+    entry consult left the completion gates text-sniffing every consult the
+    model asked for."""
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _RecordingContextManager()
+
+    engine._persist_action_to_branch_history(
+        "phase_build",
+        tool_name="advisor",
+        tool_params={},
+        result=ToolResult.completed_success(output=ADVICE),
+        observation_text=ADVICE,
+    )
+
+    entry = engine.context_manager.entries[0][1]
+    assert entry["entry_kind"] == ADVISOR_HISTORY_ENTRY_KIND
+    assert is_advisor_history_entry(entry) is True
+
+
+_CONSULT_PROSE = (
+    "This reactor requires java 17 and JAVA_HOME is not set; "
+    "install openjdk-17-jdk and export JAVA_HOME before compiling."
+)
+
+
+def _gate_reader(entries):
+    """The completion gates, reading exactly the entries just persisted."""
+    return ContextTool(
+        SimpleNamespace(
+            current_task_id="phase_build",
+            load_branch_history=lambda task_id: SimpleNamespace(history=list(entries)),
+        )
+    )
+
+
+def test_the_gates_skip_the_advisor_prose_a_model_asked_for():
+    """The whole fence, write to read: a model-issued consult whose advice is
+    made of the exact phrases both gates sniff for arms neither of them."""
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _RecordingContextManager()
+
+    engine._persist_action_to_branch_history(
+        "phase_build",
+        tool_name="advisor",
+        tool_params={},
+        result=ToolResult.completed_success(output=_CONSULT_PROSE),
+        observation_text=_CONSULT_PROSE,
+    )
+
+    gates = _gate_reader([entry for _, entry in engine.context_manager.entries])
+    assert gates._documents_unmet_requirement("clean summary") is False
+    assert gates._has_remediation_action() is False
+
+
+def test_a_real_action_still_reaches_both_gates():
+    """The mark narrows nothing else: the container's own answer still
+    documents the unmet requirement, and the install still counts as the
+    remediation that answers it."""
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _RecordingContextManager()
+
+    engine._persist_action_to_branch_history(
+        "phase_build",
+        tool_name="bash",
+        tool_params={"command": "mvn -version"},
+        result=ToolResult.completed_success(output="Error: JAVA_HOME is not set."),
+        observation_text="Error: JAVA_HOME is not set.",
+    )
+    engine._persist_action_to_branch_history(
+        "phase_build",
+        tool_name="bash",
+        tool_params={"command": "apt-get install -y openjdk-17-jdk"},
+        result=ToolResult.completed_success(output="Setting up openjdk-17-jdk ..."),
+        observation_text="Setting up openjdk-17-jdk ...",
+    )
+
+    gates = _gate_reader([entry for _, entry in engine.context_manager.entries])
+    assert gates._documents_unmet_requirement("clean summary") is True
+    assert gates._has_remediation_action() is True
 
 
 def test_a_history_write_failure_never_blocks_the_entry_consult():

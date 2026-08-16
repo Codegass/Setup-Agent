@@ -389,9 +389,9 @@ def test_a_floor_no_distribution_is_known_for_is_refused_before_any_download():
     assert "3.9" in " ".join(result.suggestions or ())
 
 
-def test_a_patch_level_floor_installs_exactly_that_distribution():
-    """A floor naming a patch names its own distribution: the lowest release
-    that satisfies `3.6.3` is 3.6.3."""
+def test_a_patch_level_floor_installs_the_release_of_its_line():
+    """A floor naming a patch is answered by the release of its line — for
+    `3.6.3` that release IS 3.6.3, the one this harness downloads."""
     container = FakeMavenContainer(system_version="3.5.4")
 
     result = _provision(container, floor="3.6.3")
@@ -399,6 +399,33 @@ def test_a_patch_level_floor_installs_exactly_that_distribution():
     assert result.succeeded is True
     assert container.downloads == ["3.6.3"]
     assert result.metadata["maven_version"] == "3.6.3"
+
+
+def test_a_patch_floor_below_its_lines_release_installs_that_release():
+    """`3.9.6` is satisfied by the 3.9 line's release, 3.9.9 — the archive that
+    exists. Returning the floor verbatim asked Apache for apache-maven-3.9.6."""
+    container = FakeMavenContainer()
+
+    result = _provision(container, floor="3.9.6")
+
+    assert result.succeeded is True
+    assert container.downloads == [DISTRIBUTION]
+    assert result.metadata["maven_version"] == DISTRIBUTION
+
+
+def test_a_patch_floor_of_a_line_no_archive_answers_is_refused_before_any_download():
+    """`3.7.1` was returned verbatim as its own distribution, so the provision
+    accepted it and reached for apache-maven-3.7.1-bin.tar.gz — a URL Apache
+    never published. There is no 3.7 line, so there is no distribution."""
+    container = FakeMavenContainer()
+
+    result = _provision(container, floor="3.7.1")
+
+    assert result.succeeded is False
+    assert result.error_code == "MAVEN_DISTRIBUTION_UNKNOWN"
+    assert container.downloads == []
+    # And the refusal names the call that CAN be made instead of only listing.
+    assert "maven_version='3.8'" in " ".join(result.suggestions or ())
 
 
 # ---------------------------------------------------------------------------

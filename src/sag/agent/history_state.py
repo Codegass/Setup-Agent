@@ -1,7 +1,7 @@
 """Canonical decoding for persisted branch-history action states."""
 
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 # The advisor's consult persists to phase history like any other action
 # (closure-contract rule 2), which is what puts reviewer PROSE into the record
@@ -12,6 +12,24 @@ from typing import Any, Mapping
 # `type: "thought"` exclusion those predicates already have, for the one other
 # author of prose in the history.
 ADVISOR_HISTORY_ENTRY_KIND = "advisor_consult"
+
+# The tool whose output IS that prose. `advisor()` is model-callable, so the
+# same reviewer text reaches phase history by two paths: the harness's
+# phase-entry consult and an ordinary model-issued tool execution. The kind
+# marks WHAT an entry is, never who asked for it, so it is resolved from the
+# tool that produced the text and every write path gets it.
+ADVISOR_TOOL_NAME = "advisor"
+
+
+def history_entry_kind_for_tool(tool_name: Any) -> Optional[str]:
+    """The kind a persisted action entry carries for the tool that wrote it.
+
+    None for every tool that answers from the container: its output is
+    evidence, and evidence is read.
+    """
+    if str(tool_name or "").strip().lower() == ADVISOR_TOOL_NAME:
+        return ADVISOR_HISTORY_ENTRY_KIND
+    return None
 
 
 def is_advisor_history_entry(entry: Any) -> bool:

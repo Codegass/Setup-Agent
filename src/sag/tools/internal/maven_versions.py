@@ -71,16 +71,22 @@ def satisfies_maven_floor(version: Any, floor: Any) -> bool:
 def maven_distribution_for_floor(floor: Any) -> Optional[str]:
     """The exact distribution version that answers this floor, or None.
 
-    A floor naming a patch names its own distribution — the lowest one that
-    satisfies it is the one it names. A floor naming a line takes that line's
-    last release; a floor naming only a major takes the newest line of it.
+    Every floor resolves through the table above, because the table is what
+    this harness can actually download. A floor naming a line takes that line's
+    last release; a floor naming a patch takes the same release when it
+    satisfies the patch, and NONE when it does not — `3.7.1` used to be handed
+    back verbatim, which named `apache-maven-3.7.1-bin.tar.gz`, an archive
+    Apache never published, and told `nearest_installable_floor` that a floor
+    with no line was installable. A floor naming only a major takes the newest
+    line of it.
     """
     normalized = normalize_maven_floor(floor)
     if normalized is None:
         return None
     parts = normalized.split(".")
     if len(parts) >= 3:
-        return normalized
+        release = MAVEN_DISTRIBUTIONS.get(".".join(parts[:2]))
+        return release if release and satisfies_maven_floor(release, normalized) else None
     if len(parts) == 2:
         return MAVEN_DISTRIBUTIONS.get(normalized)
     lines = [

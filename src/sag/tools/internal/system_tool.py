@@ -12,6 +12,7 @@ from .java_versions import JAVA_VERIFICATION_SEPARATOR, java_major, parse_java_v
 from .maven_versions import (
     maven_distribution_for_floor,
     maven_installable_floors,
+    nearest_installable_floor,
     normalize_maven_floor,
     parse_maven_version,
     satisfies_maven_floor,
@@ -718,14 +719,28 @@ class SystemTool(BaseTool):
             )
         distribution = maven_distribution_for_floor(floor)
         if distribution is None:
+            # Every floor resolves through the line table, so a patch names a
+            # distribution only when its line's release satisfies it. When
+            # another line does, the refusal names THAT call rather than the
+            # list alone: a refusal that can be acted on names the move.
+            nearest = nearest_installable_floor(floor)
             return ToolResult.completed_failure(
                 output="",
                 error=f"No Apache Maven distribution is known for floor {floor}",
                 error_code="MAVEN_DISTRIBUTION_UNKNOWN",
                 suggestions=[
                     f"Observed installable Maven lines: {maven_installable_floors()}",
-                    "Constraint: a floor naming an exact patch (for example '3.9.11') "
-                    "installs exactly that distribution",
+                    "Constraint: a floor is answered by the release of its line, so a "
+                    "patch above that release (or on a line with no release) has no "
+                    "distribution",
+                    *(
+                        [
+                            f"project(action='provision', maven_version='{nearest}') "
+                            f"installs the nearest line that satisfies {floor}"
+                        ]
+                        if nearest
+                        else []
+                    ),
                 ],
                 metadata={"maven_version_floor": floor},
             )
@@ -1178,10 +1193,18 @@ class SystemTool(BaseTool):
         --set java` ran one step earlier, so anything resolving through the
         system PATH directories is already on the new JDK. A refusal states the
         container it left, not the one it wishes it had left.
+
+        That law reaches the opening line, not only the suggestions under it:
+        the sentence a model reads first says what moved, and the typed marker
+        says the same thing in structure. When no link landed there is nothing
+        to state and the opener keeps saying the switch did not happen — which
+        is then the whole truth about the container.
         """
         java_home = java_home.rstrip("/")
         java_bin = f"{java_home}/bin/java"
         landed = sorted(name for name, ok in (alternatives or {}).items() if ok)
+        landed_links = " and ".join(f"/usr/bin/{name}" for name in landed)
+        landed_verb = "was" if len(landed) == 1 else "were"
         try:
             EnvOverlayStore(self.docker_orchestrator).register(
                 "java",
@@ -1196,7 +1219,15 @@ class SystemTool(BaseTool):
             logger.warning(f"Failed to register Java env overlay: {exc}")
             return ToolResult.completed_failure(
                 output=(
-                    f"Java {java_version} was installed at {java_home} and not activated\n\n{exc}"
+                    (
+                        f"Java {java_version} was installed at {java_home}; "
+                        f"{landed_links} {landed_verb} repointed at it and the runtime "
+                        "overlay did not persist the switch"
+                        if landed
+                        else f"Java {java_version} was installed at {java_home} "
+                        "and not activated"
+                    )
+                    + f"\n\n{exc}"
                 ),
                 error=f"Java {java_version} was installed but its activation did not persist",
                 error_code="JAVA_RUNTIME_ACTIVATION_FAILED",
@@ -1207,11 +1238,10 @@ class SystemTool(BaseTool):
                     "previously active runtime",
                     *(
                         [
-                            "Observed fact: "
-                            + " and ".join(f"/usr/bin/{name}" for name in landed)
-                            + f" were already repointed at {java_home}/bin — the container is "
-                            "not as it was found, and anything resolving through the system "
-                            "PATH directories now runs this JDK"
+                            f"Observed fact: {landed_links} {landed_verb} already repointed "
+                            f"at {java_home}/bin — the container is not as it was found, and "
+                            "anything resolving through the system PATH directories now "
+                            "runs this JDK"
                         ]
                         if landed
                         else []

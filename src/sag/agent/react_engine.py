@@ -71,7 +71,7 @@ from .evidence_assessments import (
     write_assessment,
 )
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
-from .history_state import ADVISOR_HISTORY_ENTRY_KIND
+from .history_state import history_entry_kind_for_tool
 from .invocation_contracts import (
     CONTRACT_AUTHORITY_MISSING,
     CONTRACT_PERSIST_FAILED,
@@ -7230,10 +7230,10 @@ class ReActEngine(UIEventEmitter):
             tool_params={},
             result=recorded,
             observation_text=execution.observation_text,
-            # What this entry IS: reviewer prose, not the container's answer.
-            # The completion gates read history as evidence, and advice to
-            # "install openjdk-17" is not a JDK installed.
-            entry_kind=ADVISOR_HISTORY_ENTRY_KIND,
+            # The entry is marked reviewer prose by the write itself, keyed on
+            # the tool: the completion gates read history as evidence, and
+            # advice to "install openjdk-17" is not a JDK installed — however
+            # the consult was asked for.
         )
         self._seal_turn_record(
             actor="controller",
@@ -7814,7 +7814,6 @@ class ReActEngine(UIEventEmitter):
         tool_params: Optional[Dict[str, Any]],
         result,
         observation_text: str,
-        entry_kind: Optional[str] = None,
     ) -> None:
         """Write one executed action into the phase history it belongs to.
 
@@ -7825,16 +7824,21 @@ class ReActEngine(UIEventEmitter):
         (cayenne, ignite, polaris, camel; spec §2.2 rule 2).
 
         `entry_kind` states what an entry IS when that changes how a reader may
-        use it. Only the advisor sets it today: its consult is reviewer prose,
-        and the completion gates that text-sniff this history must be able to
-        tell prose from the container's own answers. A model-issued action
-        carries no kind — it is evidence, and evidence is read.
+        use it. Only the advisor's prose sets it today, and it is resolved HERE
+        from the tool that produced the text rather than passed by one caller:
+        `advisor()` is model-callable, so the same reviewer sentences arrive by
+        the harness's phase-entry consult and by an ordinary model-issued
+        execution, and marking only the first left the completion gates
+        text-sniffing every consult the model asked for. The kind says what the
+        text is, not who asked. A tool that answered from the container carries
+        no kind — it is evidence, and evidence is read.
 
         Never raises: history is a projection, and a projection that fails must
         not take the run with it.
         """
         if not branch_task_id:
             return
+        entry_kind = history_entry_kind_for_tool(tool_name)
         try:
             output_to_store = result.output if result.output else ""
             from datetime import datetime

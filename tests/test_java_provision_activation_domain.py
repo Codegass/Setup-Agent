@@ -371,8 +371,27 @@ def test_an_activation_that_did_not_persist_still_states_the_links_that_moved():
     }
 
 
+def test_an_activation_failure_that_moved_links_does_not_open_by_denying_them():
+    """The opener is the first line the model reads, and it pairs with the
+    marker below it. "installed ... and not activated" over a container whose
+    /usr/bin links already resolve to the new JDK states the opposite of the
+    suggestion three lines later — and of the `partially_activated` marker."""
+    container = FakeJdkContainer(installed=("11",), linked_major="11", overlay_writable=False)
+
+    result = _provision(container, "17")
+
+    assert result.error_code == "JAVA_RUNTIME_ACTIVATION_FAILED"
+    assert result.metadata[PROVISION_ACTIVATION_STATE_MARKER]["landed"] == ["java", "javac"]
+    assert "not activated" not in result.output
+    assert "/usr/bin/java" in result.output and "/usr/bin/javac" in result.output
+    # The overlay is still what failed, and the error says exactly that.
+    assert "activation did not persist" in result.error
+
+
 def test_an_activation_failure_that_moved_no_link_claims_none():
-    """The marker states what landed, never what might have."""
+    """The marker states what landed, never what might have — and with no
+    marker the opener is free to say the container was not switched, because
+    nothing in it was."""
     container = FakeJdkContainer(overlay_writable=False)
     system = SystemTool(container)
     system._set_java_alternative = lambda name, binary: False
@@ -382,6 +401,8 @@ def test_an_activation_failure_that_moved_no_link_claims_none():
     assert result.error_code == "JAVA_RUNTIME_ACTIVATION_FAILED"
     assert PROVISION_ACTIVATION_STATE_MARKER not in (result.metadata or {})
     assert not any("already repointed" in s for s in (result.suggestions or ()))
+    assert "and not activated" in result.output
+    assert "/usr/bin/" not in result.output
 
 
 def test_a_javac_alternative_repair_does_not_repoint_the_java_link():
