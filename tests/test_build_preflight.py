@@ -488,3 +488,52 @@ def test_groovy_error_already_on_jdk8_is_a_noop_via_the_needed_active_gate():
     active = "8"
     assert needed == "8"
     assert not (needed and needed != active)  # gate is False -> no rerun
+
+
+# ---------------------------------------------------------------------------
+# The steering-only set is a set of FLOORS, and a floor the running JDK already
+# clears is not a requirement. The loose third wording ("<anything> requires
+# Java 8") matches build chatter no provisioning pattern would ever act on, so
+# without a magnitude comparison it turns an [INFO] line into an instruction to
+# swap the JDK downwards under a build that was merely failing its tests.
+# ---------------------------------------------------------------------------
+
+from sag.tools.internal.build_preflight import classify_runner_java_requirement
+
+ANIMAL_SNIFFER_INFO = "[INFO] the animal-sniffer plugin requires Java 8 to run"
+
+
+def test_a_steering_floor_the_active_runtime_clears_is_not_a_requirement():
+    # Pure text, no runtime named: the reader cannot compare, and says what it
+    # read — this is the same answer the function has always given.
+    assert classify_runner_java_requirement(ANIMAL_SNIFFER_INFO) == "8"
+    # With the runtime named, the comparison is possible and decides it.
+    assert classify_runner_java_requirement(ANIMAL_SNIFFER_INFO, active_version="17") is None
+    assert classify_runner_java_requirement(ANIMAL_SNIFFER_INFO, active_version="8") is None
+    assert classify_runner_java_requirement(ANIMAL_SNIFFER_INFO, active_version="1.8.0_362") is None
+    # A runtime BELOW the floor genuinely does not meet it.
+    assert classify_runner_java_requirement(ANIMAL_SNIFFER_INFO, active_version="7") == "8"
+    # An unreadable runtime string is not a comparison; behavior is unchanged.
+    assert classify_runner_java_requirement(ANIMAL_SNIFFER_INFO, active_version="unknown") == "8"
+
+
+def test_the_floor_a_runtime_does_not_clear_is_read_through_the_patch_version():
+    # The live geode wording, compared against the runtime as the JVM spells it.
+    out = "Java version 17 or later required, but was 11.0.31"
+    assert classify_runner_java_requirement(out, active_version="11.0.31") == "17"
+
+
+def test_a_satisfied_floor_does_not_hide_the_one_the_runtime_misses():
+    out = (
+        "Java version 8 or later required\n"
+        "ERROR: java version must be >= 21 and <= 24, your version: 17"
+    )
+    assert classify_runner_java_requirement(out, active_version="17") == "21"
+
+
+def test_the_provisioning_set_keeps_its_deliberate_downgrade():
+    # `classify_version_error` already authorizes an automatic re-provision in
+    # both directions — the Groovy sentinel IS a downgrade to 8. The steering
+    # guard is about the looser wordings only; it must not veto that set.
+    out = "Groovy:A transform used a generics containing ClassNode List <String>"
+    assert classify_runner_java_requirement(out, active_version="11") == "8"

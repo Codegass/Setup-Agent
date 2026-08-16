@@ -1517,6 +1517,11 @@ def classify_version_error(output: str) -> Optional[str]:
 # that list: it authorizes an automatic re-provision, and a false positive there
 # swaps the JDK under a build that was working. Everything below only ever
 # produces a sentence for the model to read, so a looser shape is safe.
+#
+# Every one of them states a FLOOR — "N or later", "must be >= N", "requires
+# (at least) Java N" — which is what makes `active_version` below a sufficient
+# guard: a floor the running JDK already clears cannot be the thing that failed
+# this build, and no reading of these sentences ever asks for a LOWER JDK.
 _JAVA_REQUIREMENT_STEERING_PATTERNS = [
     # Gradle plugin, live geode d2r4 (control_events seq 251, ref
     # output_241868447b79): "Java version 17 or later required, but was 11.0.31"
@@ -1534,7 +1539,10 @@ _JAVA_REQUIREMENT_STEERING_PATTERNS = [
 ]
 
 
-def classify_runner_java_requirement(output: str) -> Optional[str]:
+def classify_runner_java_requirement(
+    output: str,
+    active_version: Optional[str] = None,
+) -> Optional[str]:
     """The JDK major a runner said it needs — for steering text only.
 
     Live geode d2r4: the Gradle plugin said "Java version 17 or later required,
@@ -1545,17 +1553,31 @@ def classify_runner_java_requirement(output: str) -> Optional[str]:
     installs a JDK.
 
     The provisioning set is consulted FIRST so that, when both match, the
-    sentence and any automatic retry name the same major.
+    sentence and any automatic retry name the same major — and so that set keeps
+    both directions, including its deliberate Groovy-on-JDK8 downgrade, which is
+    a swap the engine already authorizes itself to perform.
+
+    `active_version` is the JDK this run is on right now, however the JVM spells
+    it ("17", "11.0.31", "1.8.0_362"). The steering wordings are floors, and the
+    loosest of them ("<anything> requires Java 8") matches ordinary build chatter
+    — a plugin banner naming the Java IT was built for. Compared against nothing,
+    such a line reads as a requirement and produces a sentence telling the model
+    to provision a LOWER JDK under a build that failed for some other reason.
+    So a floor the running JDK already clears is not a requirement, and the next
+    stated floor gets its turn. With no readable runtime to compare against there
+    is no comparison to make, and the text is reported as read.
     """
     if not output:
         return None
     needed = classify_version_error(output)
     if needed:
         return needed
+    active_major = java_major(active_version) if active_version else None
     for pattern in _JAVA_REQUIREMENT_STEERING_PATTERNS:
-        match = pattern.search(output)
-        if match:
-            return match.group(1)
+        for match in pattern.finditer(output):
+            candidate = match.group(1)
+            if active_major is None or int(candidate) > int(active_major):
+                return candidate
     return None
 
 

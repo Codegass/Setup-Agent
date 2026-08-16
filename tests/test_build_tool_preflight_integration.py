@@ -646,6 +646,48 @@ def test_a_runner_asking_for_the_major_already_active_is_not_steered():
     assert _steering_lines(result) == []
 
 
+# A plugin banner naming the Java IT needs is not the build naming the Java the
+# BUILD needs. The steering wordings are floors; a floor the running JDK already
+# clears cannot be the reason this build failed, and a sentence that names it
+# would send the model to swap the JDK downwards under a test failure.
+ANIMAL_SNIFFER_NOISE = (
+    "[INFO] --- animal-sniffer-maven-plugin:1.23:check (default) @ core ---\n"
+    "[INFO] the animal-sniffer plugin requires Java 8 to run\n"
+    "[ERROR] Failed to execute goal surefire:test (default-test) on project core: "
+    "There are test failures.\nBUILD FAILURE"
+)
+
+
+def test_a_floor_the_runtime_already_clears_never_steers_a_downgrade():
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output=ANIMAL_SNIFFER_NOISE))
+    orch = ScriptedOrch(java="17", manifest={})
+
+    result = _tool(orch, maven=maven).execute(action="test", working_directory="/workspace/proj")
+
+    assert len(maven.calls) == 1
+    assert _steering_lines(result) == []
+    assert "runner_java_requirement" not in (result.metadata or {})
+
+
+def test_the_generic_wording_still_names_the_provision_when_it_asks_for_more():
+    """Same loose wording, the other direction: 11 does not clear a Java 17
+    floor, so the sentence and the typed fact are both earned."""
+    gradle = ScriptedBackendTool(
+        ToolResult.completed_failure(
+            output="FAILURE: Build failed.\n> the shadow plugin requires Java 17 to run"
+        )
+    )
+    orch = ScriptedOrch(java="11", manifest={}, markers=("/workspace/proj/build.gradle",))
+
+    result = _tool(orch, gradle=gradle).execute(
+        action="test", working_directory="/workspace/proj"
+    )
+
+    assert len(gradle.calls) == 1
+    assert "project(action='provision', java_version='17')" in _steering_lines(result)[0]
+    assert result.metadata["runner_java_requirement"]["required_major"] == "17"
+
+
 def test_scope_warning_when_explicit_workdir_deeper_than_build_root():
     orch = ScriptedOrch(
         java="17",

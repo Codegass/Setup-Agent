@@ -1089,19 +1089,25 @@ class BuildTool(BaseTool):
         It stays a sentence. Widening the automatic re-provision to these looser
         wordings would let a stray phrase swap the JDK under a working build;
         naming the call costs nothing and cannot corrupt runtime state. It is
-        withheld in the two cases where it would be false: a retry that already
-        moved to that major has done the thing, and a runtime that already IS
-        that major failed for some other reason.
+        withheld in the three cases where it would be false: a retry that
+        already moved to that major has done the thing, a runtime that already
+        IS that major failed for some other reason, and — the direction the
+        looser wordings make possible — a stated floor the running JDK already
+        clears, which is never a reason to go DOWN. The active runtime is passed
+        into the classification so that last one is decided before any sentence
+        or typed fact exists: an [INFO] line about a plugin's own Java is not
+        this build's requirement, and a sentence naming a provision call is an
+        instruction the model can act on.
         """
         if outcome is None or inner is None or inner.succeeded:
             return ""
         failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
-        needed = classify_runner_java_requirement(failure_text)
+        active = str(getattr(outcome, "active_version", "") or "")
+        needed = classify_runner_java_requirement(failure_text, active_version=active)
         if not needed:
             return ""
         if jdk_retry and str(jdk_retry.get("to") or "") == needed:
             return ""
-        active = str(getattr(outcome, "active_version", "") or "")
         if active and active == needed:
             return ""
         # The prose and the typed fact are one statement: `_envelope` copies this
