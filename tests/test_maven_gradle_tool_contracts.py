@@ -9,6 +9,7 @@ from sag.tools.base import ToolResult
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
+from sag.tools.internal.maven_versions import nearest_installable_floor
 from sag.tools.internal.toolchain_manager import (
     ResolvedToolExecutable,
     ToolExecutableCandidate,
@@ -768,6 +769,50 @@ def test_the_provision_exit_carries_the_floor_of_an_exact_requirement():
 
     provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
     assert provision and "maven_version='3.9.6'" in provision[0]
+
+
+@pytest.mark.parametrize(
+    "floor, expected",
+    [
+        ("3.9", "3.9"),  # a line with its own distribution answers itself
+        ("3.9.6", "3.9.6"),  # a floor naming a patch names its own distribution
+        ("3.7", "3.8"),  # no 3.7 archive: the nearest line that satisfies it
+        ("3.4", "3.5"),
+        ("3", "3"),  # a bare major resolves to the newest line of it
+        ("4.0", None),  # nothing this harness installs satisfies it
+        ("", None),
+    ],
+)
+def test_the_installable_floor_is_the_nearest_line_that_satisfies_the_ask(floor, expected):
+    assert nearest_installable_floor(floor) == expected
+
+
+def test_a_floor_no_distribution_answers_is_not_named_as_a_provision_move():
+    """`floor_from_requirement` reads any lower bound a build states; the
+    provision installs only the lines this harness has a distribution for. A
+    requirement of `[3.7,)` produced `maven_version='3.7'`, which the provision
+    refuses MAVEN_DISTRIBUTION_UNKNOWN — a move that cannot succeed. The nearest
+    line that DOES satisfy the requirement is a move that can."""
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager, requirement="[3.7,)")
+
+    provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
+    assert provision, "a floor above the apt Maven still has an install route"
+    assert "maven_version='3.7'" not in provision[0], "no distribution answers 3.7"
+    assert "maven_version='3.8'" in provision[0], "the nearest line that satisfies it"
+
+
+def test_a_floor_beyond_every_installable_line_names_no_provision_move():
+    """Nothing this harness installs satisfies `[4.0,)`, so the refusal offers
+    the exits it has and invents none."""
+    manager = RequirementFreeToolchainManager()
+
+    result = _requirement_refusal(manager, requirement="[4.0,)")
+
+    assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
+    assert not any("action='provision'" in s for s in (result.suggestions or ()))
+    assert any("action='env'" in s for s in (result.suggestions or ())), "the exits it has remain"
 
 
 def test_a_project_observed_requirement_keeps_binding_and_offers_no_drop_exit():

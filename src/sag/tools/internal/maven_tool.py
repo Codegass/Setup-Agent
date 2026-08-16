@@ -42,7 +42,7 @@ from .build_utils import (
 )
 from .command_tracker import CommandTracker
 from .dispatch_argv import maven_action_tokens
-from .maven_versions import floor_from_requirement
+from .maven_versions import floor_from_requirement, nearest_installable_floor
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
 # The reactor summary Maven prints at the end of every multi-module build:
@@ -1864,10 +1864,14 @@ class MavenTool(BaseTool):
         one call that installs an Apache distribution for that floor under
         /opt, activates it in the runtime overlay, and verifies `mvn -version`
         in the domain later dispatches resolve; the floor it is given is the
-        one THIS requirement states. And `project(action='env', tool='maven',
-        executable=..., requirement=...)` registers a distribution that is
-        already on disk, canonicalizing its bin/mvn, probing `-version`, and
-        enforcing the very requirement being held. No move is offered that
+        lowest line the harness can install that SATISFIES this requirement,
+        because a floor no archive answers (`[3.7,)`) would name a call whose
+        only reply is MAVEN_DISTRIBUTION_UNKNOWN. When no installable line
+        satisfies it, the move is omitted rather than invented. And
+        `project(action='env', tool='maven', executable=..., requirement=...)`
+        registers a distribution that is already on disk, canonicalizing its
+        bin/mvn, probing `-version`, and enforcing the very requirement being
+        held. No move is offered that
         would install the wrong version: `project(action='provision',
         packages=['maven'])` is deliberately NOT named here, because apt is
         what already produced the 3.8.7 that fails this constraint.
@@ -1906,7 +1910,7 @@ class MavenTool(BaseTool):
                     f"not a project-observed constraint — re-dispatch the same build with "
                     f"maven_version_requirement omitted to run on {stated}"
                 )
-        floor = floor_from_requirement(required_version.raw)
+        floor = nearest_installable_floor(floor_from_requirement(required_version.raw))
         if floor:
             suggestions.append(
                 f"To hold {required_version.raw}, install a Maven that satisfies it: "

@@ -71,6 +71,7 @@ from .evidence_assessments import (
     write_assessment,
 )
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
+from .history_state import ADVISOR_HISTORY_ENTRY_KIND
 from .invocation_contracts import (
     CONTRACT_AUTHORITY_MISSING,
     CONTRACT_PERSIST_FAILED,
@@ -7229,6 +7230,10 @@ class ReActEngine(UIEventEmitter):
             tool_params={},
             result=recorded,
             observation_text=execution.observation_text,
+            # What this entry IS: reviewer prose, not the container's answer.
+            # The completion gates read history as evidence, and advice to
+            # "install openjdk-17" is not a JDK installed.
+            entry_kind=ADVISOR_HISTORY_ENTRY_KIND,
         )
         self._seal_turn_record(
             actor="controller",
@@ -7358,6 +7363,15 @@ class ReActEngine(UIEventEmitter):
         is excluded from resolution for exactly that reason), and it is read
         here at consult time, never from a snapshot taken before provisioning.
 
+        The whole overlay entry is read, not its `candidates` half. jackrabbit's
+        `/usr/bin/mvn` stayed a registered candidate after the `[3.9,)` failure
+        blocked it — `block` records negative evidence and drops `active`, it
+        does not un-register — so a digest that reads candidates alone hands the
+        reviewer the one Maven that provably cannot answer this build, as a move
+        needing no install. A blocked executable is stated AS blocked, with the
+        requirement it fails, and the tool's observed requirements are stated
+        too: the constraint is what makes a runtime a non-move.
+
         Silent when there is no container to read and when the overlay cannot
         be read: an unreadable overlay is not an empty one, and the digest may
         not state a state it never read."""
@@ -7375,12 +7389,21 @@ class ReActEngine(UIEventEmitter):
             entry = tools.get(name) or {}
             candidates = entry.get("candidates") or {}
             active = entry.get("active")
-            # Every registered candidate, the active one first: a runtime the
-            # overlay already holds is a move the model can make without
-            # installing anything, and the reviewer can only name it if the
-            # digest does.
-            ordered = [executable for executable in [active] if executable in candidates]
-            ordered += [executable for executable in sorted(candidates) if executable != active]
+            blocked = self._blocked_executables(entry)
+            # Every registered candidate the overlay has NOT blocked, the active
+            # one first: a runtime the overlay already holds is a move the model
+            # can make without installing anything, and the reviewer can only
+            # name it if the digest does.
+            ordered = [
+                executable
+                for executable in [active]
+                if executable in candidates and executable not in blocked
+            ]
+            ordered += [
+                executable
+                for executable in sorted(candidates)
+                if executable != active and executable not in blocked
+            ]
             for executable in ordered:
                 candidate = candidates.get(executable) or {}
                 version = str(candidate.get("version") or "").strip()
@@ -7389,9 +7412,45 @@ class ReActEngine(UIEventEmitter):
                     f"{'active' if executable == active else 'registered'} at {executable}"
                     f"{'' if executable == active else ' (not active)'}"
                 )
+            for executable in sorted(blocked):
+                version, detail = blocked[executable]
+                entries.append(
+                    f"{name} {version + ' ' if version else ''}blocked at {executable}"
+                    f"{f' ({detail})' if detail else ''}"
+                )
+            for requirement in entry.get("requirements") or []:
+                raw = str(requirement.get("raw") or "").strip()
+                if not raw:
+                    continue
+                scope = str(requirement.get("working_directory") or "").strip()
+                entries.append(
+                    f"{name} observed requirement: {raw}{f' (at {scope})' if scope else ''}"
+                )
         return self._ADVISOR_TOOLCHAIN_PREFIX + (
             "; ".join(entries) or "no runtime is registered in the env overlay"
         )
+
+    @staticmethod
+    def _blocked_executables(entry: Mapping[str, Any]) -> Dict[str, Tuple[str, str]]:
+        """Every blocked executable of one overlay entry, with what blocked it.
+
+        Keyed by executable because that is what a block record is about: one
+        exact path, blocked by one observed requirement. The newest record for a
+        path wins its detail — `block` appends, and the last thing observed is
+        the current state.
+        """
+        blocked: Dict[str, Tuple[str, str]] = {}
+        for record in entry.get("blocked") or []:
+            if not isinstance(record, Mapping):
+                continue
+            executable = str(record.get("executable") or "").strip()
+            if not executable:
+                continue
+            requirement = str(record.get("requirement") or "").strip()
+            reason = str(record.get("reason") or "").strip()
+            detail = f"requirement {requirement}" if requirement else reason
+            blocked[executable] = (str(record.get("version") or "").strip(), detail)
+        return blocked
 
     def _advisor_evidence_digest(self) -> str:
         """The deterministic evidence section: handoff projection, the toolchain
@@ -7755,6 +7814,7 @@ class ReActEngine(UIEventEmitter):
         tool_params: Optional[Dict[str, Any]],
         result,
         observation_text: str,
+        entry_kind: Optional[str] = None,
     ) -> None:
         """Write one executed action into the phase history it belongs to.
 
@@ -7763,6 +7823,12 @@ class ReActEngine(UIEventEmitter):
         phase history — the record the next context reads, and the one every
         post-hoc reconstruction reads — was missing the harness's own evidence
         (cayenne, ignite, polaris, camel; spec §2.2 rule 2).
+
+        `entry_kind` states what an entry IS when that changes how a reader may
+        use it. Only the advisor sets it today: its consult is reviewer prose,
+        and the completion gates that text-sniff this history must be able to
+        tell prose from the container's own answers. A model-issued action
+        carries no kind — it is evidence, and evidence is read.
 
         Never raises: history is a projection, and a projection that fails must
         not take the run with it.
@@ -7846,6 +7912,8 @@ class ReActEngine(UIEventEmitter):
                     ]
                 ),
             }
+            if entry_kind:
+                history_entry["entry_kind"] = entry_kind
             if fact_sheet_identity:
                 history_entry["metadata"] = fact_sheet_identity
             for field_name in ("failure_signature", "error_tail_preview"):

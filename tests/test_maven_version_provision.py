@@ -41,7 +41,7 @@ from sag.agent.evidence_assessments import (
     validate_assessment_v2,
 )
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
-from sag.tools.internal.system_tool import SystemTool
+from sag.tools.internal.system_tool import PROVISION_ACTIVATION_STATE_MARKER, SystemTool
 from sag.tools.project_tool import ProjectTool
 
 SYSTEM_MVN = "/usr/bin/mvn"
@@ -97,6 +97,7 @@ class FakeMavenContainer:
         self.installed: dict[str, str] = {}
         self.downloads: list[str] = []
         self.commands: list[str] = []
+        self.removed: list[str] = []
         self.files: dict[str, str] = {}
 
     # -- the container's own resolution -------------------------------------
@@ -122,6 +123,12 @@ class FakeMavenContainer:
     # -- command surface ----------------------------------------------------
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=True):
         self.commands.append(command)
+
+        if command.startswith("rm -rf "):
+            for path in command.split()[2:]:
+                self.removed.append(path)
+                self.installed.pop(path, None)
+            return {"success": True, "output": "", "exit_code": 0}
 
         tar = _TAR_RE.search(command)
         if tar:
@@ -227,6 +234,103 @@ def test_a_domain_that_did_not_take_the_switch_is_not_sealed_as_one_that_did():
     assert result.error_code == "MAVEN_VERSION_VERIFICATION_MISMATCH"
     assert result.metadata["verified_maven_version"] == APT_VERSION
     assert result.metadata.get("maven_version") != DISTRIBUTION
+
+
+def test_the_post_activation_refusal_states_the_container_it_actually_left():
+    """The switch landed and the domain still answered for the old Maven. A
+    refusal is right; describing the container as unswitched is not."""
+    container = FakeMavenContainer(frozen=True)
+
+    result = _provision(container)
+
+    assert result.succeeded is False
+    stated = " ".join([result.error or "", *(result.suggestions or ())])
+    assert "activation persisted; verification refused the seal" in stated
+
+
+def test_the_post_activation_refusal_leaves_a_typed_activation_marker():
+    container = FakeMavenContainer(frozen=True)
+
+    result = _provision(container)
+
+    assert result.metadata[PROVISION_ACTIVATION_STATE_MARKER] == {
+        "tool": "maven",
+        "state": "activated",
+        "executable": DISTRIBUTION_BIN,
+        "home": DISTRIBUTION_HOME,
+        "requested": "3.9",
+        "verified": APT_VERSION,
+    }
+    assert (
+        json.loads(container.files[DEFAULT_OVERLAY_JSON])["tools"]["maven"]["active"]
+        == DISTRIBUTION_BIN
+    )
+
+
+def test_a_pre_activation_refusal_carries_no_activation_marker():
+    container = FakeMavenContainer(extracted_answers={DISTRIBUTION: APT_VERSION})
+
+    result = _provision(container)
+
+    assert result.succeeded is False
+    stated = " ".join([result.error or "", *(result.suggestions or ())])
+    assert "activation persisted" not in stated
+    assert PROVISION_ACTIVATION_STATE_MARKER not in (result.metadata or {})
+
+
+# ---------------------------------------------------------------------------
+# A failed install leaves nothing behind for the resolver to prefer
+#
+# `ToolchainManager` discovers Maven with
+# `find /workspace /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn'`. An
+# extraction that produced no runnable mvn, or one whose own probe failed, is
+# exactly the tree that find will hand back to the next resolution — a Maven
+# this provision already refused, now arriving as a discovered candidate.
+# ---------------------------------------------------------------------------
+
+
+class _BrokenExtractionContainer(FakeMavenContainer):
+    """The tar lands the directory; the binary inside it is not usable."""
+
+    def __init__(self, *, binary_present, **kwargs):
+        super().__init__(**kwargs)
+        self.binary_present = binary_present
+
+    def execute_command(self, command, workdir=None, timeout=None, truncate_output=True):
+        if not self.binary_present and re.fullmatch(r"test -x (\S+) && echo 'present'", command):
+            self.commands.append(command)
+            return {"success": False, "output": "", "exit_code": 1}
+        if self.binary_present and f"{DISTRIBUTION_BIN} -version" in command:
+            self.commands.append(command)
+            return {"success": False, "output": "Error: JAVA_HOME is not set", "exit_code": 1}
+        return super().execute_command(command, workdir, timeout, truncate_output)
+
+
+def test_an_extraction_with_no_runnable_binary_is_removed_from_opt():
+    container = _BrokenExtractionContainer(binary_present=False)
+
+    result = _provision(container)
+
+    assert result.error_code == "MAVEN_BINARY_NOT_FOUND"
+    assert DISTRIBUTION_HOME in container.removed
+
+
+def test_a_distribution_that_failed_its_own_probe_is_removed_from_opt():
+    container = _BrokenExtractionContainer(binary_present=True)
+
+    result = _provision(container)
+
+    assert result.error_code == "MAVEN_CONFIG_FAILED"
+    assert DISTRIBUTION_HOME in container.removed
+
+
+def test_a_successful_provision_removes_nothing():
+    container = FakeMavenContainer()
+
+    result = _provision(container)
+
+    assert result.succeeded is True
+    assert container.removed == []
 
 
 def test_a_distribution_whose_binary_answers_another_version_moves_nothing():
@@ -335,6 +439,29 @@ def test_a_provision_asked_for_two_toolchains_at_once_drops_neither():
     assert "java_version" in stated and "maven_version" in stated
 
 
+def test_a_provision_asked_for_maven_and_apt_packages_at_once_drops_neither():
+    """The same law for the other pair the router silently resolved: maven_version
+    routed to install_maven and `packages` went nowhere — a call whose apt half
+    was never run and never refused."""
+    container = FakeMavenContainer()
+    facade = ProjectTool(system_tool=SystemTool(container))
+
+    result = facade.execute(action="provision", packages=["git"], maven_version="3.9")
+
+    assert result.succeeded is False
+    assert result.error_code == "PROJECT_PROVISION_AMBIGUOUS"
+    assert container.downloads == []
+    stated = " ".join(result.suggestions or ())
+    assert "packages" in stated and "maven_version" in stated
+
+
+def test_maven_version_alone_still_routes_to_the_maven_provision():
+    container = FakeMavenContainer()
+    facade = ProjectTool(system_tool=SystemTool(container))
+
+    assert facade.execute(action="provision", maven_version="3.9").succeeded is True
+
+
 # ---------------------------------------------------------------------------
 # (b) the typed assessment for the failure that motivated the provision
 # ---------------------------------------------------------------------------
@@ -394,6 +521,34 @@ def test_a_maven_that_already_satisfies_the_floor_is_not_told_to_provision():
     the extension wants, the same crash means something else, and naming the
     provision would be inventing a diagnosis."""
     output = f"Apache Maven 3.9.11 (abcdef)\n{CAMEL_NISSE_CRASH}"
+
+    assert maven_extension_incompatibility(MAVEN_RECEIPT, output) == []
+
+
+def test_the_extension_named_is_the_one_under_the_crash_not_an_earlier_stack():
+    """The frame search started at offset 0, so any non-core `at` line printed
+    EARLIER in a long reactor log named the extension. A stack trace above the
+    NoSuchMethodError belongs to a different failure; the caller this
+    assessment is about is the frame beneath the match."""
+    output = (
+        "[ERROR] Failed to execute goal on project widget\n"
+        "\tat com.example.unrelated.EarlierFailure.run(EarlierFailure.java:31)\n"
+        f"{CAMEL_NISSE_CRASH}"
+    )
+
+    (assessment,) = maven_extension_incompatibility(MAVEN_RECEIPT, output)
+
+    assert "eu.maveniverse.maven.nisse" in assessment.detail
+    assert "com.example.unrelated" not in assessment.detail
+
+
+def test_a_resolver_crash_with_no_frame_beneath_it_states_nothing():
+    """Whatever precedes the match cannot supply the caller."""
+    output = (
+        "\tat com.example.unrelated.EarlierFailure.run(EarlierFailure.java:31)\n"
+        'Exception in thread "main" java.lang.NoSuchMethodError: \'java.lang.Object '
+        "org.eclipse.aether.SessionData.computeIfAbsent(java.lang.Object)'\n"
+    )
 
     assert maven_extension_incompatibility(MAVEN_RECEIPT, output) == []
 

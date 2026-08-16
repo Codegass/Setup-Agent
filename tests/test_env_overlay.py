@@ -1704,6 +1704,40 @@ def test_an_absent_java_is_provisioned_by_major_never_as_an_apt_package():
     assert any("java_version=" in s for s in provision), "the JDK route is java_version"
 
 
+def test_the_java_provision_move_carries_the_major_the_refused_path_states():
+    """A move the model has to complete is a move it can get wrong. geode's own
+    path says which JDK it wanted — `java-17-openjdk-amd64` — so the refusal
+    names java_version='17', not a `<major>` placeholder."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        activate=True,
+    )
+
+    provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
+    assert provision and "java_version='17'" in provision[0]
+    assert "<major>" not in provision[0]
+
+
+def test_the_java_provision_move_keeps_the_placeholder_when_no_major_is_stated():
+    """The path is the only source: inventing a major the refusal never read
+    would install a JDK nobody asked for."""
+    tool = EnvTool(_MissingExecutableOrchestrator(wrapper=None))
+
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/opt/jdk/bin/java",
+        activate=True,
+    )
+
+    provision = [s for s in (result.suggestions or ()) if "action='provision'" in s]
+    assert provision and "java_version='<major>'" in provision[0]
+
+
 # ---------------------------------------------------------------------------
 # The third rung: a material action may not recur without bound (#42)
 # docs/superpowers/specs/2026-08-13-material-recurrence-bound-design.md §3

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from sag.agent.context_manager import TaskStatus
+from sag.agent.history_state import ADVISOR_HISTORY_ENTRY_KIND
 from sag.agent.react_types import StepType
 from sag.project_fact_sheet import (
     PROJECT_FACT_SHEET_SCHEMA,
@@ -413,6 +414,54 @@ def test_documents_unmet_requirement_ignores_thought_entries():
     observation_history = [{"type": "observation", "content": "ERROR: JAVA_HOME is not set."}]
     tool = ContextTool(_branch_cm(history=observation_history))
     assert tool._documents_unmet_requirement("clean summary") is True
+
+
+def test_documents_unmet_requirement_ignores_advisor_prose():
+    """The advisor's consult persists to phase history like any other action
+    (closure-contract rule 2), and reviewer prose says things like "this build
+    requires java 17". A reviewer SENTENCE is not the container's answer, so it
+    may not arm the requirement gate any more than a thought may."""
+    advisor_history = [
+        {
+            "type": "action",
+            "tool_name": "advisor",
+            "entry_kind": ADVISOR_HISTORY_ENTRY_KIND,
+            "observation": "the reactor requires java 17 and java_home is not set",
+            "output": "the reactor requires java 17 and java_home is not set",
+        }
+    ]
+    tool = ContextTool(_branch_cm(history=advisor_history))
+    assert tool._documents_unmet_requirement("clean summary") is False
+
+
+def test_advisor_prose_is_not_a_remediation_action():
+    """The other half of the same gate: advice to install a JDK is not a JDK
+    installed. Counting it as remediation disarms the gate on prose alone."""
+    advisor_history = [
+        {
+            "type": "action",
+            "tool_name": "advisor",
+            "entry_kind": ADVISOR_HISTORY_ENTRY_KIND,
+            "observation": "install openjdk-17-jdk and export JAVA_HOME before compiling",
+            "output": "install openjdk-17-jdk and export JAVA_HOME before compiling",
+        }
+    ]
+    tool = ContextTool(_branch_cm(history=advisor_history))
+    assert tool._has_remediation_action() is False
+
+
+def test_a_real_remediation_action_still_disarms_the_gate():
+    """The mark narrows nothing else: a bash install is still remediation."""
+    history = [
+        {
+            "type": "action",
+            "tool_name": "bash",
+            "success": True,
+            "output": "Setting up openjdk-17-jdk-headless (17.0.10+7) ...",
+        }
+    ]
+    tool = ContextTool(_branch_cm(history=history))
+    assert tool._has_remediation_action() is True
 
 
 def test_detached_handoff_is_not_build_execution_evidence():

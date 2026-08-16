@@ -7,6 +7,16 @@ from typing import Any, Dict
 
 from .base import BaseTool, ToolResult
 
+# SystemTool routes a provision by which parameter is present, and it has one
+# route per toolchain. This is the whole set, each named as the call that
+# performs it — so a call that supplies two of them is answered with both of
+# the calls it should have been.
+PROVISION_ROUTES = {
+    "java_version": "project(action='provision', java_version=...) for the JDK",
+    "maven_version": "project(action='provision', maven_version=...) for Apache Maven",
+    "packages": "project(action='provision', packages=[...]) for apt packages",
+}
+
 
 class ProjectTool(BaseTool):
     def __init__(self, setup_tool=None, analyzer_tool=None, system_tool=None, env_tool=None):
@@ -97,27 +107,30 @@ class ProjectTool(BaseTool):
             # call naming two toolchains is refused rather than silently
             # dropping one — a provision that seals a toolchain it never
             # installed is the failure mode this whole path exists to avoid.
-            if "java_version" in kwargs and "maven_version" in kwargs:
+            # Every pair the router cannot honour, not just the first one that
+            # was noticed: `maven_version` with `packages` routed to
+            # install_maven and dropped the apt half in silence — the same seal
+            # over an uninstalled toolchain, one parameter over.
+            supplied = [name for name in PROVISION_ROUTES if name in kwargs]
+            if len(supplied) > 1:
                 return ToolResult.completed_failure(
                     output="",
                     error=(
                         "project(action='provision') installs one toolchain per call: "
-                        "java_version and maven_version were both supplied"
+                        f"{', '.join(supplied)} were supplied together"
                     ),
                     error_code="PROJECT_PROVISION_AMBIGUOUS",
-                    suggestions=[
-                        "Call project(action='provision', java_version=...) for the JDK",
-                        "Call project(action='provision', maven_version=...) for Apache Maven",
-                    ],
+                    suggestions=[f"Call {PROVISION_ROUTES[name]}" for name in supplied],
                     raw_data={
                         "action": "provision",
-                        "java_version": kwargs.get("java_version"),
-                        "maven_version": kwargs.get("maven_version"),
+                        "supplied": supplied,
+                        **{name: kwargs.get(name) for name in supplied},
                     },
                 )
+            # Exactly one route is reachable here, so each branch names its own.
             if "maven_version" in kwargs:
                 kwargs.setdefault("action", "install_maven")
-            elif "packages" in kwargs and "java_version" not in kwargs:
+            elif "packages" in kwargs:
                 kwargs.setdefault("action", "install")
             else:
                 kwargs.setdefault("action", "install_java")

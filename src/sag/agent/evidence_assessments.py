@@ -1421,7 +1421,12 @@ def maven_extension_incompatibility(
     running = parse_maven_version(text)
     if running and satisfies_maven_floor(running, MAVEN_EXTENSION_REMEDY_FLOOR):
         return []
-    frame = _MAVEN_EXTENSION_FRAME.search(text)
+    # From the match, never from the top of the log. A reactor log carries
+    # thousands of lines and any earlier non-core `at` frame — a plugin's own
+    # stack trace, a warning, an unrelated exception — would otherwise be named
+    # as the extension that crashed on the resolver API. The caller this
+    # assessment is about is the first frame BENEATH the NoSuchMethodError.
+    frame = _MAVEN_EXTENSION_FRAME.search(text, missing.end())
     if not frame:
         return []
     extension = ".".join(frame.group(1).split(".")[:_EXTENSION_COORDINATE_SEGMENTS])

@@ -3,6 +3,21 @@
 from enum import Enum
 from typing import Any, Mapping
 
+# The advisor's consult persists to phase history like any other action
+# (closure-contract rule 2), which is what puts reviewer PROSE into the record
+# the completion gates text-sniff: `_documents_unmet_requirement` reads
+# observations for "requires java", `_has_remediation_action` reads actions for
+# "openjdk"/"export java_home", and an advisor sentence naturally contains both.
+# The entry states its own kind so a predicate can decline to read it — the
+# `type: "thought"` exclusion those predicates already have, for the one other
+# author of prose in the history.
+ADVISOR_HISTORY_ENTRY_KIND = "advisor_consult"
+
+
+def is_advisor_history_entry(entry: Any) -> bool:
+    """Whether a persisted history entry is the advisor's own consult record."""
+    return isinstance(entry, Mapping) and entry.get("entry_kind") == ADVISOR_HISTORY_ENTRY_KIND
+
 
 class HistoryActionState(str, Enum):
     PENDING = "pending"

@@ -89,6 +89,31 @@ def maven_distribution_for_floor(floor: Any) -> Optional[str]:
     return max(lines, key=maven_version_tuple) if lines else None
 
 
+def nearest_installable_floor(floor: Any) -> Optional[str]:
+    """The lowest floor this harness can actually install that satisfies `floor`.
+
+    `floor_from_requirement` reads whatever lower bound a build states, and a
+    build may state one no published `apache-maven-X-bin` archive answers —
+    `[3.7,)` is a real Maven range and there is no 3.7 line. Naming
+    `maven_version='3.7'` as a move offers a call whose only possible answer is
+    MAVEN_DISTRIBUTION_UNKNOWN, which is the #19 defect class: guidance that
+    cannot be acted on. The nearest line whose distribution SATISFIES the ask is
+    a move that can be acted on; when no line does, there is no move and the
+    caller must offer none rather than invent one.
+    """
+    normalized = normalize_maven_floor(floor)
+    if normalized is None:
+        return None
+    if maven_distribution_for_floor(normalized) is not None:
+        return normalized
+    satisfying = [
+        line
+        for line, version in MAVEN_DISTRIBUTIONS.items()
+        if satisfies_maven_floor(version, normalized)
+    ]
+    return min(satisfying, key=maven_version_tuple) if satisfying else None
+
+
 def floor_from_requirement(requirement: Any) -> Optional[str]:
     """The floor a stated requirement asks for: `[3.9,)` -> `3.9`, `3.9.6` -> `3.9.6`.
 

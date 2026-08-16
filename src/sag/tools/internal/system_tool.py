@@ -34,6 +34,55 @@ MAVEN_DOMAIN_VERIFICATION = "command -v mvn 2>/dev/null; mvn -version 2>&1"
 # downloads its plugins, so a distribution is as reachable as a POM.
 MAVEN_ARCHIVE_BASE = "https://archive.apache.org/dist/maven"
 MAVEN_INSTALL_ROOT = "/opt"
+# The typed fact a post-activation refusal leaves behind: WHICH container the
+# refusal is over. A provision verifies its domain by asking what a bare `java`
+# or `mvn` resolves to, and that question is only answerable once the switch is
+# persisted — so a refusal at that point is returned over a container that HAS
+# been switched. Prose alone would leave the next consult to re-derive it; the
+# marker states it in structure, beside the overlay the consult already reads.
+PROVISION_ACTIVATION_STATE_MARKER = "provision_activation_state"
+# The one sentence a post-activation refusal owes the record.
+PROVISION_ACTIVATION_PERSISTED_TEXT = "activation persisted; verification refused the seal"
+
+
+def activation_state_metadata(
+    tool: str,
+    executable: Optional[str],
+    home: str,
+    requested: str,
+    verified: Optional[str],
+) -> Dict[str, Any]:
+    """The typed marker for a refusal returned over a switched container."""
+    if not executable:
+        return {}
+    return {
+        PROVISION_ACTIVATION_STATE_MARKER: {
+            "tool": tool,
+            "state": "activated",
+            "executable": executable,
+            "home": home,
+            "requested": requested,
+            "verified": verified,
+        }
+    }
+
+
+def activation_state_suggestions(
+    tool: str,
+    executable: Optional[str],
+    home: str,
+    requested: str,
+) -> List[str]:
+    """What such a refusal must say in words: the container is not as found."""
+    if not executable:
+        return []
+    return [
+        f"Observed fact: {PROVISION_ACTIVATION_PERSISTED_TEXT} — {executable} is the "
+        f"activated {tool} runtime in the overlay every later dispatch resolves through, "
+        f"and {home} is what this provision left behind",
+        f"Constraint: the {tool} the domain resolves must be observed to answer for "
+        f"{requested} before this provision can be sealed",
+    ]
 
 
 class SystemTool(BaseTool):
@@ -593,7 +642,7 @@ class SystemTool(BaseTool):
         # so it fronts both the verification shell and every later dispatch.
         self._persist_java_home_profile(java_home)
         alternatives = self._set_java_alternatives(java_bin, javac_bin)
-        activation_failure = self._activate_java_runtime(java_home, java_version)
+        activation_failure = self._activate_java_runtime(java_home, java_version, alternatives)
         if activation_failure is not None:
             return activation_failure
 
@@ -608,6 +657,12 @@ class SystemTool(BaseTool):
             java_version,
             java_home,
             verify_result["output"],
+            # This verification cannot be bought before the switch: the domain
+            # IS the persisted overlay, so asking it what a bare `java` resolves
+            # to requires the activation to have landed. The refusal therefore
+            # says what the container is, not what a container that never moved
+            # would be.
+            activated_executable=java_bin,
         )
         if contradiction is not None:
             return contradiction
@@ -726,13 +781,19 @@ class SystemTool(BaseTool):
 
         present = self.docker_orchestrator.execute_command(f"test -x {maven_bin} && echo 'present'")
         if "present" not in present.get("output", ""):
+            # The extraction landed a directory the resolver will find:
+            # `ToolchainManager` discovers Maven with `find /workspace /tmp /opt
+            # /usr/local -path '*/apache-maven-*/bin/mvn'`. A tree this call
+            # already refused must not come back as a discovered candidate.
+            self._remove_maven_tree(maven_home, archive)
             return ToolResult.completed_failure(
                 output=present.get("output", ""),
                 error=f"Apache Maven {distribution} was installed but exposes no {maven_bin}",
                 error_code="MAVEN_BINARY_NOT_FOUND",
                 suggestions=[
                     "Observed fact: the extracted distribution has no executable bin/mvn",
-                    f"Observed candidate MAVEN_HOME: {maven_home}",
+                    f"Observed fact: the unusable tree at {maven_home} was removed, so no "
+                    "later resolution discovers it",
                 ],
                 metadata={"maven_version_floor": floor, "maven_home": maven_home},
             )
@@ -741,13 +802,15 @@ class SystemTool(BaseTool):
         # anything is switched. A refusal here leaves the container as found.
         probe_result = self.docker_orchestrator.execute_command(f"{maven_bin} -version 2>&1")
         if probe_result.get("exit_code") != 0:
+            self._remove_maven_tree(maven_home, archive)
             return ToolResult.completed_failure(
                 output=probe_result.get("output", ""),
                 error=f"Apache Maven {distribution} installed but verification failed",
                 error_code="MAVEN_CONFIG_FAILED",
                 suggestions=[
                     "Observed fact: the installed Maven failed its own post-install probe",
-                    f"Observed candidate MAVEN_HOME: {maven_home}",
+                    f"Observed fact: the unusable tree at {maven_home} was removed, so no "
+                    "later resolution discovers it",
                 ],
                 metadata={"maven_version_floor": floor, "maven_home": maven_home},
             )
@@ -773,6 +836,9 @@ class SystemTool(BaseTool):
             floor,
             maven_home,
             verify_result.get("output", ""),
+            # As with the JDK: a bare `mvn` resolves through the persisted
+            # overlay, so this question cannot be asked before the switch lands.
+            activated_executable=maven_bin,
         )
         if contradiction is not None:
             return contradiction
@@ -801,12 +867,18 @@ class SystemTool(BaseTool):
         floor: str,
         maven_home: str,
         verification_output: str,
+        *,
+        activated_executable: Optional[str] = None,
     ) -> Optional[ToolResult]:
         """Refuse the seal when the verification block does not confirm the floor.
 
         Two ways it can go unproven, and they are the same refusal: a block
         naming a version below the floor — jackrabbit's 3.8.7 answering for
         `[3.9,)` — and a block naming no Maven at all.
+
+        `activated_executable` says which container the refusal is over, exactly
+        as it does for the JDK: the exact-path probe refuses before the switch,
+        the domain verification only after it.
         """
         observed = parse_maven_version(verification_output)
         stored_output = (
@@ -818,7 +890,9 @@ class SystemTool(BaseTool):
             "maven_version_floor": floor,
             "maven_home": maven_home,
             "verified_maven_version": observed,
+            **activation_state_metadata("maven", activated_executable, maven_home, floor, observed),
         }
+        switched = activation_state_suggestions("maven", activated_executable, maven_home, floor)
         if not observed:
             return ToolResult.completed_failure(
                 output=stored_output,
@@ -831,6 +905,7 @@ class SystemTool(BaseTool):
                     "Observed fact: mvn -version named no Apache Maven version",
                     f"Observed candidate MAVEN_HOME: {maven_home}",
                     f"Constraint: the active runtime must be observed to report Maven >= {floor}",
+                    *switched,
                 ],
                 metadata=metadata,
             )
@@ -846,9 +921,22 @@ class SystemTool(BaseTool):
                 f"Constraint: the requested Maven floor is {floor}",
                 "Observed fact: a distribution can be installed while the mvn the domain "
                 "resolves is another one — the resolved executable is what a build runs",
+                *switched,
             ],
             metadata=metadata,
         )
+
+    def _remove_maven_tree(self, maven_home: str, archive: str) -> None:
+        """Take back an extraction this provision has refused.
+
+        Best effort by construction: a cleanup that fails must not turn a
+        refusal into a crash, and the refusal it accompanies is already the
+        honest answer.
+        """
+        try:
+            self.docker_orchestrator.execute_command(f"rm -rf {maven_home} {archive}")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Failed to remove refused Maven tree {maven_home}: {exc}")
 
     def _activate_maven_runtime(
         self,
@@ -974,12 +1062,24 @@ class SystemTool(BaseTool):
         java_version: str,
         java_home: str,
         verification_output: str,
+        *,
+        activated_executable: Optional[str] = None,
     ) -> Optional[ToolResult]:
         """Refuse the seal when the verification block does not confirm the claim.
 
         A requested major is a version requirement, so the two ways it can go
         unproven are refusals of the same family: a block naming a different
         major, and a block naming no major at all.
+
+        `activated_executable` states which container this refusal is over. The
+        exact-path probe runs before anything moves, and its refusal leaves the
+        container as found. The domain verification cannot: it asks what a bare
+        `java` resolves to, which is only answerable once the switch is
+        persisted. That refusal is over a SWITCHED container — the profile, the
+        /usr/bin links and the overlay all name the new JDK — and it says so,
+        because the old text closed with "verify the exact binary before
+        registering it": advice for a container that has not been registered,
+        stated over one that has.
         """
         observed = parse_java_verification(verification_output)
         claimed_major = java_major(java_version)
@@ -1003,7 +1103,13 @@ class SystemTool(BaseTool):
             "java_home": java_home,
             "verified_java_version": observed["java_version"],
             "verified_javac_version": observed["javac_version"],
+            **activation_state_metadata(
+                "java", activated_executable, java_home, java_version, observed["java_version"]
+            ),
         }
+        switched = activation_state_suggestions(
+            "java", activated_executable, java_home, java_version
+        )
         if not verified:
             return ToolResult.completed_failure(
                 output=stored_output,
@@ -1016,6 +1122,7 @@ class SystemTool(BaseTool):
                     "Observed fact: neither java -version nor javac -version named a version",
                     f"Observed candidate JAVA_HOME: {java_home}",
                     f"Constraint: the active runtime must be observed to report Java {java_version}",
+                    *switched,
                 ],
                 metadata=metadata,
             )
@@ -1036,13 +1143,26 @@ class SystemTool(BaseTool):
             suggestions=[
                 f"Observed fact: verification under JAVA_HOME={java_home} reported {stated}",
                 f"Constraint: the requested Java major version is {java_version}",
-                "Observed fact: the requested JDK may be installed while the active java "
-                "on PATH is another one — verify the exact binary before registering it",
+                # Only when nothing was switched: telling a model to verify
+                # before registering, over a container already registered, is
+                # the refusal describing a container that no longer exists.
+                *(
+                    switched
+                    or [
+                        "Observed fact: the requested JDK may be installed while the active java "
+                        "on PATH is another one — verify the exact binary before registering it"
+                    ]
+                ),
             ],
             metadata=metadata,
         )
 
-    def _activate_java_runtime(self, java_home: str, java_version: str) -> Optional[ToolResult]:
+    def _activate_java_runtime(
+        self,
+        java_home: str,
+        java_version: str,
+        alternatives: Optional[Dict[str, bool]] = None,
+    ) -> Optional[ToolResult]:
         """Make the proven JDK the runtime this container resolves.
 
         The overlay is the resolution domain: DockerOrchestrator derives every
@@ -1051,9 +1171,17 @@ class SystemTool(BaseTool):
         JDK this call was asked to replace. A switch that did not land is not
         a configured runtime, and reporting it as one is how a run spends the
         rest of itself building against the wrong JVM.
+
+        `alternatives` is what the /usr/bin half of the same switch already did.
+        This refusal used to read "installed at ... and not activated", which is
+        true of the overlay and false of the container: `update-alternatives
+        --set java` ran one step earlier, so anything resolving through the
+        system PATH directories is already on the new JDK. A refusal states the
+        container it left, not the one it wishes it had left.
         """
         java_home = java_home.rstrip("/")
         java_bin = f"{java_home}/bin/java"
+        landed = sorted(name for name, ok in (alternatives or {}).items() if ok)
         try:
             EnvOverlayStore(self.docker_orchestrator).register(
                 "java",
@@ -1077,6 +1205,17 @@ class SystemTool(BaseTool):
                     f"{java_bin}",
                     "Observed fact: until it is activated, every dispatch keeps resolving the "
                     "previously active runtime",
+                    *(
+                        [
+                            "Observed fact: "
+                            + " and ".join(f"/usr/bin/{name}" for name in landed)
+                            + f" were already repointed at {java_home}/bin — the container is "
+                            "not as it was found, and anything resolving through the system "
+                            "PATH directories now runs this JDK"
+                        ]
+                        if landed
+                        else []
+                    ),
                     f"Constraint: a provisioned Java {java_version} must be the runtime later "
                     "dispatches resolve",
                 ],
@@ -1084,6 +1223,20 @@ class SystemTool(BaseTool):
                     "claimed_java_version": java_version,
                     "java_home": java_home,
                     "activation_error": str(exc),
+                    **(
+                        {
+                            PROVISION_ACTIVATION_STATE_MARKER: {
+                                "tool": "java",
+                                "state": "partially_activated",
+                                "executable": java_bin,
+                                "home": java_home,
+                                "requested": java_version,
+                                "landed": landed,
+                            }
+                        }
+                        if landed
+                        else {}
+                    ),
                 },
             )
         return None

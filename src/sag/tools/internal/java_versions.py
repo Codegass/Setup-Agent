@@ -21,6 +21,11 @@ from typing import Any, Dict, Optional
 _JAVA_RUNTIME_VERSION_RE = re.compile(r'version\s+"([^"]+)"')
 _JAVAC_VERSION_RE = re.compile(r"(?:^|\n)\s*javac\s+([0-9][0-9._]*)")
 _JAVA_MAJOR_RE = re.compile(r"^(?:1\.)?(\d+)")
+# The major an installation PATH states about itself: `java-17-openjdk-amd64`,
+# `jdk-21.0.1`, `java-1.8.0-openjdk-amd64`. Deliberately narrow — only the
+# `java`/`jdk`/`openjdk` spellings, and only when a number follows them — so a
+# path that states no major yields none rather than a guess.
+_JAVA_PATH_MAJOR_RE = re.compile(r"(?:openjdk|jdk|java)[-_]?((?:1\.)?\d+)", re.IGNORECASE)
 # The separator the provision path echoes between its two probes.
 JAVA_VERIFICATION_SEPARATOR = "---"
 
@@ -31,6 +36,18 @@ def java_major(version: Any) -> Optional[str]:
         return None
     match = _JAVA_MAJOR_RE.match(str(version).strip())
     return match.group(1) if match else None
+
+
+def java_major_from_path(path: Any) -> Optional[str]:
+    """The JDK major an installation path names, or None when it names none.
+
+    geode d2r4 seq 227 registered `/usr/lib/jvm/java-17-openjdk-amd64/bin/java`.
+    The path says which JDK the run wanted; a refusal that answers it with a
+    `<major>` placeholder makes the model re-supply a fact it already stated,
+    and a re-supplied fact is a fact that can come back different.
+    """
+    match = _JAVA_PATH_MAJOR_RE.search(str(path or ""))
+    return java_major(match.group(1)) if match else None
 
 
 def names_bare_java_major(version: Any) -> bool:

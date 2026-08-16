@@ -38,7 +38,7 @@ import posixpath
 import re
 
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
-from sag.tools.internal.system_tool import SystemTool
+from sag.tools.internal.system_tool import PROVISION_ACTIVATION_STATE_MARKER, SystemTool
 
 ARCH = "arm64"
 JAVA_HOMES = {major: f"/usr/lib/jvm/java-{major}-openjdk-{ARCH}" for major in ("11", "17", "21")}
@@ -258,6 +258,66 @@ def test_the_lucene_shape_is_unconstructible():
     assert result.metadata.get("java_version") != "21"
 
 
+def test_the_post_activation_refusal_states_the_container_it_actually_left():
+    """A refusal returned AFTER the switch landed may not describe the
+    container as untouched. The old text closed with "verify the exact binary
+    before registering it" — advice for a container that has not been
+    registered, over a container whose overlay, profile and alternatives were
+    all rewritten one step earlier."""
+    container = FakeJdkContainer()
+    assert _provision(container, "17").succeeded is True
+    container.frozen_major = "17"
+
+    result = _provision(container, "21")
+
+    assert result.succeeded is False
+    stated = " ".join([result.error or "", *(result.suggestions or ())])
+    assert "activation persisted; verification refused the seal" in stated
+    assert "before registering it" not in stated
+
+
+def test_the_post_activation_refusal_leaves_a_typed_activation_marker():
+    """The next consult reads structure, not prose: the state the container was
+    left in is a typed fact on the refusal, so nothing has to re-derive it."""
+    container = FakeJdkContainer()
+    assert _provision(container, "17").succeeded is True
+    container.frozen_major = "17"
+
+    result = _provision(container, "21")
+
+    marker = result.metadata[PROVISION_ACTIVATION_STATE_MARKER]
+    assert marker == {
+        "tool": "java",
+        "state": "activated",
+        "executable": f"{JAVA_HOMES['21']}/bin/java",
+        "home": JAVA_HOMES["21"],
+        "requested": "21",
+        "verified": FULL_VERSION["17"],
+    }
+    # And the overlay agrees: the switch really did land.
+    assert (
+        json.loads(container.files[DEFAULT_OVERLAY_JSON])["tools"]["java"]["active"]
+        == f"{JAVA_HOMES['21']}/bin/java"
+    )
+
+
+def test_a_pre_activation_refusal_still_says_the_container_did_not_move():
+    """The other side of the same law: the exact-path probe refuses BEFORE
+    anything is switched, and that refusal keeps saying so."""
+    container = FakeJdkContainer(
+        installed=("11",),
+        linked_major="11",
+        binary_answers={"17": "11"},
+    )
+
+    result = _provision(container, "17")
+
+    assert result.succeeded is False
+    stated = " ".join([result.error or "", *(result.suggestions or ())])
+    assert "activation persisted" not in stated
+    assert PROVISION_ACTIVATION_STATE_MARKER not in (result.metadata or {})
+
+
 def test_a_jdk_whose_own_binary_answers_another_major_moves_nothing():
     """The refusal that precedes the switch leaves the container as it was."""
     container = FakeJdkContainer(
@@ -285,6 +345,43 @@ def test_an_activation_that_did_not_persist_is_not_sealed_as_success():
     assert result.succeeded is False
     assert result.error_code == "JAVA_RUNTIME_ACTIVATION_FAILED"
     assert "17" in result.error
+
+
+def test_an_activation_that_did_not_persist_still_states_the_links_that_moved():
+    """The phrase "not activated" is true of the overlay and false of the container: the
+    /usr/bin links were repointed one step earlier, so anything resolving
+    through the system PATH directories already runs the new JDK. The same law
+    as the post-activation refusal — no refusal describes a switched container
+    as untouched."""
+    container = FakeJdkContainer(installed=("11",), linked_major="11", overlay_writable=False)
+
+    result = _provision(container, "17")
+
+    assert result.error_code == "JAVA_RUNTIME_ACTIVATION_FAILED"
+    assert container.alternatives["java"] == f"{JAVA_HOMES['17']}/bin/java"
+    stated = " ".join(result.suggestions or ())
+    assert "/usr/bin/java" in stated and "already repointed" in stated
+    assert result.metadata[PROVISION_ACTIVATION_STATE_MARKER] == {
+        "tool": "java",
+        "state": "partially_activated",
+        "executable": f"{JAVA_HOMES['17']}/bin/java",
+        "home": JAVA_HOMES["17"],
+        "requested": "17",
+        "landed": ["java", "javac"],
+    }
+
+
+def test_an_activation_failure_that_moved_no_link_claims_none():
+    """The marker states what landed, never what might have."""
+    container = FakeJdkContainer(overlay_writable=False)
+    system = SystemTool(container)
+    system._set_java_alternative = lambda name, binary: False
+
+    result = system._install_and_configure_java("17")
+
+    assert result.error_code == "JAVA_RUNTIME_ACTIVATION_FAILED"
+    assert PROVISION_ACTIVATION_STATE_MARKER not in (result.metadata or {})
+    assert not any("already repointed" in s for s in (result.suggestions or ()))
 
 
 def test_a_javac_alternative_repair_does_not_repoint_the_java_link():

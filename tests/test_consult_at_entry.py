@@ -26,6 +26,7 @@ from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authori
 import sag.agent.native_messages as native_messages
 from sag.agent.advisor import AdvisorTool
 from sag.agent.evidence_state import EvidenceRole, RunEvidenceState, StateScope
+from sag.agent.history_state import ADVISOR_HISTORY_ENTRY_KIND, is_advisor_history_entry
 from sag.agent.output_storage import OutputStorageManager
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
@@ -396,6 +397,78 @@ def test_the_digest_names_the_active_runtime_first_and_the_alternative_after_it(
     ) in digest
 
 
+# The jackrabbit wall, stated in the one line that is supposed to prevent it:
+# `/usr/bin/mvn` was Maven 3.8.7, the build held `[3.9,)`, and the overlay
+# recorded BOTH facts — a `blocked` record naming the executable and the
+# requirement it fails, and the requirement itself. The digest read only
+# `candidates`, so the one Maven that cannot answer the build was handed to the
+# reviewer as a registered move, and the constraint that makes it a non-move was
+# not stated at all.
+
+
+def _blocked_overlay_orchestrator(requirement="[3.9,)"):
+    orchestrator = FakeEnvOverlayOrchestrator()
+    EnvOverlayStore(orchestrator).register("maven", "/usr/bin/mvn", version="3.8.7")
+    EnvOverlayStore(orchestrator).record_requirement_failure(
+        "maven",
+        requirement=requirement,
+        executable="/usr/bin/mvn",
+        version="3.8.7",
+        reason="Maven 3.8.7 does not satisfy [3.9,)",
+    )
+    return orchestrator
+
+
+def test_the_digest_states_a_blocked_candidate_as_blocked_never_as_a_move():
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = _blocked_overlay_orchestrator()
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "maven 3.8.7 blocked at /usr/bin/mvn" in digest
+    assert "registered at /usr/bin/mvn" not in digest
+
+
+def test_the_digest_states_the_requirement_a_blocked_candidate_fails():
+    """A block without its requirement is a dead end; with it, it is a move."""
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = _blocked_overlay_orchestrator()
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "requirement [3.9,)" in digest
+
+
+def test_the_digest_states_an_observed_requirement_the_overlay_holds():
+    """`requirements` is the harness's own record of what the build demands.
+    A reviewer that cannot see it advises against a constraint it never read."""
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = _blocked_overlay_orchestrator()
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "maven observed requirement: [3.9,)" in digest
+
+
+def test_the_digest_still_offers_the_registered_runtime_that_is_not_blocked():
+    """The fence blocks one executable, not the tool: a candidate the overlay
+    holds and nothing blocked stays the cheapest move there is."""
+    orchestrator = _blocked_overlay_orchestrator()
+    EnvOverlayStore(orchestrator).register(
+        "maven",
+        "/opt/apache-maven-3.9.9/bin/mvn",
+        version="3.9.9",
+        activate=True,
+    )
+    engine = _unit_engine(phase="build")
+    engine.orchestrator = orchestrator
+
+    digest = engine._advisor_evidence_digest()
+
+    assert "maven 3.9.9 active at /opt/apache-maven-3.9.9/bin/mvn" in digest
+    assert "maven 3.8.7 blocked at /usr/bin/mvn" in digest
+
+
 def test_the_digest_states_an_empty_overlay_as_no_registered_runtime():
     """The gora fence: there is no broken overlay to repair, so the reviewer is
     told the overlay registers nothing rather than left to invent one."""
@@ -468,6 +541,41 @@ def test_the_entry_consult_persists_to_phase_history():
     assert entry["parameters"] == {}
     assert ADVICE in entry["observation"]
     assert entry["operation_outcome"] == "success"
+
+
+def test_the_entry_consult_is_marked_as_advisor_prose_in_phase_history():
+    """Persisting the consult put reviewer PROSE into the record the completion
+    gates text-sniff. `_documents_unmet_requirement` reads observations for
+    "requires java"; `_has_remediation_action` reads actions for "openjdk" and
+    "export java_home" — both of which an advisor sentence naturally contains.
+    The entry states its own kind so a predicate can decline to read it."""
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _RecordingContextManager()
+
+    assert engine._maybe_consult_advisor_at_phase_entry() is True
+
+    entry = engine.context_manager.entries[0][1]
+    assert entry["entry_kind"] == ADVISOR_HISTORY_ENTRY_KIND
+    assert is_advisor_history_entry(entry) is True
+
+
+def test_a_model_issued_action_carries_no_advisor_entry_kind():
+    """The mark identifies the harness's reviewer prose, nothing else: a tool
+    the model ran is evidence the gates must keep reading."""
+    engine = _unit_engine(phase="build")
+    engine.context_manager = _RecordingContextManager()
+
+    engine._persist_action_to_branch_history(
+        "phase_build",
+        tool_name="bash",
+        tool_params={"command": "apt-get install -y openjdk-17-jdk"},
+        result=ToolResult.completed_success(output="Setting up openjdk-17-jdk ..."),
+        observation_text="Setting up openjdk-17-jdk ...",
+    )
+
+    entry = engine.context_manager.entries[0][1]
+    assert "entry_kind" not in entry
+    assert is_advisor_history_entry(entry) is False
 
 
 def test_a_history_write_failure_never_blocks_the_entry_consult():

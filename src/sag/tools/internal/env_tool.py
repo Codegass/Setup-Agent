@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import posixpath
-import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -15,7 +14,7 @@ from sag.agent.loop_memory import COMPLETION_CLAIM_CAP
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
-from .java_versions import java_major, names_bare_java_major
+from .java_versions import java_major, java_major_from_path, names_bare_java_major
 from .maven_versions import parse_maven_version
 from .toolchain_manager import (
     ToolchainManager,
@@ -686,12 +685,12 @@ class EnvTool(BaseTool):
             moves.append(
                 f"No {named_tool} is registered and {unusable} — if "
                 f"{named_tool} is not installed in the container, install it first: "
-                f"{self._install_call_for(named_tool)}"
+                f"{self._install_call_for(named_tool, executable)}"
             )
         return moves
 
     @staticmethod
-    def _install_call_for(tool: str) -> str:
+    def _install_call_for(tool: str, executable: Any = None) -> str:
         """The provision call that can actually install this tool.
 
         geode d2r4 seq 227: the model registered
@@ -701,9 +700,16 @@ class EnvTool(BaseTool):
         routes a JDK by MAJOR (`install_java`) and apt packages by name
         (`install`), and the facade picks the route from which parameter is
         present — so the JDK's only working spelling is java_version.
+
+        The major comes out of the refused path when the path states one, which
+        geode's does: a model that must fill in `<major>` itself is a model that
+        can fill it in wrong, and the run already said which JDK it wanted. When
+        the path names no major the placeholder stays — inventing one would
+        install a JDK nobody asked for.
         """
         if tool == "java":
-            return "project(action='provision', java_version='<major>')"
+            major = java_major_from_path(executable)
+            return f"project(action='provision', java_version='{major or '<major>'}')"
         return f"project(action='provision', packages=['{tool}'])"
 
     def _build_dispatch_move(self, tool: str, wrapper: str) -> str:

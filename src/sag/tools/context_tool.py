@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.context_manager import BranchContextHistory, ContextManager, TaskStatus
-from sag.agent.history_state import HistoryActionState, decode_history_action_state
+from sag.agent.history_state import (
+    HistoryActionState,
+    decode_history_action_state,
+    is_advisor_history_entry,
+)
 from sag.project_fact_sheet import (
     PROJECT_FACT_SHEET_SCHEMA,
     PROJECT_FACT_SHEET_VERSION,
@@ -1435,7 +1439,11 @@ IMPORTANT:
         Scans the completion summary/key_results AND the branch-history
         observations/action outputs for tight, high-signal phrases (the literal
         strings a missing JDK/Maven emit). Thought entries are excluded — the
-        agent merely *mentioning* a requirement must not arm the gate.
+        agent merely *mentioning* a requirement must not arm the gate — and so
+        is the advisor's consult, for the same reason: since the entry consult
+        began persisting to phase history, a reviewer sentence such as "the
+        reactor requires java 17" sits in this record as an `action` entry, and
+        prose about a requirement is not the container reporting one.
         """
         unmet_phrases = (
             "java_home is not set",
@@ -1451,6 +1459,8 @@ IMPORTANT:
             except Exception:
                 branch_history = None
             for entry in getattr(branch_history, "history", []) or []:
+                if is_advisor_history_entry(entry):
+                    continue
                 if isinstance(entry, dict) and entry.get("type") in ("action", "observation"):
                     texts.append(
                         " ".join(
@@ -1466,7 +1476,10 @@ IMPORTANT:
 
         Looks for install/env-setup actions (apt/yum/dnf/apk, JDK packages,
         JAVA_HOME export, sdkman) or use of the provisioning tools. Markers are
-        deliberately inclusive so a genuine remediation disarms the gate.
+        deliberately inclusive so a genuine remediation disarms the gate — which
+        is exactly why the advisor's consult is skipped: advice to "install
+        openjdk-17-jdk and export JAVA_HOME" is not a JDK installed, and
+        counting the sentence would disarm the gate on prose alone.
         """
         task_id = getattr(self.context_manager, "current_task_id", None)
         if not task_id or not hasattr(self.context_manager, "load_branch_history"):
@@ -1497,7 +1510,7 @@ IMPORTANT:
         for entry in getattr(branch_history, "history", []) or []:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("type") != "action":
+            if entry.get("type") != "action" or is_advisor_history_entry(entry):
                 continue
             tool_name = str(entry.get("tool_name") or "").lower()
             if tool_name in remediation_tools:
