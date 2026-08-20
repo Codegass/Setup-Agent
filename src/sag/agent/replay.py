@@ -49,17 +49,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sag.tools.base import ToolResult, bind_tool_result_output_storage
 from sag.verdict_rates import UNBOUNDED_CONFLICT
 
+from .action_intents import (
+    action_fingerprint,
+    canonical_params,
+    validate_repair_action_affordance,
+)
 from .attempt_policy import (
     TestCandidateResolution,
     forced_test_refusal_receipts,
     has_test_candidate_refresh_receipt,
     required_test_attempt,
     terminal_test_receipts,
-)
-from .action_intents import (
-    action_fingerprint,
-    canonical_params,
-    validate_repair_action_affordance,
 )
 from .control_events import (
     CONTROL_EVENT_SCHEMA_VERSION,
@@ -73,10 +73,9 @@ from .control_events import (
     action_envelope_sha256,
     canonical_json,
     canonical_sha256,
-    job_stall_transition,
     forced_action_sha256,
+    job_stall_transition,
 )
-from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .evidence_assessments import assessment_id
 from .evidence_publications import (
     EvidencePublicationAuthority,
@@ -84,6 +83,7 @@ from .evidence_publications import (
     reset_evidence_publication_authority,
 )
 from .evidence_records import frame_named_json_record_stream
+from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .loop_memory import CompletionClaimEvent, LoopDecision, LoopEvent, LoopMemory
 from .phase_gates import (
     ANALYSIS_FACTS_RECOVERY_CODES,
@@ -91,6 +91,7 @@ from .phase_gates import (
     GATE_ASSESSMENT_SUBJECT_PREFIX,
     OPEN_OBLIGATIONS_FACT,
     ValidatorState,
+    claim_identity,
     validate_phase_claim,
 )
 from .phase_machine import PhaseAttemptRecord, PhaseClaim, PhaseMachine
@@ -1239,7 +1240,14 @@ class ControlReplayRunner:
         for conflict in initial.conflicts:
             state.record_conflict(conflict)
         loop_memory = LoopMemory()
-        transition_policy = PhaseTransitionPolicy(repair_guard=loop_memory)
+        # Archived streams may predate the model-authored Analyze plan. Their
+        # recorded transition facts remain replayable; the stricter plan
+        # prerequisite is a live-run admission rule, not a retroactive rewrite
+        # of already sealed control history.
+        transition_policy = PhaseTransitionPolicy(
+            repair_guard=loop_memory,
+            require_analysis_plan=False,
+        )
         budgets = RepairBudgets(
             global_remaining=initial.repair_global_remaining,
             phase_remaining=dict(initial.repair_phase_remaining),
@@ -1894,14 +1902,56 @@ class ControlReplayRunner:
                                 raise ReplayValidationError(
                                     "forced pre-execution refusal requires a non-green gate"
                                 )
-                    claim = PhaseClaim(
-                        phase=payload["phase"],
-                        signal=payload["signal"],
-                        claimed_outcome=payload["claimed_outcome"],
-                        key_results=payload["key_results"],
-                        reason=payload["reason"],
-                        evidence_refs=tuple(payload["evidence_refs"]),
-                    )
+                    # The flat gate reason/evidence are the validator's
+                    # projection and may differ from what the model claimed.
+                    # New streams carry an exact PhaseClaim snapshot. Archived
+                    # streams omit it, so their claim digest remains the opaque
+                    # lineage token it was when those bytes were recorded.
+                    claim_snapshot = payload.get("phase_claim")
+                    if isinstance(claim_snapshot, Mapping):
+                        try:
+                            claim = PhaseClaim.from_metadata(claim_snapshot)
+                        except (TypeError, ValueError, PermissionError) as exc:
+                            raise ReplayValidationError(
+                                "gate phase claim snapshot is invalid"
+                            ) from exc
+                        flat_claim_fields = {
+                            "phase": payload["phase"],
+                            "signal": payload["signal"],
+                            "claimed_outcome": payload["claimed_outcome"],
+                            "key_results": payload["key_results"],
+                            "execution_plan_sha256": str(
+                                payload.get("execution_plan_sha256") or ""
+                            ),
+                            "execution_plan_ref": str(payload.get("execution_plan_ref") or ""),
+                        }
+                        snapshot_claim_fields = {
+                            "phase": claim.phase,
+                            "signal": claim.signal,
+                            "claimed_outcome": claim.claimed_outcome.value,
+                            "key_results": claim.key_results,
+                            "execution_plan_sha256": claim.execution_plan_sha256,
+                            "execution_plan_ref": claim.execution_plan_ref,
+                        }
+                        if snapshot_claim_fields != flat_claim_fields:
+                            raise ReplayValidationError(
+                                "gate phase claim snapshot differs from its flat projection"
+                            )
+                        if claim_sha256 and claim_identity(claim) != claim_sha256:
+                            raise ReplayValidationError(
+                                "gate claim identity differs from the recorded claim"
+                            )
+                    else:
+                        claim = PhaseClaim(
+                            phase=payload["phase"],
+                            signal=payload["signal"],
+                            claimed_outcome=payload["claimed_outcome"],
+                            key_results=payload["key_results"],
+                            reason=payload["reason"],
+                            evidence_refs=tuple(payload["evidence_refs"]),
+                            execution_plan_sha256=str(payload.get("execution_plan_sha256") or ""),
+                            execution_plan_ref=str(payload.get("execution_plan_ref") or ""),
+                        )
                     ownership = {}
                     if payload.get("control_disposition") is not None:
                         ownership["control_disposition"] = payload["control_disposition"]

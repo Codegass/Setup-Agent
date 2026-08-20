@@ -39,4 +39,36 @@ describe("BuildFacet", () => {
     expect(screen.getByRole("dialog", { name: /per-module build breakdown/i })).toBeInTheDocument()
     expect(screen.getByText("connect:runtime")).toBeInTheDocument()
   })
+
+  it("shows partial build evidence without inventing missing artifact or module totals", () => {
+    render(<BuildFacet detail={{
+      build: {
+        state: "partial", tool: "sealed snapshot", time: "—",
+        note: "Canonical build evidence from verdict.json", classCount: 16221,
+      },
+      modules: [],
+    } as any} />)
+
+    expect(screen.getByText("Partial")).toBeInTheDocument()
+    expect(screen.getByText("16,221")).toBeInTheDocument()
+    expect(screen.queryByText("JARs")).not.toBeInTheDocument()
+    expect(screen.getByText(/detailed module metrics were not produced/i)).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /view build details/i })).not.toBeInTheDocument()
+    expect(screen.queryByText("sealed snapshot")).not.toBeInTheDocument()
+  })
+
+  it("distinguishes measured zero outputs from unmeasured outputs", () => {
+    const { rerender } = render(<BuildFacet detail={{
+      build: { state: "failed", tool: "maven", time: "1s", note: "", classCount: 0 },
+      modules: [],
+    } as any} />)
+    expect(screen.getByText("0")).toBeInTheDocument()
+    expect(screen.queryByText(/artifact totals were not measured/i)).not.toBeInTheDocument()
+
+    rerender(<BuildFacet detail={{
+      build: { state: "unknown", tool: "—", time: "—", note: "" },
+      modules: [],
+    } as any} />)
+    expect(screen.getByText(/artifact totals were not measured/i)).toBeInTheDocument()
+  })
 })

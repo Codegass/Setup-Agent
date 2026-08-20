@@ -1,10 +1,10 @@
 """Bounded, checkout-contained document map (Plan 6 Stage A1, spec §C1).
 
-The harness must discover what a repository SAYS about building itself —
-README/INSTALL/BUILDING, module docs, CI workflows, Docker and install
-scripts, Maven/Gradle/CMake/Python metadata — without putting repository prose
-into the model prompt. This module produces that discovery as a map of typed
-HANDLES:
+The harness must inventory what a repository MAY use to explain how it builds
+itself without assuming that projects use familiar document names.  README,
+DEVNOTES and CI files are useful discovery hints, but an unusual name or
+extension never makes a checkout-contained file ineligible.  This module
+produces that bounded inventory as a map of typed HANDLES:
 
     DocumentMapEntry: entry_id, target_sha, path, realpath, source_hash,
                       kind, section_index, parser_version, discovery_status
@@ -17,8 +17,8 @@ separate, typed stages with their own policy.
 
 Discovery is bounded and contained, and every boundary is a recorded fact:
 
-* enumeration is ONE in-container `find` capped at `MAX_DEPTH`, filtered to
-  the candidate kinds, sorted and capped at `MAX_CANDIDATE_PATHS`;
+* enumeration is ONE in-container `find` capped at `MAX_DEPTH`, ordered
+  shallow-first and capped at `MAX_CANDIDATE_PATHS`;
 * `realpath` must resolve every candidate UNDER the checkout root, proved by a
   batched in-container probe — an unprovable containment indexes nothing;
 * files that could not be indexed are never silently absent: each leaves a
@@ -101,11 +101,11 @@ SECTION_INDEX_CAP = 500
 CMAKE_STATEMENT_MAX_LINES = 40
 # Tag-path depth the XML index records (spec §C1: depth ≤ 4).
 XML_MAX_DEPTH = 4
-# `*.md` is collected under doc/docs and at DOMAIN ROOTS — repo root, module
-# root, sub-module root — not repository-wide.
-MARKDOWN_ROOT_DEPTH = 3
+# These names and locations are budget-ordering hints, never eligibility
+# rules.  A project-specific DEVNOTES.txt should be read before a random source
+# file when the 400-file content budget is tight; an unfamiliar prose name is
+# still inventoried and either indexed or explicitly marked over-budget.
 DOC_DIR_SEGMENTS = ("doc", "docs")
-# `*.sh` is collected at the checkout root and in the ci/docker script dirs.
 SHELL_DIR_SEGMENTS = ("ci", "docker")
 
 # Trees whose contents are generated or vendored. A vendored 3rdparty README is
@@ -138,6 +138,7 @@ _DOCUMENT_KINDS = frozenset(
         "python",
         "requirements",
         "shell",
+        "text",
         "toml",
         "unknown",
         "xml",
@@ -167,35 +168,28 @@ class DocumentSourceChangedError(RuntimeError):
     """The bytes behind one published map handle changed before extraction."""
 
 
-# The candidate predicate, in the container's own `find` syntax. Portable
-# predicates only (`-name`/`-iname`/`-path`): the depth rules that `-path`
-# cannot express — markdown at domain roots, shell at root/ci/docker — are
-# applied locally by `is_candidate`, which is the authority on what the map
-# collects. `find` may over-return; it must never under-return.
-CANDIDATE_PREDICATES = (
-    "-iname 'README*'",
-    "-iname 'INSTALL*'",
-    "-iname 'BUILDING*'",
-    "-iname 'CONTRIBUTING*'",
-    "-name '*.md'",
-    "-path '*/.github/workflows/*.yml'",
-    "-path '*/.github/workflows/*.yaml'",
-    "-iname 'Dockerfile*'",
-    "-name '*.sh'",
-    "-name 'pom.xml'",
-    "-name 'build.gradle'",
-    "-name 'build.gradle.kts'",
-    "-name 'settings.gradle'",
-    "-name 'settings.gradle.kts'",
-    "-name 'gradle.properties'",
-    "-name 'CMakeLists.txt'",
-    "-name '*.cmake'",
-    "-name 'pyproject.toml'",
-    "-name 'setup.py'",
-    "-name 'requirements*.txt'",
+# Human-facing names receive an early budget slot, but this tuple is not used
+# to decide whether a path is visible.  It deliberately includes common names
+# that the previous restrictive allowlist missed.
+DOC_FAMILY_PREFIXES = (
+    "readme",
+    "install",
+    "building",
+    "contributing",
+    "devnotes",
+    "developing",
+    "testing",
 )
-
-DOC_FAMILY_PREFIXES = ("readme", "install", "building", "contributing")
+TEXT_DOCUMENT_EXTENSIONS = (
+    ".adoc",
+    ".asciidoc",
+    ".markdown",
+    ".md",
+    ".org",
+    ".rest",
+    ".rst",
+    ".txt",
+)
 EXACT_CANDIDATE_NAMES = (
     "pom.xml",
     "build.gradle",
@@ -296,7 +290,13 @@ def discover_document_map(
     if exhausted:
         conflicts[root] = "over_budget"
 
-    candidates = sorted({relative for relative in listing if is_candidate(relative)})
+    # Names affect only which bounded heads are fetched first.  They never
+    # decide eligibility: every enumerated path remains represented either by
+    # an entry or by a typed partial-map record.
+    candidates = sorted(
+        {relative for relative in listing if is_candidate(relative)},
+        key=_candidate_sort_key,
+    )
     kept = []
     for relative in candidates:
         if is_generated(relative):
@@ -386,13 +386,20 @@ def _build_entry(
 
 
 def enumeration_command(root: str) -> str:
-    """The one bounded `find` the map is allowed to run."""
-    predicates = " -o ".join(CANDIDATE_PREDICATES)
+    """The one bounded, name-agnostic `find` the map is allowed to run.
+
+    Shallow paths are transported first so repository-level guidance cannot be
+    crowded out by thousands of deep source files before host-side hint
+    ordering runs.  This is ordering, not filtering.
+    """
     return (
         f"cd {shlex.quote(root)} && "
         f"find . -maxdepth {MAX_DEPTH} \\( -type f -o -type l \\) "
-        f"\\( {predicates} \\) -print 2>/dev/null "
-        f"| LC_ALL=C sort | head -n {MAX_CANDIDATE_PATHS + 1}"
+        "-print 2>/dev/null "
+        '| awk \'{ probe=$0; depth=gsub("/", "/", probe); '
+        'printf "%08d\\t%s\\n", depth, $0 }\' '
+        "| LC_ALL=C sort -k1,1n -k2,2 "
+        f"| cut -f2- | head -n {MAX_CANDIDATE_PATHS + 1}"
     )
 
 
@@ -525,15 +532,24 @@ def _probe_target_sha(
 
 
 def is_candidate(relative_path: str) -> bool:
-    """Whether a discovered path is one of the candidate document kinds.
+    """Whether ``relative_path`` is eligible for the bounded inventory.
 
-    This is the authority, not the `find` predicate: `find` cannot express
-    "markdown at a domain root" or "shell at the root or under ci/docker", so
-    it over-returns and this narrows.
+    Eligibility is intentionally name-agnostic.  Binary detection, checkout
+    containment, generated-tree exclusion and explicit budgets are the only
+    narrowing stages; naming heuristics belong exclusively to ordering.
     """
     relative = str(relative_path or "").strip().strip("/")
-    if not relative:
-        return False
+    return bool(relative and relative not in (".", ".."))
+
+
+def _candidate_sort_key(relative_path: str) -> Tuple[int, int, str]:
+    """Deterministic budget priority for an already-visible path.
+
+    The rank is a hint about likely build/test guidance, not a claim that lower
+    ranks are documents or higher ranks are not.  The final path component
+    keeps selection stable across identical checkouts.
+    """
+    relative = str(relative_path or "").strip().strip("/")
     parts = relative.split("/")
     name = parts[-1]
     lowered = name.lower()
@@ -542,23 +558,24 @@ def is_candidate(relative_path: str) -> bool:
     extension = f".{extension}" if "." in lowered else ""
 
     if lowered.startswith(DOC_FAMILY_PREFIXES):
-        return True
-    if lowered.startswith("dockerfile"):
-        return True
-    if lowered in EXACT_CANDIDATE_NAMES or extension == ".cmake":
-        return True
-    if lowered.startswith("requirements") and extension == ".txt":
-        return True
-    if extension in (".yml", ".yaml"):
-        return ".github/workflows/" in relative
-    if extension == ".md":
-        return (
-            any(directory in DOC_DIR_SEGMENTS for directory in directories)
-            or len(parts) <= MARKDOWN_ROOT_DEPTH
-        )
-    if extension == ".sh":
-        return len(parts) == 1 or any(directory in SHELL_DIR_SEGMENTS for directory in directories)
-    return False
+        rank = 0
+    elif len(parts) == 1:
+        rank = 1
+    elif any(directory in DOC_DIR_SEGMENTS for directory in directories):
+        rank = 2
+    elif (
+        lowered.startswith("dockerfile")
+        or lowered in EXACT_CANDIDATE_NAMES
+        or extension == ".cmake"
+        or ".github/workflows/" in f"/{relative.lower()}"
+        or any(directory in SHELL_DIR_SEGMENTS for directory in directories)
+    ):
+        rank = 3
+    elif extension in TEXT_DOCUMENT_EXTENSIONS:
+        rank = 4
+    else:
+        rank = 5
+    return rank, len(parts), relative
 
 
 def is_generated(relative_path: str) -> bool:
@@ -589,6 +606,10 @@ def detect_kind(path: str, text: str = "") -> str:
         return "dockerfile"
     if extension in (".md", ".markdown"):
         return "markdown"
+    if name.startswith("requirements") and extension == ".txt":
+        return "requirements"
+    if extension in (".txt", ".rst", ".rest", ".adoc", ".asciidoc", ".org"):
+        return "text"
     if extension in (".yml", ".yaml"):
         return "yaml"
     if extension == ".xml":
@@ -603,8 +624,6 @@ def detect_kind(path: str, text: str = "") -> str:
         return "properties"
     if extension == ".py":
         return "python"
-    if name.startswith("requirements") and extension == ".txt":
-        return "requirements"
     if name.startswith(DOC_FAMILY_PREFIXES):
         content_kind = _kind_from_content(text)
         return content_kind or "markdown"

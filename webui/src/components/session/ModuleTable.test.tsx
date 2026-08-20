@@ -7,10 +7,10 @@ import { ModuleTable } from "./ModuleTable"
 
 const modules: ModuleSummary[] = [
   { name: "clients", path: "clients", buildStatus: "success", buildSource: "reactor",
-    classCount: 3140, jarCount: 22, testsTotal: 1420, testsPassed: 1420, testsFailed: 0,
+    classCount: 3140, jarCount: 22, testsTotal: 1420, testsPassed: 1420, testsFailed: 0, testsErrors: 0,
     testSource: "runner_xml", failingNames: [], failingCount: 0 },
   { name: "streams", path: "streams", buildStatus: "success", buildSource: "reactor",
-    classCount: 2610, jarCount: 18, testsTotal: 1240, testsPassed: 1238, testsFailed: 2,
+    classCount: 2610, jarCount: 18, testsTotal: 1240, testsPassed: 1238, testsFailed: 2, testsErrors: 0,
     testSource: "runner_xml",
     failingNames: ["a.StreamTest.shouldX", "b.StateTest.shouldY"], failingCount: 2 },
 ]
@@ -26,7 +26,7 @@ describe("ModuleTable (test variant)", () => {
     expect(text.indexOf("streams")).toBeLessThan(text.indexOf("clients"))
     // failing names hidden until expand
     expect(screen.queryByText("a.StreamTest.shouldX")).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: /view 2 failures/i }))
+    fireEvent.click(screen.getByRole("button", { name: /view 2 issues/i }))
     expect(screen.getByText("a.StreamTest.shouldX")).toBeInTheDocument()
     expect(screen.getByText("b.StateTest.shouldY")).toBeInTheDocument()
   })
@@ -36,7 +36,7 @@ describe("ModuleTable (test variant)", () => {
       name: "m", path: "m", buildStatus: "success", buildSource: "reactor",
       testSource: "runner_xml", testsFailed: 600,
       failingNames: ["x.T.a"], failingCount: 600, evidenceRefs: ["/w/m"] }]} />)
-    fireEvent.click(screen.getByRole("button", { name: /view 600 failures/i }))
+    fireEvent.click(screen.getByRole("button", { name: /view 600 issues/i }))
     expect(screen.getByText(/\+599 more/)).toBeInTheDocument()
     // path appears in both the toolbar ("report:") and the truncation pointer
     expect(screen.getAllByText(/\/w\/m/).length).toBeGreaterThanOrEqual(1)
@@ -56,7 +56,7 @@ describe("ModuleTable (test variant)", () => {
   it("shows a rate column and stacked coverage bars (test variant)", () => {
     render(<ModuleTable variant="test" modules={[
       { name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
-        testSource: "runner_xml", testsPassed: 998, testsFailed: 2, testsSkipped: 0,
+        testSource: "runner_xml", testsPassed: 998, testsFailed: 2, testsErrors: 0, testsSkipped: 0,
         failingNames: [], failingCount: 0,
         lineRate: 82, branchRate: 71 },
       { name: "examples", path: "examples", buildStatus: "unknown", buildSource: "none",
@@ -71,7 +71,7 @@ describe("ModuleTable (test variant)", () => {
   it("renders build, tests, and coverage cells in the overview variant", () => {
     render(<ModuleTable variant="overview" modules={[
       { name: "acme-core", path: "modules/acme-core", buildStatus: "success", buildSource: "reactor",
-        testSource: "runner_xml", testsTotal: 542, testsPassed: 540, testsFailed: 2,
+        testSource: "runner_xml", testsTotal: 542, testsPassed: 540, testsFailed: 2, testsErrors: 0,
         failingNames: [], failingCount: 2, lineRate: 86.4, branchRate: 74.1 },
       { name: "acme-cli", path: "modules/acme-cli", buildStatus: "failure", buildSource: "reactor",
         testSource: "none", failingNames: [], failingCount: 0 },
@@ -80,9 +80,30 @@ describe("ModuleTable (test variant)", () => {
     expect(screen.getByText("Built")).toBeInTheDocument()
     expect(screen.getByText("Failed")).toBeInTheDocument()
     expect(screen.getByText("540 / 542")).toBeInTheDocument()
-    expect(screen.getByText("2 failing")).toBeInTheDocument()
+    expect(screen.getByText("2 issues")).toBeInTheDocument()
     expect(screen.getByText("86.4%")).toBeInTheDocument()
     expect(screen.getByText("74.1%")).toBeInTheDocument()
+  })
+
+  it("includes errors in the pass-rate denominator and shows a separate errors column", () => {
+    render(<ModuleTable variant="test" modules={[{
+      name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
+      testSource: "runner_xml", testsPassed: 10, testsFailed: 0, testsErrors: 5,
+      testsSkipped: 0, failingNames: [], failingCount: 0,
+    }]} />)
+
+    expect(screen.getByRole("columnheader", { name: "Errors" })).toBeInTheDocument()
+    expect(screen.getByText("66.7%")).toBeInTheDocument()
+    expect(screen.queryByText("100%")).not.toBeInTheDocument()
+  })
+
+  it("does not calculate a rate when a required test count is unavailable", () => {
+    render(<ModuleTable variant="test" modules={[{
+      name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
+      testSource: "partial", testsPassed: 10, testsFailed: 0,
+      testsSkipped: 0, failingNames: [], failingCount: 0,
+    }]} />)
+    expect(screen.queryByText("100%")).not.toBeInTheDocument()
   })
 
   it("offers copy-all and the report path in the expanded failing list", () => {
@@ -93,7 +114,7 @@ describe("ModuleTable (test variant)", () => {
       testSource: "runner_xml", testsFailed: 2,
       failingNames: ["a.StreamTest.shouldX", "b.StateTest.shouldY"], failingCount: 2,
       evidenceRefs: ["/workspace/streams/build/test-results"] }]} />)
-    fireEvent.click(screen.getByRole("button", { name: /view 2 failures/i }))
+    fireEvent.click(screen.getByRole("button", { name: /view 2 issues/i }))
     // report path surfaced so the user can find the full source
     expect(screen.getByText(/\/workspace\/streams\/build\/test-results/)).toBeInTheDocument()
     // copy-all copies the full newline-joined list

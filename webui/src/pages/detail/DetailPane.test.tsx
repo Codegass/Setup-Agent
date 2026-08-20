@@ -72,14 +72,14 @@ describe("DetailPane", () => {
 
   it("switches panels when a tab is clicked (real switch, not scroll)", () => {
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
-    // Overview content (the build-time KPI tile) is visible up front.
-    expect(screen.getByText("Build time")).toBeInTheDocument()
+    // Overview content is visible up front; unsealed build duration is omitted.
+    expect(screen.getByText("Test run")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: /^Build/ }))
     const build = screen.getByRole("button", { name: /^Build/ })
     expect(build).toHaveAttribute("aria-current", "true")
-    // The Build facet now owns the panel; the overview KPI tile is gone.
-    expect(screen.queryByText("Build time")).not.toBeInTheDocument()
+    // The Build facet now owns the panel; the overview result cards are gone.
+    expect(screen.queryByText("Test run")).not.toBeInTheDocument()
     expect(screen.getByText("Compiled all modules")).toBeInTheDocument()
   })
 

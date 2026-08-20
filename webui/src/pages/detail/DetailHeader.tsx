@@ -38,6 +38,13 @@ function stepsClause(steps: number | null | undefined, budget: number | null | u
   return `${steps} steps`
 }
 
+function usefulMetadata(value: string | null | undefined): string | null {
+  const text = value?.trim() ?? ""
+  return text && !["unknown", "none", "unavailable", "—", "-"].includes(text.toLowerCase())
+    ? text
+    : null
+}
+
 export function DetailHeader({
   workspace,
   detail,
@@ -76,13 +83,13 @@ export function DetailHeader({
 
   // Single mono metadata line: omit any null/empty piece, join with " · ".
   const meta = [
-    workspace.container,
-    workspace.stack,
-    workspace.commit,
-    detail?.model,
+    usefulMetadata(workspace.container),
+    usefulMetadata(workspace.stack),
+    usefulMetadata(workspace.commit),
+    usefulMetadata(detail?.model),
     stepsClause(detail?.steps, detail?.stepBudget),
-    detail?.duration,
-    workspace.updated ? `finished ${workspace.updated}` : null,
+    usefulMetadata(detail?.duration),
+    usefulMetadata(detail?.finish) ? `finished ${usefulMetadata(detail?.finish)}` : null,
   ]
     .filter((piece): piece is string => Boolean(piece && String(piece).trim()))
     .join(" · ")

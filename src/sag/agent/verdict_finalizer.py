@@ -257,6 +257,21 @@ class PhaseClaimSnapshot(BaseModel):
     key_results: str = ""
     reason: str = ""
     evidence_refs: tuple[str, ...] = ()
+    execution_plan_sha256: str = Field(
+        default="",
+        pattern=r"^(?:|[0-9a-f]{64})$",
+    )
+    execution_plan_ref: str = Field(default="", max_length=512)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_execution_plan_identity(self, handler):
+        """Keep pre-plan verdict snapshots byte-identical on serialization."""
+        data = handler(self)
+        if not self.execution_plan_sha256:
+            data.pop("execution_plan_sha256", None)
+        if not self.execution_plan_ref:
+            data.pop("execution_plan_ref", None)
+        return data
 
 
 class PhaseRecordSnapshot(BaseModel):

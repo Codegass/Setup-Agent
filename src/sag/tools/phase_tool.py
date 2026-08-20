@@ -18,6 +18,7 @@ from sag.agent.attempt_policy import (
     test_closure_survey,
     untried_islands_requirement,
 )
+from sag.agent.document_map import read_live_document_map
 from sag.agent.job_obligations import read_obligations
 from sag.agent.phase_gates import (
     ANALYSIS_FACTS_RECOVERY_CODES,
@@ -28,11 +29,21 @@ from sag.agent.phase_gates import (
     GateResult,
     ValidatorState,
     check_phase_claim,
+    claim_identity,
     disclosed_live_job_ids,
     gate_observation_text,
     settlement_capped_outcome,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    ProjectExecutionPlan,
+    ProjectExecutionPlanValidationError,
+    canonical_authored_plan_sha256,
+    seal_project_execution_plan,
+    validate_authored_plan,
+    validate_reviewed_document_evidence,
+)
 
 from .base import BaseTool, ToolResult
 
@@ -55,7 +66,12 @@ class PhaseTool(BaseTool):
                 "external impediment; both are checked against physical evidence. "
                 "action='note' records a working note. A rejected terminal claim returns "
                 "typed judge facts; the model chooses its next ordinary project action. "
-                "The engine alone routes or skips phases."
+                "Analyze action='done' additionally requires execution_plan: the model's "
+                "evidence-linked build/test strategy. Each reviewed document needs a readable "
+                "output_* from a successful read/search in the current Analyze attempt. "
+                "The Harness validates and the engine "
+                "seals it, but neither authors its commands. The engine alone routes or "
+                "skips phases."
             ),
         )
         self.machine = machine
@@ -64,6 +80,7 @@ class PhaseTool(BaseTool):
         self.project_name = project_name
         self.gate_fn = gate_fn
         self.run_evidence_state = run_evidence_state
+        self._execution_plan_output_storage = None
         self._analysis_facts_recovery: Optional[Callable[[], Optional[str]]] = None
         self._analysis_facts_recovery_attempted = False
 
@@ -74,6 +91,37 @@ class PhaseTool(BaseTool):
         """Bind the controller's one-shot framework-survey recovery seam."""
 
         self._analysis_facts_recovery = callback
+
+    def bind_execution_plan_evidence(self, output_storage: Any) -> None:
+        """Bind the engine-owned store that resolves this run's output refs."""
+
+        self._execution_plan_output_storage = output_storage
+
+    def validate_execution_plan_evidence(
+        self,
+        plan: Any,
+        *,
+        source_attempt_id: str | None = None,
+    ) -> ProjectExecutionPlan:
+        """Bind claimed document reviews to this Analyze attempt's real reads."""
+
+        state = self.run_evidence_state
+        storage = self._execution_plan_output_storage
+        observations = getattr(state, "tool_observations", ()) if state is not None else ()
+        reader = getattr(storage, "retrieve_output", None) if storage is not None else None
+        if not callable(reader):
+            raise ProjectExecutionPlanValidationError(
+                "document review evidence output reader is unavailable"
+            )
+        attempt_id = str(
+            source_attempt_id or getattr(self.machine, "current_attempt_id", "") or ""
+        ).strip()
+        return validate_reviewed_document_evidence(
+            plan,
+            observations=observations,
+            output_reader=reader,
+            source_attempt_id=attempt_id,
+        )
 
     def _grade(self, claim: PhaseClaim, phase: str, *, sealed: bool):
         """One initial grade plus at most one controller-owned survey regrade.
@@ -251,6 +299,49 @@ class PhaseTool(BaseTool):
             },
         )
 
+    def _prepare_execution_plan(
+        self,
+        plan: ProjectExecutionPlan,
+        claim: PhaseClaim,
+    ) -> Dict[str, Any]:
+        """Cross-check a model plan without publishing the authoritative file.
+
+        The document map is an inventory and gap-checking input only.  The plan
+        model also permits checkout-contained sources discovered outside that
+        bounded map when the model cites a direct output/file observation.
+        Publication remains engine-owned and happens only after the delivered
+        phase gate is accepted.
+        """
+
+        attempt_id = str(getattr(self.machine, "current_attempt_id", "") or "").strip()
+        plan = self.validate_execution_plan_evidence(
+            plan,
+            source_attempt_id=attempt_id,
+        )
+        document_map = None
+        try:
+            observed = read_live_document_map(self.orchestrator)
+            if observed.complete and observed.conflict is None:
+                document_map = observed.payload
+        except Exception:
+            # The ordinary Analyze gate owns survey/map availability.  Plan
+            # validation can still bind map-external sources to direct refs;
+            # it must not invent a replacement inventory.
+            document_map = None
+        artifact = seal_project_execution_plan(
+            plan,
+            source_attempt_id=attempt_id,
+            claim_sha256=claim_identity(claim),
+            document_map=document_map,
+        )
+        return {
+            "authored_plan": plan.model_dump(mode="json"),
+            "authored_plan_sha256": artifact.authored_plan_sha256,
+            "document_map_fingerprint": artifact.document_map_fingerprint,
+            "inventory_coverage": artifact.inventory_coverage.model_dump(mode="json"),
+            "inventory_warnings": list(artifact.inventory_warnings),
+        }
+
     def execute(
         self,
         action: str,
@@ -259,6 +350,7 @@ class PhaseTool(BaseTool):
         reason: str = "",
         evidence: Optional[List[str]] = None,
         text: str = "",
+        execution_plan: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         if self.machine.is_complete:
             return ToolResult.completed_failure(
@@ -274,6 +366,12 @@ class PhaseTool(BaseTool):
                     output="note does not accept a phase outcome",
                     error="outcome is forbidden for note",
                     error_code="phase_note_outcome_forbidden",
+                )
+            if execution_plan is not None:
+                return ToolResult.completed_failure(
+                    output="note does not accept an execution plan",
+                    error="execution_plan is forbidden for note",
+                    error_code="ANALYSIS_EXECUTION_PLAN_FORBIDDEN",
                 )
             if not text:
                 return ToolResult.completed_failure(
@@ -327,6 +425,26 @@ class PhaseTool(BaseTool):
                 error_code="phase_blocker_reason_required",
             )
 
+        normalized_plan: ProjectExecutionPlan | None = None
+        plan_sha256 = ""
+        if execution_plan is not None:
+            if phase != "analyze" or verb != "done":
+                return ToolResult.completed_failure(
+                    output="execution_plan is accepted only by Analyze action='done'",
+                    error="execution_plan is not valid for this phase action",
+                    error_code="ANALYSIS_EXECUTION_PLAN_FORBIDDEN",
+                )
+            try:
+                normalized_plan = validate_authored_plan(execution_plan)
+                plan_sha256 = canonical_authored_plan_sha256(normalized_plan)
+            except ProjectExecutionPlanValidationError as exc:
+                return ToolResult.completed_failure(
+                    output=f"Analyze execution plan is incomplete or invalid: {exc}",
+                    error=str(exc),
+                    error_code="ANALYSIS_EXECUTION_PLAN_INVALID",
+                    facts={"analysis.execution_plan_valid": False},
+                )
+
         claim = PhaseClaim(
             phase=phase,
             signal=verb,
@@ -334,7 +452,26 @@ class PhaseTool(BaseTool):
             key_results=key_results,
             reason=reason,
             evidence_refs=tuple(evidence or ()),
+            execution_plan_sha256=plan_sha256,
+            execution_plan_ref=(PROJECT_EXECUTION_PLAN_PATH if plan_sha256 else ""),
         )
+
+        plan_candidate: Dict[str, Any] | None = None
+        if normalized_plan is not None:
+            try:
+                plan_candidate = self._prepare_execution_plan(normalized_plan, claim)
+            except ProjectExecutionPlanValidationError as exc:
+                return self._rejected_claim_result(
+                    claim,
+                    code="ANALYSIS_EXECUTION_PLAN_INVALID",
+                    reason=f"Analyze execution plan evidence binding is invalid: {exc}",
+                    control_disposition=GateControlDisposition.REPAIR_REQUIRED,
+                    blocker_owner="project",
+                    validated_facts={
+                        "analysis.execution_plan_valid": False,
+                        "analysis.execution_plan_error": str(exc)[:1000],
+                    },
+                )
 
         sealed = bool(getattr(self.run_evidence_state, "sealed", False))
         gate = None
@@ -525,6 +662,35 @@ class PhaseTool(BaseTool):
                 },
             )
 
+        if phase == "analyze" and verb == "done" and plan_candidate is None:
+            return self._rejected_claim_result(
+                claim,
+                code="ANALYSIS_EXECUTION_PLAN_REQUIRED",
+                reason=(
+                    "Analyze cannot close without a model-authored execution_plan. "
+                    "Review the broad document inventory and submit the documents, "
+                    "build/test actions, success criteria, constraints, risks, and "
+                    "unresolved questions with the next done claim."
+                ),
+                control_disposition=GateControlDisposition.REPAIR_REQUIRED,
+                blocker_owner="project",
+                validated_facts={
+                    **dict(gate.validated_facts),
+                    "analysis.execution_plan_valid": False,
+                    "analysis.execution_plan_required": True,
+                },
+            )
+
+        if plan_candidate is not None:
+            gate = replace(
+                gate,
+                validated_facts={
+                    **dict(gate.validated_facts),
+                    "analysis.execution_plan_candidate_valid": True,
+                    "analysis.execution_plan_sha256": plan_sha256,
+                },
+            )
+
         control_disposition = GateControlDisposition(gate.control_disposition).value
         return ToolResult.completed_success(
             # The word the model reads and the word the record seals come out of
@@ -537,6 +703,11 @@ class PhaseTool(BaseTool):
                 "phase_signal": verb,
                 "phase_claim": claim.to_metadata(),
                 "gate_result": gate.to_metadata(),
+                **(
+                    {"execution_plan_candidate": plan_candidate}
+                    if plan_candidate is not None
+                    else {}
+                ),
             },
         )
 
@@ -564,6 +735,92 @@ class PhaseTool(BaseTool):
                     "description": "refs supporting the claim (output_*, job:*, file:*)",
                 },
                 "text": {"type": "string", "description": "note: working note"},
+                "execution_plan": {
+                    "type": "object",
+                    "description": (
+                        "Required only for Analyze action='done'. Your model-authored, "
+                        "evidence-linked project build/test strategy. Harness inventory "
+                        "and extracted claims are hints, not commands."
+                    ),
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string", "maxLength": 2000},
+                        "documents_reviewed": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 24,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "path": {"type": "string", "maxLength": 2048},
+                                    "reason": {"type": "string", "maxLength": 1000},
+                                    "evidence_refs": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 12,
+                                        "items": {"type": "string", "maxLength": 512},
+                                        "description": (
+                                            "Include at least one readable output_* produced "
+                                            "by your current Analyze read/search of this path; "
+                                            "a document-map id or file path alone is not a read."
+                                        ),
+                                    },
+                                    "entry_id": {"type": "string", "maxLength": 128},
+                                    "source_hash": {"type": "string", "maxLength": 64},
+                                },
+                                "required": ["path", "reason", "evidence_refs"],
+                            },
+                        },
+                        **{
+                            lane: {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 16,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "tool": {"type": "string", "maxLength": 64},
+                                        "params": {"type": "object"},
+                                        "purpose": {"type": "string", "maxLength": 1000},
+                                        "evidence_refs": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "maxItems": 12,
+                                            "items": {"type": "string", "maxLength": 512},
+                                        },
+                                    },
+                                    "required": ["tool", "params", "purpose", "evidence_refs"],
+                                },
+                            }
+                            for lane in ("build_steps", "test_steps")
+                        },
+                        **{
+                            name: {
+                                "type": "array",
+                                "minItems": (1 if "success_criteria" in name else 0),
+                                "maxItems": 16,
+                                "items": {"type": "string", "maxLength": 1000},
+                            }
+                            for name in (
+                                "build_success_criteria",
+                                "test_success_criteria",
+                                "environment_constraints",
+                                "risks",
+                                "unresolved_questions",
+                            )
+                        },
+                    },
+                    "required": [
+                        "summary",
+                        "documents_reviewed",
+                        "build_steps",
+                        "build_success_criteria",
+                        "test_steps",
+                        "test_success_criteria",
+                    ],
+                },
             },
             "required": ["action"],
         }

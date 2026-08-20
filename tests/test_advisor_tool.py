@@ -16,9 +16,59 @@ from types import SimpleNamespace
 import pytest
 
 from sag.agent.advisor import AdvisorTool
+from sag.agent.phase_gates import claim_identity
+from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    canonical_authored_plan_sha256,
+    seal_project_execution_plan,
+)
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import ReActStep, StepType
 from sag.config.prompt_loader import load_react_engine_prompts
+
+_ADVISOR_PLAN_PAYLOAD = {
+    "summary": "Compile the project, then run its tests.",
+    "documents_reviewed": [
+        {
+            "path": "/workspace/project/README.md",
+            "reason": "The fixture treats this as the reviewed command source.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "build_steps": [
+        {
+            "tool": "build",
+            "params": {"action": "compile"},
+            "purpose": "Compile the scripted project.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "build_success_criteria": ["The scripted build action completes."],
+    "test_steps": [
+        {
+            "tool": "build",
+            "params": {"action": "test"},
+            "purpose": "Run the scripted project tests.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "test_success_criteria": ["The scripted test action completes."],
+}
+_ADVISOR_PLAN_SHA256 = canonical_authored_plan_sha256(_ADVISOR_PLAN_PAYLOAD)
+_ADVISOR_ANALYZE_CLAIM = PhaseClaim(
+    phase="analyze",
+    signal="done",
+    claimed_outcome=PhaseOutcome.SUCCESS,
+    key_results="analyze finished",
+    execution_plan_sha256=_ADVISOR_PLAN_SHA256,
+    execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+)
+_SEALED_ADVISOR_TEST_PLAN = seal_project_execution_plan(
+    _ADVISOR_PLAN_PAYLOAD,
+    source_attempt_id="analyze-1",
+    claim_sha256=claim_identity(_ADVISOR_ANALYZE_CLAIM),
+)
 
 
 class _ScriptedAdvisorClient:
@@ -71,7 +121,18 @@ def _advisor_engine(
     engine.llm_client = client if client is not None else _ScriptedAdvisorClient()
     engine.steps = list(steps or [])
     engine.current_iteration = 7
-    engine.phase_machine = SimpleNamespace(current_phase=phase)
+    engine.phase_machine = SimpleNamespace(
+        current_phase=phase,
+        records=(
+            SimpleNamespace(
+                phase="analyze",
+                attempt_id="analyze-1",
+                transition="advance",
+                claim=_ADVISOR_ANALYZE_CLAIM,
+            ),
+        ),
+    )
+    engine._sealed_execution_plan_cache = _SEALED_ADVISOR_TEST_PLAN
     engine.phase_handoff = handoff
     engine.run_evidence_state = None
     engine.physical_validator = None
@@ -269,6 +330,7 @@ def test_consult_messages_carry_the_flattened_transcript_and_the_digest():
     system_text = messages[0]["content"]
     assert "senior reviewer" in system_text
     assert "Never advise giving up while a mechanical repair is untried." in system_text
+    assert "SEALED PROJECT EXECUTION PLAN" in system_text
 
     user_text = messages[1]["content"]
     # The whole phase transcript is forwarded, flattened role by role.

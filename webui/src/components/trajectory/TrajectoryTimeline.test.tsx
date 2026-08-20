@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { TrajectoryDocument } from "@/api/types"
@@ -83,7 +83,10 @@ const withBytes: TrajectoryDocument = {
 }
 
 describe("TrajectoryTimeline", () => {
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
 
   it("draws one row per turn, each naming its control sequence", () => {
     render(<TrajectoryTimeline doc={doc} />)
@@ -178,10 +181,10 @@ describe("TrajectoryTimeline", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
 
-    expect(screen.getByRole("heading", { name: /\[A\] Window/ })).toBeInTheDocument()
-    expect(screen.getByRole("heading", { name: /\[B\] Call/ })).toBeInTheDocument()
-    expect(screen.getByRole("heading", { name: /\[C\] Observation/ })).toBeInTheDocument()
-    expect(screen.getByRole("heading", { name: /\[D\] Next/ })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: /model context/i })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: /tool call/i })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: /tool result/i })).toBeInTheDocument()
+    expect(screen.queryByRole("heading", { name: /next/i })).not.toBeInTheDocument()
     expect(onNeedBytes).toHaveBeenCalledTimes(1)
   })
 
@@ -189,7 +192,7 @@ describe("TrajectoryTimeline", () => {
     render(<TrajectoryTimeline doc={withBytes} />)
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
 
-    const window = screen.getByRole("list", { name: /window components/i })
+    const window = screen.getByRole("list", { name: /model context messages/i })
     const items = within(window).getAllByRole("listitem")
     expect(items).toHaveLength(3)
     expect(items[1]).toHaveTextContent("output_sys")
@@ -204,7 +207,24 @@ describe("TrajectoryTimeline", () => {
     expect(screen.getByText("you are a setup agent")).toBeInTheDocument()
   })
 
-  it("draws the window handle once, marked inside the list it belongs to", () => {
+  it("shows the stored role and a message preview before the opaque ref", () => {
+    const messages = {
+      ...withBytes,
+      outputs: {
+        ...withBytes.outputs,
+        output_sys: JSON.stringify({ role: "system", content: "You are a setup agent." }),
+      },
+    }
+    render(<TrajectoryTimeline doc={messages} />)
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+
+    const context = screen.getByTestId("quad-window-1")
+    expect(within(context).getByText("system")).toBeInTheDocument()
+    expect(within(context).getByText("You are a setup agent.")).toBeInTheDocument()
+    expect(within(context).getByRole("button", { name: /output_sys/ })).toBeInTheDocument()
+  })
+
+  it("draws the window handle once inside the context list", () => {
     // The record's handle into [A] IS the last component it named — the newest
     // message, the one thing this turn did not share with the turn before it.
     // Drawing it above the list and again inside it put one ref on screen
@@ -226,7 +246,6 @@ describe("TrajectoryTimeline", () => {
 
     const window = screen.getByTestId("quad-window-1")
     expect(within(window).getAllByRole("button", { name: /output_obs1/ })).toHaveLength(1)
-    expect(within(window).getByText(/handle/i)).toBeInTheDocument()
     expect(within(window).getAllByRole("listitem")).toHaveLength(2)
   })
 
@@ -246,7 +265,7 @@ describe("TrajectoryTimeline", () => {
     const window = screen.getByTestId("quad-window-1")
     expect(within(window).getByRole("button", { name: /output_win1/ })).toBeInTheDocument()
     expect(
-      within(window).queryByRole("list", { name: /window components/i }),
+      within(window).queryByRole("list", { name: /model context messages/i }),
     ).not.toBeInTheDocument()
   })
 
@@ -254,37 +273,72 @@ describe("TrajectoryTimeline", () => {
     render(<TrajectoryTimeline doc={withBytes} />)
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
 
-    expect(screen.getByText(/12 older components/i)).toBeInTheDocument()
+    expect(screen.getByText(/12 older messages/i)).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /window_truncated/ })).not.toBeInTheDocument()
   })
 
-  it("names the envelope for [B] rather than pretending the store answers it", () => {
+  it("keeps the envelope id as secondary call metadata", () => {
     render(<TrajectoryTimeline doc={withBytes} />)
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
 
     const call = screen.getByTestId("quad-call-1")
     expect(within(call).getByText("envelope-000003")).toBeInTheDocument()
-    expect(within(call).getByText(/control_events\.jsonl/)).toBeInTheDocument()
+    expect(within(call).getByText(/call envelope/i)).toBeInTheDocument()
   })
 
-  it("shows [C] as what the model read, and still names what the tool wrote", () => {
+  it("distinguishes the model-visible result from its evidence reference", () => {
     render(<TrajectoryTimeline doc={withBytes} />)
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
 
     const observation = screen.getByTestId("quad-observation-1")
-    expect(within(observation).getByText(/read by the model/i)).toBeInTheDocument()
-    expect(within(observation).getByText(/written by the tool/i)).toBeInTheDocument()
+    expect(within(observation).getByText(/model-visible result/i)).toBeInTheDocument()
+    expect(within(observation).getByText("Tool output reference")).toBeInTheDocument()
     expect(within(observation).getByRole("button", { name: /output_ev1/ })).toBeInTheDocument()
   })
 
-  it("[D] names the next turn, and says when there is none yet", () => {
-    render(<TrajectoryTimeline doc={withBytes} />)
+  it("labels a detached evidence ref as a background job", () => {
+    const jobEvidence = {
+      ...withBytes,
+      turns: [
+        {
+          ...doc.turns[0],
+          observation: { ...doc.turns[0].observation, evidence_ref: "job:58db946542a8" },
+        },
+        doc.turns[1],
+      ],
+    }
+    render(<TrajectoryTimeline doc={jobEvidence} status="ready" />)
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+
+    const observation = screen.getByTestId("quad-observation-1")
+    expect(within(observation).getByText("Background job")).toBeInTheDocument()
+    fireEvent.click(within(observation).getByRole("button", { name: /job:58db946542a8/ }))
+    expect(within(observation).getByText(/background-job handle/i)).toBeInTheDocument()
+  })
+
+  it("loads exact call parameters once when the row is expanded", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          sequence: 3,
+          envelope_id: "envelope-000003",
+          tool: "project",
+          exact_params: { action: "clone", ref: "4.3.1" },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+    )
+    render(<TrajectoryTimeline doc={withBytes} sessionId="S1" />)
 
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
-    expect(within(screen.getByTestId("quad-next-1")).getByText(/Turn 2/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText(/"action": "clone"/)).toBeInTheDocument())
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/S1/trajectory/envelopes/envelope-000003",
+    )
 
-    fireEvent.click(screen.getByRole("button", { name: /^Turn 2/ }))
-    expect(within(screen.getByTestId("quad-next-2")).getByText(/no turn after this one/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+    fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it("states a hole on the row it is about instead of hiding it", () => {

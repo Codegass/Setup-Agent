@@ -67,7 +67,8 @@ const igniteShape = {
 describe("TestFacet", () => {
   it("shows conclusion + FAILING + a 'View test details' detail for single-module", () => {
     render(<TestFacet detail={single} />)
-    expect(screen.getByText(/97\.5% pass/i)).toBeInTheDocument()
+    expect(screen.getByText(/97\.5% of non-skipped results passed/i)).toBeInTheDocument()
+    expect(screen.getByText(/sealed run results: 312 passed · 8 failed · 0 errors/i)).toBeInTheDocument()
     expect(screen.getByText(/Failing · 2/)).toBeInTheDocument()
     expect(screen.getByText("HelpFormatterTest.testWrappedWidth")).toBeInTheDocument()
     // Single-module gets a "View test details" affordance (not "per-module breakdown").
@@ -80,22 +81,61 @@ describe("TestFacet", () => {
   it("opens the per-module breakdown modal for a multi-module project", () => {
     render(<TestFacet detail={multi} />)
     fireEvent.click(screen.getByRole("button", { name: /per-module breakdown/i }))
-    expect(screen.getByRole("dialog", { name: /per-module test breakdown/i })).toBeInTheDocument()
+    expect(screen.getByRole("dialog", { name: /per-module test details/i })).toBeInTheDocument()
     expect(screen.getByText("streams")).toBeInTheDocument()
   })
 
-  it("separates claimed grains from non-verdict-bearing observations", () => {
+  it("separates a sealed run from verified identities and diagnostic observations", () => {
     render(<TestFacet detail={igniteShape} />)
 
-    expect(screen.getByText("Claimed latest subjects")).toBeInTheDocument()
+    expect(screen.getByText("Test run result")).toBeInTheDocument()
+    expect(screen.getByText("Passed")).toHaveClass("text-status-success")
+    expect(screen.getByText(/sealed run results: 2 passed · 0 failed · 0 errors/i)).toBeInTheDocument()
+    expect(screen.getByText(/100% of non-skipped results passed/i)).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /2 passed, 0 failed, 2 total/i })).toBeInTheDocument()
+
+    expect(screen.getByText("Verified test identities")).toBeInTheDocument()
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0)
-    expect(screen.queryByText(/100% pass/i)).not.toBeInTheDocument()
-    expect(screen.queryByRole("img", { name: /2 passed, 0 failed, 2 total/i })).not.toBeInTheDocument()
-    expect(screen.getByText("Receipt executions")).toBeInTheDocument()
+    expect(screen.getByText(/module names and stable test identities/i)).toBeInTheDocument()
+
+    expect(screen.getByText("Evidence details")).toBeInTheDocument()
+    expect(screen.getByText("Recorded tool runs")).toBeInTheDocument()
     expect(screen.getByText("2 / 2 passed")).toBeInTheDocument()
-    expect(screen.getByText("Quarantined observations · not verdict-bearing")).toBeInTheDocument()
+    expect(screen.getByText("Excluded observations")).toBeInTheDocument()
     expect(screen.getByText("267 / 2,887 passed")).toBeInTheDocument()
-    expect(screen.getByText("Evidence transport")).toBeInTheDocument()
-    expect(screen.getByText("complete")).toBeInTheDocument()
+    expect(screen.getByText("Diagnostic observations")).toBeInTheDocument()
+    expect(screen.getByText("2,887")).toBeInTheDocument()
+    expect(screen.getByText("Evidence records")).toBeInTheDocument()
+    expect(screen.getByText("Complete")).toBeInTheDocument()
+  })
+
+  it("counts errors as negative non-skipped results", () => {
+    render(
+      <TestFacet
+        detail={{
+          ...single,
+          test: {
+            state: "failed",
+            pass: 80,
+            fail: 5,
+            errors: 15,
+            skip: 10,
+            total: 110,
+            failingNames: [],
+          },
+        }}
+      />,
+    )
+
+    expect(screen.getByText(/80% of non-skipped results passed/i)).toBeInTheDocument()
+    expect(screen.getByText(/80 passed · 5 failed · 15 errors · 10 skipped/i)).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /80 passed, 20 failed, 100 total/i })).toBeInTheDocument()
+  })
+
+  it("does not call absent module metrics a single-module project", () => {
+    render(<TestFacet detail={{ ...single, moduleSummary: undefined, modules: [] }} />)
+
+    expect(screen.getByText(/detailed module test metrics were not produced/i)).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /view test details/i })).not.toBeInTheDocument()
   })
 })

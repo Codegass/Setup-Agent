@@ -244,7 +244,9 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_evidence():
 # The model-visible Java contract is byte-pinned so a selected call or project
 # ordering cannot silently creep back into the setup objective.
 _JAVA_BUILD_OBJECTIVE_SNAPSHOT = (
-    "Establish terminal build evidence for every required surveyed build coordinate. "
+    "Execute from the sealed Analyze execution plan, adapting only when new observed evidence "
+    "requires it and recording the reason for any deviation. Establish terminal build evidence "
+    "for every required surveyed build coordinate. "
     "An aggregator root with no sources is not compile evidence for source-bearing "
     "islands; each required island needs a current receipt and artifact/coverage evidence, "
     "or a typed evidence-backed blocker. A packaging or meta-project with no compile "

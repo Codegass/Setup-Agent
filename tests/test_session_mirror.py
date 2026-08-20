@@ -8,6 +8,10 @@ import types
 
 import pytest
 
+from sag.agent.evidence_records import (
+    decode_named_json_record_stream,
+    named_json_file_stream_command,
+)
 from sag.web import session_mirror
 from sag.web.session_mirror import MirrorReader, ensure_mirror
 
@@ -23,9 +27,10 @@ def _tar(files):
 
 
 class FakeContainer:
-    def __init__(self, archives):
+    def __init__(self, archives, container_id="a" * 64):
         self.archives = archives
         self.calls = []
+        self.id = container_id
 
     def get_archive(self, path):
         self.calls.append(path)
@@ -68,6 +73,86 @@ def test_mirror_extracts_results_and_report(tmp_path):
     assert (dest / ".sag_last_comment.json").is_file()
     # report .md name isn't derivable — resolved from the trunk's report_path
     assert (dest / REPORT).read_text() == "# report"
+
+
+def test_mirror_extracts_timestamped_report_referenced_only_by_phase_context(tmp_path):
+    archives = {
+        "/workspace/.setup_agent": _tar(
+            {
+                ".setup_agent/contexts/trunk_x.json": b'{"goal": "setup"}',
+                ".setup_agent/contexts/phase_report.json": (
+                    '{"report_path": "/workspace/' + REPORT + '"}'
+                ).encode(),
+            }
+        ),
+        "/workspace/" + REPORT: _tar({REPORT: b"# phase report"}),
+    }
+
+    dest = ensure_mirror(
+        FakeClient(FakeContainer(archives)),
+        "sag-phase-report",
+        running=False,
+        logs_root=tmp_path,
+    )
+
+    assert (dest / REPORT).read_text() == "# phase report"
+
+
+def test_mirror_and_reader_fall_back_to_generic_report(tmp_path):
+    archives = {
+        "/workspace/.setup_agent": _tar(
+            {".setup_agent/contexts/trunk_x.json": b'{"goal": "setup"}'}
+        ),
+        "/workspace/setup-report.md": _tar({"setup-report.md": b"# generic report"}),
+    }
+    dest = ensure_mirror(
+        FakeClient(FakeContainer(archives)),
+        "sag-generic-report",
+        running=False,
+        logs_root=tmp_path,
+    )
+    reader = MirrorReader(dest)
+
+    timestamped = reader.execute_command(
+        "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f "
+        "2>/dev/null | sort | tail -1"
+    )
+    generic = reader.execute_command(
+        "test -f /workspace/setup-report.md && printf '%s\\n' /workspace/setup-report.md"
+    )
+
+    assert (dest / "setup-report.md").read_text() == "# generic report"
+    assert timestamped["output"] == ""
+    assert generic["output"] == "/workspace/setup-report.md"
+
+
+def test_reader_prefers_latest_timestamped_report_over_generic(tmp_path):
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    (mirror / "setup-report.md").write_text("generic", encoding="utf-8")
+    (mirror / "setup-report-20260708-101010.md").write_text("old", encoding="utf-8")
+    (mirror / "setup-report-20260709-111111.md").write_text("latest", encoding="utf-8")
+
+    result = MirrorReader(mirror).execute_command(
+        "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f "
+        "2>/dev/null | sort | tail -1"
+    )
+
+    assert result["output"] == "/workspace/setup-report-20260709-111111.md"
+
+
+def test_reader_exposes_the_host_observed_immutable_store_identity(tmp_path):
+    container = FakeContainer(ARCHIVES, container_id="8" * 64)
+    dest = ensure_mirror(FakeClient(container), "sag-x", running=False, logs_root=tmp_path)
+
+    assert MirrorReader(dest).evidence_store_identity() == f"docker:{container.id}"
+
+
+def test_reader_fails_store_identity_closed_when_docker_exposes_none(tmp_path):
+    container = FakeContainer(ARCHIVES, container_id="")
+    dest = ensure_mirror(FakeClient(container), "sag-x", running=False, logs_root=tmp_path)
+
+    assert MirrorReader(dest).evidence_store_identity() == ""
 
 
 def test_stopped_container_mirrored_once(tmp_path):
@@ -113,6 +198,27 @@ def test_reader_answers_cat_and_finds(tmp_path):
         "find /workspace/.setup_agent/contexts -maxdepth 2 -type f "
         "\\( -name 'trunk*.json' \\) -printf '%P\\n' 2>/dev/null || true")
     assert "trunk_x.json" in ctx["output"].splitlines()
+
+
+def test_reader_answers_the_exact_named_file_transport(tmp_path):
+    dest = ensure_mirror(
+        FakeClient(FakeContainer(ARCHIVES)),
+        "sag-x",
+        running=False,
+        logs_root=tmp_path,
+    )
+    reader = MirrorReader(dest)
+
+    result = reader.execute_command(
+        named_json_file_stream_command("/workspace/.setup_agent/report_metrics.json")
+    )
+    decoded = decode_named_json_record_stream(result)
+
+    assert decoded.complete is True
+    assert decoded.conflict is None
+    assert len(decoded.records) == 1
+    assert decoded.records[0].filename == "report_metrics.json"
+    assert decoded.records[0].raw == b'{"pass_rate": 100}'
 
 
 def test_reader_missing_file_is_exit_1(tmp_path):

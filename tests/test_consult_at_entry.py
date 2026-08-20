@@ -28,9 +28,14 @@ from sag.agent.advisor import AdvisorTool
 from sag.agent.evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from sag.agent.history_state import ADVISOR_HISTORY_ENTRY_KIND, is_advisor_history_entry
 from sag.agent.output_storage import OutputStorageManager
-from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState, claim_identity
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.phase_transitions import PhaseTransitionPolicy
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    canonical_authored_plan_sha256,
+    seal_project_execution_plan,
+)
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
@@ -43,9 +48,57 @@ from sag.tools.context_tool import ContextTool
 
 ADVICE = "Compile the three untouched islands before you conclude anything."
 
+_ADVISOR_PLAN_PAYLOAD = {
+    "summary": "Compile the project, then run its tests.",
+    "documents_reviewed": [
+        {
+            "path": "/workspace/project/README.md",
+            "reason": "The fixture treats this as the reviewed command source.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "build_steps": [
+        {
+            "tool": "build",
+            "params": {"action": "compile"},
+            "purpose": "Compile the scripted project.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "build_success_criteria": ["The scripted build action completes."],
+    "test_steps": [
+        {
+            "tool": "build",
+            "params": {"action": "test"},
+            "purpose": "Run the scripted project tests.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "test_success_criteria": ["The scripted test action completes."],
+}
+_ADVISOR_PLAN_SHA256 = canonical_authored_plan_sha256(_ADVISOR_PLAN_PAYLOAD)
+_ADVISOR_ANALYZE_CLAIM = PhaseClaim(
+    phase="analyze",
+    signal="done",
+    claimed_outcome=PhaseOutcome.SUCCESS,
+    key_results="analyze finished",
+    execution_plan_sha256=_ADVISOR_PLAN_SHA256,
+    execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+)
+_SEALED_ADVISOR_TEST_PLAN = seal_project_execution_plan(
+    _ADVISOR_PLAN_PAYLOAD,
+    source_attempt_id="analyze-1",
+    claim_sha256=claim_identity(_ADVISOR_ANALYZE_CLAIM),
+)
+
 _PHASE_FACTS = {
     "provision": {"provision.workspace_ready": True},
-    "analyze": {"analysis.build_entry_ready": True},
+    "analyze": {
+        "analysis.build_entry_ready": True,
+        "analysis.execution_plan_sealed": True,
+        "analysis.execution_plan_sha256": _SEALED_ADVISOR_TEST_PLAN.authored_plan_sha256,
+        "analysis.execution_plan_source_attempt_id": "analyze-1",
+    },
     "build": {"build.test_entry_ready": True},
 }
 
@@ -94,7 +147,18 @@ def _unit_engine(*, phase="build", advisor_mode="same-model", advisor_phase_cap=
     engine.token_tracker = SimpleNamespace(update_last_tool_name=lambda name: None)
     engine.emit = lambda *a, **k: None
     engine.run_evidence_state = None
-    engine.phase_machine = SimpleNamespace(current_phase=phase, current_attempt_id="attempt-1")
+    engine.phase_machine = SimpleNamespace(
+        current_phase=phase,
+        current_attempt_id="attempt-1",
+        records=(
+            SimpleNamespace(
+                phase="analyze",
+                attempt_id="analyze-1",
+                transition="advance",
+                claim=_ADVISOR_ANALYZE_CLAIM,
+            ),
+        ),
+    )
     engine.phase_handoff = None
     engine.physical_validator = None
     engine.loop_memory = None
@@ -102,6 +166,7 @@ def _unit_engine(*, phase="build", advisor_mode="same-model", advisor_phase_cap=
     engine.control_event_sink = None
     engine.prompts = load_react_engine_prompts()
     engine.llm_client = _ScriptedAdvisorClient()
+    engine._sealed_execution_plan_cache = _SEALED_ADVISOR_TEST_PLAN
     engine.emitted_tool_results = []
     engine._get_timestamp = lambda: "2026-07-26T00:00:00Z"
     engine._record_execution_bundle = lambda execution, call: (
@@ -151,6 +216,7 @@ def test_entering_the_build_phase_consults_the_advisor_once():
     # minted, the forced-attempt way.
     assert _observations(engine)[0].tool_call_id == "advisor-entry-1"
     assert ADVICE in _observations(engine)[0].content
+    assert "SEALED PROJECT EXECUTION PLAN" in engine.llm_client.messages[0][0]["content"]
     # It is a real consult: telemetry counts it and the phase cap sees it.
     assert [call["phase"] for call in engine.advisor_telemetry["calls"]] == ["build"]
     assert engine._advisor_calls_in_phase == 1
@@ -702,6 +768,10 @@ class _PhaseTool(BaseTool):
             claimed_outcome=claimed,
             key_results=key_results or f"{phase} finished",
             reason=reason,
+            execution_plan_sha256=(
+                _SEALED_ADVISOR_TEST_PLAN.authored_plan_sha256 if phase == "analyze" else ""
+            ),
+            execution_plan_ref=(PROJECT_EXECUTION_PLAN_PATH if phase == "analyze" else ""),
         )
         gate = GateResult(
             accepted=True,
@@ -874,6 +944,8 @@ def _flow_engine(tmp_path, *, advisor_mode="same-model", max_iterations=20):
     engine.loop_memory = None
     engine.output_storage = OutputStorageManager(tmp_path / "contexts")
     engine.orchestrator = None
+    engine._sealed_execution_plan_cache = _SEALED_ADVISOR_TEST_PLAN
+    engine._finalize_analyze_execution_plan = lambda _claim, delivered, _metadata: delivered
     engine.successful_states = {}
     engine.recent_tool_executions = []
     engine.steps_since_context_switch = 0

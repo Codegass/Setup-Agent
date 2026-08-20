@@ -3,6 +3,7 @@ import { Terminal } from "lucide-react"
 import { Card, CardHead } from "@/components/common/Card"
 
 export function LogsView({ logs }: { logs: string[] }) {
+  const hasTextOnlyZero = logs.some((line) => /LLM Response from .*: 0 chars\b/.test(line))
   return (
     <Card className="overflow-hidden">
       <CardHead
@@ -10,6 +11,12 @@ export function LogsView({ logs }: { logs: string[] }) {
         sub={`${logs.length} lines`}
         title="Raw logs"
       />
+      {hasTextOnlyZero ? (
+        <div className="border-b border-border bg-muted/50 px-4 py-2 text-[11.5px] text-muted-foreground">
+          In older log lines, “0 chars” counts assistant text only. The response can still
+          contain tool calls, which appear as ACTION lines.
+        </div>
+      ) : null}
       {logs.length ? (
         <div className="max-h-[520px] overflow-auto bg-code-surface py-3 font-mono text-[12px] leading-relaxed">
           {logs.map((line, index) => (

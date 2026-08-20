@@ -63,6 +63,14 @@ describe("VerdictBand", () => {
     expect(screen.getByText(/PARTIAL/)).toBeInTheDocument()
   })
 
+  it("does not color an unrecognized fallback outcome as success", () => {
+    const { container } = render(
+      <VerdictBand detail={{ verdict: null, outcome: "Result unavailable" } as any} />,
+    )
+    expect(container.firstElementChild).toHaveClass("border-status-attention-border")
+    expect(container.firstElementChild).not.toHaveClass("border-status-success-border")
+  })
+
   it("renders a missing canonical snapshot as UNKNOWN rather than PARTIAL", () => {
     render(
       <VerdictBand

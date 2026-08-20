@@ -645,7 +645,7 @@ def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_fact
     assert detail.verdict is not None
     assert detail.verdict.verdict == "success"
     assert detail.verdict.tone == "success"
-    assert detail.verdict.headline == "Build passed. 328 tests passing"
+    assert detail.verdict.headline == "Build passed. Test run passed with 328 sealed results"
 
 
 def test_web_exposes_report_delivery_only_from_durable_flow_data(tvm_snapshot):

@@ -7,7 +7,8 @@ import pytest
 
 import sag.tools.phase_tool as phase_tool_module
 from sag.agent.evidence_records import frame_named_json_record_stream
-from sag.agent.evidence_state import RunEvidenceState
+from sag.agent.evidence_state import RunEvidenceState, StateScope
+from sag.agent.output_storage import OutputStorageManager
 from sag.agent.phase_gates import (
     ClaimDisposition,
     GateControlDisposition,
@@ -15,6 +16,11 @@ from sag.agent.phase_gates import (
     ValidatorState,
 )
 from sag.agent.phase_machine import PhaseOutcome
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    canonical_authored_plan_sha256,
+)
+from sag.tools.base import ToolResult
 from sag.tools.phase_tool import PhaseTool
 
 
@@ -68,15 +74,71 @@ class EmptyPublishedEvidence:
         return {"success": False, "exit_code": 1, "output": ""}
 
 
-def _tool(gate, phase="build"):
-    machine = SimpleNamespace(current_phase=phase, is_complete=False)
-    return PhaseTool(
+def _tool(
+    gate,
+    phase="build",
+    *,
+    run_evidence_state=None,
+    output_storage=None,
+):
+    machine = SimpleNamespace(
+        current_phase=phase,
+        current_attempt_id=f"{phase}-1",
+        is_complete=False,
+    )
+    tool = PhaseTool(
         machine=machine,
         validator=None,
         orchestrator=EmptyPublishedEvidence(),
         project_name="demo",
         gate_fn=gate,
+        run_evidence_state=run_evidence_state,
     )
+    if output_storage is not None:
+        tool.bind_execution_plan_evidence(output_storage)
+    return tool
+
+
+def _authored_execution_plan():
+    return {
+        "summary": "Use the project wrapper and keep build and tests as separate lanes.",
+        "documents_reviewed": [
+            {
+                "path": "/workspace/demo/DEVNOTES.txt",
+                "reason": "Defines the project-specific build and test entry points.",
+                "evidence_refs": ["output_devnotes"],
+            }
+        ],
+        "build_steps": [
+            {
+                "tool": "build",
+                "params": {
+                    "action": "compile",
+                    "working_directory": "/workspace/demo",
+                    "args": "-DskipTests",
+                },
+                "purpose": "Compile the reactor without entering the test lane.",
+                "evidence_refs": ["output_devnotes"],
+            }
+        ],
+        "build_success_criteria": ["A terminal receipt covers the selected reactor."],
+        "test_steps": [
+            {
+                "tool": "build",
+                "params": {
+                    "action": "test",
+                    "working_directory": "/workspace/demo",
+                    "args": "-Dtest=FocusedSuite",
+                },
+                "purpose": "Run the documented bounded test lane.",
+                "evidence_refs": ["output_devnotes"],
+            }
+        ],
+        "test_success_criteria": ["The focused suite has a terminal test receipt."],
+        "environment_constraints": ["Use the repository wrapper."],
+        "risks": [],
+        "unresolved_questions": [],
+    }
 
 
 def test_done_passes_gate_and_signals_engine():
@@ -94,6 +156,128 @@ def test_done_passes_gate_and_signals_engine():
     assert result.metadata["phase_signal"] == "done"
     assert result.metadata["phase_claim"]["key_results"] == "compiled 115 classes"
     assert gate.calls == ["build"]
+
+
+def test_analyze_done_requires_a_model_authored_execution_plan_after_gate_acceptance():
+    gate = GateRecorder(ok=True)
+
+    result = _tool(gate, phase="analyze").execute(
+        action="done",
+        outcome="success",
+        key_results="survey and document review complete",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_REQUIRED"
+    assert "phase_signal" not in result.metadata
+    assert (
+        result.metadata["gate_result"]["validated_facts"]["analysis.execution_plan_required"]
+        is True
+    )
+    assert gate.calls == ["analyze"]
+
+
+def test_analyze_done_carries_a_real_read_bound_plan_candidate_to_the_engine(tmp_path):
+    plan = _authored_execution_plan()
+    storage = OutputStorageManager(tmp_path / "contexts")
+    ref = storage.store_output(
+        task_id="analyze-read",
+        tool_name="search",
+        output="Build with ./mvnw; run FocusedSuite separately.",
+    )
+    plan["documents_reviewed"][0]["evidence_refs"] = [ref]
+    state = RunEvidenceState(run_id="plan-evidence")
+    state.ingest_tool_result(
+        StateScope.PROJECT_ANALYSIS,
+        "search",
+        ToolResult.completed_success(output="document read", output_ref=ref),
+        params={"target": "file:/workspace/demo/DEVNOTES.txt", "pattern": "."},
+        source_phase="analyze",
+        source_attempt_id="analyze-1",
+    )
+
+    result = _tool(
+        GateRecorder(ok=True),
+        phase="analyze",
+        run_evidence_state=state,
+        output_storage=storage,
+    ).execute(
+        action="done",
+        outcome="success",
+        key_results="reviewed project-specific commands",
+        evidence=[ref],
+        execution_plan=plan,
+    )
+
+    expected_sha = canonical_authored_plan_sha256(plan)
+    assert result.succeeded is True
+    assert result.metadata["phase_signal"] == "done"
+    assert result.metadata["phase_claim"]["execution_plan_sha256"] == expected_sha
+    assert result.metadata["phase_claim"]["execution_plan_ref"] == (PROJECT_EXECUTION_PLAN_PATH)
+    assert result.metadata["execution_plan_candidate"]["authored_plan_sha256"] == (expected_sha)
+    authored = result.metadata["execution_plan_candidate"]["authored_plan"]
+    assert authored["summary"] == plan["summary"]
+    assert authored["build_steps"] == plan["build_steps"]
+    assert authored["test_steps"] == plan["test_steps"]
+    assert (
+        result.metadata["gate_result"]["validated_facts"]["analysis.execution_plan_candidate_valid"]
+        is True
+    )
+
+
+def test_analyze_plan_rejects_output_like_text_without_a_current_document_read(tmp_path):
+    gate = GateRecorder(ok=True)
+    storage = OutputStorageManager(tmp_path / "contexts")
+    state = RunEvidenceState(run_id="no-document-read")
+
+    result = _tool(
+        gate,
+        phase="analyze",
+        run_evidence_state=state,
+        output_storage=storage,
+    ).execute(
+        action="done",
+        outcome="success",
+        execution_plan=_authored_execution_plan(),
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
+    assert "current Analyze attempt" in result.error
+    assert gate.calls == []
+
+
+def test_invalid_analyze_plan_never_reaches_the_physical_gate_or_emits_a_signal():
+    gate = GateRecorder(ok=True)
+    plan = _authored_execution_plan()
+    plan["test_steps"] = []
+
+    result = _tool(gate, phase="analyze").execute(
+        action="done",
+        outcome="success",
+        execution_plan=plan,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
+    assert "phase_signal" not in result.metadata
+    assert gate.calls == []
+
+
+@pytest.mark.parametrize("phase", ["provision", "build", "test", "report"])
+def test_execution_plan_is_forbidden_outside_analyze_done(phase):
+    gate = GateRecorder(ok=True)
+
+    result = _tool(gate, phase=phase).execute(
+        action="done",
+        outcome="success",
+        execution_plan=_authored_execution_plan(),
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_FORBIDDEN"
+    assert "phase_signal" not in result.metadata
+    assert gate.calls == []
 
 
 def test_a_claim_carries_the_evidence_seal_to_the_gate():
@@ -301,7 +485,7 @@ def test_honest_terminal_unpersisted_close_preserves_recovery_disposition():
     assert result.metadata["control_disposition"] == "harness_recovery_required"
 
 
-def test_analysis_facts_missing_gets_one_controller_survey_and_one_final_gate():
+def test_analysis_facts_recovery_still_runs_before_plan_requirement_is_reported():
     class RecoveringGate:
         def __init__(self):
             self.calls = 0
@@ -347,7 +531,9 @@ def test_analysis_facts_missing_gets_one_controller_survey_and_one_final_gate():
 
     result = tool.execute(action="done", outcome="failed", key_results="survey complete")
 
-    assert result.succeeded is True
+    assert result.succeeded is False
+    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_REQUIRED"
+    assert "phase_signal" not in result.metadata
     assert gate.calls == 2
     assert surveys == ["survey"]
     audit = result.metadata["gate_result"]["validated_facts"]["run.analysis_recovery"]

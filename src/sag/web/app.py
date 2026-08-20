@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from sag import __version__
-from sag.trajectory.builder import build_trajectory
+from sag.trajectory.builder import build_trajectory, read_call_envelope
 from sag.trajectory.schema import DETAIL_TIERS
 from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
@@ -238,6 +238,33 @@ def create_app(
         elif since is not None:
             document["turns"] = [turn for turn in document["turns"] if turn["turn_id"] > since]
         return document
+
+    @app.get("/api/sessions/{session_id}/trajectory/envelopes/{envelope_id}")
+    def get_session_trajectory_envelope(session_id: str, envelope_id: str) -> dict:
+        """Resolve the exact parameters for one call already named by a turn."""
+        try:
+            session_dir = builder.session_dir(session_id)
+        except UnattributableSessionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            ) from exc
+
+        try:
+            envelope = read_call_envelope(session_dir, envelope_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session directory is gone: {session_dir}",
+            ) from exc
+        if envelope is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Call envelope not found: {envelope_id}",
+            )
+        return envelope
 
     @app.get("/api/stream/dashboard")
     def stream_dashboard() -> StreamingResponse:

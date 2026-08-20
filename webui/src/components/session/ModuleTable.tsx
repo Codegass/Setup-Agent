@@ -15,9 +15,14 @@ function num(n?: number | null): string {
   return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : "—"
 }
 
-function passRate(p?: number | null, f?: number | null): string {
-  const pass = p ?? 0, fail = f ?? 0, denom = pass + fail
-  return denom > 0 ? `${((pass / denom) * 100).toFixed(1).replace(/\.0$/, "")}%` : "—"
+function passRate(p?: number | null, f?: number | null, e?: number | null): string {
+  if (![p, f, e].every((value) => typeof value === "number" && Number.isFinite(value))) {
+    return "—"
+  }
+  const pass = p as number
+  const denominator = pass + (f as number) + (e as number)
+  if (pass < 0 || denominator <= 0 || pass > denominator) return "—"
+  return `${((pass / denominator) * 100).toFixed(1).replace(/\.0$/, "")}%`
 }
 
 function covColor(rate: number): string {
@@ -70,15 +75,23 @@ function ProgressBar({ rate, color }: { rate: number; color: string }) {
 
 function OverviewRow({ m }: { m: ModuleSummary }) {
   const status = m.buildStatus ?? "unknown"
-  const pass = m.testsPassed ?? 0
-  const total = m.testsTotal ?? pass + (m.testsFailed ?? 0)
-  const fc = m.failingCount ?? 0
+  const pass = m.testsPassed
+  const total = m.testsTotal
+  const negative = typeof m.testsFailed === "number" && typeof m.testsErrors === "number"
+    ? m.testsFailed + m.testsErrors
+    : null
+  const fc = Math.max(m.failingCount ?? 0, negative ?? 0)
   const failing = fc > 0
-  const testRate = total > 0 ? (pass / total) * 100 : 0
+  const hasSafeTestTotal = typeof pass === "number"
+    && typeof total === "number"
+    && total > 0
+    && pass >= 0
+    && pass <= total
+  const testRate = hasSafeTestTotal ? (pass / total) * 100 : 0
   const testColor = failing ? "var(--status-failed)" : "var(--status-success)"
   return (
     <div
-      className="grid items-center gap-3 border-t border-border px-4 py-3"
+      className="grid min-w-[760px] items-center gap-3 border-t border-border px-4 py-3"
       style={{ gridTemplateColumns: "1.5fr 0.8fr 1.3fr 1fr 1fr" }}
     >
       <div className="min-w-0">
@@ -92,11 +105,11 @@ function OverviewRow({ m }: { m: ModuleSummary }) {
         </span>
       </div>
       <div>
-        {total > 0 ? (
+        {hasSafeTestTotal ? (
           <>
             <div className="mb-1.5 flex items-center justify-between font-mono text-[12px] text-muted-foreground">
               <span>{`${pass.toLocaleString()} / ${total.toLocaleString()}`}</span>
-              {failing ? <span className="font-mono text-[11px] text-status-failed">{fc} failing</span> : null}
+              {failing ? <span className="font-mono text-[11px] text-status-failed">{fc} issues</span> : null}
             </div>
             <ProgressBar rate={testRate} color={testColor} />
           </>
@@ -142,7 +155,11 @@ function CoverageBar({ label, rate }: { label: string; rate: number }) {
 
 function failureRank(m: ModuleSummary): number {
   if (m.buildStatus === "failure") return 0
-  if ((m.failingCount ?? 0) > 0) return 1
+  if (
+    (m.failingCount ?? 0) > 0
+    || (m.testsFailed ?? 0) > 0
+    || (m.testsErrors ?? 0) > 0
+  ) return 1
   if (m.buildStatus === "skipped") return 2
   return 3
 }
@@ -159,9 +176,9 @@ export function ModuleTable({
 
   if (variant === "overview") {
     return (
-      <div>
+      <div className="overflow-x-auto">
         <div
-          className="grid gap-3 bg-muted px-4 py-2 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground"
+          className="grid min-w-[760px] gap-3 bg-muted px-4 py-2 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground"
           style={{ gridTemplateColumns: "1.5fr 0.8fr 1.3fr 1fr 1fr" }}
         >
           <div>Module</div>
@@ -178,7 +195,8 @@ export function ModuleTable({
   }
 
   return (
-    <table className="w-full border-collapse">
+    <div className="overflow-x-auto">
+    <table className="w-full min-w-[820px] border-collapse">
       <thead>
         <tr className="border-b border-border font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
           <th className="px-2 py-2 text-left">Module</th>
@@ -193,6 +211,7 @@ export function ModuleTable({
             <>
               <th className="px-2 py-2 text-right">Pass</th>
               <th className="px-2 py-2 text-right">Fail</th>
+              <th className="px-2 py-2 text-right">Errors</th>
               <th className="px-2 py-2 text-right">Skip</th>
               <th className="px-2 py-2 text-left">Rate</th>
               <th className="px-2 py-2 text-left">Coverage</th>
@@ -206,7 +225,10 @@ export function ModuleTable({
           const isOpen = open === m.path
           const depth = m.path === "." ? 0 : m.path.split("/").length - 1
           const failing = m.failingNames ?? []
-          const fc = m.failingCount ?? 0
+          const fc = Math.max(
+            m.failingCount ?? 0,
+            (m.testsFailed ?? 0) + (m.testsErrors ?? 0),
+          )
           const hidden = Math.max(fc - failing.length, 0)
           const errs = m.buildErrorSamples ?? []
           const canExpandTest = variant === "test" && fc > 0
@@ -247,8 +269,9 @@ export function ModuleTable({
                   <>
                     <td className="px-2 py-2 text-right text-status-success">{num(m.testsPassed)}</td>
                     <td className={cn("px-2 py-2 text-right", (m.testsFailed ?? 0) > 0 && "text-status-failed")}>{num(m.testsFailed)}</td>
+                    <td className={cn("px-2 py-2 text-right", (m.testsErrors ?? 0) > 0 && "text-status-failed")}>{num(m.testsErrors)}</td>
                     <td className="px-2 py-2 text-right">{num(m.testsSkipped)}</td>
-                    <td className="px-2 py-2">{passRate(m.testsPassed, m.testsFailed)}</td>
+                    <td className="px-2 py-2">{passRate(m.testsPassed, m.testsFailed, m.testsErrors)}</td>
                     <td className="px-2 py-2" style={{ minWidth: 150 }}>
                       {m.lineRate == null && m.branchRate == null ? (
                         <span className="text-muted-foreground">— not measured</span>
@@ -263,7 +286,7 @@ export function ModuleTable({
                       {canExpandTest ? (
                         <button className="text-status-failed underline decoration-dotted" type="button"
                           onClick={() => setOpen(isOpen ? null : m.path)}>
-                          View {fc} failure{fc > 1 ? "s" : ""}
+                          View {fc} issue{fc > 1 ? "s" : ""}
                           <ChevronDown className={cn("ml-1 inline", isOpen && "rotate-180")} size={12} />
                         </button>
                       ) : <span className="text-muted-foreground">—</span>}
@@ -273,7 +296,7 @@ export function ModuleTable({
               </tr>
               {isOpen ? (
                 <tr className="bg-status-failed-soft/60">
-                  <td colSpan={variant === "build" ? 5 : 7} className="px-3 py-2">
+                  <td colSpan={variant === "build" ? 5 : 8} className="px-3 py-2">
                     <div className="mb-1.5 flex flex-wrap items-center gap-3 font-mono text-[10px] text-muted-foreground">
                       {variant === "test" && failing.length ? (
                         <button
@@ -304,5 +327,6 @@ export function ModuleTable({
         })}
       </tbody>
     </table>
+    </div>
   )
 }

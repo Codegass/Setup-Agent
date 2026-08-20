@@ -239,8 +239,17 @@ describe("TimelineTab", () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockImplementationOnce(() => Promise.resolve(json(doc())))
-      .mockImplementation(() =>
-        Promise.resolve(json(doc({ outputs: { output_1: "bash: mvn: not found" } }))),
+      .mockImplementation((input) =>
+        String(input).includes("/envelopes/")
+          ? Promise.resolve(
+              json({
+                sequence: 1,
+                envelope_id: "envelope-1",
+                tool: "project",
+                exact_params: { action: "clone" },
+              }),
+            )
+          : Promise.resolve(json(doc({ outputs: { output_1: "bash: mvn: not found" } }))),
       )
 
     render(<TimelineTab live={false} sessionId="S1" />)
@@ -249,7 +258,7 @@ describe("TimelineTab", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
     await settle()
 
-    expect(fetchMock).toHaveBeenLastCalledWith("/api/sessions/S1/trajectory?detail=full")
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=full")
     fireEvent.click(screen.getByRole("button", { name: /output_1/ }))
     expect(screen.getByText("bash: mvn: not found")).toBeInTheDocument()
 
@@ -257,7 +266,7 @@ describe("TimelineTab", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
     await settle()
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it("never lets a slow byte read overwrite a newer state of the ledger", async () => {
@@ -282,13 +291,25 @@ describe("TimelineTab", () => {
     })
 
     let landFull = () => {}
+    let summaryReads = 0
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).includes("/envelopes/")) {
+        return Promise.resolve(
+          json({
+            sequence: 1,
+            envelope_id: "envelope-1",
+            tool: "project",
+            exact_params: { action: "clone" },
+          }),
+        )
+      }
       if (String(input).includes("detail=full")) {
         return new Promise<Response>((resolve) => {
           landFull = () => resolve(json(stale))
         })
       }
-      return Promise.resolve(json(fetchMock.mock.calls.length > 1 ? fresh : asItStood))
+      summaryReads += 1
+      return Promise.resolve(json(summaryReads > 1 ? fresh : asItStood))
     })
 
     render(<TimelineTab live sessionId="S1" />)
@@ -297,7 +318,7 @@ describe("TimelineTab", () => {
     // A row is expanded: the full tier is asked for, and does not answer yet.
     fireEvent.click(screen.getByRole("button", { name: /^Turn 1/ }))
     await settle()
-    expect(fetchMock).toHaveBeenLastCalledWith("/api/sessions/S1/trajectory?detail=full")
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/S1/trajectory?detail=full")
 
     // The ledger moves under it, and the poll lands first.
     await settle(5000)
@@ -356,8 +377,8 @@ describe("TimelineTab", () => {
     render(<TimelineTab live={false} sessionId="S1" />)
     await settle()
 
-    expect(screen.getByRole("img", { name: /tokens per turn/i })).toBeInTheDocument()
-    expect(screen.getByRole("img", { name: /duration per turn/i })).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /model-response tokens per turn/i })).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /action duration per turn/i })).toBeInTheDocument()
   })
 
   it("never stacks a poll on a poll that has not answered", async () => {

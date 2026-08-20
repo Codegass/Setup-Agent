@@ -322,14 +322,21 @@ def test_a_sealed_window_resolves_to_the_bytes_the_model_saw(sealed_run):
 
 
 def test_the_windows_bytes_are_stored_once_and_the_order_carries_the_repeat(sealed_run):
-    """Every turn re-sends the system prompt; the store keeps one copy of it."""
+    """Each distinct system-prompt revision is stored once and then reused.
+
+    Provision and Analyze share the base prompt.  The accepted Analyze plan
+    creates one new prompt identity, shared by Build, Test, and Report.
+    """
     records = _model_records(sealed_run)
     first_components = [row["payload"]["window_digest"]["component_refs"][0] for row in records]
     referenced = [
         ref for row in records for ref in row["payload"]["window_digest"]["component_refs"]
     ]
 
-    assert len(set(first_components)) == 1, "the system prompt was stored more than once"
+    assert len(set(first_components)) == 2
+    assert first_components[0] == first_components[1]
+    assert first_components[2] == first_components[3] == first_components[4]
+    assert first_components[1] != first_components[2]
     assert len(referenced) > len(set(referenced)), "no component was reused across turns"
 
 

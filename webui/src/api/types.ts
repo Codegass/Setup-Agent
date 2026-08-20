@@ -1,7 +1,13 @@
 export type Tone = "neutral" | "blue" | "green" | "red" | "amber"
 export type CanonicalVerdict = "success" | "partial" | "failed" | "unknown"
 export type VerdictSource = "snapshot" | "legacy" | "derived"
-export type SnapshotStatus = "valid" | "missing" | "corrupt" | "legacy" | "unavailable"
+export type SnapshotStatus =
+  | "valid"
+  | "missing"
+  | "corrupt"
+  | "untrusted"
+  | "legacy"
+  | "unavailable"
 export type ReportDeliveryStatus = "delivered" | "failed" | "skipped"
 
 export interface DockerSummary {
@@ -184,6 +190,8 @@ export interface ExecutionSessionSummary {
 export interface DashboardResponse {
   docker: DockerSummary
   workspaces: WorkspaceSummary[]
+  readStatus?: "available" | "unavailable"
+  readError?: string | null
 }
 
 export interface EvidenceRecord {
@@ -262,6 +270,7 @@ export interface ExecutionSessionDetail {
   status: string
   entry: string
   start: string
+  finish?: string | null
   duration: string
   outcome: string
   verdict?: VerdictSummary | null
@@ -409,15 +418,23 @@ export interface TrajectorySession {
   wall_clock_seconds?: number | null
 }
 
-/** [B] of the quad: what was asked of the tool. `params_ref` names an envelope
- *  in `control_events.jsonl`, not an output-store handle. */
+/** What was asked of the tool. `params_ref` names a control-ledger envelope,
+ *  not an output-store handle. */
 export interface TrajectoryCall {
   tool: string
   params_ref?: string | null
 }
 
-/** [C] of the quad. `ref` is what the model READ; `evidence_ref` is what the
- *  tool WROTE, when those are not the same bytes. */
+/** Exact call parameters resolved lazily from one control-ledger envelope. */
+export interface TrajectoryEnvelope {
+  sequence: number | null
+  envelope_id: string
+  tool: string
+  exact_params: Record<string, unknown>
+}
+
+/** The tool result. `ref` is what the model read; `evidence_ref` is the raw
+ *  tool output, when those are not the same bytes. */
 export interface TrajectoryObservation {
   ref?: string | null
   evidence_ref?: string | null
@@ -442,7 +459,7 @@ export interface TrajectoryTurn {
   iteration?: number | null
   actor: TrajectoryActor
   window_ref?: string | null
-  /** [A] whole, in render order. A `window_truncated:<n>` entry names a CUT
+  /** Model context in render order. A `window_truncated:<n>` entry names a cut
    *  rather than bytes and resolves to nothing on purpose. */
   window_components?: string[] | null
   call?: TrajectoryCall | null

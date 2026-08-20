@@ -10,8 +10,8 @@ def test_partial_verdict():
     )
     assert v["tone"] == "attention"
     assert "3 of 4 modules" in v["headline"]
-    assert "7 of 1,205 tests failing" in v["headline"]
-    assert "review before promoting" in v["headline"]
+    assert "7 non-passing results of 1,205" in v["headline"]
+    assert "Review before promoting" in v["headline"]
 
 
 def test_success_verdict():
@@ -52,7 +52,7 @@ def test_single_module_phrasing():
         blocker=None,
     )
     assert "module" not in v["headline"].lower() or "modules" not in v["headline"]
-    assert "320 tests passing" in v["headline"]
+    assert "Test run passed with 320 sealed results" in v["headline"]
 
 
 def test_returns_none_when_empty():
@@ -73,5 +73,32 @@ def test_test_errors_are_rendered_as_non_passing():
         verdict_source="snapshot",
     )
 
-    assert "328 of 328 tests failing" in verdict["headline"]
-    assert "tests passing" not in verdict["headline"]
+    assert "328 non-passing results of 328" in verdict["headline"]
+    assert "Test run passed" not in verdict["headline"]
+
+
+def test_partial_build_and_unknown_tests_are_explained():
+    verdict = compose_verdict(
+        build={"state": "partial"},
+        test={"state": "unknown", "pass": 0, "fail": 0, "errors": 0, "total": 0},
+        module_summary=None,
+        outcome="PARTIAL",
+        blocker=None,
+        canonical_verdict="partial",
+        verdict_source="snapshot",
+    )
+
+    assert verdict["tone"] == "attention"
+    assert "Build partially completed" in verdict["headline"]
+    assert "Test result unavailable" in verdict["headline"]
+
+
+def test_unrecognized_derived_outcome_is_not_green():
+    verdict = compose_verdict(
+        build={"state": "unknown"},
+        test={"state": "unknown", "total": 0},
+        module_summary=None,
+        outcome="mystery",
+        blocker=None,
+    )
+    assert verdict["tone"] == "attention"

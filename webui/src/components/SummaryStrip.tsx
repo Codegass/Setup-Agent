@@ -1,4 +1,4 @@
-import type { BuildSummary, WorkspaceSummary } from "@/api/types"
+import type { BuildSummary, EvidenceCountSummary, WorkspaceSummary } from "@/api/types"
 import { Tooltip } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
@@ -9,22 +9,63 @@ interface Rollup {
   total: number
   running: number
   buildSuccess: number
+  buildPartial: number
+  buildFailed: number
+  buildUnavailable: number
   buildKnown: number
   passed: number
+  failed: number
+  errors: number
   executedNonSkip: number
   executed: number
   declared: number
   claimedSubjectWorkspaces: number
+  claimedSubjectMeasured: number
   claimedSubjectUnavailable: number
   claimedSubjectPassed: number
+  claimedSubjectFailed: number
+  claimedSubjectErrors: number
   claimedSubjectExecutedNonSkip: number
   claimedSubjectExecuted: number
+  runResultMeasured: number
   nonVerdictObservations: number
   nonVerdictReportFiles: number
+  nonVerdictIncomplete: boolean
 }
 
 function buildState(build: BuildSummary | string): string {
   return (typeof build === "string" ? build : build.state).trim().toLowerCase()
+}
+
+function isFiniteCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+}
+
+function buildBucket(state: string): "success" | "partial" | "failed" | "unavailable" {
+  if (["success", "green", "passed", "pass"].includes(state)) return "success"
+  if (["partial", "incomplete"].includes(state)) return "partial"
+  if (["failure", "failed", "red"].includes(state)) return "failed"
+  return "unavailable"
+}
+
+function hasMeasuredCounts(counts: EvidenceCountSummary): boolean {
+  const values = [counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped]
+  if (counts.availability === "unavailable" || !values.every(isFiniteCount)) return false
+  return (counts.executed as number) === (
+    (counts.passed as number)
+    + (counts.failed as number)
+    + (counts.errors as number)
+    + (counts.skipped as number)
+  )
+}
+
+function hasSealedRunResult(workspace: WorkspaceSummary): boolean {
+  const state = workspace.test.state.trim().toLowerCase()
+  if (!state || ["none", "unknown", "unavailable", "pending", "not-run", "not_run"].includes(state)) {
+    return false
+  }
+  return [workspace.test.pass, workspace.test.fail, workspace.test.errors ?? 0, workspace.test.skip, workspace.test.total]
+    .every(isFiniteCount)
 }
 
 export function rollup(workspaces: WorkspaceSummary[]): Rollup {
@@ -32,36 +73,56 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
     total: workspaces.length,
     running: 0,
     buildSuccess: 0,
+    buildPartial: 0,
+    buildFailed: 0,
+    buildUnavailable: 0,
     buildKnown: 0,
     passed: 0,
+    failed: 0,
+    errors: 0,
     executedNonSkip: 0,
     executed: 0,
     declared: 0,
     claimedSubjectWorkspaces: 0,
+    claimedSubjectMeasured: 0,
     claimedSubjectUnavailable: 0,
     claimedSubjectPassed: 0,
+    claimedSubjectFailed: 0,
+    claimedSubjectErrors: 0,
     claimedSubjectExecutedNonSkip: 0,
     claimedSubjectExecuted: 0,
+    runResultMeasured: 0,
     nonVerdictObservations: 0,
     nonVerdictReportFiles: 0,
+    nonVerdictIncomplete: false,
   }
   for (const w of workspaces) {
     if (w.docker.status === "running") r.running += 1
-    const state = buildState(w.build)
-    if (state && state !== "none" && state !== "unknown") {
+    const bucket = buildBucket(buildState(w.build))
+    if (bucket === "success") {
       r.buildKnown += 1
-      if (state === "success" || state === "green" || state === "passed") r.buildSuccess += 1
+      r.buildSuccess += 1
+    } else if (bucket === "partial") {
+      r.buildKnown += 1
+      r.buildPartial += 1
+    } else if (bucket === "failed") {
+      r.buildKnown += 1
+      r.buildFailed += 1
+    } else {
+      r.buildUnavailable += 1
     }
     const t = w.test
     const layers = t?.evidenceLayers?.tests
     if (layers) {
       r.claimedSubjectWorkspaces += 1
       const subjects = layers.claimed.latestSubjects
-      const counts = [subjects.executed, subjects.passed, subjects.failed, subjects.errors, subjects.skipped]
-      if (subjects.availability === "unavailable" || !counts.every((value) => typeof value === "number" && Number.isFinite(value))) {
+      if (!hasMeasuredCounts(subjects)) {
         r.claimedSubjectUnavailable += 1
       } else {
+        r.claimedSubjectMeasured += 1
         r.claimedSubjectPassed += subjects.passed as number
+        r.claimedSubjectFailed += subjects.failed as number
+        r.claimedSubjectErrors += subjects.errors as number
         r.claimedSubjectExecutedNonSkip += (subjects.passed as number) + (subjects.failed as number) + (subjects.errors as number)
         r.claimedSubjectExecuted += subjects.executed as number
       }
@@ -70,16 +131,22 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
         layers.unattributedObservations,
         layers.staleObservations,
       ]) {
-        if (typeof observations.executed === "number") {
+        if (isFiniteCount(observations.executed)) {
           r.nonVerdictObservations += observations.executed
+        } else if (observations.availability === "unavailable" || observations.executed == null) {
+          r.nonVerdictIncomplete = true
         }
-        if (typeof observations.reportFileCount === "number") {
+        if (isFiniteCount(observations.reportFileCount)) {
           r.nonVerdictReportFiles += observations.reportFileCount
         }
       }
-    } else if (t && t.total > 0) {
+    }
+    if (t && hasSealedRunResult(w)) {
+      r.runResultMeasured += 1
       r.passed += t.pass
-      // Skips are "not run", not failures — matches SAG's own pass-rate rule.
+      r.failed += t.fail
+      r.errors += t.errors ?? 0
+      // Skips are "not run". Errors are negative run results and stay in the denominator.
       r.executedNonSkip += t.pass + t.fail + (t.errors ?? 0)
       r.executed += t.total
       if (t.declaredTotal && t.declaredTotal > 0) r.declared += t.declaredTotal
@@ -89,8 +156,19 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
 }
 
 function pct(numerator: number, denominator: number): string | null {
-  if (denominator <= 0) return null
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator)) return null
+  if (denominator <= 0 || numerator < 0 || numerator > denominator) return null
   return `${((100 * numerator) / denominator).toFixed(1)}%`
+}
+
+function buildDistribution(r: Rollup): string {
+  const parts = [
+    r.buildSuccess ? `${r.buildSuccess} passed` : null,
+    r.buildPartial ? `${r.buildPartial} partial` : null,
+    r.buildFailed ? `${r.buildFailed} failed` : null,
+    r.buildUnavailable ? `${r.buildUnavailable} unavailable` : null,
+  ].filter(Boolean)
+  return parts.join(" · ") || "Unavailable"
 }
 
 function Stat({
@@ -134,24 +212,19 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
   if (workspaces.length === 0) return null
   const r = rollup(workspaces)
 
-  const buildRate = pct(r.buildSuccess, r.buildKnown)
   const hasEvidenceLayers = r.claimedSubjectWorkspaces > 0
-  const claimedRate = r.claimedSubjectUnavailable === 0
-    ? pct(r.claimedSubjectPassed, r.claimedSubjectExecutedNonSkip)
-    : null
-  const legacyPassRate = pct(r.passed, r.executedNonSkip)
-  const legacyExecRate = pct(r.executed, r.declared)
+  const claimedRate = pct(r.claimedSubjectPassed, r.claimedSubjectExecutedNonSkip)
+  const runPassRate = pct(r.passed, r.executedNonSkip)
+  const executionRate = pct(r.executed, r.declared)
+  const measuredIdentityLabel = `${r.claimedSubjectMeasured} measured workspace${r.claimedSubjectMeasured === 1 ? "" : "s"}`
+  const measuredRunLabel = `${r.runResultMeasured} measured workspace${r.runResultMeasured === 1 ? "" : "s"}`
   const diagnosticValue = r.nonVerdictObservations > 0
-    ? r.nonVerdictObservations.toLocaleString()
-    : `${r.nonVerdictReportFiles.toLocaleString()} files`
-  const claimedSubjectValue = r.claimedSubjectUnavailable > 0
-    ? "Unavailable"
-    : claimedRate ?? "No executions"
-  const claimedSubjectHint = r.claimedSubjectUnavailable > 0
-    ? `${r.claimedSubjectUnavailable} of ${r.claimedSubjectWorkspaces} workspaces lack module-qualified subject counts`
-    : claimedRate === null
-      ? "No non-skipped module-qualified latest subjects were executed"
-      : `${r.claimedSubjectPassed.toLocaleString()} passed of ${r.claimedSubjectExecutedNonSkip.toLocaleString()} module-qualified latest subjects (skips excluded)`
+    ? `${r.nonVerdictObservations.toLocaleString()}${r.nonVerdictIncomplete ? "+" : ""}`
+    : r.nonVerdictIncomplete ? "Incomplete" : `${r.nonVerdictReportFiles.toLocaleString()} files`
+  const identityHint = `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded stable test identities. ${r.total - r.claimedSubjectMeasured} did not.`
+  const diagnosticHint = r.nonVerdictIncomplete
+    ? `At least ${r.nonVerdictObservations.toLocaleString()} diagnostics; some sources were not countable. Excluded from run results.`
+    : `${r.nonVerdictObservations.toLocaleString()} diagnostics${r.nonVerdictReportFiles ? ` across ${r.nonVerdictReportFiles.toLocaleString()} files` : ""}. Excluded from run results.`
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-5 py-2.5 sm:px-6">
@@ -161,51 +234,57 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
       <Stat
         label="Workspaces"
         value={`${r.total}`}
-        hint={`${r.total} workspaces on the dashboard, ${r.running} running`}
+        hint={`${r.total} workspaces on the dashboard, ${r.running} running containers`}
       />
-      {buildRate !== null ? (
-        <Stat
-          label="Build success"
-          value={buildRate}
-          tone={rateTone(buildRate)}
-          hint={`${r.buildSuccess} of ${r.buildKnown} workspaces with a known build state built successfully`}
-        />
-      ) : null}
+      <Stat
+        label="Build states"
+        value={buildDistribution(r)}
+        tone={r.buildFailed || r.buildPartial ? "warn" : r.buildSuccess ? "good" : "neutral"}
+        hint={`${r.buildSuccess} passed, ${r.buildPartial} partial, ${r.buildFailed} failed, and ${r.buildUnavailable} unavailable`}
+      />
       {hasEvidenceLayers ? (
         <Stat
-          label="Claimed subjects"
-          value={claimedSubjectValue}
-          tone={rateTone(claimedRate)}
-          hint={claimedSubjectHint}
-        />
-      ) : legacyPassRate !== null ? (
-        <Stat
-          label="Pass rate"
-          value={legacyPassRate}
-          tone={rateTone(legacyPassRate)}
-          hint={`${r.passed.toLocaleString()} passed of ${r.executedNonSkip.toLocaleString()} executed (pass+fail+errors; skips excluded)`}
+          label="Identity coverage"
+          value={`${r.claimedSubjectMeasured}/${r.total} measured`}
+          tone={r.claimedSubjectMeasured === r.total ? "good" : "warn"}
+          hint={identityHint}
         />
       ) : null}
-      {hasEvidenceLayers && (r.nonVerdictObservations > 0 || r.nonVerdictReportFiles > 0) ? (
+      {hasEvidenceLayers && claimedRate !== null ? (
+        <Stat
+          label="Verified pass rate"
+          value={claimedRate}
+          tone={rateTone(claimedRate)}
+          hint={`${r.claimedSubjectPassed.toLocaleString()} of ${r.claimedSubjectExecutedNonSkip.toLocaleString()} passed across ${measuredIdentityLabel} only; failures and errors are in the denominator`}
+        />
+      ) : null}
+      <Stat
+        label="Run coverage"
+        value={`${r.runResultMeasured}/${r.total} measured`}
+        tone={r.runResultMeasured === r.total ? "good" : "warn"}
+        hint={`${r.runResultMeasured} of ${r.total} workspaces have a sealed run result, including explicit zero-result runs`}
+      />
+      {runPassRate !== null ? (
+        <Stat
+          label="Run pass rate"
+          value={runPassRate}
+          tone={rateTone(runPassRate)}
+          hint={`${r.passed.toLocaleString()} passed, ${r.failed.toLocaleString()} failed, and ${r.errors.toLocaleString()} errors across ${measuredRunLabel} only; skips excluded`}
+        />
+      ) : null}
+      {hasEvidenceLayers && (r.nonVerdictObservations > 0 || r.nonVerdictReportFiles > 0 || r.nonVerdictIncomplete) ? (
         <Stat
           label="Diagnostics"
           value={diagnosticValue}
-          hint={`${r.nonVerdictObservations.toLocaleString()} report observations across ${r.nonVerdictReportFiles.toLocaleString()} files; not verdict-bearing`}
+          hint={diagnosticHint}
         />
       ) : null}
-      {hasEvidenceLayers && legacyPassRate !== null ? (
+      {executionRate !== null ? (
         <Stat
-          label="Legacy tests"
-          value={legacyPassRate}
-          hint="Legacy workspace test aggregates; kept separate from metrics-v2 claimed subjects"
-        />
-      ) : null}
-      {legacyExecRate !== null ? (
-        <Stat
-          label={hasEvidenceLayers ? "Legacy execution" : "Execution rate"}
-          value={legacyExecRate}
-          tone={hasEvidenceLayers ? "neutral" : rateTone(legacyExecRate)}
-          hint={`${r.executed.toLocaleString()} legacy tests executed of ${r.declared.toLocaleString()} declared test methods`}
+          label="Execution coverage"
+          value={executionRate}
+          tone={rateTone(executionRate)}
+          hint={`${r.executed.toLocaleString()} sealed run results of ${r.declared.toLocaleString()} declared test methods`}
         />
       ) : null}
     </div>

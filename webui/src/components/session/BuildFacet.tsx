@@ -24,7 +24,7 @@ function MonoLabel({ children, className }: { children: React.ReactNode; classNa
 }
 
 function KV({ k, v }: { k: string; v?: string | null }) {
-  if (!v || v.trim().toLowerCase() === "unknown") {
+  if (!v || ["unknown", "none", "unavailable", "sealed snapshot", "—", "-"].includes(v.trim().toLowerCase())) {
     return null
   }
   return (
@@ -48,8 +48,11 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
   const norm = build.state.trim().toLowerCase()
   const ok = norm === "success"
   const bad = norm === "failure" || norm === "failed"
+  const partial = norm === "partial"
   const system = build.system ?? build.tool
-  const showBadge = Boolean(system) && system!.trim().toLowerCase() !== "unknown"
+  const normalizedSystem = system?.trim().toLowerCase()
+  const showBadge = Boolean(system)
+    && !["unknown", "sealed snapshot", "—", "-"].includes(normalizedSystem ?? "")
   return (
     <Card className="p-4">
       <div className="flex items-center justify-between gap-3">
@@ -58,13 +61,15 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
             <Check className="text-status-success" size={16} />
           ) : bad ? (
             <X className="text-status-failed" size={16} />
+          ) : partial ? (
+            <Clock className="text-status-attention" size={15} />
           ) : (
             <Clock className="text-muted-foreground" size={15} />
           )}
           {statusMeta(build.state).label}
         </span>
         {showBadge ? (
-          <Badge mono tone={ok ? "green" : bad ? "red" : "neutral"}>
+          <Badge mono tone={ok ? "green" : bad ? "red" : partial ? "amber" : "neutral"}>
             {system}
           </Badge>
         ) : null}
@@ -81,13 +86,24 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
 
 function OutputsCard({ build }: { build: BuildSummary }) {
   const warnings = build.warnings ?? []
+  const outputs = [
+    build.classCount != null ? { label: "classes", value: build.classCount } : null,
+    build.jarCount != null ? { label: "JARs", value: build.jarCount } : null,
+  ].filter((item): item is { label: string; value: number } => item !== null)
   return (
     <Card className="p-4">
       <MonoLabel>Outputs</MonoLabel>
-      <div className="mt-2 grid grid-cols-2 gap-2">
-        <Stat label="classes" value={fmtNum(build.classCount)} />
-        <Stat label="JARs" value={fmtNum(build.jarCount)} />
-      </div>
+      {outputs.length ? (
+        <div className={cn("mt-2 grid gap-2", outputs.length > 1 && "grid-cols-2")}>
+          {outputs.map((output) => (
+            <Stat key={output.label} label={output.label} value={fmtNum(output.value)} />
+          ))}
+        </div>
+      ) : (
+        <p className="mt-2 text-[12px] leading-relaxed text-muted-foreground">
+          Artifact totals were not measured for this run.
+        </p>
+      )}
       {warnings.length ? (
         <div className="mt-3">
           <MonoLabel className="text-status-attention">
@@ -107,8 +123,10 @@ function OutputsCard({ build }: { build: BuildSummary }) {
 export function BuildFacet({ detail }: { detail: ExecutionSessionDetail }) {
   const [open, setOpen] = useState(false)
   const s = detail.moduleSummary
-  const single = s?.singleModule ?? (detail.modules?.length ?? 0) <= 1
-  const moduleCount = s?.modulesTotal ?? detail.modules?.length ?? 0
+  const moduleRecords = detail.modules ?? []
+  const hasModuleMetrics = Boolean(s) || moduleRecords.length > 0
+  const single = s?.singleModule ?? moduleRecords.length === 1
+  const moduleCount = s?.modulesTotal ?? moduleRecords.length
 
   return (
     <div className="space-y-4">
@@ -116,14 +134,20 @@ export function BuildFacet({ detail }: { detail: ExecutionSessionDetail }) {
         <ConclusionCard build={detail.build} />
         <OutputsCard build={detail.build} />
       </div>
-      <button
-        className="font-mono text-[11px] text-status-running hover:underline"
-        onClick={() => setOpen(true)}
-        type="button"
-      >
-        {single ? "View build details →" : `View per-module breakdown (${moduleCount} modules) →`}
-      </button>
-      {open ? (
+      {hasModuleMetrics ? (
+        <button
+          className="font-mono text-[11px] text-status-running hover:underline"
+          onClick={() => setOpen(true)}
+          type="button"
+        >
+          {single ? "View build details →" : `View per-module breakdown (${moduleCount} modules) →`}
+        </button>
+      ) : (
+        <div className="rounded-lg border border-dashed border-border px-3 py-2.5 text-[12px] text-muted-foreground">
+          Detailed module metrics were not produced for this run.
+        </div>
+      )}
+      {open && hasModuleMetrics ? (
         <ModuleBreakdownDialog
           onClose={() => setOpen(false)}
           title={single ? "Build details" : "Per-module build breakdown"}

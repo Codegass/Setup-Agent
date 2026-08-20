@@ -24,7 +24,8 @@ from loguru import logger
 # Result paths mirrored from the container (all under /workspace). `.setup_agent`
 # holds sessions/index.json, contexts/, report_metrics.json, module_metrics.json.
 _ARCHIVE_PATHS = ("/workspace/.setup_agent", "/workspace/.sag_last_comment.json")
-_REPORT_RE = re.compile(r"setup-report-\d{8}-\d{6}\.md")
+_REPORT_RE = re.compile(r"setup-report(?:-\d{8}-\d{6})?\.md")
+_STORE_IDENTITY_FILE = ".evidence-store-identity"
 RUNNING_TTL_SECONDS = 10.0
 
 _last_fetch: dict[str, float] = {}
@@ -61,8 +62,32 @@ def ensure_mirror(
     for path in _ARCHIVE_PATHS:
         _extract(container, path, dest)
     _extract_report(container, dest)
+    _write_store_identity(container, dest)
     _last_fetch[container_name] = now()
     return dest
+
+
+def _write_store_identity(container: Any, dest: Path) -> None:
+    """Persist Docker's host-observed immutable id beside the mirror.
+
+    The mirrored result files are container bytes. Live evidence readers must
+    still prove those bytes came from the store the host control ledger bound
+    to this run, so the reader cannot identify itself by its Python object id.
+    This sidecar is written from the Docker API and is not part of the archive.
+    """
+
+    container_id = str(getattr(container, "id", "") or "").strip()
+    if not container_id:
+        return
+    try:
+        (dest / _STORE_IDENTITY_FILE).write_text(
+            f"docker:{container_id}\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        # A missing identity makes authority checks fail closed. The mirror is
+        # still useful for non-authoritative context, logs, and trajectories.
+        logger.debug("mirror store identity write failed for {}: {}", dest, exc)
 
 
 class _ChunkReader(io.RawIOBase):
@@ -102,17 +127,20 @@ def _extract(container: Any, container_path: str, dest: Path) -> None:
 
 
 def _extract_report(container: Any, dest: Path) -> None:
-    """The setup-report-<ts>.md name isn't derivable, but its path is recorded in
-    the trunk context we just mirrored. Grep it out, fetch that exact file."""
+    """Fetch reports named by any JSON context, with the generic report as fallback.
+
+    A completed run can record its report only in ``phase_report.json`` rather
+    than the trunk.  The generic ``setup-report.md`` name is also still emitted
+    by older report flows, so try it even when no context names it.
+    """
     contexts = dest / ".setup_agent" / "contexts"
-    if not contexts.is_dir():
-        return
-    names: set[str] = set()
-    for f in contexts.glob("trunk*.json"):
-        try:
-            names.update(_REPORT_RE.findall(f.read_text(encoding="utf-8", errors="ignore")))
-        except OSError:
-            continue
+    names: set[str] = {"setup-report.md"}
+    if contexts.is_dir():
+        for f in contexts.rglob("*.json"):
+            try:
+                names.update(_REPORT_RE.findall(f.read_text(encoding="utf-8", errors="ignore")))
+            except OSError:
+                continue
     for name in names:
         _extract(container, f"/workspace/{name}", dest)
 
@@ -130,14 +158,58 @@ class MirrorReader:
     def __init__(self, mirror: Path):
         self.mirror = mirror
 
+    def evidence_store_identity(self) -> str:
+        """Return the immutable store identity observed by the host mirror."""
+
+        try:
+            value = (self.mirror / _STORE_IDENTITY_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        return value if value.startswith("docker:") and len(value) > len("docker:") else ""
+
     def execute_command(self, command: str, timeout: int | None = None, **_: Any) -> dict[str, Any]:
+        if command.startswith("file="):
+            return self._named_json_file_stream(command)
         if command.startswith("cat "):
             return self._cat(command)
         if "setup-report-*.md" in command:
-            return self._latest_report()
+            return self._latest_timestamped_report()
+        if "setup-report.md" in command:
+            return self._generic_report()
         if "/contexts" in command and command.startswith("find "):
             return self._context_files()
         return {"output": "", "exit_code": 1, "success": False}
+
+    def _named_json_file_stream(self, command: str) -> dict[str, Any]:
+        """Answer the exact bounded transport used by live artifact readers."""
+
+        from sag.agent.evidence_records import (
+            frame_named_json_record_stream,
+            named_json_file_stream_command,
+        )
+
+        assignment, separator, _ = command.partition("; count=0;")
+        if not separator or not assignment.startswith("file="):
+            return {"output": "", "exit_code": 1, "success": False}
+        try:
+            paths = shlex.split(assignment.removeprefix("file="))
+        except ValueError:
+            return {"output": "", "exit_code": 1, "success": False}
+        if len(paths) != 1 or command != named_json_file_stream_command(paths[0]):
+            return {"output": "", "exit_code": 1, "success": False}
+
+        target = self._host(paths[0])
+        records: list[tuple[str, bytes]] = []
+        if target.is_file():
+            try:
+                records.append((target.name, target.read_bytes()))
+            except OSError:
+                return {"output": "", "exit_code": 1, "success": False}
+        return {
+            "output": frame_named_json_record_stream(records),
+            "exit_code": 0,
+            "success": True,
+        }
 
     def _host(self, container_path: str) -> Path:
         return self.mirror / container_path.removeprefix("/workspace/").lstrip("/")
@@ -153,9 +225,14 @@ class MirrorReader:
                 pass
         return {"output": "", "exit_code": 1, "success": False}
 
-    def _latest_report(self) -> dict[str, Any]:
+    def _latest_timestamped_report(self) -> dict[str, Any]:
         reports = sorted(self.mirror.glob("setup-report-*.md"))
         out = f"/workspace/{reports[-1].name}" if reports else ""
+        return {"output": out, "exit_code": 0, "success": True}
+
+    def _generic_report(self) -> dict[str, Any]:
+        report = self.mirror / "setup-report.md"
+        out = "/workspace/setup-report.md" if report.is_file() else ""
         return {"output": out, "exit_code": 0, "success": True}
 
     def _context_files(self) -> dict[str, Any]:

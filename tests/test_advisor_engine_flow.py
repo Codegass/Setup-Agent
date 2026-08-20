@@ -31,9 +31,14 @@ import sag.agent.native_messages as native_messages
 from sag.agent.advisor import AdvisorTool
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.output_storage import OutputStorageManager
-from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState, claim_identity
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.phase_transitions import PhaseTransitionPolicy
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    canonical_authored_plan_sha256,
+    seal_project_execution_plan,
+)
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
@@ -42,13 +47,61 @@ from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.tools.base import BaseTool, ToolResult
 
+ADVICE = "The provider is below the declared floor; install it, then retry the root install."
+
+_ADVISOR_PLAN_PAYLOAD = {
+    "summary": "Compile the project, then run its tests.",
+    "documents_reviewed": [
+        {
+            "path": "/workspace/project/README.md",
+            "reason": "The fixture treats this as the reviewed command source.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "build_steps": [
+        {
+            "tool": "build",
+            "params": {"action": "compile"},
+            "purpose": "Compile the scripted project.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "build_success_criteria": ["The scripted build action completes."],
+    "test_steps": [
+        {
+            "tool": "build",
+            "params": {"action": "test"},
+            "purpose": "Run the scripted project tests.",
+            "evidence_refs": ["output_advisor_fixture"],
+        }
+    ],
+    "test_success_criteria": ["The scripted test action completes."],
+}
+_ADVISOR_PLAN_SHA256 = canonical_authored_plan_sha256(_ADVISOR_PLAN_PAYLOAD)
+_ADVISOR_ANALYZE_CLAIM = PhaseClaim(
+    phase="analyze",
+    signal="done",
+    claimed_outcome=PhaseOutcome.SUCCESS,
+    key_results="analyze finished",
+    execution_plan_sha256=_ADVISOR_PLAN_SHA256,
+    execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+)
+_SEALED_ADVISOR_TEST_PLAN = seal_project_execution_plan(
+    _ADVISOR_PLAN_PAYLOAD,
+    source_attempt_id="analyze-1",
+    claim_sha256=claim_identity(_ADVISOR_ANALYZE_CLAIM),
+)
+
 _PHASE_FACTS = {
     "provision": {"provision.workspace_ready": True},
-    "analyze": {"analysis.build_entry_ready": True},
+    "analyze": {
+        "analysis.build_entry_ready": True,
+        "analysis.execution_plan_sealed": True,
+        "analysis.execution_plan_sha256": _SEALED_ADVISOR_TEST_PLAN.authored_plan_sha256,
+        "analysis.execution_plan_source_attempt_id": "analyze-1",
+    },
     "build": {"build.test_entry_ready": True},
 }
-
-ADVICE = "The provider is below the declared floor; install it, then retry the root install."
 
 _VALIDATOR_STATES = {
     PhaseOutcome.SUCCESS: ValidatorState.GREEN,
@@ -80,6 +133,10 @@ class _PhaseTool(BaseTool):
             claimed_outcome=claimed,
             key_results=key_results or f"{phase} finished",
             reason=reason,
+            execution_plan_sha256=(
+                _SEALED_ADVISOR_TEST_PLAN.authored_plan_sha256 if phase == "analyze" else ""
+            ),
+            execution_plan_ref=(PROJECT_EXECUTION_PLAN_PATH if phase == "analyze" else ""),
         )
         gate = GateResult(
             accepted=True,
@@ -240,6 +297,8 @@ def _engine(tmp_path, *, advisor_mode="same-model", max_iterations=20):
     engine.loop_memory = None
     engine.output_storage = OutputStorageManager(tmp_path / "contexts")
     engine.orchestrator = None
+    engine._sealed_execution_plan_cache = _SEALED_ADVISOR_TEST_PLAN
+    engine._finalize_analyze_execution_plan = lambda _claim, delivered, _metadata: delivered
     engine.successful_states = {}
     engine.recent_tool_executions = []
     engine.steps_since_context_switch = 0

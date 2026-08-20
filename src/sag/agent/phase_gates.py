@@ -1041,6 +1041,7 @@ def check_phase_claim(
     *,
     sealed: bool = False,
     disclosed_job_ids: Iterable[str] = (),
+    expected_analysis_attempt_id: str | None = None,
 ) -> GateResult:
     """Inspect physical evidence and validate one terminal phase claim.
 
@@ -1061,6 +1062,7 @@ def check_phase_claim(
         project_name,
         sealed=sealed,
         disclosed_job_ids=disclosed_job_ids,
+        expected_analysis_attempt_id=expected_analysis_attempt_id,
     )
     return validate_phase_claim(
         claim,
@@ -1083,6 +1085,7 @@ def check_phase_done(
     *,
     sealed: bool = False,
     disclosed_job_ids: Iterable[str] = (),
+    expected_analysis_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Read-only compatibility projection for engine nudges during WS3.
 
@@ -1107,6 +1110,7 @@ def check_phase_done(
         project_name,
         sealed=sealed,
         disclosed_job_ids=disclosed_job_ids,
+        expected_analysis_attempt_id=expected_analysis_attempt_id,
     )
     state, reason = settled_observation(
         observation.state, observation.reason, observation.validated_facts
@@ -1312,6 +1316,7 @@ def _inspect_phase(
     *,
     sealed: bool = False,
     disclosed_job_ids: Iterable[str] = (),
+    expected_analysis_attempt_id: str | None = None,
 ) -> _ValidatorObservation:
     jobs = _settle_before_grading(
         orchestrator,
@@ -1338,7 +1343,21 @@ def _inspect_phase(
             blocker_owner=BlockerOwner.HARNESS,
         )
 
-    observation = _inspect_phase_evidence(phase, validator, orchestrator, project_name)
+    if phase == "analyze":
+        observation = _inspect_phase_evidence(
+            phase,
+            validator,
+            orchestrator,
+            project_name,
+            expected_analysis_attempt_id=expected_analysis_attempt_id,
+        )
+    else:
+        observation = _inspect_phase_evidence(
+            phase,
+            validator,
+            orchestrator,
+            project_name,
+        )
     if not jobs.terminal_unpersisted:
         if not jobs.disclosed_job_ids:
             return observation
@@ -1399,12 +1418,24 @@ def _inspect_phase(
     )
 
 
-def _inspect_phase_evidence(phase, validator, orchestrator, project_name) -> _ValidatorObservation:
+def _inspect_phase_evidence(
+    phase,
+    validator,
+    orchestrator,
+    project_name,
+    *,
+    expected_analysis_attempt_id: str | None = None,
+) -> _ValidatorObservation:
     try:
         if phase == "provision":
             return _inspect_provision(orchestrator, project_name)
         if phase == "analyze":
-            return _inspect_analyze(validator, project_name)
+            return _inspect_analyze(
+                validator,
+                project_name,
+                orchestrator,
+                expected_attempt_id=expected_analysis_attempt_id,
+            )
         if phase == "build":
             return _inspect_build(validator, project_name, orchestrator=orchestrator)
         if phase == "test":
@@ -2128,7 +2159,13 @@ def _live_receipt_scope(validator, orchestrator, requirements=None):
     )
 
 
-def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
+def _inspect_analyze(
+    validator,
+    project_name,
+    orchestrator=None,
+    *,
+    expected_attempt_id: str | None = None,
+) -> _ValidatorObservation:
     method = getattr(validator, "validate_project_analysis_status", None)
     if method is None:
         return _ValidatorObservation(
@@ -2167,18 +2204,61 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
     if not isinstance(analysis_status_facts, Mapping):
         analysis_status_facts = {}
     harness_failure = analysis_code in _ANALYSIS_HARNESS_FAILURE_CODES
+    plan_ready = False
+    plan_present = False
+    plan_ref = ""
+    plan_sha256 = ""
+    plan_source_attempt_id = ""
+    plan_error = ""
+    try:
+        from .project_execution_plan import (
+            PROJECT_EXECUTION_PLAN_PATH,
+            read_sealed_project_execution_plan,
+        )
+
+        artifact = read_sealed_project_execution_plan(orchestrator)
+        if artifact is not None:
+            plan_present = True
+            plan_ref = PROJECT_EXECUTION_PLAN_PATH
+            plan_sha256 = artifact.authored_plan_sha256
+            plan_source_attempt_id = artifact.source_attempt_id
+            expected = str(expected_attempt_id or "").strip()
+            plan_ready = bool(expected and plan_source_attempt_id == expected)
+            if expected and not plan_ready:
+                plan_error = (
+                    "sealed execution plan belongs to "
+                    f"{plan_source_attempt_id!r}, not current Analyze attempt {expected!r}"
+                )
+    except Exception as exc:
+        # Survey truth remains independently gradable.  The missing/corrupt
+        # plan only withholds entry into Build; a fresh model-authored candidate
+        # may still be submitted and atomically replace it on this attempt.
+        plan_error = str(exc)[:1000]
+    survey_ready = state in {ValidatorState.GREEN, ValidatorState.PARTIAL}
+    evidence_refs = list(_status_refs(status))
+    if plan_ref:
+        evidence_refs.append(plan_ref)
     return _ValidatorObservation(
         state,
         reason=projected_reason
         or status.get("reason")
         or "project analysis validator returned no conclusion",
-        evidence_refs=_status_refs(status),
+        evidence_refs=tuple(dict.fromkeys(evidence_refs)),
         suggestions=projected_suggestions,
         code=analysis_code or f"analysis_{state.value}",
         validated_facts={
-            "analysis.build_entry_ready": state in {ValidatorState.GREEN, ValidatorState.PARTIAL},
+            "analysis.build_entry_ready": survey_ready and plan_ready,
             "analysis.status_code": analysis_code or None,
             "analysis.status_facts": dict(analysis_status_facts),
+            "analysis.execution_plan_sealed": plan_ready,
+            "analysis.execution_plan_artifact_present": plan_present,
+            "analysis.execution_plan_ref": plan_ref or None,
+            "analysis.execution_plan_sha256": plan_sha256 or None,
+            "analysis.execution_plan_source_attempt_id": plan_source_attempt_id or None,
+            "analysis.execution_plan_expected_attempt_id": (
+                str(expected_attempt_id or "").strip() or None
+            ),
+            **({"analysis.execution_plan_error": plan_error} if plan_error else {}),
         },
         control_disposition=(
             GateControlDisposition.HARNESS_RECOVERY_REQUIRED

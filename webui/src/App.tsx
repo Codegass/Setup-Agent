@@ -154,6 +154,8 @@ export function App() {
   const selectedWorkspace =
     dashboard?.workspaces.find((w) => w.id === selectedWorkspaceId) ?? null
   const sessionId = selectedSessionId ?? selectedWorkspace?.latestSession ?? undefined
+  const dashboardReady = dashboard !== null
+  const selectedSessionStatus = sessionId ? sessionDetails[sessionId]?.status : undefined
 
   // Auto-select the first attention-first workspace once the dashboard loads.
   // Guard on the resolved workspace (not the raw id) so that if the current
@@ -168,25 +170,27 @@ export function App() {
   }, [dashboard, selectedWorkspace])
 
   useEffect(() => {
-    if (!dashboard || !sessionId) {
+    if (!dashboardReady || !sessionId) {
       return
     }
     void ensureSessionDetail(sessionId)
-  }, [dashboard, ensureSessionDetail, sessionId])
+  }, [dashboardReady, ensureSessionDetail, sessionId])
 
   useEffect(() => {
     if (!sessionId) {
       return
     }
-    const detail = sessionDetails[sessionId]
-    if (detail && !isLiveSessionStatus(detail.status)) {
-      return
-    }
+    // Completed sessions can receive report/metrics mirror files shortly after
+    // the terminal status is written. Keep a slower refresh so those late
+    // artifacts replace an earlier "Unavailable" without a full page reload.
+    const delay = selectedSessionStatus && !isLiveSessionStatus(selectedSessionStatus)
+      ? DASHBOARD_POLL_MS
+      : SESSION_DETAIL_POLL_MS
     const interval = window.setInterval(() => {
       void ensureSessionDetail(sessionId, { silent: true })
-    }, SESSION_DETAIL_POLL_MS)
+    }, delay)
     return () => window.clearInterval(interval)
-  }, [ensureSessionDetail, sessionId, sessionDetails])
+  }, [ensureSessionDetail, selectedSessionStatus, sessionId])
 
   // Esc closes the mobile rail drawer.
   useEffect(() => {

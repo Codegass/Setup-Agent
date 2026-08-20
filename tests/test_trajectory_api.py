@@ -124,6 +124,39 @@ def test_the_endpoint_serves_the_document_the_replay_derives(tmp_path):
     assert response.json() == build_trajectory(session_dir).model_dump(mode="json")
 
 
+def test_one_call_envelope_exposes_its_exact_parameters_on_demand(tmp_path):
+    logs, _, mirror = _mount(tmp_path)
+    session = _session_id("kafka")
+
+    response = _client(logs, mirror).get(
+        f"/api/sessions/{session}/trajectory/envelopes/envelope-000003"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "sequence": 3,
+        "envelope_id": "envelope-000003",
+        "tool": "project",
+        "exact_params": {
+            "action": "clone",
+            "ref": "4.3.1",
+            "repo_url": "https://github.com/apache/kafka.git",
+        },
+    }
+
+
+def test_a_missing_call_envelope_is_a_404(tmp_path):
+    logs, _, mirror = _mount(tmp_path)
+    session = _session_id("kafka")
+
+    response = _client(logs, mirror).get(
+        f"/api/sessions/{session}/trajectory/envelopes/envelope-missing"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Call envelope not found: envelope-missing"
+
+
 def test_a_since_cut_returns_only_the_turns_after_it(tmp_path):
     """The cut is over TURNS, and over nothing else.
 

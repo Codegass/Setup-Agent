@@ -1,6 +1,6 @@
 import type { TrajectoryDocument } from "@/api/types"
 import type { SparkColumn } from "@/lib/trajectory"
-import { formatDuration, formatTokens, seriesPeak, sparkColumns } from "@/lib/trajectory"
+import { formatDuration, formatTokens, sparkColumns } from "@/lib/trajectory"
 
 /** One column per turn, wide enough to be a target and thin enough to be a spark. */
 const COLUMN = 6
@@ -22,6 +22,7 @@ const BASELINE = 1.5
 interface Series {
   key: string
   label: string
+  detail: string
   /** The value this series reads off a column, or null when none was stated. */
   value: (column: SparkColumn) => number | null
   /** How a value is spoken, in the axis label and in a column's own title. */
@@ -44,14 +45,16 @@ const INK = "fill-primary"
 const SERIES: Series[] = [
   {
     key: "tokens",
-    label: "tokens per turn",
+    label: "Model-response tokens per turn",
+    detail: "Input plus output tokens attributed to this turn",
     value: (column) => column.tokens,
     format: formatTokens,
     unstated: "no tokens stated",
   },
   {
     key: "duration",
-    label: "duration per turn",
+    label: "Action duration per turn",
+    detail: "Elapsed wall time recorded for this turn",
     value: (column) => column.durationMs,
     format: formatDuration,
     unstated: "no duration stated",
@@ -63,68 +66,89 @@ function exact(series: Series, value: number): string {
   return series.key === "tokens" ? `${value.toLocaleString("en-US")} tokens` : formatDuration(value)
 }
 
+function peakColumn(
+  columns: SparkColumn[],
+  pick: (column: SparkColumn) => number | null,
+): { column: SparkColumn; value: number } | null {
+  let peak: { column: SparkColumn; value: number } | null = null
+  for (const column of columns) {
+    const value = pick(column)
+    if (value != null && (peak === null || value > peak.value)) {
+      peak = { column, value }
+    }
+  }
+  return peak
+}
+
 function Plot({ columns, series }: { columns: SparkColumn[]; series: Series }) {
-  const peak = seriesPeak(columns, series.value)
+  const peak = peakColumn(columns, series.value)
+  const peakValue = peak?.value ?? null
   const width = Math.max(columns.length * PITCH - GAP, 1)
 
   return (
-    <div className="flex items-end gap-2">
-      <svg
-        aria-label={series.label}
-        className="shrink-0"
-        height={PLOT}
-        role="img"
-        viewBox={`0 0 ${width} ${PLOT}`}
-        width={width}
-      >
-        {columns.map((column, index) => {
-          const value = series.value(column)
-          const x = index * PITCH
-          if (value == null || peak == null) {
-            // An absence is drawn as an absence. A zero-height bar would be a
-            // turn that cost nothing, which is a different fact.
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="text-[11px] font-semibold text-foreground">{series.label}</span>
+        <span className="text-[10.5px] text-muted-foreground">{series.detail}</span>
+      </div>
+      <div className="flex items-end gap-2">
+        <svg
+          aria-label={series.label}
+          className="shrink-0"
+          height={PLOT}
+          role="img"
+          viewBox={`0 0 ${width} ${PLOT}`}
+          width={width}
+        >
+          {columns.map((column, index) => {
+            const value = series.value(column)
+            const x = index * PITCH
+            if (value == null || peakValue == null) {
+              // An absence is drawn as an absence. A zero-height bar would be a
+              // turn that cost nothing, which is a different fact.
+              return (
+                <rect
+                  className="fill-muted-foreground/35"
+                  height={BASELINE}
+                  key={column.turnId}
+                  width={COLUMN}
+                  x={x}
+                  y={PLOT - BASELINE}
+                >
+                  <title>{`turn ${column.turnId} · ${series.unstated}`}</title>
+                </rect>
+              )
+            }
+            // A peak of zero is a series every column of which stated zero. A
+            // stated value keeps a visible baseline and its title supplies the
+            // exact value.
+            const height =
+              peakValue > 0 ? Math.max(BASELINE, (value / peakValue) * PLOT) : BASELINE
             return (
               <rect
-                className="fill-muted-foreground/35"
-                height={BASELINE}
+                className={INK}
+                height={height}
                 key={column.turnId}
+                rx={1.5}
                 width={COLUMN}
                 x={x}
-                y={PLOT - BASELINE}
+                y={PLOT - height}
               >
-                <title>{`turn ${column.turnId} · ${series.unstated}`}</title>
+                <title>{`turn ${column.turnId} · ${exact(series, value)}`}</title>
               </rect>
             )
-          }
-          // A peak of zero is a series every column of which stated zero — a
-          // run of cached turns, two stamps in the same millisecond. There is
-          // no scale to draw against, and dividing by it wrote NaN into the
-          // geometry, which is a plot that silently disappears. Every stated
-          // value gets the baseline instead: the ink says a value exists, and
-          // its own title says what it was.
-          const height = peak > 0 ? Math.max(BASELINE, (value / peak) * PLOT) : BASELINE
-          return (
-            <rect
-              className={INK}
-              height={height}
-              key={column.turnId}
-              rx={1.5}
-              width={COLUMN}
-              x={x}
-              y={PLOT - height}
-            >
-              <title>{`turn ${column.turnId} · ${exact(series, value)}`}</title>
-            </rect>
-          )
-        })}
-      </svg>
-      <div className="flex min-w-0 flex-col leading-tight">
-        <span className="font-mono text-[10.5px] text-foreground">
-          {peak == null ? "—" : series.format(peak)}
-        </span>
-        <span className="text-[10px] uppercase tracking-[0.06em] text-muted-foreground">
-          {`peak ${series.key}`}
-        </span>
+          })}
+        </svg>
+        <div className="flex min-w-0 flex-col leading-tight">
+          <span className="font-mono text-[10.5px] text-foreground">
+            {peakValue == null ? "—" : series.format(peakValue)}
+          </span>
+          <span className="whitespace-nowrap text-[10px] text-muted-foreground">
+            {peak
+              ? `Max at Turn ${peak.column.turnId}${peak.column.tool ? ` · ${peak.column.tool}` : ""}`
+              : `No ${series.key} stated`}
+          </span>
+        </div>
       </div>
     </div>
   )
@@ -167,7 +191,7 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
         ) : null}
         {billed ? null : (
           <span className="text-[10.5px] text-muted-foreground">
-            no turn has been billed yet — the token ledger lands when the loop exits
+            no turn has been billed yet; the token ledger lands when the loop exits
           </span>
         )}
       </figcaption>
@@ -211,6 +235,10 @@ export function TurnSparkline({ doc }: { doc: TrajectoryDocument }) {
           ))}
         </div>
       </div>
+      <p className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">
+        Blue columns are stated values. Gray ticks mean no value is attributed to that turn.
+        Tokens are recorded once per model response; duration is elapsed time for the turn.
+      </p>
     </figure>
   )
 }

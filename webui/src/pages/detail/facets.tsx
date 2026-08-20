@@ -29,11 +29,17 @@ function nonZero(n: number | null | undefined): number | null {
   return typeof n === "number" && n > 0 ? n : null
 }
 
+function testIssues(d: ExecutionSessionDetail): number | null {
+  const failed = Number.isFinite(d.test.fail) ? d.test.fail : 0
+  const errors = Number.isFinite(d.test.errors) ? d.test.errors ?? 0 : 0
+  return nonZero(failed + errors)
+}
+
 /** Nav/section metadata for the detail pane (order matters; bodies render via <FacetBody>). */
 export function buildDetailFacets(d: ExecutionSessionDetail): FacetMeta[] {
   return [
     { id: "build", label: "Build", icon: Box, count: null, countTone: "neutral" },
-    { id: "test", label: "Test", icon: Activity, count: nonZero(d.test.fail), countTone: "red" },
+    { id: "test", label: "Test", icon: Activity, count: testIssues(d), countTone: "red" },
     { id: "flow", label: "Flow", icon: Layers, count: null, countTone: "neutral" },
     { id: "evidence", label: "Evidence", icon: Sparkles, count: nonZero(d.evidence.length), countTone: "neutral" },
     { id: "files", label: "Files", icon: FileText, count: nonZero(d.files?.items.length), countTone: "neutral" },
@@ -117,7 +123,7 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
     tabs.push({ id: "flow", label: "Flow" })
   }
 
-  const failing = nonZero(d.test.fail)
+  const failing = testIssues(d)
   tabs.push({
     id: "tests",
     label: "Tests",

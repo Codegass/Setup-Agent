@@ -798,6 +798,7 @@ class ExecutionSessionDetail(WebModel):
     )
     entry: str
     start: str
+    finish: str | None = None
     duration: str
     outcome: str
     build: BuildSummary
@@ -852,3 +853,5 @@ class TerminalConnectionState(WebModel):
 class DashboardResponse(WebModel):
     docker: DockerSummary
     workspaces: list[WorkspaceSummary]
+    read_status: str = Field(default="available", serialization_alias="readStatus")
+    read_error: str | None = Field(default=None, serialization_alias="readError")

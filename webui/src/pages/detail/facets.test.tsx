@@ -54,6 +54,18 @@ describe("buildDetailFacets", () => {
     expect(byId.files.count).toBe(1)
     expect(byId.build.count).toBeNull()
   })
+
+  it("includes test errors in attention counts", () => {
+    const facets = buildDetailFacets(
+      detail({ test: { state: "partial", pass: 10, fail: 2, errors: 3, skip: 0, total: 15 } }),
+    )
+    const tabs = buildDetailTabs(
+      detail({ test: { state: "partial", pass: 10, fail: 2, errors: 3, skip: 0, total: 15 } }),
+    )
+
+    expect(facets.find((facet) => facet.id === "test")?.count).toBe(5)
+    expect(tabs.find((tab) => tab.id === "tests")?.count).toBe(5)
+  })
 })
 
 describe("buildDetailTabs", () => {

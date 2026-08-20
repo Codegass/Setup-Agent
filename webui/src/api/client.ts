@@ -10,6 +10,7 @@ import type {
   SystemSummary,
   TrajectoryDetail,
   TrajectoryDocument,
+  TrajectoryEnvelope,
 } from "./types"
 
 /**
@@ -88,6 +89,16 @@ export function fetchTrajectory(
 
   return getJson<TrajectoryDocument>(
     `/api/sessions/${encodeURIComponent(sessionId)}/trajectory?${query.toString()}`,
+  )
+}
+
+/** Resolve the exact parameters for one call named by a trajectory turn. */
+export function fetchTrajectoryEnvelope(
+  sessionId: string,
+  envelopeId: string,
+): Promise<TrajectoryEnvelope> {
+  return getJson<TrajectoryEnvelope>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/trajectory/envelopes/${encodeURIComponent(envelopeId)}`,
   )
 }
 

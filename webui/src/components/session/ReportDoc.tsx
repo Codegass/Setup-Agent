@@ -31,6 +31,9 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
       />
       <div className="px-6 py-5">
         <div className="mx-auto max-w-[68ch] space-y-3">
+          <div className="rounded-md border border-status-attention-border bg-status-attention-soft px-3 py-2.5 text-[12.5px] leading-relaxed text-status-attention">
+            This generated report is preserved for context. When its numbers differ from the sealed Overview or Tests summary, use the sealed summary.
+          </div>
           {doc.blocks.map((block, index) => (
             <ReportBlock block={block} key={index} />
           ))}
@@ -78,13 +81,27 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
   }
 
   if (type === "status") {
-    const ok = Boolean(block.ok)
+    const explicitTone = typeof block.tone === "string" ? block.tone.toLowerCase() : ""
+    const normalized = text.toLowerCase()
+    const tone = explicitTone === "success" || explicitTone === "green" || block.ok === true
+      ? "success"
+      : explicitTone === "failed" || explicitTone === "failure" || explicitTone === "red"
+          || /\b(failed|failure|error)\b/.test(normalized)
+        ? "failed"
+        : /\b(partial|unknown|incomplete|unavailable)\b/.test(normalized)
+          ? "attention"
+          : "neutral"
+    const toneClass = tone === "success"
+      ? "border-status-success-border bg-status-success-soft text-status-success"
+      : tone === "failed"
+        ? "border-status-failed-border bg-status-failed-soft text-status-failed"
+        : tone === "attention"
+          ? "border-status-attention-border bg-status-attention-soft text-status-attention"
+          : "border-border bg-muted text-muted-foreground"
 
     return (
       <div
-        className={`flex items-center gap-2 rounded-md border px-3 py-2 text-[13px] ${
-          ok ? "border-status-success-border bg-status-success-soft text-status-success" : "border-status-failed-border bg-status-failed-soft text-status-failed"
-        }`}
+        className={`flex items-center gap-2 rounded-md border px-3 py-2 text-[13px] ${toneClass}`}
       >
         {text}
       </div>
@@ -108,8 +125,8 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
     const rows = block.rows.filter((row): row is unknown[] => Array.isArray(row))
 
     return (
-      <div className="overflow-hidden rounded-md border border-border">
-        <table className="w-full border-collapse text-[13px]">
+      <div className="overflow-x-auto rounded-md border border-border">
+        <table className="w-full min-w-[480px] border-collapse text-[13px]">
           <tbody className="divide-y divide-border">
             {rows.map((row, index) => (
               <tr key={index} className="bg-card">

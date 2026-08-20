@@ -1,7 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
+import type { DashboardResponse, EvidenceLayerProjectionSummary, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
 import { WorkspaceRail } from "./WorkspaceRail"
 
 function queueItem(overrides: Partial<LaunchQueueItem>): LaunchQueueItem {
@@ -29,7 +29,7 @@ function ws(overrides: Partial<WorkspaceSummary>): WorkspaceSummary {
   }
 }
 
-function evidenceLayers() {
+function evidenceLayers(): EvidenceLayerProjectionSummary {
   const unavailable = {
     executed: null, passed: null, failed: null, errors: null, skipped: null,
     availability: "unavailable" as const, reason: "module-qualified subject identity unavailable",
@@ -85,7 +85,7 @@ describe("WorkspaceRail", () => {
     expect(screen.getByRole("button", { name: /owner\/broken/ })).toHaveAttribute("aria-current", "false")
   })
 
-  it("does not render legacy 2/2 as a green test bar when subject identity is unavailable", () => {
+  it("shows sealed run results while explaining unavailable identity attribution", () => {
     const modern = ws({
       id: "sag-ignite",
       project: "apache/ignite",
@@ -102,9 +102,80 @@ describe("WorkspaceRail", () => {
       />,
     )
 
-    expect(screen.queryByRole("img", { name: /2 passed, 0 failed, 2 total/i })).not.toBeInTheDocument()
-    expect(screen.getByLabelText(/claimed latest subjects unavailable/i)).toBeInTheDocument()
-    expect(screen.getByLabelText(/2,887 quarantined observations.*not verdict-bearing/i)).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /2 passed, 0 failed, 2 total/i })).toBeInTheDocument()
+    expect(screen.getByText(/sealed run: 2 passed/i)).toBeInTheDocument()
+    expect(screen.getByText(/stable module and test identities unavailable/i)).toBeInTheDocument()
+    expect(screen.getAllByText(/2,887 additional diagnostics.*excluded from the sealed run result/i).length).toBeGreaterThan(0)
+  })
+
+  it("shows partial builds as partial and labels running workspace counts as containers", () => {
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{
+          ...data,
+          workspaces: [ws({ build: { state: "partial", tool: "Maven", time: "", note: "" } })],
+        }}
+      />,
+    )
+
+    expect(screen.getByText("Containers")).toBeInTheDocument()
+    expect(screen.getByText("Build partially completed")).toBeInTheDocument()
+    expect(screen.getByText("1 partial")).toBeInTheDocument()
+    expect(screen.queryByText(/no build result yet/i)).not.toBeInTheDocument()
+  })
+
+  it("does not print placeholder stack metadata", () => {
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{ ...data, workspaces: [ws({ stack: "Unknown", commit: "abc123" })] }}
+      />,
+    )
+
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument()
+    expect(screen.getByText("abc123")).toBeInTheDocument()
+  })
+
+  it("reports measured identity coverage without discarding unmeasured workspaces", () => {
+    const measuredLayers = evidenceLayers()
+    measuredLayers.tests.claimed.latestSubjects = {
+      executed: 10, passed: 8, failed: 1, errors: 1, skipped: 0,
+      availability: "available",
+    }
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{
+          ...data,
+          workspaces: [
+            ws({ id: "measured", test: { state: "failed", pass: 8, fail: 1, errors: 1, skip: 0, total: 10, evidenceLayers: measuredLayers } }),
+            ws({ id: "unmeasured", test: { state: "success", pass: 3, fail: 0, skip: 0, total: 3, evidenceLayers: evidenceLayers() } }),
+          ],
+        }}
+      />,
+    )
+
+    const identityCard = screen.getByText("Identity coverage").parentElement
+    expect(within(identityCard as HTMLElement).getByText("1/2")).toBeInTheDocument()
+    expect(within(identityCard as HTMLElement).getByText("80% measured subset")).toBeInTheDocument()
+  })
+
+  it("marks diagnostic totals as lower bounds when a source is unavailable", () => {
+    const layers = evidenceLayers()
+    layers.tests.staleObservations = {
+      executed: null, passed: null, failed: null, errors: null, skipped: null,
+      availability: "unavailable", reason: "not countable",
+    }
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{ ...data, workspaces: [ws({ test: { state: "success", pass: 1, fail: 0, skip: 0, total: 1, evidenceLayers: layers } })] }}
+      />,
+    )
+
+    expect(screen.getByText("2,887+")).toBeInTheDocument()
+    expect(screen.getByText(/at least 2,887 diagnostics/i)).toBeInTheDocument()
   })
 
   it("orders attention-needing workspaces first", () => {
@@ -212,5 +283,24 @@ describe("WorkspaceRail", () => {
     )
     expect(screen.queryByText(/no workspaces yet/i)).not.toBeInTheDocument()
     expect(screen.getByLabelText(/pending launch queued/i)).toBeInTheDocument()
+  })
+
+  it("distinguishes an unavailable workspace read from an empty dashboard", () => {
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{
+          ...data,
+          readStatus: "unavailable",
+          readError: "workspace registry read failed",
+          workspaces: [],
+        }}
+        selectedId={null}
+      />,
+    )
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Workspace data unavailable")
+    expect(screen.getByRole("button", { name: /retry dashboard/i })).toBeInTheDocument()
+    expect(screen.queryByText(/no workspaces yet/i)).not.toBeInTheDocument()
   })
 })

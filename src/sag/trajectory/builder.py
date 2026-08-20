@@ -118,6 +118,45 @@ def build_trajectory(session_dir: Path | str, *, detail: str = "summary") -> Tra
     return sources.finish(reducer.snapshot(), extra=unread)
 
 
+def read_call_envelope(session_dir: Path | str, envelope_id: str) -> dict[str, Any] | None:
+    """Return one call envelope's exact parameters without changing trajectory-v1.
+
+    Call parameters live in the control ledger rather than the output store. The
+    timeline resolves them on demand so the summary document stays small while a
+    reader can still inspect the call the row names.
+    """
+    sources = _SessionSources(session_dir, detail="summary")
+    ledger = sources.control_events()
+    if ledger is None:
+        return None
+
+    lines, _ = _read_lines(ledger)
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("kind") not in {
+            "action_envelope",
+            "forced_action",
+        }:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or payload.get("envelope_id") != envelope_id:
+            continue
+        exact_params = payload.get("exact_params")
+        tool = payload.get("tool")
+        if not isinstance(exact_params, dict) or not isinstance(tool, str) or not tool:
+            return None
+        return {
+            "sequence": event.get("sequence"),
+            "envelope_id": envelope_id,
+            "tool": tool,
+            "exact_params": exact_params,
+        }
+    return None
+
+
 def follow_trajectory(
     session_dir: Path | str,
     *,

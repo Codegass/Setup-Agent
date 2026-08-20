@@ -1,29 +1,32 @@
 import type * as React from "react"
 
-import type { TrajectoryTurn } from "@/api/types"
-import { formatSeq, truncationMarker } from "@/lib/trajectory"
+import type { TrajectoryEnvelope, TrajectoryTurn } from "@/api/types"
+import { truncationMarker } from "@/lib/trajectory"
+import { cn } from "@/lib/utils"
 
 import { RefDescent, type BytesStatus } from "./RefDescent"
+
+export type EnvelopeStatus = "absent" | "loading" | "ready" | "error"
 
 function Panel({
   title,
   hint,
   testId,
+  className,
   children,
 }: {
   title: string
   hint?: string
   testId: string
+  className?: string
   children: React.ReactNode
 }) {
   return (
     <section
-      className="min-w-0 rounded-lg border border-border bg-card p-3"
+      className={cn("min-w-0 rounded-lg border border-border bg-card p-3", className)}
       data-testid={testId}
     >
-      <h4 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-        {title}
-      </h4>
+      <h4 className="text-[12px] font-semibold text-foreground">{title}</h4>
       {hint ? <p className="mt-0.5 text-[11px] text-muted-foreground">{hint}</p> : null}
       <div className="mt-2 space-y-2">{children}</div>
     </section>
@@ -34,146 +37,226 @@ function Nothing({ label }: { label: string }) {
   return <p className="text-[11.5px] italic text-muted-foreground">{label}</p>
 }
 
-/**
- * The quad of one turn: [A] what the model saw, [B] what it asked, [C] what it
- * read back, [D] what happened next.
- *
- * Every panel resolves refs rather than restating bytes: the row's handles are
- * the authoritative record's own, so any panel can be descended from.
- */
-export function TurnQuad({
-  turn,
-  next,
+function field(label: string, value: React.ReactNode) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
+        {label}
+      </span>
+      {value}
+    </div>
+  )
+}
+
+function modelMessage(bytes: string | undefined): { role: string; preview: string } | null {
+  if (bytes == null) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(bytes) as unknown
+    if (typeof parsed !== "object" || parsed === null) {
+      return null
+    }
+    const record = parsed as Record<string, unknown>
+    if (typeof record.role !== "string" || typeof record.content !== "string") {
+      return null
+    }
+    const compact = record.content.replace(/\s+/g, " ").trim()
+    return {
+      role: record.role,
+      preview: compact.length > 180 ? `${compact.slice(0, 179)}…` : compact,
+    }
+  } catch {
+    return null
+  }
+}
+
+function evidenceRefLabel(refName: string): string {
+  if (refName.startsWith("job:")) {
+    return "Background job"
+  }
+  if (refName.startsWith("output_")) {
+    return "Tool output reference"
+  }
+  return "Evidence reference"
+}
+
+function ContextRef({
+  refName,
   outputs,
   status,
 }: {
-  turn: TrajectoryTurn
-  next: TrajectoryTurn | null
+  refName: string
   outputs: Record<string, string> | null
   status: BytesStatus
 }) {
+  const message = modelMessage(outputs?.[refName])
+  return (
+    <div className="space-y-1.5">
+      {message ? (
+        <div className="flex min-w-0 items-start gap-2">
+          <span className="shrink-0 rounded bg-accent px-1.5 py-0.5 font-mono text-[10.5px] text-muted-foreground">
+            {message.role}
+          </span>
+          <span className="min-w-0 text-[11.5px] leading-relaxed text-foreground">
+            {message.preview || "Empty message content"}
+          </span>
+        </div>
+      ) : null}
+      <RefDescent outputs={outputs} refName={refName} status={status} />
+    </div>
+  )
+}
+
+function CallParameters({
+  envelopeId,
+  envelope,
+  status,
+  error,
+}: {
+  envelopeId: string
+  envelope: TrajectoryEnvelope | null
+  status: EnvelopeStatus
+  error: string | null
+}) {
+  return (
+    <div className="space-y-2">
+      {status === "loading" ? (
+        <p className="text-[11.5px] text-muted-foreground">Reading exact parameters…</p>
+      ) : null}
+      {status === "error" ? (
+        <p className="text-[11.5px] text-status-failed">
+          {`Exact parameters could not be read${error ? `: ${error}` : "."}`}
+        </p>
+      ) : null}
+      {envelope ? (
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-foreground">
+          {JSON.stringify(envelope.exact_params, null, 2)}
+        </pre>
+      ) : null}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+        <span>Call envelope</span>
+        <span className="font-mono">{envelopeId}</span>
+        {envelope?.sequence != null ? (
+          <span className="font-mono">{`seq ${envelope.sequence}`}</span>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+/** The model context, tool call, and tool result for one turn. */
+export function TurnQuad({
+  turn,
+  outputs,
+  status,
+  envelope,
+  envelopeStatus = "absent",
+  envelopeError = null,
+}: {
+  turn: TrajectoryTurn
+  outputs: Record<string, string> | null
+  status: BytesStatus
+  envelope?: TrajectoryEnvelope | null
+  envelopeStatus?: EnvelopeStatus
+  envelopeError?: string | null
+}) {
   const components = turn.window_components ?? []
-  // The row's handle into [A] is the record's own, and the record makes it the
-  // LAST component it named — the newest message, the one thing this turn did
-  // not share with the turn before it. So it is normally already in the list
-  // below, and drawing it above as well put one ref on screen twice and invited
-  // a reader to descend the same bytes from two places. It is marked where it
-  // lives instead, and keeps its own descent only when the list does not carry
-  // it — a record that named a handle and no components.
   const handle = turn.window_ref == null ? -1 : components.lastIndexOf(turn.window_ref)
 
   return (
     <div className="grid gap-2.5 lg:grid-cols-2">
       <Panel
-        hint="Every component the record named, in render order."
+        className="lg:col-span-2"
+        hint="Messages sent to the model, in order. The role and preview come from the stored message."
         testId={`quad-window-${turn.turn_id}`}
-        title="[A] Window — what the model saw"
+        title="Model context"
       >
         {turn.window_ref && handle < 0 ? (
-          <RefDescent
-            label="window handle"
-            outputs={outputs}
-            refName={turn.window_ref}
-            status={status}
-          />
+          <ContextRef outputs={outputs} refName={turn.window_ref} status={status} />
         ) : null}
         {components.length ? (
-          <ol aria-label="Window components" className="space-y-1.5">
+          <ol aria-label="Model context messages" className="space-y-2">
             {components.map((component, index) => {
               const cut = truncationMarker(component)
               return (
                 <li className="min-w-0" key={`${component}-${index}`}>
                   {cut != null ? (
                     <span className="text-[11.5px] text-status-attention">
-                      {`${cut} older components the record could not name (window cut)`}
+                      {`${cut} older messages are omitted by this context window.`}
                     </span>
                   ) : (
-                    <RefDescent
-                      label={index === handle ? "window handle" : undefined}
-                      outputs={outputs}
-                      refName={component}
-                      status={status}
-                    />
+                    <ContextRef outputs={outputs} refName={component} status={status} />
                   )}
                 </li>
               )
             })}
           </ol>
         ) : turn.window_ref ? null : (
-          <Nothing label="No record stated a window for this turn." />
+          <Nothing label="No model context is recorded for this turn." />
         )}
       </Panel>
 
-      <Panel testId={`quad-call-${turn.turn_id}`} title="[B] Call — what was asked">
+      <Panel testId={`quad-call-${turn.turn_id}`} title="Tool call">
         {turn.call ? (
           <>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-                tool
-              </span>
-              <span className="font-mono text-[11.5px] text-foreground">{turn.call.tool}</span>
-            </div>
+            {field(
+              "tool",
+              <span className="font-mono text-[11.5px] text-foreground">{turn.call.tool}</span>,
+            )}
             {turn.call.params_ref ? (
-              <>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-                    envelope
-                  </span>
-                  <span className="font-mono text-[11.5px] text-foreground">
-                    {turn.call.params_ref}
-                  </span>
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  The exact params live in control_events.jsonl under this envelope id; the
-                  output store was never built to answer one.
-                </p>
-              </>
+              <CallParameters
+                envelope={envelope ?? null}
+                envelopeId={turn.call.params_ref}
+                error={envelopeError}
+                status={envelopeStatus}
+              />
             ) : (
-              <Nothing label="No envelope was sealed for this call." />
+              <Nothing label="No parameter envelope is recorded for this call." />
             )}
           </>
         ) : (
-          <Nothing label="This turn called nothing." />
+          <Nothing label="This turn called no tool." />
         )}
       </Panel>
 
-      <Panel testId={`quad-observation-${turn.turn_id}`} title="[C] Observation — what came back">
+      <Panel
+        hint="Exact tool message added to the model context. It may include status, evidence refs, and a bounded diagnostic tail."
+        testId={`quad-observation-${turn.turn_id}`}
+        title="Tool result"
+      >
         {turn.observation ? (
           <>
-            {turn.observation.error_code ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-                  error
-                </span>
-                <span className="font-mono text-[11.5px] text-status-failed">
-                  {turn.observation.error_code}
-                </span>
-              </div>
-            ) : null}
-            {turn.observation.failure_signature ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-                  signature
-                </span>
-                <span className="break-all font-mono text-[11.5px] text-muted-foreground">
-                  {turn.observation.failure_signature}
-                </span>
-              </div>
-            ) : null}
+            {turn.observation.error_code
+              ? field(
+                  "error",
+                  <span className="font-mono text-[11.5px] text-status-failed">
+                    {turn.observation.error_code}
+                  </span>,
+                )
+              : null}
+            {turn.observation.failure_signature
+              ? field(
+                  "signature",
+                  <span className="break-all font-mono text-[11.5px] text-muted-foreground">
+                    {turn.observation.failure_signature}
+                  </span>,
+                )
+              : null}
             {turn.observation.ref ? (
               <RefDescent
-                label="read by the model"
+                label="Model-visible result"
                 outputs={outputs}
                 refName={turn.observation.ref}
                 status={status}
               />
             ) : (
-              <Nothing label="No delivered observation is on the record for this turn." />
+              <Nothing label="No model-visible result is recorded for this turn." />
             )}
             {turn.observation.evidence_ref &&
             turn.observation.evidence_ref !== turn.observation.ref ? (
               <RefDescent
-                label="written by the tool"
+                label={evidenceRefLabel(turn.observation.evidence_ref)}
                 outputs={outputs}
                 refName={turn.observation.evidence_ref}
                 status={status}
@@ -181,33 +264,7 @@ export function TurnQuad({
             ) : null}
           </>
         ) : (
-          <Nothing label="Nothing came back — the turn has no observation." />
-        )}
-      </Panel>
-
-      <Panel testId={`quad-next-${turn.turn_id}`} title="[D] Next — what happened after">
-        {next ? (
-          <>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono text-[11.5px] font-semibold text-foreground">
-                {`Turn ${next.turn_id}`}
-              </span>
-              <span className="text-[11.5px] text-muted-foreground">{next.actor}</span>
-              {next.call ? (
-                <span className="font-mono text-[11.5px] text-foreground">{next.call.tool}</span>
-              ) : null}
-            </div>
-            {next.phase !== turn.phase ? (
-              <p className="text-[11.5px] text-status-attention">
-                {`The run left ${turn.phase} for ${next.phase} between these two turns.`}
-              </p>
-            ) : null}
-            <p className="font-mono text-[11px] text-muted-foreground">
-              {`seq ${formatSeq(next.control_seq)}`}
-            </p>
-          </>
-        ) : (
-          <Nothing label="The ledger states no turn after this one — it is the last turn folded so far." />
+          <Nothing label="No tool result is recorded for this turn." />
         )}
       </Panel>
     </div>

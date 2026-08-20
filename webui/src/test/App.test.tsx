@@ -465,10 +465,43 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
     expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
-    // The Tests tab's tiles reflect the freshly polled 430/430 totals.
+    // The Tests tab's sealed-run summary reflects the freshly polled totals.
     fireEvent.click(screen.getByRole("button", { name: /^Tests/ }))
-    expect(screen.getAllByText("430").length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByText(/sealed run results: 430 passed/i)).toBeInTheDocument()
   }, 8000)
+
+  it("refreshes completed session details when late metrics arrive", async () => {
+    const completed = {
+      ...sessionDetail,
+      status: "completed",
+      outcome: "Metrics are still being mirrored.",
+      test: { state: "success", pass: 4722, fail: 0, errors: 0, skip: 0, total: 4722 },
+    }
+    const refreshed = {
+      ...completed,
+      outcome: "Late report metrics are now available.",
+    }
+    let sessionFetches = 0
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+      if (url === "/api/project-launches") return Promise.resolve(jsonResponse(emptyLaunchQueue))
+      if (url === "/api/workspaces") return Promise.resolve(jsonResponse(dashboard))
+      if (url === "/api/system") return Promise.resolve(jsonResponse({}))
+      if (url === "/api/sessions/CC-3") {
+        sessionFetches += 1
+        return Promise.resolve(jsonResponse(sessionFetches === 1 ? completed : refreshed))
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    render(<App />)
+    fireEvent.click((await screen.findAllByRole("button", { name: /open workspace apache\/commons-cli/i }))[0])
+    expect(await screen.findByText("Metrics are still being mirrored.")).toBeInTheDocument()
+
+    await new Promise((resolve) => setTimeout(resolve, 5200))
+
+    expect(await screen.findByText("Late report metrics are now available.")).toBeInTheDocument()
+  }, 9000)
 
   it("does not mount the terminal panel when the workspace container is not running", async () => {
     const stoppedDashboard = {

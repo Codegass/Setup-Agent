@@ -963,6 +963,27 @@ class GateDecisionPayload(_StrictPayload):
     # word happened to be delivered last. `key_results` above is bounded like
     # every other flat field; this digest is taken from the claim itself.
     claim_sha256: str | None = Field(default=None, min_length=1, max_length=128)
+    # `reason` and `evidence_refs` above describe the validator's grading, not
+    # necessarily the model claim. New streams therefore retain the exact
+    # model-authored PhaseClaim metadata whose digest is `claim_sha256`.
+    # Archived streams predate this snapshot and keep their opaque claim token.
+    phase_claim: dict[str, Any] | None = None
+    # Model-authored Analyze plans live in a separate bounded artifact. These
+    # optional fields preserve the complete PhaseClaim identity for new
+    # transcripts while archived pre-plan streams remain parseable.
+    execution_plan_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    execution_plan_ref: str | None = Field(default=None, min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _claim_snapshot_is_not_null(self) -> "GateDecisionPayload":
+        if "phase_claim" in self.model_fields_set and self.phase_claim is None:
+            raise ValueError("gate phase claim snapshot cannot be null")
+        if self.phase_claim is not None and not self.claim_sha256:
+            raise ValueError("gate phase claim snapshot requires its claim identity")
+        return self
 
     @model_serializer(mode="wrap")
     def _ownership_absent_stays_absent(self, handler):
@@ -975,6 +996,9 @@ class GateDecisionPayload(_StrictPayload):
             "supersedes",
             "gate_result",
             "claim_sha256",
+            "phase_claim",
+            "execution_plan_sha256",
+            "execution_plan_ref",
         ):
             if name not in self.model_fields_set:
                 data.pop(name, None)

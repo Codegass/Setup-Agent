@@ -47,10 +47,12 @@ describe("TurnSparkline", () => {
 
     // Two measures of different units share no axis: each is its own chart,
     // scaled to its own peak and labelled with it.
-    expect(screen.getByRole("img", { name: /tokens per turn/i })).toBeInTheDocument()
-    expect(screen.getByRole("img", { name: /duration per turn/i })).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /model-response tokens per turn/i })).toBeInTheDocument()
+    expect(screen.getByRole("img", { name: /action duration per turn/i })).toBeInTheDocument()
     expect(screen.getByText("4.2k")).toBeInTheDocument()
     expect(screen.getByText("13.5s")).toBeInTheDocument()
+    expect(screen.getAllByText(/Max at Turn 1/i)).toHaveLength(2)
+    expect(screen.getByText(/Gray ticks mean no value is attributed/i)).toBeInTheDocument()
   })
 
   it("gives every column an SVG title, so a hover names the turn it is about", () => {
@@ -69,7 +71,8 @@ describe("TurnSparkline", () => {
     // that cost nothing, and this run's most interesting turn is the open one.
     render(<TurnSparkline doc={doc({ turns: [turn(1), turn(2, { tokens: null })] })} />)
 
-    expect(screen.getAllByText(/no tokens stated/i)).toHaveLength(2)
+    const tokens = screen.getByRole("img", { name: /model-response tokens per turn/i })
+    expect(within(tokens).getAllByText(/no tokens stated/i)).toHaveLength(2)
     expect(screen.getByText(/no turn has been billed yet/i)).toBeInTheDocument()
   })
 

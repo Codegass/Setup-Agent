@@ -1,0 +1,920 @@
+"""Model-authored project execution plans and their engine-owned seal.
+
+The analyze model authors the project-specific build and test strategy.  The
+harness contributes a bounded document inventory, verifies exact document-map
+bindings, records discovery gaps, and seals the accepted plan for later phases.
+Inventory heuristics and deterministic claims are guidance; neither one is an
+allowlist for what the model may review.
+
+The authored plan and its sealed artifact are deliberately separate:
+
+* :class:`ProjectExecutionPlan` contains only the model's reviewed evidence and
+  proposed execution strategy;
+* :class:`SealedProjectExecutionPlan` binds that authored payload to the analyze
+  attempt, accepted phase claim, document-map snapshot, and inventory gaps;
+* only the engine should call :func:`seal_and_write_project_execution_plan`.
+
+The container mirror is one canonical JSON object at
+``/workspace/.setup_agent/project_execution_plan.json``.  Reads use the exact
+byte path and revalidate both the authored-plan digest and the artifact digest.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import posixpath
+import re
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Literal, cast
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+from sag.agent.control_events import canonical_json, canonical_sha256
+from sag.agent.document_map import document_map_fingerprint
+from sag.agent.document_map import entry_id as document_entry_id
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
+from sag.utils.container_io import (
+    WRITE_INVALID_ARGUMENTS,
+    ContainerWriteResult,
+    write_container_text_atomic,
+)
+
+PROJECT_EXECUTION_PLAN_SCHEMA_VERSION = 1
+PROJECT_EXECUTION_PLAN_PATH = "/workspace/.setup_agent/project_execution_plan.json"
+
+MAX_AUTHORED_PLAN_BYTES = 16 * 1024
+MAX_SEALED_PLAN_BYTES = 64 * 1024
+MAX_SYSTEM_PROMPT_CHARS = 24 * 1024
+MAX_INVENTORY_PROMPT_CHARS = 16 * 1024
+
+MAX_DOCUMENTS_REVIEWED = 24
+MAX_EXECUTION_STEPS = 16
+MAX_SUCCESS_CRITERIA = 16
+MAX_CONTEXT_ITEMS = 16
+MAX_EVIDENCE_REFS = 12
+MAX_INVENTORY_WARNINGS = 32
+MAX_INVENTORY_RECORDS = 5_000
+MAX_PARAMS_BYTES = 4_096
+MAX_PARAM_DEPTH = 4
+MAX_PARAM_ITEMS = 32
+MAX_PARAM_STRING_CHARS = 2_048
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_OUTPUT_REF_RE = re.compile(r"^output_[A-Za-z0-9][A-Za-z0-9._-]{1,127}$")
+
+
+class ProjectExecutionPlanValidationError(ValueError):
+    """The authored plan or its evidence binding is not valid."""
+
+
+class ProjectExecutionPlanPersistenceError(RuntimeError):
+    """The engine could not persist a sealed plan artifact."""
+
+
+class ProjectExecutionPlanReadError(RuntimeError):
+    """The sealed plan artifact was unreadable, malformed, or tampered."""
+
+
+class _FrozenPlanModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        str_strip_whitespace=True,
+    )
+
+
+def _normalize_sha256(value: Any, *, field_name: str) -> str:
+    digest = str(value or "").strip().lower()
+    if _SHA256_RE.fullmatch(digest) is None:
+        raise ValueError(f"{field_name} must be a SHA-256 digest")
+    return digest
+
+
+def _unique_nonempty(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
+    normalized = tuple(str(value or "").strip() for value in values)
+    if any(not value for value in normalized):
+        raise ValueError(f"{field_name} cannot contain empty values")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{field_name} cannot contain duplicate values")
+    return normalized
+
+
+def _normalize_json_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > MAX_PARAM_DEPTH:
+        raise ValueError("execution params exceed the nesting bound")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("execution params require finite numbers")
+        return value
+    if isinstance(value, str):
+        if len(value) > MAX_PARAM_STRING_CHARS:
+            raise ValueError("execution param string exceeds the character bound")
+        return value
+    if isinstance(value, Mapping):
+        if len(value) > MAX_PARAM_ITEMS:
+            raise ValueError("execution params exceed the mapping item bound")
+        normalized: dict[str, Any] = {}
+        for raw_key, child in value.items():
+            if not isinstance(raw_key, str):
+                raise ValueError("execution param keys must be strings")
+            key = raw_key.strip()
+            if not key or len(key) > 128:
+                raise ValueError("execution param key is empty or too long")
+            if key in normalized:
+                raise ValueError("execution params contain duplicate normalized keys")
+            normalized[key] = _normalize_json_value(child, depth=depth + 1)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        if len(value) > MAX_PARAM_ITEMS:
+            raise ValueError("execution params exceed the sequence item bound")
+        return [_normalize_json_value(child, depth=depth + 1) for child in value]
+    raise ValueError(f"execution params contain unsupported value {type(value).__name__}")
+
+
+class ReviewedDocument(_FrozenPlanModel):
+    """One source the analyze model deliberately reviewed."""
+
+    path: str = Field(min_length=1, max_length=2_048)
+    reason: str = Field(min_length=1, max_length=1_000)
+    evidence_refs: tuple[str, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVIDENCE_REFS,
+    )
+    # Present together for a document-map-backed source.  A direct output/file
+    # observation outside the bounded map intentionally leaves both absent.
+    entry_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source_hash: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _valid_path(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("document path contains NUL")
+        return value
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def _valid_refs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = _unique_nonempty(value, field_name="evidence_refs")
+        if any(len(ref) > 512 for ref in normalized):
+            raise ValueError("evidence reference exceeds the character bound")
+        return normalized
+
+    @field_validator("source_hash")
+    @classmethod
+    def _valid_source_hash(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalize_sha256(value, field_name="source_hash")
+
+    @model_validator(mode="after")
+    def _complete_map_binding(self) -> "ReviewedDocument":
+        if (self.entry_id is None) != (self.source_hash is None):
+            raise ValueError("entry_id and source_hash must be present together")
+        return self
+
+
+class ExecutionStep(_FrozenPlanModel):
+    """One planned build or test action, still expressed as public tool params."""
+
+    tool: str = Field(min_length=1, max_length=64)
+    params: dict[str, Any]
+    purpose: str = Field(min_length=1, max_length=1_000)
+    evidence_refs: tuple[str, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVIDENCE_REFS,
+    )
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _bounded_params(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("execution params must be a mapping")
+        normalized = _normalize_json_value(value)
+        if not isinstance(normalized, dict):  # narrowed from the recursive JSON type
+            raise ValueError("execution params must normalize to a mapping")
+        if len(canonical_json(normalized).encode("utf-8")) > MAX_PARAMS_BYTES:
+            raise ValueError("execution params exceed the canonical byte bound")
+        return cast(dict[str, Any], normalized)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def _valid_refs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = _unique_nonempty(value, field_name="evidence_refs")
+        if any(len(ref) > 512 for ref in normalized):
+            raise ValueError("evidence reference exceeds the character bound")
+        return normalized
+
+
+class ProjectExecutionPlan(_FrozenPlanModel):
+    """The bounded strategy authored by the analyze model."""
+
+    summary: str = Field(min_length=1, max_length=2_000)
+    documents_reviewed: tuple[ReviewedDocument, ...] = Field(
+        min_length=1,
+        max_length=MAX_DOCUMENTS_REVIEWED,
+    )
+    build_steps: tuple[ExecutionStep, ...] = Field(
+        min_length=1,
+        max_length=MAX_EXECUTION_STEPS,
+    )
+    build_success_criteria: tuple[str, ...] = Field(
+        min_length=1,
+        max_length=MAX_SUCCESS_CRITERIA,
+    )
+    test_steps: tuple[ExecutionStep, ...] = Field(
+        min_length=1,
+        max_length=MAX_EXECUTION_STEPS,
+    )
+    test_success_criteria: tuple[str, ...] = Field(
+        min_length=1,
+        max_length=MAX_SUCCESS_CRITERIA,
+    )
+    environment_constraints: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_CONTEXT_ITEMS,
+    )
+    risks: tuple[str, ...] = Field(default=(), max_length=MAX_CONTEXT_ITEMS)
+    unresolved_questions: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_CONTEXT_ITEMS,
+    )
+
+    @field_validator(
+        "build_success_criteria",
+        "test_success_criteria",
+        "environment_constraints",
+        "risks",
+        "unresolved_questions",
+    )
+    @classmethod
+    def _bounded_text_lists(cls, value: tuple[str, ...], info: Any) -> tuple[str, ...]:
+        normalized = _unique_nonempty(value, field_name=info.field_name)
+        if any(len(item) > 1_000 for item in normalized):
+            raise ValueError(f"{info.field_name} item exceeds the character bound")
+        return normalized
+
+    @model_validator(mode="after")
+    def _unique_documents_and_bounded_payload(self) -> "ProjectExecutionPlan":
+        paths = [document.path for document in self.documents_reviewed]
+        if len(set(paths)) != len(paths):
+            raise ValueError("documents_reviewed contains duplicate paths")
+        size = len(canonical_json(self.model_dump(mode="json")).encode("utf-8"))
+        if size > MAX_AUTHORED_PLAN_BYTES:
+            raise ValueError("authored project execution plan exceeds the canonical byte bound")
+        return self
+
+    def to_system_prompt(self) -> str:
+        """Render the complete authored plan within a fixed prompt bound."""
+
+        body = canonical_json(self.model_dump(mode="json"))
+        prompt = (
+            "=== PROJECT EXECUTION PLAN ===\n"
+            "This plan was authored during project analysis. Build and test "
+            "actions should follow it; unresolved items remain explicit.\n"
+            f"{body}"
+        )
+        if len(prompt) > MAX_SYSTEM_PROMPT_CHARS:
+            # The model-level canonical byte bound should make this impossible.
+            raise ProjectExecutionPlanValidationError("system prompt exceeds its fixed bound")
+        return prompt
+
+
+class InventoryCoverage(_FrozenPlanModel):
+    """Exact counts; no percentage implies that every file needed review."""
+
+    indexed_documents: int = Field(ge=0, le=MAX_INVENTORY_RECORDS)
+    reviewed_indexed_documents: int = Field(ge=0, le=MAX_INVENTORY_RECORDS)
+    unreviewed_indexed_documents: int = Field(ge=0, le=MAX_INVENTORY_RECORDS)
+    external_documents_reviewed: int = Field(ge=0, le=MAX_DOCUMENTS_REVIEWED)
+    partial_inventory_records: int = Field(ge=0, le=MAX_INVENTORY_RECORDS)
+    all_indexed_documents_reviewed: bool
+
+    @model_validator(mode="after")
+    def _counts_reconcile(self) -> "InventoryCoverage":
+        if (
+            self.reviewed_indexed_documents + self.unreviewed_indexed_documents
+            != self.indexed_documents
+        ):
+            raise ValueError("inventory coverage counts do not reconcile")
+        if self.all_indexed_documents_reviewed != (self.unreviewed_indexed_documents == 0):
+            raise ValueError("inventory completion flag does not match its counts")
+        return self
+
+
+class SealedProjectExecutionPlan(_FrozenPlanModel):
+    """Engine-owned binding of an authored plan to one analyze attempt."""
+
+    schema_version: Literal[1] = 1
+    source_attempt_id: str = Field(min_length=1, max_length=128)
+    claim_sha256: str
+    document_map_fingerprint: str | None = None
+    authored_plan_sha256: str
+    inventory_coverage: InventoryCoverage
+    inventory_warnings: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_INVENTORY_WARNINGS,
+    )
+    plan: ProjectExecutionPlan
+    artifact_sha256: str
+
+    @field_validator("claim_sha256", "authored_plan_sha256", "artifact_sha256")
+    @classmethod
+    def _valid_sha(cls, value: str, info: Any) -> str:
+        return _normalize_sha256(value, field_name=info.field_name)
+
+    @field_validator("document_map_fingerprint")
+    @classmethod
+    def _valid_map_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalize_sha256(value, field_name="document_map_fingerprint")
+
+    @field_validator("inventory_warnings")
+    @classmethod
+    def _valid_warnings(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = _unique_nonempty(value, field_name="inventory_warnings")
+        if any(len(item) > 512 for item in normalized):
+            raise ValueError("inventory warning exceeds the character bound")
+        return normalized
+
+    @model_validator(mode="after")
+    def _valid_seals(self) -> "SealedProjectExecutionPlan":
+        if canonical_authored_plan_sha256(self.plan) != self.authored_plan_sha256:
+            raise ValueError("authored project execution plan hash mismatch")
+        payload = self.model_dump(mode="json", exclude={"artifact_sha256"})
+        if canonical_sha256(payload) != self.artifact_sha256:
+            raise ValueError("sealed project execution plan artifact hash mismatch")
+        coverage = self.inventory_coverage
+        has_gap = bool(
+            coverage.unreviewed_indexed_documents
+            or coverage.external_documents_reviewed
+            or coverage.partial_inventory_records
+        )
+        if has_gap and not self.inventory_warnings:
+            raise ValueError("inventory gaps require a visible warning")
+        return self
+
+    def to_system_prompt(self) -> str:
+        """Render seal identity, exact inventory counts, warnings, and the plan."""
+
+        coverage = self.inventory_coverage
+        lines = [
+            "=== SEALED PROJECT EXECUTION PLAN ===",
+            f"source_attempt_id: {self.source_attempt_id}",
+            f"claim_sha256: {self.claim_sha256}",
+            f"authored_plan_sha256: {self.authored_plan_sha256}",
+            "inventory_coverage: "
+            f"reviewed={coverage.reviewed_indexed_documents}/"
+            f"{coverage.indexed_documents}, "
+            f"external={coverage.external_documents_reviewed}, "
+            f"partial={coverage.partial_inventory_records}",
+        ]
+        if self.inventory_warnings:
+            lines.append("inventory_warnings:")
+            lines.extend(f"- {warning}" for warning in self.inventory_warnings)
+        lines.append(self.plan.to_system_prompt())
+        prompt = "\n".join(lines)
+        if len(prompt) <= MAX_SYSTEM_PROMPT_CHARS:
+            return prompt
+
+        # Core plan content is never truncated.  Only diagnostic warnings are
+        # compacted when they would crowd the fixed system-prompt envelope.
+        compact = [line for line in lines if line != "inventory_warnings:"]
+        compact = [line for line in compact if not line.startswith("- ")]
+        compact.insert(5, f"inventory_warnings: {len(self.inventory_warnings)} recorded")
+        prompt = "\n".join(compact)
+        if len(prompt) > MAX_SYSTEM_PROMPT_CHARS:
+            raise ProjectExecutionPlanValidationError("sealed system prompt exceeds its bound")
+        return prompt
+
+
+def validate_authored_plan(candidate: Any) -> ProjectExecutionPlan:
+    """Validate and normalize a model-authored candidate into the strict model."""
+
+    try:
+        if isinstance(candidate, ProjectExecutionPlan):
+            plan = ProjectExecutionPlan.model_validate(candidate.model_dump(mode="python"))
+        elif isinstance(candidate, str):
+            if len(candidate.encode("utf-8")) > MAX_AUTHORED_PLAN_BYTES:
+                raise ValueError("authored plan JSON exceeds the raw byte bound")
+            plan = ProjectExecutionPlan.model_validate_json(candidate)
+        elif isinstance(candidate, Mapping):
+            plan = ProjectExecutionPlan.model_validate(dict(candidate))
+        else:
+            raise TypeError("authored plan candidate must be a mapping or JSON object")
+        # The after-validator checks the canonical bound; this copy also makes
+        # the return value independent from caller-owned mutable structures.
+        return plan.model_copy(deep=True)
+    except (TypeError, ValueError, ValidationError) as exc:
+        if isinstance(exc, ProjectExecutionPlanValidationError):
+            raise
+        raise ProjectExecutionPlanValidationError(str(exc)) from exc
+
+
+def canonical_authored_plan_sha256(candidate: Any) -> str:
+    """Canonical digest of only the model-authored plan, excluding its seal."""
+
+    plan = validate_authored_plan(candidate)
+    return canonical_sha256(plan.model_dump(mode="json"))
+
+
+def _entry_body(entry: Any) -> dict[str, Any]:
+    if isinstance(entry, Mapping):
+        return dict(entry)
+    payload = getattr(entry, "payload", None)
+    if callable(payload):
+        value = payload()
+        if isinstance(value, Mapping):
+            return dict(value)
+    raise ProjectExecutionPlanValidationError("document map entry is not a mapping")
+
+
+def _is_direct_document_evidence(ref: str) -> bool:
+    value = str(ref or "").strip()
+    return bool(
+        _OUTPUT_REF_RE.fullmatch(value)
+        or value.startswith("/")
+        or value.startswith("file:")
+        or value.startswith("path:")
+    )
+
+
+def _record_member(record: Any, name: str, default: Any = None) -> Any:
+    if isinstance(record, Mapping):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def _normalized_document_path(value: Any) -> str:
+    path = str(value or "").strip()
+    for prefix in ("file:", "path:"):
+        if path.startswith(prefix):
+            path = path[len(prefix) :]
+            break
+    return posixpath.normpath(path) if path else ""
+
+
+def _observation_targets_document(observation: Any, document_path: str) -> bool:
+    """Whether one successful tool call explicitly inspected this path."""
+
+    tool_name = str(_record_member(observation, "tool_name", "") or "").strip().lower()
+    params = _record_member(observation, "params", {})
+    if not isinstance(params, Mapping):
+        return False
+    action = str(params.get("action") or "").strip().lower()
+    expected = _normalized_document_path(document_path)
+    if not expected:
+        return False
+
+    if tool_name == "file_io" and action == "read":
+        return _normalized_document_path(params.get("path")) == expected
+    if tool_name == "search":
+        target = str(params.get("target") or "").strip()
+        return target.startswith("file:") and _normalized_document_path(target) == expected
+
+    # Keep the seam usable by equivalent read facades without treating every
+    # action carrying a path (clone/write/build) as proof that the document was
+    # inspected.
+    if action not in {"cat", "inspect", "read", "show"}:
+        return False
+    return any(
+        _normalized_document_path(params.get(key)) == expected
+        for key in ("file", "filename", "path", "target")
+        if params.get(key) not in (None, "")
+    )
+
+
+def _output_matches_source_hash(output: str, source_hash: str | None) -> bool:
+    if source_hash is None:
+        return False
+    return hashlib.sha256(output.encode("utf-8")).hexdigest() == source_hash
+
+
+def validate_reviewed_document_evidence(
+    candidate: Any,
+    *,
+    observations: Sequence[Any],
+    output_reader: Callable[[str], str | None],
+    source_attempt_id: str,
+) -> ProjectExecutionPlan:
+    """Require each claimed document review to resolve to this Analyze attempt.
+
+    A document-map entry/hash proves inventory identity and currentness; it does
+    not prove that the model actually read the source.  This gate therefore
+    requires one durable ``output_*`` reference per reviewed document.  The
+    referenced output must be readable, belong to a successful tool
+    observation in the current Analyze attempt, and either carry explicit
+    read/search params for the claimed path or equal the claimed source hash.
+
+    The check is deliberately independent from document-map membership.  A
+    model may discover and read a source outside the bounded map through the
+    same ordinary tool path.
+    """
+
+    plan = validate_authored_plan(candidate)
+    attempt_id = str(source_attempt_id or "").strip()
+    if not attempt_id:
+        raise ProjectExecutionPlanValidationError(
+            "document review evidence requires the current Analyze attempt id"
+        )
+    if not callable(output_reader):
+        raise ProjectExecutionPlanValidationError(
+            "document review evidence output reader is unavailable"
+        )
+    if isinstance(observations, (str, bytes)) or not isinstance(observations, Sequence):
+        raise ProjectExecutionPlanValidationError("tool observations must be a sequence")
+
+    observations_by_ref: dict[str, list[Any]] = {}
+    for observation in observations:
+        if str(_record_member(observation, "source_phase", "") or "").strip() != "analyze":
+            continue
+        if str(_record_member(observation, "source_attempt_id", "") or "").strip() != attempt_id:
+            continue
+        result = _record_member(observation, "result")
+        if result is None or not bool(_record_member(result, "succeeded", False)):
+            continue
+        ref = str(_record_member(result, "output_ref", "") or "").strip()
+        if _OUTPUT_REF_RE.fullmatch(ref) is not None:
+            observations_by_ref.setdefault(ref, []).append(observation)
+
+    output_cache: dict[str, str | None] = {}
+    for reviewed in plan.documents_reviewed:
+        bound = False
+        for ref in reviewed.evidence_refs:
+            matching = observations_by_ref.get(ref, ())
+            if not matching:
+                continue
+            if ref not in output_cache:
+                try:
+                    resolved = output_reader(ref)
+                except Exception:
+                    resolved = None
+                output_cache[ref] = resolved if isinstance(resolved, str) else None
+            output = output_cache[ref]
+            if output is None:
+                continue
+            if any(
+                _observation_targets_document(observation, reviewed.path)
+                for observation in matching
+            ) or _output_matches_source_hash(output, reviewed.source_hash):
+                bound = True
+                break
+        if not bound:
+            raise ProjectExecutionPlanValidationError(
+                "document review requires at least one readable output_* from the current "
+                "Analyze attempt, bound by read/search path or source_hash: "
+                f"{reviewed.path}"
+            )
+    return plan
+
+
+def _document_inventory(
+    document_map: Mapping[str, Any] | None,
+) -> tuple[dict[str, tuple[str, str]], str | None, list[dict[str, str]]]:
+    if document_map is None:
+        return {}, None, []
+    if not isinstance(document_map, Mapping):
+        raise ProjectExecutionPlanValidationError("document_map must be a mapping")
+    raw_entries = document_map.get("entries") or ()
+    if isinstance(raw_entries, (str, bytes)) or not isinstance(raw_entries, Sequence):
+        raise ProjectExecutionPlanValidationError("document_map entries must be a sequence")
+    if len(raw_entries) > MAX_INVENTORY_RECORDS:
+        raise ProjectExecutionPlanValidationError("document_map exceeds the inventory bound")
+
+    by_path: dict[str, tuple[str, str]] = {}
+    entry_ids: set[str] = set()
+    entry_bodies: list[dict[str, Any]] = []
+    for raw_entry in raw_entries:
+        entry = _entry_body(raw_entry)
+        path = str(entry.get("path") or "").strip()
+        entry_id = str(entry.get("entry_id") or "").strip()
+        source_hash = _normalize_sha256(entry.get("source_hash"), field_name="source_hash")
+        if not path or not entry_id:
+            raise ProjectExecutionPlanValidationError("document map entry lacks path or entry_id")
+        if entry_id != document_entry_id(path):
+            raise ProjectExecutionPlanValidationError(
+                f"document map entry_id does not match its path: {path}"
+            )
+        if path in by_path or entry_id in entry_ids:
+            raise ProjectExecutionPlanValidationError("document map contains duplicate identity")
+        by_path[path] = (entry_id, source_hash)
+        entry_ids.add(entry_id)
+        entry_bodies.append(entry)
+
+    computed_fingerprint = document_map_fingerprint(entry_bodies)
+    stated_fingerprint = str(document_map.get("document_map_fingerprint") or "").strip().lower()
+    if stated_fingerprint:
+        stated_fingerprint = _normalize_sha256(
+            stated_fingerprint,
+            field_name="document_map_fingerprint",
+        )
+        if stated_fingerprint != computed_fingerprint:
+            raise ProjectExecutionPlanValidationError("document map fingerprint mismatch")
+    else:
+        stated_fingerprint = computed_fingerprint
+
+    raw_partial = document_map.get("partial_map") or ()
+    if isinstance(raw_partial, (str, bytes)) or not isinstance(raw_partial, Sequence):
+        raise ProjectExecutionPlanValidationError("document_map partial_map must be a sequence")
+    if len(raw_partial) > MAX_INVENTORY_RECORDS:
+        raise ProjectExecutionPlanValidationError(
+            "document_map partial inventory exceeds its bound"
+        )
+    partial: list[dict[str, str]] = []
+    for raw_gap in raw_partial:
+        if not isinstance(raw_gap, Mapping):
+            raise ProjectExecutionPlanValidationError("document_map gap is not a mapping")
+        path = str(raw_gap.get("path") or "").strip()
+        reason = str(raw_gap.get("reason") or "").strip()
+        if not path or not reason:
+            raise ProjectExecutionPlanValidationError("document_map gap lacks path or reason")
+        partial.append({"path": path, "reason": reason})
+    return by_path, stated_fingerprint, partial
+
+
+def _cross_check_inventory(
+    plan: ProjectExecutionPlan,
+    document_map: Mapping[str, Any] | None,
+) -> tuple[str | None, InventoryCoverage, tuple[str, ...]]:
+    by_path, fingerprint, partial = _document_inventory(document_map)
+    reviewed_indexed: set[str] = set()
+    external: list[ReviewedDocument] = []
+
+    for reviewed in plan.documents_reviewed:
+        binding = by_path.get(reviewed.path)
+        if binding is not None:
+            expected_entry_id, expected_hash = binding
+            if reviewed.entry_id != expected_entry_id:
+                raise ProjectExecutionPlanValidationError(
+                    f"document entry_id mismatch for {reviewed.path}"
+                )
+            if reviewed.source_hash != expected_hash:
+                raise ProjectExecutionPlanValidationError(
+                    f"document source_hash mismatch for {reviewed.path}"
+                )
+            reviewed_indexed.add(reviewed.path)
+            continue
+
+        if reviewed.entry_id is not None or reviewed.source_hash is not None:
+            raise ProjectExecutionPlanValidationError(
+                f"document map binding names a path outside the inventory: {reviewed.path}"
+            )
+        if not any(_is_direct_document_evidence(ref) for ref in reviewed.evidence_refs):
+            raise ProjectExecutionPlanValidationError(
+                f"map-external document lacks output/file evidence: {reviewed.path}"
+            )
+        external.append(reviewed)
+
+    unreviewed = sorted(set(by_path) - reviewed_indexed)
+    coverage = InventoryCoverage(
+        indexed_documents=len(by_path),
+        reviewed_indexed_documents=len(reviewed_indexed),
+        unreviewed_indexed_documents=len(unreviewed),
+        external_documents_reviewed=len(external),
+        partial_inventory_records=len(partial),
+        all_indexed_documents_reviewed=not unreviewed,
+    )
+
+    warnings: list[str] = []
+    if document_map is None:
+        warnings.append(
+            "document_map_unavailable: reviewed documents are bound only to direct output/file evidence"
+        )
+    if unreviewed:
+        examples = ", ".join(unreviewed[:5])
+        warnings.append(
+            "inventory_review_gap: "
+            f"{len(unreviewed)} of {len(by_path)} indexed documents were not reviewed"
+            + (f"; examples={examples}" if examples else "")
+        )
+    if partial:
+        reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(Counter(row["reason"] for row in partial).items())
+        )
+        warnings.append(
+            f"inventory_discovery_gap: {len(partial)} paths were not indexed; reasons={reasons}"
+        )
+    for reviewed in external:
+        direct_refs = [ref for ref in reviewed.evidence_refs if _is_direct_document_evidence(ref)]
+        warnings.append(
+            f"external_document_reviewed: {reviewed.path}; evidence={','.join(direct_refs[:3])}"
+        )
+    if len(warnings) > MAX_INVENTORY_WARNINGS:
+        warnings = warnings[: MAX_INVENTORY_WARNINGS - 1] + [
+            f"inventory_warnings_truncated: {len(warnings) - MAX_INVENTORY_WARNINGS + 1} omitted"
+        ]
+    return fingerprint, coverage, tuple(warning[:512] for warning in warnings)
+
+
+def seal_project_execution_plan(
+    candidate: Any,
+    *,
+    source_attempt_id: str,
+    claim_sha256: str,
+    document_map: Mapping[str, Any] | None = None,
+) -> SealedProjectExecutionPlan:
+    """Cross-check and seal a candidate without performing container I/O."""
+
+    try:
+        plan = validate_authored_plan(candidate)
+        attempt_id = str(source_attempt_id or "").strip()
+        if not attempt_id or len(attempt_id) > 128:
+            raise ProjectExecutionPlanValidationError("source_attempt_id is empty or too long")
+        claim_digest = _normalize_sha256(claim_sha256, field_name="claim_sha256")
+        fingerprint, coverage, warnings = _cross_check_inventory(plan, document_map)
+        authored_digest = canonical_authored_plan_sha256(plan)
+        body = {
+            "schema_version": PROJECT_EXECUTION_PLAN_SCHEMA_VERSION,
+            "source_attempt_id": attempt_id,
+            "claim_sha256": claim_digest,
+            "document_map_fingerprint": fingerprint,
+            "authored_plan_sha256": authored_digest,
+            "inventory_coverage": coverage.model_dump(mode="json"),
+            "inventory_warnings": list(warnings),
+            "plan": plan.model_dump(mode="json"),
+        }
+        body["artifact_sha256"] = canonical_sha256(body)
+        artifact = SealedProjectExecutionPlan.model_validate(body)
+        if (
+            len(canonical_json(artifact.model_dump(mode="json")).encode("utf-8"))
+            > MAX_SEALED_PLAN_BYTES
+        ):
+            raise ProjectExecutionPlanValidationError(
+                "sealed project execution plan exceeds its bound"
+            )
+        return artifact
+    except ProjectExecutionPlanValidationError:
+        raise
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ProjectExecutionPlanValidationError(str(exc)) from exc
+
+
+def write_sealed_project_execution_plan(
+    orchestrator: Any,
+    artifact: Any,
+) -> ContainerWriteResult:
+    """Atomically persist one already-sealed artifact at the fixed path."""
+
+    try:
+        if isinstance(artifact, SealedProjectExecutionPlan):
+            validated = SealedProjectExecutionPlan.model_validate(
+                artifact.model_dump(mode="python")
+            )
+        elif isinstance(artifact, Mapping):
+            validated = SealedProjectExecutionPlan.model_validate(dict(artifact))
+        else:
+            raise TypeError("artifact must be a SealedProjectExecutionPlan or mapping")
+        body = canonical_json(validated.model_dump(mode="json"))
+        if len(body.encode("utf-8")) > MAX_SEALED_PLAN_BYTES:
+            raise ValueError("sealed artifact exceeds the byte bound")
+    except (TypeError, ValueError, ValidationError):
+        return ContainerWriteResult(False, WRITE_INVALID_ARGUMENTS)
+    return write_container_text_atomic(
+        orchestrator,
+        PROJECT_EXECUTION_PLAN_PATH,
+        body,
+        validate_json=True,
+    )
+
+
+def seal_and_write_project_execution_plan(
+    candidate: Any,
+    orchestrator: Any,
+    *,
+    source_attempt_id: str,
+    claim_sha256: str,
+    document_map: Mapping[str, Any] | None = None,
+) -> SealedProjectExecutionPlan:
+    """Engine convenience API: validate, seal, and atomically persist the plan."""
+
+    artifact = seal_project_execution_plan(
+        candidate,
+        source_attempt_id=source_attempt_id,
+        claim_sha256=claim_sha256,
+        document_map=document_map,
+    )
+    result = write_sealed_project_execution_plan(orchestrator, artifact)
+    if not result.persisted:
+        raise ProjectExecutionPlanPersistenceError(
+            f"project execution plan persistence failed: {result.code}"
+        )
+    return artifact
+
+
+def read_sealed_project_execution_plan(orchestrator: Any) -> SealedProjectExecutionPlan | None:
+    """Strictly read and verify the fixed sealed artifact; absent remains None."""
+
+    try:
+        raw = read_container_text(
+            orchestrator,
+            PROJECT_EXECUTION_PLAN_PATH,
+            exact_bytes=True,
+        )
+    except ContainerFileReadError as exc:
+        raise ProjectExecutionPlanReadError(str(exc)) from exc
+    if raw is None:
+        return None
+    try:
+        if len(raw.encode("utf-8")) > MAX_SEALED_PLAN_BYTES:
+            raise ValueError("sealed project execution plan exceeds the read bound")
+        return SealedProjectExecutionPlan.model_validate_json(raw, strict=True)
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ProjectExecutionPlanReadError(str(exc)) from exc
+
+
+def render_plan_system_prompt(
+    value: ProjectExecutionPlan | SealedProjectExecutionPlan | Any,
+) -> str:
+    """Public rendering API for either an authored or a sealed plan."""
+
+    if isinstance(value, SealedProjectExecutionPlan):
+        return value.to_system_prompt()
+    return validate_authored_plan(value).to_system_prompt()
+
+
+def _bounded_lines(lines: Sequence[str], *, max_chars: int) -> str:
+    budget = max(512, min(int(max_chars), MAX_INVENTORY_PROMPT_CHARS))
+    kept: list[str] = []
+    used = 0
+    omitted = 0
+    for raw_line in lines:
+        line = str(raw_line).replace("\n", " ")[:2_048]
+        cost = len(line) + (1 if kept else 0)
+        if used + cost <= budget - 64:
+            kept.append(line)
+            used += cost
+        else:
+            omitted += 1
+    if omitted:
+        marker = f"... {omitted} inventory lines omitted by prompt bound"
+        while kept and len("\n".join([*kept, marker])) > budget:
+            kept.pop()
+            omitted += 1
+            marker = f"... {omitted} inventory lines omitted by prompt bound"
+        kept.append(marker)
+    return "\n".join(kept)[:budget]
+
+
+def render_document_inventory_guidance(
+    document_map: Mapping[str, Any] | None,
+    *,
+    max_chars: int = MAX_INVENTORY_PROMPT_CHARS,
+) -> str:
+    """Render bounded discovery guidance for the analyze model.
+
+    The rendering intentionally labels the inventory as hints and includes
+    exact handles, so the model can choose what to read without treating an
+    omitted or over-budget path as proof that no relevant document exists.
+    """
+
+    by_path, fingerprint, partial = _document_inventory(document_map)
+    lines = [
+        "=== BOUNDED DOCUMENT INVENTORY ===",
+        "Harness discovery is guidance, not a document allowlist. Choose and read project-specific sources before authoring the execution plan.",
+        f"document_map_fingerprint: {fingerprint or 'unavailable'}",
+        f"indexed_documents: {len(by_path)}",
+        f"partial_inventory_records: {len(partial)}",
+    ]
+    for path, (entry_id, source_hash) in sorted(
+        by_path.items(),
+        key=lambda item: (item[0].count("/"), item[0]),
+    ):
+        lines.append(f"- path={path} entry_id={entry_id} source_hash={source_hash}")
+    for gap in sorted(partial, key=lambda item: (item["path"], item["reason"])):
+        lines.append(f"- inventory_gap path={gap['path']} reason={gap['reason']}")
+    return _bounded_lines(lines, max_chars=max_chars)
+
+
+__all__ = [
+    "ExecutionStep",
+    "InventoryCoverage",
+    "MAX_AUTHORED_PLAN_BYTES",
+    "MAX_INVENTORY_PROMPT_CHARS",
+    "MAX_SEALED_PLAN_BYTES",
+    "MAX_SYSTEM_PROMPT_CHARS",
+    "PROJECT_EXECUTION_PLAN_PATH",
+    "PROJECT_EXECUTION_PLAN_SCHEMA_VERSION",
+    "ProjectExecutionPlan",
+    "ProjectExecutionPlanPersistenceError",
+    "ProjectExecutionPlanReadError",
+    "ProjectExecutionPlanValidationError",
+    "ReviewedDocument",
+    "SealedProjectExecutionPlan",
+    "canonical_authored_plan_sha256",
+    "read_sealed_project_execution_plan",
+    "render_document_inventory_guidance",
+    "render_plan_system_prompt",
+    "seal_and_write_project_execution_plan",
+    "seal_project_execution_plan",
+    "validate_authored_plan",
+    "validate_reviewed_document_evidence",
+    "write_sealed_project_execution_plan",
+]

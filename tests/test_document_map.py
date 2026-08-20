@@ -25,7 +25,6 @@ from test_container_io import FakeContainer
 from test_python_tool import fail, ok
 
 from sag.agent import document_map
-from sag.agent.evidence_publications import DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
 from sag.agent.document_map import (
     DOCUMENT_MAP_PATH,
     GENERATED_SEGMENTS,
@@ -43,6 +42,7 @@ from sag.agent.document_map import (
     entry_id,
     write_document_map,
 )
+from sag.agent.evidence_publications import DOCUMENT_MAP_LOGICAL_ARTIFACT_ID
 
 ROOT = "/workspace/proj"
 SHA = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809111213"
@@ -283,7 +283,7 @@ def test_document_map_persists_to_the_pinned_workspace_path():
 
 
 # ---------------------------------------------------------------------------
-# enumeration: ONE bounded find over the candidate kinds
+# enumeration: ONE bounded, name-agnostic file inventory
 # ---------------------------------------------------------------------------
 
 
@@ -296,35 +296,17 @@ def test_enumeration_is_a_single_depth_bounded_find():
     assert f"-maxdepth {MAX_DEPTH}" in execute.finds()[0]
 
 
-def test_enumeration_asks_for_every_candidate_kind():
+def test_enumeration_is_name_agnostic_instead_of_an_allowlist():
     execute = FakeTree(files={"README.md": README})
 
     discover_document_map(execute, ROOT)
     command = execute.finds()[0]
 
-    for predicate in (
-        "-iname 'README*'",
-        "-iname 'INSTALL*'",
-        "-iname 'BUILDING*'",
-        "-iname 'CONTRIBUTING*'",
-        "-name '*.md'",
-        "-path '*/.github/workflows/*.yml'",
-        "-path '*/.github/workflows/*.yaml'",
-        "-iname 'Dockerfile*'",
-        "-name '*.sh'",
-        "-name 'pom.xml'",
-        "-name 'build.gradle'",
-        "-name 'build.gradle.kts'",
-        "-name 'settings.gradle'",
-        "-name 'settings.gradle.kts'",
-        "-name 'gradle.properties'",
-        "-name 'CMakeLists.txt'",
-        "-name '*.cmake'",
-        "-name 'pyproject.toml'",
-        "-name 'setup.py'",
-        "-name 'requirements*.txt'",
-    ):
-        assert predicate in command
+    assert "-type f -o -type l" in command
+    assert "-name" not in command
+    assert "-iname" not in command
+    assert "-path" not in command
+    assert "awk" in command
 
 
 def test_enumeration_keeps_symlinks_visible_so_an_escape_can_be_recorded():
@@ -356,8 +338,7 @@ def test_entries_are_sorted_by_path_and_read_once_each():
     assert f"head -c {MAX_FILE_BYTES}" in execute.reads()[0]
 
 
-def test_markdown_outside_doc_dirs_and_below_the_domain_roots_is_not_a_candidate():
-    """`*.md` is collected under doc/docs and at domain roots — not repo-wide."""
+def test_markdown_anywhere_within_the_depth_bound_remains_visible():
     execute = FakeTree(
         files={
             "notes.md": "# root\n",
@@ -373,13 +354,14 @@ def test_markdown_outside_doc_dirs_and_below_the_domain_roots_is_not_a_candidate
     assert paths_of(result) == [
         f"{ROOT}/core/notes.md",
         f"{ROOT}/core/sub/deep/docs/notes.md",
+        f"{ROOT}/core/sub/deep/notes.md",
         f"{ROOT}/core/sub/notes.md",
         f"{ROOT}/notes.md",
     ]
     assert conflict_reasons(result) == {}
 
 
-def test_shell_scripts_are_collected_at_the_root_and_in_ci_and_docker_dirs():
+def test_shell_location_is_a_hint_not_an_eligibility_rule():
     execute = FakeTree(
         files={
             "install.sh": SHELL,
@@ -395,7 +377,31 @@ def test_shell_scripts_are_collected_at_the_root_and_in_ci_and_docker_dirs():
         f"{ROOT}/ci/build.sh",
         f"{ROOT}/docker/entrypoint.sh",
         f"{ROOT}/install.sh",
+        f"{ROOT}/src/main/resources/helper.sh",
     ]
+
+
+def test_unfamiliar_names_and_extensions_are_still_inventory_entries():
+    execute = FakeTree(
+        files={
+            "DEVNOTES.txt": "Build with ./mvnw install\n",
+            "TESTING": "Run the focused suite\n",
+            "DEVELOPING.rst": "Developer guide\n===============\n",
+            "tribal-knowledge.zzz": "Project-specific instructions\n",
+        }
+    )
+
+    result = discover_document_map(execute, ROOT)
+
+    assert paths_of(result) == [
+        f"{ROOT}/DEVELOPING.rst",
+        f"{ROOT}/DEVNOTES.txt",
+        f"{ROOT}/TESTING",
+        f"{ROOT}/tribal-knowledge.zzz",
+    ]
+    assert entry_named(result, "DEVNOTES.txt").kind == "text"
+    assert entry_named(result, "TESTING").kind == "markdown"
+    assert entry_named(result, "tribal-knowledge.zzz").kind == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +423,8 @@ def test_detect_kind_maps_every_candidate_shape_to_its_typed_kind():
     assert detect_kind(f"{ROOT}/gradle.properties", "org.gradle.jvmargs=-Xmx2g") == "properties"
     assert detect_kind(f"{ROOT}/setup.py", "from setuptools import setup") == "python"
     assert detect_kind(f"{ROOT}/requirements-dev.txt", "pytest==8.4.2") == "requirements"
+    assert detect_kind(f"{ROOT}/DEVNOTES.txt", "build notes") == "text"
+    assert detect_kind(f"{ROOT}/DEVELOPING.rst", "Developer guide") == "text"
 
 
 def test_detect_kind_uses_content_only_where_the_extension_says_nothing():
@@ -722,7 +730,7 @@ def test_the_file_budget_stops_at_the_cap_and_records_every_excluded_path(monkey
 
 
 def test_the_file_budget_keeps_the_sorted_head_whatever_order_find_replied(monkeypatch):
-    """Which files a budget KEEPS is a sorted-path decision, not a listing order.
+    """Budget selection is deterministic hint priority plus path, not listing order.
 
     Without this the same checkout could index a different 400 files per run —
     the map would still be "bounded" and its fingerprint would still be stable
@@ -740,6 +748,26 @@ def test_the_file_budget_keeps_the_sorted_head_whatever_order_find_replied(monke
     assert set(conflict_reasons(result)) == {
         f"{ROOT}/c/README.md",
         f"{ROOT}/d/README.md",
+    }
+
+
+def test_document_names_prioritize_content_reads_but_do_not_hide_other_paths(monkeypatch):
+    monkeypatch.setattr(document_map, "MAX_FILES", 1)
+    execute = FakeTree(
+        files={
+            "src/a.py": "print('a')\n",
+            "DEVNOTES.txt": "Build with ./mvnw install\n",
+            "unusual.zzz": "also potentially useful\n",
+        },
+        listing=["src/a.py", "unusual.zzz", "DEVNOTES.txt"],
+    )
+
+    result = discover_document_map(execute, ROOT)
+
+    assert paths_of(result) == [f"{ROOT}/DEVNOTES.txt"]
+    assert conflict_reasons(result) == {
+        f"{ROOT}/src/a.py": "over_budget",
+        f"{ROOT}/unusual.zzz": "over_budget",
     }
 
 

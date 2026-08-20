@@ -4,38 +4,29 @@ import type { EvidenceCountSummary, ExecutionSessionDetail, ObservationCountSumm
 import { Badge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { TestBar } from "@/components/common/TestBar"
+import {
+  completeEvidenceCounts,
+  formatCount,
+  formatRate,
+  presentDiagnostics,
+  presentTestRun,
+  presentVerifiedIdentities,
+} from "@/evidencePresentation"
 
 import { FailingCard } from "./FailingCard"
 import { ModuleBreakdownDialog } from "./ModuleBreakdownDialog"
 import { TestDetailPage } from "./TestDetailPage"
 
-function fmtNum(n?: number | null): string {
-  return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : "—"
-}
-
-function completeCounts(counts: EvidenceCountSummary): counts is EvidenceCountSummary & {
-  executed: number
-  passed: number
-  failed: number
-  errors: number
-  skipped: number
-} {
-  return counts.availability !== "unavailable"
-    && [counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped]
-      .every((value) => typeof value === "number" && Number.isFinite(value))
-}
-
 function LayerRow({
   counts,
   label,
-  nonVerdictBearing = false,
+  note,
 }: {
   counts: EvidenceCountSummary | ObservationCountSummary
   label: string
-  nonVerdictBearing?: boolean
+  note?: string
 }) {
-  const available = completeCounts(counts)
-  const displayLabel = nonVerdictBearing ? `${label} · not verdict-bearing` : label
+  const available = completeEvidenceCounts(counts)
   const fileNote = "reportFileCount" in counts && typeof counts.reportFileCount === "number"
     ? `${counts.reportFileCount.toLocaleString()} report files`
     : null
@@ -44,20 +35,20 @@ function LayerRow({
     <div className="border-t border-border py-2 first:border-t-0">
       <div className="flex items-center justify-between gap-3">
         <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
-          {displayLabel}
+          {label}
         </span>
         <span className="font-mono text-[12px] text-foreground">
-          {available ? `${fmtNum(counts.passed)} / ${fmtNum(counts.executed)} passed` : "Unavailable"}
+          {available ? `${formatCount(available.passed)} / ${formatCount(available.executed)} passed` : "Unavailable"}
         </span>
       </div>
-      {available && (counts.failed > 0 || counts.errors > 0 || counts.skipped > 0) ? (
+      {available && (available.failed > 0 || available.errors > 0 || available.skipped > 0) ? (
         <div className="mt-0.5 text-right font-mono text-[11px] text-muted-foreground">
-          {`${fmtNum(counts.failed)} failed · ${fmtNum(counts.errors)} errors · ${fmtNum(counts.skipped)} skipped`}
+          {`${formatCount(available.failed)} failed · ${formatCount(available.errors)} errors · ${formatCount(available.skipped)} skipped`}
         </div>
       ) : null}
-      {!available && (counts.reason || fileNote) ? (
+      {!available || note ? (
         <div className="mt-0.5 text-right font-mono text-[11px] text-muted-foreground">
-          {[fileNote, counts.reason].filter(Boolean).join(" · ")}
+          {[note, fileNote, !available ? counts.reason || "Count details were incomplete" : null].filter(Boolean).join(" · ")}
         </div>
       ) : null}
     </div>
@@ -66,106 +57,121 @@ function LayerRow({
 
 // Conclusion-first test summary (prototype workbench/sections.jsx TestBody).
 export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["test"] }) {
+  const run = presentTestRun(test)
+  const identities = presentVerifiedIdentities(test)
   const evidenceLayers = test.evidenceLayers
-  if (evidenceLayers) {
-    const layers = evidenceLayers.tests
-    const subjects = layers.claimed.latestSubjects
-    const subjectsAvailable = completeCounts(subjects)
-    const subjectNonSkip = subjectsAvailable
-      ? subjects.passed + subjects.failed + subjects.errors
-      : 0
-    const subjectRate = subjectsAvailable && subjectNonSkip > 0
-      ? Math.round((subjects.passed / subjectNonSkip) * 1000) / 10
-      : null
+  const layers = evidenceLayers?.tests
+  const diagnostics = presentDiagnostics(layers)
+  const integrityLabel = evidenceLayers
+    ? ({
+        complete: "Complete",
+        degraded: "Incomplete",
+        failed: "Failed",
+        unavailable: "Unavailable",
+      } as const)[evidenceLayers.evidence.integrity]
+    : null
 
-    return (
-      <Card className="p-4">
-        <div className="flex items-end justify-between gap-4">
+  return (
+    <Card className="overflow-hidden">
+      <div className="p-4">
+        <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
-            <div className="text-[26px] font-semibold tabular-nums text-foreground">
-              {subjectsAvailable ? (
-                <>
-                  {fmtNum(subjects.passed)}
-                  <span className="text-[16px] font-normal text-muted-foreground">
-                    {` / ${fmtNum(subjects.executed)}`}
-                  </span>
-                </>
-              ) : "Unavailable"}
+            <div className={`text-[26px] font-semibold tabular-nums ${run.valueClass ?? "text-foreground"}`}>
+              {run.stateLabel}
             </div>
             <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-              Claimed latest subjects
+              Test run result
             </div>
           </div>
-          {subjectRate != null ? (
-            <Badge tone={subjectRate >= 99 ? "green" : subjectRate >= 90 ? "amber" : "red"}>
-              {subjectRate}% pass
-            </Badge>
+          {run.passRate != null ? (
+            <Badge tone={run.tone}>{formatRate(run.passRate)} of non-skipped results passed</Badge>
           ) : null}
         </div>
-        {!subjectsAvailable && subjects.reason ? (
-          <div className="mt-2 font-mono text-[11px] text-muted-foreground">{subjects.reason}</div>
+        <p className="mt-2 text-[12px] leading-relaxed text-muted-foreground">{run.summary}</p>
+        {run.nonSkipped > 0 ? (
+          <div className="mt-3">
+            <TestBar fail={run.negative} pass={run.passed} total={run.nonSkipped} />
+          </div>
         ) : null}
-        {subjectsAvailable && subjects.executed > 0 ? (
+      </div>
+
+      <div className="border-t border-border p-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-semibold text-foreground">Verified test identities</div>
+            <p className="mt-0.5 max-w-[70ch] text-[12px] leading-relaxed text-muted-foreground">
+              {identities.summary}
+            </p>
+          </div>
+          <div className={`shrink-0 font-mono text-[16px] font-semibold tabular-nums ${identities.valueClass ?? "text-foreground"}`}>
+            {identities.value}
+          </div>
+        </div>
+        {identities.counts && identities.nonSkipped && identities.nonSkipped > 0 ? (
           <div className="mt-3">
             <TestBar
-              fail={subjects.failed + subjects.errors}
-              pass={subjects.passed}
-              total={subjects.executed}
+              fail={identities.negative ?? 0}
+              pass={identities.counts.passed}
+              total={identities.nonSkipped}
             />
           </div>
         ) : null}
-        <div className="mt-3">
-          <LayerRow counts={layers.claimed.latestCases} label="Claimed latest cases" />
-          <LayerRow counts={layers.claimed.receiptExecutions} label="Receipt executions" />
-          <LayerRow counts={layers.quarantinedObservations} label="Quarantined observations" nonVerdictBearing />
-          <LayerRow counts={layers.unattributedObservations} label="Unattributed observations" nonVerdictBearing />
-          <LayerRow counts={layers.staleObservations} label="Stale observations" nonVerdictBearing />
-          <div className="flex items-center justify-between gap-3 border-t border-border pt-2">
-            <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
-              Evidence transport
-            </span>
-            <span className="font-mono text-[12px] text-foreground">{evidenceLayers.evidence.integrity}</span>
-          </div>
-        </div>
-      </Card>
-    )
-  }
-
-  const total = Math.max(test.total, test.pass + test.fail)
-  // passRate is a percentage (0-100) in this codebase — round, don't re-scale.
-  const rate =
-    test.passRate != null
-      ? Math.round(test.passRate * 10) / 10
-      : total > 0
-        ? Math.round((test.pass / total) * 1000) / 10
-        : null
-  return (
-    <Card className="p-4">
-      <div className="flex items-end justify-between gap-4">
-        <div>
-          <div className="text-[26px] font-semibold tabular-nums text-foreground">
-            {fmtNum(test.pass)}
-            <span className="text-[16px] font-normal text-muted-foreground"> / {fmtNum(total)}</span>
-          </div>
-          <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-            runner executions passed
-          </div>
-        </div>
-        {rate != null ? (
-          <Badge tone={rate >= 99 ? "green" : rate >= 90 ? "amber" : "red"}>{rate}% pass</Badge>
-        ) : null}
       </div>
-      {total > 0 ? (
-        <div className="mt-3">
-          <TestBar fail={test.fail} pass={test.pass} total={total} />
+
+      {layers && diagnostics.hasData ? (
+        <div className="border-t border-border bg-muted/35 px-4 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-[12px] font-semibold text-foreground">Diagnostic observations</div>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{diagnostics.summary}</p>
+              {diagnostics.breakdown ? (
+                <p className="mt-1 font-mono text-[11px] text-muted-foreground">{diagnostics.breakdown}</p>
+              ) : null}
+            </div>
+            <span className="shrink-0 font-mono text-[15px] font-semibold tabular-nums text-foreground">
+              {diagnostics.value}
+            </span>
+          </div>
         </div>
       ) : null}
-      <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[12px]">
-        <span className="text-status-success">{fmtNum(test.pass)} passed</span>
-        <span className="text-status-failed">{fmtNum(test.fail)} failed</span>
-        <span className="text-muted-foreground">{fmtNum(test.skip)} skipped</span>
-        {test.note ? <span className="text-muted-foreground">· {test.note}</span> : null}
-      </div>
+
+      {layers && evidenceLayers ? (
+        <details className="group border-t border-border px-4 py-3">
+          <summary className="cursor-pointer select-none text-[11px] font-semibold text-muted-foreground hover:text-foreground">
+            Evidence details
+          </summary>
+          <div className="mt-2">
+            <LayerRow counts={layers.claimed.latestCases} label="Verified test cases" />
+            <LayerRow counts={layers.claimed.receiptExecutions} label="Recorded tool runs" />
+            <LayerRow
+              counts={layers.quarantinedObservations}
+              label="Excluded observations"
+              note="Not used in the verified result"
+            />
+            <LayerRow
+              counts={layers.unattributedObservations}
+              label="Observations without test identity"
+              note="Not used in the verified result"
+            />
+            <LayerRow
+              counts={layers.staleObservations}
+              label="Earlier-run observations"
+              note="Not used in the verified result"
+            />
+            <div className="flex items-center justify-between gap-3 border-t border-border pt-2">
+              <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+                Evidence records
+              </span>
+              <span className="font-mono text-[12px] text-foreground">{integrityLabel}</span>
+            </div>
+            {identities.rawReason ? (
+              <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted-foreground">
+                Source note: {identities.rawReason}
+              </p>
+            ) : null}
+          </div>
+        </details>
+      ) : null}
     </Card>
   )
 }
@@ -173,32 +179,38 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
 export function TestFacet({ detail }: { detail: ExecutionSessionDetail }) {
   const [open, setOpen] = useState(false)
   const s = detail.moduleSummary
-  const single = s?.singleModule ?? (detail.modules?.length ?? 0) <= 1
+  const moduleRows = detail.modules?.length ?? 0
+  const hasModuleMetrics = s != null || moduleRows > 0
+  const single = s?.singleModule ?? moduleRows === 1
   const moduleCount = s?.modulesTotal ?? detail.modules?.length ?? 0
   const failing = detail.test.failingNames ?? []
   const evidenceLayers = detail.test.evidenceLayers
   const detailLabel = evidenceLayers
-    ? single ? "View diagnostic test details →" : `View diagnostic per-module breakdown (${moduleCount} modules) →`
+    ? single ? "View module test details →" : `View per-module test details (${moduleCount} modules) →`
     : single ? "View test details →" : `View per-module breakdown (${moduleCount} modules) →`
 
   return (
     <div className="space-y-4">
       <TestConclusionCard test={detail.test} />
       {!evidenceLayers ? <FailingCard names={failing} /> : null}
-      <button
-        className="font-mono text-[11px] text-status-running hover:underline"
-        onClick={() => setOpen(true)}
-        type="button"
-      >
-        {detailLabel}
-      </button>
+      {hasModuleMetrics ? (
+        <button
+          className="font-mono text-[11px] text-status-running hover:underline"
+          onClick={() => setOpen(true)}
+          type="button"
+        >
+          {detailLabel}
+        </button>
+      ) : (
+        <p className="font-mono text-[11px] text-muted-foreground">
+          Detailed module test metrics were not produced for this run.
+        </p>
+      )}
       {open ? (
         <ModuleBreakdownDialog
           onClose={() => setOpen(false)}
           title={
-            evidenceLayers
-              ? single ? "Diagnostic test details" : "Diagnostic per-module test breakdown"
-              : single ? "Test details" : "Per-module test breakdown"
+            single ? "Test details" : "Per-module test details"
           }
         >
           <TestDetailPage detail={detail} />

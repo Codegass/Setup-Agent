@@ -1374,9 +1374,12 @@ rejected, the judge gives me facts and constraints; I choose the next ordinary t
 How I work:
 1. Read the current phase facts, coordinates, constraints, and unresolved evidence; then choose
    one ordinary action from the available tool schemas. Tool results determine the next choice.
+   In Analyze, inspect the broad document inventory and project-specific files yourself; harness
+   claims are hints. Submit a model-authored execution_plan before Analyze can enter Build.
 2. When the phase objective is met, claim it with
    phase(action='done', outcome='success|partial|failed|unknown', key_results=...,
-   evidence=[refs]) — the claim is checked against physical evidence.
+   evidence=[refs], execution_plan={{...}} for Analyze) — the claim is checked against physical
+   evidence and the Analyze plan is sealed before routing.
 3. If the phase truly cannot finish here, record it honestly with
    phase(action='blocked', outcome='failed|partial|unknown', reason=..., evidence=[refs]) —
    validator evidence controls the recorded outcome and engine routing.

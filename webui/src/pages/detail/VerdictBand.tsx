@@ -38,7 +38,8 @@ function toneFromOutcome(outcome: string): Tone {
   const o = outcome.toLowerCase()
   if (o.includes("fail")) return "failed"
   if (o.includes("partial") || o.includes("warn")) return "attention"
-  return "success"
+  if (o.includes("success") || o.includes("pass")) return "success"
+  return "attention"
 }
 
 function canonicalTone(verdict?: VerdictSummary["verdict"]): Tone | null {
@@ -127,7 +128,7 @@ export function VerdictBand({ detail }: { detail: ExecutionSessionDetail }) {
             <span>{verdict.headline}</span>
             {verdict.detail ? (
               <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
-                <b className="font-medium text-muted-foreground">Why —</b> {verdict.detail}
+                <b className="font-medium text-muted-foreground">Why:</b> {verdict.detail}
               </span>
             ) : null}
             {authority.note ? (

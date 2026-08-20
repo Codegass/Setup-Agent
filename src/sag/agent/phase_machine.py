@@ -63,6 +63,8 @@ class PhaseClaim:
     key_results: str = ""
     reason: str = ""
     evidence_refs: tuple[str, ...] = field(default_factory=tuple)
+    execution_plan_sha256: str = ""
+    execution_plan_ref: str = ""
 
     def __post_init__(self) -> None:
         signal = str(self.signal).strip().lower()
@@ -74,9 +76,19 @@ class PhaseClaim:
         object.__setattr__(self, "signal", signal)
         object.__setattr__(self, "claimed_outcome", claimed_outcome)
         object.__setattr__(self, "evidence_refs", tuple(self.evidence_refs))
+        object.__setattr__(
+            self,
+            "execution_plan_sha256",
+            str(self.execution_plan_sha256 or "").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "execution_plan_ref",
+            str(self.execution_plan_ref or "").strip(),
+        )
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        body = {
             "phase": self.phase,
             "signal": self.signal,
             "claimed_outcome": self.claimed_outcome.value,
@@ -84,6 +96,14 @@ class PhaseClaim:
             "reason": self.reason,
             "evidence_refs": list(self.evidence_refs),
         }
+        # Legacy claims remain byte-for-byte compatible.  A live Analyze claim
+        # adds only the bounded identity of its separately persisted plan, not
+        # the full model-authored object.
+        if self.execution_plan_sha256:
+            body["execution_plan_sha256"] = self.execution_plan_sha256
+        if self.execution_plan_ref:
+            body["execution_plan_ref"] = self.execution_plan_ref
+        return body
 
     @classmethod
     def from_metadata(cls, value: Mapping[str, Any]) -> "PhaseClaim":
@@ -99,6 +119,8 @@ class PhaseClaim:
             key_results=str(value.get("key_results") or ""),
             reason=str(value.get("reason") or ""),
             evidence_refs=tuple(evidence_refs),
+            execution_plan_sha256=str(value.get("execution_plan_sha256") or ""),
+            execution_plan_ref=str(value.get("execution_plan_ref") or ""),
         )
 
 

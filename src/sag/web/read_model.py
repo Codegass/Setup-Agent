@@ -47,6 +47,8 @@ class ReadModelBuilder:
             return DashboardResponse(
                 docker=DockerSummary(status="unavailable"),
                 workspaces=[],
+                read_status="unavailable",
+                read_error="Workspace data could not be read. Retry when Docker is available.",
             )
 
         return DashboardResponse(

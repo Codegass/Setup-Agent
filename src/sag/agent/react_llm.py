@@ -285,7 +285,7 @@ class ReactLLMClient:
         turn = self._native_turn_from_response(response, capabilities)
         if self.config.verbose:
             self._log_llm_response(capabilities.model, turn.text, response)
-        self._log_agent_response_length(capabilities.model, turn.text)
+        self._log_agent_response_length(capabilities.model, turn)
         return turn
 
     def get_advisor_response(
@@ -446,12 +446,27 @@ class ReactLLMClient:
             self.logger.debug(f"Could not read LLM trace context: {exc}")
             return {}
 
-    def _log_agent_response_length(self, model: str, content: str) -> None:
+    def _log_agent_response_length(self, model: str, turn: NativeTurn) -> None:
         agent_logger = self._get_trace_context().get("agent_logger")
         if agent_logger is None:
             return
 
-        agent_logger.info(f"LLM Response from {model}: {len(content)} chars")
+        call_count = len(turn.tool_calls)
+        if call_count:
+            names = ", ".join(call.name or "unknown" for call in turn.tool_calls)
+            if turn.text:
+                summary = (
+                    f"{len(turn.text)} text chars, {call_count} "
+                    f"tool call{'s' if call_count != 1 else ''} [{names}]"
+                )
+            else:
+                summary = (
+                    f"tool-only, {call_count} "
+                    f"tool call{'s' if call_count != 1 else ''} [{names}]"
+                )
+        else:
+            summary = f"{len(turn.text)} text chars, no tool calls"
+        agent_logger.info(f"LLM Response from {model}: {summary}")
 
     def _supports_function_calling(self, model: str) -> bool:
         try:

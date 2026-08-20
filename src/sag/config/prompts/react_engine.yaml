@@ -24,6 +24,10 @@ initial_system:
         the claim is checked against physical evidence (build artifacts, test reports)
       • phase(action="blocked", outcome="failed|partial|unknown", reason="...", evidence=[refs]) → claim an external impediment ended the phase; the gate validates the evidence
       • phase(action="note", text="...") → record a lasting working note for the current phase
+    - In Analyze, actively inspect the broad document inventory and any additional
+      project-specific files you discover. Harness-extracted claims are evidence hints,
+      not an execution strategy. Analyze done requires a model-authored execution_plan;
+      the engine seals it before Build and places it in later system prompts.
     - A rejected terminal claim may install a typed RepairContext. It contains judge facts,
       constraints, and neutral tool affordances, never a command or ordered repair plan.
     - While that context is active, the selected tool schema requires a repair_intent
@@ -63,6 +67,8 @@ initial_system:
       • Valid actions: done, blocked, note
       • done: claim the current phase is finished - checked against physical evidence; include
         key_results (the lasting record: facts, versions, paths, numbers) and evidence refs
+        Analyze done additionally requires execution_plan with reviewed documents, build/test
+        actions, success criteria, constraints, risks, and unresolved questions.
       • blocked: claim an external impediment ended the current phase (outcome and concrete reason required); validator evidence still controls the recorded outcome
       • note: record a lasting working note for the current phase
       • Example: phase(action="done", outcome="success", key_results="Compiled 115 classes with JDK 17; Maven 3.9.9 registered", evidence=["output_42"])
@@ -107,7 +113,14 @@ initial_system:
   intelligent_setup_workflow: |
     EVIDENCE-GROUNDED SETUP:
     - Work only the current engine-owned phase and use returned evidence to choose each action
-    - The engine mechanically creates the initial project survey/fact sheet; review those facts instead of regenerating them by default
+    - The engine mechanically inventories checkout files and creates a fact sheet
+    - The engine mechanically creates the initial project survey/fact sheet; treat these Harness
+      outputs as broad evidence and gap-checking inputs, not a harness-authored project plan or
+      execution strategy
+    - In Analyze, inspect relevant documentation, configuration, and CI yourself, including
+      unfamiliar document names, then submit an evidence-linked execution_plan
+    - Build and Test receive the sealed model-authored plan in the system message; follow it as
+      the execution baseline and explain evidence-driven deviations
     - The project schema exposes an optional fact refresh affordance after relevant checkout or configuration changes; it is not a fixed post-clone step
     - Record observed build system, runtime constraints, coordinates, and test facts in the phase result
     - Close each phase with an explicit evidence-backed outcome; the engine validates and routes it
@@ -127,9 +140,9 @@ initial_system:
     7. When a call fails, read the returned error before choosing the next call
 
     ENGINE-DRIVEN PHASE FLOW:
-    1. Read the CURRENT phase objective and its mechanically supplied facts
+    1. Read the CURRENT phase objective, inventory, and mechanically supplied facts
     2. Choose only the domain action needed for the current evidence; no fixed post-clone action sequence is required
-    3. When the work is verifiably done: phase(action="done", outcome="success|partial|failed|unknown", key_results="facts, versions, paths, numbers", evidence=[refs])
+    3. In Analyze, first author execution_plan; when any phase is verifiably done call phase(action="done", outcome="success|partial|failed|unknown", key_results="facts, versions, paths, numbers", evidence=[refs], execution_plan={...} for Analyze)
     4. For an external impediment: phase(action="blocked", outcome="failed|partial|unknown", reason="...", evidence=[refs])
     5. The engine validates, routes, and resets the phase window
 

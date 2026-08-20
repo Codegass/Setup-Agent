@@ -4,15 +4,55 @@ import shlex
 from datetime import datetime
 from pathlib import Path
 
+from sag.agent.verdict_finalizer import (
+    RunVerdictSnapshot,
+    SnapshotTestCounts,
+    SnapshotTestStats,
+)
 from sag.web.models import DockerSummary, WorkspaceSummary
 from sag.web.session_registry import (
     ContainerSessionRegistry,
     ContainerSessionStore,
     SessionRegistry,
     _build_payload_from_metrics,
+    _evidence,
     _matching_log_session_dir,
+    _snapshot_test_payload,
     _setup_logs,
 )
+
+
+def test_evidence_groups_use_actual_refs_and_do_not_fabricate_a_session_record():
+    groups = _evidence(
+        {
+            "start": "2026-08-16T03:50:00",
+            "finish": "2026-08-16T03:51:00",
+            "build": {
+                "state": "partial",
+                "note": "Canonical build evidence",
+                "evidence_refs": ["output_build"],
+            },
+            "test": {
+                "state": "success",
+                "evidence_refs": ["output_test_1", "output_test_2"],
+            },
+            "report_path": "/workspace/setup-report.md",
+        },
+        "Run completed",
+    )
+
+    assert [group.source for group in groups] == [
+        "Build evidence",
+        "Sealed run inputs",
+        "Generated report",
+    ]
+    assert groups[0].records[0].ref == "output_build"
+    assert groups[1].counts == "2 references"
+    assert all(group.source != "SAG session" for group in groups)
+
+
+def test_evidence_groups_are_empty_when_no_artifact_refs_exist():
+    assert _evidence({"start": "2026-08-16T03:50:00"}, "Run completed") == []
 
 
 def _make_session_dir(logs: Path, name: str, project: str, agent_line: str, mtime: float) -> Path:
@@ -92,6 +132,11 @@ class FakeOrchestrator:
             ]
             return {"exit_code": 0, "output": "\n".join(reports)}
 
+        if command.startswith("test -f /workspace/setup-report.md"):
+            if "/workspace/setup-report.md" in self.files:
+                return {"exit_code": 0, "output": "/workspace/setup-report.md\n"}
+            return {"exit_code": 1, "output": ""}
+
         return {"exit_code": 0, "output": ""}
 
 
@@ -102,6 +147,58 @@ def workspace_summary() -> WorkspaceSummary:
         container="sag-commons-cli",
         docker=DockerSummary(status="running"),
     )
+
+
+def test_snapshot_test_payload_uses_test_judgment_not_overall_verdict():
+    snapshot = RunVerdictSnapshot(
+        run_id="run-partial-with-green-tests",
+        finalized_at="2026-06-06T21:35:09Z",
+        verdict="partial",
+        test_stats=SnapshotTestStats(
+            discovered=4,
+            unique=SnapshotTestCounts(executed=4, passed=4),
+            raw=SnapshotTestCounts(executed=4, passed=4),
+            judgment="success",
+        ),
+    )
+
+    payload = _snapshot_test_payload(snapshot, metrics={})
+
+    assert payload["state"] == "success"
+    assert payload["total"] == 4
+    assert payload["pass"] == 4
+
+
+def test_setup_artifact_falls_back_to_generic_report_and_uses_its_finish_time():
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "legacy": True,
+                "created_at": "2026-06-06 21:32:41",
+                "last_updated": "2026-06-06 21:33:00",
+                "goal": "Set up commons-cli",
+                "todo_list": [],
+            }
+        ),
+        "/workspace/setup-report.md": (
+            "# Project Setup Report\n\n"
+            "**Generated:** 2026-06-06 21:35:09\n"
+            "**Result:** SUCCESS\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+    detail = registry.get_workspace_session_detail(workspace_summary(), rows[0].id)
+
+    assert rows[0].report == "ready"
+    assert rows[0].duration == "2m 28s"
+    assert detail is not None
+    assert detail.report_doc is not None
+    assert detail.report_doc.title == "setup-report.md"
 
 
 def test_session_registry_reads_local_session_index(tmp_path: Path):
@@ -357,7 +454,8 @@ def test_container_session_registry_returns_legacy_last_comment_detail():
     assert detail is not None
     assert detail.id == "LEGACY-20260606-211409"
     assert detail.outcome.startswith("Task completed")
-    assert detail.evidence[0].source == "SAG session"
+    assert detail.finish == "2026-06-06T21:14:09.715549"
+    assert detail.evidence == []
 
 
 def test_container_session_registry_falls_back_to_setup_artifacts_without_index_or_comment():
@@ -677,7 +775,9 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
     # not reconstruct canonical test counts or verdict from report metrics.
     assert detail.verdict is not None
     assert detail.verdict.tone == "attention"
-    assert detail.verdict.headline == "Setup verdict unknown — review before promoting"
+    assert detail.verdict.headline == (
+        "Build result unavailable. Test result unavailable. Review before promoting"
+    )
     assert detail.canonical_verdict == "unknown"
     assert detail.snapshot_status == "missing"
     assert detail.test.total == 0

@@ -25,6 +25,34 @@ def _state() -> RunEvidenceState:
     return RunEvidenceState(run_id="routing-test")
 
 
+def _analysis_record(
+    *,
+    attempt_id: str = "analyze-1",
+    plan_sha256: str = "",
+    signal: str = "done",
+    outcome: PhaseOutcome = PhaseOutcome.SUCCESS,
+) -> PhaseAttemptRecord:
+    claim = PhaseClaim(
+        phase="analyze",
+        signal=signal,
+        claimed_outcome=outcome,
+        execution_plan_sha256=plan_sha256,
+        execution_plan_ref=(
+            "/workspace/.setup_agent/project_execution_plan.json" if plan_sha256 else ""
+        ),
+    )
+    return PhaseAttemptRecord(
+        phase="analyze",
+        attempt_id=attempt_id,
+        termination=(
+            PhaseTermination.BLOCKED if signal == "blocked" else PhaseTermination.COMPLETED
+        ),
+        outcome=outcome,
+        evidence_refs=("validator://analyze",),
+        claim=claim,
+    )
+
+
 def test_failed_build_without_repair_skips_test():
     state = _state()
     policy = PhaseTransitionPolicy()
@@ -81,6 +109,116 @@ def test_successful_build_still_requires_test_entry_prerequisite():
 
     assert decision.route.kind == "evidence_close"
     assert decision.reason_code == "build_not_ready"
+
+
+def test_analyze_requires_both_survey_readiness_and_a_sealed_model_plan():
+    state = _state()
+    plan_sha256 = "a" * 64
+    state.set_fact(
+        "analysis.build_entry_ready",
+        True,
+        evidence_ref="validator://analysis",
+    )
+
+    missing = PhaseTransitionPolicy().decide(
+        _analysis_record(plan_sha256=plan_sha256),
+        state=state,
+        budgets=RepairBudgets.available(),
+    )
+
+    assert missing.route.kind == "evidence_close"
+    assert missing.reason_code == "analysis_plan_not_sealed"
+    assert [record.phase for record in missing.skips] == ["build", "test"]
+
+    state.set_fact(
+        "analysis.execution_plan_sealed",
+        True,
+        evidence_ref="/workspace/.setup_agent/project_execution_plan.json",
+    )
+    state.set_fact(
+        "analysis.execution_plan_sha256",
+        plan_sha256,
+        evidence_ref="/workspace/.setup_agent/project_execution_plan.json",
+    )
+    state.set_fact(
+        "analysis.execution_plan_source_attempt_id",
+        "analyze-1",
+        evidence_ref="/workspace/.setup_agent/project_execution_plan.json",
+    )
+
+    ready = PhaseTransitionPolicy().decide(
+        _analysis_record(plan_sha256=plan_sha256),
+        state=state,
+        budgets=RepairBudgets.available(),
+    )
+
+    assert ready.route.kind == "advance"
+    assert ready.route.target == "build"
+
+
+def test_analyze_one_plan_cannot_license_analyze_two():
+    state = _state()
+    plan_sha256 = "b" * 64
+    for key, value in (
+        ("analysis.build_entry_ready", True),
+        ("analysis.execution_plan_sealed", True),
+        ("analysis.execution_plan_sha256", plan_sha256),
+        ("analysis.execution_plan_source_attempt_id", "analyze-1"),
+    ):
+        state.set_fact(key, value, evidence_ref="artifact://analyze-1-plan")
+
+    decision = PhaseTransitionPolicy().decide(
+        _analysis_record(attempt_id="analyze-2", plan_sha256=plan_sha256),
+        state=state,
+        budgets=RepairBudgets.available(),
+    )
+
+    assert decision.route.kind == "evidence_close"
+    assert decision.reason_code == "analysis_plan_not_current"
+    assert [record.phase for record in decision.skips] == ["build", "test"]
+
+
+def test_blocked_analyze_without_a_plan_claim_cannot_borrow_a_sealed_artifact():
+    state = _state()
+    for key, value in (
+        ("analysis.build_entry_ready", True),
+        ("analysis.execution_plan_sealed", True),
+        ("analysis.execution_plan_sha256", "c" * 64),
+        ("analysis.execution_plan_source_attempt_id", "analyze-2"),
+    ):
+        state.set_fact(key, value, evidence_ref="artifact://analyze-2-plan")
+
+    decision = PhaseTransitionPolicy().decide(
+        _analysis_record(
+            attempt_id="analyze-2",
+            signal="blocked",
+            outcome=PhaseOutcome.PARTIAL,
+        ),
+        state=state,
+        budgets=RepairBudgets.available(),
+    )
+
+    assert decision.route.kind == "evidence_close"
+    assert decision.reason_code == "analysis_plan_not_current"
+    assert [record.phase for record in decision.skips] == ["build", "test"]
+
+
+def test_legacy_replay_policy_can_replay_pre_plan_analysis_transition():
+    state = _state()
+    state.set_fact(
+        "analysis.build_entry_ready",
+        True,
+        evidence_ref="validator://legacy-analysis",
+    )
+
+    decision = PhaseTransitionPolicy(require_analysis_plan=False).decide(
+        _record("analyze", PhaseOutcome.SUCCESS),
+        state=state,
+        budgets=RepairBudgets.available(),
+    )
+
+    assert decision.route.kind == "advance"
+    assert decision.route.target == "build"
 
 
 def test_terminal_test_routes_to_evidence_close_for_every_outcome():

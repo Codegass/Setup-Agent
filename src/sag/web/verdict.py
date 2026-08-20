@@ -11,7 +11,9 @@ def _tone(outcome: str, build: dict | None, test: dict | None) -> str:
         test and int(test.get("fail", 0) or 0) + int(test.get("errors", 0) or 0) > 0
     ):
         return "attention"
-    return "success"
+    if "success" in o or "pass" in o:
+        return "success"
+    return "attention"
 
 
 def _canonical_tone(verdict: str) -> str:
@@ -34,11 +36,17 @@ def _build_clause(build: dict | None, ms: dict | None) -> str | None:
         return (
             f"Build passed on {built} of {total} modules"
             if built
-            else f"Build failed — 0 of {total} modules compiled"
+            else f"Build failed; 0 of {total} modules compiled"
         )
     if state in {"failed", "failure"}:
         return "Build failed"
-    return "Build passed" if state in {"success", "ok"} else None
+    if state in {"success", "ok"}:
+        return "Build passed"
+    if state == "partial":
+        return "Build partially completed"
+    if state in {"unknown", "unavailable"}:
+        return "Build result unavailable"
+    return None
 
 
 def _test_clause(test: dict | None) -> str | None:
@@ -46,11 +54,12 @@ def _test_clause(test: dict | None) -> str | None:
         return None
     total = int(test.get("total", 0) or 0)
     fail = int(test.get("fail", 0) or 0) + int(test.get("errors", 0) or 0)
+    state = str(test.get("state", "")).lower()
     if total <= 0:
-        return None
+        return "Test result unavailable" if state in {"unknown", "unavailable"} else None
     if fail == 0:
-        return f"{total:,} tests passing"
-    return f"{fail:,} of {total:,} tests failing"
+        return f"Test run passed with {total:,} sealed results"
+    return f"Test run recorded {fail:,} non-passing results of {total:,}"
 
 
 def compose_verdict(
@@ -73,9 +82,9 @@ def compose_verdict(
         tone = _canonical_tone(canonical_verdict)
     else:
         tone = _tone(outcome, build, test)
-    headline = ". ".join(clauses) or "Setup verdict unknown"
+    headline = ". ".join(clauses) or "Setup result unavailable"
     if tone != "success":
-        headline += " — review before promoting"
+        headline += ". Review before promoting"
     detail = (blocker or {}).get("hint") if blocker else None
     return {
         "tone": tone,

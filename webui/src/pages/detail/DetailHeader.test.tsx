@@ -82,6 +82,26 @@ describe("DetailHeader", () => {
     expect(screen.queryByText(/\/\s*\d+\s*steps/)).not.toBeInTheDocument()
   })
 
+  it("omits placeholder metadata and uses the selected session finish time", () => {
+    render(
+      <DetailHeader
+        workspace={{
+          id: "sag-acme", project: "acme-platform", container: "sag-acme",
+          stack: "Unknown", updated: "a newer workspace run",
+        } as WorkspaceSummary}
+        detail={{
+          duration: "—", model: "unknown", finish: "2026-08-16T03:50:48Z",
+        } as ExecutionSessionDetail}
+        sessionId="S1"
+        {...noopHandlers}
+      />,
+    )
+
+    expect(screen.queryByText(/unknown/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/a newer workspace run/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/finished 2026-08-16T03:50:48Z/i)).toBeInTheDocument()
+  })
+
   it("renders the primary New task action and labeled secondary actions", () => {
     const onNewTask = vi.fn()
     render(<DetailHeader workspace={workspace} detail={makeDetail()} sessionId="CC-1" {...noopHandlers} onNewTask={onNewTask} />)

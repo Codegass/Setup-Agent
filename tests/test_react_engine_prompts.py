@@ -117,7 +117,10 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "AVAILABLE TOOLS" in prompt
     assert "dummy: Dummy tool for prompt tests" not in prompt
     assert "Usage: dummy()" not in prompt
-    assert "engine mechanically creates the initial project survey/fact sheet" in prompt
+    assert "engine mechanically inventories checkout files and creates a fact sheet" in prompt
+    assert "broad evidence and gap-checking inputs" in prompt
+    assert "not a harness-authored project plan" in prompt
+    assert "submit an evidence-linked execution_plan" in prompt
     assert "no fixed post-clone action sequence is required" in prompt
     assert "Handling Maven POM Parsing Errors" not in prompt
     assert "Handling Multi-Module Maven Test Execution" not in prompt

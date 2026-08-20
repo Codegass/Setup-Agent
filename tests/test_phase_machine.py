@@ -3,7 +3,8 @@ advancement, always-available escape valve, honest records."""
 
 import pytest
 
-from sag.agent.phase_gates import ValidatorState, validate_phase_claim
+from sag.agent.control_events import GateDecisionPayload
+from sag.agent.phase_gates import ValidatorState, claim_identity, validate_phase_claim
 from sag.agent.phase_machine import (
     PHASE_NAMES,
     PhaseAttemptRecord,
@@ -17,6 +18,48 @@ from sag.agent.phase_transitions import PhaseRoute, TransitionDecision
 
 def test_phase_order_is_fixed():
     assert PHASE_NAMES == ["provision", "analyze", "build", "test", "report"]
+
+
+def test_plan_identity_round_trips_and_changes_the_terminal_claim_identity():
+    base = PhaseClaim(
+        phase="analyze",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="same analysis result",
+    )
+    with_plan = PhaseClaim(
+        phase="analyze",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="same analysis result",
+        execution_plan_sha256="a" * 64,
+        execution_plan_ref="/workspace/.setup_agent/project_execution_plan.json",
+    )
+
+    assert "execution_plan_sha256" not in base.to_metadata()
+    assert PhaseClaim.from_metadata(with_plan.to_metadata()) == with_plan
+    assert claim_identity(base) != claim_identity(with_plan)
+
+
+def test_gate_decision_preserves_plan_identity_without_changing_legacy_payloads():
+    common = {
+        "phase": "analyze",
+        "claimed_outcome": "success",
+        "validator_state": "green",
+        "expected_accepted": True,
+        "expected_outcome": "success",
+    }
+
+    legacy = GateDecisionPayload.model_validate(common).model_dump(mode="json")
+    current = GateDecisionPayload.model_validate(
+        {
+            **common,
+            "execution_plan_sha256": "b" * 64,
+            "execution_plan_ref": "/workspace/.setup_agent/project_execution_plan.json",
+        }
+    ).model_dump(mode="json")
+
+    assert "execution_plan_sha256" not in legacy
+    assert current["execution_plan_sha256"] == "b" * 64
+    assert current["execution_plan_ref"].endswith("project_execution_plan.json")
 
 
 def test_starts_in_provision():

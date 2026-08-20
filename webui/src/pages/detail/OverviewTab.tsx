@@ -1,40 +1,18 @@
-import type { EvidenceCountSummary, ExecutionSessionDetail, ObservationCountSummary } from "@/api/types"
+import type { ExecutionSessionDetail } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
 import { NeedsAttention } from "@/components/session/NeedsAttention"
+import {
+  formatRate,
+  presentBuild,
+  presentDataNotes,
+  presentDiagnostics,
+  presentTestRun,
+  presentVerifiedIdentities,
+} from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
 function pct1(n: number): string {
   return `${n.toFixed(1).replace(/\.0$/, "")}%`
-}
-
-function passRate(pass: number, total: number): string | null {
-  return total > 0 ? pct1((pass / total) * 100) : null
-}
-
-function completeCounts(counts: EvidenceCountSummary | undefined): counts is EvidenceCountSummary & {
-  executed: number
-  passed: number
-  failed: number
-  errors: number
-  skipped: number
-} {
-  return !!counts
-    && counts.availability !== "unavailable"
-    && [counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped]
-      .every((value) => typeof value === "number" && Number.isFinite(value))
-}
-
-function observationNote(
-  label: string,
-  counts: ObservationCountSummary,
-): string | null {
-  if (typeof counts.executed === "number" && counts.executed > 0) {
-    return `${counts.executed.toLocaleString()} ${label} observations · not verdict-bearing`
-  }
-  if (typeof counts.reportFileCount === "number" && counts.reportFileCount > 0) {
-    return `${counts.reportFileCount.toLocaleString()} ${label} report files · not verdict-bearing`
-  }
-  return null
 }
 
 function progressText(progress: Record<string, number> | undefined): string | null {
@@ -57,12 +35,12 @@ function Tile({
   valueClass?: string
 }) {
   return (
-    <div className="rounded-[10px] border border-border bg-card px-4 py-3.5">
+    <div className="min-w-0 rounded-[10px] border border-border bg-card px-4 py-3.5">
       <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">{label}</div>
       <div className={cn("mt-1 text-[27px] font-bold leading-[1.1] tracking-[-0.02em] text-foreground", valueClass)}>
         {value}
       </div>
-      {sub ? <div className="mt-1 font-mono text-[12px] text-muted-foreground">{sub}</div> : null}
+      {sub ? <div className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{sub}</div> : null}
     </div>
   )
 }
@@ -83,55 +61,30 @@ export function OverviewTab({
   const test = detail.test
   const ms = detail.moduleSummary
   const modules = detail.modules ?? []
-  const singleModule = ms?.singleModule ?? modules.length <= 1
   const layers = test.evidenceLayers?.tests
-  const claimedSubjects = layers?.claimed.latestSubjects
-  const claimedAvailable = completeCounts(claimedSubjects)
-  const claimedNonSkip = claimedAvailable
-    ? claimedSubjects.passed + claimedSubjects.failed + claimedSubjects.errors
-    : 0
-
-  const rate = layers
-    ? claimedAvailable ? passRate(claimedSubjects.passed, claimedNonSkip) : null
-    : passRate(test.pass, test.total)
-  const passSub = layers
-    ? claimedAvailable
-      ? [
-          `${claimedSubjects.passed.toLocaleString()} passed`,
-          claimedSubjects.skipped ? `${claimedSubjects.skipped.toLocaleString()} skipped` : null,
-        ].filter(Boolean).join(" · ")
-      : claimedSubjects?.reason ?? "module-qualified subject metric unavailable"
-    : [
-        test.pass ? `${test.pass.toLocaleString()} passed` : null,
-        test.skip ? `${test.skip.toLocaleString()} skipped` : null,
-      ].filter(Boolean).join(" · ")
-
-  const claimedFailures = claimedAvailable
-    ? claimedSubjects.failed + claimedSubjects.errors
-    : null
-  const observationSub = layers
-    ? [
-        observationNote("quarantined", layers.quarantinedObservations),
-        observationNote("unattributed", layers.unattributedObservations),
-        observationNote("stale", layers.staleObservations),
-      ].filter(Boolean).join(" · ")
-    : null
-
-  const failingModules = modules.filter((m) => (m.failingCount ?? 0) > 0).length
-  const failSub = layers
-    ? observationSub || null
-    : !singleModule && failingModules > 0
-      ? `across ${failingModules} module${failingModules > 1 ? "s" : ""}`
-      : null
-  const passValueClass = layers
-    ? claimedFailures === 0 && rate !== null ? "text-status-success" : undefined
-    : "text-status-success"
-  const failureValueClass = (layers ? claimedFailures ?? 0 : test.fail) > 0
-    ? "text-status-failed"
-    : undefined
+  const run = presentTestRun(test)
+  const identities = presentVerifiedIdentities(test)
+  const diagnostics = presentDiagnostics(layers)
+  const dataNotes = presentDataNotes(test.conflicts)
 
   const goal = detail.context?.trunk.goal
   const progress = progressText(detail.context?.trunk.progress)
+  const build = presentBuild(detail.build, detail.rates)
+  const hasModuleMetrics = ms != null || modules.length > 0
+  const reportDeliveryCopy = detail.reportDeliveryStatus === "failed"
+    ? {
+        title: "Final report not delivered",
+        body: "The sealed results above are available, but the final report could not be delivered.",
+      }
+    : detail.reportDeliveryStatus === "skipped"
+      ? {
+          title: "Final report delivery skipped",
+          body: "The sealed results above are available. This run did not send a final report.",
+        }
+      : null
+  const partialResult = detail.canonicalVerdict === "partial"
+    || detail.status.trim().toLowerCase() === "partial"
+    || test.state.trim().toLowerCase() === "partial"
 
   return (
     <div>
@@ -148,38 +101,29 @@ export function OverviewTab({
         </button>
       ) : null}
 
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <Tile
-          label={layers ? "Claimed subject pass rate" : "Pass rate"}
-          value={rate ?? "—"}
-          sub={passSub || null}
-          valueClass={passValueClass}
+          label="Test run"
+          value={run.stateLabel}
+          sub={
+            run.passRate == null
+              ? run.summary
+              : `${run.summary} · ${formatRate(run.passRate)} of non-skipped results passed`
+          }
+          valueClass={run.valueClass}
         />
         <Tile
-          label={layers ? "Claimed subject failures" : "Failing tests"}
-          value={claimedFailures === null && layers ? "—" : String(layers ? claimedFailures : test.fail ?? 0)}
-          sub={failSub}
-          valueClass={failureValueClass}
+          label="Verified test identities"
+          value={identities.value}
+          sub={identities.summary}
+          valueClass={identities.valueClass}
         />
-        {!singleModule && ms ? (
-          <Tile
-            label="Modules built"
-            value={`${ms.modulesBuilt} / ${ms.modulesTotal}`}
-            sub={ms.modulesFailed > 0 ? `${ms.modulesFailed} failed` : null}
-            valueClass={
-              ms.modulesFailed === 0 && ms.modulesBuilt >= ms.modulesTotal
-                ? "text-status-success"
-                : "text-status-attention"
-            }
-          />
-        ) : (
-          <Tile
-            label="Build"
-            value={detail.build.state === "success" ? "Passed" : detail.build.state === "failed" || detail.build.state === "failure" ? "Failed" : "—"}
-            sub={detail.build.tool || null}
-            valueClass={detail.build.state === "success" ? "text-status-success" : "text-status-failed"}
-          />
-        )}
+        <Tile
+          label="Build"
+          value={build.value}
+          sub={build.summary}
+          valueClass={build.valueClass}
+        />
         {ms?.lineRate != null ? (
           <Tile
             label="Line coverage"
@@ -202,12 +146,44 @@ export function OverviewTab({
             }
           />
         ) : null}
-        {detail.build.time ? (
-          <Tile label="Build time" value={detail.build.time} sub={detail.build.note || null} />
-        ) : null}
       </div>
 
-      {!singleModule && modules.length > 0 ? (
+      {layers && diagnostics.hasData ? (
+        <section className="mt-3 flex flex-col gap-3 rounded-[10px] border border-border bg-muted/40 px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0">
+            <h2 className="text-[13px] font-semibold text-foreground">Diagnostic observations</h2>
+            <p className="mt-0.5 max-w-[72ch] text-[12px] leading-relaxed text-muted-foreground">
+              {diagnostics.summary}
+            </p>
+            {diagnostics.breakdown ? (
+              <p className="mt-1 font-mono text-[11px] text-muted-foreground">{diagnostics.breakdown}</p>
+            ) : null}
+          </div>
+          <div className="shrink-0 font-mono text-[20px] font-semibold tabular-nums text-foreground">
+            {diagnostics.value}
+          </div>
+        </section>
+      ) : null}
+
+      {reportDeliveryCopy ? (
+        <section className="mt-3 rounded-[10px] border border-status-attention-border bg-status-attention-soft/40 px-4 py-3">
+          <h2 className="text-[13px] font-semibold text-status-attention">{reportDeliveryCopy.title}</h2>
+          <p className="mt-0.5 text-[12px] leading-relaxed text-foreground">{reportDeliveryCopy.body}</p>
+        </section>
+      ) : null}
+
+      {dataNotes.length > 0 ? (
+        <details className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3">
+          <summary className="cursor-pointer select-none text-[12px] font-semibold text-muted-foreground hover:text-foreground">
+            {partialResult ? "Why this result is partial" : "Data notes"}
+          </summary>
+          <ul className="mt-2 space-y-1.5 pl-4 text-[12px] leading-relaxed text-muted-foreground">
+            {dataNotes.map((note) => <li key={note} className="list-disc">{note}</li>)}
+          </ul>
+        </details>
+      ) : null}
+
+      {modules.length > 0 ? (
         <section className="mt-5 overflow-hidden rounded-xl border border-border bg-card">
           <div className="flex items-center justify-between border-b border-border px-4 py-3">
             <h2 className="text-[14px] font-bold text-foreground">Per-module breakdown</h2>
@@ -217,6 +193,13 @@ export function OverviewTab({
             </span>
           </div>
           <ModuleTable modules={modules} variant="overview" />
+        </section>
+      ) : !hasModuleMetrics ? (
+        <section className="mt-5 rounded-xl border border-dashed border-border bg-muted/30 px-4 py-3">
+          <h2 className="text-[13px] font-semibold text-foreground">Module details unavailable</h2>
+          <p className="mt-0.5 text-[12px] leading-relaxed text-muted-foreground">
+            Detailed module metrics were not produced for this run. The build result above remains the recorded result.
+          </p>
         </section>
       ) : null}
 

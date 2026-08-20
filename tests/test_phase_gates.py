@@ -403,6 +403,47 @@ def test_analyze_validator_maps_complete_and_partial_evidence():
     assert partial.validator_state is ValidatorState.PARTIAL
 
 
+def test_analyze_readiness_rejects_a_sealed_plan_from_another_attempt(monkeypatch):
+    class Analyzer(FakeValidator):
+        def validate_project_analysis_status(self, project_name=None):
+            return {
+                "analyzed": True,
+                "has_static_test_count": True,
+                "static_test_count": 12,
+            }
+
+    monkeypatch.setattr(
+        "sag.agent.project_execution_plan.read_sealed_project_execution_plan",
+        lambda _orchestrator: SimpleNamespace(
+            authored_plan_sha256="a" * 64,
+            source_attempt_id="analyze-1",
+        ),
+    )
+
+    stale = check_phase_done(
+        "analyze",
+        validator=Analyzer(),
+        orchestrator=_orch(),
+        project_name="demo",
+        expected_analysis_attempt_id="analyze-2",
+    )
+    current = check_phase_done(
+        "analyze",
+        validator=Analyzer(),
+        orchestrator=_orch(),
+        project_name="demo",
+        expected_analysis_attempt_id="analyze-1",
+    )
+
+    assert stale["validated_facts"]["analysis.execution_plan_artifact_present"] is True
+    assert stale["validated_facts"]["analysis.execution_plan_sealed"] is False
+    assert stale["validated_facts"]["analysis.build_entry_ready"] is False
+    assert stale["validated_facts"]["analysis.execution_plan_source_attempt_id"] == "analyze-1"
+    assert stale["validated_facts"]["analysis.execution_plan_expected_attempt_id"] == "analyze-2"
+    assert current["validated_facts"]["analysis.execution_plan_sealed"] is True
+    assert current["validated_facts"]["analysis.build_entry_ready"] is True
+
+
 def test_analyze_missing_facts_reason_is_engine_projected_from_typed_code():
     class Analyzer(FakeValidator):
         def validate_project_analysis_status(self, project_name=None):

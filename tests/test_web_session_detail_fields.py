@@ -81,7 +81,8 @@ def test_compose_verdict_reads_serialized_model_aliases():
     assert verdict is not None
     assert verdict["tone"] == "attention"
     assert verdict["headline"] == (
-        "Build passed on 3 of 4 modules. 7 of 1,205 tests failing — review before promoting"
+        "Build passed on 3 of 4 modules. "
+        "Test run recorded 7 non-passing results of 1,205. Review before promoting"
     )
 
 

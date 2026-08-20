@@ -200,9 +200,29 @@ def test_native_turn_logs_trace_context_and_agent_response_length(monkeypatch):
     turn = client.get_native_turn([{"role": "user", "content": "go"}])
 
     assert turn.text == "all good"
-    assert agent_logger.messages == ["LLM Response from gpt-4o: 8 chars"]
+    assert agent_logger.messages == ["LLM Response from gpt-4o: 8 text chars, no tool calls"]
     assert '"iteration": 7' in captured_verbose_logger.info_messages[0]
     assert '"timestamp": "2026-06-03 22:15:00"' in captured_verbose_logger.info_messages[0]
+
+
+def test_native_turn_logs_a_tool_only_response_as_a_call(monkeypatch):
+    captured_verbose_logger = FakeVerboseLogger()
+    agent_logger = FakeAgentLogger()
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(name="search", arguments='{"query":"maven"}'),
+    )
+    monkeypatch.setattr(
+        "litellm.completion",
+        lambda **params: make_response(tool_calls=[tool_call]),
+    )
+    client = _verbose_client(monkeypatch, captured_verbose_logger, agent_logger)
+
+    turn = client.get_native_turn([{"role": "user", "content": "go"}])
+
+    assert turn.text == ""
+    assert [call.name for call in turn.tool_calls] == ["search"]
+    assert agent_logger.messages == ["LLM Response from gpt-4o: tool-only, 1 tool call [search]"]
 
 
 def test_native_turn_logs_then_propagates_a_provider_failure(monkeypatch):
@@ -221,5 +241,4 @@ def test_native_turn_logs_then_propagates_a_provider_failure(monkeypatch):
         client.get_native_turn([{"role": "user", "content": "go"}])
 
     assert any("llm_error" in message for message in captured_verbose_logger.error_messages)
-
 

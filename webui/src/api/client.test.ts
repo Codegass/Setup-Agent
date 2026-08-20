@@ -6,6 +6,7 @@ import {
   fetchLaunchQueue,
   fetchSession,
   fetchTrajectory,
+  fetchTrajectoryEnvelope,
   submitProjectBatch,
   submitTask,
 } from "./client"
@@ -71,6 +72,23 @@ describe("api client", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/sessions/S%201%2F%3F/trajectory?detail=full&since_seq=12",
+    )
+  })
+
+  it("resolves one encoded trajectory envelope", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        sequence: 8,
+        envelope_id: "envelope 8/?",
+        tool: "project",
+        exact_params: { action: "provision", java_version: "17" },
+      }),
+    )
+
+    await fetchTrajectoryEnvelope("S 1/?", "envelope 8/?")
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/S%201%2F%3F/trajectory/envelopes/envelope%208%2F%3F",
     )
   })
 

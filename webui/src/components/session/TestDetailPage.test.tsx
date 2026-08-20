@@ -22,7 +22,7 @@ describe("TestDetailPage (per-module breakdown)", () => {
   it("renders the tiles and the per-module table with failing expand", () => {
     render(<TestDetailPage detail={multi} />)
     expect(screen.getByText(/modules w\/ fails/i)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: /view 2 failures/i }))
+    fireEvent.click(screen.getByRole("button", { name: /view 2 issues/i }))
     expect(screen.getByText("a.StreamTest.shouldX")).toBeInTheDocument()
   })
 

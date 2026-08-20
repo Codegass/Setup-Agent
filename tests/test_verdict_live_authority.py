@@ -9,6 +9,7 @@ from sag.agent.control_events import ControlEventSink
 from sag.agent.evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
     EvidencePublicationAuthority,
+    evidence_publication_authority_for,
     install_evidence_publication_authority,
     reset_evidence_publication_authority,
 )
@@ -468,6 +469,7 @@ def test_web_offline_reader_recovers_verdict_from_host_run_pin_authority(tmp_pat
     assert snapshot is not None
     assert snapshot.run_id == "offline-run"
     assert snapshot.verdict == "partial"
+    assert evidence_publication_authority_for(orchestrator).run_id == "offline-run"
 
 
 def test_web_offline_reader_rejects_old_published_run_selected_by_container(tmp_path):

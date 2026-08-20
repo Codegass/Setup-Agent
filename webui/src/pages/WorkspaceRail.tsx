@@ -30,22 +30,51 @@ function buildState(build: WorkspaceSummary["build"]): string {
   return normalize(typeof build === "string" ? build : build.state)
 }
 
+function isFiniteCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+}
+
+function visibleMetadata(value: string | null | undefined): string | null {
+  const normalized = normalize(value)
+  return normalized && !["unknown", "none", "unavailable", "n/a", "-", "—"].includes(normalized)
+    ? value!.trim()
+    : null
+}
+
 function evidenceObservationLabel(test: WorkspaceSummary["test"]): string | null {
   const layers = test.evidenceLayers?.tests
   if (!layers) return null
-  const labels: string[] = []
-  for (const [name, observations] of [
-    ["quarantined", layers.quarantinedObservations],
-    ["unattributed", layers.unattributedObservations],
-    ["stale", layers.staleObservations],
-  ] as const) {
-    if (typeof observations.executed === "number" && observations.executed > 0) {
-      labels.push(`${observations.executed.toLocaleString()} ${name} observations`)
-    } else if (typeof observations.reportFileCount === "number" && observations.reportFileCount > 0) {
-      labels.push(`${observations.reportFileCount.toLocaleString()} ${name} report files`)
+  let known = 0
+  let files = 0
+  let incomplete = false
+  for (const observations of [
+    layers.quarantinedObservations,
+    layers.unattributedObservations,
+    layers.staleObservations,
+  ]) {
+    if (isFiniteCount(observations.executed)) {
+      known += observations.executed
+    } else if (observations.availability === "unavailable" || observations.executed == null) {
+      incomplete = true
     }
+    if (isFiniteCount(observations.reportFileCount)) files += observations.reportFileCount
   }
-  return labels.length ? `${labels.join("; ")} (not verdict-bearing)` : null
+  if (known > 0) {
+    return `${incomplete ? "At least " : ""}${known.toLocaleString()} additional diagnostics were excluded from the sealed run result`
+  }
+  if (incomplete) {
+    return "Additional diagnostic observations exist, but their total is unavailable; they are excluded from the sealed run result"
+  }
+  return files > 0
+    ? `Additional diagnostics exist in ${files.toLocaleString()} report files and are excluded from the sealed run result`
+    : null
+}
+
+function buildBucket(state: string): "success" | "partial" | "failed" | "unavailable" {
+  if (["success", "green", "passed", "pass"].includes(state)) return "success"
+  if (["partial", "incomplete"].includes(state)) return "partial"
+  if (["failure", "failed", "red"].includes(state)) return "failed"
+  return "unavailable"
 }
 
 const DOT_TONE: Record<string, string> = {
@@ -74,7 +103,7 @@ function RailRow({
 }) {
   const dockerNorm = normalize(workspace.docker.status)
   const dot = DOT_TONE[statusMeta(workspace.docker.status).tone] ?? DOT_TONE.neutral
-  const build = buildState(workspace.build)
+  const build = buildBucket(buildState(workspace.build))
   const attention = needsAttention(workspace)
   const subjectCounts = workspace.test.evidenceLayers?.tests.claimed.latestSubjects
   const subjectValues = subjectCounts
@@ -82,12 +111,39 @@ function RailRow({
     : []
   const subjectsAvailable = !!subjectCounts
     && subjectCounts.availability !== "unavailable"
-    && subjectValues.every((value) => typeof value === "number" && Number.isFinite(value))
+    && subjectValues.every(isFiniteCount)
+    && (subjectCounts.executed as number) === (
+      (subjectCounts.passed as number)
+      + (subjectCounts.failed as number)
+      + (subjectCounts.errors as number)
+      + (subjectCounts.skipped as number)
+    )
   const claimedTotal = subjectsAvailable ? subjectCounts.executed as number : 0
   const claimedPassed = subjectsAvailable ? subjectCounts.passed as number : 0
   const claimedFailed = subjectsAvailable ? (subjectCounts.failed as number) + (subjectCounts.errors as number) : 0
-  const legacyTotal = Math.max(workspace.test.total, workspace.test.pass + workspace.test.fail)
+  const runErrors = workspace.test.errors ?? 0
+  const runValues = [workspace.test.pass, workspace.test.fail, runErrors, workspace.test.skip, workspace.test.total]
+  const runComponents = workspace.test.pass + workspace.test.fail + runErrors + workspace.test.skip
+  const runState = normalize(workspace.test.state)
+  const runMeasured = !!runState
+    && !["none", "unknown", "unavailable", "pending", "not-run", "not_run"].includes(runState)
+    && runValues.every(isFiniteCount)
+  const runAvailable = runMeasured && runComponents > 0
+  const runFailed = workspace.test.fail + runErrors
   const observationLabel = evidenceObservationLabel(workspace.test)
+  const identityLabel = subjectCounts
+    ? subjectsAvailable
+      ? `Stable identities: ${claimedPassed.toLocaleString()} passed and ${claimedFailed.toLocaleString()} failed or errored of ${claimedTotal.toLocaleString()}`
+      : "Stable module and test identities unavailable"
+    : null
+  const stack = visibleMetadata(workspace.stack)
+  const commit = visibleMetadata(workspace.commit)
+  const runBreakdown = [
+    `${workspace.test.pass.toLocaleString()} passed`,
+    workspace.test.fail ? `${workspace.test.fail.toLocaleString()} failed` : null,
+    runErrors ? `${runErrors.toLocaleString()} errors` : null,
+    workspace.test.skip ? `${workspace.test.skip.toLocaleString()} skipped` : null,
+  ].filter(Boolean).join(", ")
 
   const body = (
     <>
@@ -104,9 +160,11 @@ function RailRow({
           {workspace.release ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{workspace.release}</span> : null}
           {workspace.activeSession ? <Activity className="shrink-0 text-status-running" size={11} /> : null}
         </span>
-        <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
-          {[workspace.stack, workspace.commit].filter(Boolean).join(" · ")}
-        </span>
+        {stack || commit ? (
+          <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+            {[stack, commit].filter(Boolean).join(" · ")}
+          </span>
+        ) : null}
       </span>
       <span className="flex shrink-0 items-center gap-2">
         {deleting ? (
@@ -119,58 +177,43 @@ function RailRow({
               label={
                 build === "success"
                   ? "Build succeeded"
-                  : build === "failure" || build === "failed"
+                  : build === "partial"
+                    ? "Build partially completed"
+                    : build === "failed"
                     ? "Build failed"
-                    : "No build result yet"
+                    : "Build result unavailable"
               }
             >
-              {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-muted-foreground" size={12} />}
-            </Tooltip>
-            {subjectCounts ? (
-              subjectsAvailable ? (
-                claimedTotal > 0 ? (
-                  <Tooltip
-                    label={[
-                      `Claimed latest subjects: ${claimedPassed} passed, ${claimedFailed} failed of ${claimedTotal}`,
-                      observationLabel,
-                    ].filter(Boolean).join(". ")}
-                  >
-                    <TestBar fail={claimedFailed} pass={claimedPassed} total={claimedTotal} />
-                  </Tooltip>
-                ) : (
-                  <Tooltip label={["Claimed latest subjects: 0 executed", observationLabel].filter(Boolean).join("; ")}>
-                    <span
-                      aria-label={["Claimed latest subjects: 0 executed", observationLabel].filter(Boolean).join("; ")}
-                      className="w-10 text-right font-mono text-[10px] text-muted-foreground"
-                    >
-                      0
-                    </span>
-                  </Tooltip>
-                )
+              {build === "success" ? (
+                <Check className="text-status-success" size={13} />
+              ) : build === "partial" ? (
+                <Clock className="text-status-attention" size={12} />
+              ) : build === "failed" ? (
+                <X className="text-status-failed" size={13} />
               ) : (
-                <Tooltip
-                  label={[
-                    "Claimed latest subjects unavailable",
-                    observationLabel,
-                  ].filter(Boolean).join("; ")}
-                >
-                  <span
-                    aria-label={[
-                      "Claimed latest subjects unavailable",
-                      observationLabel,
-                    ].filter(Boolean).join("; ")}
-                    className="w-10 text-right font-mono text-[10px] text-muted-foreground"
-                  >
-                    —
-                  </span>
-                </Tooltip>
-              )
-            ) : normalize(workspace.test.state) !== "none" && legacyTotal > 0 ? (
-              <Tooltip label={`Tests: ${workspace.test.pass} passed, ${workspace.test.fail} failed of ${legacyTotal}`}>
-                <TestBar fail={workspace.test.fail} pass={workspace.test.pass} total={legacyTotal} />
+                <Clock className="text-muted-foreground" size={12} />
+              )}
+            </Tooltip>
+            {runAvailable ? (
+              <Tooltip
+                label={[
+                  `Sealed run: ${runBreakdown}`,
+                  identityLabel,
+                  observationLabel,
+                ].filter(Boolean).join(". ")}
+              >
+                <TestBar fail={runFailed} pass={workspace.test.pass} total={runComponents} />
+              </Tooltip>
+            ) : runMeasured ? (
+              <Tooltip label={["Sealed run: 0 results", identityLabel, observationLabel].filter(Boolean).join(". ")}>
+                <span className="w-10 text-right font-mono text-[10px] text-muted-foreground">0</span>
+              </Tooltip>
+            ) : subjectsAvailable && claimedTotal > 0 ? (
+              <Tooltip label={[identityLabel, observationLabel].filter(Boolean).join(". ")}>
+                <TestBar fail={claimedFailed} pass={claimedPassed} total={claimedTotal} />
               </Tooltip>
             ) : (
-              <Tooltip label="No tests run yet">
+              <Tooltip label={["Sealed run results unavailable", identityLabel, observationLabel].filter(Boolean).join(". ")}>
                 <span className="w-10 text-right font-mono text-[10px] text-muted-foreground">—</span>
               </Tooltip>
             )}
@@ -288,7 +331,8 @@ function Chip({ label, value, tone }: { label: string; value: number; tone?: "bl
 }
 
 function pct(num: number, den: number): number | null {
-  return den > 0 ? (100 * num) / den : null
+  if (!Number.isFinite(num) || !Number.isFinite(den)) return null
+  return den > 0 && num >= 0 && num <= den ? (100 * num) / den : null
 }
 
 function compact(n: number): string {
@@ -302,6 +346,7 @@ function StatCard({
   detail,
   hint,
   value,
+  tone: toneOverride,
 }: {
   icon: typeof Hammer
   label: string
@@ -309,12 +354,19 @@ function StatCard({
   detail: string
   hint: string
   value?: string
+  tone?: "good" | "warn" | "neutral"
 }) {
-  const tone = rate == null
-    ? "text-muted-foreground"
-    : rate >= 80 ? "text-status-success" : "text-status-attention"
+  const tone = toneOverride === "good"
+    ? "text-status-success"
+    : toneOverride === "warn"
+      ? "text-status-attention"
+      : toneOverride === "neutral"
+        ? "text-muted-foreground"
+        : rate == null
+          ? "text-muted-foreground"
+          : rate >= 80 ? "text-status-success" : "text-status-attention"
   return (
-    <Tooltip className="flex-1" label={hint} side="bottom">
+    <Tooltip className="min-w-0" label={hint} side="bottom">
       <div className="w-full rounded-lg border border-border bg-card px-2.5 py-2">
         <div className="flex items-center gap-1.5">
           <Icon className={cn("shrink-0", tone)} size={14} />
@@ -335,68 +387,68 @@ function StatCard({
 function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
   if (!workspaces.length) return null
   const r = rollup(workspaces)
-  const build = pct(r.buildSuccess, r.buildKnown)
   const hasEvidenceLayers = r.claimedSubjectWorkspaces > 0
-  const subjects = r.claimedSubjectUnavailable === 0
-    ? pct(r.claimedSubjectPassed, r.claimedSubjectExecutedNonSkip)
-    : null
-  const legacyPass = pct(r.passed, r.executedNonSkip)
-  const legacyExec = pct(r.executed, r.declared)
-  const subjectDetail = r.claimedSubjectUnavailable > 0
-    ? "Unavailable"
-    : subjects === null ? "No executions" : `${compact(r.claimedSubjectPassed)}/${compact(r.claimedSubjectExecutedNonSkip)}`
-  const subjectHint = r.claimedSubjectUnavailable > 0
-    ? `${r.claimedSubjectUnavailable} workspaces lack module-qualified latest-subject counts`
-    : subjects === null
-      ? "No non-skipped module-qualified latest subjects were executed"
-      : `${r.claimedSubjectPassed.toLocaleString()} passed of ${r.claimedSubjectExecutedNonSkip.toLocaleString()} claimed latest subjects`
-  if (build === null && !hasEvidenceLayers && legacyPass === null && legacyExec === null) return null
+  const subjects = pct(r.claimedSubjectPassed, r.claimedSubjectExecutedNonSkip)
+  const runPass = pct(r.passed, r.executedNonSkip)
+  const measuredIdentityLabel = `${r.claimedSubjectMeasured} measured workspace${r.claimedSubjectMeasured === 1 ? "" : "s"}`
+  const measuredRunLabel = `${r.runResultMeasured} measured workspace${r.runResultMeasured === 1 ? "" : "s"}`
+  const buildDetail = [
+    r.buildSuccess ? `${r.buildSuccess} ok` : null,
+    r.buildPartial ? `${r.buildPartial} partial` : null,
+    r.buildFailed ? `${r.buildFailed} failed` : null,
+    r.buildUnavailable ? `${r.buildUnavailable} n/a` : null,
+  ].filter(Boolean).join(" · ")
+  const subjectDetail = subjects === null ? "measured" : `${subjects.toFixed(0)}% measured subset`
+  const subjectHint = `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded stable test identities${subjects === null ? "" : `; ${r.claimedSubjectPassed.toLocaleString()} of ${r.claimedSubjectExecutedNonSkip.toLocaleString()} passed across ${measuredIdentityLabel}`}`
+  const diagnosticsHint = r.nonVerdictIncomplete
+    ? `At least ${r.nonVerdictObservations.toLocaleString()} diagnostics; some sources were not countable. Excluded from sealed run results.`
+    : `${r.nonVerdictObservations.toLocaleString()} diagnostics were excluded from sealed run results.`
 
   return (
-    <div className="mt-2 flex gap-2">
-      {build !== null ? (
-        <StatCard
-          detail={`${r.buildSuccess}/${r.buildKnown}`}
-          hint={`${r.buildSuccess} of ${r.buildKnown} workspaces built successfully`}
-          icon={Hammer}
-          label="Build"
-          rate={build}
-        />
-      ) : null}
+    <div className="mt-2 grid grid-cols-2 gap-2">
+      <StatCard
+        detail={buildDetail}
+        hint={`${r.buildSuccess} passed, ${r.buildPartial} partial, ${r.buildFailed} failed, and ${r.buildUnavailable} unavailable`}
+        icon={Hammer}
+        label="Build coverage"
+        rate={null}
+        tone={r.buildFailed || r.buildPartial ? "warn" : r.buildSuccess ? "good" : "neutral"}
+        value={`${r.buildKnown}/${r.total}`}
+      />
       {hasEvidenceLayers ? (
         <StatCard
           detail={subjectDetail}
           hint={subjectHint}
           icon={CircleCheck}
-          label="Subjects"
-          rate={subjects}
-        />
-      ) : legacyPass !== null ? (
-        <StatCard
-          detail={`${compact(r.passed)}/${compact(r.executedNonSkip)}`}
-          hint={`${r.passed.toLocaleString()} passed of ${r.executedNonSkip.toLocaleString()} executed (skips excluded)`}
-          icon={CircleCheck}
-          label="Pass"
-          rate={legacyPass}
+          label="Identity coverage"
+          rate={null}
+          tone={r.claimedSubjectMeasured === r.total ? "good" : "warn"}
+          value={`${r.claimedSubjectMeasured}/${r.total}`}
         />
       ) : null}
-      {hasEvidenceLayers && (r.nonVerdictObservations > 0 || r.nonVerdictReportFiles > 0) ? (
+      <StatCard
+        detail={runPass === null
+          ? `${r.runResultMeasured}/${r.total} measured`
+          : `${r.runResultMeasured}/${r.total} measured workspaces`}
+        hint={runPass === null
+          ? `${r.runResultMeasured} of ${r.total} workspaces have a sealed run result; there are no non-skipped results to rate`
+          : `${r.passed.toLocaleString()} passed, ${r.failed.toLocaleString()} failed, and ${r.errors.toLocaleString()} errors across ${measuredRunLabel} only`}
+        icon={CircleCheck}
+        label={runPass === null ? "Run coverage" : "Run results"}
+        rate={runPass}
+        tone={runPass === null && r.runResultMeasured < r.total ? "warn" : undefined}
+        value={runPass === null ? `${r.runResultMeasured}/${r.total}` : undefined}
+      />
+      {hasEvidenceLayers && (r.nonVerdictObservations > 0 || r.nonVerdictReportFiles > 0 || r.nonVerdictIncomplete) ? (
         <StatCard
-          detail="not verdict-bearing"
-          hint={`${r.nonVerdictObservations.toLocaleString()} report observations across ${r.nonVerdictReportFiles.toLocaleString()} files; not verdict-bearing`}
+          detail="excluded from results"
+          hint={diagnosticsHint}
           icon={Gauge}
           label="Diagnostics"
           rate={null}
-          value={r.nonVerdictObservations > 0 ? compact(r.nonVerdictObservations) : `${r.nonVerdictReportFiles} files`}
-        />
-      ) : null}
-      {!hasEvidenceLayers && legacyExec !== null ? (
-        <StatCard
-          detail={`${compact(r.executed)}/${compact(r.declared)}`}
-          hint={`${r.executed.toLocaleString()} executed of ${r.declared.toLocaleString()} declared test methods`}
-          icon={Gauge}
-          label="Exec"
-          rate={legacyExec}
+          value={r.nonVerdictObservations > 0
+            ? `${compact(r.nonVerdictObservations)}${r.nonVerdictIncomplete ? "+" : ""}`
+            : r.nonVerdictIncomplete ? "Incomplete" : `${r.nonVerdictReportFiles} files`}
         />
       ) : null}
     </div>
@@ -492,6 +544,7 @@ export function WorkspaceRail({
   const failedLaunches = pending.filter((item) => normalize(item.status) === "failed").length
   const attention = data.workspaces.filter(needsAttention).length + failedLaunches
   const dockerDot = DOT_TONE[statusMeta(data.docker.status).tone] ?? DOT_TONE.neutral
+  const workspaceDataUnavailable = data.readStatus === "unavailable"
 
   return (
     <aside
@@ -526,23 +579,27 @@ export function WorkspaceRail({
             <Rocket size={14} /> Launch setups
           </button>
         </Tooltip>
-        <div className="mt-3 flex gap-2">
-          <Chip label="Workspaces" value={data.workspaces.length} />
-          <Chip label="Running" value={running} tone="blue" />
-          <Chip label="Attention" value={attention} tone={attention ? "red" : undefined} />
-        </div>
-        <RailSummary workspaces={data.workspaces} />
-        <div className="relative mt-3">
-          <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" size={13} />
-          <input
-            aria-label="Filter workspaces"
-            className="w-full rounded-md border border-border bg-muted py-1.5 pl-8 pr-2 text-[12.5px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:bg-card focus:outline-none focus:ring-2 focus:ring-ring/30"
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Filter workspaces…"
-            value={query}
-          />
-        </div>
-        {onDeleteMany && data.workspaces.length ? (
+        {!workspaceDataUnavailable ? (
+          <>
+            <div className="mt-3 flex gap-2">
+              <Chip label="Workspaces" value={data.workspaces.length} />
+              <Chip label="Containers" value={running} tone="blue" />
+              <Chip label="Attention" value={attention} tone={attention ? "red" : undefined} />
+            </div>
+            <RailSummary workspaces={data.workspaces} />
+            <div className="relative mt-3">
+              <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" size={13} />
+              <input
+                aria-label="Filter workspaces"
+                className="w-full rounded-md border border-border bg-muted py-1.5 pl-8 pr-2 text-[12.5px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:bg-card focus:outline-none focus:ring-2 focus:ring-ring/30"
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter workspaces…"
+                value={query}
+              />
+            </div>
+          </>
+        ) : null}
+        {!workspaceDataUnavailable && onDeleteMany && data.workspaces.length ? (
           <div className="mt-2 flex justify-end">
             <Tooltip label={selectMode ? "Exit multi-select mode" : "Select multiple workspaces to delete"}>
               <button
@@ -558,7 +615,24 @@ export function WorkspaceRail({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {pendingRows.length || rows.length ? (
+        {workspaceDataUnavailable ? (
+          <div className="m-3 rounded-lg border border-status-attention/40 bg-status-attention-soft px-3 py-4" role="alert">
+            <div className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
+              <AlertTriangle className="text-status-attention" size={15} />
+              Workspace data unavailable
+            </div>
+            <p className="mt-1.5 text-[12px] leading-relaxed text-muted-foreground">
+              The workspace index could not be read. No workspace totals or rows are shown because they may be incomplete.
+            </p>
+            <button
+              className="mt-3 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-medium text-foreground hover:bg-accent"
+              onClick={() => window.location.reload()}
+              type="button"
+            >
+              Retry dashboard
+            </button>
+          </div>
+        ) : pendingRows.length || rows.length ? (
           <>
             {pendingRows.map((item) => (
               <PendingRailRow

@@ -16,9 +16,14 @@ from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authori
 import sag.agent.native_messages as native_messages
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.native_messages import render_messages
-from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState, claim_identity
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.phase_transitions import PhaseTransitionPolicy
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    canonical_authored_plan_sha256,
+    seal_project_execution_plan,
+)
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
@@ -26,9 +31,67 @@ from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
 from sag.tools.base import BaseTool, ToolResult
 
+_SCRIPTED_PLAN_PAYLOAD = {
+    "summary": "Use the documented wrapper for a bounded build and test lane.",
+    "documents_reviewed": [
+        {
+            "path": "/workspace/demo/DEVNOTES.txt",
+            "reason": "Defines the supported build and test entry points.",
+            "evidence_refs": ["output_document"],
+        }
+    ],
+    "build_steps": [
+        {
+            "tool": "build",
+            "params": {
+                "action": "compile",
+                "working_directory": "/workspace/demo",
+            },
+            "purpose": "Compile through the registered project facade.",
+            "evidence_refs": ["output_document"],
+        }
+    ],
+    "build_success_criteria": ["A terminal compile receipt is successful."],
+    "test_steps": [
+        {
+            "tool": "build",
+            "params": {
+                "action": "test",
+                "working_directory": "/workspace/demo",
+            },
+            "purpose": "Run the documented bounded test lane.",
+            "evidence_refs": ["output_document"],
+        }
+    ],
+    "test_success_criteria": ["A terminal test receipt reports no failures."],
+    "environment_constraints": ["Use the repository wrapper."],
+    "risks": [],
+    "unresolved_questions": [],
+}
+_SCRIPTED_PLAN_SHA256 = canonical_authored_plan_sha256(_SCRIPTED_PLAN_PAYLOAD)
+_SCRIPTED_ANALYZE_CLAIM = PhaseClaim(
+    phase="analyze",
+    signal="done",
+    claimed_outcome=PhaseOutcome.SUCCESS,
+    key_results="analyze finished",
+    execution_plan_sha256=_SCRIPTED_PLAN_SHA256,
+    execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+)
+_SCRIPTED_PLAN = seal_project_execution_plan(
+    _SCRIPTED_PLAN_PAYLOAD,
+    source_attempt_id="analyze-1",
+    claim_sha256=claim_identity(_SCRIPTED_ANALYZE_CLAIM),
+)
+
+
 _PHASE_FACTS = {
     "provision": {"provision.workspace_ready": True},
-    "analyze": {"analysis.build_entry_ready": True},
+    "analyze": {
+        "analysis.build_entry_ready": True,
+        "analysis.execution_plan_sealed": True,
+        "analysis.execution_plan_sha256": _SCRIPTED_PLAN.authored_plan_sha256,
+        "analysis.execution_plan_source_attempt_id": "analyze-1",
+    },
     "build": {"build.test_entry_ready": True},
 }
 
@@ -48,6 +111,10 @@ class _PhaseTool(BaseTool):
             signal=action,
             claimed_outcome=claimed,
             key_results=key_results or f"{phase} finished",
+            execution_plan_sha256=(
+                _SCRIPTED_PLAN.authored_plan_sha256 if phase == "analyze" else ""
+            ),
+            execution_plan_ref=(PROJECT_EXECUTION_PLAN_PATH if phase == "analyze" else ""),
         )
         gate = GateResult(
             accepted=True,
@@ -159,6 +226,11 @@ def _engine(turns, *, max_iterations=12):
     engine.loop_memory = None
     engine.output_storage = None
     engine.orchestrator = None
+    # This mechanical loop fixture does not exercise Analyze persistence, but
+    # it must still satisfy the live Build/Test contract: the transition facts
+    # name a sealed plan and the actual provider prompt renders that artifact.
+    engine._sealed_execution_plan_cache = _SCRIPTED_PLAN
+    engine._finalize_analyze_execution_plan = lambda _claim, delivered, _metadata: delivered
     engine.successful_states = {}
     engine.recent_tool_executions = []
     engine.steps_since_context_switch = 0
@@ -278,6 +350,16 @@ def test_every_request_carries_the_system_prompt_and_a_paired_history():
                 assert reply["role"] == "tool"
                 assert reply["tool_call_id"] == call["id"]
                 index += 1
+
+    # Provision and Analyze receive only the stable base prompt. Once Analyze
+    # closes, the sealed model-authored plan is part of messages[0] for every
+    # Build, Test, and Report provider request (not an ordinary user message).
+    system_prompts = [messages[0]["content"] for messages in engine.llm_client.requests]
+    sealed_marker = "=== SEALED PROJECT EXECUTION PLAN ==="
+    assert all(sealed_marker not in prompt for prompt in system_prompts[:2])
+    assert all(sealed_marker in prompt for prompt in system_prompts[2:])
+    assert all("MODEL-AUTHORED IN ANALYZE" in prompt for prompt in system_prompts[2:])
+    assert system_prompts[2] == system_prompts[3] == system_prompts[4]
 
 
 def test_final_window_renders_without_pairing_repair():

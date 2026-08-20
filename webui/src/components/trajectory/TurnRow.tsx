@@ -1,8 +1,10 @@
 import { ChevronDown, ChevronRight } from "lucide-react"
 import { useState } from "react"
 
+import { fetchTrajectoryEnvelope } from "@/api/client"
 import type {
   TrajectoryAnnotation,
+  TrajectoryEnvelope,
   TrajectoryPhase,
   TrajectoryTurn,
   TrajectoryWarning,
@@ -19,7 +21,19 @@ import {
 import { cn } from "@/lib/utils"
 
 import type { BytesStatus } from "./RefDescent"
-import { TurnQuad } from "./TurnQuad"
+import { TurnQuad, type EnvelopeStatus } from "./TurnQuad"
+
+interface EnvelopeState {
+  sessionId: string
+  id: string
+  status: EnvelopeStatus
+  envelope: TrajectoryEnvelope | null
+  error: string | null
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 /** Gate words the run delivers, toned the way the rest of the app tones an
  *  outcome. An unknown word is neutral rather than guessed at. */
@@ -112,29 +126,37 @@ function GateBadge({
  */
 export function TurnRow({
   turn,
-  next,
   phases,
   annotations,
   warnings,
   outputs,
   status,
   onNeedBytes,
+  sessionId,
 }: {
   turn: TrajectoryTurn
-  next: TrajectoryTurn | null
   phases: TrajectoryPhase[]
   annotations: TrajectoryAnnotation[]
   warnings: TrajectoryWarning[]
   outputs: Record<string, string> | null
   status: BytesStatus
   onNeedBytes?: () => void
+  sessionId?: string
 }) {
   const [open, setOpen] = useState(false)
+  const [envelopeState, setEnvelopeState] = useState<EnvelopeState | null>(null)
   const controller = turn.actor === "controller"
   const recurrence = recurrenceCount(annotations)
   const marks = anomalies(annotations)
   const quadId = `turn-quad-${turn.turn_id}`
   const duration = durationLabel(turn)
+  const envelopeId = turn.call?.params_ref
+  const callEnvelopeState =
+    envelopeState !== null &&
+    envelopeState.sessionId === sessionId &&
+    envelopeState.id === envelopeId
+      ? envelopeState
+      : null
 
   // The ask for bytes lives outside the state updater: an updater may be called
   // twice, and asking twice would poll the full tier twice for one expansion.
@@ -143,6 +165,39 @@ export function TurnRow({
   const toggle = () => {
     if (!open && unresolvedRefs(turn, outputs).length) {
       onNeedBytes?.()
+    }
+    if (
+      !open &&
+      sessionId &&
+      envelopeId &&
+      (callEnvelopeState === null || callEnvelopeState.status === "error")
+    ) {
+      setEnvelopeState({
+        sessionId,
+        id: envelopeId,
+        status: "loading",
+        envelope: null,
+        error: null,
+      })
+      void fetchTrajectoryEnvelope(sessionId, envelopeId)
+        .then((envelope) => {
+          setEnvelopeState({
+            sessionId,
+            id: envelopeId,
+            status: "ready",
+            envelope,
+            error: null,
+          })
+        })
+        .catch((error) => {
+          setEnvelopeState({
+            sessionId,
+            id: envelopeId,
+            status: "error",
+            envelope: null,
+            error: errorMessage(error),
+          })
+        })
     }
     setOpen((value) => !value)
   }
@@ -268,7 +323,14 @@ export function TurnRow({
 
       {open ? (
         <div className="mt-2.5" id={quadId}>
-          <TurnQuad next={next} outputs={outputs} status={status} turn={turn} />
+          <TurnQuad
+            envelope={callEnvelopeState?.envelope ?? null}
+            envelopeError={callEnvelopeState?.error ?? null}
+            envelopeStatus={callEnvelopeState?.status ?? "absent"}
+            outputs={outputs}
+            status={status}
+            turn={turn}
+          />
         </div>
       ) : null}
     </article>

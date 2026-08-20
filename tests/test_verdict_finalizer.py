@@ -2,8 +2,8 @@ import json
 from dataclasses import asdict, replace
 
 import pytest
-
 from container_evidence_fakes import ContainerFS
+
 from sag.agent.evidence_publications import (
     EvidencePublicationAuthority,
     install_evidence_publication_authority,
@@ -24,7 +24,9 @@ from sag.agent.verdict_finalizer import (
     RunVerdictSnapshot,
     SnapshotTestCounts,
     SnapshotTestStats,
-    VerdictFinalizer as _VerdictFinalizer,
+)
+from sag.agent.verdict_finalizer import VerdictFinalizer as _VerdictFinalizer
+from sag.agent.verdict_finalizer import (
     read_verdict_snapshot,
 )
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
@@ -1091,6 +1093,39 @@ def test_phase_claim_and_validated_outcome_are_preserved_for_audit():
     assert audited.validated_outcome == "success"
     assert audited.outcome == "success"
     assert audited.claim_disposition == "pessimistic"
+    serialized_claim = snapshot.model_dump(mode="json")["phase_records"][-1]["claim"]
+    assert "execution_plan_sha256" not in serialized_claim
+    assert "execution_plan_ref" not in serialized_claim
+    legacy_bytes = snapshot.model_dump_json()
+    assert RunVerdictSnapshot.model_validate_json(legacy_bytes).model_dump_json() == legacy_bytes
+
+
+def test_phase_claim_execution_plan_identity_round_trips_in_verdict_snapshot():
+    state = _tvm_state()
+    machine = PhaseMachine()
+    machine.mark_done("workspace ready", ["output_clone"])
+    validation = validate_phase_claim(
+        PhaseClaim(
+            phase="analyze",
+            claimed_outcome=PhaseOutcome.SUCCESS,
+            execution_plan_sha256="a" * 64,
+            execution_plan_ref="/workspace/.setup_agent/project_execution_plan.json",
+        ),
+        ValidatorState.GREEN,
+    )
+    record = replace(machine.close_attempt(validation), attempt_id="analyze-plan-2")
+    state.record_phase_record(record)
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    serialized = snapshot.model_dump(mode="json")["phase_records"][-1]["claim"]
+    assert serialized["execution_plan_sha256"] == "a" * 64
+    assert serialized["execution_plan_ref"] == "/workspace/.setup_agent/project_execution_plan.json"
+    reread = RunVerdictSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert reread.phase_records[-1].claim is not None
+    assert reread.phase_records[-1].claim.execution_plan_sha256 == "a" * 64
 
 
 def test_phase_record_snapshot_upgrades_pre_claim_validation_shape():

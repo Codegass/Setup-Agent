@@ -259,13 +259,18 @@ PHASE_OBJECTIVES = {
         "remains an explicit blocker or unknown fact."
     ),
     "analyze": (
-        "Review the engine-created project fact sheet and document map. The persisted facts "
-        "must describe the observed build system, build/test roots, test counts, constraints, "
-        "and open conflicts. Facts need refreshing only after a relevant checkout or "
-        "configuration change. An honest 'unknown' with evidence is acceptable."
+        "Actively inspect the project and its document inventory, including project-specific "
+        "files beyond familiar README/BUILDING names. Treat harness-extracted claims as hints, "
+        "not as the project strategy. Before closing this phase, author a structured execution "
+        "plan that names the documents and evidence you relied on, the intended build and test "
+        "actions, success criteria, constraints, risks, and unresolved questions. Submit that "
+        "plan in execution_plan on the terminal phase call; Build cannot start until it is "
+        "validated and sealed. An honest unknown may remain explicit in the plan."
     ),
     "build": (
-        "Establish terminal build evidence for every required surveyed build coordinate. "
+        "Execute from the sealed Analyze execution plan, adapting only when new observed evidence "
+        "requires it and recording the reason for any deviation. Establish terminal build evidence "
+        "for every required surveyed build coordinate. "
         "An aggregator root with no sources is not compile evidence for source-bearing "
         "islands; each required island needs a current receipt and artifact/coverage evidence, "
         "or a typed evidence-backed blocker. A packaging or meta-project with no compile "
@@ -274,7 +279,9 @@ PHASE_OBJECTIVES = {
         "are automatic and no unrelated work may start."
     ),
     "test": (
-        "Establish terminal runner evidence for the required surveyed test coordinates. "
+        "Execute the test strategy from the sealed Analyze plan, adapting only when current "
+        "evidence requires it and recording the reason for any deviation. Establish terminal "
+        "runner evidence for the required surveyed test coordinates. "
         "Test coordinates can live in a different module or build system from build "
         "coordinates. Persist executed, passed, failed, error, and skipped counts with their "
         "receipt references. Report what executed against what was discovered; red tests are "
@@ -282,7 +289,8 @@ PHASE_OBJECTIVES = {
         "absence of a runner receipt cannot support test success."
     ),
     "report": (
-        "Persist the final setup report grounded in the sealed verdict, current receipts, "
+        "Persist the final setup report grounded in the sealed Analyze execution plan, the sealed "
+        "verdict, current receipts, "
         "artifacts, test counts, and unresolved conflicts. Completion requires a durable report "
         "artifact reference; report delivery status does not rewrite the verdict."
     ),
@@ -618,6 +626,9 @@ class ReActEngine(UIEventEmitter):
         )
         self._analysis_facts_recovery_attempted = False
         phase_tool = self.tools.get("phase")
+        bind_plan_evidence = getattr(phase_tool, "bind_execution_plan_evidence", None)
+        if callable(bind_plan_evidence):
+            bind_plan_evidence(self.output_storage)
         bind_recovery = getattr(phase_tool, "bind_analysis_facts_recovery", None)
         if callable(bind_recovery):
             bind_recovery(self._recover_analysis_facts_once)
@@ -2764,6 +2775,9 @@ class ReActEngine(UIEventEmitter):
             }.get(survey_state)
             if survey_projection:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, survey_projection)
+            inventory_guidance = self._document_inventory_guidance()
+            if inventory_guidance:
+                lines.extend(["", inventory_guidance])
         if phase in ("build", "test"):
             if survey_state == "created":
                 lines.append(
@@ -2809,6 +2823,125 @@ class ReActEngine(UIEventEmitter):
             content=content,
             timestamp=self._get_timestamp(),
         )
+
+    def _document_inventory_guidance(self) -> str:
+        """Bounded Analyze inventory projection; never a document allowlist."""
+
+        try:
+            from .document_map import read_live_document_map
+            from .project_execution_plan import render_document_inventory_guidance
+
+            orchestrator = getattr(self, "orchestrator", None) or getattr(
+                getattr(self, "context_manager", None), "orchestrator", None
+            )
+            observed = read_live_document_map(orchestrator)
+            if not observed.complete or observed.conflict is not None:
+                return (
+                    "Document inventory unavailable: the Harness could not project its "
+                    "bounded checkout inventory. Continue discovering project-specific "
+                    "documents with search; do not infer that an unlisted file is irrelevant."
+                )
+            return render_document_inventory_guidance(observed.payload, max_chars=12_000)
+        except Exception as exc:
+            return (
+                "Document inventory unavailable: "
+                f"{str(exc)[:240]}. Use search to discover project-specific sources; "
+                "familiar filenames are not an allowlist."
+            )
+
+    def _accepted_analysis_plan_binding(self) -> tuple[str, str, str]:
+        """Return the one Analyze claim allowed to feed later phases.
+
+        The newest Analyze record is authoritative even when it closed toward
+        Report.  Falling back to an older successful record after an Analyze
+        repair/re-entry would silently resurrect the superseded plan.
+        """
+
+        machine = getattr(self, "phase_machine", None)
+        for record in reversed(tuple(getattr(machine, "records", ()) or ())):
+            if getattr(record, "phase", None) != "analyze":
+                continue
+            claim = getattr(record, "claim", None)
+            plan_sha256 = str(getattr(claim, "execution_plan_sha256", "") or "").strip()
+            if (
+                getattr(record, "transition", None) == "advance"
+                and claim is not None
+                and getattr(claim, "signal", None) == "done"
+                and plan_sha256
+            ):
+                return record.attempt_id, plan_sha256, claim_identity(claim)
+            return "", "", ""
+        return "", "", ""
+
+    @staticmethod
+    def _execution_plan_matches_binding(
+        artifact,
+        binding: tuple[str, str, str],
+    ) -> bool:
+        attempt_id, authored_plan_sha256, claim_sha256 = binding
+        return bool(
+            artifact is not None
+            and attempt_id
+            and authored_plan_sha256
+            and claim_sha256
+            and artifact.source_attempt_id == attempt_id
+            and artifact.authored_plan_sha256 == authored_plan_sha256
+            and artifact.claim_sha256 == claim_sha256
+        )
+
+    def _read_sealed_execution_plan(self):
+        binding = self._accepted_analysis_plan_binding()
+        cached = getattr(self, "_sealed_execution_plan_cache", None)
+        if self._execution_plan_matches_binding(cached, binding):
+            return cached
+        # A repair/re-entry can leave the previous attempt's plan cached even
+        # after the canonical artifact has been replaced. Never return it, but
+        # still re-read once so a current replacement can become authoritative.
+        self._sealed_execution_plan_cache = None
+        if not all(binding):
+            return None
+        from .project_execution_plan import read_sealed_project_execution_plan
+
+        orchestrator = getattr(self, "orchestrator", None) or getattr(
+            getattr(self, "context_manager", None), "orchestrator", None
+        )
+        artifact = read_sealed_project_execution_plan(orchestrator)
+        if self._execution_plan_matches_binding(artifact, binding):
+            self._sealed_execution_plan_cache = artifact
+            return artifact
+        return None
+
+    def _system_prompt_for_current_phase(self, base_system_prompt: str) -> str:
+        """Append the sealed model plan to the actual provider system message.
+
+        Phase intro steps are intentionally user-role messages in the native
+        renderer.  Rebuilding the effective system prompt per request is what
+        guarantees that Build/Test/Report receive the accepted Analyze plan in
+        ``messages[0]`` rather than as ordinary conversational prose.
+        """
+
+        machine = getattr(self, "phase_machine", None)
+        phase = str(getattr(machine, "current_phase", "") or "")
+        if phase not in {"build", "test", "report"}:
+            return base_system_prompt
+        artifact = self._read_sealed_execution_plan()
+        if artifact is None:
+            if phase in {"build", "test"}:
+                raise RuntimeError(
+                    f"{phase} cannot dispatch without a sealed Analyze execution plan"
+                )
+            return base_system_prompt
+        from .project_execution_plan import render_plan_system_prompt
+
+        plan_block = render_plan_system_prompt(artifact)
+        authority = (
+            "MODEL-AUTHORED IN ANALYZE. The Harness verified bounded structure, "
+            "source bindings, and persistence; it did not choose or semantically "
+            "approve the project commands. Treat this as the execution baseline. "
+            "If current tool evidence requires a deviation, state the evidence and "
+            "reason explicitly."
+        )
+        return f"{base_system_prompt}\n\n{authority}\n{plan_block}"
 
     def _detected_build_system(self) -> Optional[str]:
         """The analyzer-detected build system, read best-effort from the trunk's
@@ -2988,6 +3121,135 @@ class ReActEngine(UIEventEmitter):
         except Exception:
             return getattr(self.context_manager, "project_name", None)
 
+    def _finalize_analyze_execution_plan(
+        self,
+        claim: PhaseClaim,
+        delivered: GateResult,
+        metadata: Mapping[str, Any],
+    ) -> GateResult:
+        """Seal an accepted Analyze plan before any phase state can move.
+
+        PhaseTool validates a bounded candidate but does not publish it.  The
+        engine owns the transition boundary, so this is the only place that
+        may turn that candidate into the authoritative plan read by later
+        system prompts.  A persistence/currentness failure replaces the
+        delivered acceptance with a harness-owned rejection; the caller's
+        existing supersede path states that revision and keeps Analyze open.
+        """
+
+        if claim.phase != "analyze" or not claim.execution_plan_sha256:
+            return delivered
+        candidate = metadata.get("execution_plan_candidate")
+        try:
+            if not isinstance(candidate, Mapping):
+                raise ValueError("accepted Analyze claim lost its execution plan candidate")
+            authored = candidate.get("authored_plan")
+            if not isinstance(authored, Mapping):
+                raise ValueError("execution plan candidate lacks the authored plan")
+            source_attempt_id = str(
+                getattr(self.phase_machine, "current_attempt_id", "") or ""
+            ).strip()
+            if not source_attempt_id or self.phase_machine.current_phase != "analyze":
+                raise ValueError("execution plan is not bound to an open Analyze attempt")
+            phase_tool = getattr(self, "tools", {}).get("phase")
+            validate_plan_evidence = getattr(
+                phase_tool,
+                "validate_execution_plan_evidence",
+                None,
+            )
+            if not callable(validate_plan_evidence):
+                raise ValueError("execution plan evidence validator is unavailable")
+            authored = validate_plan_evidence(
+                authored,
+                source_attempt_id=source_attempt_id,
+            )
+
+            from .document_map import read_live_document_map
+            from .project_execution_plan import (
+                PROJECT_EXECUTION_PLAN_PATH,
+                read_sealed_project_execution_plan,
+                seal_and_write_project_execution_plan,
+            )
+
+            orchestrator = getattr(self, "orchestrator", None) or getattr(
+                getattr(self, "context_manager", None), "orchestrator", None
+            )
+            observed_map = read_live_document_map(orchestrator)
+            # The inventory is a gap-checking input, never semantic authority.
+            # If its publication is unavailable, the plan can still be sealed
+            # from direct output/file evidence and the artifact records that
+            # inventory gap explicitly. A model claim that relies on map-only
+            # entry/hash bindings will still fail currentness validation when
+            # the map itself cannot be verified.
+            document_map = (
+                observed_map.payload
+                if observed_map.complete and observed_map.conflict is None
+                else None
+            )
+            artifact = seal_and_write_project_execution_plan(
+                authored,
+                orchestrator,
+                source_attempt_id=source_attempt_id,
+                claim_sha256=claim_identity(claim),
+                document_map=document_map,
+            )
+            reread = read_sealed_project_execution_plan(orchestrator)
+            if reread is None or reread.artifact_sha256 != artifact.artifact_sha256:
+                raise ValueError("sealed execution plan did not round-trip")
+            if artifact.authored_plan_sha256 != claim.execution_plan_sha256:
+                raise ValueError("sealed execution plan differs from the model claim")
+            if artifact.source_attempt_id != source_attempt_id:
+                raise ValueError("sealed execution plan belongs to another Analyze attempt")
+            if claim.execution_plan_ref != PROJECT_EXECUTION_PLAN_PATH:
+                raise ValueError("execution plan claim names a noncanonical artifact path")
+            self._sealed_execution_plan_cache = reread
+        except Exception as exc:
+            reason = f"Analyze execution plan could not be sealed: {exc}"
+            return GateResult(
+                accepted=False,
+                validated_outcome=PhaseOutcome.UNKNOWN,
+                claim_disposition=ClaimDisposition.CONTRADICTED,
+                validator_state=ValidatorState.UNAVAILABLE,
+                control_disposition=GateControlDisposition.HARNESS_RECOVERY_REQUIRED,
+                blocker_owner="harness",
+                reason=reason,
+                evidence_refs=tuple(delivered.evidence_refs),
+                suggestions=(),
+                code="analysis_execution_plan_seal_failed",
+                validated_facts={
+                    **dict(delivered.validated_facts),
+                    "analysis.execution_plan_sealed": False,
+                    "analysis.execution_plan_error": str(exc)[:1000],
+                },
+                claim=claim,
+            )
+
+        return replace(
+            delivered,
+            evidence_refs=tuple(
+                dict.fromkeys((*delivered.evidence_refs, PROJECT_EXECUTION_PLAN_PATH))
+            ),
+            validated_facts={
+                **dict(delivered.validated_facts),
+                # The read-only Analyze gate cannot see the artifact before
+                # this transition boundary publishes it. Once the accepted
+                # survey state and the plan seal coexist, Build entry becomes
+                # ready in the one final gate recorded below.
+                "analysis.build_entry_ready": delivered.validator_state
+                in {ValidatorState.GREEN, ValidatorState.PARTIAL},
+                "analysis.execution_plan_candidate_valid": True,
+                "analysis.execution_plan_sealed": True,
+                "analysis.execution_plan_ref": PROJECT_EXECUTION_PLAN_PATH,
+                "analysis.execution_plan_sha256": artifact.authored_plan_sha256,
+                "analysis.execution_plan_source_attempt_id": artifact.source_attempt_id,
+                "analysis.execution_plan_artifact_sha256": artifact.artifact_sha256,
+                "analysis.execution_plan_inventory_coverage": (
+                    artifact.inventory_coverage.model_dump(mode="json")
+                ),
+                "analysis.execution_plan_inventory_warnings": list(artifact.inventory_warnings),
+            },
+        )
+
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:
         """Validate terminal claims, then route them through exactly one policy call."""
         if getattr(self, "phase_machine", None) is None:
@@ -3031,10 +3293,11 @@ class ReActEngine(UIEventEmitter):
             # exactly it, or says out loud that it is replacing it (spec §3.1).
             delivered = gate
             self._register_delivered_gate(claim, delivered)
+            gate = self._finalize_analyze_execution_plan(claim, delivered, metadata)
             # One close, one survey read: the cap and the requirement below both
             # ask the same question and must get the same answer.
             survey = self._test_candidate_survey()
-            gate = self._cap_unresolved_test_gate(claim, delivered, survey=survey)
+            gate = self._cap_unresolved_test_gate(claim, gate, survey=survey)
             word_revised = False
             if gate is not delivered:
                 # A second grading is legal; it just has to name the first.
@@ -3219,6 +3482,11 @@ class ReActEngine(UIEventEmitter):
             project_name=project_name,
             sealed=self._evidence_is_sealed(),
             disclosed_job_ids=sorted(self._disclosed_live_jobs()),
+            expected_analysis_attempt_id=(
+                str(getattr(self.phase_machine, "current_attempt_id", "") or "")
+                if phase == "analyze"
+                else None
+            ),
         )
 
     NUDGE_EVERY = 15
@@ -3412,6 +3680,15 @@ class ReActEngine(UIEventEmitter):
         if remaining > reserved:
             return False
 
+        # Analyze owns the project strategy.  A generic budget floor may close
+        # an evidence phase, but it may not manufacture a model-authored plan
+        # or mark Analyze complete without one.  Reclaim the downstream reserve
+        # and keep asking for the bounded plan; if the model never supplies it,
+        # the outer iteration guard records Analyze as aborted instead of
+        # entering Build or pretending analysis completed.
+        if self._keep_analyze_open_for_execution_plan("phase_floor"):
+            return False
+
         probe = self._phase_gate_check(phase)
         unresolved = self._unresolved_test_coordinates_after_refresh(survey)
         refusals = self._forced_test_refusals(survey)
@@ -3482,6 +3759,40 @@ class ReActEngine(UIEventEmitter):
         policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
         decision = policy.decide(record, state=state, budgets=self._repair_budgets())
         self._apply_phase_decision(record, decision)
+        return True
+
+    def _keep_analyze_open_for_execution_plan(self, trigger: str) -> bool:
+        """Return True when an engine-owned close must not bypass the plan.
+
+        Historical replay remains permissive; this seam is called only by the
+        live engine's automatic close paths.  The live model-facing PhaseTool
+        separately rejects an accepted Analyze terminal claim without a plan.
+        """
+
+        machine = getattr(self, "phase_machine", None)
+        if machine is None or machine.is_complete or machine.current_phase != "analyze":
+            return False
+        state = getattr(self, "run_evidence_state", None)
+        current_attempt_id = str(machine.current_attempt_id or "")
+        sealed = bool(
+            state is not None
+            and state.fact_value("analysis.execution_plan_sealed") is True
+            and str(state.fact_value("analysis.execution_plan_sha256") or "").strip()
+            and str(state.fact_value("analysis.execution_plan_source_attempt_id") or "").strip()
+            == current_attempt_id
+        )
+        if sealed:
+            return False
+        key = (current_attempt_id, str(trigger or ""))
+        if getattr(self, "_analysis_plan_guidance_key", None) != key:
+            self._analysis_plan_guidance_key = key
+            self._add_system_guidance(
+                "ANALYSIS_EXECUTION_PLAN_REQUIRED: Analyze remains open. Inspect the broad "
+                "document inventory and submit a model-authored execution_plan on "
+                "phase(action='done'). The harness will validate and seal it; no automatic "
+                "floor may invent the plan or enter Build without it.",
+                priority=9,
+            )
         return True
 
     def _persist_phase_record(self, phase_name: str, status: str, text: str) -> None:
@@ -3695,7 +4006,7 @@ class ReActEngine(UIEventEmitter):
         # The system prompt is rebuilt once and re-sent on EVERY request — the
         # audit finding in spec §3.1 was that the old loop rendered it once and
         # then overwrote it with a flat text rebuild.
-        system_prompt = self.prompt_builder.build_initial_system_prompt(
+        base_system_prompt = self.prompt_builder.build_initial_system_prompt(
             repository_url=self.repository_url,
             repository_ref=self.repository_ref,
             workflow_mode=completion_mode,
@@ -3704,7 +4015,7 @@ class ReActEngine(UIEventEmitter):
             # The kickoff text lives in the system message ONLY. Repeating it as
             # a user turn made a run-task model read its own instructions twice
             # (Stage B carried the duplication deliberately; Task 8 removes it).
-            system_prompt = system_prompt + "\n\n" + initial_prompt
+            base_system_prompt = base_system_prompt + "\n\n" + initial_prompt
 
         run_started_at = time.time()
         wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
@@ -3767,6 +4078,11 @@ class ReActEngine(UIEventEmitter):
                 self.agent_logger.info(f"Native iteration {self.current_iteration}/{max_iter}")
                 self.token_tracker.set_iteration(self.current_iteration)
 
+                system_prompt = (
+                    self._system_prompt_for_current_phase(base_system_prompt)
+                    if phase_mode
+                    else base_system_prompt
+                )
                 messages = render_messages(system_prompt, self.steps)
                 # [A], sealed before the request goes out: every turn this
                 # iteration opens refers to THIS array, because this is the
@@ -4915,10 +5231,18 @@ class ReActEngine(UIEventEmitter):
             "reason": body["reason"],
             "key_results": claim.key_results,
             "evidence_refs": control_evidence_refs,
+            # Gate reason/evidence describe the grading. Preserve the exact
+            # model claim separately so replay can reconstruct the same shape
+            # that `claim_sha256` names, including Analyze plan identity.
+            "phase_claim": claim.to_metadata(),
             "validated_facts": validated_facts,
             "gate_result": body,
             "source_attempt_id": getattr(machine, "current_attempt_id", None),
         }
+        if claim.execution_plan_sha256:
+            gate_payload["execution_plan_sha256"] = claim.execution_plan_sha256
+        if claim.execution_plan_ref:
+            gate_payload["execution_plan_ref"] = claim.execution_plan_ref
         if body.get("supersedes"):
             gate_payload["supersedes"] = body["supersedes"]
         if claim.phase == "test":
@@ -5463,6 +5787,8 @@ class ReActEngine(UIEventEmitter):
         state = getattr(self, "run_evidence_state", None)
         if machine is None or state is None or state.sealed or machine.is_complete:
             return False
+        if self._keep_analyze_open_for_execution_plan("agent_no_progress"):
+            return False
         # The test phase's no-op convergence may not skip the harness-owned
         # floor: the TEST_ATTEMPT_REQUIRED gate just told the model "the
         # controller owns and will execute the registered phase-floor action",
@@ -5476,9 +5802,7 @@ class ReActEngine(UIEventEmitter):
             floor_key = (str(machine.current_attempt_id), required_attempt.action_text())
             if getattr(self, "_no_op_convergence_floor_key", None) != floor_key:
                 self._no_op_convergence_floor_key = floor_key
-                if self._force_required_test_attempt(
-                    required_attempt, trigger="no_op_convergence"
-                ):
+                if self._force_required_test_attempt(required_attempt, trigger="no_op_convergence"):
                     self._add_system_guidance(
                         "TEST_ATTEMPT_REQUIRED: no-op completion claims cannot "
                         "close the test phase before the harness executes the "
@@ -6923,6 +7247,8 @@ class ReActEngine(UIEventEmitter):
         state = getattr(self, "run_evidence_state", None)
         if machine is None or state is None or state.sealed or machine.is_complete:
             return False
+        if self._keep_analyze_open_for_execution_plan("loop_force_break"):
+            return False
         required_attempt = self._missing_required_test_attempt()
         if required_attempt is not None:
             self._force_required_test_attempt(
@@ -7249,7 +7575,8 @@ class ReActEngine(UIEventEmitter):
 
         The model chooses WHEN to consult, never WHAT the reviewer sees."""
         # Prompt key: advisor_system
-        system_brief = self.prompts.get("advisor_system")
+        system_brief = str(self.prompts.get("advisor_system") or "")
+        system_brief = self._system_prompt_for_current_phase(system_brief)
         return [
             {"role": "system", "content": system_brief},
             {"role": "user", "content": self._advisor_user_message()},

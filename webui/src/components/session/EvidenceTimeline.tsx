@@ -1,4 +1,4 @@
-import { ChevronDown, ExternalLink } from "lucide-react"
+import { ChevronDown, Copy } from "lucide-react"
 import { useState } from "react"
 
 import type { EvidenceGroup } from "@/api/types"
@@ -102,9 +102,16 @@ export function EvidenceTimeline({
                       <div className="mt-1.5 text-[12px] leading-relaxed text-muted-foreground">
                         {record.detail}
                       </div>
-                      <div className="mt-2 flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-status-running">
-                        <ExternalLink size={11} />
-                        <span className="truncate">{record.ref}</span>
+                      <div className="mt-2 flex min-w-0 items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
+                        <span className="min-w-0 flex-1 truncate" title={record.ref}>{record.ref}</span>
+                        <button
+                          aria-label={`Copy evidence reference ${record.ref}`}
+                          className="inline-flex shrink-0 items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5 text-status-running hover:bg-accent"
+                          onClick={() => navigator.clipboard?.writeText(record.ref)}
+                          type="button"
+                        >
+                          <Copy size={10} /> Copy
+                        </button>
                       </div>
                     </Card>
                   ))

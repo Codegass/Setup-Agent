@@ -423,6 +423,8 @@ export interface SparkColumn {
   turnId: number
   phase: string
   actor: TrajectoryActor
+  /** Tool named by the turn, used to identify a peak without opening the row. */
+  tool: string | null
   /** Prompt + completion tokens, or null when no bill has been stated yet. */
   tokens: number | null
   /** Wall time, or null when the turn has only one of its two stamps. */
@@ -447,6 +449,7 @@ export function sparkColumns(doc: TrajectoryDocument): SparkColumn[] {
       turnId: turn.turn_id,
       phase: turn.phase,
       actor: turn.actor,
+      tool: turn.call?.tool ?? null,
       tokens: turn.tokens ? turn.tokens.input + turn.tokens.output : null,
       durationMs: turnDurationMs(turn),
       anomalies: anomalies(marks.get(turn.turn_id) ?? []),

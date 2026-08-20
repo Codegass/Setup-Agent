@@ -6,10 +6,26 @@ state — not the full LLM loop."""
 
 from types import SimpleNamespace
 
+import pytest
+from test_container_io import FakeContainer
+
 from sag.agent.evidence_state import RunEvidenceState
-from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
-from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState, claim_identity
+from sag.agent.phase_machine import (
+    PhaseAttemptRecord,
+    PhaseClaim,
+    PhaseMachine,
+    PhaseOutcome,
+    PhaseTermination,
+)
 from sag.agent.phase_transitions import PhaseTransitionPolicy
+from sag.agent.project_execution_plan import (
+    PROJECT_EXECUTION_PLAN_PATH,
+    canonical_authored_plan_sha256,
+    read_sealed_project_execution_plan,
+    seal_project_execution_plan,
+    validate_authored_plan,
+)
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
 from sag.agent.verdict_finalizer import EvidenceCloseReason
@@ -41,6 +57,15 @@ def _engine_with_machine(*, start_phase="provision"):
     )
     engine.finalized_reasons = []
     engine._finalize_evidence = lambda reason: engine.finalized_reasons.append(reason)
+    engine.plan_evidence_validations = []
+
+    def validate_plan_evidence(plan, *, source_attempt_id):
+        engine.plan_evidence_validations.append(source_attempt_id)
+        return validate_authored_plan(plan)
+
+    engine.tools = {
+        "phase": SimpleNamespace(validate_execution_plan_evidence=validate_plan_evidence)
+    }
     return engine
 
 
@@ -116,6 +141,89 @@ def _terminal_step(
     )
 
 
+def _execution_plan_payload():
+    return {
+        "summary": "Build and test through the project-specific wrapper lanes.",
+        "documents_reviewed": [
+            {
+                "path": "/workspace/demo/DEVNOTES.txt",
+                "reason": "Defines the supported build and test entry points.",
+                "evidence_refs": ["output_devnotes"],
+            }
+        ],
+        "build_steps": [
+            {
+                "tool": "build",
+                "params": {
+                    "action": "compile",
+                    "working_directory": "/workspace/demo",
+                    "args": "-DskipTests",
+                },
+                "purpose": "Compile before entering the separate test lane.",
+                "evidence_refs": ["output_devnotes"],
+            }
+        ],
+        "build_success_criteria": ["A terminal receipt covers the reactor."],
+        "test_steps": [
+            {
+                "tool": "build",
+                "params": {
+                    "action": "test",
+                    "working_directory": "/workspace/demo",
+                    "args": "-Dtest=FocusedSuite",
+                },
+                "purpose": "Run the documented bounded test lane.",
+                "evidence_refs": ["output_devnotes"],
+            }
+        ],
+        "test_success_criteria": ["The focused lane has a terminal test receipt."],
+        "environment_constraints": ["Use the repository wrapper."],
+        "risks": [],
+        "unresolved_questions": [],
+    }
+
+
+def _analyze_plan_step(plan):
+    plan_sha256 = canonical_authored_plan_sha256(plan)
+    claim = PhaseClaim(
+        phase="analyze",
+        signal="done",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="reviewed the project execution contract",
+        evidence_refs=("output_devnotes",),
+        execution_plan_sha256=plan_sha256,
+        execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+    )
+    gate = GateResult(
+        accepted=True,
+        validated_outcome=PhaseOutcome.SUCCESS,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=ValidatorState.GREEN,
+        reason="analysis evidence is ready",
+        validated_facts={
+            # The ordinary Analyze observation runs before the plan artifact
+            # exists, so its read-only readiness projection is still false.
+            "analysis.build_entry_ready": False,
+            "analysis.execution_plan_candidate_valid": True,
+            "analysis.execution_plan_sha256": plan_sha256,
+        },
+        claim=claim,
+    )
+    return SimpleNamespace(
+        step_type=SimpleNamespace(value="action"),
+        tool_name="phase",
+        tool_result=SimpleNamespace(
+            success=True,
+            metadata={
+                "phase_signal": "done",
+                "phase_claim": claim.to_metadata(),
+                "gate_result": gate.to_metadata(),
+                "execution_plan_candidate": {"authored_plan": plan},
+            },
+        ),
+    )
+
+
 def test_phase_done_signal_advances_and_resets_window():
     engine = _engine_with_machine()
     step = _terminal_step(engine, key_results="cloned + JDK")
@@ -128,6 +236,312 @@ def test_phase_done_signal_advances_and_resets_window():
     assert "analyze" in intro.lower()
     assert "cloned + JDK" in intro, "prior key results carried into the digest"
     assert engine._phase_iterations == 0
+
+
+def test_analyze_plan_is_persisted_before_gate_facts_are_recorded_and_build_opens(
+    monkeypatch,
+):
+    engine = _engine_with_machine(start_phase="analyze")
+    container = FakeContainer()
+    engine.orchestrator = container
+    monkeypatch.setattr(
+        "sag.agent.document_map.read_live_document_map",
+        lambda _source: SimpleNamespace(
+            complete=True,
+            conflict=None,
+            detail="",
+            payload=None,
+        ),
+    )
+    recorded = []
+    original_record = engine._record_gate_facts
+
+    def record_after_publish(phase, gate):
+        assert PROJECT_EXECUTION_PLAN_PATH in container.files
+        recorded.append((phase, gate.validated_facts["analysis.execution_plan_sealed"]))
+        return original_record(phase, gate)
+
+    engine._record_gate_facts = record_after_publish
+
+    signal = engine._handle_phase_signals([_analyze_plan_step(_execution_plan_payload())])
+
+    artifact = read_sealed_project_execution_plan(container)
+    assert signal == "done"
+    assert artifact is not None
+    assert artifact.authored_plan_sha256 == canonical_authored_plan_sha256(
+        _execution_plan_payload()
+    )
+    assert recorded == [("analyze", True)]
+    assert engine.plan_evidence_validations == ["analyze-1"]
+    assert engine.run_evidence_state.fact_value("analysis.execution_plan_sealed") is True
+    assert (
+        engine.run_evidence_state.fact_value("analysis.execution_plan_source_attempt_id")
+        == "analyze-1"
+    )
+    assert engine.phase_machine.current_phase == "build"
+
+
+def test_engine_rechecks_document_read_evidence_immediately_before_sealing(monkeypatch):
+    engine = _engine_with_machine(start_phase="analyze")
+    container = FakeContainer()
+    engine.orchestrator = container
+    calls = []
+
+    def reject_stale_evidence(_plan, *, source_attempt_id):
+        calls.append(source_attempt_id)
+        raise ValueError("document output became unreadable")
+
+    engine.tools["phase"].validate_execution_plan_evidence = reject_stale_evidence
+    monkeypatch.setattr(
+        "sag.agent.document_map.read_live_document_map",
+        lambda _source: SimpleNamespace(
+            complete=True,
+            conflict=None,
+            detail="",
+            payload=None,
+        ),
+    )
+
+    signal = engine._handle_phase_signals([_analyze_plan_step(_execution_plan_payload())])
+
+    assert signal is None
+    assert calls == ["analyze-1"]
+    assert PROJECT_EXECUTION_PLAN_PATH not in container.files
+    assert engine.phase_machine.current_phase == "analyze"
+
+
+def test_analyze_plan_publish_failure_supersedes_acceptance_and_keeps_analyze_open(
+    monkeypatch,
+):
+    engine = _engine_with_machine(start_phase="analyze")
+    container = FakeContainer(fail_on="mv -f --")
+    engine.orchestrator = container
+    monkeypatch.setattr(
+        "sag.agent.document_map.read_live_document_map",
+        lambda _source: SimpleNamespace(
+            complete=True,
+            conflict=None,
+            detail="",
+            payload=None,
+        ),
+    )
+
+    signal = engine._handle_phase_signals([_analyze_plan_step(_execution_plan_payload())])
+
+    assert signal is None
+    assert PROJECT_EXECUTION_PLAN_PATH not in container.files
+    assert engine.phase_machine.current_phase == "analyze"
+    assert engine.phase_machine.records == ()
+
+
+def test_unavailable_inventory_records_a_gap_but_does_not_become_a_document_allowlist(
+    monkeypatch,
+):
+    engine = _engine_with_machine(start_phase="analyze")
+    container = FakeContainer()
+    engine.orchestrator = container
+    monkeypatch.setattr(
+        "sag.agent.document_map.read_live_document_map",
+        lambda _source: SimpleNamespace(
+            complete=False,
+            conflict="publication_missing",
+            detail="document map was not published",
+            payload=None,
+        ),
+    )
+
+    signal = engine._handle_phase_signals([_analyze_plan_step(_execution_plan_payload())])
+
+    artifact = read_sealed_project_execution_plan(container)
+    assert signal == "done"
+    assert artifact is not None
+    assert any(
+        warning.startswith("document_map_unavailable:") for warning in artifact.inventory_warnings
+    )
+    assert engine.phase_machine.current_phase == "build"
+
+
+def test_analyze_auto_close_does_not_reuse_plan_facts_from_an_older_attempt():
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = SimpleNamespace(
+        is_complete=False,
+        current_phase="analyze",
+        current_attempt_id="analyze-2",
+    )
+    engine.run_evidence_state = RunEvidenceState(run_id="analyze-reentry")
+    for key, value in (
+        ("analysis.execution_plan_sealed", True),
+        ("analysis.execution_plan_sha256", "a" * 64),
+        ("analysis.execution_plan_source_attempt_id", "analyze-1"),
+    ):
+        engine.run_evidence_state.set_fact(
+            key,
+            value,
+            evidence_ref="artifact://analyze-1-plan",
+            source_phase="analyze",
+            source_attempt_id="analyze-1",
+        )
+    guidance = []
+    engine._add_system_guidance = lambda text, priority=0: guidance.append((text, priority))
+
+    assert engine._keep_analyze_open_for_execution_plan("phase_floor") is True
+    assert guidance and "ANALYSIS_EXECUTION_PLAN_REQUIRED" in guidance[0][0]
+
+
+def test_build_prompt_rejects_plan_bound_to_an_older_analyze_record(monkeypatch):
+    plan = _execution_plan_payload()
+    plan_sha256 = canonical_authored_plan_sha256(plan)
+
+    def accepted_record(attempt_id: str, key_results: str) -> PhaseAttemptRecord:
+        claim = PhaseClaim(
+            phase="analyze",
+            signal="done",
+            claimed_outcome=PhaseOutcome.SUCCESS,
+            key_results=key_results,
+            execution_plan_sha256=plan_sha256,
+            execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+        )
+        return PhaseAttemptRecord(
+            phase="analyze",
+            attempt_id=attempt_id,
+            termination=PhaseTermination.COMPLETED,
+            outcome=PhaseOutcome.SUCCESS,
+            transition="advance",
+            claim=claim,
+        )
+
+    analyze_one = accepted_record("analyze-1", "first strategy")
+    artifact = seal_project_execution_plan(
+        plan,
+        source_attempt_id="analyze-1",
+        claim_sha256=claim_identity(analyze_one.claim),
+    )
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = SimpleNamespace(current_phase="build", records=(analyze_one,))
+    engine._sealed_execution_plan_cache = artifact
+    engine.orchestrator = object()
+    assert "MODEL-AUTHORED IN ANALYZE" in engine._system_prompt_for_current_phase("BASE")
+
+    analyze_two = accepted_record("analyze-2", "revised strategy")
+    engine.phase_machine = SimpleNamespace(
+        current_phase="build",
+        records=(analyze_one, analyze_two),
+    )
+    monkeypatch.setattr(
+        "sag.agent.project_execution_plan.read_sealed_project_execution_plan",
+        lambda _orchestrator: artifact,
+    )
+
+    with pytest.raises(RuntimeError, match="sealed Analyze execution plan"):
+        engine._system_prompt_for_current_phase("BASE")
+    assert engine._sealed_execution_plan_cache is None
+
+
+def test_report_does_not_inject_analyze_one_plan_after_analyze_two_blocks(monkeypatch):
+    plan = _execution_plan_payload()
+    plan_sha256 = canonical_authored_plan_sha256(plan)
+    first_claim = PhaseClaim(
+        phase="analyze",
+        signal="done",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        execution_plan_sha256=plan_sha256,
+        execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+    )
+    first_record = PhaseAttemptRecord(
+        phase="analyze",
+        attempt_id="analyze-1",
+        termination=PhaseTermination.COMPLETED,
+        outcome=PhaseOutcome.SUCCESS,
+        transition="advance",
+        claim=first_claim,
+    )
+    stale_artifact = seal_project_execution_plan(
+        plan,
+        source_attempt_id="analyze-1",
+        claim_sha256=claim_identity(first_claim),
+    )
+    blocked_claim = PhaseClaim(
+        phase="analyze",
+        signal="blocked",
+        claimed_outcome=PhaseOutcome.PARTIAL,
+        reason="documentation remains unresolved",
+    )
+    blocked_record = PhaseAttemptRecord(
+        phase="analyze",
+        attempt_id="analyze-2",
+        termination=PhaseTermination.BLOCKED,
+        outcome=PhaseOutcome.PARTIAL,
+        transition="evidence_close",
+        claim=blocked_claim,
+    )
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.phase_machine = SimpleNamespace(
+        current_phase="report",
+        records=(first_record, blocked_record),
+    )
+    engine._sealed_execution_plan_cache = stale_artifact
+    engine.orchestrator = object()
+    monkeypatch.setattr(
+        "sag.agent.project_execution_plan.read_sealed_project_execution_plan",
+        lambda _orchestrator: stale_artifact,
+    )
+
+    assert engine._system_prompt_for_current_phase("BASE") == "BASE"
+    assert engine._sealed_execution_plan_cache is None
+
+
+def test_plan_reader_rejects_each_record_binding_mismatch(monkeypatch):
+    plan = _execution_plan_payload()
+    plan_sha256 = canonical_authored_plan_sha256(plan)
+    claim = PhaseClaim(
+        phase="analyze",
+        signal="done",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="current strategy",
+        execution_plan_sha256=plan_sha256,
+        execution_plan_ref=PROJECT_EXECUTION_PLAN_PATH,
+    )
+    record = PhaseAttemptRecord(
+        phase="analyze",
+        attempt_id="analyze-2",
+        termination=PhaseTermination.COMPLETED,
+        outcome=PhaseOutcome.SUCCESS,
+        transition="advance",
+        claim=claim,
+    )
+    revised_plan = {**plan, "summary": "A different authored execution strategy."}
+    mismatches = {
+        "source_attempt": seal_project_execution_plan(
+            plan,
+            source_attempt_id="analyze-1",
+            claim_sha256=claim_identity(claim),
+        ),
+        "claim_sha": seal_project_execution_plan(
+            plan,
+            source_attempt_id="analyze-2",
+            claim_sha256="f" * 64,
+        ),
+        "authored_plan": seal_project_execution_plan(
+            revised_plan,
+            source_attempt_id="analyze-2",
+            claim_sha256=claim_identity(claim),
+        ),
+    }
+    holder = {"artifact": None}
+    monkeypatch.setattr(
+        "sag.agent.project_execution_plan.read_sealed_project_execution_plan",
+        lambda _orchestrator: holder["artifact"],
+    )
+
+    for name, artifact in mismatches.items():
+        engine = ReActEngine.__new__(ReActEngine)
+        engine.phase_machine = SimpleNamespace(current_phase="build", records=(record,))
+        engine._sealed_execution_plan_cache = artifact
+        engine.orchestrator = object()
+        holder["artifact"] = artifact
+
+        assert engine._read_sealed_execution_plan() is None, name
+        assert engine._sealed_execution_plan_cache is None, name
 
 
 def test_phase_blocked_signal_routes_from_prerequisites_not_linear_order():

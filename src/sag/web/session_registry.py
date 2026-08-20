@@ -19,7 +19,10 @@ from sag.agent.evidence_publications import (
     RUN_PIN_LOGICAL_ARTIFACT_ID,
     VERDICT_LOGICAL_ARTIFACT_ID,
     EvidencePublicationAuthority,
+    EvidencePublicationError,
     EvidencePublicationRecoveryError,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
 )
 from sag.agent.control_events import RunPin, canonical_json
 from sag.agent.verdict_finalizer import (
@@ -604,6 +607,7 @@ def _session_detail(
         evidence_status=summary.evidence_status,
         entry=summary.entry,
         start=summary.start,
+        finish=summary.finish,
         duration=summary.duration,
         outcome=outcome,
         build=build,
@@ -612,7 +616,7 @@ def _session_detail(
         module_summary=module_summary,
         report=summary.report,
         report_doc=report_doc,
-        blocker=None,
+        blocker=item.get("blocker"),
         evidence=_evidence(item, outcome),
         files=None,
         context=context,
@@ -796,9 +800,24 @@ def _read_setup_verdict_snapshot(
                 ).authorized
                 and authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID) is not None
             ):
-                live = read_live_verdict_snapshot(orchestrator, authority=authority)
+                token = None
+                try:
+                    # Keep the recovered host authority on this mirror reader.
+                    # The same reader immediately consumes report_metrics.json,
+                    # whose live reader resolves authority from the source.
+                    token = install_evidence_publication_authority(
+                        authority,
+                        orchestrator=orchestrator,
+                    )
+                    live = read_live_verdict_snapshot(orchestrator, authority=authority)
+                except (AttributeError, EvidencePublicationError, TypeError, ValueError):
+                    live = None
+                finally:
+                    if token is not None:
+                        reset_evidence_publication_authority(token)
                 if (
-                    live.run_id == forensic.run_id
+                    live is not None
+                    and live.run_id == forensic.run_id
                     and live.model_dump_json() == forensic.model_dump_json()
                 ):
                     return live, "valid"
@@ -818,7 +837,7 @@ def _snapshot_test_payload(
         )
     tests = snapshot.test_stats
     return {
-        "state": snapshot.verdict,
+        "state": tests.judgment,
         "pass": tests.passed,
         "fail": tests.failed,
         "skip": tests.skipped,
@@ -846,6 +865,7 @@ def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
         "state": build.outcome.value,
         "tool": "sealed snapshot",
         "note": "Canonical build evidence from verdict.json",
+        "class_count": build.compiled_classes,
         "evidence_refs": list(build.refs),
     }
 
@@ -882,7 +902,11 @@ def _setup_artifact_item(
     created = _text(trunk_data.get("created_at"), default="")
     updated = _text(trunk_data.get("last_updated"), default=created)
     if snapshot is not None:
-        finish = snapshot.finalized_at
+        # Trunk/report timestamps use the run's local clock, while the sealed
+        # snapshot finalizer records UTC. Prefer the report time for the UI's
+        # elapsed calculation when the durable report exists so a timezone
+        # offset is not added to the run duration.
+        finish = _report_generated_at(report_raw) or snapshot.finalized_at
     else:
         finish = _report_generated_at(report_raw) or updated
     status = _setup_status(tasks, report_path)
@@ -951,7 +975,10 @@ def _setup_artifact_item(
         "modules": _modules_payload_from_metrics(module_metrics),
         "module_summary": _module_rollup_from_metrics(module_metrics),
         "report": "ready" if report_path else "none",
-        "files": len(tasks),
+        # Trunk tasks are workflow records, not changed files. Until a real
+        # file digest is available, report no file count instead of relabeling
+        # the number of phases/tasks as source changes.
+        "files": 0,
         "evidence": len(tasks) + (1 if report_path else 0),
         "outcome": outcome,
         "updated": _normalize_timestamp(finish) or finish or "unknown",
@@ -1032,9 +1059,27 @@ def _latest_setup_report_path(orchestrator: Any) -> str | None:
         return None
 
     report_path = output.strip().splitlines()[-1] if output.strip() else ""
-    if not report_path.startswith("/workspace/setup-report-") or not report_path.endswith(".md"):
+    if report_path.startswith("/workspace/setup-report-") and report_path.endswith(".md"):
+        return report_path
+
+    fallback_command = (
+        "test -f /workspace/setup-report.md && "
+        "printf '%s\\n' /workspace/setup-report.md"
+    )
+    try:
+        fallback = _execute_control(orchestrator, fallback_command, timeout=5)
+    except TypeError:
+        fallback = _execute_control(orchestrator, fallback_command)
+    except Exception:
         return None
-    return report_path
+
+    if not isinstance(fallback, dict) or fallback.get("exit_code") != 0:
+        return None
+    fallback_output = fallback.get("output")
+    if not isinstance(fallback_output, str):
+        return None
+    fallback_path = fallback_output.strip().splitlines()[-1] if fallback_output.strip() else ""
+    return fallback_path if fallback_path == "/workspace/setup-report.md" else None
 
 
 def _raw_task_dicts(trunk_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1873,24 +1918,77 @@ def _build_summary(value: Any) -> BuildSummary:
 
 def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
     time = _display_time(_optional_text(item.get("finish")) or _text(item.get("start"), default=""))
-    status = _status_for_evidence(_evidence_status(item))
-    record = EvidenceRecord(
-        time=time,
-        status=status,
-        title=_text(item.get("title"), default="Workspace task"),
-        detail=outcome,
-        ref=f"{SESSION_INDEX_PATH}#{_text(item.get('id'), default='session')}",
-    )
-    return [
-        EvidenceGroup(
-            source="SAG session",
-            status=status,
-            counts="1 record",
-            time=record.time,
-            summary=outcome,
-            records=[record],
+    groups: list[EvidenceGroup] = []
+
+    def add_refs(
+        *,
+        source: str,
+        title: str,
+        status_value: Any,
+        detail: str,
+        refs_value: Any,
+    ) -> None:
+        refs = [str(ref) for ref in refs_value if str(ref).strip()] if isinstance(refs_value, list) else []
+        if not refs:
+            return
+        status = _status_for_evidence(_text(status_value, default="unknown"))
+        shown = refs[:20]
+        records = [
+            EvidenceRecord(time=time, status=status, title=title, detail=detail, ref=ref)
+            for ref in shown
+        ]
+        suffix = f" Showing the first {len(shown)}." if len(refs) > len(shown) else ""
+        groups.append(
+            EvidenceGroup(
+                source=source,
+                status=status,
+                counts=f"{len(refs)} reference{'s' if len(refs) != 1 else ''}",
+                time=time,
+                summary=f"{detail}{suffix}",
+                records=records,
+            )
         )
-    ]
+
+    build = item.get("build") if isinstance(item.get("build"), dict) else {}
+    add_refs(
+        source="Build evidence",
+        title="Build evidence reference",
+        status_value=build.get("state"),
+        detail=_text(build.get("note"), default="Evidence used for the sealed build result."),
+        refs_value=build.get("evidence_refs"),
+    )
+
+    test = item.get("test") if isinstance(item.get("test"), dict) else {}
+    add_refs(
+        source="Sealed run inputs",
+        title="Run evidence reference",
+        status_value=test.get("state"),
+        detail="Evidence inputs used to produce the sealed run summary.",
+        refs_value=test.get("evidence_refs"),
+    )
+
+    report_path = _optional_text(item.get("report_path"))
+    if report_path:
+        groups.append(
+            EvidenceGroup(
+                source="Generated report",
+                status="info",
+                counts="1 artifact",
+                time=time,
+                summary="Generated narrative report; the sealed summary remains authoritative.",
+                records=[
+                    EvidenceRecord(
+                        time=time,
+                        status="info",
+                        title="Report artifact",
+                        detail=outcome,
+                        ref=report_path,
+                    )
+                ],
+            )
+        )
+
+    return groups
 
 
 def _status_for_evidence(status: str) -> str:

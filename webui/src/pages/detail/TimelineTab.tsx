@@ -18,9 +18,10 @@ function message(error: unknown): string {
 /**
  * The Timeline tab: one session's trajectory, live.
  *
- * The whole view is fed by `GET /api/sessions/{id}/trajectory` and nothing
- * else — one derivation serving the timeline, the CLI and the golden fences
- * (spec §1/§4). Two reads, with different jobs:
+ * The timeline document is fed by `GET /api/sessions/{id}/trajectory`, one
+ * derivation shared with the CLI and golden fences (spec §1/§4). Exact call
+ * parameters are resolved lazily from the envelope endpoint when a row opens.
+ * The document itself has two reads, with different jobs:
  *
  * - the SUMMARY tier is what the run is polled at. While the session is live the
  *   poll carries `since_seq=<the last ledger line held>`, so each response
@@ -312,7 +313,12 @@ export function TimelineTab({ sessionId, live }: { sessionId: string; live: bool
         </ul>
       ) : null}
 
-      <TrajectoryTimeline doc={doc} onNeedBytes={needBytes} status={bytes} />
+      <TrajectoryTimeline
+        doc={doc}
+        onNeedBytes={needBytes}
+        sessionId={sessionId}
+        status={bytes}
+      />
     </div>
   )
 }

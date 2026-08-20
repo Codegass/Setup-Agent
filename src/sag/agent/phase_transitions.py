@@ -188,8 +188,17 @@ class RepairRecurrenceGuard(Protocol):
 
 
 class PhaseTransitionPolicy:
-    def __init__(self, repair_guard: RepairRecurrenceGuard | None = None):
+    def __init__(
+        self,
+        repair_guard: RepairRecurrenceGuard | None = None,
+        *,
+        require_analysis_plan: bool = True,
+    ):
         self.repair_guard = repair_guard
+        # Historical control streams predate model-authored Analyze plans.
+        # Live runs default to the new invariant; replay opts out explicitly
+        # and still verifies the transition facts recorded by those streams.
+        self.require_analysis_plan = bool(require_analysis_plan)
         self._default_repair_guards: dict[int, tuple[RunEvidenceState, LoopMemory]] = {}
 
     def _repair_guard_for(self, state: RunEvidenceState) -> RepairRecurrenceGuard:
@@ -274,9 +283,7 @@ class PhaseTransitionPolicy:
         if phase == "provision":
             if state.fact_value("provision.workspace_ready") is True:
                 return TransitionDecision(
-                    self._route(
-                        "advance", record, target="analyze", reason_code="workspace_ready"
-                    )
+                    self._route("advance", record, target="analyze", reason_code="workspace_ready")
                 )
             ref = state.fact_provenance("provision.workspace_ready") or _first_ref(record)
             return self._evidence_close(
@@ -287,17 +294,57 @@ class PhaseTransitionPolicy:
                 prerequisite_ref=ref,
             )
         if phase == "analyze":
-            if state.fact_value("analysis.build_entry_ready") is True:
+            # A survey can establish build coordinates, but it cannot author
+            # the project strategy.  Only a model-authored plan sealed from an
+            # accepted Analyze claim licenses entry into Build.  This second
+            # check also closes the phase-floor/engine-close bypass: those
+            # paths may end a starved Analyze attempt, but they cannot silently
+            # start Build without the plan the model was required to produce.
+            analysis_ready = state.fact_value("analysis.build_entry_ready") is True
+            plan_ready = state.fact_value("analysis.execution_plan_sealed") is True
+            plan_fingerprint = state.fact_value("analysis.execution_plan_sha256")
+            plan_source_attempt = str(
+                state.fact_value("analysis.execution_plan_source_attempt_id") or ""
+            ).strip()
+            claim_plan_fingerprint = str(
+                getattr(record.claim, "execution_plan_sha256", "") or ""
+            ).strip()
+            plan_is_current = plan_source_attempt == record.attempt_id
+            plan_is_this_claim = bool(
+                record.claim is not None
+                and record.claim.signal == "done"
+                and claim_plan_fingerprint
+                and claim_plan_fingerprint == str(plan_fingerprint or "").strip()
+            )
+            plan_requirement_met = not self.require_analysis_plan or (
+                plan_ready
+                and bool(str(plan_fingerprint or "").strip())
+                and plan_is_current
+                and plan_is_this_claim
+            )
+            if analysis_ready and plan_requirement_met:
                 return TransitionDecision(
-                    self._route(
-                        "advance", record, target="build", reason_code="analysis_ready"
-                    )
+                    self._route("advance", record, target="build", reason_code="analysis_ready")
                 )
-            ref = state.fact_provenance("analysis.build_entry_ready") or _first_ref(record)
+            ref = (
+                state.fact_provenance("analysis.execution_plan_sealed")
+                or state.fact_provenance("analysis.build_entry_ready")
+                or _first_ref(record)
+            )
             return self._evidence_close(
                 record,
                 state=state,
-                reason_code="analysis_not_ready",
+                reason_code=(
+                    "analysis_not_ready"
+                    if not analysis_ready
+                    else (
+                        "analysis_plan_not_current"
+                        if plan_ready
+                        and bool(str(plan_fingerprint or "").strip())
+                        and (not plan_is_current or not plan_is_this_claim)
+                        else "analysis_plan_not_sealed"
+                    )
+                ),
                 skipped_phases=("build", "test"),
                 prerequisite_ref=ref,
             )

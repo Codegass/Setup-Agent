@@ -17,18 +17,18 @@ export function TrajectoryTimeline({
   doc,
   status = "absent",
   onNeedBytes,
+  sessionId,
 }: {
   doc: TrajectoryDocument
   status?: BytesStatus
   onNeedBytes?: () => void
+  sessionId?: string
 }) {
   const bands = bandTurns(doc)
   const annotations = rowsByTurn(doc.annotations)
   const warnings = rowsByTurn(doc.warnings)
-  const ordered = [...doc.turns].sort((a, b) => a.turn_id - b.turn_id)
-  const nextOf = new Map(ordered.map((turn, index) => [turn.turn_id, ordered[index + 1] ?? null]))
 
-  if (!ordered.length) {
+  if (!doc.turns.length) {
     return (
       <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
         No turns on the record yet. A run that has just attached shows its first turn as soon
@@ -80,10 +80,10 @@ export function TrajectoryTimeline({
               <TurnRow
                 annotations={annotations.get(turn.turn_id) ?? []}
                 key={turn.turn_id}
-                next={nextOf.get(turn.turn_id) ?? null}
                 onNeedBytes={onNeedBytes}
                 outputs={doc.outputs ?? null}
                 phases={doc.phases}
+                sessionId={sessionId}
                 status={status}
                 turn={turn}
                 warnings={warnings.get(turn.turn_id) ?? []}

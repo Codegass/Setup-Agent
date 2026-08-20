@@ -323,6 +323,8 @@ def test_read_model_builder_marks_docker_unavailable_when_registry_raises():
     assert dashboard.docker.status == "unavailable"
     assert dashboard.docker.image is None
     assert dashboard.workspaces == []
+    assert dashboard.read_status == "unavailable"
+    assert "could not be read" in (dashboard.read_error or "")
 
 
 def test_non_demo_session_detail_uses_session_registry_without_workspace_registry(monkeypatch):
