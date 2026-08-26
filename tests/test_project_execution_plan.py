@@ -7,6 +7,7 @@ import pytest
 from test_container_io import FakeContainer
 
 from sag.agent.document_map import DocumentMapEntry, document_map_fingerprint, entry_id
+from sag.agent.control_events import canonical_sha256
 from sag.agent.project_execution_plan import (
     MAX_INVENTORY_PROMPT_CHARS,
     MAX_SYSTEM_PROMPT_CHARS,
@@ -17,6 +18,7 @@ from sag.agent.project_execution_plan import (
     ProjectExecutionPlanReadError,
     ProjectExecutionPlanValidationError,
     SealedProjectExecutionPlan,
+    bind_project_execution_plan_inventory,
     canonical_authored_plan_sha256,
     read_sealed_project_execution_plan,
     render_document_inventory_guidance,
@@ -72,8 +74,6 @@ def candidate():
                 "path": DEVNOTES_PATH,
                 "reason": "Defines the project's supported build and test entry points.",
                 "evidence_refs": [DEVNOTES.entry_id],
-                "entry_id": DEVNOTES.entry_id,
-                "source_hash": DEVNOTES.source_hash,
             }
         ],
         "build_steps": [
@@ -112,6 +112,35 @@ def candidate():
     }
 
 
+def planned_candidate():
+    value = candidate()
+    value["test_disposition"] = {
+        "status": "planned",
+        "reason": "DEVNOTES defines IgniteBasicTestSuite as an unattended product test lane.",
+        "execution_mechanism": "Maven Surefire executes IgniteBasicTestSuite.",
+        "verdict_scope": "product_test_cases",
+        "readiness": "ready",
+        "evidence_refs": [DEVNOTES.entry_id],
+        "definition_evidence_refs": [DEVNOTES.entry_id],
+    }
+    return value
+
+
+def blocked_candidate():
+    value = candidate()
+    value["test_steps"] = []
+    value["test_disposition"] = {
+        "status": "blocked",
+        "reason": "The documented test lane requires manual network coordination.",
+        "execution_mechanism": "A server and client must be launched separately.",
+        "verdict_scope": "benchmark_or_manual",
+        "readiness": "blocked",
+        "evidence_refs": [DEVNOTES.entry_id],
+        "definition_evidence_refs": [DEVNOTES.entry_id],
+    }
+    return value
+
+
 def test_validate_authored_plan_normalizes_to_frozen_bounded_models():
     plan = validate_authored_plan(candidate())
 
@@ -123,13 +152,67 @@ def test_validate_authored_plan_normalizes_to_frozen_bounded_models():
         plan.summary = "changed"
 
 
+def test_new_analyze_plans_require_an_explicit_test_disposition():
+    with pytest.raises(ProjectExecutionPlanValidationError, match="test_disposition"):
+        validate_authored_plan(candidate(), require_test_disposition=True)
+
+    planned = validate_authored_plan(planned_candidate(), require_test_disposition=True)
+    blocked = validate_authored_plan(blocked_candidate(), require_test_disposition=True)
+
+    assert planned.test_disposition.status == "planned"
+    assert blocked.test_disposition.status == "blocked"
+    assert blocked.test_steps == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("readiness", "unknown", "readiness=ready"),
+        ("verdict_scope", "quality_only", "verdict_scope=product_test_cases"),
+    ],
+)
+def test_planned_test_disposition_requires_ready_product_cases(field, value, message):
+    plan = planned_candidate()
+    plan["test_disposition"][field] = value
+
+    with pytest.raises(ProjectExecutionPlanValidationError, match=message):
+        validate_authored_plan(plan, require_test_disposition=True)
+
+
+def test_legacy_plan_digest_does_not_gain_a_null_disposition_field():
+    plan = validate_authored_plan(candidate())
+    legacy_payload = plan.model_dump(mode="json", exclude={"test_disposition"})
+
+    assert canonical_authored_plan_sha256(plan) == canonical_sha256(legacy_payload)
+
+
+def test_execution_steps_do_not_require_repeating_document_refs():
+    value = candidate()
+    value["build_steps"][0].pop("evidence_refs")
+    value["test_steps"][0].pop("evidence_refs")
+
+    plan = validate_authored_plan(value)
+
+    assert plan.build_steps[0].evidence_refs == ()
+    assert plan.test_steps[0].evidence_refs == ()
+
+
+def test_test_steps_may_be_empty_when_analysis_cannot_establish_a_safe_entry():
+    value = candidate()
+    value["test_steps"] = []
+    value["risks"] = ["No project-declared unattended test entry was established."]
+
+    plan = validate_authored_plan(value)
+
+    assert plan.test_steps == ()
+
+
 @pytest.mark.parametrize(
     "missing",
     [
         "documents_reviewed",
         "build_steps",
         "build_success_criteria",
-        "test_steps",
         "test_success_criteria",
     ],
 )
@@ -166,6 +249,22 @@ def test_canonical_authored_hash_is_stable_across_mapping_order():
     )
 
 
+def test_inventory_binding_hints_do_not_change_the_model_strategy_hash():
+    without_hints = candidate()
+    with_hints = candidate()
+    with_hints["documents_reviewed"][0].update(
+        {"entry_id": "model-hint", "source_hash": "not-a-digest-hint"}
+    )
+
+    mapped = document_map(DEVNOTES)
+    bound_without_hints = bind_project_execution_plan_inventory(without_hints, mapped)
+    bound_with_hints = bind_project_execution_plan_inventory(with_hints, mapped)
+
+    assert canonical_authored_plan_sha256(bound_with_hints) == canonical_authored_plan_sha256(
+        bound_without_hints
+    )
+
+
 def test_seal_binds_attempt_claim_authored_plan_and_document_map():
     mapped = document_map(
         DEVNOTES,
@@ -183,8 +282,10 @@ def test_seal_binds_attempt_claim_authored_plan_and_document_map():
     assert isinstance(artifact, SealedProjectExecutionPlan)
     assert artifact.source_attempt_id == ATTEMPT_ID
     assert artifact.claim_sha256 == CLAIM_SHA
-    assert artifact.authored_plan_sha256 == canonical_authored_plan_sha256(candidate())
+    assert artifact.authored_plan_sha256 == canonical_authored_plan_sha256(artifact.plan)
     assert artifact.document_map_fingerprint == mapped["document_map_fingerprint"]
+    assert artifact.plan.documents_reviewed[0].entry_id == DEVNOTES.entry_id
+    assert artifact.plan.documents_reviewed[0].source_hash == DEVNOTES.source_hash
     assert artifact.inventory_coverage.indexed_documents == 2
     assert artifact.inventory_coverage.reviewed_indexed_documents == 1
     assert artifact.inventory_coverage.unreviewed_indexed_documents == 1
@@ -194,17 +295,24 @@ def test_seal_binds_attempt_claim_authored_plan_and_document_map():
 
 
 @pytest.mark.parametrize("field", ["entry_id", "source_hash"])
-def test_seal_rejects_document_map_identity_or_hash_mismatch(field):
+def test_seal_corrects_optional_document_map_binding_hints(field):
     value = candidate()
     value["documents_reviewed"][0][field] = "f" * 64 if field == "source_hash" else "doc-wrong"
 
-    with pytest.raises(ProjectExecutionPlanValidationError, match=field):
-        seal_project_execution_plan(
-            value,
-            source_attempt_id=ATTEMPT_ID,
-            claim_sha256=CLAIM_SHA,
-            document_map=document_map(DEVNOTES),
-        )
+    artifact = seal_project_execution_plan(
+        value,
+        source_attempt_id=ATTEMPT_ID,
+        claim_sha256=CLAIM_SHA,
+        document_map=document_map(DEVNOTES),
+    )
+
+    reviewed = artifact.plan.documents_reviewed[0]
+    assert reviewed.entry_id == DEVNOTES.entry_id
+    assert reviewed.source_hash == DEVNOTES.source_hash
+    assert any(
+        "document_binding_hint_corrected" in warning and field in warning
+        for warning in artifact.inventory_warnings
+    )
 
 
 def test_seal_rejects_a_tampered_document_map_fingerprint():
@@ -220,14 +328,14 @@ def test_seal_rejects_a_tampered_document_map_fingerprint():
         )
 
 
-@pytest.mark.parametrize("evidence_ref", ["output_abc123", f"file:{ROOT}/PRIVATE-NOTES"])
-def test_map_external_document_with_direct_output_or_file_evidence_is_a_warning(evidence_ref):
+def test_map_external_document_with_direct_output_evidence_is_a_warning():
     value = candidate()
     value["documents_reviewed"] = [
         {
             "path": f"{ROOT}/PRIVATE-NOTES",
             "reason": "A targeted repository search found project-specific instructions.",
-            "evidence_refs": [evidence_ref],
+            "evidence_refs": ["output_abc123"],
+            "entry_id": "stale-model-hint",
         }
     ]
 
@@ -240,20 +348,27 @@ def test_map_external_document_with_direct_output_or_file_evidence_is_a_warning(
 
     assert artifact.inventory_coverage.external_documents_reviewed == 1
     assert artifact.inventory_coverage.unreviewed_indexed_documents == 1
+    assert artifact.plan.documents_reviewed[0].entry_id is None
+    assert artifact.plan.documents_reviewed[0].source_hash is None
     assert any("external_document_reviewed" in warning for warning in artifact.inventory_warnings)
+    assert any(
+        "external_document_binding_hint_ignored" in warning
+        for warning in artifact.inventory_warnings
+    )
 
 
-def test_map_external_document_without_direct_evidence_is_rejected():
+@pytest.mark.parametrize("evidence_ref", ["claim-123", f"file:{ROOT}/PRIVATE-NOTES"])
+def test_map_external_document_without_output_evidence_is_rejected(evidence_ref):
     value = candidate()
     value["documents_reviewed"] = [
         {
             "path": f"{ROOT}/PRIVATE-NOTES",
             "reason": "Unbound prose.",
-            "evidence_refs": ["claim-123"],
+            "evidence_refs": [evidence_ref],
         }
     ]
 
-    with pytest.raises(ProjectExecutionPlanValidationError, match="output/file evidence"):
+    with pytest.raises(ProjectExecutionPlanValidationError, match="output evidence"):
         seal_project_execution_plan(
             value,
             source_attempt_id=ATTEMPT_ID,
@@ -265,8 +380,8 @@ def test_map_external_document_without_direct_evidence_is_rejected():
 def test_absent_document_map_allows_direct_evidence_and_records_the_gap():
     value = candidate()
     review = value["documents_reviewed"][0]
-    review.pop("entry_id")
-    review.pop("source_hash")
+    review.pop("entry_id", None)
+    review.pop("source_hash", None)
     review["evidence_refs"] = ["output_direct_read"]
 
     artifact = seal_project_execution_plan(
@@ -313,6 +428,40 @@ def test_document_review_evidence_resolves_current_analyze_output_and_path():
     assert plan.documents_reviewed[0].evidence_refs == ("output_real_read",)
 
 
+def test_document_review_does_not_depend_on_tool_or_action_names():
+    value = candidate()
+    value["documents_reviewed"][0]["evidence_refs"] = ["output_future_reader"]
+    observation = _document_read_observation(
+        "output_future_reader",
+        tool_name="future_document_facade",
+        params={"operation": "open", "request": {"source": DEVNOTES_PATH}},
+    )
+
+    plan = validate_reviewed_document_evidence(
+        value,
+        observations=[observation],
+        output_reader={"output_future_reader": DEVNOTES_TEXT}.get,
+        source_attempt_id=ATTEMPT_ID,
+    )
+
+    assert plan.documents_reviewed[0].evidence_refs == ("output_future_reader",)
+
+
+def test_document_review_rejects_a_search_observation_that_explicitly_did_not_match():
+    value = candidate()
+    value["documents_reviewed"][0]["evidence_refs"] = ["output_empty_search"]
+    observation = _document_read_observation("output_empty_search")
+    observation["result"]["facts"] = {"matched": False}
+
+    with pytest.raises(ProjectExecutionPlanValidationError, match="current Analyze attempt"):
+        validate_reviewed_document_evidence(
+            value,
+            observations=[observation],
+            output_reader={"output_empty_search": "No matches found"}.get,
+            source_attempt_id=ATTEMPT_ID,
+        )
+
+
 @pytest.mark.parametrize(
     ("evidence_refs", "observations", "outputs"),
     [
@@ -352,23 +501,49 @@ def test_document_review_rejects_unreadable_unbound_or_previous_attempt_refs(
         )
 
 
-def test_document_review_accepts_full_output_hash_when_tool_params_have_no_path():
+def test_document_review_rejects_hash_only_output_without_a_path_bound_read():
     value = candidate()
     value["documents_reviewed"][0]["evidence_refs"] = ["output_exact_document"]
+    value["documents_reviewed"][0]["source_hash"] = DEVNOTES_HASH
     observation = _document_read_observation(
         "output_exact_document",
         tool_name="advisor",
         params={"action": "consult"},
     )
 
-    plan = validate_reviewed_document_evidence(
-        value,
-        observations=[observation],
-        output_reader={"output_exact_document": DEVNOTES_TEXT}.get,
-        source_attempt_id=ATTEMPT_ID,
-    )
+    with pytest.raises(ProjectExecutionPlanValidationError, match="Exact valid.*none"):
+        validate_reviewed_document_evidence(
+            value,
+            observations=[observation],
+            output_reader={"output_exact_document": DEVNOTES_TEXT}.get,
+            source_attempt_id=ATTEMPT_ID,
+        )
 
-    assert plan.documents_reviewed[0].source_hash == DEVNOTES_HASH
+
+def test_document_review_error_lists_exact_valid_refs_for_the_claimed_path():
+    value = candidate()
+    value["documents_reviewed"][0]["evidence_refs"] = ["output_guessed"]
+    observations = [
+        _document_read_observation("output_valid_devnotes"),
+        _document_read_observation("output_other_document", path=README_PATH),
+    ]
+
+    with pytest.raises(ProjectExecutionPlanValidationError) as raised:
+        validate_reviewed_document_evidence(
+            value,
+            observations=observations,
+            output_reader={
+                "output_valid_devnotes": DEVNOTES_TEXT,
+                "output_other_document": README_TEXT,
+            }.get,
+            source_attempt_id=ATTEMPT_ID,
+        )
+
+    message = str(raised.value)
+    assert "output_valid_devnotes" in message
+    assert "output_guessed" in message
+    assert "output_other_document" not in message
+    assert len(message) <= 4_096
 
 
 def test_document_review_binding_does_not_make_the_inventory_an_allowlist():
@@ -409,6 +584,7 @@ def test_atomic_write_and_strict_read_round_trip_the_sealed_artifact():
     assert json.loads(fake.files[PROJECT_EXECUTION_PLAN_PATH])["artifact_sha256"] == (
         artifact.artifact_sha256
     )
+    assert "test_disposition" not in json.loads(fake.files[PROJECT_EXECUTION_PLAN_PATH])["plan"]
     assert any("json.load" in command for command in fake.commands)
     assert not any(path.endswith(".tmp") for path in fake.files)
 
@@ -423,6 +599,12 @@ def test_strict_read_rejects_authored_or_artifact_tampering_and_extra_fields():
     )
     body = artifact.model_dump(mode="json")
     body["plan"]["summary"] = "changed after sealing"
+    fake.files[PROJECT_EXECUTION_PLAN_PATH] = json.dumps(body)
+    with pytest.raises(ProjectExecutionPlanReadError, match="hash mismatch"):
+        read_sealed_project_execution_plan(fake)
+
+    body = artifact.model_dump(mode="json")
+    body["plan"]["documents_reviewed"][0]["entry_id"] = "doc-tampered"
     fake.files[PROJECT_EXECUTION_PLAN_PATH] = json.dumps(body)
     with pytest.raises(ProjectExecutionPlanReadError, match="hash mismatch"):
         read_sealed_project_execution_plan(fake)
@@ -523,6 +705,8 @@ def test_document_inventory_guidance_is_bounded_and_labels_hints_and_gaps():
     assert len(guidance) <= 900
     assert "guidance, not a document allowlist" in guidance
     assert DEVNOTES_PATH in guidance
+    assert "entry_id=" not in guidance
+    assert "source_hash=" not in guidance
     assert "inventory lines omitted" in guidance
     assert len(render_document_inventory_guidance(mapped)) <= MAX_INVENTORY_PROMPT_CHARS
 

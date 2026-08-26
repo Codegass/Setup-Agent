@@ -265,10 +265,33 @@ PHASE_OBJECTIVES = {
         "plan that names the documents and evidence you relied on, the intended build and test "
         "actions, success criteria, constraints, risks, and unresolved questions. Submit that "
         "plan in execution_plan on the terminal phase call; Build cannot start until it is "
-        "validated and sealed. An honest unknown may remain explicit in the plan."
+        "validated and sealed. Classify whether the project's declared test entry is suitable "
+        "for unattended execution from its docs, CI, profiles, and suite definitions. Prefer the "
+        "project-declared suite/profile/target; do not use a broad root run merely to discover "
+        "whether it stalls. Record test_disposition as planned with at least one evidence-backed "
+        "test step, or blocked with empty test_steps and a concrete reason plus reviewed-document "
+        "evidence refs. In test_disposition, keep the exact execution mechanism, verdict_scope, "
+        "and unattended readiness separate. Classify verdict_scope from the definition before "
+        "choosing status: product_test_cases executes product behavior cases; test_metadata only "
+        "checks their inventory or suite membership; quality_only is not a test verdict; "
+        "benchmark_or_manual needs coordination; unknown stays unresolved. Only "
+        "product_test_cases with readiness ready may be planned. For a custom profile, "
+        "task, script, wrapper, or suite, read its actual definition and cite that output in "
+        "definition_evidence_refs; never infer its behavior from its name or invocation alone. "
+        "Before selecting one, prioritize project testing, developer, or contributor "
+        "documentation over a generic README or generic test-plugin configuration. Refine or read "
+        "a relevant capped search before treating its question as settled. In the plan reason, "
+        "explicitly reconcile the exact entry with the project's own label or stated purpose and "
+        "cite evidence binding it to automated product test cases. Each planned step's tool, "
+        "working directory, and arguments must faithfully implement the cited project command; "
+        "do not substitute a similarly named build lifecycle or a mechanical fact-sheet runner. "
+        "Resolve required services, external checkouts, manual coordination, and runner/report "
+        "support before sealing. Prefer a bounded self-contained documented suite; if the real "
+        "entry cannot run unattended here, keep test_steps empty and use blocked."
     ),
     "build": (
-        "Execute from the sealed Analyze execution plan, adapting only when new observed evidence "
+        "Execute the exact lifecycle and scope in the sealed Analyze execution plan, adapting "
+        "only when new observed evidence "
         "requires it and recording the reason for any deviation. Establish terminal build evidence "
         "for every required surveyed build coordinate. "
         "An aggregator root with no sources is not compile evidence for source-bearing "
@@ -279,7 +302,8 @@ PHASE_OBJECTIVES = {
         "are automatic and no unrelated work may start."
     ),
     "test": (
-        "Execute the test strategy from the sealed Analyze plan, adapting only when current "
+        "Execute the exact lifecycle and scope in the sealed Analyze test strategy; do not "
+        "broaden it to a larger lifecycle or repository scope. Adapt only when current "
         "evidence requires it and recording the reason for any deviation. Establish terminal "
         "runner evidence for the required surveyed test coordinates. "
         "Test coordinates can live in a different module or build system from build "
@@ -2260,7 +2284,7 @@ class ReActEngine(UIEventEmitter):
         if machine is None:
             raise RuntimeError("abort termination is available only for setup runs")
         if not machine.is_complete:
-            record = machine.record_abort(reason, evidence=[])
+            record = machine.record_abort(reason, evidence=[], outcome=PhaseOutcome.FAILED)
             self._record_phase_audit(record)
         state = getattr(self, "run_evidence_state", None)
         if state is not None and not state.sealed:
@@ -2775,6 +2799,9 @@ class ReActEngine(UIEventEmitter):
             }.get(survey_state)
             if survey_projection:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, survey_projection)
+            fact_guidance = self._analyze_fact_sheet_guidance()
+            if fact_guidance:
+                lines.extend(["", fact_guidance])
             inventory_guidance = self._document_inventory_guidance()
             if inventory_guidance:
                 lines.extend(["", inventory_guidance])
@@ -2823,6 +2850,49 @@ class ReActEngine(UIEventEmitter):
             content=content,
             timestamp=self._get_timestamp(),
         )
+
+    def _analyze_fact_sheet_guidance(self) -> str:
+        """Project the small observed coordinate set useful for Analyze."""
+
+        try:
+            from sag.tools.internal.build_preflight import read_live_build_requirements
+
+            orchestrator = getattr(self, "orchestrator", None) or getattr(
+                getattr(self, "context_manager", None), "orchestrator", None
+            )
+            observed = read_live_build_requirements(orchestrator)
+            if (
+                not observed.complete
+                or observed.conflict is not None
+                or not isinstance(observed.payload, Mapping)
+            ):
+                return ""
+            manifest = observed.payload
+            module_structure = manifest.get("module_structure")
+            modules = (
+                module_structure.get("modules")
+                if isinstance(module_structure, Mapping)
+                else None
+            )
+            fields = [
+                ("build_root", manifest.get("build_root")),
+                ("test_root", manifest.get("test_root")),
+                ("root_shape", manifest.get("root_shape")),
+                ("surveyed_modules", len(modules) if isinstance(modules, Sequence) else None),
+            ]
+            rendered = " · ".join(
+                f"{name}={value}" for name, value in fields if value not in (None, "", [])
+            )
+            if not rendered:
+                return ""
+            return (
+                "Harness fact-sheet hints (mechanically observed coordinates, not a runner "
+                "choice or execution plan): "
+                f"{rendered}. Use them to locate and gap-check project docs/CI/config; "
+                "project evidence still controls the test runner and strategy."
+            )
+        except Exception:
+            return ""
 
     def _document_inventory_guidance(self) -> str:
         """Bounded Analyze inventory projection; never a document allowlist."""
@@ -4258,7 +4328,11 @@ class ReActEngine(UIEventEmitter):
 
     def _record_setup_abort(self, phase_mode: bool, reason: str) -> None:
         if phase_mode and not self.phase_machine.is_complete:
-            record = self.phase_machine.record_abort(reason, evidence=[])
+            record = self.phase_machine.record_abort(
+                reason,
+                evidence=[],
+                outcome=PhaseOutcome.FAILED,
+            )
             self._record_phase_audit(record)
 
     def _restore_active_repair_context(self) -> None:
@@ -4557,6 +4631,22 @@ class ReActEngine(UIEventEmitter):
         params: Dict[str, Any],
     ) -> str | None:
         """Mint intent, persist its envelope, and open the contract scope."""
+
+        machine = getattr(self, "phase_machine", None)
+        current_phase = str(getattr(machine, "current_phase", "") or "").strip().lower()
+        tool_name = str(call.name or "").strip().lower()
+        action = str(params.get("action") or "").strip().lower()
+        if current_phase == "build" and tool_name == "build" and action == "test":
+            raise PreDispatchControlError(
+                "build(action='test') belongs to the Test phase; finish the current "
+                "Build phase with its build steps first",
+                error_code="PHASE_ACTION_MISMATCH",
+                metadata={
+                    "runner_dispatched": False,
+                    "current_phase": current_phase,
+                    "requested_action": action,
+                },
+            )
 
         if call.action_intent is None:
             call.action_intent = self._mint_model_action_intent(call, params)

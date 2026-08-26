@@ -15,12 +15,13 @@ from sag.agent.evidence_records import (
     frame_json_record_stream,
     frame_named_json_record_stream,
 )
-from sag.agent.receipt_test_rows import testcase_execution_id as _testcase_execution_id
 from sag.agent.invocation_receipts import build_receipt
+from sag.agent.receipt_test_rows import testcase_execution_id as _testcase_execution_id
 from sag.main import _read_metrics_v2_for_cli
 from sag.tools.report_metrics import (
     METRICS_PATH,
     REPORT_METRICS_LOGICAL_ARTIFACT_ID,
+    _receipt_row_projection,
     assemble_report_metrics,
     read_live_report_metrics,
     validate_report_metrics_v2,
@@ -217,6 +218,81 @@ def test_persist_metrics_writes_json_artifact():
     assert METRICS_PATH in orch.writes
     parsed = json.loads(orch.writes[METRICS_PATH])
     assert parsed == metrics
+
+
+def test_analyze_abort_projects_unreached_build_and_test_as_not_attempted():
+    metrics = assemble_report_metrics(
+        snapshot={
+            "verdict": "failed",
+            "build_evidence": {"observed": False, "judgment": "unknown"},
+            "test_stats": {
+                "unique": {
+                    "executed": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                },
+                "raw": {
+                    "executed": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                },
+            },
+            "phase_records": [
+                {
+                    "phase": "analyze",
+                    "attempt_id": "analyze-1",
+                    "termination": "aborted",
+                    "outcome": "unknown",
+                    "validated_outcome": "unknown",
+                    "reason": "iteration budget exhausted",
+                }
+            ],
+        },
+        build_evidence={},
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-08-20T09:38:28Z",
+        close_reason="aborted",
+    )
+
+    assert metrics["outcome"]["build_state"] == "not_attempted"
+    assert metrics["outcome"]["test_state"] == "not_attempted"
+    assert metrics["coverage"]["domains_attempted"] is None
+    for bucket in metrics["tests"]["claimed"].values():
+        assert bucket["availability"] == "unavailable"
+        assert bucket["reason"] == "tests were not run"
+    assert metrics["tests"]["unattributed_observations"]["executed"] is None
+
+
+def test_policy_skipped_phases_project_as_not_attempted():
+    metrics = assemble_report_metrics(
+        snapshot={
+            "verdict": "partial",
+            "build_evidence": {"observed": False, "judgment": "unknown"},
+            "test_stats": {
+                "unique": {"executed": 0},
+                "raw": {"executed": 0},
+            },
+            "phase_records": [
+                {"phase": "build", "termination": "skipped"},
+                {"phase": "test", "termination": "skipped"},
+            ],
+        },
+        build_evidence={},
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-08-20T10:00:00Z",
+    )
+
+    assert metrics["outcome"]["build_state"] == "not_attempted"
+    assert metrics["outcome"]["test_state"] == "not_attempted"
+    assert metrics["tests"]["unattributed_observations"]["availability"] == "unavailable"
 
 
 def test_metrics_writer_publishes_one_stable_mutable_head(
@@ -578,6 +654,78 @@ def test_post_loop_finalizer_rehydrates_module_qualified_rows_from_durable_recei
     assert metrics["tests"]["claimed"]["receipt_executions"]["executed"] == 1
     assert orch.receipt_reads == 1
     assert json.loads(orch.writes[METRICS_PATH]) == metrics
+
+
+def test_build_receipt_before_test_receipt_does_not_hide_testcase_rows():
+    run_id = "run-pytest"
+    target_sha = "a" * 40
+    report = "/workspace/proj/target/surefire-reports/TEST-a.xml"
+    report_sha = "e" * 64
+    receipt_id = "inv-maven-test-0002"
+    row = {
+        "run_id": run_id,
+        "receipt_id": receipt_id,
+        "execution_index": 2,
+        "execution_ordinal": 1,
+        "target_sha": target_sha,
+        "domain_id": "/workspace/proj",
+        "module_coordinate": ".",
+        "framework": "junit-xml",
+        "owner": "com.acme.ExactTest",
+        "test_name": "works",
+        "parameter_id": None,
+        "outcome": "passed",
+        "report_path": report,
+        "report_sha256": report_sha,
+        "disposition": "claimed",
+        "qualifying_invocation": True,
+    }
+    row["execution_id"] = _testcase_execution_id(row)
+    build = build_receipt(
+        receipt_id="inv-maven-build-0001",
+        run_id=run_id,
+        tool="maven",
+        requested_action="compile",
+        effective_action="compile",
+        argv="mvn compile",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={},
+        target_sha=target_sha,
+        domain_id="/workspace/proj",
+    )
+    test = build_receipt(
+        receipt_id=receipt_id,
+        run_id=run_id,
+        tool="maven",
+        requested_action="test",
+        effective_action="test",
+        argv="mvn test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={report: report_sha},
+        target_sha=target_sha,
+        domain_id="/workspace/proj",
+        testcase_execution_rows={
+            "schema_version": 2,
+            "status": "complete",
+            "report_count": 1,
+            "rows": [row],
+        },
+    )
+
+    projection = _receipt_row_projection(
+        [build, test],
+        run_id=run_id,
+        run_target_sha=target_sha,
+    )
+
+    assert projection is not None
+    assert projection["identity_complete"] is True
+    assert projection["unattributed"] is False
+    assert projection["claimed"]["receipt_executions"]["executed"] == 1
 
 
 def test_unpublished_run_pin_and_receipts_are_not_laundered_into_metrics():

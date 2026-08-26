@@ -197,7 +197,8 @@ def test_real_setup_tool_bundle_has_no_pre_evidence_routing_or_usage_examples():
         "Usage:",
     )
     assert [text for text in forbidden if text in prompt] == []
-    assert "action= deps|compile|test|package" in prompt
+    assert "action= compile|test|package|deps" in prompt
+    assert "on-demand diagnostic, not a routine prerequisite" in prompt
     assert "Valid actions: done, blocked, note" in prompt
     assert "Project build runner dispatches are recorded only by the build facade" in prompt
 
@@ -207,7 +208,8 @@ def test_build_schema_description_is_a_factual_boundary_not_a_router():
 
     description = BuildTool(None).description
 
-    assert "action = deps | compile | test | package" in description
+    assert "action = compile | test | package | deps" in description
+    assert "deps is an on-demand diagnostic, not a routine prerequisite" in description
     assert "durable invocation receipt" in description
     assert "bash mvn/gradle" not in description
     assert "wrong version" not in description

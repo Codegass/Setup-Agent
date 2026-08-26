@@ -500,8 +500,8 @@ def test_progressing_job_reaches_wall_guard_without_stall_cleanup(monkeypatch):
     clock = [0.0]
     triggers = []
     progress = ProgressObservation(
-        JobProgressSnapshot(process_state="running", cpu_ticks_delta=10),
-        ("cpu_active",),
+        JobProgressSnapshot(process_state="running", log_size=20),
+        ("log_growth",),
     )
     monkeypatch.setattr(
         "sag.agent.react_engine.probe_job_progress",

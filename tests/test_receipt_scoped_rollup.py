@@ -33,6 +33,7 @@ import shlex
 from pathlib import Path
 
 import pytest
+from test_container_io import FakeContainer
 
 from sag.agent.attempt_policy import TestAttemptRequirement as AttemptRequirement
 from sag.agent.attempt_policy import TestCandidateResolution as CandidateResolution
@@ -147,6 +148,7 @@ class ReceiptOrchestrator:
     def __init__(self, workspace: ReceiptWorkspace):
         self.workspace = workspace
         self.commands: list[str] = []
+        self.atomic = FakeContainer()
         if workspace.receipts_dir.is_dir():
             for path in sorted(workspace.receipts_dir.glob("*.json")):
                 try:
@@ -185,6 +187,26 @@ class ReceiptOrchestrator:
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         text = command.strip()
+        if text.startswith(
+            (
+                "mkdir -p -- ",
+                ": > ",
+                "printf '%s' ",
+                "base64 --decode ",
+                "python3 -c ",
+                "rm -f -- ",
+                "mv -f -- ",
+            )
+        ):
+            result = self.atomic.execute_command(command, **kwargs)
+            if text.startswith("mv -f -- ") and result.get("exit_code") == 0:
+                target = shlex.split(text)[-1]
+                payload = self.atomic.files.get(target)
+                if payload is not None:
+                    path = Path(target)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(payload, encoding="utf-8")
+            return result
         if "SAG_COMPACT_TEST_REPORT_PARSER" in text:
             return self._run_compact_parser(command)
         if "SAG_NAMED_JSON_RECORD_V1" in text and "for file in " in text:

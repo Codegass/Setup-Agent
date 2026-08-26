@@ -17,6 +17,7 @@ import re
 import pytest
 from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import _MemoryControlSink
+from test_container_io import FakeContainer
 
 from sag.agent.control_events import canonical_json
 from sag.agent.evidence_publications import (
@@ -172,9 +173,22 @@ class FakeReportOrchestrator:
         self.report_dir = report_dir
         self.xml_files = dict(xml_files)
         self.commands = []
+        self.atomic = FakeContainer()
 
     def execute_command(self, command):
         self.commands.append(command)
+        if command.strip().startswith(
+            (
+                "mkdir -p -- ",
+                ": > ",
+                "printf '%s' ",
+                "base64 --decode ",
+                "python3 -c ",
+                "rm -f -- ",
+                "mv -f -- ",
+            )
+        ):
+            return self.atomic.execute_command(command)
         framed = _empty_named_evidence_stream(command)
         if framed is not None:
             return framed
@@ -628,6 +642,83 @@ def test_settings_build_coverage_threshold_from_env(monkeypatch):
     """SAG_BUILD_COVERAGE_THRESHOLD must override the default in Config.from_env."""
     monkeypatch.setenv("SAG_BUILD_COVERAGE_THRESHOLD", "0.5")
     assert Config.from_env().build_coverage_threshold == 0.5
+
+
+def test_exit_143_test_receipt_with_rows_is_partial_not_completed():
+    validator = PhysicalValidator(
+        docker_orchestrator=FakeBuildOrchestrator(),
+        project_path="/workspace",
+    )
+    validator._current_scoped_receipts = lambda _project_dir: [
+        {
+            "receipt_id": "inv-ignite-test",
+            "tool": "maven",
+            "requested_action": "test",
+            "effective_action": "test",
+            "actual_cwd": "/workspace/ignite",
+            "sequence": 9,
+            "exit_code": 143,
+            "lifecycle_state": "finished",
+            "testcase_execution_rows": {
+                "status": "complete",
+                "rows": [{"execution_id": f"row-{index}"} for index in range(20)],
+            },
+        }
+    ]
+
+    summary = validator._test_execution_receipt_summary("/workspace/ignite")
+
+    assert summary["state"] == "partial"
+    assert summary["observed_rows"] == 20
+    assert summary["receipt_ids"] == ["inv-ignite-test"]
+    assert summary["interrupted_receipt_ids"] == ["inv-ignite-test"]
+
+
+def test_validate_test_status_preserves_rows_but_marks_interrupted_run_partial():
+    validator = PhysicalValidator(
+        docker_orchestrator=FakeBuildOrchestrator(),
+        project_path="/workspace",
+    )
+    validator._python_collected_count = lambda _project_name: None
+    validator.parse_test_reports_with_catalog = lambda _project_dir: {
+        "valid": True,
+        "total_tests": 20,
+        "passed_tests": 20,
+        "failed_tests": 0,
+        "error_tests": 0,
+        "skipped_tests": 0,
+        "raw_total_tests": 20,
+        "raw_passed_tests": 20,
+        "raw_failed_tests": 0,
+        "raw_error_tests": 0,
+        "raw_skipped_tests": 0,
+        "unique_tests": 20,
+        "unique_passed_tests": 20,
+        "unique_failed_tests": 0,
+        "unique_error_tests": 0,
+        "unique_skipped_tests": 0,
+        "discovered": 15104,
+        "report_files": ["/workspace/ignite/target/surefire-reports/TEST-a.xml"],
+        "receipt_scoped": True,
+    }
+    validator._test_execution_receipt_summary = lambda _project_dir: {
+        "state": "partial",
+        "reason": "test execution was interrupted after 20 sealed row(s)",
+        "receipt_ids": ["inv-ignite-test"],
+        "interrupted_receipt_ids": ["inv-ignite-test"],
+        "observed_rows": 20,
+    }
+
+    result = validator.validate_test_status("ignite")
+
+    assert result["status"] == "PARTIAL"
+    assert result["evidence_status"] == "partial"
+    assert result["total_tests"] == 20
+    assert result["passed_tests"] == 20
+    assert result["test_execution_state"] == "partial"
+    assert result["test_execution_receipt_ids"] == ["inv-ignite-test"]
+    assert result["test_interrupted_receipt_ids"] == ["inv-ignite-test"]
+    assert "interrupted after 20 sealed row" in result["reason"]
 
 
 @pytest.mark.parametrize(

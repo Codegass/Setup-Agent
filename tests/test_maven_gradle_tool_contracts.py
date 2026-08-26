@@ -563,6 +563,23 @@ def test_maven_tool_preserves_list_properties_when_fail_at_end_adds_ignore():
     assert " -Dm " not in command
 
 
+def test_maven_fail_at_end_does_not_duplicate_caller_supplied_ignore_property():
+    orchestrator = FakeBuildToolOrchestrator()
+    tool = MavenTool(orchestrator)
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        extra_args="-B -Dmaven.test.failure.ignore=true",
+        fail_at_end=True,
+        working_directory="/workspace/project",
+    )
+
+    assert result.succeeded is True
+    command = orchestrator.monitored_commands[0][0]
+    assert command.count("-Dmaven.test.failure.ignore=true") == 1
+
+
 def test_maven_tool_uses_resolved_toolchain_executable():
     orchestrator = FakeBuildToolOrchestrator()
     toolchain_manager = FakeToolchainManager("/tmp/apache-maven-3.9.6/bin/mvn")

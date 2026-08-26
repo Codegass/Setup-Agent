@@ -66,7 +66,12 @@ class TestAttemptRequirement:
             return f"search(target={params['target']!r})"
         if tool == "project":
             return "project(action='analyze')"
-        return f"build(action='test', working_directory={params['working_directory']!r})"
+        args = str(params.get("args") or "").strip()
+        suffix = f", args={args!r}" if args else ""
+        return (
+            "build(action='test', "
+            f"working_directory={params['working_directory']!r}{suffix})"
+        )
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -482,7 +487,106 @@ def test_execution_matches_candidate(
     candidate: TestAttemptRequirement,
 ) -> bool:
     root, system = test_execution_binding(tool_name, params, result)
-    return root == candidate.root and system == candidate.system
+    if root != candidate.root or system != candidate.system:
+        return False
+    if candidate.reason_code != "sealed_plan_test_step":
+        return True
+    expected = candidate.required_action
+    if expected.get("tool") != "build":
+        return False
+    expected_params = expected.get("params")
+    if not isinstance(expected_params, Mapping):
+        return False
+    if tool_name == "build":
+        return all(params.get(key) == value for key, value in expected_params.items())
+
+    # Evidence state records the physical backend leaf, not the facade wrapper.
+    # Compare the public sealed step to that backend's materialized parameter
+    # vocabulary so a completed exact model call satisfies the floor once,
+    # without treating an arbitrary test at the same root as equivalent.
+    action_keys = {
+        "maven": "command",
+        "gradle": "tasks",
+        "python": "operation",
+    }
+    args_keys = {
+        "maven": "extra_args",
+        "gradle": "gradle_args",
+        "python": "args",
+    }
+    if tool_name not in action_keys:
+        return False
+    expected_action = str(expected_params.get("action") or "").strip().lower()
+    actual_action = str(params.get(action_keys[tool_name]) or "").strip().lower()
+    if actual_action != expected_action:
+        return False
+    expected_args = str(expected_params.get("args") or "").strip()
+    actual_args = str(params.get(args_keys[tool_name]) or "").strip()
+    if actual_args != expected_args:
+        return False
+    for key, value in expected_params.items():
+        if key in {"action", "args", "working_directory"}:
+            continue
+        if params.get(key) != value:
+            return False
+    return True
+
+
+def _sealed_plan_test_resolution(
+    orchestrator: Any,
+    survey: TestCandidateResolution,
+) -> tuple[bool, TestCandidateResolution | None]:
+    """Bind the Test floor to the accepted model plan when one is sealed."""
+
+    try:
+        from .project_execution_plan import read_sealed_project_execution_plan
+
+        artifact = read_sealed_project_execution_plan(orchestrator)
+    except Exception:
+        return False, None
+    if artifact is None:
+        return False, None
+    steps = tuple(artifact.plan.test_steps)
+    if not steps:
+        return True, None
+    if survey.status != "available":
+        return True, survey
+
+    survey_by_root = {candidate.root: candidate for candidate in survey.candidates}
+    planned: list[TestAttemptRequirement] = []
+    for step in steps:
+        params = dict(step.params)
+        root = _normalized_root(
+            params.get("working_directory"),
+            survey.project_root,
+            workspace_root=survey.workspace_root,
+        )
+        surveyed = survey_by_root.get(root)
+        if (
+            step.tool != "build"
+            or str(params.get("action") or "").strip().lower() != "test"
+            or surveyed is None
+        ):
+            return True, TestCandidateResolution(
+                status="unsafe_coordinates",
+                project_root=survey.project_root,
+                workspace_root=survey.workspace_root,
+            )
+        planned.append(
+            TestAttemptRequirement(
+                root=root,
+                system=surveyed.system,
+                required_action={"tool": step.tool, "params": params},
+                reason_code="sealed_plan_test_step",
+            )
+        )
+    return True, TestCandidateResolution(
+        status="available",
+        candidates=tuple(planned),
+        project_root=survey.project_root,
+        workspace_root=survey.workspace_root,
+        primary=planned[0],
+    )
 
 
 def _matches_candidate(
@@ -832,7 +936,9 @@ def test_closure_survey(
         return None
     if state.fact_value("build.test_entry_ready") is not True:
         return None
-    return resolution or resolve_survey_test_candidates(orchestrator)
+    surveyed = resolution or resolve_survey_test_candidates(orchestrator)
+    sealed, planned = _sealed_plan_test_resolution(orchestrator, surveyed)
+    return planned if sealed else surveyed
 
 
 def required_test_attempt(

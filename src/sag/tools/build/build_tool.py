@@ -209,9 +209,11 @@ class BuildTool(BaseTool):
         super().__init__(
             name="build",
             description=(
-                "Project build runner facade: action = deps | compile | test | package. "
+                "Project build runner facade: action = compile | test | package | deps. "
                 "It detects maven, gradle, or python project markers, resolves the registered "
                 "toolchain, and records each dispatched runner in a durable invocation receipt. "
+                "For Maven and Gradle, compile/test/package already resolve declared dependencies; "
+                "deps is an on-demand diagnostic, not a routine prerequisite. "
                 "Python deps uses the project's installer and ./.venv; Python test records JUnit "
                 "XML. Long-running dispatches return a controller-owned job reference."
             ),

@@ -1671,6 +1671,26 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
                 "unmeasured_test_stats": _excluded_report_counts(
                     status.get("unmeasured_test_stats")
                 ),
+                "execution_state": (str(status.get("test_execution_state") or "").strip() or None),
+                "execution_reason": (
+                    str(status.get("test_execution_reason") or "").strip() or None
+                ),
+                "execution_receipt_ids": (
+                    [
+                        str(item)
+                        for item in status.get("test_execution_receipt_ids") or ()
+                        if str(item).strip()
+                    ]
+                    or None
+                ),
+                "interrupted_receipt_ids": (
+                    [
+                        str(item)
+                        for item in status.get("test_interrupted_receipt_ids") or ()
+                        if str(item).strip()
+                    ]
+                    or None
+                ),
             }.items()
             if value is not None
         },
@@ -2541,9 +2561,29 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             # The upgrade brings its own sentence (spec §2.3): the validator's
             # label described the pass rate, and keeping it here is exactly how
             # ignite sealed "below the threshold" next to `green`.
-            decision = _test_execution_decision(rollup)
+            execution_state = str(rollup.get("execution_state") or "").strip().lower()
+            if execution_state == "partial":
+                decision = _GradedDecision(
+                    state=ValidatorState.PARTIAL,
+                    code="test_execution_interrupted",
+                    reason=(
+                        str(rollup.get("execution_reason") or "").strip()
+                        or f"test execution incomplete after {executed:,} sealed result(s)"
+                    ),
+                )
+            elif execution_state == "failed":
+                decision = _GradedDecision(
+                    state=ValidatorState.RED,
+                    code="test_execution_interrupted",
+                    reason=(
+                        str(rollup.get("execution_reason") or "").strip()
+                        or "test execution was interrupted"
+                    ),
+                )
+            else:
+                decision = _test_execution_decision(rollup)
             state, code, reason = decision.state, decision.code, decision.reason
-            suggestions = ()
+            suggestions = () if state is ValidatorState.GREEN else suggestions
     else:
         evidence_integrity_failure = False
     # THE decision — the only one graded, and the only one that leaves here.

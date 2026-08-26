@@ -521,6 +521,10 @@ def test_setup_prompt_has_no_fixed_post_clone_analysis_or_maven_repair_playbook(
     assert [phrase for phrase in forbidden if phrase in prompt] == []
     assert "engine mechanically creates the initial project survey/fact sheet" in prompt
     assert "not a fixed post-clone step" in prompt
+    assert "test_disposition.status" in prompt
+    assert "definition_evidence_refs" in prompt
+    assert "verdict_scope" in prompt
+    assert "product_test_cases" in prompt
 
 
 def test_setup_repository_notice_is_an_evidence_coordinate_not_a_selected_clone_call():

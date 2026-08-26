@@ -33,6 +33,7 @@ from .build_preflight import (
 )
 from .build_utils import (
     DETACHED_HANDOFF_STATUSES,
+    bounded_detached_log_excerpt,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
@@ -184,6 +185,7 @@ class GradleTool(BaseTool):
         """
 
         self._pending_invocation_receipt = None
+        self._pending_log_storage_metadata: Dict[str, Any] = {}
         if current_contract() is None:
             return ToolResult.completed_failure(
                 output="[contract] Gradle was not dispatched: no facade-frozen contract is active.",
@@ -520,8 +522,11 @@ class GradleTool(BaseTool):
                     if compile_mismatch:
                         analysis["compile_source_mismatch"] = compile_mismatch
 
-            # Persist the complete log so output_search surfaces the real failure.
+            # The durable detached job log remains complete; output storage
+            # keeps a bounded searchable excerpt plus the full-log reference.
             ref_id = None
+            stored_output, log_storage_metadata = bounded_detached_log_excerpt(full_output, result)
+            self._pending_log_storage_metadata = log_storage_metadata
             if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
                     contexts_dir = Path("/workspace/.setup_agent/contexts")
@@ -530,8 +535,12 @@ class GradleTool(BaseTool):
                 ref_id = self.output_storage.store_output(
                     task_id=f"gradle_{working_directory.replace('/', '_')}",
                     tool_name="gradle",
-                    output=full_output,
-                    metadata={"command": gradle_cmd, "exit_code": result["exit_code"]},
+                    output=stored_output,
+                    metadata={
+                        "command": gradle_cmd,
+                        "exit_code": result["exit_code"],
+                        **log_storage_metadata,
+                    },
                 )
                 logger.debug(f"Stored Gradle output with ref_id: {ref_id}")
 
@@ -541,7 +550,7 @@ class GradleTool(BaseTool):
                     str(result.get("output") or ""),
                     ref_id,
                     runner="gradle",
-                    full_output=str(full_output),
+                    full_output=stored_output,
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
                     invocation_status=(
@@ -700,6 +709,7 @@ class GradleTool(BaseTool):
             tool_result.raw_output = preamble + (tool_result.raw_output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
+        tool_result.metadata.update(getattr(self, "_pending_log_storage_metadata", {}) or {})
         return self._apply_invocation_receipt(tool_result)
 
     def _record_invocation_receipt(

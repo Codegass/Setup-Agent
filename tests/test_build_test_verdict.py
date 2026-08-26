@@ -218,6 +218,37 @@ def test_validate_build_status_partial_below_coverage_threshold():
     assert "incomplete" in result["reason"].lower()
 
 
+def test_terminal_root_reactor_receipt_outranks_incomplete_filesystem_census():
+    """Ignite shape: Maven itself completed every reactor module, while a
+    source/class heuristic remained a few files short. The terminal exact
+    reactor receipt is execution authority; the census remains diagnostic."""
+
+    validator = _coverage_validator(
+        0.5,
+        found=["a"],
+        missing=["b", "c", "d"],
+        threshold=1.0,
+    )
+    validator._terminal_root_maven_reactor_receipt = lambda _project_dir: {
+        "receipt_id": "inv-ignite-build",
+        "modules_succeeded": 41,
+        "modules_total": 41,
+        "requested_action": "compile",
+    }
+
+    result = validator.validate_build_status("m")
+
+    assert result["success"] is True
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert result["conflicts"] == []
+    assert result["evidence"]["authority"] == "terminal_reactor_receipt"
+    assert result["evidence"]["terminal_reactor_receipt_id"] == "inv-ignite-build"
+    assert result["evidence"]["reactor_modules_succeeded"] == 41
+    assert result["evidence"]["reactor_modules_total"] == 41
+    assert "filesystem class and module scans are diagnostic" in result["reason"]
+
+
 def test_validate_build_status_strict_default_partial_when_not_all_modules():
     """Default strict threshold (1.0): a near-complete build (0.99) is PARTIAL,
     never a full success — every active module must compile for SUCCESS."""

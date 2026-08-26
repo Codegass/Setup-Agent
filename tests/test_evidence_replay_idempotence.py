@@ -59,6 +59,7 @@ from sag.agent.phase_gates import (
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.agent.physical_validator import PhysicalValidator
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from test_container_io import FakeContainer
 
 WORKSPACE = "/workspace/bigtop"
 PRODUCER = f"{WORKSPACE}/bigtop-data-generators"
@@ -970,6 +971,7 @@ class ParserOrchestrator:
     def __init__(self, workspace):
         self.commands = []
         self.workspace = workspace
+        self.atomic = FakeContainer()
         self.evidence = strict_published_evidence(
             self,
             run_id="run-pytest",
@@ -1009,6 +1011,26 @@ class ParserOrchestrator:
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         text = command.strip()
+        if text.startswith(
+            (
+                "mkdir -p -- ",
+                ": > ",
+                "printf '%s' ",
+                "base64 --decode ",
+                "python3 -c ",
+                "rm -f -- ",
+                "mv -f -- ",
+            )
+        ):
+            result = self.atomic.execute_command(command, **kwargs)
+            if text.startswith("mv -f -- ") and result.get("exit_code") == 0:
+                target = shlex.split(text)[-1]
+                payload = self.atomic.files.get(target)
+                if payload is not None:
+                    path = Path(target)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(payload, encoding="utf-8")
+            return result
         if "SAG_COMPACT_TEST_REPORT_PARSER" in text:
             body = command.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
             buffer = io.StringIO()

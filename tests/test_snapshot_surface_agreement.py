@@ -3,10 +3,10 @@ import re
 from dataclasses import dataclass
 
 import pytest
+from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
 from rich.console import Console
 
 import sag.main as main_module
-from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
 from sag.agent.evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
     RUN_PIN_LOGICAL_ARTIFACT_ID,
@@ -17,6 +17,7 @@ from sag.agent.evidence_publications import (
 )
 from sag.agent.verdict_finalizer import (
     BuildEvidenceSnapshot,
+    PhaseRecordSnapshot,
     ReportDeliveryStatus,
     RunTermination,
     RunTerminationStatus,
@@ -646,6 +647,101 @@ def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_fact
     assert detail.verdict.verdict == "success"
     assert detail.verdict.tone == "success"
     assert detail.verdict.headline == "Build passed. Test run passed with 328 sealed results"
+
+
+def test_web_terminal_snapshot_overrides_stale_trunk_and_marks_unreached_phases_not_run():
+    unavailable = {"band": "unavailable", "reason": "phase was not run"}
+    snapshot = RunVerdictSnapshot(
+        run_id="tvm-run",
+        finalized_at="2026-07-17T12:00:00Z",
+        verdict="failed",
+        build_evidence=BuildEvidenceSnapshot(
+            observed=True,
+            judgment="failed",
+            outcome=OperationOutcome.FAILED,
+            evidence_status=EvidenceStatus.VERIFIED,
+            compiled_classes=0,
+        ),
+        test_stats=SnapshotTestStats(discovered=15085),
+        rates={
+            "build": {"modules": unavailable, "classes": unavailable},
+            "test": {"cases": unavailable, "modules": unavailable},
+            "coverage": {"status": "unavailable", "reason": "not collected"},
+        },
+        phase_records=(
+            PhaseRecordSnapshot(
+                phase="analyze",
+                attempt_id="analyze-1",
+                termination="aborted",
+                outcome="failed",
+                validated_outcome="failed",
+                reason="iteration budget exhausted",
+            ),
+        ),
+    )
+    trunk = json.loads(_phase_trunk())
+    trunk["todo_list"] = [
+        {"id": "phase_analyze", "description": "Analyze", "status": "in_progress"},
+        {"id": "phase_build", "description": "Build", "status": "pending"},
+        {"id": "phase_test", "description": "Test", "status": "pending"},
+    ]
+    files = {
+        VERDICT_PATH: snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": json.dumps(trunk),
+    }
+
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm")
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.status == "completed"
+    assert detail.finish == "2026-07-17T12:00:00+00:00"
+    assert detail.duration == "—"
+    assert detail.build.state == "not_attempted"
+    assert detail.build.class_count is None
+    assert detail.test.state == "not_attempted"
+    assert detail.test.execution_rate is None
+    assert detail.verdict is not None
+    assert detail.verdict.headline == (
+        "Build was not run. Tests were not run. Review before promoting"
+    )
+
+
+def test_web_treats_policy_skipped_build_and_test_as_not_run():
+    unavailable = {"band": "unavailable", "reason": "phase was not run"}
+    snapshot = RunVerdictSnapshot(
+        run_id="tvm-skipped-run",
+        finalized_at="2026-07-17T12:00:00Z",
+        verdict="partial",
+        rates={
+            "build": {"modules": unavailable, "classes": unavailable},
+            "test": {"cases": unavailable, "modules": unavailable},
+            "coverage": {"status": "unavailable", "reason": "not collected"},
+        },
+        phase_records=tuple(
+            PhaseRecordSnapshot(
+                phase=phase,
+                attempt_id=f"{phase}-1",
+                termination="skipped",
+                outcome="skipped",
+                validated_outcome="skipped",
+                reason="phase skipped by transition policy",
+            )
+            for phase in ("build", "test")
+        ),
+    )
+    files = {
+        VERDICT_PATH: snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+    }
+
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm")
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.build.state == "not_attempted"
+    assert detail.test.state == "not_attempted"
+    assert detail.verdict is not None
+    assert "Build was not run" in detail.verdict.headline
+    assert "Tests were not run" in detail.verdict.headline
 
 
 def test_web_exposes_report_delivery_only_from_durable_flow_data(tvm_snapshot):

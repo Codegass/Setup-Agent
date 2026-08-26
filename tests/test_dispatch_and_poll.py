@@ -6,6 +6,7 @@ the agent gets the log tail + poll instructions and the process keeps running.
 """
 
 import base64
+import hashlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import bind_tool_result_output_storage
 from sag.tools.internal.build_utils import (
     BuildAnalyzer,
+    bounded_detached_log_excerpt,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_runner_from_command,
@@ -38,6 +40,46 @@ from sag.tools.search_tool import SearchTool
 
 CONTAINER_ID = "c" * 64
 DOCKER_EXEC_ID = "d" * 64
+
+
+def test_detached_output_storage_copy_is_bounded_with_a_durable_log_reference():
+    full_output = "HEAD\n" + ("x" * 20_000) + "\nTAIL"
+
+    excerpt, metadata = bounded_detached_log_excerpt(
+        full_output,
+        {
+            "dispatch": {
+                "job_id": "ignite-test",
+                "log_path": "/tmp/sag_jobs/ignite-test.log",
+            }
+        },
+        max_bytes=4096,
+    )
+
+    assert len(excerpt.encode("utf-8")) <= 4096
+    assert excerpt.startswith("HEAD\n")
+    assert excerpt.endswith("\nTAIL")
+    assert "omitted from this OutputStorage copy" in excerpt
+    assert metadata == {
+        "full_log_bytes": len(full_output.encode("utf-8")),
+        "full_log_sha256": hashlib.sha256(full_output.encode("utf-8")).hexdigest(),
+        "output_storage_truncated": True,
+        "full_log_ref": "job:ignite-test",
+        "full_log_path": "/tmp/sag_jobs/ignite-test.log",
+    }
+
+
+def test_output_storage_keeps_full_text_when_no_external_log_can_recover_it():
+    full_output = "x" * 20_000
+
+    stored, metadata = bounded_detached_log_excerpt(
+        full_output,
+        {"exit_code": 0},
+        max_bytes=4096,
+    )
+
+    assert stored == full_output
+    assert metadata == {}
 
 
 class FakeDetachedAPI:

@@ -736,20 +736,6 @@ def control_stalled_job(
             progress=first,
             trigger=trigger,
         )
-    if diagnostic.snapshot.cpu_active:
-        observed = ProgressObservation(
-            diagnostic.snapshot,
-            ("cpu_active",),
-            "observed",
-        )
-        return StallControlResult(
-            job_id,
-            "progress_observed",
-            diagnostic=diagnostic,
-            progress=observed,
-            trigger=trigger,
-        )
-
     sleeper = sleep or time.sleep
     sleeper(max(0.0, float(confirmation_grace_seconds)))
     second = probe_job_progress(execute, job, previous=first.snapshot)
@@ -1023,8 +1009,6 @@ def _progress_signals(
     previous: Optional[JobProgressSnapshot], current: JobProgressSnapshot
 ) -> Tuple[str, ...]:
     signals = []
-    if current.cpu_active:
-        signals.append("cpu_active")
     if previous is not None:
         if current.log_size > previous.log_size:
             signals.append("log_growth")

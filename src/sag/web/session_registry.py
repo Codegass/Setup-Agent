@@ -15,6 +15,7 @@ from typing import Any
 
 from loguru import logger
 
+from sag.agent.control_events import RunPin, canonical_json
 from sag.agent.evidence_publications import (
     RUN_PIN_LOGICAL_ARTIFACT_ID,
     VERDICT_LOGICAL_ARTIFACT_ID,
@@ -24,7 +25,6 @@ from sag.agent.evidence_publications import (
     install_evidence_publication_authority,
     reset_evidence_publication_authority,
 )
-from sag.agent.control_events import RunPin, canonical_json
 from sag.agent.verdict_finalizer import (
     VERDICT_SNAPSHOT_PATH,
     RunVerdictSnapshot,
@@ -836,15 +836,16 @@ def _snapshot_test_payload(
             conflicts=list(snapshot.conflicts),
         )
     tests = snapshot.test_stats
+    test_not_run = _snapshot_phase_reached(snapshot, "test") is False and tests.executed == 0
     return {
-        "state": tests.judgment,
+        "state": "not_attempted" if test_not_run else tests.judgment,
         "pass": tests.passed,
         "fail": tests.failed,
         "skip": tests.skipped,
         "errors": tests.errors,
         "total": tests.executed,
         "pass_rate": tests.pass_rate if tests.executed > 0 else None,
-        "execution_rate": tests.execution_rate,
+        "execution_rate": None if test_not_run else tests.execution_rate,
         "unique_total": tests.executed,
         "unique_passed": tests.passed,
         "unique_failed": tests.failed,
@@ -861,6 +862,14 @@ def _snapshot_test_payload(
 
 def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
     build = snapshot.build_evidence
+    if _snapshot_phase_reached(snapshot, "build") is False:
+        return {
+            "state": "not_attempted",
+            "tool": "—",
+            "note": "Run stopped before the Build phase",
+            "class_count": None,
+            "evidence_refs": [],
+        }
     return {
         "state": build.outcome.value,
         "tool": "sealed snapshot",
@@ -868,6 +877,13 @@ def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
         "class_count": build.compiled_classes,
         "evidence_refs": list(build.refs),
     }
+
+
+def _snapshot_phase_reached(snapshot: RunVerdictSnapshot, phase: str) -> bool | None:
+    records = snapshot.phase_records
+    if not records:
+        return None
+    return any(record.phase == phase and record.termination != "skipped" for record in records)
 
 
 def _durable_report_delivery_status(trunk_data: dict[str, Any]) -> str | None:
@@ -909,7 +925,9 @@ def _setup_artifact_item(
         finish = _report_generated_at(report_raw) or snapshot.finalized_at
     else:
         finish = _report_generated_at(report_raw) or updated
-    status = _setup_status(tasks, report_path)
+    # A valid verdict snapshot is written only at evidence close.  It is the
+    # terminal authority when the mutable trunk missed its final task update.
+    status = "completed" if snapshot is not None else _setup_status(tasks, report_path)
     metrics = _read_report_metrics(orchestrator)
     module_metrics = _read_module_metrics(orchestrator)
 
@@ -1063,8 +1081,7 @@ def _latest_setup_report_path(orchestrator: Any) -> str | None:
         return report_path
 
     fallback_command = (
-        "test -f /workspace/setup-report.md && "
-        "printf '%s\\n' /workspace/setup-report.md"
+        "test -f /workspace/setup-report.md && " "printf '%s\\n' /workspace/setup-report.md"
     )
     try:
         fallback = _execute_control(orchestrator, fallback_command, timeout=5)
@@ -1928,7 +1945,11 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
         detail: str,
         refs_value: Any,
     ) -> None:
-        refs = [str(ref) for ref in refs_value if str(ref).strip()] if isinstance(refs_value, list) else []
+        refs = (
+            [str(ref) for ref in refs_value if str(ref).strip()]
+            if isinstance(refs_value, list)
+            else []
+        )
         if not refs:
             return
         status = _status_for_evidence(_text(status_value, default="unknown"))
@@ -2020,10 +2041,12 @@ def _duration(start: str, finish: str) -> str:
     except ValueError:
         return "—"
 
-    if start_time.tzinfo is None and finish_time.tzinfo is not None:
-        start_time = start_time.replace(tzinfo=finish_time.tzinfo)
-    elif start_time.tzinfo is not None and finish_time.tzinfo is None:
-        finish_time = finish_time.replace(tzinfo=start_time.tzinfo)
+    if (start_time.tzinfo is None) != (finish_time.tzinfo is None):
+        # The setup trunk historically wrote local naive timestamps while the
+        # verdict finalizer writes UTC.  Their offset is unknowable here; an
+        # unavailable duration is more honest than assigning either clock to
+        # the other.
+        return "—"
 
     seconds = max(int((finish_time - start_time).total_seconds()), 0)
     if seconds < 60:

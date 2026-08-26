@@ -18,6 +18,7 @@ from sag.agent.phase_gates import (
 from sag.agent.phase_machine import PhaseOutcome
 from sag.agent.project_execution_plan import (
     PROJECT_EXECUTION_PLAN_PATH,
+    bind_project_execution_plan_inventory,
     canonical_authored_plan_sha256,
 )
 from sag.tools.base import ToolResult
@@ -122,6 +123,15 @@ def _authored_execution_plan():
             }
         ],
         "build_success_criteria": ["A terminal receipt covers the selected reactor."],
+        "test_disposition": {
+            "status": "planned",
+            "reason": "DEVNOTES defines FocusedSuite as the unattended product test lane.",
+            "execution_mechanism": "Maven Surefire runs FocusedSuite through build(action='test').",
+            "verdict_scope": "product_test_cases",
+            "readiness": "ready",
+            "evidence_refs": ["output_devnotes"],
+            "definition_evidence_refs": ["output_devnotes"],
+        },
         "test_steps": [
             {
                 "tool": "build",
@@ -177,6 +187,20 @@ def test_analyze_done_requires_a_model_authored_execution_plan_after_gate_accept
     assert gate.calls == ["analyze"]
 
 
+def test_analyze_plan_schema_treats_inventory_hints_and_step_refs_as_optional():
+    schema = _tool(GateRecorder(ok=True), phase="analyze")._get_parameters_schema()
+    plan = schema["properties"]["execution_plan"]
+    reviewed = plan["properties"]["documents_reviewed"]["items"]
+    build_step = plan["properties"]["build_steps"]["items"]
+
+    assert "entry_id" not in reviewed["required"]
+    assert "source_hash" not in reviewed["required"]
+    assert "Harness derives" in reviewed["properties"]["entry_id"]["description"]
+    assert "evidence_refs" not in build_step["required"]
+    assert plan["properties"]["build_steps"]["minItems"] == 1
+    assert plan["properties"]["test_steps"]["minItems"] == 0
+
+
 def test_analyze_done_carries_a_real_read_bound_plan_candidate_to_the_engine(tmp_path):
     plan = _authored_execution_plan()
     storage = OutputStorageManager(tmp_path / "contexts")
@@ -186,6 +210,9 @@ def test_analyze_done_carries_a_real_read_bound_plan_candidate_to_the_engine(tmp
         output="Build with ./mvnw; run FocusedSuite separately.",
     )
     plan["documents_reviewed"][0]["evidence_refs"] = [ref]
+    plan["test_disposition"]["evidence_refs"] = [ref]
+    plan["test_disposition"]["definition_evidence_refs"] = [ref]
+    plan["documents_reviewed"][0]["entry_id"] = "model-supplied-hint"
     state = RunEvidenceState(run_id="plan-evidence")
     state.ingest_tool_result(
         StateScope.PROJECT_ANALYSIS,
@@ -209,7 +236,7 @@ def test_analyze_done_carries_a_real_read_bound_plan_candidate_to_the_engine(tmp
         execution_plan=plan,
     )
 
-    expected_sha = canonical_authored_plan_sha256(plan)
+    expected_sha = canonical_authored_plan_sha256(bind_project_execution_plan_inventory(plan, None))
     assert result.succeeded is True
     assert result.metadata["phase_signal"] == "done"
     assert result.metadata["phase_claim"]["execution_plan_sha256"] == expected_sha
@@ -219,6 +246,11 @@ def test_analyze_done_carries_a_real_read_bound_plan_candidate_to_the_engine(tmp
     assert authored["summary"] == plan["summary"]
     assert authored["build_steps"] == plan["build_steps"]
     assert authored["test_steps"] == plan["test_steps"]
+    assert authored["documents_reviewed"][0]["entry_id"] is None
+    assert any(
+        "external_document_binding_hint_ignored" in warning
+        for warning in result.metadata["execution_plan_candidate"]["inventory_warnings"]
+    )
     assert (
         result.metadata["gate_result"]["validated_facts"]["analysis.execution_plan_candidate_valid"]
         is True
@@ -247,12 +279,33 @@ def test_analyze_plan_rejects_output_like_text_without_a_current_document_read(t
     assert gate.calls == []
 
 
-def test_invalid_analyze_plan_never_reaches_the_physical_gate_or_emits_a_signal():
-    gate = GateRecorder(ok=True)
+def test_analyze_plan_rejection_returns_the_exact_valid_ref_for_the_path(tmp_path):
     plan = _authored_execution_plan()
-    plan["test_steps"] = []
+    plan["documents_reviewed"][0]["evidence_refs"] = ["output_guessed"]
+    plan["test_disposition"]["evidence_refs"] = ["output_guessed"]
+    plan["test_disposition"]["definition_evidence_refs"] = ["output_guessed"]
+    storage = OutputStorageManager(tmp_path / "contexts")
+    valid_ref = storage.store_output(
+        task_id="analyze-read",
+        tool_name="search",
+        output="Build with ./mvnw; run FocusedSuite separately.",
+    )
+    state = RunEvidenceState(run_id="actionable-plan-evidence")
+    state.ingest_tool_result(
+        StateScope.PROJECT_ANALYSIS,
+        "search",
+        ToolResult.completed_success(output="document read", output_ref=valid_ref),
+        params={"target": "file:/workspace/demo/DEVNOTES.txt", "pattern": "."},
+        source_phase="analyze",
+        source_attempt_id="analyze-1",
+    )
 
-    result = _tool(gate, phase="analyze").execute(
+    result = _tool(
+        GateRecorder(ok=True),
+        phase="analyze",
+        run_evidence_state=state,
+        output_storage=storage,
+    ).execute(
         action="done",
         outcome="success",
         execution_plan=plan,
@@ -260,8 +313,58 @@ def test_invalid_analyze_plan_never_reaches_the_physical_gate_or_emits_a_signal(
 
     assert result.succeeded is False
     assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
-    assert "phase_signal" not in result.metadata
-    assert gate.calls == []
+    assert valid_ref in result.error
+    assert "output_guessed" in result.error
+
+
+def test_analyze_plan_may_honestly_defer_tests_when_no_safe_entry_was_established(tmp_path):
+    gate = GateRecorder(ok=True)
+    plan = _authored_execution_plan()
+    plan["test_steps"] = []
+    plan["test_disposition"] = {
+        "status": "blocked",
+        "reason": "The project documents no safe unattended test entry.",
+        "execution_mechanism": "No unattended execution mechanism is documented.",
+        "verdict_scope": "unknown",
+        "readiness": "unknown",
+        "evidence_refs": ["output_devnotes"],
+        "definition_evidence_refs": ["output_devnotes"],
+    }
+    plan["risks"] = ["No documented unattended test entry was established."]
+    storage = OutputStorageManager(tmp_path / "contexts")
+    ref = storage.store_output(
+        task_id="analyze-read",
+        tool_name="search",
+        output="The project documents no unattended test entry.",
+    )
+    plan["documents_reviewed"][0]["evidence_refs"] = [ref]
+    plan["test_disposition"]["evidence_refs"] = [ref]
+    plan["test_disposition"]["definition_evidence_refs"] = [ref]
+    state = RunEvidenceState(run_id="deferred-test-plan")
+    state.ingest_tool_result(
+        StateScope.PROJECT_ANALYSIS,
+        "search",
+        ToolResult.completed_success(output="document read", output_ref=ref),
+        params={"target": "file:/workspace/demo/DEVNOTES.txt", "pattern": "."},
+        source_phase="analyze",
+        source_attempt_id="analyze-1",
+    )
+
+    result = _tool(
+        gate,
+        phase="analyze",
+        run_evidence_state=state,
+        output_storage=storage,
+    ).execute(
+        action="done",
+        outcome="success",
+        execution_plan=plan,
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["phase_signal"] == "done"
+    assert result.metadata["execution_plan_candidate"]["authored_plan"]["test_steps"] == []
+    assert gate.calls == ["analyze"]
 
 
 @pytest.mark.parametrize("phase", ["provision", "build", "test", "report"])
@@ -646,9 +749,7 @@ def test_analysis_recovery_is_not_run_when_sealed_or_unavailable(sealed, code):
     tool.bind_analysis_facts_recovery(lambda: surveys.append("survey") or "created")
     if sealed:
         tool.run_evidence_state = RunEvidenceState(run_id="sealed-analysis")
-        tool.run_evidence_state.seal(
-            finalized_at="2026-08-08T00:00:00Z", close_reason="test"
-        )
+        tool.run_evidence_state.seal(finalized_at="2026-08-08T00:00:00Z", close_reason="test")
 
     result = tool.execute(action="done", outcome="failed", key_results="cannot inspect")
 
@@ -683,9 +784,7 @@ def test_external_blocked_claim_is_accepted_when_evidence_is_unavailable():
 def test_green_evidence_refuses_blocked_without_selecting_a_terminal_call(monkeypatch):
     monkeypatch.setattr(phase_tool_module, "required_test_attempt", lambda *a, **k: None)
     monkeypatch.setattr(phase_tool_module, "build_attempt_requirement", lambda *a, **k: None)
-    monkeypatch.setattr(
-        phase_tool_module, "untried_islands_requirement", lambda *a, **k: None
-    )
+    monkeypatch.setattr(phase_tool_module, "untried_islands_requirement", lambda *a, **k: None)
 
     result = _tool(GateRecorder()).execute(
         action="blocked",

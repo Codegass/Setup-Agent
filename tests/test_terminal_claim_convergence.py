@@ -147,6 +147,19 @@ def _rejected(signal="done"):
     )
 
 
+def test_build_phase_rejects_a_test_action_before_runner_dispatch():
+    engine = _engine()
+    params = {"action": "test", "working_directory": "/workspace/demo"}
+    call = ToolCall(name="build", raw_params=params)
+
+    with pytest.raises(PreDispatchControlError) as exc:
+        engine._prepare_control_action(call, params)
+
+    assert exc.value.error_code == "PHASE_ACTION_MISMATCH"
+    assert exc.value.metadata["runner_dispatched"] is False
+    assert engine.control_event_sink.events == []
+
+
 def test_rejected_gate_persists_facts_only_context_and_requires_model_fields():
     engine = _engine()
 

@@ -5,7 +5,7 @@ from test_verdict_finalizer import FakeVerdictOrchestrator, bind_verdict_authori
 import sag.agent.react_engine as react_engine_module
 import sag.tools.base as tool_base_module
 from sag.agent.evidence_state import EvidenceRole, RunEvidenceState
-from sag.agent.phase_machine import PhaseMachine, PhaseTermination
+from sag.agent.phase_machine import PhaseMachine, PhaseOutcome, PhaseTermination
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
@@ -70,6 +70,7 @@ def _assert_setup_abort(engine, reason):
     assert len(engine.phase_machine.records) == 1
     record = engine.phase_machine.records[0]
     assert record.termination is PhaseTermination.ABORTED
+    assert record.outcome is PhaseOutcome.FAILED
     assert record.reason == reason
     assert engine.phase_machine.current_phase == "provision"
     assert engine.phase_machine.termination_state() == "aborted"

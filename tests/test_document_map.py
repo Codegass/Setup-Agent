@@ -17,6 +17,7 @@ Scripted-orchestrator style (house pattern, shared with
 tests/test_invocation_receipts.py and tests/test_receipt_v2_and_assessments.py).
 """
 
+import base64
 import hashlib
 import json
 import shlex
@@ -27,6 +28,8 @@ from test_python_tool import fail, ok
 from sag.agent import document_map
 from sag.agent.document_map import (
     DOCUMENT_MAP_PATH,
+    DOCUMENT_PATH_END_PREFIX,
+    DOCUMENT_PATH_FRAME_PREFIX,
     GENERATED_SEGMENTS,
     MAX_DEPTH,
     MAX_FILE_BYTES,
@@ -125,6 +128,16 @@ RUN apt-get update \\
 """
 
 
+def framed_inventory(paths):
+    lines = []
+    for path in paths:
+        relative = path if str(path).startswith("./") else f"./{path}"
+        encoded = base64.b64encode(relative.encode("utf-8")).decode("ascii")
+        lines.append(f"{DOCUMENT_PATH_FRAME_PREFIX}\t{encoded}\n")
+    lines.append(f"{DOCUMENT_PATH_END_PREFIX}\t{len(lines)}\n")
+    return "".join(lines)
+
+
 class FakeTree:
     """Container double with a virtual checkout, so probes are observable.
 
@@ -151,6 +164,7 @@ class FakeTree:
         self.writable = writable
         self.realpath_ok = realpath_ok
         self.commands = []
+        self.command_options = []
         self.persisted = {}
         self.atomic = FakeContainer()
         self.atomic.files = self.persisted
@@ -175,6 +189,7 @@ class FakeTree:
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        self.command_options.append(dict(kwargs))
         tokens = (
             shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
         )
@@ -196,7 +211,7 @@ class FakeTree:
             return ok(self.sha) if self.sha else fail("")
         if " find . " in command:
             names = sorted(self.files) if self.listing is None else list(self.listing)
-            return ok("".join(f"./{name}\n" for name in names))
+            return ok(framed_inventory(names))
         if command.startswith("realpath "):
             if not self.realpath_ok:
                 return fail("realpath: unavailable")
@@ -223,6 +238,13 @@ class FakeTree:
     # -- assertions ------------------------------------------------------
     def finds(self):
         return [command for command in self.commands if " find . " in command]
+
+    def find_options(self):
+        return [
+            options
+            for command, options in zip(self.commands, self.command_options)
+            if " find . " in command
+        ]
 
     def reads(self):
         return [command for command in self.commands if command.startswith("head -c ")]
@@ -306,7 +328,61 @@ def test_enumeration_is_name_agnostic_instead_of_an_allowlist():
     assert "-name" not in command
     assert "-iname" not in command
     assert "-path" not in command
-    assert "awk" in command
+    assert "-printf" in command
+    assert "sort -z" in command
+    assert DOCUMENT_PATH_FRAME_PREFIX in command
+
+
+def test_enumeration_requests_the_complete_framed_transport():
+    execute = FakeTree(files={"README.md": README})
+
+    discover_document_map(execute, ROOT)
+
+    assert execute.find_options() == [{"truncate_output": False}]
+
+
+def test_an_orchestrator_truncation_marker_is_not_parsed_as_a_path():
+    class TruncatedInventory(FakeTree):
+        def __call__(self, command, **kwargs):
+            if " find . " in command:
+                self.commands.append(command)
+                self.command_options.append(dict(kwargs))
+                complete = framed_inventory(["README.md", "docs/build.md"])
+                first, _, footer = complete.splitlines()
+                return ok(
+                    "\n".join(
+                        [
+                            first,
+                            "... [ORCHESTRATOR TRUNCATED: 200 lines, 12000 chars] ...",
+                            footer,
+                        ]
+                    )
+                )
+            return super().__call__(command, **kwargs)
+
+    execute = TruncatedInventory(files={"README.md": README, "docs/build.md": "# Build\n"})
+
+    result = discover_document_map(execute, ROOT)
+
+    assert result["entries"] == []
+    assert conflict_reasons(result) == {ROOT: "unreadable"}
+    assert execute.reads() == []
+
+
+def test_large_inventory_is_not_subject_to_presentation_truncation():
+    class PresentationTruncatingTree(FakeTree):
+        def __call__(self, command, **kwargs):
+            if " find . " in command and kwargs.get("truncate_output", True):
+                raise AssertionError("inventory used the presentation-truncated command path")
+            return super().__call__(command, **kwargs)
+
+    files = {f"docs/note-{index:03d}": "text\n" for index in range(120)}
+    execute = PresentationTruncatingTree(files=files)
+
+    result = discover_document_map(execute, ROOT)
+
+    assert len(result["entries"]) == 120
+    assert result["partial_map"] == []
 
 
 def test_enumeration_keeps_symlinks_visible_so_an_escape_can_be_recorded():
@@ -751,23 +827,23 @@ def test_the_file_budget_keeps_the_sorted_head_whatever_order_find_replied(monke
     }
 
 
-def test_document_names_prioritize_content_reads_but_do_not_hide_other_paths(monkeypatch):
+def test_file_budget_order_does_not_prioritize_familiar_document_names(monkeypatch):
     monkeypatch.setattr(document_map, "MAX_FILES", 1)
     execute = FakeTree(
         files={
+            "README.md": "Familiar name\n",
+            "AAA.project-instructions": "Unfamiliar but potentially important\n",
             "src/a.py": "print('a')\n",
-            "DEVNOTES.txt": "Build with ./mvnw install\n",
-            "unusual.zzz": "also potentially useful\n",
         },
-        listing=["src/a.py", "unusual.zzz", "DEVNOTES.txt"],
+        listing=["src/a.py", "README.md", "AAA.project-instructions"],
     )
 
     result = discover_document_map(execute, ROOT)
 
-    assert paths_of(result) == [f"{ROOT}/DEVNOTES.txt"]
+    assert paths_of(result) == [f"{ROOT}/AAA.project-instructions"]
     assert conflict_reasons(result) == {
+        f"{ROOT}/README.md": "over_budget",
         f"{ROOT}/src/a.py": "over_budget",
-        f"{ROOT}/unusual.zzz": "over_budget",
     }
 
 
@@ -1186,7 +1262,4 @@ def test_write_document_map_with_an_unbindable_authority_returns_false():
     def free_standing_execute(command, **kwargs):
         return {"success": True, "output": "", "exit_code": 0}
 
-    assert (
-        write_document_map(free_standing_execute, {"entries": [], "partial_map": []})
-        is False
-    )
+    assert write_document_map(free_standing_execute, {"entries": [], "partial_map": []}) is False

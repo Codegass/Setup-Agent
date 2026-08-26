@@ -18,7 +18,7 @@ export interface CompleteEvidenceCounts {
 
 export interface TestRunPresentation extends CompleteEvidenceCounts {
   countsAvailable: boolean
-  stateLabel: "Passed" | "Failed" | "Partial" | "Unavailable"
+  stateLabel: "Passed" | "Failed" | "Partial" | "Not run" | "Unavailable"
   tone: ResultTone
   valueClass?: string
   nonSkipped: number
@@ -56,7 +56,7 @@ export interface BuildScopePresentation {
 }
 
 export interface BuildPresentation {
-  value: "Passed" | "Failed" | "Partial" | "Unavailable"
+  value: "Passed" | "Failed" | "Partial" | "Not run" | "Unavailable"
   tone: ResultTone
   valueClass?: string
   summary: string
@@ -68,6 +68,7 @@ const DATA_NOTE_COPY: Record<string, string> = {
   build_coverage_scope_unverified: "Build coverage could not be verified across the full project scope.",
   test_primary_coordinate_unresolved: "The primary test project or module could not be identified.",
   test_executions_unattributed_to_receipts: "Some test runs could not be linked to their recorded tool executions.",
+  test_execution_interrupted: "The test runner stopped before the declared scope completed; shown counts are the sealed prefix.",
   rate_denominator_not_a_bound: "A rate denominator did not bound the observed count, so no percentage is shown.",
   metrics_conflict: "Conflicting test or build metrics were recorded.",
   reactor_scope_narrowed: "The build ran against a narrower module scope than the full project.",
@@ -152,6 +153,9 @@ function resultState(value: string | undefined): {
   if (state === "partial") {
     return { label: "Partial", tone: "amber", valueClass: "text-status-attention" }
   }
+  if (state === "not_attempted") {
+    return { label: "Not run", tone: "neutral" }
+  }
   return { label: "Unavailable", tone: "neutral" }
 }
 
@@ -160,7 +164,8 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
   const errors = finiteCount(test.errors) ? test.errors : 0
   const numericCounts = [test.pass, test.fail, test.skip].every(finiteCount)
   const accounted = numericCounts ? test.pass + test.fail + errors + test.skip : 0
-  const countsAvailable = numericCounts
+  const countsAvailable = reportedState.label !== "Not run"
+    && numericCounts
     && (reportedState.label !== "Unavailable" || accounted > 0)
   const passed = countsAvailable ? test.pass : 0
   const failed = countsAvailable ? test.fail : 0
@@ -178,8 +183,10 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
     : accounted
   const passRate = countsAvailable ? safeRate(passed, nonSkipped) : null
 
-  let summary = "Sealed run counts were not recorded."
-  if (countsAvailable && accounted === 0) {
+  let summary = state.label === "Not run"
+    ? "Tests were not run."
+    : "Sealed run counts were not recorded."
+  if (state.label !== "Not run" && countsAvailable && accounted === 0) {
     summary = "No sealed test results were recorded."
   } else if (countsAvailable) {
     const parts = [
@@ -211,7 +218,7 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
 export function humanizeIdentityGap(reason: string | null | undefined): string {
   const normalized = reason?.trim().toLowerCase() ?? ""
   if (normalized.includes("module-qualified") || normalized.includes("subject/case identity")) {
-    return "Tests ran, but their module names and stable test identities were not recorded."
+    return "Module-qualified test identities were not sealed for this run."
   }
   if (normalized.includes("receipt") && normalized.includes("identity")) {
     return "Some test results were missing the module and stable test identity needed for verification."
@@ -384,6 +391,14 @@ export function presentBuild(
   rates?: Record<string, unknown> | null,
 ): BuildPresentation {
   const state = resultState(build.state)
+  if (state.label === "Not run") {
+    return {
+      value: "Not run",
+      tone: "neutral",
+      summary: "Build was not run.",
+      scope: null,
+    }
+  }
   const scope = buildScopeFromRates(rates, build.state)
   const facts = [
     scope ? `Evidence covers ${formatCount(scope.observed)} of ${formatCount(scope.expected)} modules` : null,

@@ -211,7 +211,7 @@ describe("OverviewTab", () => {
 
     const identityTile = screen.getByText("Verified test identities").parentElement
     expect(within(identityTile as HTMLElement).getByText("Unavailable")).toBeInTheDocument()
-    expect(within(identityTile as HTMLElement).getByText(/module names and stable test identities/i)).toBeInTheDocument()
+    expect(within(identityTile as HTMLElement).getByText(/module-qualified test identities were not sealed/i)).toBeInTheDocument()
     expect(screen.getByText("Diagnostic observations")).toBeInTheDocument()
     expect(screen.getByText("2,887")).toBeInTheDocument()
     expect(screen.getByText(/2,481 errors/)).toBeInTheDocument()

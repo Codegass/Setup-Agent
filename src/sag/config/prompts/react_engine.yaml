@@ -72,7 +72,10 @@ initial_system:
       • blocked: claim an external impediment ended the current phase (outcome and concrete reason required); validator evidence still controls the recorded outcome
       • note: record a lasting working note for the current phase
       • Example: phase(action="done", outcome="success", key_results="Compiled 115 classes with JDK 17; Maven 3.9.9 registered", evidence=["output_42"])
-    - build: Registered project runner facade; action= deps|compile|test|package; build-system detection covers maven/gradle/python
+    - build: Registered project runner facade; action= compile|test|package|deps; build-system detection covers maven/gradle/python
+      • For Maven and Gradle, compile/test/package already resolve declared dependencies. `deps`
+        is an on-demand diagnostic, not a routine prerequisite; use it only when reviewed
+        project instructions declare a separate dependency step or observed evidence calls for it
       • Maven/Gradle bare test has multi-module fail-at-end semantics
       • Python bare test is bounded to a survey-verified smoke coordinate when native readiness is absent, otherwise it refuses before collection
       • A long-running dispatch enters a controller-owned job barrier; the controller waits and settles it before another model turn
@@ -118,9 +121,33 @@ initial_system:
       outputs as broad evidence and gap-checking inputs, not a harness-authored project plan or
       execution strategy
     - In Analyze, inspect relevant documentation, configuration, and CI yourself, including
-      unfamiliar document names, then submit an evidence-linked execution_plan
-    - Build and Test receive the sealed model-authored plan in the system message; follow it as
-      the execution baseline and explain evidence-driven deviations
+      unfamiliar document names, then submit an evidence-linked execution_plan. Determine whether
+      the project's declared test suite/profile/target is suitable for unattended execution; do
+      not use a broad root test merely to discover whether it stalls. Set test_disposition.status
+      to planned with at least one evidence-backed test step, or to blocked with empty test_steps
+      and a concrete reason plus reviewed-document evidence refs. Fill execution_mechanism from
+      the exact selected entry's definition and readiness as ready|blocked|unknown; planned
+      requires readiness=ready. For a custom profile, task, script, wrapper, or suite, read its
+      actual definition and cite that output separately in definition_evidence_refs; never infer
+      behavior from the entry name or from prose that merely invokes it. Classify verdict_scope
+      from that definition before choosing status: product_test_cases executes product behavior
+      cases; test_metadata checks inventory or suite membership; quality_only is not a test
+      verdict; benchmark_or_manual needs coordination; unknown stays unresolved. Only
+      product_test_cases with readiness=ready may be planned
+    - Before selecting a test entry, prioritize project testing, developer, or contributor docs
+      over a generic README or generic test-plugin configuration, and refine/read a relevant
+      capped search before treating its question as settled. In test_disposition.reason,
+      reconcile the exact entry with the project's own stated purpose and cite evidence binding
+      it to automated product cases. Every planned step's tool, working directory, and arguments
+      must faithfully implement the cited project command; do not substitute a similarly named
+      lifecycle or a mechanical fact-sheet runner. Resolve external services, checkouts, manual
+      coordination, runner support, and report support before sealing. Prefer a bounded,
+      self-contained documented suite; if the real entry cannot run unattended here, use blocked
+    - Put only evidence-backed project lifecycle steps in the plan. Do not prepend generic setup
+      or dependency actions merely because a tool exposes them; begin with the build/CI entry that
+      the reviewed project sources actually declare
+    - Build and Test receive the sealed model-authored plan in the system message; follow its exact
+      lifecycle and scope as the execution baseline and explain evidence-driven deviations
     - The project schema exposes an optional fact refresh affordance after relevant checkout or configuration changes; it is not a fixed post-clone step
     - Record observed build system, runtime constraints, coordinates, and test facts in the phase result
     - Close each phase with an explicit evidence-backed outcome; the engine validates and routes it

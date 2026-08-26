@@ -408,7 +408,13 @@ class PhaseMachine:
             )
         )
 
-    def record_abort(self, reason: str, evidence: List[str]) -> PhaseAttemptRecord:
+    def record_abort(
+        self,
+        reason: str,
+        evidence: List[str],
+        *,
+        outcome: PhaseOutcome | str = PhaseOutcome.UNKNOWN,
+    ) -> PhaseAttemptRecord:
         """Record an abnormal exit for the current attempt without advancing."""
         if self._records and self._records[-1].termination is PhaseTermination.ABORTED:
             return self._records[-1]
@@ -416,7 +422,7 @@ class PhaseMachine:
             phase=self.current_phase,
             attempt_id=self._attempt_id(),
             termination=PhaseTermination.ABORTED,
-            outcome=PhaseOutcome.UNKNOWN,
+            outcome=outcome,
             transition="abort",
             reason=reason or "setup phase aborted",
             evidence=list(evidence or []),

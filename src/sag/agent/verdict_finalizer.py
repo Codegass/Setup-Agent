@@ -114,7 +114,7 @@ class SnapshotTestStats(BaseModel):
     unique: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     raw: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     flaky_count: int = 0
-    judgment: Literal["success", "failed", "unknown"] = "unknown"
+    judgment: Literal["success", "partial", "failed", "unknown"] = "unknown"
     # Plan 4 audit fix: pytest collection failures are first-class sealed
     # facts, never laundered into executed-test counts (None = not observed).
     collection_errors: int | None = None
@@ -230,6 +230,8 @@ class BuildEvidenceSnapshot(BaseModel):
     refs: tuple[str, ...] = ()
     compiled_classes: int | None = None
     source_files: int | None = None
+    reactor_modules_succeeded: int | None = None
+    reactor_modules_total: int | None = None
     # Plan 5 Task C2 (P0-F): per-domain build states, sealed WITH the build
     # evidence they describe — {"<root>": {"state": ..., "blocker": "<detail>"?}}.
     # None = no multi-domain decomposition was surveyed (single-domain
@@ -243,6 +245,10 @@ class BuildEvidenceSnapshot(BaseModel):
         data = handler(self)
         if data.get("source_files") is None:
             data.pop("source_files", None)
+        if data.get("reactor_modules_succeeded") is None:
+            data.pop("reactor_modules_succeeded", None)
+        if data.get("reactor_modules_total") is None:
+            data.pop("reactor_modules_total", None)
         if data.get("domain_states") is None:
             data.pop("domain_states", None)
         return data
@@ -481,6 +487,40 @@ def _physical_judgment(status: dict[str, Any]) -> str | None:
     return None
 
 
+def _phase_definitely_not_reached(
+    state: RunEvidenceState,
+    phase: str,
+    *,
+    role: EvidenceRole,
+) -> bool:
+    """Return true only when current run history proves a phase never opened.
+
+    Historical/replay states may not carry phase records, so absence there is
+    not evidence.  In a current run, an observation carrying the phase's
+    evidence role also proves execution even if shutdown happened before the
+    phase record was persisted.
+    """
+
+    records = state.phase_records
+    if not records:
+        return False
+    if any(
+        str(getattr(record, "phase", "") or "") == phase
+        and str(
+            getattr(
+                getattr(record, "termination", ""),
+                "value",
+                getattr(record, "termination", ""),
+            )
+            or ""
+        )
+        != "skipped"
+        for record in records
+    ):
+        return False
+    return not any(role in observation.roles for observation in state.tool_observations)
+
+
 _ACTION_PARAM_KEYS = ("action", "command", "task", "tasks", "goal", "operation")
 
 
@@ -569,6 +609,12 @@ def _fold_build_evidence(
     )
     domain_states = _sealed_domain_states(state)
 
+    # A close-time filesystem scan answers what exists on disk; it cannot say
+    # that a build command ran.  When current phase history proves the run
+    # stopped before Build, keep that scan out of the canonical outcome.
+    if _phase_definitely_not_reached(state, "build", role=EvidenceRole.BUILD):
+        return BuildEvidenceSnapshot(), ()
+
     physical = _physical_build_status(validator, project_name)
     judgment = _physical_judgment(physical) if physical is not None else None
     if judgment is not None:
@@ -583,8 +629,21 @@ def _fold_build_evidence(
         )
         if source_files is None:
             source_files = _nonnegative_int(state.fact_value("build.source_files"))
+        reactor_modules_succeeded = _nonnegative_int(
+            evidence.get("reactor_modules_succeeded") if isinstance(evidence, dict) else None
+        )
+        reactor_modules_total = _nonnegative_int(
+            evidence.get("reactor_modules_total") if isinstance(evidence, dict) else None
+        )
         physical_refs = tuple(
             str(ref) for ref in (physical.get("evidence_refs") or ()) if str(ref).strip()
+        )
+        terminal_reactor_authority = bool(
+            isinstance(evidence, dict)
+            and evidence.get("authority") == "terminal_reactor_receipt"
+            and reactor_modules_total is not None
+            and reactor_modules_total > 0
+            and reactor_modules_succeeded == reactor_modules_total
         )
         conflicts = tuple(
             dict.fromkeys(
@@ -594,7 +653,11 @@ def _fold_build_evidence(
                         for conflict in (physical.get("conflicts") or ())
                         if str(conflict).strip()
                     ),
-                    *_module_coverage_conflicts(validator, project_name),
+                    *(
+                        ()
+                        if terminal_reactor_authority
+                        else _module_coverage_conflicts(validator, project_name)
+                    ),
                 ]
             )
         )
@@ -613,6 +676,8 @@ def _fold_build_evidence(
                 refs=_dedupe([*physical_refs, *observation_refs]),
                 compiled_classes=compiled,
                 source_files=source_files,
+                reactor_modules_succeeded=reactor_modules_succeeded,
+                reactor_modules_total=reactor_modules_total,
                 domain_states=domain_states,
             ),
             conflicts,
@@ -819,9 +884,19 @@ def _fold_test_stats(
         # Execution, not the project's pass percentage, is the physical fact
         # this snapshot records.  Red remains visible in the counts and the
         # heavy-red rate signal; it is not a failed SAG execution.
-        validated_judgment: Literal["success", "failed", "unknown"] = (
-            "success" if validated_unique.executed > 0 else "unknown"
-        )
+        execution_state = str(validated_rollup.get("execution_state") or "").strip().lower()
+        validated_judgment: Literal["success", "partial", "failed", "unknown"]
+        if execution_state == "partial":
+            validated_judgment = "partial"
+            # A complete-looking fraction describes only the rows observed
+            # before interruption. Keep that explicit incompleteness in the
+            # verdict kernel as well as the test-stats display; otherwise a
+            # 100/100 prefix can mechanically lift the run back to success.
+            conflicts = _dedupe([*conflicts, "test_execution_interrupted"])
+        elif execution_state == "failed":
+            validated_judgment = "failed"
+        else:
+            validated_judgment = "success" if validated_unique.executed > 0 else "unknown"
         return (
             SnapshotTestStats(
                 discovered=_nonnegative_int(validated_rollup.get("discovered")),
@@ -1173,7 +1248,13 @@ def test_grain_rates(
         # it travel together, so the sentence is never a fact nothing points at.
         conflicts += (UNREADABLE_REPORT_CONFLICT,)
 
-    if test_modules:
+    if test_modules and any(module.startswith("/") for module in test_modules):
+        modules = GrainRate(
+            0,
+            None,
+            reason="test receipts identify execution domains, not module coverage",
+        )
+    elif test_modules:
         modules = GrainRate(
             numerator=len(driven_modules & test_modules),
             denominator=len(test_modules),
@@ -1234,17 +1315,47 @@ def _snapshot_rates(
     """Assemble the one serialized rates block from already-held evidence."""
     from sag.agent.module_coverage import build_grain_rates, shared_module_scan
 
-    build_grains, build_conflicts = build_grain_rates(
-        shared_module_scan(validator, project_name),
-        compiled_classes=build.compiled_classes,
-        source_files=build.source_files,
-    )
+    if _phase_definitely_not_reached(state, "build", role=EvidenceRole.BUILD):
+        not_run = GrainRate(0, None, reason="build was not run")
+        build_grains = {"modules": not_run, "classes": not_run}
+        build_conflicts = ()
+    elif (
+        build.reactor_modules_total is not None
+        and build.reactor_modules_total > 0
+        and build.reactor_modules_succeeded == build.reactor_modules_total
+    ):
+        modules = GrainRate(
+            build.reactor_modules_succeeded,
+            build.reactor_modules_total,
+            reason="terminal root reactor receipt is authoritative",
+        )
+        classes = GrainRate(
+            0,
+            None,
+            reason=(
+                "terminal reactor receipt is authoritative; filesystem class/source "
+                "counts are diagnostic and not comparable"
+            ),
+        )
+        build_grains = {"modules": modules, "classes": classes}
+        build_conflicts = ()
+    else:
+        build_grains, build_conflicts = build_grain_rates(
+            shared_module_scan(validator, project_name),
+            compiled_classes=build.compiled_classes,
+            source_files=build.source_files,
+        )
     driven_modules, test_modules = _module_sets_from_rollup(state)
-    test_grains, rate_conflicts = test_grain_rates(
-        tests,
-        driven_modules=driven_modules,
-        test_modules=test_modules,
-    )
+    if _phase_definitely_not_reached(state, "test", role=EvidenceRole.TEST):
+        not_run = GrainRate(0, None, reason="tests were not run")
+        test_grains = {"cases": not_run, "modules": not_run}
+        rate_conflicts = ()
+    else:
+        test_grains, rate_conflicts = test_grain_rates(
+            tests,
+            driven_modules=driven_modules,
+            test_modules=test_modules,
+        )
     rates = {
         "build": {name: grain.payload() for name, grain in build_grains.items()},
         "test": {name: grain.payload() for name, grain in test_grains.items()},
@@ -1329,6 +1440,36 @@ def _oracle_divergence_conflicts(state: RunEvidenceState, build) -> tuple[str, .
 
 def _phase_record_snapshot(record) -> PhaseRecordSnapshot:
     return PhaseRecordSnapshot.model_validate(asdict(record))
+
+
+def _phase_machine_verdict(records) -> str | None:
+    """Project an explicit failed abort without conflating cancellation."""
+
+    return (
+        "failed"
+        if any(
+            str(
+                getattr(
+                    getattr(record, "termination", ""),
+                    "value",
+                    getattr(record, "termination", ""),
+                )
+                or ""
+            )
+            == "aborted"
+            and str(
+                getattr(
+                    getattr(record, "outcome", ""),
+                    "value",
+                    getattr(record, "outcome", ""),
+                )
+                or ""
+            )
+            == "failed"
+            for record in records
+        )
+        else None
+    )
 
 
 def _read_snapshot_text(orchestrator) -> str | None:
@@ -1597,7 +1738,7 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
         conflicts=snapshot.conflicts,
     )
     expected_verdict = run_verdict(
-        None,
+        _phase_machine_verdict(snapshot.phase_records),
         derived_verdict_word(build_modules, test_cases),
         snapshot.conflicts,
     )
@@ -1735,7 +1876,7 @@ class VerdictFinalizer:
             finalized_at=state.finalized_at or "unknown",
             input_refs=input_refs,
             verdict=run_verdict(
-                None,
+                _phase_machine_verdict(state.phase_records),
                 derived_verdict_word(build_modules_rate, test_cases_rate),
                 conflicts,
             ),

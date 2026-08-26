@@ -308,6 +308,47 @@ def test_extended_regex_alternation_finds_the_gradlew_path(tmp_path):
     assert "2:/workspace/tapestry-5/gradlew" in result.output
 
 
+def test_file_search_exposes_case_insensitivity_without_rewriting_the_pattern(tmp_path):
+    subject = tmp_path / "testing.md"
+    subject.write_text("Run the Product Test Suite\n")
+    orch = LocalShellOrchestrator(tmp_path)
+
+    result = SearchTool(orch).execute(
+        target=f"file:{subject}",
+        pattern="product test suite",
+        ignore_case=True,
+    )
+
+    assert result.succeeded is True
+    assert result.facts["matched"] is True
+    assert "Product Test Suite" in result.output
+    assert "grep -nEi" in orch.commands[0]
+
+
+def test_exit_one_with_a_grep_diagnostic_is_not_reported_as_no_matches():
+    diagnostic = "grep: unsupported expression"
+    orch = FakeOrchestrator(
+        responses={
+            "/workspace/p/README.md": {
+                "success": False,
+                "exit_code": 1,
+                "output": diagnostic,
+                "stdout": "",
+                "stderr": diagnostic,
+            }
+        }
+    )
+
+    result = SearchTool(orch).execute(
+        target="file:/workspace/p/README.md",
+        pattern="(?i)test",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "SEARCH_FAILED"
+    assert result.facts["matched"] is None
+
+
 def test_directory_target_is_searched_recursively(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "build.gradle").write_text("apply plugin: 'java'\n")
@@ -572,6 +613,7 @@ def test_description_tells_the_model_which_form_matches_names(tmp_path):
     schema = tool.get_parameter_schema()
     target_doc = schema["properties"]["target"]["description"]
     pattern_doc = schema["properties"]["pattern"]["description"]
+    ignore_case = schema["properties"]["ignore_case"]
 
     for text in (tool.description, target_doc):
         assert "file:" in text and "name:" in text
@@ -579,3 +621,6 @@ def test_description_tells_the_model_which_form_matches_names(tmp_path):
         assert "NAMES" in text
     assert "glob" in tool.description and "glob" in pattern_doc
     assert "grep -E" in tool.description and "grep -E" in pattern_doc
+    assert ignore_case["type"] == "boolean"
+    assert ignore_case["default"] is False
+    assert "(?i)" in tool.description and "(?i)" in pattern_doc

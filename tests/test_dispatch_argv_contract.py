@@ -143,5 +143,5 @@ def test_the_maven_vector_appends_nothing_the_contract_did_not_name():
     backend = MavenBackend(SimpleNamespace(orchestrator=None))
     params = backend.materialize("test", None, "/workspace/seatunnel-web", None)
 
-    assert shlex.split(_physical_maven(params)) == ["mvn", "--fail-at-end", "verify"]
+    assert shlex.split(_physical_maven(params)) == ["mvn", "--fail-at-end", "test"]
     assert compliance_class(backend.expected_argv(params), _physical_maven(params)) == "exact"

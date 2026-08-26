@@ -1193,13 +1193,13 @@ class ReceiptWritingMavenTool:
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
-        argv = "mvn --fail-at-end verify"
+        argv = "mvn --fail-at-end test"
         metadata = record_invocation(
             self.orchestrator.execute_command,
             tool="maven",
             attempt=1,
-            requested_action="verify",
-            effective_action="verify",
+            requested_action="test",
+            effective_action="test",
             argv=argv,
             working_directory=kwargs.get("working_directory") or "/workspace/proj",
             exit_code=self.exit_code,

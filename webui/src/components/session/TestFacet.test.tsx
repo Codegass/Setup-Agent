@@ -96,7 +96,7 @@ describe("TestFacet", () => {
 
     expect(screen.getByText("Verified test identities")).toBeInTheDocument()
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0)
-    expect(screen.getByText(/module names and stable test identities/i)).toBeInTheDocument()
+    expect(screen.getByText(/module-qualified test identities were not sealed/i)).toBeInTheDocument()
 
     expect(screen.getByText("Evidence details")).toBeInTheDocument()
     expect(screen.getByText("Recorded tool runs")).toBeInTheDocument()

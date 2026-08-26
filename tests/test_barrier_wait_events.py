@@ -154,11 +154,11 @@ def test_the_first_wait_states_an_unknown_progress_predicate():
 
     waits = [payload for kind, payload in events if kind == "job_barrier_wait"]
     assert [wait["waits"] for wait in waits] == [1, 3, 5]
-    # The container's probe reports a live CPU tick on every sample, so every
-    # wait that HAD a predecessor to compare with states the predicate it
-    # computed. Only the first one has nothing to compare.
+    # CPU movement is liveness diagnostics, not substantive progress. A
+    # predecessor makes the predicate known, but log/report/receipt state did
+    # not change, so the later samples are explicitly not progressing.
     assert waits[0]["progressing"] is None
-    assert [wait["progressing"] for wait in waits[1:]] == [True, True]
+    assert [wait["progressing"] for wait in waits[1:]] == [False, False]
 
 
 def test_a_failing_event_sink_never_ends_the_wait():

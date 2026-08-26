@@ -8,7 +8,11 @@ def _tone(outcome: str, build: dict | None, test: dict | None) -> str:
     if "fail" in o or (build and str(build.get("state", "")).lower() in {"failed", "failure"}):
         return "failed"
     if "partial" in o or (
-        test and int(test.get("fail", 0) or 0) + int(test.get("errors", 0) or 0) > 0
+        test
+        and (
+            str(test.get("state", "")).lower() == "partial"
+            or int(test.get("fail", 0) or 0) + int(test.get("errors", 0) or 0) > 0
+        )
     ):
         return "attention"
     if "success" in o or "pass" in o:
@@ -44,6 +48,8 @@ def _build_clause(build: dict | None, ms: dict | None) -> str | None:
         return "Build passed"
     if state == "partial":
         return "Build partially completed"
+    if state == "not_attempted":
+        return "Build was not run"
     if state in {"unknown", "unavailable"}:
         return "Build result unavailable"
     return None
@@ -56,7 +62,16 @@ def _test_clause(test: dict | None) -> str | None:
     fail = int(test.get("fail", 0) or 0) + int(test.get("errors", 0) or 0)
     state = str(test.get("state", "")).lower()
     if total <= 0:
+        if state == "not_attempted":
+            return "Tests were not run"
         return "Test result unavailable" if state in {"unknown", "unavailable"} else None
+    if state == "partial":
+        if fail:
+            return (
+                f"Test execution incomplete; {fail:,} non-passing results of "
+                f"{total:,} sealed results observed"
+            )
+        return f"Test execution incomplete; {total:,} sealed results observed"
     if fail == 0:
         return f"Test run passed with {total:,} sealed results"
     return f"Test run recorded {fail:,} non-passing results of {total:,}"

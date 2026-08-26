@@ -39,6 +39,7 @@ from sag.agent.project_execution_plan import (
     PROJECT_EXECUTION_PLAN_PATH,
     ProjectExecutionPlan,
     ProjectExecutionPlanValidationError,
+    bind_project_execution_plan_inventory,
     canonical_authored_plan_sha256,
     seal_project_execution_plan,
     validate_authored_plan,
@@ -67,9 +68,28 @@ class PhaseTool(BaseTool):
                 "action='note' records a working note. A rejected terminal claim returns "
                 "typed judge facts; the model chooses its next ordinary project action. "
                 "Analyze action='done' additionally requires execution_plan: the model's "
-                "evidence-linked build/test strategy. Each reviewed document needs a readable "
-                "output_* from a successful read/search in the current Analyze attempt. "
-                "The Harness validates and the engine "
+                "evidence-linked build/test strategy. test_disposition must be planned with "
+                "at least one test step, or blocked with empty test_steps and a concrete reason "
+                "plus reviewed-document evidence refs. Separately record execution_mechanism, "
+                "verdict_scope, and readiness. Classify verdict_scope from the actual definition "
+                "before choosing status: product_test_cases executes product behavior cases; "
+                "test_metadata checks their inventory or suite membership; quality_only is not a "
+                "test verdict; benchmark_or_manual needs coordination; unknown stays unresolved. "
+                "Only product_test_cases with readiness=ready may be planned. For a custom profile, "
+                "task, script, wrapper, or suite, read its actual definition and cite that direct "
+                "definition in definition_evidence_refs; do not infer behavior from its name or "
+                "from prose that merely invokes it. Reconcile the exact entry with the project's "
+                "own stated purpose and cite evidence that it executes automated product cases. "
+                "Its tool, directory, and arguments must faithfully implement that cited command, "
+                "not a similarly named lifecycle or mechanical fact-sheet runner. Refine relevant "
+                "capped searches and resolve external services, checkouts, manual coordination, "
+                "runner support, and report support before sealing. Prefer a bounded self-contained "
+                "documented suite; keep looking or use blocked when the real entry cannot run "
+                "unattended here. Each reviewed "
+                "document needs a readable "
+                "output_* from a successful current-Analyze call that names that exact path. "
+                "Inventory entry_id/source_hash values are optional hints; "
+                "the Harness derives authoritative bindings and the engine "
                 "seals it, but neither authors its commands. The engine alone routes or "
                 "skips phases."
             ),
@@ -303,21 +323,35 @@ class PhaseTool(BaseTool):
         self,
         plan: ProjectExecutionPlan,
         claim: PhaseClaim,
+        document_map: Any,
     ) -> Dict[str, Any]:
         """Cross-check a model plan without publishing the authoritative file.
 
         The document map is an inventory and gap-checking input only.  The plan
         model also permits checkout-contained sources discovered outside that
-        bounded map when the model cites a direct output/file observation.
+        bounded map when the model cites a direct output observation.
         Publication remains engine-owned and happens only after the delivered
         phase gate is accepted.
         """
 
         attempt_id = str(getattr(self.machine, "current_attempt_id", "") or "").strip()
-        plan = self.validate_execution_plan_evidence(
+        artifact = seal_project_execution_plan(
             plan,
             source_attempt_id=attempt_id,
+            claim_sha256=claim_identity(claim),
+            document_map=document_map,
         )
+        return {
+            "authored_plan": artifact.plan.model_dump(mode="json"),
+            "authored_plan_sha256": artifact.authored_plan_sha256,
+            "document_map_fingerprint": artifact.document_map_fingerprint,
+            "inventory_coverage": artifact.inventory_coverage.model_dump(mode="json"),
+            "inventory_warnings": list(artifact.inventory_warnings),
+        }
+
+    def _execution_plan_document_map(self) -> Any:
+        """Read the optional live inventory used only for binding and gap audit."""
+
         document_map = None
         try:
             observed = read_live_document_map(self.orchestrator)
@@ -328,19 +362,7 @@ class PhaseTool(BaseTool):
             # validation can still bind map-external sources to direct refs;
             # it must not invent a replacement inventory.
             document_map = None
-        artifact = seal_project_execution_plan(
-            plan,
-            source_attempt_id=attempt_id,
-            claim_sha256=claim_identity(claim),
-            document_map=document_map,
-        )
-        return {
-            "authored_plan": plan.model_dump(mode="json"),
-            "authored_plan_sha256": artifact.authored_plan_sha256,
-            "document_map_fingerprint": artifact.document_map_fingerprint,
-            "inventory_coverage": artifact.inventory_coverage.model_dump(mode="json"),
-            "inventory_warnings": list(artifact.inventory_warnings),
-        }
+        return document_map
 
     def execute(
         self,
@@ -426,6 +448,9 @@ class PhaseTool(BaseTool):
             )
 
         normalized_plan: ProjectExecutionPlan | None = None
+        plan_seal_candidate: ProjectExecutionPlan | None = None
+        plan_document_map: Any = None
+        plan_binding_error: ProjectExecutionPlanValidationError | None = None
         plan_sha256 = ""
         if execution_plan is not None:
             if phase != "analyze" or verb != "done":
@@ -435,8 +460,10 @@ class PhaseTool(BaseTool):
                     error_code="ANALYSIS_EXECUTION_PLAN_FORBIDDEN",
                 )
             try:
-                normalized_plan = validate_authored_plan(execution_plan)
-                plan_sha256 = canonical_authored_plan_sha256(normalized_plan)
+                normalized_plan = validate_authored_plan(
+                    execution_plan,
+                    require_test_disposition=True,
+                )
             except ProjectExecutionPlanValidationError as exc:
                 return ToolResult.completed_failure(
                     output=f"Analyze execution plan is incomplete or invalid: {exc}",
@@ -444,6 +471,17 @@ class PhaseTool(BaseTool):
                     error_code="ANALYSIS_EXECUTION_PLAN_INVALID",
                     facts={"analysis.execution_plan_valid": False},
                 )
+            try:
+                normalized_plan = self.validate_execution_plan_evidence(normalized_plan)
+                plan_seal_candidate = normalized_plan
+                plan_document_map = self._execution_plan_document_map()
+                normalized_plan = bind_project_execution_plan_inventory(
+                    normalized_plan, plan_document_map
+                )
+                plan_sha256 = canonical_authored_plan_sha256(normalized_plan)
+            except ProjectExecutionPlanValidationError as exc:
+                plan_binding_error = exc
+                plan_sha256 = canonical_authored_plan_sha256(normalized_plan)
 
         claim = PhaseClaim(
             phase=phase,
@@ -457,9 +495,27 @@ class PhaseTool(BaseTool):
         )
 
         plan_candidate: Dict[str, Any] | None = None
+        if plan_binding_error is not None:
+            return self._rejected_claim_result(
+                claim,
+                code="ANALYSIS_EXECUTION_PLAN_INVALID",
+                reason=(
+                    "Analyze execution plan evidence binding is invalid: " f"{plan_binding_error}"
+                ),
+                control_disposition=GateControlDisposition.REPAIR_REQUIRED,
+                blocker_owner="project",
+                validated_facts={
+                    "analysis.execution_plan_valid": False,
+                    "analysis.execution_plan_error": str(plan_binding_error)[:1000],
+                },
+            )
         if normalized_plan is not None:
             try:
-                plan_candidate = self._prepare_execution_plan(normalized_plan, claim)
+                plan_candidate = self._prepare_execution_plan(
+                    plan_seal_candidate or normalized_plan,
+                    claim,
+                    plan_document_map,
+                )
             except ProjectExecutionPlanValidationError as exc:
                 return self._rejected_claim_result(
                     claim,
@@ -762,20 +818,107 @@ class PhaseTool(BaseTool):
                                         "items": {"type": "string", "maxLength": 512},
                                         "description": (
                                             "Include at least one readable output_* produced "
-                                            "by your current Analyze read/search of this path; "
-                                            "a document-map id or file path alone is not a read."
+                                            "by a current Analyze call that names this exact "
+                                            "path. If a claim is rejected, the error lists the "
+                                            "exact valid refs already observed for the path."
                                         ),
                                     },
-                                    "entry_id": {"type": "string", "maxLength": 128},
-                                    "source_hash": {"type": "string", "maxLength": 64},
+                                    "entry_id": {
+                                        "type": "string",
+                                        "maxLength": 128,
+                                        "description": (
+                                            "Optional inventory hint; normally omit it because "
+                                            "the Harness derives the authoritative binding."
+                                        ),
+                                    },
+                                    "source_hash": {
+                                        "type": "string",
+                                        "maxLength": 128,
+                                        "description": (
+                                            "Optional inventory hint; normally omit it because "
+                                            "the Harness derives the authoritative binding."
+                                        ),
+                                    },
                                 },
                                 "required": ["path", "reason", "evidence_refs"],
                             },
                         },
+                        "test_disposition": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["planned", "blocked"],
+                                },
+                                "reason": {"type": "string", "maxLength": 1000},
+                                "execution_mechanism": {
+                                    "type": "string",
+                                    "maxLength": 1000,
+                                    "description": (
+                                        "What the exact selected entry dispatches according to "
+                                        "its reviewed definition, including the runner/plugin/task."
+                                    ),
+                                },
+                                "verdict_scope": {
+                                    "type": "string",
+                                    "enum": [
+                                        "product_test_cases",
+                                        "test_metadata",
+                                        "quality_only",
+                                        "benchmark_or_manual",
+                                        "unknown",
+                                    ],
+                                    "description": (
+                                        "Classify what the entry's reviewed definition actually "
+                                        "executes. Unit, integration, and system behavior cases "
+                                        "are product_test_cases; inventory/suite-membership checks "
+                                        "are test_metadata."
+                                    ),
+                                },
+                                "readiness": {
+                                    "type": "string",
+                                    "enum": ["ready", "blocked", "unknown"],
+                                    "description": (
+                                        "Whether required services, checkouts, coordination, "
+                                        "runner support, and durable reports are established."
+                                    ),
+                                },
+                                "evidence_refs": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 12,
+                                    "items": {"type": "string", "maxLength": 512},
+                                    "description": (
+                                        "Cite reviewed-document output refs supporting the "
+                                        "planned entry or concrete blocker."
+                                    ),
+                                },
+                                "definition_evidence_refs": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 12,
+                                    "items": {"type": "string", "maxLength": 512},
+                                    "description": (
+                                        "Cite the reviewed output that shows the actual definition "
+                                        "or dispatch mechanism of the selected entry."
+                                    ),
+                                },
+                            },
+                            "required": [
+                                "status",
+                                "reason",
+                                "execution_mechanism",
+                                "verdict_scope",
+                                "readiness",
+                                "evidence_refs",
+                                "definition_evidence_refs",
+                            ],
+                        },
                         **{
                             lane: {
                                 "type": "array",
-                                "minItems": 1,
+                                "minItems": (0 if lane == "test_steps" else 1),
                                 "maxItems": 16,
                                 "items": {
                                     "type": "object",
@@ -786,12 +929,12 @@ class PhaseTool(BaseTool):
                                         "purpose": {"type": "string", "maxLength": 1000},
                                         "evidence_refs": {
                                             "type": "array",
-                                            "minItems": 1,
+                                            "minItems": 0,
                                             "maxItems": 12,
                                             "items": {"type": "string", "maxLength": 512},
                                         },
                                     },
-                                    "required": ["tool", "params", "purpose", "evidence_refs"],
+                                    "required": ["tool", "params", "purpose"],
                                 },
                             }
                             for lane in ("build_steps", "test_steps")
@@ -817,6 +960,7 @@ class PhaseTool(BaseTool):
                         "documents_reviewed",
                         "build_steps",
                         "build_success_criteria",
+                        "test_disposition",
                         "test_steps",
                         "test_success_criteria",
                     ],

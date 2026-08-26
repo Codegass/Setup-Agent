@@ -574,6 +574,15 @@ def _receipt_row_projection(
     foreign_run_seen = False
     stale_files: set[str] = set()
 
+    def declares_test_execution(receipt: Mapping[str, Any]) -> bool:
+        requested = str(receipt.get("requested_action") or "").strip().lower()
+        effective = str(receipt.get("effective_action") or "").strip().lower()
+        return bool(
+            requested in {"test", "verify", "integration-test"}
+            or effective in {"test", "verify", "integration-test"}
+            or isinstance(receipt.get("testcase_execution_rows"), Mapping)
+        )
+
     for receipt in receipts:
         receipt_run = _nonempty_text(receipt.get("run_id"))
         if receipt_run != active_run:
@@ -595,7 +604,11 @@ def _receipt_row_projection(
             path and re.fullmatch(r"[0-9a-f]{64}", digest) for path, digest in report_claims
         )
         if not entries:
-            if receipt.get("schema_version") == 2 and receipt_target == target:
+            if (
+                declares_test_execution(receipt)
+                and receipt.get("schema_version") == 2
+                and receipt_target == target
+            ):
                 # A current v2 receipt with no report delta is known to exist,
                 # but without a sealed row envelope it cannot authorize the
                 # snapshot's aggregate receipt-scoped counts.
@@ -724,6 +737,21 @@ def _canonical_snapshot(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
     return nested if isinstance(nested, Mapping) else snapshot
 
 
+def _recorded_phase_reached(snapshot: Mapping[str, Any], phase: str) -> bool | None:
+    """Read explicit phase history; legacy snapshots with no history stay unknown."""
+
+    canonical = _canonical_snapshot(snapshot)
+    records = canonical.get("phase_records")
+    if not isinstance(records, list) or not records:
+        return None
+    return any(
+        isinstance(record, Mapping)
+        and str(record.get("phase") or "") == phase
+        and str(record.get("termination") or "") != "skipped"
+        for record in records
+    )
+
+
 def _snapshot_test_facts(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     canonical = _canonical_snapshot(snapshot)
     test_stats = canonical.get("test_stats")
@@ -812,6 +840,39 @@ def _project_tests(
         run_id=run_id,
         run_target_sha=run_target_sha,
     )
+    observed_execution = (
+        any(
+            isinstance(facts.get(basis), Mapping)
+            and bool(_int_or_none(facts[basis].get("executed")))
+            for basis in ("raw", "unique")
+        )
+        or facts["receipt_scoped"]
+    )
+    if (
+        _recorded_phase_reached(snapshot, "test") is False
+        and not observed_execution
+        and not (
+            isinstance(row_projection, Mapping)
+            and row_projection.get("current_receipt_seen") is True
+        )
+    ):
+        unavailable = _all_null_counts(reason="tests were not run")
+        observation = _observation_bucket(
+            _all_null_counts(reason="tests were not run"),
+            report_file_count=None,
+        )
+        return {
+            "claimed": {
+                "latest_subjects": dict(unavailable),
+                "latest_cases": dict(unavailable),
+                "receipt_executions": dict(unavailable),
+            },
+            "quarantined_observations": dict(observation),
+            "unattributed_observations": dict(observation),
+            "stale_observations": dict(observation),
+            "retried_cases": None,
+            "flaky_cases": None,
+        }
     raw_candidate = facts["raw"]
     raw = (
         raw_candidate
@@ -885,9 +946,11 @@ def _project_tests(
             # them is not a licence to invent an outcome for them. Reports the
             # parser could not open are unmeasured here too, never a measured
             # zero — `_excluded_volume` draws that line.
-            stale_counts
-            if stale_counts is not None
-            else _all_null_counts(reason="stale report outcomes were not counted by this seal"),
+            (
+                stale_counts
+                if stale_counts is not None
+                else _all_null_counts(reason="stale report outcomes were not counted by this seal")
+            ),
             report_file_count=len(set(stale_reports)) + (row_stale_files or 0),
             reason="receipt_claim_superseded" if stale_counts is not None else None,
         )
@@ -1028,10 +1091,30 @@ def _outcome_surface(snapshot: Mapping[str, Any], *, close_reason: str = "") -> 
     tests = tests if isinstance(tests, Mapping) else {}
     status = snapshot.get("status")
     status = status if isinstance(status, Mapping) else {}
+    build_not_run = _recorded_phase_reached(snapshot, "build") is False and not bool(
+        build.get("observed")
+    )
+    test_not_run = (
+        _recorded_phase_reached(snapshot, "test") is False
+        and not any(
+            bool(_int_or_none(counts.get("executed")))
+            for counts in (tests.get("raw"), tests.get("unique"))
+            if isinstance(counts, Mapping)
+        )
+        and tests.get("receipt_scoped") is not True
+    )
     return {
         "verdict": verdict if verdict in {"success", "partial", "failed", "unknown"} else "unknown",
-        "build_state": str(build.get("judgment") or status.get("overall") or "unavailable"),
-        "test_state": str(tests.get("judgment") or status.get("overall") or "unavailable"),
+        "build_state": (
+            "not_attempted"
+            if build_not_run
+            else str(build.get("judgment") or status.get("overall") or "unavailable")
+        ),
+        "test_state": (
+            "not_attempted"
+            if test_not_run
+            else str(tests.get("judgment") or status.get("overall") or "unavailable")
+        ),
         # The seal's own word for why the run closed. The verdict snapshot has
         # no `close_reason` field, so reading only there made this fallback the
         # answer in EVERY run — a field that said "unavailable" about a reason

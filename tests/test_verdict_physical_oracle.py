@@ -24,8 +24,9 @@ from test_verdict_finalizer import (
     bind_verdict_authority,
 )
 
-from sag.agent.evidence_state import EvidenceRole, StateScope
+from sag.agent.evidence_state import EvidenceRole
 from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
+from sag.agent.evidence_state import StateScope
 from sag.agent.phase_machine import PhaseAttemptRecord
 from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
@@ -59,7 +60,13 @@ class FakePhysicalValidator:
         return self.status
 
 
-def _finalize(state, validator, *, orchestrator=None):
+def _finalize(
+    state,
+    validator,
+    *,
+    orchestrator=None,
+    reason=EvidenceCloseReason.TEST_TERMINATED,
+):
     verdict_orchestrator = orchestrator or FakeVerdictOrchestrator()
     bind_verdict_authority(verdict_orchestrator, state.run_id)
     finalizer = VerdictFinalizer(
@@ -67,7 +74,7 @@ def _finalize(state, validator, *, orchestrator=None):
         validator=validator,
         project_name="proj",
     )
-    return finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    return finalizer.finalize(state, reason)
 
 
 def _green_tests(state, *, total=50):
@@ -198,6 +205,64 @@ def test_full_physical_success_with_green_tests_is_success():
     assert snapshot.verdict == "partial"
 
 
+def test_terminal_reactor_authority_seals_module_rate_without_class_ratio_conflict():
+    state = RunEvidenceState(run_id="session-ignite-reactor")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(output="reactor built", refs=["output_build"]),
+        provenance="output_build",
+    )
+    _green_tests(state, total=20)
+    validator = FakePhysicalValidator(
+        {
+            "success": True,
+            "build_complete": True,
+            "reason": "41 of 41 reactor modules succeeded",
+            "conflicts": [],
+            "evidence_status": "success",
+            "evidence": {
+                "authority": "terminal_reactor_receipt",
+                "terminal_reactor_receipt_id": "inv-ignite-build",
+                "reactor_modules_succeeded": 41,
+                "reactor_modules_total": 41,
+                # These remain visible diagnostics, but one source file can
+                # emit many classes and therefore cannot bound this count.
+                "class_count": 17779,
+                "source_files": 5470,
+            },
+        }
+    )
+    # Deliberately stale/incomplete filesystem view: receipt authority must
+    # prevent this close-time diagnostic from re-capping the sealed build.
+    validator.module_scan = lambda _project_name: {
+        "summary": {"modules_built": 25, "modules_total": 37},
+        "modules": [],
+        "project_dir": "/workspace/proj",
+    }
+
+    snapshot = _finalize(state, validator)
+
+    assert snapshot.build_evidence.judgment == "success"
+    assert snapshot.rates["build"]["modules"] == {
+        "rate": 100.0,
+        "band": "fully",
+        "numerator": 41,
+        "denominator": 41,
+        "reason": "terminal root reactor receipt is authoritative",
+    }
+    assert snapshot.rates["build"]["classes"] == {
+        "band": "unavailable",
+        "reason": (
+            "terminal reactor receipt is authoritative; filesystem class/source "
+            "counts are diagnostic and not comparable"
+        ),
+    }
+    assert "build_modules_incomplete" not in snapshot.conflicts
+    assert "rate_denominator_not_a_bound" not in snapshot.conflicts
+    assert snapshot.verdict == "success"
+
+
 def test_fallback_aggregates_observations_instead_of_last_wins():
     # replay shape: no validator available; mixed success + failed build calls
     snapshot = _finalize(_bigtop_state(), validator=None)
@@ -229,6 +294,79 @@ def test_true_unknown_requires_nothing_observed_anywhere():
     snapshot = _finalize(state, validator=None)
     assert snapshot.build_evidence.judgment == "unknown"
     assert snapshot.verdict == "partial"
+
+
+def test_analyze_abort_does_not_turn_a_static_scan_into_a_failed_build():
+    state = RunEvidenceState(run_id="session-analyze-abort")
+    state.record_phase_record(
+        PhaseAttemptRecord(
+            phase="analyze",
+            attempt_id="analyze-1",
+            termination="aborted",
+            outcome="failed",
+            validated_outcome="failed",
+            reason="iteration budget exhausted",
+        )
+    )
+    validator = FakePhysicalValidator(
+        {
+            "success": False,
+            "build_complete": False,
+            "reason": "no compiled classes found",
+            "conflicts": ["build_validation_failed"],
+            "evidence_status": "blocked",
+            "evidence": {"class_count": 0, "source_files": 5470},
+        }
+    )
+
+    snapshot = _finalize(state, validator, reason=EvidenceCloseReason.ABORTED)
+
+    assert validator.calls == []
+    assert snapshot.verdict == "failed"
+    assert snapshot.build_evidence.observed is False
+    assert snapshot.build_evidence.judgment == "unknown"
+    assert snapshot.build_evidence.source == "none"
+    assert snapshot.rates["build"]["modules"] == {
+        "band": "unavailable",
+        "reason": "build was not run",
+    }
+    assert snapshot.rates["test"]["cases"] == {
+        "band": "unavailable",
+        "reason": "tests were not run",
+    }
+    assert "build_validation_failed" not in snapshot.conflicts
+
+
+def test_policy_skipped_build_and_test_are_not_treated_as_executed_phases():
+    state = RunEvidenceState(run_id="session-policy-skips")
+    for phase in ("build", "test"):
+        state.record_phase_record(
+            PhaseAttemptRecord(
+                phase=phase,
+                attempt_id=f"{phase}-1",
+                termination="skipped",
+                outcome="skipped",
+                validated_outcome="skipped",
+                reason="phase skipped by transition policy",
+            )
+        )
+    validator = FakePhysicalValidator(
+        {
+            "success": False,
+            "build_complete": False,
+            "reason": "no compiled classes found",
+            "conflicts": ["build_validation_failed"],
+            "evidence_status": "blocked",
+            "evidence": {"class_count": 0, "source_files": 10},
+        }
+    )
+
+    snapshot = _finalize(state, validator)
+
+    assert validator.calls == []
+    assert snapshot.build_evidence.observed is False
+    assert snapshot.rates["build"]["modules"]["reason"] == "build was not run"
+    assert snapshot.rates["test"]["cases"]["reason"] == "tests were not run"
 
 
 def test_validator_exception_degrades_to_observation_fallback_never_raises():

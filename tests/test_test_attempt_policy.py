@@ -12,14 +12,17 @@ from container_evidence_fakes import (
     strict_published_evidence,
 )
 
+import sag.agent.attempt_policy as attempt_policy
 from sag.agent.attempt_policy import (
-    TestCandidateResolution,
+    TestAttemptRequirement as AttemptRequirement,
+    TestCandidateResolution as CandidateResolution,
     forced_test_refusal_receipts,
     has_test_candidate_refresh_receipt,
     required_test_attempt,
     resolve_survey_test_candidates,
     survey_test_candidates,
     terminal_test_receipts,
+    test_execution_matches_candidate as execution_matches_candidate,
 )
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.evidence_state import RunEvidenceState, StateScope
@@ -1205,8 +1208,102 @@ def test_snapshot_round_trip_preserves_the_primary_coordinate():
     resolution = resolve_survey_test_candidates(ManifestOrchestrator())
     assert resolution.primary is not None
 
-    restored = TestCandidateResolution.from_snapshot(resolution.to_snapshot())
+    restored = CandidateResolution.from_snapshot(resolution.to_snapshot())
 
     assert restored.primary is not None
     assert restored.primary.root == resolution.primary.root
     assert restored.primary.system == resolution.primary.system
+
+
+def _sealed_test_resolution(monkeypatch, *, system, params):
+    root = "/workspace/bigtop/bigtop-data-generators"
+    surveyed = AttemptRequirement(
+        root=root,
+        system=system,
+        required_action={
+            "tool": "build",
+            "params": {"action": "test", "working_directory": root},
+        },
+    )
+    survey = CandidateResolution(
+        status="available",
+        candidates=(surveyed,),
+        project_root="/workspace/bigtop",
+        workspace_root="/workspace",
+        primary=surveyed,
+    )
+    import sag.agent.project_execution_plan as plan_module
+
+    monkeypatch.setattr(
+        plan_module,
+        "read_sealed_project_execution_plan",
+        lambda _orchestrator: SimpleNamespace(
+            plan=SimpleNamespace(
+                test_steps=(SimpleNamespace(tool="build", params=params),)
+                if params is not None
+                else ()
+            )
+        ),
+    )
+    sealed, resolution = attempt_policy._sealed_plan_test_resolution(object(), survey)
+    assert sealed is True
+    return resolution
+
+
+def test_empty_sealed_plan_does_not_restore_the_survey_invented_root_test(monkeypatch):
+    assert _sealed_test_resolution(monkeypatch, system="gradle", params=None) is None
+
+
+@pytest.mark.parametrize(
+    ("system", "backend_params", "different_params"),
+    [
+        (
+            "maven",
+            {
+                "command": "test",
+                "extra_args": "-Dtest=FocusedSuite",
+                "working_directory": "/workspace/bigtop/bigtop-data-generators",
+            },
+            {
+                "command": "test",
+                "extra_args": "-Dtest=OtherSuite",
+                "working_directory": "/workspace/bigtop/bigtop-data-generators",
+            },
+        ),
+        (
+            "gradle",
+            {
+                "tasks": "test",
+                "gradle_args": "--tests org.example.FastTest",
+                "working_directory": "/workspace/bigtop/bigtop-data-generators",
+            },
+            {
+                "tasks": "test",
+                "gradle_args": "--tests org.example.OtherTest",
+                "working_directory": "/workspace/bigtop/bigtop-data-generators",
+            },
+        ),
+    ],
+)
+def test_sealed_plan_floor_accepts_only_the_exact_backend_receipt(
+    monkeypatch,
+    system,
+    backend_params,
+    different_params,
+):
+    args = backend_params.get("extra_args") or backend_params.get("gradle_args")
+    resolution = _sealed_test_resolution(
+        monkeypatch,
+        system=system,
+        params={
+            "action": "test",
+            "args": args,
+            "working_directory": "/workspace/bigtop/bigtop-data-generators",
+        },
+    )
+    assert resolution is not None
+    requirement = resolution.primary
+    result = ToolResult.completed_success(output="terminal backend receipt", facts={"system": system})
+
+    assert execution_matches_candidate(system, backend_params, result, requirement)
+    assert not execution_matches_candidate(system, different_params, result, requirement)

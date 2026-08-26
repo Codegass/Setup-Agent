@@ -135,7 +135,25 @@ class _RateValidator:
         }
 
 
-def _set_rate_test_rollup(state, *, passed, failed, errors, driven_modules):
+def _set_rate_test_rollup(
+    state,
+    *,
+    passed,
+    failed,
+    errors,
+    driven_modules,
+    execution_state=None,
+):
+    execution = (
+        {
+            "execution_state": execution_state,
+            "execution_reason": "test execution was interrupted after sealed rows",
+            "execution_receipt_ids": ["inv-test-partial"],
+            "interrupted_receipt_ids": ["inv-test-partial"],
+        }
+        if execution_state
+        else {}
+    )
     state.set_fact(
         "test.stats",
         {
@@ -162,6 +180,7 @@ def _set_rate_test_rollup(state, *, passed, failed, errors, driven_modules):
             # shell fallback's unpartitioned corpus and is sealed as
             # unattributed volume, never as the headline.
             "receipt_scoped": True,
+            **execution,
         },
         evidence_ref="receipt://test-rollup",
         source_phase="test",
@@ -233,6 +252,30 @@ def test_v4_finalize_round_trip_carries_the_complete_rates_block():
     assert read_verdict_snapshot(orchestrator) == snapshot
 
 
+def test_interrupted_test_rollup_remains_partial_even_when_all_observed_rows_pass():
+    state = RunEvidenceState(run_id="session-interrupted-test")
+    _set_rate_test_rollup(
+        state,
+        passed=100,
+        failed=0,
+        errors=0,
+        driven_modules=["core", "io"],
+        execution_state="partial",
+    )
+
+    snapshot = VerdictFinalizer(
+        FakeVerdictOrchestrator(),
+        validator=_RateValidator(),
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    assert snapshot.test_stats.unique.executed == 100
+    assert snapshot.test_stats.unique.passed == 100
+    assert snapshot.test_stats.judgment == "partial"
+    assert "test_execution_interrupted" in snapshot.conflicts
+    assert snapshot.verdict == "partial"
+
+
 def test_heavy_red_v4_is_partial_from_bands_not_failed_by_pass_rate():
     """The old 80% pass line is gone: execution is full, then heavy red
     demotes exactly the cases grain to most and records the weak conflict."""
@@ -293,8 +336,8 @@ def test_test_grain_rates_cases_and_modules_with_weak_signal():
 
     grains, conflicts = test_grain_rates(
         stats,
-        driven_modules={"/w/p/core"},
-        test_modules={"/w/p/core", "/w/p/io"},
+        driven_modules={"core"},
+        test_modules={"core", "io"},
     )
 
     assert grains["cases"].band == "most"
@@ -302,6 +345,21 @@ def test_test_grain_rates_cases_and_modules_with_weak_signal():
     assert conflicts == ("test_failures_heavy",)
     assert grains["modules"].payload()["numerator"] == 1
     assert grains["modules"].band == "half"
+
+
+def test_absolute_test_domains_are_not_mislabeled_as_module_coverage():
+    from sag.agent.verdict_finalizer import test_grain_rates
+
+    grains, _ = test_grain_rates(
+        SnapshotTestStats(),
+        driven_modules={"/workspace/demo"},
+        test_modules={"/workspace/demo"},
+    )
+
+    assert grains["modules"].payload() == {
+        "band": "unavailable",
+        "reason": "test receipts identify execution domains, not module coverage",
+    }
 
 
 def test_test_grain_rates_type_their_absences():

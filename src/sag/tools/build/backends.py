@@ -144,11 +144,10 @@ class MavenBackend:
     VERBS = {
         "deps": "dependency:resolve",
         "compile": "compile",
-        # Maven's `test` phase omits failsafe/integration tests. The invariant
-        # build(action='test') contract means the full project test lifecycle,
-        # so route through `verify`; MavenTool still adds fail-at-end and the
-        # bounded test-failure-ignore policy for a complete reactor rollup.
-        "test": "verify",
+        # Preserve the public action's Maven lifecycle. A project that declares
+        # verify/failsafe in its model-authored plan must request that lifecycle
+        # explicitly; the facade must not silently widen `test` to `verify`.
+        "test": "test",
         "package": "package",
         # A reactor whose modules depend on siblings' produced artifacts (shaded
         # jars, code-gen, packaged deps) needs those installed to the local repo so

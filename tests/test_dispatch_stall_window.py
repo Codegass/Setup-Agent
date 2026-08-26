@@ -1124,6 +1124,7 @@ from sag.agent.stall_diagnostics import (
     control_stalled_job,
     diagnostic_bundle_ref,
     diagnostic_seal_ref,
+    probe_job_progress,
     seal_stall_evidence,
 )
 from sag.utils.container_io import ContainerWriteResult
@@ -1393,19 +1394,17 @@ def test_jvm_thread_join_is_classified_from_the_one_shot_bundle(monkeypatch):
     assert syntax.returncode == 0, syntax.stderr
 
 
-def test_cpu_active_job_returns_to_wait_without_signal(monkeypatch):
-    harness = _DiagnosticHarness(progress=[_progress_output(cpu=10)])
+def test_cpu_active_is_liveness_but_not_substantive_progress(monkeypatch):
+    harness = _DiagnosticHarness(progress=[_progress_output(cpu=10), _progress_output(cpu=10)])
     monkeypatch.setattr(stall_diagnostics, "write_container_text_atomic", harness.writer)
 
-    result = control_stalled_job(
-        harness.execute,
-        _stall_job(),
-        sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("must not sleep")),
-    )
+    first = probe_job_progress(harness.execute, _stall_job())
+    second = probe_job_progress(harness.execute, _stall_job(), previous=first.snapshot)
 
-    assert result.code == "progress_observed"
-    assert result.progress.signals == ("cpu_active",)
-    assert result.diagnostic is None
+    assert first.snapshot.cpu_active is True
+    assert second.snapshot.cpu_active is True
+    assert first.signals == ()
+    assert second.signals == ()
     assert not any("sag-job-diagnostic" in command for command in harness.commands)
     assert not any(command.startswith("kill -TERM") for command in harness.commands)
 
@@ -1655,7 +1654,7 @@ def test_progress_probe_streams_the_complete_tree_and_propagates_timeout_status(
     assert syntax.returncode == 0, syntax.stderr
 
 
-def test_wall_guard_reports_progress_without_diagnostic_or_signal(monkeypatch):
+def test_wall_guard_treats_cpu_only_as_unconfirmed_no_progress(monkeypatch):
     harness = _DiagnosticHarness(progress=[_progress_output(cpu=3)])
     monkeypatch.setattr(stall_diagnostics, "write_container_text_atomic", harness.writer)
 
@@ -1666,7 +1665,7 @@ def test_wall_guard_reports_progress_without_diagnostic_or_signal(monkeypatch):
         sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("must not wait")),
     )
 
-    assert result.code == "wall_guard_progressing"
+    assert result.code == "wall_guard_no_progress_unconfirmed"
     assert result.trigger == "wall_guard"
     assert result.diagnostic is None
     assert result.seal is None

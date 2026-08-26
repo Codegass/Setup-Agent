@@ -34,6 +34,8 @@ module never raises. A transport failure degrades to an empty map with a
 visible conflict, never to a map that pretends to be complete.
 """
 
+import base64
+import binascii
 import hashlib
 import json
 import posixpath
@@ -84,11 +86,16 @@ BUDGETS = {
     "max_depth": MAX_DEPTH,
 }
 
-# Enumeration bound. `find` is already depth- and name-filtered, but a repo can
+# Enumeration bound. `find` is already depth-bounded, but a repo can
 # still hold tens of thousands of matching documents; the listing is sorted and
 # cut in-container so the transport itself stays bounded. A cut is a conflict,
 # never a silent shortening.
 MAX_CANDIDATE_PATHS = 4_000
+# The path inventory is a framed transport, not newline-delimited command text.
+# A footer makes a clipped orchestrator response distinguishable from a complete
+# prefix, while base64 keeps repository filenames out of the framing grammar.
+DOCUMENT_PATH_FRAME_PREFIX = "SAG_DOCUMENT_PATH_V1"
+DOCUMENT_PATH_END_PREFIX = "SAG_DOCUMENT_PATH_END_V1"
 # `realpath` argv bound — containment is proved in batches, not per file.
 REALPATH_BATCH_SIZE = 100
 # Bytes of the fetched head that decide "binary".
@@ -101,13 +108,6 @@ SECTION_INDEX_CAP = 500
 CMAKE_STATEMENT_MAX_LINES = 40
 # Tag-path depth the XML index records (spec §C1: depth ≤ 4).
 XML_MAX_DEPTH = 4
-# These names and locations are budget-ordering hints, never eligibility
-# rules.  A project-specific DEVNOTES.txt should be read before a random source
-# file when the 400-file content budget is tight; an unfamiliar prose name is
-# still inventoried and either indexed or explicitly marked over-budget.
-DOC_DIR_SEGMENTS = ("doc", "docs")
-SHELL_DIR_SEGMENTS = ("ci", "docker")
-
 # Trees whose contents are generated or vendored. A vendored 3rdparty README is
 # excluded HERE: the surveyed local-provider path has its own machinery for the
 # few vendored roots that matter, and indexing them from the map would let a
@@ -168,9 +168,8 @@ class DocumentSourceChangedError(RuntimeError):
     """The bytes behind one published map handle changed before extraction."""
 
 
-# Human-facing names receive an early budget slot, but this tuple is not used
-# to decide whether a path is visible.  It deliberately includes common names
-# that the previous restrictive allowlist missed.
+# These names only help describe the structure of already-indexed extensionless
+# text.  They do not affect discovery eligibility or budget selection.
 DOC_FAMILY_PREFIXES = (
     "readme",
     "install",
@@ -190,19 +189,6 @@ TEXT_DOCUMENT_EXTENSIONS = (
     ".rst",
     ".txt",
 )
-EXACT_CANDIDATE_NAMES = (
-    "pom.xml",
-    "build.gradle",
-    "build.gradle.kts",
-    "settings.gradle",
-    "settings.gradle.kts",
-    "gradle.properties",
-    "cmakelists.txt",
-    "pyproject.toml",
-    "setup.py",
-)
-
-
 # ---------------------------------------------------------------------------
 # identity
 # ---------------------------------------------------------------------------
@@ -290,9 +276,9 @@ def discover_document_map(
     if exhausted:
         conflicts[root] = "over_budget"
 
-    # Names affect only which bounded heads are fetched first.  They never
-    # decide eligibility: every enumerated path remains represented either by
-    # an entry or by a typed partial-map record.
+    # Shallow paths are fetched first, then lexical path order.  Filename and
+    # extension do not decide either eligibility or budget priority: every
+    # enumerated path remains an entry or a typed partial-map record.
     candidates = sorted(
         {relative for relative in listing if is_candidate(relative)},
         key=_candidate_sort_key,
@@ -390,16 +376,28 @@ def enumeration_command(root: str) -> str:
 
     Shallow paths are transported first so repository-level guidance cannot be
     crowded out by thousands of deep source files before host-side hint
-    ordering runs.  This is ordering, not filtering.
+    ordering runs.  This is ordering, not filtering.  Each NUL-delimited path is
+    base64 framed and the final count is sealed by a footer, so presentation
+    truncation can only invalidate the inventory; it can never manufacture a
+    candidate path.
     """
+    frame_script = (
+        "import base64,sys\n"
+        "raw=sys.stdin.buffer.read()\n"
+        "if raw and not raw.endswith(b'\\0'): raise SystemExit(70)\n"
+        "paths=[path for path in raw.split(b'\\0') if path]\n"
+        "for path in paths:\n"
+        f" print('{DOCUMENT_PATH_FRAME_PREFIX}\\t'+base64.b64encode(path).decode('ascii'))\n"
+        f"print('{DOCUMENT_PATH_END_PREFIX}\\t'+str(len(paths)))\n"
+    )
     return (
         f"cd {shlex.quote(root)} && "
         f"find . -maxdepth {MAX_DEPTH} \\( -type f -o -type l \\) "
-        "-print 2>/dev/null "
-        '| awk \'{ probe=$0; depth=gsub("/", "/", probe); '
-        'printf "%08d\\t%s\\n", depth, $0 }\' '
-        "| LC_ALL=C sort -k1,1n -k2,2 "
-        f"| cut -f2- | head -n {MAX_CANDIDATE_PATHS + 1}"
+        "-printf '%08d\\t%p\\0' 2>/dev/null "
+        "| LC_ALL=C sort -z -k1,1n -k2 "
+        f"| head -z -n {MAX_CANDIDATE_PATHS + 1} "
+        "| cut -z -f2- "
+        f"| python3 -c {shlex.quote(frame_script)}"
     )
 
 
@@ -407,23 +405,75 @@ def _enumerate(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     root: str,
 ) -> Tuple[Optional[List[str]], bool]:
-    """Candidate paths relative to `root`, and whether the listing was cut."""
+    """Candidate paths relative to `root`, and whether the listing was cut.
+
+    The shell command emits a complete framed stream.  Missing/malformed frames,
+    an absent footer, or a mismatched count make the whole inventory unavailable;
+    no unframed output line is ever interpreted as a repository path.
+    """
     try:
-        result = execute(enumeration_command(root)) or {}
+        command = enumeration_command(root)
+        try:
+            result = execute(command, truncate_output=False) or {}
+        except TypeError as exc:
+            # Compatibility for small executors that predate the presentation
+            # flag.  The framing still detects any clipping on their output.
+            if "truncate_output" not in str(exc):
+                raise
+            result = execute(command) or {}
     except Exception as exc:  # discovery never breaks the caller
         logger.debug(f"document map enumeration failed: {exc}")
         return None, False
     if not _succeeded(result):
         return None, False
-    relatives = []
-    for line in str(result.get("output") or "").splitlines():
-        candidate = line.strip()
-        if candidate.startswith("./"):
-            candidate = candidate[2:]
-        if candidate and candidate not in (".", ".."):
-            relatives.append(candidate)
+    relatives = _decode_document_path_stream(result.get("output"))
+    if relatives is None:
+        return None, False
     exhausted = len(relatives) > MAX_CANDIDATE_PATHS
     return relatives[:MAX_CANDIDATE_PATHS], exhausted
+
+
+def _decode_document_path_stream(output: Any) -> Optional[List[str]]:
+    """Decode one complete path stream, or ``None`` when it proves no inventory."""
+    if not isinstance(output, str) or not output or "\r" in output:
+        return None
+    lines = output.splitlines(keepends=True)
+    if not lines or any(not line.endswith("\n") for line in lines[:-1]):
+        return None
+
+    footer_line = lines[-1]
+    footer = footer_line[:-1] if footer_line.endswith("\n") else footer_line
+    footer_fields = footer.split("\t")
+    if len(footer_fields) != 2 or footer_fields[0] != DOCUMENT_PATH_END_PREFIX:
+        return None
+    count_text = footer_fields[1]
+    if not count_text.isascii() or not count_text.isdigit():
+        return None
+    expected_count = int(count_text)
+    if str(expected_count) != count_text or expected_count > MAX_CANDIDATE_PATHS + 1:
+        return None
+
+    frame_lines = lines[:-1]
+    if len(frame_lines) != expected_count:
+        return None
+    relatives: List[str] = []
+    for frame_line in frame_lines:
+        fields = frame_line[:-1].split("\t")
+        if len(fields) != 2 or fields[0] != DOCUMENT_PATH_FRAME_PREFIX:
+            return None
+        encoded = fields[1]
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+            candidate = raw.decode("utf-8", errors="strict")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return None
+        if base64.b64encode(raw).decode("ascii") != encoded or not candidate.startswith("./"):
+            return None
+        relative = candidate[2:]
+        if not relative or relative in (".", "..") or posixpath.normpath(relative) != relative:
+            return None
+        relatives.append(relative)
+    return relatives
 
 
 def _resolve_paths(
@@ -542,40 +592,12 @@ def is_candidate(relative_path: str) -> bool:
     return bool(relative and relative not in (".", ".."))
 
 
-def _candidate_sort_key(relative_path: str) -> Tuple[int, int, str]:
-    """Deterministic budget priority for an already-visible path.
+def _candidate_sort_key(relative_path: str) -> Tuple[int, str]:
+    """Deterministic, name-agnostic budget order for a visible path."""
 
-    The rank is a hint about likely build/test guidance, not a claim that lower
-    ranks are documents or higher ranks are not.  The final path component
-    keeps selection stable across identical checkouts.
-    """
     relative = str(relative_path or "").strip().strip("/")
     parts = relative.split("/")
-    name = parts[-1]
-    lowered = name.lower()
-    directories = [part.lower() for part in parts[:-1]]
-    _, _, extension = lowered.rpartition(".")
-    extension = f".{extension}" if "." in lowered else ""
-
-    if lowered.startswith(DOC_FAMILY_PREFIXES):
-        rank = 0
-    elif len(parts) == 1:
-        rank = 1
-    elif any(directory in DOC_DIR_SEGMENTS for directory in directories):
-        rank = 2
-    elif (
-        lowered.startswith("dockerfile")
-        or lowered in EXACT_CANDIDATE_NAMES
-        or extension == ".cmake"
-        or ".github/workflows/" in f"/{relative.lower()}"
-        or any(directory in SHELL_DIR_SEGMENTS for directory in directories)
-    ):
-        rank = 3
-    elif extension in TEXT_DOCUMENT_EXTENSIONS:
-        rank = 4
-    else:
-        rank = 5
-    return rank, len(parts), relative
+    return len(parts), relative
 
 
 def is_generated(relative_path: str) -> bool:

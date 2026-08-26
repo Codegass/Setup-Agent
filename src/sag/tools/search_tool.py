@@ -62,7 +62,9 @@ class SearchTool(BaseTool):
                 "form that establishes whether a path such as gradlew or pom.xml is "
                 "on disk. "
                 "pattern: for 'file:' and ref ids an extended regular expression "
-                "(grep -E); for 'name:' one or more shell globs separated by "
+                "(grep -E). Set ignore_case=true for case-insensitive file-content "
+                "searches instead of using PCRE-only inline flags such as (?i); "
+                "for 'name:' one or more shell globs separated by "
                 f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew'), "
                 "matched against the name alone; ignored for web; "
                 "for a ref id, omit pattern to read the stored output itself."
@@ -73,10 +75,18 @@ class SearchTool(BaseTool):
         self.web_search = web_search
         self.command_tracker = command_tracker
 
-    def execute(self, target: str, pattern: str = "", max_results: int = 50) -> ToolResult:
+    def execute(
+        self,
+        target: str,
+        pattern: str = "",
+        max_results: int = 50,
+        ignore_case: bool = False,
+    ) -> ToolResult:
         target = (target or "").strip()
         if target.startswith("file:"):
-            return self._grep_container(target[5:], pattern, max_results)
+            return self._grep_container(
+                target[5:], pattern, max_results, ignore_case=ignore_case
+            )
         if target.startswith("name:"):
             return self._find_by_name(target[5:], pattern, max_results)
         if target.startswith("job:"):
@@ -198,7 +208,14 @@ class SearchTool(BaseTool):
             poll_ref=poll_ref,
         )
 
-    def _grep_container(self, path: str, pattern: str, max_results: int) -> ToolResult:
+    def _grep_container(
+        self,
+        path: str,
+        pattern: str,
+        max_results: int,
+        *,
+        ignore_case: bool = False,
+    ) -> ToolResult:
         """Grep inside the container, keeping "did not run" apart from "found nothing".
 
         A search that did not succeed is not a search that found nothing
@@ -216,6 +233,7 @@ class SearchTool(BaseTool):
         # so an alternation like `(^|/)build\.gradle$|(^|/)gradlew$` can never
         # match anything.
         quoted_pattern = shlex.quote(pattern or ".")
+        grep_flags = "E" + ("i" if ignore_case else "")
         # `head` is the LAST command in the pipeline, so an unguarded `$?` is
         # HEAD's status: an erroring grep reads as exit 0. `pipefail` hands the
         # pipeline grep's status instead, which is the only way exit 2 (the
@@ -226,8 +244,8 @@ class SearchTool(BaseTool):
         command = (
             "set -o pipefail; "
             f"if test -d {quoted_path}; then "
-            f"grep -rnE -e {quoted_pattern} -- {quoted_path} | head -{limit}; "
-            f"else grep -nE -e {quoted_pattern} -- {quoted_path} | head -{limit}; fi"
+            f"grep -rn{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{limit}; "
+            f"else grep -n{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{limit}; fi"
         )
         result = self.docker_orchestrator.execute_command(command, workdir=None, timeout=60)
 
@@ -249,6 +267,8 @@ class SearchTool(BaseTool):
                     "capped_at_max_results": capped,
                 },
             )
+        if exit_code == _GREP_FOUND_NOTHING and diagnostic:
+            return self._search_failed(path, pattern, exit_code, diagnostic)
         if exit_code == _GREP_FOUND_NOTHING:
             return ToolResult.completed_success(
                 output=f"No matches for {pattern!r} in {path}",
@@ -430,9 +450,18 @@ class SearchTool(BaseTool):
                     "type": "string",
                     "description": (
                         "file:/ref id -> extended regular expression, grep -E; "
+                        "use ignore_case=true instead of inline PCRE flags such as (?i); "
                         "name: -> shell globs separated by "
                         f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew') "
                         "matched against the name alone; ignored for web"
+                    ),
+                },
+                "ignore_case": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Case-insensitive matching for file: content searches; use this "
+                        "instead of PCRE-only inline flags."
                     ),
                 },
                 "max_results": {"type": "integer", "default": 50},

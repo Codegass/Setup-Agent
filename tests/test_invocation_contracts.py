@@ -1306,7 +1306,7 @@ def test_facade_dispatch_binds_its_receipt_to_the_contract_it_froze():
 
         def execute(self, **kwargs):
             self.calls.append(kwargs)
-            seen.update(contract_receipt_fields("mvn --fail-at-end verify"))
+            seen.update(contract_receipt_fields("mvn --fail-at-end test"))
             return ToolResult.completed_success(output="BUILD SUCCESS")
 
     orchestrator.publish_manifest()

@@ -595,6 +595,58 @@ def test_red_tests_never_reject_a_test_phase_close():
     assert "test_failures" not in gate.code
 
 
+def test_interrupted_test_with_sealed_rows_closes_only_as_partial():
+    class InterruptedSuite(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "evidence_status": "partial",
+                "reason": "test execution was interrupted after 20 sealed row(s)",
+                "report_files": ["report://ignite-surefire"],
+                "test_stats": {
+                    "discovered": 15104,
+                    "executed": 20,
+                    "passed": 20,
+                    "failed": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                    "driven_modules": ["/workspace/ignite"],
+                    "test_modules": ["/workspace/ignite"],
+                },
+                "unique_tests": 20,
+                "unique_passed_tests": 20,
+                "unique_failed_tests": 0,
+                "unique_error_tests": 0,
+                "unique_skipped_tests": 0,
+                "raw_total_tests": 20,
+                "raw_passed_tests": 20,
+                "raw_failed_tests": 0,
+                "raw_error_tests": 0,
+                "raw_skipped_tests": 0,
+                "receipt_scoped": True,
+                "test_execution_state": "partial",
+                "test_execution_reason": ("test execution was interrupted after 20 sealed row(s)"),
+                "test_execution_receipt_ids": ["inv-ignite-test"],
+                "test_interrupted_receipt_ids": ["inv-ignite-test"],
+            }
+
+    gate = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=InterruptedSuite(),
+        orchestrator=_orch(),
+        project_name="ignite",
+    )
+
+    assert gate.accepted is True
+    assert gate.validator_state is ValidatorState.PARTIAL
+    assert gate.validated_outcome is PhaseOutcome.PARTIAL
+    assert gate.code == "test_execution_interrupted"
+    assert gate.validated_facts["test.stats"]["execution_state"] == "partial"
+    assert gate.validated_facts["test.stats"]["interrupted_receipt_ids"] == ["inv-ignite-test"]
+
+
 def test_counts_that_did_not_come_from_the_claim_partition_cannot_close_the_phase():
     """`receipt_scoped` absent has exactly ONE meaning after universal scoping.
 

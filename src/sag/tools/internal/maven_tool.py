@@ -34,6 +34,7 @@ from .build_preflight import (
 )
 from .build_utils import (
     DETACHED_HANDOFF_STATUSES,
+    bounded_detached_log_excerpt,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
@@ -170,6 +171,7 @@ class MavenTool(BaseTool):
 
         self._pending_invocation_receipt = None
         self._pending_runner_choice = None
+        self._pending_log_storage_metadata: Dict[str, Any] = {}
         if current_contract() is None:
             return ToolResult.completed_failure(
                 output="[contract] Maven was not dispatched: no facade-frozen contract is active.",
@@ -441,7 +443,15 @@ class MavenTool(BaseTool):
         if fail_at_end and command in ["test", "verify", "integration-test"]:
             logger.info("📝 Enabling test failure ignore for fail_at_end with test command")
             logger.info("   (Maven's --fail-at-end doesn't continue after test failures)")
-            properties = self._append_maven_property(properties, "maven.test.failure.ignore=true")
+            caller_supplied_ignore = any(
+                self._property_name(token) == "maven.test.failure.ignore"
+                for token in maven_action_tokens(None, extra_args=extra_args)
+                if str(token).startswith("-D")
+            )
+            if not caller_supplied_ignore:
+                properties = self._append_maven_property(
+                    properties, "maven.test.failure.ignore=true"
+                )
             auto_ignore_test_failures = not ignore_test_failures
 
         # Validate that pom.xml exists in the working directory
@@ -668,9 +678,10 @@ class MavenTool(BaseTool):
 
             # The complete log. For detached builds the orchestrator hands back
             # a complete `full_output` (untruncated) alongside the bounded
-            # inline `output`; everything derived internally — the analysis, the
-            # command tracker, the persisted output — reads THIS text, never the
-            # model-facing window (live commons-cli 2026-07-27: the aggregate
+            # inline `output`; semantic parsing and receipt summaries read THIS
+            # text, never the model-facing window. OutputStorage may keep a
+            # bounded duplicate below because the durable job log retains the
+            # complete bytes (live commons-cli 2026-07-27: the aggregate
             # `Tests run:` line sat in the omitted middle, so counts the runner
             # had already computed were discarded and re-derived by hand).
             full_output = result.get("full_output") or result["output"]
@@ -684,9 +695,12 @@ class MavenTool(BaseTool):
             if requested_requirement_metadata and not analysis.get("maven_version_requirement"):
                 analysis["maven_version_requirement"] = requested_requirement_metadata
 
-            # Persist the complete log so output_search can surface the real
-            # failure, not just a 50-line tail.
+            # The durable detached job log remains the complete source. Keep a
+            # bounded duplicate in output storage so persistence does not ship
+            # multi-megabyte logs through encoded container-write commands.
             ref_id = None
+            stored_output, log_storage_metadata = bounded_detached_log_excerpt(full_output, result)
+            self._pending_log_storage_metadata = log_storage_metadata
             if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
                     contexts_dir = Path("/workspace/.setup_agent/contexts")
@@ -695,8 +709,12 @@ class MavenTool(BaseTool):
                 ref_id = self.output_storage.store_output(
                     task_id=f"maven_{working_directory.replace('/', '_')}",
                     tool_name="maven",
-                    output=full_output,
-                    metadata={"command": maven_cmd, "exit_code": result["exit_code"]},
+                    output=stored_output,
+                    metadata={
+                        "command": maven_cmd,
+                        "exit_code": result["exit_code"],
+                        **log_storage_metadata,
+                    },
                 )
                 logger.debug(f"Stored Maven output with ref_id: {ref_id}")
 
@@ -706,7 +724,7 @@ class MavenTool(BaseTool):
                     str(result.get("output") or ""),
                     ref_id,
                     runner="maven",
-                    full_output=str(full_output),
+                    full_output=stored_output,
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
                     invocation_status=(
@@ -1024,6 +1042,7 @@ class MavenTool(BaseTool):
             tool_result.raw_output = preamble + (tool_result.raw_output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
+        tool_result.metadata.update(getattr(self, "_pending_log_storage_metadata", {}) or {})
         return self._apply_invocation_receipt(tool_result)
 
     @staticmethod

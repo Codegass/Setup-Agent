@@ -80,7 +80,8 @@ describe("evidence presentation", () => {
       available: false,
       value: "Unavailable",
     })
-    expect(presentVerifiedIdentities(test).summary).toMatch(/module names and stable test identities/i)
+    expect(presentVerifiedIdentities(test).summary).toMatch(/module-qualified test identities/i)
+    expect(presentVerifiedIdentities(test).summary).not.toMatch(/tests ran/i)
   })
 
   it("includes errors in the non-skipped denominator and negative count", () => {
@@ -160,13 +161,36 @@ describe("evidence presentation", () => {
     })
   })
 
+  it("presents phases that were never entered without showing zero coverage", () => {
+    expect(presentBuild({
+      state: "not_attempted", tool: "—", time: "—", note: "", classCount: 0,
+    }, {
+      build: { modules: { numerator: 0, denominator: 37, rate: 0, band: "none" } },
+    })).toEqual({
+      value: "Not run",
+      tone: "neutral",
+      summary: "Build was not run.",
+      scope: null,
+    })
+
+    expect(presentTestRun({
+      state: "not_attempted", pass: 0, fail: 0, errors: 0, skip: 0, total: 0,
+    })).toMatchObject({
+      stateLabel: "Not run",
+      countsAvailable: false,
+      summary: "Tests were not run.",
+    })
+  })
+
   it("turns internal conflict codes into concise data notes", () => {
     expect(presentDataNotes([
       "build_modules_incomplete",
+      "test_execution_interrupted",
       "rate_denominator_not_a_bound",
       "unknown_internal_code",
     ])).toEqual([
       "Build evidence covers only part of the discovered module set.",
+      "The test runner stopped before the declared scope completed; shown counts are the sealed prefix.",
       "A rate denominator did not bound the observed count, so no percentage is shown.",
       "An additional evidence consistency issue was recorded.",
     ])

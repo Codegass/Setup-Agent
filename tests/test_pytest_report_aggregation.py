@@ -26,10 +26,12 @@ tmp-dir fixtures (same code path as the live container run).
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
 import pytest
+from test_container_io import FakeContainer
 
 from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import PhysicalValidator
@@ -47,9 +49,31 @@ class LocalExecOrch:
 
     def __init__(self):
         self.commands = []
+        self.atomic = FakeContainer()
 
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
+        text = cmd.strip()
+        if text.startswith(
+            (
+                "mkdir -p -- ",
+                ": > ",
+                "printf '%s' ",
+                "base64 --decode ",
+                "python3 -c ",
+                "rm -f -- ",
+                "mv -f -- ",
+            )
+        ):
+            result = self.atomic.execute_command(cmd, **kwargs)
+            if text.startswith("mv -f -- ") and result.get("exit_code") == 0:
+                target = shlex.split(text)[-1]
+                payload = self.atomic.files.get(target)
+                if payload is not None:
+                    path = Path(target)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(payload, encoding="utf-8")
+            return result
         proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
         return {
             "exit_code": proc.returncode,

@@ -23,19 +23,26 @@ the engine plumbing is the shared
 `forced_engine` fixture from tests/test_forced_attempt_native.py.
 """
 
+import base64
 import hashlib
 import json
 import shlex
 
 import pytest
-
 from test_container_io import FakeContainer as AtomicFakeContainer
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 
 from sag.agent.action_intents import action_fingerprint
 from sag.agent.claim_graph import CLAIM_GRAPH_PATH, read_claim_files
 from sag.agent.claim_records import CLAIM_DIR, entry_has_extractors
-from sag.agent.document_map import DOCUMENT_MAP_PATH, MAX_FILE_BYTES, entry_id, read_entry_text
+from sag.agent.document_map import (
+    DOCUMENT_MAP_PATH,
+    DOCUMENT_PATH_END_PREFIX,
+    DOCUMENT_PATH_FRAME_PREFIX,
+    MAX_FILE_BYTES,
+    entry_id,
+    read_entry_text,
+)
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
 from sag.agent.evidence_publications import evidence_publication_authority_for
 from sag.agent.evidence_records import (
@@ -78,6 +85,16 @@ WORKFLOW = """jobs:
 CMAKE = 'set(USE_LLVM OFF)\noption(USE_CUDA "cuda" OFF)\n'
 
 REQUIREMENTS = "numpy==1.26.4\n"
+
+
+def _framed_document_inventory(paths):
+    lines = []
+    for path in paths:
+        encoded = base64.b64encode(f"./{path}".encode("utf-8")).decode("ascii")
+        lines.append(f"{DOCUMENT_PATH_FRAME_PREFIX}\t{encoded}\n")
+    lines.append(f"{DOCUMENT_PATH_END_PREFIX}\t{len(lines)}\n")
+    return "".join(lines)
+
 
 # Indexed by the map, read by NO extractor: fetching its text again would be a
 # probe with no possible product.
@@ -161,7 +178,7 @@ class FakeContainer:
         if "rev-parse HEAD" in command:
             return ok(self.sha) if self.sha else fail("")
         if " find . " in command:
-            return ok("".join(f"./{name}\n" for name in sorted(self.checkout)))
+            return ok(_framed_document_inventory(sorted(self.checkout)))
         if command.startswith("realpath "):
             arguments = shlex.split(command)
             paths = arguments[arguments.index("--") + 1 :]

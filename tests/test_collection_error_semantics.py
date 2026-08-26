@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 import pytest
+from test_container_io import FakeContainer
 
 from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.physical_validator import _COMPACT_REPORT_PARSER_BODY, PhysicalValidator
@@ -119,10 +120,23 @@ class _PytestReportOrchestrator:
     def __init__(self, xml_files):
         self.xml_files = dict(xml_files)
         self.commands = []
+        self.atomic = FakeContainer()
 
     def execute_command(self, command):
         self.commands.append(command)
         c = command.strip()
+        if c.startswith(
+            (
+                "mkdir -p -- ",
+                ": > ",
+                "printf '%s' ",
+                "base64 --decode ",
+                "python3 -c ",
+                "rm -f -- ",
+                "mv -f -- ",
+            )
+        ):
+            return self.atomic.execute_command(command)
         if "SAG_COMPACT_TEST_REPORT_PARSER" in c:
             return {"exit_code": 1, "output": ""}
         if "SAG_NAMED_JSON_RECORD_V1" in c:

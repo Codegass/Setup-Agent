@@ -213,6 +213,9 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         if evidence_lines:
             formatted += "\n" + "\n".join(evidence_lines)
 
+        if result.output_ref:
+            formatted += f"\nFull output ref: {result.output_ref} (cite this ref as evidence)"
+
         # Add command information for bash tool
         if tool_name == "bash" and result.metadata and "command" in result.metadata:
             formatted += f"\nCommand: {result.metadata['command']}"

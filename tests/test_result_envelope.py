@@ -111,3 +111,23 @@ def test_success_observation_shape_is_stable():
     observation = format_tool_result("bash", ToolResult.completed_success(output="hello"))
 
     assert "✅ bash executed successfully" in observation
+
+
+@pytest.mark.parametrize("tool_name", ["search", "file_io"])
+def test_success_observation_exposes_durable_output_ref_as_citable_evidence(
+    durable_tool_result_storage,
+    tool_name,
+):
+    output = "project document contents"
+    output_ref = durable_tool_result_storage.store_output(
+        task_id=f"{tool_name}-read",
+        tool_name=tool_name,
+        output=output,
+    )
+    result = ToolResult.completed_success(output=output, output_ref=output_ref)
+
+    observation = format_tool_result(tool_name, result)
+
+    reference_line = f"Full output ref: {output_ref} (cite this ref as evidence)"
+    assert reference_line in observation
+    assert observation.index(reference_line) < observation.index("Output:")

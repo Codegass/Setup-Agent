@@ -67,6 +67,7 @@ from sag.testcases.results import (
     aggregate_test_results,
     canonical_test_identity,
 )
+from sag.utils.container_io import write_container_text_atomic
 from sag.verdict_rates import STALE_CONFLICT, execution_sentence, no_execution_sentence
 
 
@@ -2191,7 +2192,7 @@ class PhysicalValidator:
         foreign-run v2 records remain forensic and never enter this snapshot.
         """
 
-        if not self.docker_orchestrator:
+        if not getattr(self, "docker_orchestrator", None):
             return []
         from sag.agent.invocation_receipts import (
             receipt_record_scope,
@@ -2220,6 +2221,194 @@ class PhysicalValidator:
             )
             return None
         return [dict(record.payload) for record in read.records]
+
+    @staticmethod
+    def _receipt_sequence(receipt: Mapping[str, Any]) -> tuple[int, str]:
+        receipt_id = str(receipt.get("receipt_id") or "").strip()
+        try:
+            sequence = int(receipt_id.rsplit("-", 1)[-1])
+        except ValueError:
+            sequence = -1
+        return sequence, receipt_id
+
+    def _current_scoped_receipts(
+        self,
+        project_dir: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Current-run receipts bound to this checkout and project root."""
+
+        records = self._read_live_invocation_receipts()
+        if records is None:
+            return None
+        if not records:
+            return []
+        from sag.agent.attempt_policy import (
+            current_run_durable_receipt,
+            resolve_current_build_receipt_scope,
+        )
+        from sag.agent.invocation_receipts import active_receipt_run_id
+
+        run_id = self.receipt_run_id or active_receipt_run_id()
+        scope = resolve_current_build_receipt_scope(
+            self.docker_orchestrator,
+            run_id=run_id,
+            workspace_root=self.project_path,
+            project_root=project_dir,
+        )
+        if not scope.available:
+            return None
+        return [
+            receipt
+            for receipt in records
+            if current_run_durable_receipt(
+                receipt,
+                receipt_id=str(receipt.get("receipt_id") or ""),
+                run_id=run_id,
+                target_sha=scope.target_sha or "",
+                project_root=scope.project_root or project_dir,
+            )
+        ]
+
+    def _terminal_root_maven_reactor_receipt(
+        self,
+        project_dir: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Newest root Maven build receipt when it proves complete success.
+
+        This is execution authority, not a heuristic source/class census. A
+        scoped reactor, a non-exact contract, a later failed build, or a
+        partial module summary cannot satisfy it.
+        """
+
+        receipts = self._current_scoped_receipts(project_dir)
+        if not receipts:
+            return None
+        build_actions = {"compile", "package", "install"}
+        candidates = [
+            receipt
+            for receipt in receipts
+            if str(receipt.get("tool") or "").strip().lower() == "maven"
+            and str(receipt.get("requested_action") or "").strip().lower() in build_actions
+            and posixpath.normpath(
+                str(receipt.get("actual_cwd") or receipt.get("working_directory") or "")
+            )
+            == posixpath.normpath(project_dir)
+        ]
+        if not candidates:
+            return None
+        latest = max(candidates, key=self._receipt_sequence)
+        outcomes = latest.get("module_outcomes")
+        if (
+            latest.get("exit_code") != 0
+            or str(latest.get("outcome") or "").strip().lower() != "completed"
+            or not _dispatch_terminated(latest)
+            or str(latest.get("compliance") or "").strip().lower() != "exact"
+            or not isinstance(outcomes, list)
+            or not outcomes
+            or any(
+                str((entry or {}).get("status") or "").strip().lower() != "success"
+                for entry in outcomes
+            )
+        ):
+            return None
+        return {
+            "receipt_id": str(latest.get("receipt_id") or ""),
+            "modules_succeeded": len(outcomes),
+            "modules_total": len(outcomes),
+            "requested_action": str(latest.get("requested_action") or ""),
+        }
+
+    def _test_execution_receipt_summary(self, project_dir: str) -> Dict[str, Any]:
+        """Separate runner completion from the outcomes in emitted test rows."""
+
+        receipts = self._current_scoped_receipts(project_dir)
+        if receipts is None:
+            return {"state": "unknown", "reason": "test receipt scope unavailable"}
+        test_actions = {"test", "verify", "integration-test"}
+        candidates = []
+        for receipt in receipts:
+            requested = str(receipt.get("requested_action") or "").strip().lower()
+            effective = str(receipt.get("effective_action") or "").strip().lower()
+            if (
+                requested not in test_actions
+                and effective not in test_actions
+                and not isinstance(receipt.get("testcase_execution_rows"), Mapping)
+            ):
+                continue
+            candidates.append(receipt)
+        if not candidates:
+            return {"state": "unknown", "reason": "no current test receipt"}
+
+        latest_by_action: Dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        for receipt in sorted(candidates, key=self._receipt_sequence):
+            key = (
+                str(receipt.get("tool") or "").strip().lower(),
+                str(receipt.get("requested_action") or receipt.get("effective_action") or "")
+                .strip()
+                .lower(),
+                posixpath.normpath(
+                    str(
+                        receipt.get("actual_cwd") or receipt.get("working_directory") or project_dir
+                    )
+                ),
+            )
+            latest_by_action[key] = receipt
+
+        interrupted: List[str] = []
+        completed: List[str] = []
+        observed_rows = 0
+        for receipt in latest_by_action.values():
+            receipt_id = str(receipt.get("receipt_id") or "").strip()
+            envelope = receipt.get("testcase_execution_rows")
+            rows = envelope.get("rows") if isinstance(envelope, Mapping) else None
+            if isinstance(rows, list):
+                observed_rows += len(rows)
+            exit_code = receipt.get("exit_code")
+            lifecycle = str(receipt.get("lifecycle_state") or "").strip().lower()
+            was_interrupted = bool(
+                str(receipt.get("termination_reason") or "").strip()
+                or lifecycle == "vanished"
+                or (
+                    isinstance(exit_code, int)
+                    and not isinstance(exit_code, bool)
+                    and exit_code >= 128
+                )
+            )
+            if was_interrupted:
+                interrupted.append(receipt_id)
+            elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                completed.append(receipt_id)
+
+        if interrupted:
+            state = "partial" if observed_rows else "failed"
+            return {
+                "state": state,
+                "reason": (
+                    f"test execution was interrupted after {observed_rows:,} sealed row(s)"
+                    if observed_rows
+                    else "test execution was interrupted before any sealed test row"
+                ),
+                "receipt_ids": [
+                    str(receipt.get("receipt_id") or "") for receipt in latest_by_action.values()
+                ],
+                "interrupted_receipt_ids": interrupted,
+                "observed_rows": observed_rows,
+            }
+        if completed and len(completed) == len(latest_by_action):
+            return {
+                "state": "completed",
+                "reason": "test runner receipts reached terminal process outcomes",
+                "receipt_ids": completed,
+                "observed_rows": observed_rows,
+            }
+        return {
+            "state": "unknown",
+            "reason": "test receipt completion is unavailable",
+            "receipt_ids": [
+                str(receipt.get("receipt_id") or "") for receipt in latest_by_action.values()
+            ],
+            "observed_rows": observed_rows,
+        }
 
     def _read_live_evidence_assessments(self) -> Optional[List[Dict[str, Any]]]:
         """Return the complete strict host-published assessment union."""
@@ -2591,13 +2780,49 @@ class PhysicalValidator:
                 "receipt_error_files": [],
             }
         receipt_claims = self._verified_report_claims(records, primary_root)
+        parser_input = json.dumps(
+            {
+                "project_dir": project_dir,
+                "pytest_reports_dir": PYTEST_REPORT_DIR,
+                "receipt_claims": receipt_claims,
+                "primary_root": primary_root,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        parser_input_sha256 = hashlib.sha256(parser_input.encode("utf-8")).hexdigest()
+        workspace_root = posixpath.dirname(posixpath.normpath(project_dir))
+        parser_input_path = posixpath.join(
+            workspace_root,
+            ".setup_agent",
+            "validator_inputs",
+            f"test-report-parser-{parser_input_sha256[:20]}.json",
+        )
+        persisted = write_container_text_atomic(
+            self.docker_orchestrator,
+            parser_input_path,
+            parser_input,
+            validate_json=True,
+        )
+        if not persisted.persisted:
+            return {
+                "valid": False,
+                "receipt_error": (
+                    "receipt claim transport could not persist the bounded parser input "
+                    f"({persisted.code})"
+                ),
+                "receipt_error_files": [],
+            }
         command = (
             "python3 - <<'PY'\n"
             "# SAG_COMPACT_TEST_REPORT_PARSER\n"
-            f"project_dir = {json.dumps(project_dir)}\n"
-            f"pytest_reports_dir = {json.dumps(PYTEST_REPORT_DIR)}\n"
-            f"receipt_claims = {json.dumps(receipt_claims, sort_keys=True)}\n"
-            f"primary_root = {json.dumps(primary_root) if primary_root else 'None'}\n"
+            "import json\n"
+            f"with open({json.dumps(parser_input_path)}, encoding='utf-8') as source:\n"
+            "    parser_input = json.load(source)\n"
+            "project_dir = parser_input['project_dir']\n"
+            "pytest_reports_dir = parser_input['pytest_reports_dir']\n"
+            "receipt_claims = parser_input['receipt_claims']\n"
+            "primary_root = parser_input['primary_root']\n"
             f"{_COMPACT_REPORT_PARSER_BODY}\n"
             "PY"
         )
@@ -3260,6 +3485,20 @@ class PhysicalValidator:
         # build_evidence["tool"]; without this it always name-drifted to None.
         evidence["tool"] = build_system if build_system != "unknown" else None
         logger.info(f"Detected build system: {build_system}")
+        terminal_reactor = (
+            self._terminal_root_maven_reactor_receipt(project_dir)
+            if build_system == "maven"
+            else None
+        )
+        if terminal_reactor is not None:
+            evidence.update(
+                {
+                    "authority": "terminal_reactor_receipt",
+                    "terminal_reactor_receipt_id": terminal_reactor["receipt_id"],
+                    "reactor_modules_succeeded": terminal_reactor["modules_succeeded"],
+                    "reactor_modules_total": terminal_reactor["modules_total"],
+                }
+            )
 
         # Check 1: Build artifacts
         artifacts_result = self._check_build_artifacts_complete(project_dir)
@@ -3710,6 +3949,7 @@ class PhysicalValidator:
         if (
             isinstance(maven_reactor_snapshot, _MavenReactorSnapshot)
             and not maven_reactor_snapshot.complete
+            and terminal_reactor is None
         ):
             complete = False
             reactor_reason = (
@@ -3725,7 +3965,7 @@ class PhysicalValidator:
         # receipt-stated denominator the scan is deliberately not a cap: a
         # module the build never attempted is untried, not unbuilt, which is
         # the whole point of the #17 narrowing.
-        if build_system in ("maven", "gradle"):
+        if build_system in ("maven", "gradle") and terminal_reactor is None:
             if basis.states_a_shortfall or denominator_refusals:
                 if complete:
                     # A completeness claim must not be left standing at the head
@@ -3768,6 +4008,16 @@ class PhysicalValidator:
                 complete = False
             reason = f"{reason} · {basis.phrase()}" if reason else basis.phrase()
 
+        if terminal_reactor is not None:
+            success, complete = True, True
+            reason = (
+                f"Root Maven {terminal_reactor['requested_action']} receipt "
+                f"{terminal_reactor['receipt_id']} completed exactly with "
+                f"{terminal_reactor['modules_succeeded']} of "
+                f"{terminal_reactor['modules_total']} reactor modules successful; "
+                "filesystem class and module scans are diagnostic"
+            )
+
         # Surface the build command + timed duration (if a command tracker with a
         # recorded build is attached) and the primary artifact for the metrics
         # read model. validate_build_status itself does not execute the build, so
@@ -3801,12 +4051,14 @@ class PhysicalValidator:
         # channel, not only the evidence dict: the finalizer and the report kernel
         # cap on `result["conflicts"]`, and a disagreement that never reaches
         # there is a disagreement nothing downstream can act on.
-        for code in denominator_refusals:
-            if code not in conflicts:
-                conflicts.append(code)
+        if terminal_reactor is None:
+            for code in denominator_refusals:
+                if code not in conflicts:
+                    conflicts.append(code)
         if (
             isinstance(maven_reactor_snapshot, _MavenReactorSnapshot)
             and not maven_reactor_snapshot.complete
+            and terminal_reactor is None
         ):
             conflicts.append("maven_reactor_unverified")
         if python_build is not None:
@@ -5442,6 +5694,7 @@ class PhysicalValidator:
 
         # Calculate pass rate
         pass_rate = self.calculate_test_pass_rate(test_metrics)
+        execution_summary = self._test_execution_receipt_summary(project_dir)
 
         # pytest collection nodes are NOT executed tests (Plan 4 Task 2). They
         # travel with the verdict so the report can quote the real root cause
@@ -5496,6 +5749,18 @@ class PhysicalValidator:
             reason = f"Test collection failed for {collection_errors} files — 0 tests executed"
             if collection_error_summary:
                 reason = f"{reason}: {collection_error_summary}"
+
+        if execution_summary.get("state") == "partial":
+            status = "PARTIAL"
+            evidence_status = "partial"
+            reason = str(execution_summary.get("reason") or "test execution was interrupted")
+        elif execution_summary.get("state") == "failed" and not test_metrics.get("total_tests", 0):
+            status = "FAILED"
+            evidence_status = "blocked"
+            reason = str(
+                execution_summary.get("reason")
+                or "test execution was interrupted before producing results"
+            )
 
         has_test_count_evidence = test_metrics.get("valid", False) or any(
             key in test_metrics and test_metrics.get(key) is not None
@@ -5610,6 +5875,13 @@ class PhysicalValidator:
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(report_files) or [project_dir],
         }
+        if execution_summary.get("state") != "unknown":
+            result["test_execution_state"] = execution_summary["state"]
+            result["test_execution_reason"] = execution_summary.get("reason")
+            result["test_execution_receipt_ids"] = list(execution_summary.get("receipt_ids") or ())
+            interrupted_ids = list(execution_summary.get("interrupted_receipt_ids") or ())
+            if interrupted_ids:
+                result["test_interrupted_receipt_ids"] = interrupted_ids
         # Absent facts = absent keys: a receipt-free run carries none of these,
         # so its status dict (and everything projected from it) is unchanged.
         for key in (
