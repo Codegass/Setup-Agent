@@ -75,9 +75,17 @@ def _bodies(
     if with_default_branch:
         bodies[f"repos/{REPO}"] = {"default_branch": branch}
     for sha, (checks, statuses) in signals.items():
-        bodies[f"repos/{REPO}/commits/{sha}/check-runs"] = checks
-        bodies[f"repos/{REPO}/commits/{sha}/status"] = statuses
+        bodies[_checks_path(sha)] = checks
+        bodies[_status_path(sha)] = statuses
     return bodies
+
+
+def _checks_path(sha: str, page: int = 1) -> str:
+    return f"repos/{REPO}/commits/{sha}/check-runs?per_page=100&page={page}"
+
+
+def _status_path(sha: str, page: int = 1) -> str:
+    return f"repos/{REPO}/commits/{sha}/status?per_page=100&page={page}"
 
 
 @pytest.fixture
@@ -293,6 +301,97 @@ class TestSelectAnchor:
         with pytest.raises(SelectorError):
             select_anchor("kafka")
         assert fake.calls == []
+
+
+class TestSignalPagination:
+    """A commit's CI record is read whole, not one API page of it.
+
+    GitHub hands back 30 check runs per page by default and 100 at most, and
+    busy repositories put more than that on a single commit.  A build cell that
+    lands behind a page of bot noise still has to count as evidence, and the
+    anchor it produces still has to carry every cell.
+    """
+
+    @staticmethod
+    def _noise_page(count: int) -> dict[str, object]:
+        return {
+            "check_runs": [
+                {"name": f"CodeQL scan {index}", "status": "completed", "conclusion": "success"}
+                for index in range(count)
+            ]
+        }
+
+    def test_a_build_cell_on_the_second_page_of_checks_is_still_evidence(self, api):
+        bodies = _bodies(
+            commits=[_commit(HEAD_SHA, "2026-08-27T17:41:11Z")],
+            signals={HEAD_SHA: (_check_runs(), _statuses())},
+        )
+        bodies[_checks_path(HEAD_SHA)] = self._noise_page(100)
+        bodies[_checks_path(HEAD_SHA, page=2)] = _check_runs(
+            ("build (17, false)", "success"),
+            ("build (28-ea, true)", "failure"),
+        )
+        api(bodies)
+
+        anchor = select_anchor(REPO)
+
+        assert anchor["sha"] == HEAD_SHA
+        assert anchor["checks"] == [
+            {"name": "build (17, false)", "conclusion": "success"},
+            {"name": "build (28-ea, true)", "conclusion": "failure"},
+        ]
+
+    def test_a_jenkins_status_on_the_second_page_is_still_evidence(self, api):
+        bodies = _bodies(
+            commits=[_commit(HEAD_SHA, "2026-07-08T20:12:05Z")],
+            signals={HEAD_SHA: (_check_runs(), _statuses())},
+        )
+        bodies[_status_path(HEAD_SHA)] = _statuses(
+            *((f"license/cla-{index}", "success") for index in range(100))
+        )
+        bodies[_status_path(HEAD_SHA, page=2)] = _statuses(
+            ("continuous-integration/jenkins/branch", "failure")
+        )
+        api(bodies)
+
+        anchor = select_anchor(REPO)
+
+        assert anchor["statuses"] == [
+            {"context": "continuous-integration/jenkins/branch", "state": "failure"}
+        ]
+
+    def test_a_short_first_page_ends_the_walk(self, api):
+        fake = api(
+            _bodies(
+                commits=[_commit(HEAD_SHA, "2026-08-27T17:41:11Z")],
+                signals={HEAD_SHA: (_check_runs(("build (17, false)", "success")), _statuses())},
+            )
+        )
+        select_anchor(REPO)
+
+        assert _checks_path(HEAD_SHA) in fake.calls
+        assert _checks_path(HEAD_SHA, page=2) not in fake.calls
+        assert _status_path(HEAD_SHA, page=2) not in fake.calls
+
+    def test_an_unbounded_run_of_full_pages_stops_at_the_page_cap(self, api, monkeypatch):
+        monkeypatch.setattr("scripts.d3_select_anchor.API_PAGE_SIZE", 2)
+        monkeypatch.setattr("scripts.d3_select_anchor.MAX_SIGNAL_PAGES", 2)
+        noise = self._noise_page(2)
+        bodies: dict[str, object] = {
+            f"repos/{REPO}": {"default_branch": "main"},
+            f"repos/{REPO}/commits?sha=main&per_page=15": [
+                _commit(HEAD_SHA, "2026-08-27T17:41:11Z")
+            ],
+        }
+        for page in (1, 2):
+            bodies[f"repos/{REPO}/commits/{HEAD_SHA}/check-runs?per_page=2&page={page}"] = noise
+            bodies[f"repos/{REPO}/commits/{HEAD_SHA}/status?per_page=2&page={page}"] = _statuses()
+        fake = api(bodies)
+
+        # A third page would be an unexpected path and the fake would say so.
+        with pytest.raises(SelectorError):
+            select_anchor(REPO)
+        assert sum(1 for call in fake.calls if "check-runs" in call) == 2
 
 
 class TestCli:

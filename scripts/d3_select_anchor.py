@@ -71,6 +71,13 @@ UNDECIDED_STATES: frozenset[str] = frozenset({"", "pending"})
 DEFAULT_MAX_COMMITS = 15
 MAX_COMMITS_BOUND = 100
 
+# GitHub answers a list endpoint 30 items at a time unless asked otherwise, and
+# 100 is its per_page ceiling.  A commit's checks have to be read whole: a build
+# cell sitting behind a first page of bot noise would otherwise read as no
+# evidence at all, and the walk would step past a perfectly good anchor.
+API_PAGE_SIZE = 100
+MAX_SIGNAL_PAGES = 10
+
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 
@@ -100,6 +107,26 @@ def fetch(path: str) -> Any:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise SelectorError(f"gh api {path} did not answer JSON: {exc}") from exc
+
+
+def fetch_pages(path: str, key: str) -> tuple[dict[str, Any], ...]:
+    """Return every object under ``key``, walking the endpoint's pages.
+
+    A page that comes back short is the last one; a run of full pages stops at
+    ``MAX_SIGNAL_PAGES`` so a pathological commit cannot hold the walk open.
+    """
+
+    joiner = "&" if "?" in path else "?"
+    items: list[dict[str, Any]] = []
+    for page in range(1, MAX_SIGNAL_PAGES + 1):
+        body = fetch(f"{path}{joiner}per_page={API_PAGE_SIZE}&page={page}")
+        raw = body.get(key) if isinstance(body, dict) else None
+        if not isinstance(raw, list):
+            break
+        items.extend(item for item in raw if isinstance(item, dict))
+        if len(raw) < API_PAGE_SIZE:
+            break
+    return tuple(items)
 
 
 def is_noise(name: str) -> bool:
@@ -146,24 +173,16 @@ def commit_date(commit: dict[str, Any]) -> str:
 def commit_signals(repo: str, sha: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Return one commit's noise-filtered, verdict-carrying checks and statuses."""
 
-    checks_body = fetch(f"repos/{repo}/commits/{sha}/check-runs")
-    raw_checks = checks_body.get("check_runs") if isinstance(checks_body, dict) else None
     checks: list[dict[str, str]] = []
-    for run in raw_checks or ():
-        if not isinstance(run, dict):
-            continue
+    for run in fetch_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs"):
         name = str(run.get("name") or "").strip()
         conclusion = str(run.get("conclusion") or "").strip().lower()
         if not name or is_noise(name) or conclusion in UNDECIDED_CONCLUSIONS:
             continue
         checks.append({"name": name, "conclusion": conclusion})
 
-    status_body = fetch(f"repos/{repo}/commits/{sha}/status")
-    raw_statuses = status_body.get("statuses") if isinstance(status_body, dict) else None
     statuses: list[dict[str, str]] = []
-    for status in raw_statuses or ():
-        if not isinstance(status, dict):
-            continue
+    for status in fetch_pages(f"repos/{repo}/commits/{sha}/status", "statuses"):
         context = str(status.get("context") or "").strip()
         state = str(status.get("state") or "").strip().lower()
         if not context or is_noise(context) or state in UNDECIDED_STATES:
