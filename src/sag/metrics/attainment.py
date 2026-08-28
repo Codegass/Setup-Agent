@@ -229,7 +229,12 @@ def evaluate_attainment(view: CertificateView, target: TargetRecord) -> Attainme
     # The id form needs a run that can name what it ran: red identities without
     # an executed universe are not a set the run can vouch for.
     view_red_known = bool(view.red_ids) or view.red_count == 0
-    cell_red_known = bool(cell.red_ids) or bool(cell.flaky_ids) or cell.red_count == 0
+    # Both halves of the cell's union must be nameable: a cell that counted a
+    # flaky test it could not store would otherwise read as having none, and the
+    # run's rerun of that same test would be reported as new red.
+    cell_red_known = (bool(cell.red_ids) or cell.red_count == 0) and (
+        bool(cell.flaky_ids) or cell.flaky_count == 0
+    )
     unexpected_red: tuple[str, ...] = ()
     if view_red_known and cell_red_known and view.executed_ids:
         clean_form: CleanForm = "ids"

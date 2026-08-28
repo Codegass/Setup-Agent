@@ -80,6 +80,18 @@ class TestCellTargetCountAgreement:
         cell = _cell(red_count=7, executed_ids=(), executed_count=0, grade="B")
         assert cell.red_count == 7
 
+    def test_flaky_count_must_not_contradict_named_flaky_identities(self):
+        with pytest.raises(ValidationError, match="flaky count"):
+            _cell(flaky_ids=("a#one",), flaky_count=2)
+
+    def test_named_flaky_identities_state_the_count_themselves(self):
+        assert _cell(flaky_ids=("a#one",)).flaky_count == 1
+
+    def test_flaky_count_stands_alone_when_no_flaky_identities_are_named(self):
+        cell = _cell(flaky_count=3, flaky_ids=())
+        assert cell.flaky_count == 3
+        assert cell.flaky_ids == ()
+
     def test_negative_counts_are_rejected(self):
         with pytest.raises(ValidationError):
             _cell(executed_count=-1, executed_ids=())
@@ -154,6 +166,48 @@ class TestCellTargetShape:
     def test_laundered_conclusion_defaults_to_false(self):
         assert _cell().laundered_conclusion is False
         assert _cell(laundered_conclusion=True).laundered_conclusion is True
+
+
+class TestLaunderedCells:
+    """A swallowed exit status buys a cell no standing it did not earn."""
+
+    def _conclusion_cell(self, **overrides):
+        payload = {
+            "grade": "B",
+            "executed_count": 0,
+            "executed_ids": (),
+            "red_count": 0,
+            "laundered_conclusion": True,
+        }
+        payload.update(overrides)
+        return _cell(**payload)
+
+    def test_a_laundered_conclusion_grade_cell_cannot_state_a_build_outcome(self):
+        for outcome in ("ok", "failed"):
+            with pytest.raises(ValidationError, match="cannot state a build outcome"):
+                self._conclusion_cell(build=outcome)
+        assert self._conclusion_cell(build="unknown").build == "unknown"
+
+    def test_a_laundered_cell_that_counted_tests_keeps_its_outcome(self):
+        # continue-on-error cannot touch the XML, so count-grade cells survive.
+        cell = _cell(laundered_conclusion=True, grade="A", build="ok")
+        assert cell.build == "ok"
+
+    def test_a_laundered_conclusion_cannot_be_the_goalpost(self):
+        cell = self._conclusion_cell(build="unknown")
+        with pytest.raises(ValidationError, match="cannot be the matched cell"):
+            _record(cells=(cell,), matched_cell=cell.cell_id)
+
+    def test_a_laundered_conclusion_may_still_be_recorded_beside_a_real_goalpost(self):
+        laundered = self._conclusion_cell(build="unknown", cell_id="JDK17 windows-latest")
+        record = _record(cells=(_cell(), laundered), matched_cell="JDK17 ubuntu-latest")
+        assert record.matched_cell == "JDK17 ubuntu-latest"
+        assert record.cells[1].laundered_conclusion is True
+
+    def test_a_laundered_count_grade_cell_is_still_a_usable_goalpost(self):
+        cell = _cell(laundered_conclusion=True, grade="A")
+        record = _record(cells=(cell,), matched_cell=cell.cell_id)
+        assert record.matched_cell == cell.cell_id
 
 
 class TestTargetRecordShape:

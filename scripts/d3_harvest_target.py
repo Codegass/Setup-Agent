@@ -20,8 +20,11 @@ What a cell is here:
   notes disclose that the reading is the harvester's.
 * **Grade B, one per uncovered check.**  A check that no pool measures is worth
   its conclusion and nothing more.  A check a pool already measures gets no
-  second cell: a green conclusion is not extra evidence about work whose XML is
-  already counted.
+  second cell *unless it concluded failed*: a green conclusion is not extra
+  evidence about work whose XML is already counted, but a red one is a defeater
+  of those counts -- a suite that crashed after uploading partial green XML
+  reports exactly that -- so it keeps its cell and the notes name the pool it
+  contradicts.
 
 Laundering is vetted over any workflow config in the snapshot.  A config that
 swallows a build or test failure makes every conclusion in the run a statement
@@ -31,7 +34,10 @@ counts, which ``continue-on-error`` cannot touch.
 
 Identities are stored only when the record can hold them: kafka's main pool
 carries 36,259 executions and identities past 1,100 characters, so that cell
-reports counts and says so in the notes.
+reports counts and says so in the notes.  Executed, red and flaky identities are
+each judged against those bounds on their own, and every set the record cannot
+hold is counted in the cell and disclosed in the notes -- an unlistable flaky
+test is still a flaky test the run had.
 
 Examples::
 
@@ -137,6 +143,13 @@ CHECK_BUILD_OUTCOME: dict[str, BuildOutcome] = {
     "startup_failure": "failed",
     "action_required": "failed",
 }
+
+# The platform labels one cell may stand in for another under, once the
+# toolchain already agrees.  This is the class ``match_cell`` itself admits
+# from: linux is the platform SAG's container is, and a pool artifact name
+# states no platform at all, so the two are one class; macOS and windows each
+# stand only for themselves.
+LINUX_COMPATIBLE_OS: frozenset[str] = frozenset({"linux", "unknown"})
 
 
 class HarvestError(Exception):
@@ -255,21 +268,39 @@ def _storable(ids: tuple[str, ...]) -> bool:
     return all(len(identity) <= IDENTITY_CHARACTER_BOUND for identity in ids)
 
 
+def _storable_ids(
+    ids: tuple[str, ...], *, cell_id: str, label: str
+) -> tuple[tuple[str, ...], str | None]:
+    """Return the identities the record can hold, and the note when it cannot.
+
+    Every set the record refuses is still a set the run had, so the omission is
+    disclosed rather than left to read as an empty set.
+    """
+
+    if not ids or _storable(ids):
+        return ids, None
+    reason = (
+        f"the record holds at most {IDENTITY_COUNT_BOUND}"
+        if len(ids) > IDENTITY_COUNT_BOUND
+        else f"an identity exceeds the record's {IDENTITY_CHARACTER_BOUND}-character bound"
+    )
+    return (), (
+        f"cell {cell_id}: {label} identities are counted, not listed "
+        f"({len(ids)} of them) -- {reason}"
+    )
+
+
 def cell_from_pool(reading: PoolReading) -> HarvestedCell:
     """Build the grade-A cell one pool proves."""
 
     result = reading.deconvolved
     cell_id = pool_cell_id(reading.pool_id)
-    keep_ids = _storable(result.executed_ids)
-    notes: list[str] = []
-    if result.executed_ids and not keep_ids:
-        reason = (
-            f"{len(result.executed_ids)} executions exceed the record's "
-            f"{IDENTITY_COUNT_BOUND}-identity bound"
-            if len(result.executed_ids) > IDENTITY_COUNT_BOUND
-            else f"an identity exceeds the record's {IDENTITY_CHARACTER_BOUND}-character bound"
-        )
-        notes.append(f"cell {cell_id}: executed identities are counted, not listed -- {reason}")
+    executed_ids, executed_note = _storable_ids(
+        result.executed_ids, cell_id=cell_id, label="executed"
+    )
+    red_ids, red_note = _storable_ids(result.final_red_ids, cell_id=cell_id, label="red")
+    flaky_ids, flaky_note = _storable_ids(result.flaky_ids, cell_id=cell_id, label="flaky")
+    notes: list[str] = [note for note in (executed_note, red_note, flaky_note) if note]
     if reading.unreadable:
         notes.append(
             f"cell {cell_id}: {len(reading.unreadable)} XML files in {reading.artifact} "
@@ -285,10 +316,11 @@ def cell_from_pool(reading: PoolReading) -> HarvestedCell:
         cell_id=cell_id,
         build="failed" if result.final_red_ids else "ok",
         executed_count=len(result.executed_ids),
-        executed_ids=result.executed_ids if keep_ids else (),
+        executed_ids=executed_ids,
         red_count=len(result.final_red_ids),
-        red_ids=result.final_red_ids if _storable(result.final_red_ids) else (),
-        flaky_ids=result.flaky_ids if _storable(result.flaky_ids) else (),
+        red_ids=red_ids,
+        flaky_count=len(result.flaky_ids),
+        flaky_ids=flaky_ids,
         skipped=len(result.final_skipped_ids),
         grade="A",
         evidence_refs=(reading.artifact,),
@@ -296,10 +328,16 @@ def cell_from_pool(reading: PoolReading) -> HarvestedCell:
     return HarvestedCell(cell=cell, notes=tuple(notes))
 
 
+def check_build_outcome(conclusion: str) -> BuildOutcome:
+    """Return the build outcome one check conclusion decides, before laundering."""
+
+    return CHECK_BUILD_OUTCOME.get((conclusion or "").strip().lower(), "unknown")
+
+
 def cell_from_check(name: str, conclusion: str, *, laundered: bool) -> CellTarget:
     """Build the grade-B cell one check's conclusion proves."""
 
-    outcome: BuildOutcome = CHECK_BUILD_OUTCOME.get((conclusion or "").strip().lower(), "unknown")
+    outcome: BuildOutcome = check_build_outcome(conclusion)
     if laundered:
         # A laundered conclusion is a claim about the workflow file, so it may
         # not stand as this cell's build outcome.
@@ -355,19 +393,47 @@ def vet_snapshot_workflows(snapshot_dir: Path) -> tuple[LaunderingVet, tuple[str
     )
 
 
+def interchangeable_os(cell_os: str) -> frozenset[str]:
+    """Return the platform labels a cell on ``cell_os`` may be compared against."""
+
+    return LINUX_COMPATIBLE_OS if cell_os in LINUX_COMPATIBLE_OS else frozenset({cell_os})
+
+
 def select_matched_cell(
     cells: tuple[CellTarget, ...], jdk_major: int
 ) -> tuple[str | None, tuple[str, ...]]:
     """Choose the cell a run on ``jdk_major`` is measured against.
 
     :func:`match_cell` decides which toolchain is admissible and what that cost.
-    Among the cells of that same toolchain and platform the widest proven
-    universe wins: a 31-test flaky rerun pool is not the goalpost the main suite
-    of the same JDK sets, and alphabetical order alone would have picked it.
+    Among the cells of that same toolchain on an interchangeable platform the
+    widest proven universe wins: a 31-test flaky rerun pool is not the goalpost
+    the main suite of the same JDK sets, and alphabetical order alone would have
+    picked it.
+
+    Interchangeable is the same class :func:`match_cell` admits from, not string
+    equality of the platform label: a pool artifact name carries no OS, so a
+    strict comparison would let an ``ubuntu``-labelled conclusion cell of the
+    same JDK -- which :func:`match_cell` ranks first for being labelled at all --
+    keep a match away from the pool that actually counted that toolchain's tests.
+
+    A laundered conclusion-grade cell is not a candidate at all: its conclusion
+    is a statement about the workflow file, so it proves nothing for a run to
+    match, and its bare toolchain annotation would otherwise outrank the pool
+    that actually counted tests.
     """
 
-    match = match_cell(cells, jdk_major)
     notes: list[str] = []
+    eligible = tuple(
+        cell for cell in cells if not (cell.laundered_conclusion and cell.grade == "B")
+    )
+    excluded = len(cells) - len(eligible)
+    if excluded:
+        notes.append(
+            "laundered conclusion-grade cells cannot be the target: "
+            f"{excluded} of {len(cells)} excluded from matching"
+        )
+
+    match = match_cell(eligible, jdk_major)
     if match.caveat:
         notes.append(f"matched cell: {match.caveat}")
     if match.cell_id is None:
@@ -375,20 +441,26 @@ def select_matched_cell(
 
     chosen_jdk = extract_cell_jdk(match.cell_id)
     chosen_os = extract_cell_os(match.cell_id)
+    peers = interchangeable_os(chosen_os)
     equivalent = [
         cell
-        for cell in cells
-        if extract_cell_jdk(cell.cell_id) == chosen_jdk
-        and extract_cell_os(cell.cell_id) == chosen_os
+        for cell in eligible
+        if extract_cell_jdk(cell.cell_id) == chosen_jdk and extract_cell_os(cell.cell_id) in peers
     ]
     widest = sorted(
         equivalent,
         key=lambda cell: (-cell.executed_count, 0 if cell.grade == "A" else 1, cell.cell_id),
     )[0]
     if widest.cell_id != match.cell_id:
+        widest_os = extract_cell_os(widest.cell_id)
+        platform = (
+            ""
+            if widest_os == chosen_os
+            else f", whose platform reads {widest_os} where {chosen_os} was first matched"
+        )
         notes.append(
             f"matched cell {widest.cell_id} over {match.cell_id}: the widest proven "
-            f"universe on the same toolchain ({widest.executed_count} executions)"
+            f"universe on the same toolchain ({widest.executed_count} executions){platform}"
         )
     return widest.cell_id, tuple(notes)
 
@@ -432,8 +504,13 @@ def assemble_target_record(
 
     covered = 0
     duplicates = 0
+    defeaters: list[str] = []
     for name, conclusion in read_jobs(snapshot_dir):
-        if any(pool_covers_check(pool_id, name) for pool_id in pool_ids):
+        covering = next((pool_id for pool_id in pool_ids if pool_covers_check(pool_id, name)), None)
+        # A conclusion that decided nothing, or decided green, says nothing a
+        # pool's own XML has not already said.  A failed one contradicts it, and
+        # a defeater of counted work is evidence, so it keeps its cell.
+        if covering is not None and check_build_outcome(conclusion) != "failed":
             covered += 1
             continue
         if name in taken:
@@ -441,6 +518,8 @@ def assemble_target_record(
             continue
         taken.add(name)
         cells.append(cell_from_check(name, conclusion, laundered=vet.laundered))
+        if covering is not None:
+            defeaters.append(f"{name} ({conclusion}) over {pool_cell_id(covering)}")
 
     if not cells:
         raise HarvestError(f"{snapshot_dir} carries no JUnit pool and no check conclusion")
@@ -459,6 +538,15 @@ def assemble_target_record(
         notes.append(
             f"{covered} checks are already measured by a JUnit pool and carry no "
             "separate conclusion-grade cell"
+        )
+    if defeaters:
+        # Bounded because the record refuses a note past 2,000 characters and a
+        # cell id may be 128 of them; the count is the claim, the names are aid.
+        listed = "; ".join(defeaters[:5])
+        remainder = f", and {len(defeaters) - 5} more" if len(defeaters) > 5 else ""
+        notes.append(
+            f"{len(defeaters)} checks concluded failed over work a JUnit pool already "
+            f"measures and keep their own cell as a defeater of its counts: {listed}{remainder}"
         )
     if duplicates:
         notes.append(f"{duplicates} repeated check names were collapsed into their first cell")
@@ -581,7 +669,7 @@ def summarize(record: TargetRecord, digest: str, destination: Path) -> str:
             f"matched={matched.cell_id if matched else '-'}",
             f"executed={matched.executed_count if matched else '-'}",
             f"red={matched.red_count if matched else '-'}",
-            f"flaky={len(matched.flaky_ids) if matched else '-'}",
+            f"flaky={matched.flaky_count if matched else '-'}",
             f"out={destination}",
         ]
     )

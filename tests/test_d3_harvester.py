@@ -219,6 +219,30 @@ class TestPoolCells:
         assert cell.executed_ids == ()
         assert _has_note(_record(snapshot), "512-character bound")
 
+    def test_a_flaky_identity_past_the_bound_is_counted_not_erased(self, tmp_path):
+        long_name = "b" * 600
+        snapshot = build_snapshot(
+            tmp_path / "run",
+            pools={
+                "junit-xml-17-noflaky-nonew": {
+                    # One test, failed then passed on the retry: one flaky execution
+                    # whose identity the record cannot hold.
+                    "core/TEST-pkg.LongFlakyTest.xml": _suite(
+                        "pkg.LongFlakyTest", ((long_name, True), (long_name, False))
+                    )
+                }
+            },
+        )
+        record = _record(snapshot)
+        cell = _cell(record, "junit-xml-17-noflaky-nonew (jdk 17)")
+
+        assert cell.executed_count == 1
+        assert cell.red_count == 0
+        assert cell.build == "ok"
+        assert cell.flaky_count == 1
+        assert cell.flaky_ids == ()
+        assert _has_note(record, "flaky identities are counted, not listed (1 of them)")
+
     def test_an_unreadable_pool_is_refused_rather_than_reported_empty(self, tmp_path):
         snapshot = tmp_path / "run"
         snapshot.mkdir()
@@ -249,6 +273,30 @@ class TestCheckCells:
 
     def test_a_conclusion_that_judged_nothing_leaves_the_build_unknown(self, snapshot):
         assert _cell(_record(snapshot), "build / Update Test Catalog").build == "unknown"
+
+    def test_a_failed_check_over_pool_measured_work_keeps_its_cell(self, tmp_path):
+        """A suite that crashed after uploading partial green XML looks like this."""
+
+        snapshot = build_snapshot(
+            tmp_path / "run",
+            pools={
+                "junit-xml-17-noflaky-nonew": {
+                    "core/TEST-pkg.GreenTest.xml": _suite(
+                        "pkg.GreenTest", (("one()", False), ("two()", False))
+                    )
+                }
+            },
+            jobs=(("build / JUnit tests Java 17", "failure"),),
+        )
+        record = _record(snapshot, jdk_major=17)
+        cell = _cell(record, "build / JUnit tests Java 17")
+
+        assert cell.grade == "B"
+        assert cell.build == "failed"
+        assert not _has_note(record, "already measured by a JUnit pool")
+        assert _has_note(record, "defeater of its counts")
+        # The pool still sets the goalpost; the defeater stands beside it.
+        assert record.matched_cell == "junit-xml-17-noflaky-nonew (jdk 17)"
 
     def test_a_snapshot_with_neither_pool_nor_check_is_refused(self, tmp_path):
         empty = tmp_path / "run"
@@ -301,6 +349,24 @@ class TestLaunderingVet:
         assert _has_note(record, "no workflow config was harvested")
         assert not any(cell.laundered_conclusion for cell in record.cells)
 
+    def test_a_laundered_conclusion_never_becomes_the_goalpost(self, laundered):
+        """The laundered check names JDK17 and counted nothing; the pool wins."""
+
+        record = _record(laundered, jdk_major=17)
+
+        assert record.matched_cell == "junit-xml-17-noflaky-nonew (jdk 17)"
+        assert _has_note(record, "laundered conclusion-grade cells cannot be the target")
+
+    def test_a_run_whose_only_toolchain_cell_is_laundered_matches_nothing(self, tmp_path):
+        only_conclusions = build_snapshot(
+            tmp_path / "run",
+            jobs=(("JDK17 ubuntu-latest", "success"),),
+            workflow=LAUNDERED_CI,
+        )
+        record = _record(only_conclusions, jdk_major=17)
+
+        assert record.matched_cell is None
+
 
 class TestMatchedCell:
     def test_the_widest_proven_universe_on_the_toolchain_is_the_target(self, snapshot):
@@ -321,6 +387,50 @@ class TestMatchedCell:
 
     def test_no_toolchain_asked_for_means_no_cell_matched(self, snapshot):
         assert _record(snapshot).matched_cell is None
+
+    def _pool_and_check(self, tmp_path, *, jobs, workflow=None) -> Path:
+        return build_snapshot(
+            tmp_path / "run",
+            pools={
+                "junit-xml-17-noflaky-nonew": {
+                    "core/TEST-kafka.server.ReplicationQuotasTest.xml": RETRY_SUITE.read_bytes()
+                }
+            },
+            jobs=jobs,
+            workflow=workflow,
+        )
+
+    def test_a_platform_labelled_conclusion_never_outranks_the_proven_pool(self, tmp_path):
+        """The check name says ubuntu; the pool artifact name says no platform at all.
+
+        ``match_cell`` ranks the labelled cell first for that alone, so the
+        widest-universe rule is the only thing keeping the counted cell in front
+        of a conclusion on the same toolchain.
+        """
+
+        record = _record(
+            self._pool_and_check(tmp_path, jobs=(("JDK17 ubuntu-latest", "success"),)),
+            jdk_major=17,
+        )
+        matched = _cell(record, record.matched_cell)
+
+        assert record.matched_cell == "junit-xml-17-noflaky-nonew (jdk 17)"
+        assert matched.grade == "A"
+        assert matched.executed_count == 3
+        assert _has_note(record, "whose platform reads unknown where linux was first matched")
+
+    def test_the_laundered_run_is_measured_against_its_pool_not_its_conclusion(self, tmp_path):
+        record = _record(
+            self._pool_and_check(
+                tmp_path,
+                jobs=(("JDK17 ubuntu-latest", "success"), ("smoke (8, ubuntu-latest)", "success")),
+                workflow=LAUNDERED_CI,
+            ),
+            jdk_major=17,
+        )
+
+        assert record.matched_cell == "junit-xml-17-noflaky-nonew (jdk 17)"
+        assert _cell(record, "JDK17 ubuntu-latest").grade == "B"
 
 
 class TestWrittenRecord:

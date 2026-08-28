@@ -7,6 +7,17 @@ revision, plus the cell a SAG run was matched against.
 The record is a claim about identities, not about rates: a cell names the tests
 it executed and the tests that stayed red, so a later comparison is a set
 operation rather than a percentage.  Counts are integers; there are no floats.
+Every identity set the record cannot hold -- too many identities, or one too
+long -- falls back to its count and never to nothing, so a harvest that drops
+36,259 executions or one 600-character flaky name still states how many there
+were.
+
+A laundered cell is one whose workflow swallowed a build or test failure
+(``continue-on-error``), so its conclusion states what the workflow file
+allows, not what the code did.  The record keeps such a cell as disclosure but
+gives its conclusion no standing: a laundered conclusion-grade cell reports no
+build outcome and can never be the matched cell.  Counts are untouched by a
+swallowed exit status, so a laundered cell that carries them stays a target.
 """
 
 from __future__ import annotations
@@ -57,6 +68,7 @@ class CellTarget(BaseModel):
     executed_ids: tuple[str, ...] = ()
     red_count: int = Field(ge=0)
     red_ids: tuple[str, ...] = ()
+    flaky_count: int = Field(default=0, ge=0)
     flaky_ids: tuple[str, ...] = ()
     skipped: int = Field(default=0, ge=0)
     modules: tuple[str, ...] = ()
@@ -80,6 +92,15 @@ class CellTarget(BaseModel):
             raise ValueError("executed count does not match the executed identities")
         if red and self.red_count != len(red):
             raise ValueError("red count does not match the red identities")
+        # A cell that lists its flaky identities need not restate their number,
+        # but it may never state a number that contradicts them: a flaky test
+        # too long to store is still a flaky test, and the count is where it
+        # survives.
+        flaky_count = self.flaky_count
+        if flaky and flaky_count not in (0, len(flaky)):
+            raise ValueError("flaky count does not match the flaky identities")
+        if flaky:
+            flaky_count = len(flaky)
         if set(red) & set(flaky):
             raise ValueError("a test cannot be both finally red and flaky")
         if executed:
@@ -89,9 +110,15 @@ class CellTarget(BaseModel):
             if not set(flaky).issubset(universe):
                 raise ValueError("flaky ids must be a subset of executed ids")
 
+        # A conclusion-grade cell knows only its conclusion, so laundering
+        # leaves it nothing to report: it may be recorded, never as an outcome.
+        if self.laundered_conclusion and self.grade == "B" and self.build != "unknown":
+            raise ValueError("a laundered conclusion-grade cell cannot state a build outcome")
+
         object.__setattr__(self, "cell_id", cell_id)
         object.__setattr__(self, "executed_ids", executed)
         object.__setattr__(self, "red_ids", red)
+        object.__setattr__(self, "flaky_count", flaky_count)
         object.__setattr__(self, "flaky_ids", flaky)
         object.__setattr__(self, "modules", modules)
         object.__setattr__(self, "evidence_refs", refs)
@@ -133,6 +160,11 @@ class TargetRecord(BaseModel):
                 raise ValueError("matched cell cannot be blank")
             if matched not in set(cell_ids):
                 raise ValueError("matched cell does not name a harvested cell")
+            goalpost = next(cell for cell in self.cells if cell.cell_id == matched)
+            # The goalpost is what a run must match or beat; a laundered
+            # conclusion proves nothing, so a run cannot be measured against it.
+            if goalpost.laundered_conclusion and goalpost.grade == "B":
+                raise ValueError("a laundered conclusion-grade cell cannot be the matched cell")
 
         notes: list[str] = []
         for note in self.notes:
