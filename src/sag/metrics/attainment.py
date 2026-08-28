@@ -288,13 +288,19 @@ def evaluate_attainment(view: CertificateView, target: TargetRecord) -> Attainme
         alpha_build = None
     elif not clean:
         verdict = "not_met"
-    elif built and covered:
+    elif built:
+        # Strict extra on either axis is decided before coverage is: beating
+        # the target is its own arm, ahead of the arm that merely reaches it.
+        # An empty test universe is unmeasured, not measured at zero, so no
+        # number of executions can strictly beat it.
+        beats_executions = cell.executed_count > 0 and view.executed_count > cell.executed_count
         # A strict superset of the target's modules only counts as beating the
         # target when the target named modules at all.
         beats_modules = bool(target_modules) and observed_modules > target_modules
-        verdict = (
-            "exceeded" if view.executed_count > cell.executed_count or beats_modules else "met"
-        )
+        if beats_executions or beats_modules:
+            verdict = "exceeded"
+        else:
+            verdict = "met" if covered else "partial"
     else:
         verdict = "partial"
 

@@ -359,6 +359,26 @@ class TestExceededStrictness:
         assert result.verdict == "met"
         assert result.alpha_build == Pair(numerator=1, denominator=1)
 
+    def test_an_unmeasured_test_universe_is_never_strictly_beaten(self):
+        """A grade-B zero is unmeasured, not measured at zero, so no run beats it."""
+
+        cell = _cell(executed_count=0, red_count=0, grade="B")
+        result = _judge(_view(executed_count=5), cell)
+        assert result.verdict == "met"
+        assert result.alpha_test is None
+        assert TARGET_TEST_UNIVERSE_EMPTY in result.reason_codes
+
+    def test_extra_modules_are_exceeded_even_below_the_execution_target(self):
+        """Spec 4.3 puts the strict-superset arm ahead of the coverage arm."""
+
+        cell = _cell(executed_count=10, red_count=0, modules=("core",))
+        result = _judge(_view(executed_count=5, modules=("core", "extra")), cell)
+        assert result.verdict == "exceeded"
+        # The shortfall is not swallowed by the verdict: alpha and the reason
+        # code still carry it.
+        assert result.alpha == Pair(numerator=5, denominator=10)
+        assert EXECUTION_BELOW_TARGET in result.reason_codes
+
     def test_a_failed_build_axis_without_target_modules_is_partial(self):
         cell = _cell(executed_count=52, red_count=0, modules=())
         result = _judge(_view(executed_count=52, build_ok=False), cell)
