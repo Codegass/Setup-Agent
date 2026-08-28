@@ -7,7 +7,9 @@ outside yardstick a run's own result is measured against.
 
 The success certificate stays in :mod:`sag.agent.java_success_certificates`.
 That module judges one SAG run against its own sealed obligations; this package
-judges a run against an external target.  Neither imports the other.
+judges a run against an external target.  The dependency runs one way only: the
+adapter in :mod:`sag.metrics.attainment` reads a finished certificate, and the
+certificate module never imports this package.
 
 Every module here is pure: no filesystem, process, or network authority.  Stored
 metrics carry integer counts only; a fraction is an integer numerator/denominator
