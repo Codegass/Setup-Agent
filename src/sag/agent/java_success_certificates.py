@@ -35,7 +35,7 @@ ScopeClosure = Literal["closed", "partial", "unknown"]
 Applicability = Literal["required", "not_applicable", "unknown"]
 ObligationStatus = Literal["complete", "failed", "incomplete", "not_applicable", "unavailable"]
 BuildStatus = Literal["success", "failed", "incomplete", "unverifiable"]
-TestExecutionStatus = Literal["complete", "incomplete", "unverifiable", "not_applicable"]
+TestExecutionStatus = Literal["complete", "failed", "incomplete", "unverifiable", "not_applicable"]
 TestOutcomeStatus = Literal["clean", "red", "empty", "unknown", "not_applicable"]
 AssuranceLevel = Literal["legacy_projected", "receipt_bound", "sealed_lineage"]
 ProofStatus = Literal["verified", "projected", "partial", "unverifiable"]
@@ -44,6 +44,7 @@ CertificateResult = Literal[
     "repository_product_test_green",
     "scoped_green",
     "build_failed",
+    "test_execution_failed",
     "test_red",
     "build_only",
     "incomplete",
@@ -84,6 +85,7 @@ OVERALL_TRUTH_BY_RESULT: dict[CertificateResult, TruthValue] = {
     "scoped_green": "PASS",
     "build_only": "PASS",
     "build_failed": "FAIL",
+    "test_execution_failed": "FAIL",
     "test_red": "FAIL",
     "incomplete": "UNKNOWN",
     "unverifiable": "UNKNOWN",
@@ -96,6 +98,7 @@ BUILD_AXIS_TRUTH: dict[BuildStatus, AxisTruth] = {
 }
 TEST_EXECUTION_AXIS_TRUTH: dict[TestExecutionStatus, AxisTruth] = {
     "complete": "PASS",
+    "failed": "FAIL",
     "incomplete": "UNKNOWN",
     "unverifiable": "UNKNOWN",
     "not_applicable": "NOT_APPLICABLE",
@@ -111,6 +114,16 @@ INTEGRITY_AXIS_TRUTH: dict[IntegrityStatus, AxisTruth] = {
     "complete": "PASS",
     "degraded": "UNKNOWN",
     "unavailable": "UNKNOWN",
+}
+# SAG-MS-1 §6.1: a blocker is a recorded finding that observations on one axis
+# fail the binding predicate, so every affected axis names its own undercutting
+# defeater on the public surface.
+BLOCKED_AXIS_REASON_CODES: dict[ProofAxis, str] = {
+    "scope": "SCOPE_AUTHORITY_BLOCKED",
+    "build": "BUILD_AUTHORITY_BLOCKED",
+    "test_execution": "TEST_EXECUTION_AUTHORITY_BLOCKED",
+    "test_outcome": "TEST_OUTCOME_AUTHORITY_BLOCKED",
+    "integrity": "INTEGRITY_AUTHORITY_BLOCKED",
 }
 ASSURANCE_BY_LEVEL: dict[AssuranceLevel, Assurance] = {
     "legacy_projected": "PROJECTED",
@@ -199,6 +212,9 @@ class TypedObligationSet(BaseModel):
     failed_ids: tuple[str, ...] = ()
     unexpected_ids: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
+    execution_failed_ids: tuple[str, ...] = ()
+    product_red_ids: tuple[str, ...] = ()
+    integrity_conflict_ids: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _validate_identity_sets(self) -> "TypedObligationSet":
@@ -207,10 +223,24 @@ class TypedObligationSet(BaseModel):
         failed = _canonical_ids(self.failed_ids, label="failed ids")
         unexpected = _canonical_ids(self.unexpected_ids, label="unexpected ids")
         refs = _canonical_ids(self.evidence_refs, label="obligation evidence refs")
+        execution_failed = _canonical_ids(self.execution_failed_ids, label="execution failed ids")
+        product_red = _canonical_ids(self.product_red_ids, label="product red ids")
+        integrity_conflict = _canonical_ids(
+            self.integrity_conflict_ids, label="integrity conflict ids"
+        )
         required_set = set(required)
         satisfied_set = set(satisfied)
         failed_set = set(failed)
         unexpected_set = set(unexpected)
+
+        attributed: set[str] = set()
+        for kind_ids in (execution_failed, product_red, integrity_conflict):
+            kind_set = set(kind_ids)
+            if not kind_set.issubset(failed_set):
+                raise ValueError("a failure kind can only attribute a failed identity")
+            if kind_set & attributed:
+                raise ValueError("a failed identity cannot carry two failure kinds")
+            attributed |= kind_set
 
         if self.applicability == "required" and not required:
             raise ValueError("a required obligation set must name at least one identity")
@@ -230,6 +260,9 @@ class TypedObligationSet(BaseModel):
         object.__setattr__(self, "failed_ids", failed)
         object.__setattr__(self, "unexpected_ids", unexpected)
         object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(self, "execution_failed_ids", execution_failed)
+        object.__setattr__(self, "product_red_ids", product_red)
+        object.__setattr__(self, "integrity_conflict_ids", integrity_conflict)
         return self
 
 
@@ -286,6 +319,17 @@ class DiagnosticMetric(BaseModel):
         refs = _canonical_ids(self.evidence_refs, label="diagnostic evidence refs")
         object.__setattr__(self, "evidence_refs", refs)
         return self
+
+
+def _product_red_bearing_failures(obligation: TypedObligationSet) -> tuple[str, ...]:
+    """The failed identities that assert a red test outcome.
+
+    A step that never dispatched and an identity conflict are failures about
+    the run, not about the product, so they carry no claim over the counts.
+    """
+
+    excused = set(obligation.execution_failed_ids) | set(obligation.integrity_conflict_ids)
+    return tuple(item for item in obligation.failed_ids if item not in excused)
 
 
 class JavaCertificateInput(BaseModel):
@@ -367,8 +411,8 @@ class JavaCertificateInput(BaseModel):
             raise ValueError("unavailable test results cannot carry counts")
         if self.test_results_authority == "receipt_bound" and self.test_counts is not None:
             counts_are_red = bool(self.test_counts.failed or self.test_counts.errors)
-            targets_are_red = bool(self.test_targets.failed_ids)
-            steps_are_red = bool(self.test_steps.failed_ids)
+            targets_are_red = bool(_product_red_bearing_failures(self.test_targets))
+            steps_are_red = bool(_product_red_bearing_failures(self.test_steps))
             if counts_are_red and not targets_are_red:
                 raise ValueError("red receipt-bound counts require a failed test-target identity")
             if not counts_are_red and (targets_are_red or steps_are_red):
@@ -411,6 +455,37 @@ class SatisfactionInterval(BaseModel):
         return self
 
 
+class FailureAttribution(BaseModel):
+    """r2 §18/3: the failed identities split by the kind of defeat they record.
+
+    ``failed_ids`` alone cannot tell a runner that never ran from a product
+    test that went red from an identity contradiction.  ``null`` on an
+    obligation set means no attribution was recorded, which is never the same
+    claim as an attribution of zero.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    execution_failed: int = Field(ge=0)
+    product_red: int = Field(ge=0)
+    integrity_conflict: int = Field(ge=0)
+    execution_failed_ids: tuple[str, ...] = ()
+    product_red_ids: tuple[str, ...] = ()
+    integrity_conflict_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _counts_restate_the_identities(self) -> "FailureAttribution":
+        if (self.execution_failed, self.product_red, self.integrity_conflict) != (
+            len(self.execution_failed_ids),
+            len(self.product_red_ids),
+            len(self.integrity_conflict_ids),
+        ):
+            raise ValueError("a failure-kind count disagrees with its identity list")
+        if not (self.execution_failed or self.product_red or self.integrity_conflict):
+            raise ValueError("an unattributed failure set is null, never a zero record")
+        return self
+
+
 class ObligationMetrics(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -436,9 +511,16 @@ class ObligationMetrics(BaseModel):
     missing_ids: tuple[str, ...]
     unexpected_ids: tuple[str, ...]
     evidence_refs: tuple[str, ...]
+    failure_attribution: FailureAttribution | None = None
 
     @model_validator(mode="after")
     def _validate_single_measurement_object(self) -> "ObligationMetrics":
+        attribution = self.failure_attribution
+        if attribution is not None and (
+            attribution.execution_failed + attribution.product_red + attribution.integrity_conflict
+            > self.failed
+        ):
+            raise ValueError("the attributed failure kinds exceed the failed identity count")
         measured = self.closure_fraction is not None
         if (self.success_fraction is not None) is not measured:
             raise ValueError("the closure and success fractions disagree about measurement")
@@ -574,6 +656,12 @@ class JavaSuccessCertificate(BaseModel):
             item.defeater_type == "rebutting" for item in self.typed_reason_codes
         ):
             raise ValueError("a failing certificate must carry a rebutting reason code")
+        # The dual C4 clause: ``unverifiable`` is the authority-undercut species
+        # of UNKNOWN, so the defeater that removed the authority must be named.
+        if self.result == "unverifiable" and not any(
+            item.defeater_type == "undercutting" for item in self.typed_reason_codes
+        ):
+            raise ValueError("an unverifiable certificate must carry an undercutting reason code")
         return self
 
     def model_dump_json(self, **kwargs: Any) -> str:
@@ -642,6 +730,20 @@ def _obligation_metrics(obligation: TypedObligationSet, subject: ScopeSubject) -
             ensure_ascii=True,
         ).encode("utf-8")
     ).hexdigest()
+    attribution: FailureAttribution | None = None
+    if (
+        obligation.execution_failed_ids
+        or obligation.product_red_ids
+        or obligation.integrity_conflict_ids
+    ):
+        attribution = FailureAttribution(
+            execution_failed=len(obligation.execution_failed_ids),
+            product_red=len(obligation.product_red_ids),
+            integrity_conflict=len(obligation.integrity_conflict_ids),
+            execution_failed_ids=obligation.execution_failed_ids,
+            product_red_ids=obligation.product_red_ids,
+            integrity_conflict_ids=obligation.integrity_conflict_ids,
+        )
     return ObligationMetrics(
         unit=obligation.unit,
         basis_ref=obligation.basis_ref,
@@ -665,6 +767,7 @@ def _obligation_metrics(obligation: TypedObligationSet, subject: ScopeSubject) -
         missing_ids=missing_ids,
         unexpected_ids=obligation.unexpected_ids,
         evidence_refs=obligation.evidence_refs,
+        failure_attribution=attribution,
     )
 
 
@@ -672,20 +775,63 @@ def _blocked(payload: JavaCertificateInput, axis: ProofAxis) -> bool:
     return any(axis in blocker.affects for blocker in payload.blockers)
 
 
-def _scope_axis_truth(scope: ScopeClaim) -> AxisTruth:
+def _blocked_axes(payload: JavaCertificateInput) -> frozenset[ProofAxis]:
+    return frozenset(axis for blocker in payload.blockers for axis in blocker.affects)
+
+
+def _execution_failures(*obligations: ObligationMetrics) -> int:
+    return sum(
+        item.failure_attribution.execution_failed
+        for item in obligations
+        if item.failure_attribution is not None
+    )
+
+
+def _integrity_conflicts(*obligations: ObligationMetrics) -> int:
+    return sum(
+        item.failure_attribution.integrity_conflict
+        for item in obligations
+        if item.failure_attribution is not None
+    )
+
+
+def _scope_axis_truth(scope: ScopeClaim, *, blocked: bool) -> AxisTruth:
+    # A blocker on the scope axis undercuts the sealing proof itself, so the
+    # axis cannot keep publishing PASS while the certificate reads unverifiable.
+    if blocked:
+        return "UNKNOWN"
     if scope.closure == "closed" and scope.kind != "unknown":
         return "PASS"
     return "UNKNOWN"
 
 
+def _test_outcome_axis_truth(
+    status: TestOutcomeStatus,
+    *,
+    test_results_authority: TestResultsAuthority,
+    blocked: bool,
+) -> AxisTruth:
+    # SAG-MS-1 Theorem 6.2 (ii): unbound observations grade nothing.  An
+    # unbound clean run cannot read PASS and an unbound red run cannot read
+    # FAIL, whatever the diagnostic counts say.
+    if status == "not_applicable":
+        return "NOT_APPLICABLE"
+    if blocked or test_results_authority != "receipt_bound":
+        return "UNKNOWN"
+    return TEST_OUTCOME_AXIS_TRUTH[status]
+
+
 def _typed_reason_codes(
     *,
     build_status: BuildStatus,
+    test_execution_status: TestExecutionStatus,
     test_outcome_status: TestOutcomeStatus,
+    test_outcome_truth: AxisTruth,
     test_results_authority: TestResultsAuthority,
     integrity_status: IntegrityStatus,
     scope_truth: AxisTruth,
     documented_no_automated_tests: bool,
+    blocked_axes: frozenset[ProofAxis],
     obligations: tuple[ObligationMetrics, ...],
 ) -> tuple[TypedReasonCode, ...]:
     """Derive the typed defeater summary from the sealed certificate surface."""
@@ -693,18 +839,26 @@ def _typed_reason_codes(
     codes: dict[str, DefeaterType] = {}
     if build_status == "failed":
         codes["AUTHORITATIVE_BUILD_FAILURE"] = "rebutting"
-    if test_outcome_status == "red":
+    if test_execution_status == "failed":
+        codes["TEST_EXECUTION_FAILURE"] = "rebutting"
+    if test_outcome_truth == "FAIL":
         codes["TEST_OUTCOME_RED"] = "rebutting"
     if any(item.applicability == "required" and item.missing > 0 for item in obligations):
         codes["MISSING_REQUIRED_IDENTITY"] = "incompleteness"
     if test_outcome_status == "empty":
         codes["EMPTY_VERDICT_BEARING_RESULT"] = "vacuity"
+    if _integrity_conflicts(*obligations):
+        codes["IDENTITY_CONFLICT"] = "undercutting"
     if test_results_authority == "diagnostic":
         codes["DIAGNOSTIC_ONLY_OBSERVATION"] = "undercutting"
+    if test_results_authority == "unavailable" and not documented_no_automated_tests:
+        codes["TEST_RESULTS_UNAVAILABLE"] = "undercutting"
     if integrity_status in {"degraded", "unavailable"}:
         codes["LINEAGE_UNAVAILABLE"] = "undercutting"
-    if scope_truth == "UNKNOWN":
+    if scope_truth == "UNKNOWN" or any(item.applicability == "unknown" for item in obligations):
         codes["UNSEALED_DENOMINATOR"] = "undercutting"
+    for axis in blocked_axes:
+        codes[BLOCKED_AXIS_REASON_CODES[axis]] = "undercutting"
     if documented_no_automated_tests:
         codes["DOCUMENTED_NO_AUTOMATED_TESTS"] = "applicability"
     return tuple(TypedReasonCode(code=code, defeater_type=codes[code]) for code in sorted(codes))
@@ -724,15 +878,19 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
     test_targets = _obligation_metrics(payload.test_targets, subject)
     evidence = _obligation_metrics(payload.evidence_items, subject)
 
+    obligations = (build_steps, build_units, test_steps, test_targets, evidence)
     if (
+        evidence.status in {"unavailable", "failed"}
+        or _blocked(payload, "integrity")
+        or _integrity_conflicts(*obligations)
+    ):
+        integrity_status: Literal["complete", "degraded", "unavailable"] = "unavailable"
+    elif (
         evidence.status == "complete"
         and payload.unsettled_jobs == 0
         and payload.terminal_receipts_unpersisted == 0
-        and not _blocked(payload, "integrity")
     ):
-        integrity_status: Literal["complete", "degraded", "unavailable"] = "complete"
-    elif evidence.status in {"unavailable", "failed"} or _blocked(payload, "integrity"):
-        integrity_status = "unavailable"
+        integrity_status = "complete"
     else:
         integrity_status = "degraded"
     integrity = IntegrityAssessment(
@@ -755,6 +913,12 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
 
     if payload.documented_no_automated_tests:
         test_execution_status: TestExecutionStatus = "not_applicable"
+    elif (
+        _execution_failures(test_steps, test_targets)
+        and integrity_status != "unavailable"
+        and not _blocked(payload, "test_execution")
+    ):
+        test_execution_status = "failed"
     elif (
         test_steps.applicability == "required"
         and test_targets.applicability == "required"
@@ -801,6 +965,13 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
     else:
         test_outcome_status = "clean"
 
+    blocked_axes = _blocked_axes(payload)
+    scope_truth = _scope_axis_truth(payload.scope, blocked=_blocked(payload, "scope"))
+    test_outcome_truth = _test_outcome_axis_truth(
+        test_outcome_status,
+        test_results_authority=payload.test_results_authority,
+        blocked=_blocked(payload, "test_outcome"),
+    )
     build_success = build_status == "success"
     test_execution_complete = test_execution_status == "complete"
     test_obligations_successful = (
@@ -871,15 +1042,15 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
     elif scoped_green:
         result = "scoped_green"
         proof_status = positive_proof
+    elif test_execution_status == "failed":
+        result = "test_execution_failed"
+        proof_status = positive_proof
     elif _blocked(payload, "test_outcome"):
         result = "unverifiable"
         proof_status = "unverifiable"
-    elif (
-        build_success
-        and test_execution_complete
-        and test_outcome_status == "red"
-        and test_targets.failed > 0
-    ):
+    elif test_execution_complete and test_outcome_truth == "FAIL" and test_targets.failed > 0:
+        # SAG-MS-1 Definition 7.2 / Lemma 7.3: an intact FAIL on one axis is the
+        # overall truth whatever an unrelated axis still leaves open.
         result = "test_red"
         proof_status = positive_proof
     elif (
@@ -897,17 +1068,19 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
         result = "incomplete"
         proof_status = "partial"
 
-    scope_truth = _scope_axis_truth(payload.scope)
     overall_truth = OVERALL_TRUTH_BY_RESULT[result]
     assurance = ASSURANCE_BY_LEVEL[payload.assurance_level]
     typed_reason_codes = _typed_reason_codes(
         build_status=build_status,
+        test_execution_status=test_execution_status,
         test_outcome_status=test_outcome_status,
+        test_outcome_truth=test_outcome_truth,
         test_results_authority=payload.test_results_authority,
         integrity_status=integrity_status,
         scope_truth=scope_truth,
         documented_no_automated_tests=payload.documented_no_automated_tests,
-        obligations=(build_steps, build_units, test_steps, test_targets, evidence),
+        blocked_axes=blocked_axes,
+        obligations=obligations,
     )
     # Provisional promotion policy: r2 open decision #2 has not sealed which
     # scope classes may promote, so only the two repository scopes qualify.
@@ -933,7 +1106,7 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
             scope=scope_truth,
             build=BUILD_AXIS_TRUTH[build_status],
             test_execution=TEST_EXECUTION_AXIS_TRUTH[test_execution_status],
-            test_outcome=TEST_OUTCOME_AXIS_TRUTH[test_outcome_status],
+            test_outcome=test_outcome_truth,
             integrity=INTEGRITY_AXIS_TRUTH[integrity_status],
         ),
         typed_reason_codes=typed_reason_codes,

@@ -52,6 +52,15 @@ measured absence. Each certificate also carries the SAG-MS-1 truth surface —
 kind. Those fields are additive and derived; the legacy `result`,
 `proof_status`, and `assurance_level` remain canonical.
 
+The `test_outcome` axis truth is gated on evidence authority: Ignite and the
+Cassandra driver both hold diagnostic-only observations, so their outcome axis
+reads `UNKNOWN` and their counts raise no rebutting code, however clean or red
+those counts look. Each obligation set also carries `failure_attribution`,
+which splits the failed identities into `execution_failed`, `product_red`, and
+`integrity_conflict`; it is `null` in this projection because the reviewed
+legacy evidence attributes no failure kind, and `null` there is the absence of
+an attribution, never an attribution of zero.
+
 Runtime test executions, static test declarations, source files, and compiled
 classes are retained only as separate-grain diagnostics. They never share a
 denominator and never close a plan step or module target. A green result also
@@ -68,6 +77,6 @@ UV_CACHE_DIR=/tmp/setup-agent-java-cert-uv-cache uv run python \
 ```
 
 The generated JSON SHA-256 is
-`85c5e2d02a51711d18045198420b8856fbf0225e05d2987e57bc7163029f258d`.
+`777a80d80e80b5b6a7a4a1e953e65c5f5e892b8f1912963cc3219740d42b2ec5`.
 The source-checksum snapshot SHA-256 is
 `cbd4200664f5304a883c687dfaf5beffbe113cea54f697e7f5d3395d9b342a50`.

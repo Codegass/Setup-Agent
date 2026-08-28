@@ -26,6 +26,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -67,6 +68,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -128,6 +130,7 @@
           ],
           "failed": 0,
           "failed_ids": [],
+          "failure_attribution": null,
           "interval": {
             "denominator": 6,
             "lower_numerator": 6,
@@ -218,6 +221,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -258,6 +262,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -312,6 +317,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -353,6 +359,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -426,6 +433,7 @@
           ],
           "failed": 0,
           "failed_ids": [],
+          "failure_attribution": null,
           "interval": {
             "denominator": 6,
             "lower_numerator": 6,
@@ -517,6 +525,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -557,6 +566,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -593,7 +603,7 @@
         "integrity": "PASS",
         "scope": "UNKNOWN",
         "test_execution": "UNKNOWN",
-        "test_outcome": "PASS"
+        "test_outcome": "UNKNOWN"
       },
       "blockers": [],
       "build_status": "success",
@@ -611,6 +621,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -651,6 +662,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 41,
           "lower_numerator": 41,
@@ -816,6 +828,7 @@
           ],
           "failed": 0,
           "failed_ids": [],
+          "failure_attribution": null,
           "interval": {
             "denominator": 6,
             "lower_numerator": 6,
@@ -907,6 +920,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -948,6 +962,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 28,
           "lower_numerator": 0,
@@ -1071,6 +1086,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -1111,6 +1127,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 23,
           "lower_numerator": 23,
@@ -1217,6 +1234,7 @@
           ],
           "failed": 0,
           "failed_ids": [],
+          "failure_attribution": null,
           "interval": {
             "denominator": 6,
             "lower_numerator": 6,
@@ -1307,6 +1325,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 1,
@@ -1347,6 +1366,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 0,
@@ -1396,7 +1416,7 @@
         "integrity": "PASS",
         "scope": "UNKNOWN",
         "test_execution": "UNKNOWN",
-        "test_outcome": "FAIL"
+        "test_outcome": "UNKNOWN"
       },
       "blockers": [],
       "build_status": "failed",
@@ -1417,6 +1437,7 @@
         "failed_ids": [
           "plan:build:0:root-compile"
         ],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 0,
@@ -1459,6 +1480,7 @@
         "failed_ids": [
           "Apache Cassandra Java Driver - core"
         ],
+        "failure_attribution": null,
         "interval": {
           "denominator": 8,
           "lower_numerator": 3,
@@ -1572,6 +1594,7 @@
           ],
           "failed": 0,
           "failed_ids": [],
+          "failure_attribution": null,
           "interval": {
             "denominator": 7,
             "lower_numerator": 7,
@@ -1665,6 +1688,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": {
           "denominator": 1,
           "lower_numerator": 0,
@@ -1705,6 +1729,7 @@
         ],
         "failed": 0,
         "failed_ids": [],
+        "failure_attribution": null,
         "interval": null,
         "missing": 0,
         "missing_ids": [],
@@ -1734,10 +1759,6 @@
         {
           "code": "MISSING_REQUIRED_IDENTITY",
           "defeater_type": "incompleteness"
-        },
-        {
-          "code": "TEST_OUTCOME_RED",
-          "defeater_type": "rebutting"
         },
         {
           "code": "UNSEALED_DENOMINATOR",

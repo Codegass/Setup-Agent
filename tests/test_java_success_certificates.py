@@ -64,6 +64,9 @@ def _obligations(
     unexpected=(),
     applicability="required",
     subject=None,
+    execution_failed=(),
+    product_red=(),
+    integrity_conflict=(),
 ):
     subject = subject or _subject()
     return TypedObligationSet(
@@ -79,6 +82,9 @@ def _obligations(
         failed_ids=failed,
         unexpected_ids=unexpected,
         evidence_refs=(f"evidence:{unit}",),
+        execution_failed_ids=execution_failed,
+        product_red_ids=product_red,
+        integrity_conflict_ids=integrity_conflict,
     )
 
 
