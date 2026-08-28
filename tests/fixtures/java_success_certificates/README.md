@@ -41,6 +41,17 @@ Every set reports `required`, `closed`, `satisfied`, `failed`, `missing`, and
 rounded into percentages, so a partial set cannot display as 100%. A failed
 obligation can therefore be fully closed without being successful.
 
+Each measured set additionally serializes the same counts as integer pairs —
+`closure_pair`, `satisfaction_pair`, and the satisfaction `interval`
+(`[satisfied, satisfied + missing] / required`). They are the SAG-MS-1 §5 view
+of one object, never a second opinion: a `not_applicable` or unsealed set
+carries `null` there and in the fraction strings, because zero would assert a
+measured absence. Each certificate also carries the SAG-MS-1 truth surface —
+`overall_truth`, `result_class`, per-axis `axis_truths`, the renamed
+`assurance`, `promotion_eligible`, and `typed_reason_codes` with their defeater
+kind. Those fields are additive and derived; the legacy `result`,
+`proof_status`, and `assurance_level` remain canonical.
+
 Runtime test executions, static test declarations, source files, and compiled
 classes are retained only as separate-grain diagnostics. They never share a
 denominator and never close a plan step or module target. A green result also
@@ -57,6 +68,6 @@ UV_CACHE_DIR=/tmp/setup-agent-java-cert-uv-cache uv run python \
 ```
 
 The generated JSON SHA-256 is
-`442c4052f538549f2579e8693283f7f5b40752ebdac322415a491d885e09ea34`.
+`85c5e2d02a51711d18045198420b8856fbf0225e05d2987e57bc7163029f258d`.
 The source-checksum snapshot SHA-256 is
 `cbd4200664f5304a883c687dfaf5beffbe113cea54f697e7f5d3395d9b342a50`.

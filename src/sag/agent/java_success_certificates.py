@@ -61,6 +61,67 @@ ObligationUnit = Literal[
     "gradle_test_task",
     "evidence_binding",
 ]
+IntegrityStatus = Literal["complete", "degraded", "unavailable"]
+TestResultsAuthority = Literal["receipt_bound", "diagnostic", "unavailable"]
+
+# SAG-MS-1 truth surface.  The internal four values collapse to three in
+# public: ``INCONC`` and ``ERROR`` both read ``UNKNOWN`` while the result class
+# keeps the species (``incomplete`` versus ``unverifiable``).
+TruthValue = Literal["PASS", "FAIL", "UNKNOWN"]
+AxisTruth = Literal["PASS", "FAIL", "UNKNOWN", "NOT_APPLICABLE"]
+Assurance = Literal["PROJECTED", "RECEIPT_BOUND", "SEALED_LINEAGE"]
+DefeaterType = Literal[
+    "rebutting",
+    "undercutting",
+    "incompleteness",
+    "vacuity",
+    "applicability",
+]
+
+OVERALL_TRUTH_BY_RESULT: dict[CertificateResult, TruthValue] = {
+    "repository_green": "PASS",
+    "repository_product_test_green": "PASS",
+    "scoped_green": "PASS",
+    "build_only": "PASS",
+    "build_failed": "FAIL",
+    "test_red": "FAIL",
+    "incomplete": "UNKNOWN",
+    "unverifiable": "UNKNOWN",
+}
+BUILD_AXIS_TRUTH: dict[BuildStatus, AxisTruth] = {
+    "success": "PASS",
+    "failed": "FAIL",
+    "incomplete": "UNKNOWN",
+    "unverifiable": "UNKNOWN",
+}
+TEST_EXECUTION_AXIS_TRUTH: dict[TestExecutionStatus, AxisTruth] = {
+    "complete": "PASS",
+    "incomplete": "UNKNOWN",
+    "unverifiable": "UNKNOWN",
+    "not_applicable": "NOT_APPLICABLE",
+}
+TEST_OUTCOME_AXIS_TRUTH: dict[TestOutcomeStatus, AxisTruth] = {
+    "clean": "PASS",
+    "red": "FAIL",
+    "empty": "UNKNOWN",
+    "unknown": "UNKNOWN",
+    "not_applicable": "NOT_APPLICABLE",
+}
+INTEGRITY_AXIS_TRUTH: dict[IntegrityStatus, AxisTruth] = {
+    "complete": "PASS",
+    "degraded": "UNKNOWN",
+    "unavailable": "UNKNOWN",
+}
+ASSURANCE_BY_LEVEL: dict[AssuranceLevel, Assurance] = {
+    "legacy_projected": "PROJECTED",
+    "receipt_bound": "RECEIPT_BOUND",
+    "sealed_lineage": "SEALED_LINEAGE",
+}
+# Provisional until r2 open decision #2 seals which scope classes may promote;
+# ``ci_matrix`` deliberately stays out while that decision is open.
+PROMOTABLE_SCOPE_KINDS: frozenset[str] = frozenset(
+    {"repository_default", "repository_product_tests"}
+)
 
 
 def _canonical_ids(values: tuple[str, ...], *, label: str) -> tuple[str, ...]:
@@ -238,7 +299,7 @@ class JavaCertificateInput(BaseModel):
     test_steps: TypedObligationSet
     test_targets: TypedObligationSet
     evidence_items: TypedObligationSet
-    test_results_authority: Literal["receipt_bound", "diagnostic", "unavailable"]
+    test_results_authority: TestResultsAuthority
     test_counts: TestCounts | None = None
     documented_no_automated_tests: bool = False
     unsettled_jobs: int = Field(default=0, ge=0)
@@ -317,6 +378,39 @@ class JavaCertificateInput(BaseModel):
         return self
 
 
+class CountPair(BaseModel):
+    """An exact fraction as integers; percentages are presentation only."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    numerator: int = Field(ge=0)
+    denominator: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _within_the_universe(self) -> "CountPair":
+        if self.numerator > self.denominator:
+            raise ValueError("a fraction over a required identity universe cannot exceed one")
+        return self
+
+
+class SatisfactionInterval(BaseModel):
+    """The exact range of satisfaction over every completion of one structure."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lower_numerator: int = Field(ge=0)
+    upper_numerator: int = Field(ge=0)
+    denominator: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _ordered_within_the_universe(self) -> "SatisfactionInterval":
+        if self.lower_numerator > self.upper_numerator:
+            raise ValueError("the satisfaction interval lower endpoint exceeds its upper endpoint")
+        if self.upper_numerator > self.denominator:
+            raise ValueError("the satisfaction interval cannot exceed one")
+        return self
+
+
 class ObligationMetrics(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -333,6 +427,9 @@ class ObligationMetrics(BaseModel):
     unexpected: int
     closure_fraction: str | None
     success_fraction: str | None
+    closure_pair: CountPair | None = None
+    satisfaction_pair: CountPair | None = None
+    interval: SatisfactionInterval | None = None
     required_ids: tuple[str, ...]
     satisfied_ids: tuple[str, ...]
     failed_ids: tuple[str, ...]
@@ -340,11 +437,57 @@ class ObligationMetrics(BaseModel):
     unexpected_ids: tuple[str, ...]
     evidence_refs: tuple[str, ...]
 
+    @model_validator(mode="after")
+    def _validate_single_measurement_object(self) -> "ObligationMetrics":
+        measured = self.closure_fraction is not None
+        if (self.success_fraction is not None) is not measured:
+            raise ValueError("the closure and success fractions disagree about measurement")
+        closure_pair = self.closure_pair
+        satisfaction_pair = self.satisfaction_pair
+        interval = self.interval
+        if closure_pair is None or satisfaction_pair is None or interval is None:
+            if not (closure_pair is None and satisfaction_pair is None and interval is None):
+                raise ValueError("the structured obligation measures are partially populated")
+            if measured:
+                raise ValueError("a measured obligation set must carry structured measures")
+            return self
+        if not measured:
+            raise ValueError("an unmeasured obligation set cannot carry structured measures")
+        if self.required != self.satisfied + self.failed + self.missing:
+            raise ValueError("the obligation counts do not partition the required universe")
+        if self.closed != self.satisfied + self.failed:
+            raise ValueError("the closed count does not equal the terminal identities")
+        if self.closure_fraction != f"{self.closed}/{self.required}":
+            raise ValueError("the closure fraction disagrees with the obligation counts")
+        if self.success_fraction != f"{self.satisfied}/{self.required}":
+            raise ValueError("the success fraction disagrees with the obligation counts")
+        if (closure_pair.numerator, closure_pair.denominator) != (self.closed, self.required):
+            raise ValueError("the closure pair disagrees with the obligation counts")
+        if (satisfaction_pair.numerator, satisfaction_pair.denominator) != (
+            self.satisfied,
+            self.required,
+        ):
+            raise ValueError("the satisfaction pair disagrees with the obligation counts")
+        if (
+            interval.lower_numerator,
+            interval.upper_numerator,
+            interval.denominator,
+        ) != (self.satisfied, self.satisfied + self.missing, self.required):
+            raise ValueError("the satisfaction interval disagrees with the obligation counts")
+        # The interval collapse is the status: a capped upper endpoint is a
+        # definite failure, and a degenerate interval is exact completion.
+        if (interval.upper_numerator < interval.denominator) is not (self.failed > 0):
+            raise ValueError("the interval collapse disagrees with the failed identity count")
+        degenerate = interval.lower_numerator == interval.upper_numerator == interval.denominator
+        if degenerate is not (self.status == "complete"):
+            raise ValueError("the degenerate interval disagrees with the obligation status")
+        return self
+
 
 class IntegrityAssessment(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    status: Literal["complete", "degraded", "unavailable"]
+    status: IntegrityStatus
     evidence: ObligationMetrics
     unsettled_jobs: int
     terminal_receipts_unpersisted: int
@@ -359,6 +502,27 @@ class CertificateFlags(BaseModel):
     green_proof_verified: bool
 
 
+class AxisTruths(BaseModel):
+    """Per-axis public truth.  ``NOT_APPLICABLE`` is applicability, not truth."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    scope: AxisTruth
+    build: AxisTruth
+    test_execution: AxisTruth
+    test_outcome: AxisTruth
+    integrity: AxisTruth
+
+
+class TypedReasonCode(BaseModel):
+    """A reason code carrying the defeater kind that bounds what it can do."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: str = Field(min_length=1, max_length=128)
+    defeater_type: DefeaterType
+
+
 class JavaSuccessCertificate(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -368,9 +532,15 @@ class JavaSuccessCertificate(BaseModel):
     target_sha: str
     plan_sha256: str
     assurance_level: AssuranceLevel
+    assurance: Assurance
     scope: ScopeClaim
     proof_status: ProofStatus
     result: CertificateResult
+    result_class: str
+    overall_truth: TruthValue
+    axis_truths: AxisTruths
+    typed_reason_codes: tuple[TypedReasonCode, ...]
+    promotion_eligible: bool
     build_status: BuildStatus
     build_steps: ObligationMetrics
     build_units: ObligationMetrics
@@ -379,11 +549,32 @@ class JavaSuccessCertificate(BaseModel):
     test_targets: ObligationMetrics
     test_outcome_status: TestOutcomeStatus
     test_counts: TestCounts | None
-    test_results_authority: Literal["receipt_bound", "diagnostic", "unavailable"]
+    test_results_authority: TestResultsAuthority
     integrity: IntegrityAssessment
     flags: CertificateFlags
     blockers: tuple[CertificateBlocker, ...]
     diagnostics: tuple[DiagnosticMetric, ...]
+
+    @model_validator(mode="after")
+    def _validate_truth_surface(self) -> "JavaSuccessCertificate":
+        if self.result_class != self.result:
+            raise ValueError("the v2 result class must alias the canonical result")
+        if self.overall_truth != OVERALL_TRUTH_BY_RESULT[self.result]:
+            raise ValueError("the overall truth disagrees with the result class")
+        if self.assurance != ASSURANCE_BY_LEVEL[self.assurance_level]:
+            raise ValueError("the assurance alias disagrees with the assurance level")
+        codes = tuple(item.code for item in self.typed_reason_codes)
+        if len(set(codes)) != len(codes):
+            raise ValueError("a typed reason code is repeated")
+        if tuple(sorted(codes)) != codes:
+            raise ValueError("typed reason codes are not ordered by code")
+        # SAG-MS-1 C4: every FAIL is witnessed by an intact rebutting defeater.
+        # A certificate that fails without one is a bug, not a renderable state.
+        if self.overall_truth == "FAIL" and not any(
+            item.defeater_type == "rebutting" for item in self.typed_reason_codes
+        ):
+            raise ValueError("a failing certificate must carry a rebutting reason code")
+        return self
 
     def model_dump_json(self, **kwargs: Any) -> str:
         indent = kwargs.pop("indent", None)
@@ -403,6 +594,9 @@ def _obligation_metrics(obligation: TypedObligationSet, subject: ScopeSubject) -
     required = set(obligation.required_ids)
     observed = set(obligation.satisfied_ids) | set(obligation.failed_ids)
     missing_ids = tuple(item for item in obligation.required_ids if item not in observed)
+    closure_pair: CountPair | None = None
+    satisfaction_pair: CountPair | None = None
+    interval: SatisfactionInterval | None = None
     if obligation.applicability == "not_applicable":
         status: ObligationStatus = "not_applicable"
         closure_fraction = None
@@ -411,18 +605,24 @@ def _obligation_metrics(obligation: TypedObligationSet, subject: ScopeSubject) -
         status = "unavailable"
         closure_fraction = None
         success_fraction = None
-    elif obligation.failed_ids:
-        status = "failed"
-        closure_fraction = f"{len(observed)}/{len(required)}"
-        success_fraction = f"{len(obligation.satisfied_ids)}/{len(required)}"
-    elif missing_ids:
-        status = "incomplete"
-        closure_fraction = f"{len(observed)}/{len(required)}"
-        success_fraction = f"{len(obligation.satisfied_ids)}/{len(required)}"
     else:
-        status = "complete"
+        if obligation.failed_ids:
+            status = "failed"
+        elif missing_ids:
+            status = "incomplete"
+        else:
+            status = "complete"
         closure_fraction = f"{len(observed)}/{len(required)}"
         success_fraction = f"{len(obligation.satisfied_ids)}/{len(required)}"
+        closure_pair = CountPair(numerator=len(observed), denominator=len(required))
+        satisfaction_pair = CountPair(
+            numerator=len(obligation.satisfied_ids), denominator=len(required)
+        )
+        interval = SatisfactionInterval(
+            lower_numerator=len(obligation.satisfied_ids),
+            upper_numerator=len(obligation.satisfied_ids) + len(missing_ids),
+            denominator=len(required),
+        )
     identity_payload = {
         "applicability": obligation.applicability,
         "basis_ref": obligation.basis_ref,
@@ -456,6 +656,9 @@ def _obligation_metrics(obligation: TypedObligationSet, subject: ScopeSubject) -
         unexpected=len(obligation.unexpected_ids),
         closure_fraction=closure_fraction,
         success_fraction=success_fraction,
+        closure_pair=closure_pair,
+        satisfaction_pair=satisfaction_pair,
+        interval=interval,
         required_ids=obligation.required_ids,
         satisfied_ids=obligation.satisfied_ids,
         failed_ids=obligation.failed_ids,
@@ -467,6 +670,44 @@ def _obligation_metrics(obligation: TypedObligationSet, subject: ScopeSubject) -
 
 def _blocked(payload: JavaCertificateInput, axis: ProofAxis) -> bool:
     return any(axis in blocker.affects for blocker in payload.blockers)
+
+
+def _scope_axis_truth(scope: ScopeClaim) -> AxisTruth:
+    if scope.closure == "closed" and scope.kind != "unknown":
+        return "PASS"
+    return "UNKNOWN"
+
+
+def _typed_reason_codes(
+    *,
+    build_status: BuildStatus,
+    test_outcome_status: TestOutcomeStatus,
+    test_results_authority: TestResultsAuthority,
+    integrity_status: IntegrityStatus,
+    scope_truth: AxisTruth,
+    documented_no_automated_tests: bool,
+    obligations: tuple[ObligationMetrics, ...],
+) -> tuple[TypedReasonCode, ...]:
+    """Derive the typed defeater summary from the sealed certificate surface."""
+
+    codes: dict[str, DefeaterType] = {}
+    if build_status == "failed":
+        codes["AUTHORITATIVE_BUILD_FAILURE"] = "rebutting"
+    if test_outcome_status == "red":
+        codes["TEST_OUTCOME_RED"] = "rebutting"
+    if any(item.applicability == "required" and item.missing > 0 for item in obligations):
+        codes["MISSING_REQUIRED_IDENTITY"] = "incompleteness"
+    if test_outcome_status == "empty":
+        codes["EMPTY_VERDICT_BEARING_RESULT"] = "vacuity"
+    if test_results_authority == "diagnostic":
+        codes["DIAGNOSTIC_ONLY_OBSERVATION"] = "undercutting"
+    if integrity_status in {"degraded", "unavailable"}:
+        codes["LINEAGE_UNAVAILABLE"] = "undercutting"
+    if scope_truth == "UNKNOWN":
+        codes["UNSEALED_DENOMINATOR"] = "undercutting"
+    if documented_no_automated_tests:
+        codes["DOCUMENTED_NO_AUTOMATED_TESTS"] = "applicability"
+    return tuple(TypedReasonCode(code=code, defeater_type=codes[code]) for code in sorted(codes))
 
 
 def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSuccessCertificate:
@@ -656,15 +897,47 @@ def evaluate_java_success_certificate(payload: JavaCertificateInput) -> JavaSucc
         result = "incomplete"
         proof_status = "partial"
 
+    scope_truth = _scope_axis_truth(payload.scope)
+    overall_truth = OVERALL_TRUTH_BY_RESULT[result]
+    assurance = ASSURANCE_BY_LEVEL[payload.assurance_level]
+    typed_reason_codes = _typed_reason_codes(
+        build_status=build_status,
+        test_outcome_status=test_outcome_status,
+        test_results_authority=payload.test_results_authority,
+        integrity_status=integrity_status,
+        scope_truth=scope_truth,
+        documented_no_automated_tests=payload.documented_no_automated_tests,
+        obligations=(build_steps, build_units, test_steps, test_targets, evidence),
+    )
+    # Provisional promotion policy: r2 open decision #2 has not sealed which
+    # scope classes may promote, so only the two repository scopes qualify.
+    promotion_eligible = (
+        overall_truth == "PASS"
+        and assurance == "SEALED_LINEAGE"
+        and payload.scope.kind in PROMOTABLE_SCOPE_KINDS
+    )
+
     return JavaSuccessCertificate(
         project_id=subject.project_id,
         run_id=subject.run_id,
         target_sha=subject.target_sha,
         plan_sha256=subject.plan_sha256,
         assurance_level=payload.assurance_level,
+        assurance=assurance,
         scope=payload.scope,
         proof_status=proof_status,
         result=result,
+        result_class=result,
+        overall_truth=overall_truth,
+        axis_truths=AxisTruths(
+            scope=scope_truth,
+            build=BUILD_AXIS_TRUTH[build_status],
+            test_execution=TEST_EXECUTION_AXIS_TRUTH[test_execution_status],
+            test_outcome=TEST_OUTCOME_AXIS_TRUTH[test_outcome_status],
+            integrity=INTEGRITY_AXIS_TRUTH[integrity_status],
+        ),
+        typed_reason_codes=typed_reason_codes,
+        promotion_eligible=promotion_eligible,
         build_status=build_status,
         build_steps=build_steps,
         build_units=build_units,
