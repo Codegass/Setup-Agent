@@ -148,10 +148,71 @@ class TestVetWorkflowConfig:
             """)
         assert vet.laundered is False
 
+    def test_a_uses_step_naming_a_build_action_is_flagged(self):
+        vet = vet_workflow_config("""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@v4
+                  - uses: gradle/gradle-build-action@v3
+                    continue-on-error: true
+            """)
+        assert vet.laundered is True
+        assert vet.locations == ("job:build/step:1",)
+
+    def test_an_allow_failure_flag_launders_an_actions_step(self):
+        # The spec names allow-failure beside continue-on-error.
+        vet = vet_workflow_config("""
+            jobs:
+              build:
+                steps:
+                  - run: mvn -V test
+                    allow-failure: true
+            """)
+        assert vet.laundered is True
+        assert vet.locations == ("job:build/step:0",)
+
+    def test_a_gitlab_job_allow_failure_launders_the_job(self):
+        vet = vet_workflow_config("""
+            test-job:
+              script:
+                - mvn -V test
+              allow_failure: true
+            """)
+        assert vet.laundered is True
+        assert vet.locations == ("job:test-job",)
+
+    def test_a_gitlab_config_without_a_flag_is_read_and_reported_clean(self):
+        vet = vet_workflow_config("""
+            stages: [test]
+            test-job:
+              stage: test
+              script:
+                - mvn -V test
+            """)
+        assert vet.laundered is False
+        assert vet.locations == ()
+
     def test_a_workflow_without_jobs_is_clean(self):
         vet = vet_workflow_config("name: CI\non: [push]\n")
         assert vet.laundered is False
         assert vet.locations == ()
+
+    def test_a_shape_neither_reader_understands_is_disclosed_not_called_clean(self):
+        # Travis-style and Azure-style configs: not read, so never asserted
+        # clean — a clean vet and an unread config must not be byte-identical.
+        travis = vet_workflow_config("language: java\nscript: mvn -V test\n")
+        assert travis.laundered is False
+        assert travis.locations == ("unrecognized-shape",)
+        azure = vet_workflow_config("""
+            jobs:
+              - job: Build
+                steps:
+                  - script: mvn -V test
+                    continueOnError: true
+            """)
+        assert azure.laundered is False
+        assert azure.locations == ("unrecognized-shape",)
 
     def test_unparseable_yaml_is_disclosed_not_crashed(self):
         vet = vet_workflow_config("jobs:\n  - [unbalanced\n")
@@ -287,6 +348,29 @@ class TestMatchCell:
         assert match.cell_id == "JDK11 ubuntu-latest"
         assert match.exact is False
         assert match.caveat == "no cell runs JDK17; matched the nearest below, JDK11"
+
+    def test_a_linux_cell_above_outranks_an_exact_foreign_cell(self):
+        # Spec 4.2: mu is same-JDK-and-linux, else nearest JDK >= on linux.  A
+        # windows cell of the exact JDK is a different test universe and must
+        # not become the frozen obligation.
+        cells = (_cell("JDK17 windows-latest"), _cell("JDK21 ubuntu-latest"))
+        match = match_cell(cells, 17)
+        assert match.cell_id == "JDK21 ubuntu-latest"
+        assert match.exact is False
+        assert match.caveat == (
+            "JDK17 is only proven on windows, not on linux; "
+            "matched the nearest above, JDK21"
+        )
+
+    def test_a_linux_cell_below_outranks_an_exact_foreign_cell(self):
+        cells = (_cell("JDK17 macos-14"), _cell("JDK11 ubuntu-latest"))
+        match = match_cell(cells, 17)
+        assert match.cell_id == "JDK11 ubuntu-latest"
+        assert match.exact is False
+        assert match.caveat == (
+            "JDK17 is only proven on macos, not on linux; "
+            "matched the nearest below, JDK11"
+        )
 
     def test_an_inexact_windows_cell_is_never_substituted(self):
         cells = (_cell("JDK21 windows-latest"), _cell("JDK11 macos-14"))

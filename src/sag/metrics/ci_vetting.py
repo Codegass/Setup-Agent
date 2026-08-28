@@ -2,13 +2,17 @@
 
 Two failure modes make an upstream "success" worthless as a yardstick:
 
-* **Laundering.** ``continue-on-error: true`` on the job, or on the step that
-  actually runs the build or the tests, turns a red run green.  The conclusion
-  is then a statement about the workflow file, not about the code.
+* **Laundering.** ``continue-on-error``/``allow-failure`` on the job, or on the
+  step that actually runs the build or the tests, turns a red run green.  The
+  conclusion is then a statement about the workflow file, not about the code.
+  Two config shapes are read — GitHub Actions ``jobs``/``steps`` and GitLab-style
+  top-level jobs carrying a ``script`` — and anything else is disclosed as
+  un-vetted rather than reported clean.
 * **Cell mismatch.** A JDK17 target proves nothing about a run on JDK8, and a
-  windows-only cell proves little about a Linux container.  Matching therefore
-  prefers the toolchain first and the platform second, and never silently
-  substitutes a windows or macOS cell for a Linux one.
+  windows-only cell proves little about a Linux container.  Linux compatibility
+  is the harder requirement: matching walks the Linux-compatible cells by JDK
+  distance first, and a foreign-platform cell is a last resort, never a
+  substitute for a Linux one that is a major or two away.
 
 This module is pure text and data analysis: it reads YAML the caller already
 holds and cell identifiers the caller already harvested.
@@ -39,6 +43,19 @@ BUILD_TEST_TOKENS: tuple[str, ...] = (
     "verify",
 )
 
+# The spec names continue-on-error and allow-failure; CI systems spell them with
+# either separator, so both punctuations of both names are honoured.
+LAUNDERING_KEYS: tuple[str, ...] = (
+    "continue-on-error",
+    "continue_on_error",
+    "allow-failure",
+    "allow_failure",
+)
+
+# GitHub Actions parses ``on:`` to the boolean True under YAML 1.1, so the marker
+# for "this is a workflow file" is that key or the literal string.
+_ACTIONS_MARKER_KEYS: tuple[Any, ...] = ("jobs", "on", True)
+
 _FALSEY_STRINGS = frozenset({"", "false", "0", "no", "off", "none", "null"})
 
 _JDK_TOKEN_RE = re.compile(
@@ -55,7 +72,7 @@ _WINDOWS_TOKENS = ("windows", "win-", "win32", "win64")
 # Linux is the container platform SAG runs on; an unlabelled cell is treated as
 # Linux-compatible rather than as a foreign platform.
 _OS_RANK: dict[CellOs, int] = {"linux": 0, "unknown": 1, "macos": 2, "windows": 3}
-_LINUX_COMPATIBLE = frozenset({"linux", "unknown"})
+LINUX_COMPATIBLE: frozenset[str] = frozenset({"linux", "unknown"})
 
 
 class LaunderingVet(BaseModel):
@@ -94,6 +111,54 @@ def _mentions_build_or_test(run_text: str) -> bool:
     return any(token in lowered for token in BUILD_TEST_TOKENS)
 
 
+def _swallows_failure(node: dict[Any, Any]) -> bool:
+    return any(_is_truthy(node[key]) for key in LAUNDERING_KEYS if key in node)
+
+
+def _vet_actions_jobs(jobs: dict[Any, Any]) -> LaunderingVet:
+    # Locations are emitted in document order: they name positions in the file.
+    locations: list[str] = []
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if _swallows_failure(job):
+            locations.append(f"job:{job_id}")
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            if not _swallows_failure(step):
+                continue
+            # A step builds or tests either through its shell text or through the
+            # action it calls, so both name the command this step really runs.
+            command = " ".join(
+                text
+                for text in (step.get("run"), step.get("uses"))
+                if isinstance(text, str)
+            )
+            if _mentions_build_or_test(command):
+                locations.append(f"job:{job_id}/step:{index}")
+    return LaunderingVet(laundered=bool(locations), locations=tuple(locations))
+
+
+def _vet_gitlab_jobs(document: dict[Any, Any]) -> LaunderingVet | None:
+    """Vet top-level GitLab-style jobs, or None when the document has none."""
+
+    job_ids = [
+        key
+        for key, value in document.items()
+        if isinstance(key, str) and isinstance(value, dict) and "script" in value
+    ]
+    if not job_ids:
+        return None
+    locations = tuple(
+        f"job:{job_id}" for job_id in job_ids if _swallows_failure(document[job_id])
+    )
+    return LaunderingVet(laundered=bool(locations), locations=locations)
+
+
 def vet_workflow_config(yaml_text: str) -> LaunderingVet:
     """Report every place a workflow config swallows a build or test failure."""
 
@@ -106,31 +171,23 @@ def vet_workflow_config(yaml_text: str) -> LaunderingVet:
     if not isinstance(document, dict):
         return LaunderingVet(laundered=False, locations=("unparseable",))
 
-    jobs = document.get("jobs")
-    if not isinstance(jobs, dict):
+    if "jobs" in document:
+        jobs = document["jobs"]
+        if isinstance(jobs, dict):
+            return _vet_actions_jobs(jobs)
+        return LaunderingVet(laundered=False, locations=("unrecognized-shape",))
+
+    gitlab = _vet_gitlab_jobs(document)
+    if gitlab is not None:
+        return gitlab
+
+    if any(key in document for key in _ACTIONS_MARKER_KEYS):
+        # A workflow that declares no jobs has nothing to swallow.
         return LaunderingVet(laundered=False, locations=())
 
-    # Locations are emitted in document order: they name positions in the file.
-    locations: list[str] = []
-    for job_id, job in jobs.items():
-        if not isinstance(job, dict):
-            continue
-        if _is_truthy(job.get("continue-on-error")):
-            locations.append(f"job:{job_id}")
-        steps = job.get("steps")
-        if not isinstance(steps, list):
-            continue
-        for index, step in enumerate(steps):
-            if not isinstance(step, dict):
-                continue
-            if not _is_truthy(step.get("continue-on-error")):
-                continue
-            run_text = step.get("run")
-            if not isinstance(run_text, str):
-                continue
-            if _mentions_build_or_test(run_text):
-                locations.append(f"job:{job_id}/step:{index}")
-    return LaunderingVet(laundered=bool(locations), locations=tuple(locations))
+    # A shape neither reader understands is disclosed as un-vetted; reporting it
+    # clean would be indistinguishable from a config this module actually read.
+    return LaunderingVet(laundered=False, locations=("unrecognized-shape",))
 
 
 def extract_cell_jdk(cell_id: str) -> int | None:
@@ -185,26 +242,29 @@ def match_cell(cells: Sequence[CellTarget], jdk_major: int) -> CellMatch:
         )
 
     exact_compatible = sorted(
-        (item for item in parsed if item[1] == jdk_major and item[2] in _LINUX_COMPATIBLE),
+        (item for item in parsed if item[1] == jdk_major and item[2] in LINUX_COMPATIBLE),
         key=lambda item: (_OS_RANK[item[2]], item[0]),
     )
     if exact_compatible:
         return CellMatch(cell_id=exact_compatible[0][0], exact=True, caveat=None)
 
+    # Spec 4.2 makes Linux part of mu and nearest-JDK-above the only sanctioned
+    # relaxation, so a foreign-platform cell of the exact JDK is passed over
+    # here; when it exists the caveat names it, since the reader must know the
+    # exact JDK ran somewhere SAG cannot use.
     exact_foreign = sorted(
         (item for item in parsed if item[1] == jdk_major),
         key=lambda item: (_OS_RANK[item[2]], item[0]),
     )
-    if exact_foreign:
-        cell_id, _, cell_os = exact_foreign[0]
-        return CellMatch(
-            cell_id=cell_id,
-            exact=True,
-            caveat=f"JDK{jdk_major} is only proven on {cell_os}, not on linux",
-        )
+    foreign_os = exact_foreign[0][2] if exact_foreign else None
+    passed_over = (
+        f"JDK{jdk_major} is only proven on {foreign_os}, not on linux; matched the nearest "
+        if foreign_os is not None
+        else f"no cell runs JDK{jdk_major}; matched the nearest "
+    )
 
     above = sorted(
-        (item for item in parsed if item[1] > jdk_major and item[2] in _LINUX_COMPATIBLE),
+        (item for item in parsed if item[1] > jdk_major and item[2] in LINUX_COMPATIBLE),
         key=lambda item: (item[1] - jdk_major, _OS_RANK[item[2]], item[0]),
     )
     if above:
@@ -212,11 +272,11 @@ def match_cell(cells: Sequence[CellTarget], jdk_major: int) -> CellMatch:
         return CellMatch(
             cell_id=cell_id,
             exact=False,
-            caveat=f"no cell runs JDK{jdk_major}; matched the nearest above, JDK{major}",
+            caveat=f"{passed_over}above, JDK{major}",
         )
 
     below = sorted(
-        (item for item in parsed if item[1] < jdk_major and item[2] in _LINUX_COMPATIBLE),
+        (item for item in parsed if item[1] < jdk_major and item[2] in LINUX_COMPATIBLE),
         key=lambda item: (jdk_major - item[1], _OS_RANK[item[2]], item[0]),
     )
     if below:
@@ -224,7 +284,15 @@ def match_cell(cells: Sequence[CellTarget], jdk_major: int) -> CellMatch:
         return CellMatch(
             cell_id=cell_id,
             exact=False,
-            caveat=f"no cell runs JDK{jdk_major}; matched the nearest below, JDK{major}",
+            caveat=f"{passed_over}below, JDK{major}",
+        )
+
+    if exact_foreign:
+        cell_id, _, cell_os = exact_foreign[0]
+        return CellMatch(
+            cell_id=cell_id,
+            exact=True,
+            caveat=f"JDK{jdk_major} is only proven on {cell_os}, not on linux",
         )
 
     return CellMatch(
