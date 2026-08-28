@@ -1,0 +1,41 @@
+# synthetic-modeled-on-real: hand-written here, shaped after
+# apache/tomcat-jakartaee-migration .github/workflows/ci.yml @ 50c811bf --
+# same matrix-of-JDK-cells layout and the same "JDK<n> <os>" job names that run
+# reported (JDK11 ubuntu-latest, JDK11 windows-latest, JDK17/18/19-ea).
+# The continue-on-error laundering below is the part this fixture exists to
+# exercise; it is NOT a claim about what upstream ships.
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: JDK${{ matrix.java }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [11, 17, 18]
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Build and test
+        run: mvn -V test
+        continue-on-error: true
+      - name: Upload surefire reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-${{ matrix.java }}-${{ matrix.os }}
+          path: target/surefire-reports
+
+  smoke:
+    name: smoke (8, ubuntu-latest)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./mvnw -q verify
