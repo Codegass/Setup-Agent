@@ -141,7 +141,24 @@ _REPORT_TAG_HEADER_RE = re.compile(r"^([0-9a-f]{64})\s+(\S.*)$")
 # into the receipt.
 GRADLE_NO_TEST_REPORTS = "gradle_no_test_reports_on_disk"
 GRADLE_SUITE_TOTALS_UNREADABLE = "gradle_suite_totals_unreadable"
-DECLARED_OMISSION_REASONS = frozenset({GRADLE_NO_TEST_REPORTS, GRADLE_SUITE_TOTALS_UNREADABLE})
+# Reports exist on disk and NONE of them is this invocation's: every one is
+# byte-identical to what an earlier attempt left, and `report_delta` already
+# refused to claim them. Summing them would attribute another dispatch's tests
+# to this receipt, so this dispatch states what it can prove — that it wrote no
+# report of its own — instead of borrowing the tree's.
+GRADLE_NO_CLAIMED_TEST_REPORTS = "gradle_no_claimed_test_reports"
+# The one tag round trip did not complete. The totals still stand (they came
+# from a different read), but there IS no row sample, and a disclosure that
+# described one would be describing a sample the receipt does not carry.
+GRADLE_ROW_SAMPLE_UNREADABLE = "gradle_row_sample_unreadable"
+DECLARED_OMISSION_REASONS = frozenset(
+    {
+        GRADLE_NO_TEST_REPORTS,
+        GRADLE_NO_CLAIMED_TEST_REPORTS,
+        GRADLE_SUITE_TOTALS_UNREADABLE,
+        GRADLE_ROW_SAMPLE_UNREADABLE,
+    }
+)
 # Not an omission reason: a scan that never ran proved nothing, and an
 # unanswered probe must stay an absent key rather than becoming a receipt-level
 # claim that the build produced no test evidence.
@@ -1496,11 +1513,18 @@ def parse_report_tag_rows(
 def _report_tag_rows(body: str, *, path: str, digest: str) -> List[Dict[str, Any]]:
     """One report's token stream -> its rows, in the order the file states them.
 
-    Same closing rule as `_parse_testcase_tags`: a node whose closing tag the
-    per-file bound cut still closes when the next testcase opens, so a
-    truncated read reports fewer rows and never a wrong one. Unlike the
-    diagnostic parser this does NOT deduplicate by identity — a report may
-    legitimately repeat a testcase element, and each one is an execution.
+    A node whose closing tag the per-file bound cut still closes when the NEXT
+    testcase opens — by then the whole node was read, so its outcome is
+    observed. A node still pending when the stream ENDS is different: the bound
+    cut this report somewhere inside it, and every child that would have stated
+    a failure may be on the other side of the cut. Publishing it would publish
+    the parser's default (`passed`) as an observation, which is exactly how a
+    red identity becomes a green row. So it is dropped, and the file's declared
+    total is what discloses the loss. Fewer rows, never a wrong one.
+
+    Unlike the diagnostic parser this does NOT deduplicate by identity — a
+    report may legitimately repeat a testcase element, and each one is an
+    execution.
     """
 
     rows: List[Dict[str, Any]] = []
@@ -1539,7 +1563,8 @@ def _report_tag_rows(body: str, *, path: str, digest: str) -> List[Dict[str, Any
             reason = _tag_attribute(attributes, "message")
             if reason:
                 pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
-    close(pending)
+    # `pending` is deliberately NOT closed here: an unterminated trailing node
+    # is a cut read, not a passing test.
     return rows[:TESTCASE_PARSE_CAP]
 
 
@@ -1824,6 +1849,7 @@ def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -
         "dropped_green",
         "dropped_files",
         "dropped_red",
+        "unread_rows",
     }:
         raise ValueError("receipt gradle_row_disclosure.rows_truncated shape is invalid")
     if not {"dropped_green", "dropped_files"}.issubset(truncation):
@@ -1835,11 +1861,20 @@ def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -
         red = _receipt_count(
             truncation.get("dropped_red"), "gradle_row_disclosure.dropped_red", minimum=1
         )
+    # Identities a report declared and its bounded read never delivered. A
+    # per-file bound is as real a cap as the row cap, and a sample that reported
+    # 130 of a file's 1,000 tests while counting nothing dropped would be the
+    # silent cap in its purest form.
+    unread = 0
+    if "unread_rows" in truncation:
+        unread = _receipt_count(
+            truncation.get("unread_rows"), "gradle_row_disclosure.unread_rows", minimum=1
+        )
     # A file-level bound is a loss even when no row it would have produced was
     # ever built: kafka's 50-file tag bound leaves 1,126 reports unspoken for,
     # and a truncation record that refused to say so would be the silent cap
     # this schema exists to forbid.
-    if not green and not red and not files:
+    if not green and not red and not files and not unread:
         raise ValueError("receipt gradle_row_disclosure.rows_truncated dropped nothing")
     if red and complete is not False:
         raise ValueError("receipt gradle_row_disclosure cannot drop a red and claim completeness")
@@ -1914,9 +1949,14 @@ def assemble_gradle_test_rows(
     identities this sample does not carry.
 
     Truncation is red-first: a failure or error identity keeps its slot while
-    passing and skipped rows lose theirs, and every drop is counted. Absence is
-    absence — a harvest that found nothing returns `(None, [], None)` and the
-    caller records an evidence omission rather than a zero.
+    passing and skipped rows lose theirs, and every drop is counted. A loss
+    that happened INSIDE a file — its bounded read ended before its last
+    testcase — is counted too, as `unread_rows`, against the total that file's
+    own `<testsuite>` root declares; it needs `path` on the summary entries,
+    which is how the harvest states them.
+
+    Absence is absence — a harvest that found nothing returns `(None, [], None)`
+    and the caller records an evidence omission rather than a zero.
     """
 
     summary_cap = (
@@ -1938,6 +1978,10 @@ def assemble_gradle_test_rows(
         else 0
     )
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # `path -> tests the file's own <testsuite> root declares`, kept per FILE
+    # because that is the unit the per-file read bound cuts. Callers that state
+    # no path (the summaries alone are the measurement) simply never appear.
+    declared_by_file: Dict[str, int] = {}
     unreadable = 0
     for entry in suite_summaries or ():
         counts = (
@@ -1957,6 +2001,9 @@ def assemble_gradle_test_rows(
         bucket["xml_files"] += 1
         for field, count in counts.items():
             bucket[field] += count
+        report_path = _gradle_evidence_text(entry.get("path"))
+        if report_path:
+            declared_by_file[report_path] = declared_by_file.get(report_path, 0) + counts["tests"]
 
     declared_red = sum(group["failures"] + group["errors"] for group in groups.values())
     # Red-bearing pairs are the ones a truncated summary must keep; ties break
@@ -2017,6 +2064,27 @@ def assemble_gradle_test_rows(
     } - {""}
     dropped_files = len(covered_files - kept_files)
 
+    # Identities lost INSIDE a file the sample does speak for: the per-file tag
+    # bound stops the read partway (kafka's 400-token bound against a report
+    # declaring 1,000 tests), so rows the fold never saw can neither be dropped
+    # greens — nothing built them — nor a dropped file, since the report is
+    # represented. Without this they are a silent cap, which the receipt schema
+    # exists to forbid. Measured against the file's own declared total, and only
+    # for files that DID contribute rows: a file that contributed none is
+    # already wholly disclosed by `dropped_files`.
+    parsed_by_file: Dict[str, int] = {}
+    for row in ordered:
+        if not isinstance(row, Mapping):
+            continue
+        report_path = str(row.get("report_path") or "").strip()
+        if report_path:
+            parsed_by_file[report_path] = parsed_by_file.get(report_path, 0) + 1
+    unread_rows = sum(
+        max(0, declared_by_file[report_path] - parsed)
+        for report_path, parsed in parsed_by_file.items()
+        if report_path in declared_by_file
+    )
+
     disclosures: Optional[Dict[str, Any]] = None
     if groups or ordered:
         disclosures = {
@@ -2031,11 +2099,12 @@ def assemble_gradle_test_rows(
             and not dropped_red
             and min(len(red), row_cap) >= declared_red,
         }
-        if dropped_green or dropped_red or dropped_files:
+        if dropped_green or dropped_red or dropped_files or unread_rows:
             disclosures["rows_truncated"] = {
                 "dropped_green": dropped_green,
                 "dropped_files": dropped_files,
                 **({"dropped_red": dropped_red} if dropped_red else {}),
+                **({"unread_rows": unread_rows} if unread_rows else {}),
             }
     return summary_section, kept_rows, disclosures
 
@@ -2877,12 +2946,18 @@ def record_invocation(
         # this list and the `gradle_row_disclosure` beside it, and the two are
         # one measurement: letting a different transport win the list here
         # would leave the receipt disclosing drops from a sample it does not
-        # carry. Below it, the exact hash-verified parse; below that, the
-        # historical unattributed tag read.
+        # carry. So a stated disclosure BINDS the list to the harvest — even
+        # when the harvest folded to no usable row at all. That case (a failed
+        # tag transport, empty claims, rows with no name) is an absent key, not
+        # an opening for another transport to fill: a truncation record beside
+        # a list it never described is contradictory evidence, and unknown is
+        # absent here as everywhere else. With no disclosure there is no sample
+        # to contradict — the exact hash-verified parse, then the historical
+        # unattributed tag read.
         testcase_outcomes=(
             harvested_testcase_outcomes
-            or diagnostic_rows
-            or read_testcase_outcomes(execute, resolved_delta)
+            if gradle_row_disclosure is not None
+            else (diagnostic_rows or read_testcase_outcomes(execute, resolved_delta))
         ),
         testcase_execution_rows=sealed_rows,
         contract_id=contract_id,

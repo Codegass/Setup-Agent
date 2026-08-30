@@ -1632,6 +1632,30 @@ def test_the_gradle_summary_section_is_bounded_by_its_own_declared_cap():
             },
             "rows_truncated shape",
         ),
+        # A stated in-file loss states a number; zero of them is not a loss and
+        # a truncation record that says so is describing nothing.
+        (
+            {
+                **GRADLE_DISCLOSURE,
+                "rows_truncated": {
+                    "dropped_green": 0,
+                    "dropped_files": 0,
+                    "unread_rows": 0,
+                },
+            },
+            "unread_rows",
+        ),
+        (
+            {
+                **GRADLE_DISCLOSURE,
+                "rows_truncated": {
+                    "dropped_green": 0,
+                    "dropped_files": 0,
+                    "unread_rows": True,
+                },
+            },
+            "unread_rows",
+        ),
     ],
 )
 def test_the_gradle_row_disclosure_refuses_a_shape_it_cannot_stand_behind(disclosure, refusal):

@@ -3,13 +3,18 @@ import json
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from test_container_io import FakeContainer
 from test_invocation_receipts import HASH_A, FakeExecute, ok, receipts_written
 
 from sag.agent import invocation_receipts
-from sag.agent.invocation_receipts import assemble_gradle_test_rows
+from sag.agent.invocation_receipts import (
+    REPORT_TAG_MARKER,
+    assemble_gradle_test_rows,
+    parse_report_tag_rows,
+)
 from sag.agent.receipt_test_rows import (
     _CONTAINER_REPORT_ROW_PARSER,
     diagnostic_testcase_outcomes,
@@ -949,3 +954,218 @@ def test_capped_gradle_rows_still_seal_through_the_one_maven_row_contract():
         == sealed
     )
     assert disclosures["rows_truncated"]["dropped_green"] == 1
+
+
+_RED_FIXTURE = Path(__file__).parent / "fixtures" / "gradle_receipts" / "kafka-red-suite.xml"
+
+
+def _cut_red_stream(path):
+    """kafka's red report, its tag stream cut exactly where `head -n` cuts.
+
+    Line 20 is `testFileUnreadable()`'s open tag and line 21 is its `<failure>`
+    child, so the first 20 lines are a report whose last node opened and never
+    stated an outcome — the ordinary shape of a bounded read against a report
+    that (in the measured container) runs to 137.8 MB.
+    """
+    lines = _RED_FIXTURE.read_text().splitlines()
+    cut = "\n".join(lines[:20]) + "\n"
+    assert cut.rstrip().endswith('time="0.019">')
+    digest = hashlib.sha256(_RED_FIXTURE.read_bytes()).hexdigest()
+    return f"{REPORT_TAG_MARKER}{digest}  {path}\n{cut}", digest
+
+
+def test_a_report_cut_before_a_failure_child_yields_no_row_rather_than_a_green_one():
+    """The per-file bound cuts mid-node; the parser's DEFAULT must not ship.
+
+    The trailing node's outcome is on the other side of the cut, so closing it
+    at stream end publishes `testFileUnreadable()` — one of the eight measured
+    kafka reds — as a PASSING row. A red identity reported green is worse than
+    a red identity not reported: fewer rows, never a wrong one.
+    """
+    path = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-red.xml"
+    stream, digest = _cut_red_stream(path)
+
+    rows = parse_report_tag_rows(stream, report_claims={path: digest})
+
+    assert "testFileUnreadable()" not in [row["name"] for row in rows]
+    # The 16 nodes that did close still stand.
+    assert len(rows) == 16
+    assert {row["outcome"] for row in rows} == {"passed"}
+
+
+def test_a_partly_read_report_states_the_identities_its_own_bound_never_delivered():
+    """The same cut, folded: 19 declared by the file, 16 delivered by the read.
+
+    The row cap never fires and the report keeps its slot in the sample, so
+    neither `dropped_green` nor `dropped_files` can carry this loss — without a
+    count of its own it is a silent cap, and the red that the cut swallowed
+    would leave no trace at all.
+    """
+    path = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-red.xml"
+    stream, digest = _cut_red_stream(path)
+    rows = parse_report_tag_rows(stream, report_claims={path: digest})
+
+    _section, kept, disclosures = assemble_gradle_test_rows(
+        # The head read of the same file: its `<testsuite>` root declares 19
+        # tests and one failure, and those counts stay complete.
+        [{**_suite(":clients", "test", tests=19, failures=1), "path": path}],
+        rows,
+    )
+
+    assert len(kept) == 16
+    assert disclosures["rows_truncated"] == {
+        "dropped_green": 0,
+        "dropped_files": 0,
+        "unread_rows": 3,
+    }
+    # The declared failure is not in the sample, and nothing claims it is.
+    assert disclosures["red_rows_complete"] is False
+
+
+def test_identities_lost_inside_a_partly_read_report_are_counted_not_silent():
+    """kafka's 400-token per-file bound against a report declaring 1,000 tests.
+
+    The rows that bound never built can be neither a dropped green (nothing
+    built them) nor a dropped file (the report IS represented in the sample),
+    so before this they were a cap that applied and recorded nothing — while
+    the suite totals beside them declared 1,000. Measured against the file's
+    own `<testsuite>` total, they are a stated loss.
+    """
+    report = f"{GRADLE_ROOT}/streams/build/test-results/test/TEST-giant.xml"
+    delivered = [
+        dict(
+            _gradle_row("streams", f"green{index}", "passed", ordinal=index),
+            report_path=report,
+        )
+        for index in range(1, 131)
+    ]
+
+    _section, rows, disclosures = assemble_gradle_test_rows(
+        [{**_suite(":streams", "test", tests=1000), "path": report}],
+        delivered,
+        row_cap=200,
+    )
+
+    assert len(rows) == 130
+    # The row cap never fired and the report kept its slot: without the in-file
+    # count this disclosure would have been absent entirely.
+    assert disclosures["rows_truncated"] == {
+        "dropped_green": 0,
+        "dropped_files": 0,
+        "unread_rows": 870,
+    }
+
+
+def test_a_file_that_delivered_no_row_at_all_stays_a_dropped_file_and_not_unread_rows():
+    """One loss, counted once, in the unit that describes it.
+
+    A report the sample never spoke for is wholly disclosed by `dropped_files`;
+    re-counting its declared tests as unread identities would inflate a second
+    field with the same fact.
+    """
+    read = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-read.xml"
+    unread = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-unread.xml"
+
+    _section, _rows, disclosures = assemble_gradle_test_rows(
+        [
+            {**_suite(":clients", "test", tests=1), "path": read},
+            {**_suite(":clients", "test", tests=500), "path": unread},
+        ],
+        [dict(_gradle_row("clients", "green", "passed"), report_path=read)],
+        harvested_files=[read, unread],
+    )
+
+    assert disclosures["rows_truncated"] == {"dropped_green": 0, "dropped_files": 1}
+
+
+def test_a_stated_row_disclosure_binds_the_diagnostic_list_to_its_own_harvest(monkeypatch):
+    """A disclosure and the list beside it are ONE sample, or they are evidence
+    against each other.
+
+    A harvest can state a disclosure and still fold to no usable row — a tag
+    transport that returned nothing, claims that matched nothing, rows with no
+    name. Letting a different transport fill the list there leaves the receipt
+    disclosing dropped files and truncated rows of a sample it does not carry,
+    and a reader reconciling the two gets contradictory evidence. Absent is the
+    honest answer.
+    """
+    path = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-a.xml"
+    execute = FakeExecute(
+        rules=[
+            ("rev-parse HEAD", ok("d" * 40)),
+            ("command -v", ok("/usr/bin/gradle\nSAGTOOLCHAIN\nGradle 8.5\n")),
+            # Both weaker transports are armed, and neither may win.
+            ("grep -oE", ok('<testcase classname="a.S" name="fromTheTagRead">\n</testcase>\n')),
+        ]
+    )
+    monkeypatch.setattr(
+        invocation_receipts,
+        "read_delta_testcase_rows",
+        lambda *_args, **_kwargs: _parsed(path),
+    )
+
+    invocation_receipts.record_invocation(
+        execute,
+        receipt_id="inv-gradle-test-0041",
+        run_id=RUN_ID,
+        tool="gradle",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory=GRADLE_ROOT,
+        exit_code=0,
+        before={},
+        after={path: HASH_A},
+        requirements={"build_domains": [{"root": GRADLE_ROOT, "system": "gradle"}]},
+        gradle_row_disclosure={
+            "rows_source": "gradle_xml",
+            "red_rows_complete": False,
+            "rows_truncated": {"dropped_green": 0, "dropped_files": 3},
+        },
+        harvested_testcase_outcomes=None,
+    )
+
+    (receipt,) = receipts_written(execute.commands)
+    assert receipt["gradle_row_disclosure"]["rows_truncated"]["dropped_files"] == 3
+    assert "testcase_outcomes" not in receipt
+    # The weakest transport is not even probed once the harvest has spoken.
+    assert not any("grep -oE" in command for command in execute.commands)
+
+
+def test_without_a_harvest_disclosure_the_receipt_still_falls_back_to_the_exact_parse(monkeypatch):
+    """The binding is the disclosure's, not gradle's: nothing else narrows."""
+    path = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-a.xml"
+    execute = FakeExecute(
+        rules=[
+            ("rev-parse HEAD", ok("d" * 40)),
+            ("command -v", ok("/usr/bin/gradle\nSAGTOOLCHAIN\nGradle 8.5\n")),
+        ]
+    )
+    monkeypatch.setattr(
+        invocation_receipts,
+        "read_delta_testcase_rows",
+        lambda *_args, **_kwargs: _parsed(path),
+    )
+
+    invocation_receipts.record_invocation(
+        execute,
+        receipt_id="inv-gradle-test-0042",
+        run_id=RUN_ID,
+        tool="gradle",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory=GRADLE_ROOT,
+        exit_code=0,
+        before={},
+        after={path: HASH_A},
+        requirements={"build_domains": [{"root": GRADLE_ROOT, "system": "gradle"}]},
+    )
+
+    (receipt,) = receipts_written(execute.commands)
+    assert "gradle_row_disclosure" not in receipt
+    assert receipt["testcase_outcomes"]["nodes"] == [
+        {"node_id": "com.acme.SharedTest#roundTrip[size=1]", "status": "passed"}
+    ]
