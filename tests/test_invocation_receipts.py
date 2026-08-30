@@ -1452,3 +1452,303 @@ def test_no_admitted_receipt_can_omit_its_effective_action():
 
     assert _production_build_receipt({"effective_action": "test", "requested_action": "deps"})
     assert not _production_build_receipt({"effective_action": "deps", "requested_action": "test"})
+
+
+# ---------------------------------------------------------------------------
+# Gradle test evidence fields (evidence study 2026-08-30). Two ADDITIVE
+# optional sections on the same schema v2: the complete per (project, task-dir)
+# totals, and what the bounded identity harvest beside them had to drop. Absent
+# stays absent, every cap that fires is stated, and neither section can be
+# carried by a runner that never harvested it.
+# ---------------------------------------------------------------------------
+
+GRADLE_SUITE = {
+    "module": ":clients",
+    "task": "test",
+    "xml_files": 231,
+    "tests": 8123,
+    "failures": 3,
+    "errors": 0,
+    "skipped": 12,
+}
+GRADLE_DISCLOSURE = {"rows_source": "gradle_xml", "red_rows_complete": True}
+
+
+def _gradle_receipt(**overrides):
+    payload = _canonical_receipt(
+        tool="gradle",
+        argv="./gradlew test",
+        receipt_id="inv-gradle-test-0001",
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_gradle_evidence_sections_stay_absent_when_the_harvest_stated_nothing():
+    """Additive means additive: an untouched receipt is byte-identical."""
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    receipt = build_receipt(
+        receipt_id="inv-gradle-test-0001",
+        run_id="run-gradle",
+        tool="gradle",
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={},
+        gradle_suite_summaries=None,
+        gradle_row_disclosure=None,
+    )
+
+    assert "gradle_suite_summaries" not in receipt
+    assert "gradle_row_disclosure" not in receipt
+    assert "evidence_omissions" not in receipt
+    assert validate_receipt_v2(receipt)["schema_version"] == RECEIPT_SCHEMA_VERSION
+    # The schema version does NOT move for an additive optional field.
+    assert RECEIPT_SCHEMA_VERSION == 2
+
+
+def test_a_full_gradle_evidence_receipt_validates_on_schema_two():
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    receipt = build_receipt(
+        receipt_id="inv-gradle-test-0002",
+        run_id="run-gradle",
+        tool="gradle",
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={},
+        gradle_suite_summaries={
+            "suites": [GRADLE_SUITE],
+            "truncated": True,
+            "dropped_suites": 4,
+            "unreadable_suites": 1,
+        },
+        gradle_row_disclosure={
+            "rows_source": "gradle_xml",
+            "red_rows_complete": False,
+            "rows_truncated": {"dropped_green": 27000, "dropped_files": 900, "dropped_red": 2},
+        },
+    )
+
+    validated = validate_receipt_v2(receipt)
+    assert validated["schema_version"] == 2
+    assert validated["gradle_suite_summaries"]["suites"] == [GRADLE_SUITE]
+    assert validated["gradle_row_disclosure"]["rows_truncated"]["dropped_red"] == 2
+    assert "evidence_omissions" not in validated
+
+
+@pytest.mark.parametrize("field", ["gradle_suite_summaries", "gradle_row_disclosure"])
+def test_a_runner_that_never_harvested_gradle_reports_cannot_carry_its_sections(field):
+    """A maven or pytest receipt stating Gradle evidence is stating nothing."""
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    value = {"suites": [GRADLE_SUITE]} if field.endswith("summaries") else dict(GRADLE_DISCLOSURE)
+    for tool, argv in (("maven", "mvn test"), ("python", "python -m pytest")):
+        with pytest.raises(ValueError, match=field):
+            validate_receipt_v2(_gradle_receipt(tool=tool, argv=argv, **{field: value}))
+    assert validate_receipt_v2(_gradle_receipt(**{field: value}))[field] == value
+
+
+@pytest.mark.parametrize(
+    "section, refusal",
+    [
+        ({"suites": []}, "suites"),
+        ({}, "suites"),
+        ({"suites": [GRADLE_SUITE], "unknown": 1}, "shape"),
+        ({"suites": [{**GRADLE_SUITE, "extra": 1}]}, "entry shape"),
+        (
+            {"suites": [{key: value for key, value in GRADLE_SUITE.items() if key != "task"}]},
+            "shape",
+        ),
+        ({"suites": [{**GRADLE_SUITE, "module": ""}]}, "module"),
+        ({"suites": [{**GRADLE_SUITE, "task": "test\nrun"}]}, "task"),
+        ({"suites": [{**GRADLE_SUITE, "xml_files": 0}]}, "xml_files"),
+        ({"suites": [{**GRADLE_SUITE, "tests": -1}]}, "tests"),
+        ({"suites": [{**GRADLE_SUITE, "failures": True}]}, "failures"),
+        ({"suites": [{**GRADLE_SUITE, "skipped": "12"}]}, "skipped"),
+        ({"suites": [GRADLE_SUITE, dict(GRADLE_SUITE)]}, "repeats a module task pair"),
+        ({"suites": [GRADLE_SUITE], "truncated": True}, "state what it dropped"),
+        ({"suites": [GRADLE_SUITE], "dropped_suites": 3}, "state what it dropped"),
+        ({"suites": [GRADLE_SUITE], "truncated": False, "dropped_suites": 3}, "truncated"),
+        ({"suites": [GRADLE_SUITE], "truncated": True, "dropped_suites": 0}, "dropped_suites"),
+        ({"suites": [GRADLE_SUITE], "unreadable_suites": 0}, "unreadable_suites"),
+    ],
+)
+def test_the_gradle_summary_section_refuses_a_shape_it_cannot_stand_behind(section, refusal):
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    with pytest.raises(ValueError, match=refusal):
+        validate_receipt_v2(_gradle_receipt(gradle_suite_summaries=section))
+
+
+def test_the_gradle_summary_section_is_bounded_by_its_own_declared_cap():
+    from sag.agent.invocation_receipts import GRADLE_SUITE_SUMMARY_CAP, validate_receipt_v2
+
+    def suites(count):
+        return [dict(GRADLE_SUITE, module=f":m{index:04d}") for index in range(count)]
+
+    at_cap = _gradle_receipt(gradle_suite_summaries={"suites": suites(GRADLE_SUITE_SUMMARY_CAP)})
+    assert len(validate_receipt_v2(at_cap)["gradle_suite_summaries"]["suites"]) == 256
+    over = _gradle_receipt(gradle_suite_summaries={"suites": suites(GRADLE_SUITE_SUMMARY_CAP + 1)})
+    with pytest.raises(ValueError, match="gradle_suite_summaries.suites"):
+        validate_receipt_v2(over)
+
+
+@pytest.mark.parametrize(
+    "disclosure, refusal",
+    [
+        ({"rows_source": "gradle_xml"}, "red completeness"),
+        ({"red_rows_complete": True}, "red completeness"),
+        ({**GRADLE_DISCLOSURE, "unknown": 1}, "shape"),
+        ({**GRADLE_DISCLOSURE, "rows_source": "model_summary"}, "rows_source"),
+        ({**GRADLE_DISCLOSURE, "rows_source": ""}, "rows_source"),
+        ({**GRADLE_DISCLOSURE, "red_rows_complete": 1}, "red_rows_complete"),
+        ({**GRADLE_DISCLOSURE, "red_rows_complete": "true"}, "red_rows_complete"),
+        ({**GRADLE_DISCLOSURE, "rows_truncated": {"dropped_green": 1}}, "incomplete"),
+        (
+            {**GRADLE_DISCLOSURE, "rows_truncated": {"dropped_green": 0, "dropped_files": 0}},
+            "dropped nothing",
+        ),
+        (
+            {**GRADLE_DISCLOSURE, "rows_truncated": {"dropped_green": -1, "dropped_files": 0}},
+            "dropped_green",
+        ),
+        (
+            {**GRADLE_DISCLOSURE, "rows_truncated": {"dropped_green": 1, "dropped_files": True}},
+            "dropped_files",
+        ),
+        (
+            {
+                **GRADLE_DISCLOSURE,
+                "rows_truncated": {"dropped_green": 1, "dropped_files": 1, "surprise": 1},
+            },
+            "rows_truncated shape",
+        ),
+    ],
+)
+def test_the_gradle_row_disclosure_refuses_a_shape_it_cannot_stand_behind(disclosure, refusal):
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    with pytest.raises(ValueError, match=refusal):
+        validate_receipt_v2(_gradle_receipt(gradle_row_disclosure=disclosure))
+
+
+def test_a_disclosure_cannot_drop_a_red_and_still_claim_the_reds_are_complete():
+    """The one claim a sampled row list offers is the one that is checked."""
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    dropped_red = {"dropped_green": 4, "dropped_files": 1, "dropped_red": 2}
+    with pytest.raises(ValueError, match="cannot drop a red and claim completeness"):
+        validate_receipt_v2(
+            _gradle_receipt(
+                gradle_row_disclosure={
+                    "rows_source": "gradle_xml",
+                    "red_rows_complete": True,
+                    "rows_truncated": dropped_red,
+                }
+            )
+        )
+    honest = _gradle_receipt(
+        gradle_row_disclosure={
+            "rows_source": "gradle_xml",
+            "red_rows_complete": False,
+            "rows_truncated": dropped_red,
+        }
+    )
+    assert validate_receipt_v2(honest)["gradle_row_disclosure"]["rows_truncated"] == dropped_red
+    # Dropping only greens keeps the claim available — that is the whole point
+    # of ordering reds first.
+    greens_only = _gradle_receipt(
+        gradle_row_disclosure={
+            "rows_source": "gradle_xml",
+            "red_rows_complete": True,
+            "rows_truncated": {"dropped_green": 27000, "dropped_files": 900},
+        }
+    )
+    assert validate_receipt_v2(greens_only)["gradle_row_disclosure"]["red_rows_complete"] is True
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("gradle_suite_summaries", {"suites": [{**GRADLE_SUITE, "module": "a\nb"}]}),
+        ("gradle_row_disclosure", {"rows_source": "hand_counted", "red_rows_complete": True}),
+        # Not a mapping at all: the drop still costs one field, never the copy
+        # that assembles it.
+        ("gradle_suite_summaries", [GRADLE_SUITE]),
+        ("gradle_row_disclosure", "red_rows_complete"),
+    ],
+)
+def test_unrepresentable_gradle_evidence_is_dropped_alone_and_stated_as_an_omission(field, value):
+    """Live camel and live kafka: one bad evidence field voided whole receipts.
+
+    A Gradle section the schema refuses must cost that section and nothing
+    else — the exit code, the argv and the report delta survive, and the drop
+    is a stated omission rather than a silent absence.
+    """
+    from sag.agent.invocation_receipts import receipt_refusal_code, validate_receipt_v2
+
+    receipt = build_receipt(
+        receipt_id="inv-gradle-test-0003",
+        run_id="run-gradle",
+        tool="gradle",
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory="/workspace/proj",
+        exit_code=1,
+        before={},
+        after={},
+        module_outcomes=[{"module": ":clients", "status": "attempted"}],
+        **{field: value},
+    )
+
+    assert field not in receipt
+    assert receipt["exit_code"] == 1
+    assert receipt["module_outcomes"] == [{"module": ":clients", "status": "attempted"}]
+    assert [entry["field"] for entry in receipt["evidence_omissions"]] == [field]
+    assert receipt["evidence_omissions"][0]["status"] == "unavailable"
+    assert receipt["evidence_omissions"][0]["reasons"]
+    assert validate_receipt_v2(receipt)["evidence_omissions"][0]["field"] == field
+    # And the refusal names the argument, so a caller can repair it.
+    assert receipt_refusal_code(ValueError(f"receipt {field} shape is invalid")).endswith(field)
+
+
+def test_record_invocation_carries_the_gradle_sections_to_the_one_assembly_point():
+    """Settlement parity: the detached path calls the SAME `record_invocation`.
+
+    A Gradle section only the synchronous caller could pass would be missing
+    from every receipt settled from a job obligation — which is exactly how the
+    measured kafka run lost its evidence.
+    """
+    execute = FakeExecute()
+    metadata = record_invocation(
+        execute,
+        receipt_id="inv-gradle-test-0004",
+        run_id="run-pytest",
+        tool="gradle",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={},
+        gradle_suite_summaries={"suites": [GRADLE_SUITE]},
+        gradle_row_disclosure=dict(GRADLE_DISCLOSURE),
+    )
+
+    assert metadata == {"receipt_id": "inv-gradle-test-0004"}
+    written = receipts_written(execute.commands)
+    assert len(written) == 1
+    assert written[0]["gradle_suite_summaries"]["suites"] == [GRADLE_SUITE]
+    assert written[0]["gradle_row_disclosure"] == GRADLE_DISCLOSURE

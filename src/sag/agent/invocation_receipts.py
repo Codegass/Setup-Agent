@@ -21,6 +21,14 @@ invocation's report delta (review binding note (b)). Every schema-v1 key keeps
 its exact name and shape — the Plan 5 consumers read v2 receipts unchanged —
 and every v2 fact is absent when unknown, never null and never defaulted.
 
+Gradle test evidence (2026-08-30 study) rides that same rule as two further
+optional sections on the SAME schema version: `gradle_suite_summaries`, the
+complete per (project, task-dir) totals summed from the reports' own
+`<testsuite>` roots, and `gradle_row_disclosure`, which states what the bounded
+identity harvest beside them kept and what it dropped. They are separate
+measurements from `testcase_execution_rows` and are named separately so no
+reader can mistake a bounded sample for a project-wide rollup.
+
 When the authorizing contract names an effective JDK, the receipt copies that
 binding and its scoped provenance verbatim. A detached dispatch carries it
 through the job obligation so settlement cannot reconstruct runtime authority
@@ -98,6 +106,28 @@ TESTCASE_FILE_CAP = 50
 TESTCASE_TAG_CAP = 400
 TESTCASE_PARSE_CAP = 500
 SKIP_REASON_MAX_CHARS = 200
+# Gradle test evidence (evidence study 2026-08-30). A Gradle reactor writes its
+# reports per (project, TASK dir) — geode proves `test-results/distributedTest`
+# exists alongside `test-results/test` — so the summary unit is the pair, not
+# the module. 256 pairs is generous against the measured shape (kafka 19
+# modules, geode 27) and is a safety bound, not an expected one; exceeding it
+# truncates red-bearing-first and records the drop.
+GRADLE_SUITE_SUMMARY_CAP = 256
+# The per-testcase identity rows are the receipt's only unbounded list. kafka's
+# one measured run left 27,219 executed tests; a sealed row canonicalizes to
+# roughly a kilobyte, so an uncapped envelope would blow the 16 MB canonical
+# budget and VOID THE WHOLE RECEIPT at write time (the `_attach` gate checks
+# per-field validity, not the byte budget). 2048 rows is ~2 MB — room for the
+# argv, the reactor list and the delta beside it — and no measured project has
+# more than a handful of reds, so the red set always survives the cap.
+GRADLE_TESTCASE_ROW_CAP = 2048
+# The one transport these rows may claim: XML this engine parsed in-container
+# from bytes hash-bound to the receipt's own report delta.
+GRADLE_ROWS_SOURCE = "gradle_xml"
+_GRADLE_SUITE_COUNT_FIELDS = ("tests", "failures", "errors", "skipped")
+_GRADLE_SUITE_FIELDS = frozenset({"module", "task", "xml_files", *_GRADLE_SUITE_COUNT_FIELDS})
+_GRADLE_RED_OUTCOMES = frozenset({"failed", "error"})
+_GRADLE_GREEN_OUTCOMES = frozenset({"passed", "skipped"})
 # Python setup/build/compile observations are part of the immutable receipt,
 # never ToolResult prose.  Refuse an observation that cannot fit this exact
 # canonical budget: truncating a package list, artifact list, or source/PYC
@@ -177,6 +207,8 @@ _RECEIPT_V2_OPTIONAL_FIELDS = frozenset(
         "producer_observations_sha256",
         "testcase_outcomes",
         "testcase_execution_rows",
+        "gradle_suite_summaries",
+        "gradle_row_disclosure",
         "capability_observations",
         "module_outcomes",
         "excluded_claimed_paths",
@@ -193,6 +225,8 @@ _RECEIPT_OMITTABLE_EVIDENCE_FIELDS = frozenset(
     {
         "testcase_outcomes",
         "testcase_execution_rows",
+        "gradle_suite_summaries",
+        "gradle_row_disclosure",
         "capability_observations",
         "module_outcomes",
     }
@@ -1546,6 +1580,284 @@ def _validate_module_outcomes(value: Any) -> None:
         _receipt_text(module.get("status"), "module_outcomes.status")
 
 
+def _receipt_count(value: Any, field: str, *, minimum: int = 0) -> int:
+    """One non-negative integer count. `True` is not 1 and never was."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"receipt {field} must be an integer >= {minimum}")
+    return value
+
+
+def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) -> None:
+    """Per (project, task-dir) totals summed from the `<testsuite>` roots.
+
+    This is the COUNT side of Gradle test evidence and it is deliberately not
+    the same measurement as `testcase_execution_rows`: the totals here come
+    from every harvested report's own declared attributes, while the rows are a
+    bounded identity sample. A reader that conflates the two would turn a
+    2048-row sample into a project-wide rollup, so they stay separate fields
+    with separate names.
+
+    Nothing here is summed by a model, and a summary is only meaningful for the
+    runner whose layout defines the (project, task) pair — a maven or pytest
+    receipt carrying one would be stating evidence it never harvested.
+    """
+
+    if str(receipt.get("tool") or "").strip().lower() != "gradle":
+        raise ValueError("receipt gradle_suite_summaries requires the gradle runner")
+    if not isinstance(value, Mapping) or not set(value).issubset(
+        {"suites", "truncated", "dropped_suites", "unreadable_suites"}
+    ):
+        raise ValueError("receipt gradle_suite_summaries shape is invalid")
+    suites = value.get("suites")
+    if not isinstance(suites, list) or not suites or len(suites) > GRADLE_SUITE_SUMMARY_CAP:
+        raise ValueError("receipt gradle_suite_summaries.suites is invalid")
+    seen: set[tuple[str, str]] = set()
+    for suite in suites:
+        if not isinstance(suite, Mapping) or set(suite) != _GRADLE_SUITE_FIELDS:
+            raise ValueError("receipt gradle_suite_summaries entry shape is invalid")
+        module = _receipt_text(suite.get("module"), "gradle_suite_summaries.module")
+        task = _receipt_text(suite.get("task"), "gradle_suite_summaries.task")
+        _receipt_count(suite.get("xml_files"), "gradle_suite_summaries.xml_files", minimum=1)
+        for field in _GRADLE_SUITE_COUNT_FIELDS:
+            _receipt_count(suite.get(field), f"gradle_suite_summaries.{field}")
+        if (module, task) in seen:
+            raise ValueError("receipt gradle_suite_summaries repeats a module task pair")
+        seen.add((module, task))
+    # A cap that fired and a cap that did not are different facts, and the
+    # count of what it dropped is the fact — `truncated` alone would say a
+    # summary is partial without saying by how much.
+    truncated = "truncated" in value
+    if truncated and value.get("truncated") is not True:
+        raise ValueError("receipt gradle_suite_summaries.truncated must be true when present")
+    if truncated != ("dropped_suites" in value):
+        raise ValueError("receipt gradle_suite_summaries truncation must state what it dropped")
+    if truncated:
+        _receipt_count(
+            value.get("dropped_suites"), "gradle_suite_summaries.dropped_suites", minimum=1
+        )
+    if "unreadable_suites" in value:
+        _receipt_count(
+            value.get("unreadable_suites"), "gradle_suite_summaries.unreadable_suites", minimum=1
+        )
+
+
+def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -> None:
+    """What the bounded identity harvest kept, and what it had to drop.
+
+    `red_rows_complete` is the only claim a consumer may lean on when the rows
+    are a sample: it says every failure/error identity the harvested summaries
+    account for is present in the rows. It is a claim, so it is refused when it
+    contradicts the truncation record beside it.
+    """
+
+    if str(receipt.get("tool") or "").strip().lower() != "gradle":
+        raise ValueError("receipt gradle_row_disclosure requires the gradle runner")
+    if not isinstance(value, Mapping) or set(value) - {
+        "rows_source",
+        "red_rows_complete",
+        "rows_truncated",
+    }:
+        raise ValueError("receipt gradle_row_disclosure shape is invalid")
+    if not {"rows_source", "red_rows_complete"}.issubset(value):
+        raise ValueError("receipt gradle_row_disclosure must state its source and red completeness")
+    source = _receipt_text(value.get("rows_source"), "gradle_row_disclosure.rows_source")
+    if source != GRADLE_ROWS_SOURCE:
+        raise ValueError("receipt gradle_row_disclosure.rows_source is not a known transport")
+    complete = value.get("red_rows_complete")
+    if complete is not True and complete is not False:
+        raise ValueError("receipt gradle_row_disclosure.red_rows_complete must be a boolean")
+    if "rows_truncated" not in value:
+        return
+    truncation = value.get("rows_truncated")
+    if not isinstance(truncation, Mapping) or set(truncation) - {
+        "dropped_green",
+        "dropped_files",
+        "dropped_red",
+    }:
+        raise ValueError("receipt gradle_row_disclosure.rows_truncated shape is invalid")
+    if not {"dropped_green", "dropped_files"}.issubset(truncation):
+        raise ValueError("receipt gradle_row_disclosure.rows_truncated is incomplete")
+    green = _receipt_count(truncation.get("dropped_green"), "gradle_row_disclosure.dropped_green")
+    _receipt_count(truncation.get("dropped_files"), "gradle_row_disclosure.dropped_files")
+    red = 0
+    if "dropped_red" in truncation:
+        red = _receipt_count(
+            truncation.get("dropped_red"), "gradle_row_disclosure.dropped_red", minimum=1
+        )
+    if not green and not red:
+        raise ValueError("receipt gradle_row_disclosure.rows_truncated dropped nothing")
+    if red and complete is not False:
+        raise ValueError("receipt gradle_row_disclosure cannot drop a red and claim completeness")
+
+
+def _gradle_evidence_text(value: Any) -> str:
+    """Collapse harvested text to one receipt-safe line.
+
+    The kafka lesson: a JUnit display name may legally carry a newline, and
+    `_receipt_text` refuses control characters. Collapsing HERE means the field
+    is carried; collapsing nowhere means the field is dropped to an omission.
+    """
+
+    return " ".join(str(value if value is not None else "").split())
+
+
+def _gradle_summary_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _gradle_row_ordinal(row: Mapping[str, Any]) -> int:
+    value = row.get("execution_ordinal")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        # Sorts after every stated ordinal without changing tier: an unstated
+        # ordinal cannot be sealed anyway, so it is the first row to lose a
+        # contested slot inside its own tier.
+        return 1 << 62
+    return value
+
+
+def _gradle_row_sort_key(row: Mapping[str, Any]) -> tuple[str, int, str, str]:
+    return (
+        str(row.get("report_path") or ""),
+        _gradle_row_ordinal(row),
+        _gradle_evidence_text(row.get("classname")),
+        _gradle_evidence_text(row.get("name")),
+    )
+
+
+def assemble_gradle_test_rows(
+    suite_summaries: Sequence[Mapping[str, Any]],
+    testcase_rows: Sequence[Mapping[str, Any]],
+    *,
+    summary_cap: int = GRADLE_SUITE_SUMMARY_CAP,
+    row_cap: int = GRADLE_TESTCASE_ROW_CAP,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Fold one Gradle harvest into `(summary_section, rows, disclosures)`.
+
+    Pure: no container, no clock, no receipt identity. `suite_summaries` is one
+    entry PER REPORT FILE — `{module, task, tests, failures, errors, skipped}`
+    read from that file's `<testsuite>` root — and this folds them into the
+    (module, task) totals the receipt carries, counting the files it summed.
+    `testcase_rows` are the parser's raw rows; the rows returned here are the
+    same objects in the same shape, only ordered and bounded, so identity
+    sealing and `validate_testcase_execution_row` stay the single row contract.
+
+    Truncation is red-first: a failure or error identity keeps its slot while
+    passing and skipped rows lose theirs, and every drop is counted. Absence is
+    absence — a harvest that found nothing returns `(None, [], None)` and the
+    caller records an evidence omission rather than a zero.
+    """
+
+    summary_cap = (
+        summary_cap
+        if isinstance(summary_cap, int) and not isinstance(summary_cap, bool) and summary_cap > 0
+        else GRADLE_SUITE_SUMMARY_CAP
+    )
+    row_cap = (
+        row_cap
+        if isinstance(row_cap, int) and not isinstance(row_cap, bool) and row_cap > 0
+        else GRADLE_TESTCASE_ROW_CAP
+    )
+
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    unreadable = 0
+    for entry in suite_summaries or ():
+        counts = (
+            {field: _gradle_summary_count(entry.get(field)) for field in _GRADLE_SUITE_COUNT_FIELDS}
+            if isinstance(entry, Mapping)
+            else {}
+        )
+        module = _gradle_evidence_text(entry.get("module")) if isinstance(entry, Mapping) else ""
+        task = _gradle_evidence_text(entry.get("task")) if isinstance(entry, Mapping) else ""
+        if not module or not task or any(count is None for count in counts.values()) or not counts:
+            unreadable += 1
+            continue
+        bucket = groups.setdefault(
+            (module, task),
+            {"module": module, "task": task, "xml_files": 0, **{f: 0 for f in counts}},
+        )
+        bucket["xml_files"] += 1
+        for field, count in counts.items():
+            bucket[field] += count
+
+    declared_red = sum(group["failures"] + group["errors"] for group in groups.values())
+    # Red-bearing pairs are the ones a truncated summary must keep; ties break
+    # on the pair itself so the selection never depends on harvest order.
+    ranked = sorted(
+        groups.values(),
+        key=lambda group: (
+            0 if group["failures"] + group["errors"] else 1,
+            group["module"],
+            group["task"],
+        ),
+    )
+    kept_groups = ranked[:summary_cap]
+    dropped_suites = len(ranked) - len(kept_groups)
+    summary_section: Optional[Dict[str, Any]] = None
+    if kept_groups:
+        summary_section = {
+            "suites": sorted(kept_groups, key=lambda group: (group["module"], group["task"]))
+        }
+        if dropped_suites:
+            summary_section["truncated"] = True
+            summary_section["dropped_suites"] = dropped_suites
+        if unreadable:
+            summary_section["unreadable_suites"] = unreadable
+
+    red: List[Mapping[str, Any]] = []
+    green: List[Mapping[str, Any]] = []
+    unclassified: List[Any] = []
+    for row in testcase_rows or ():
+        if not isinstance(row, Mapping):
+            unclassified.append(row)
+            continue
+        outcome = _gradle_evidence_text(row.get("outcome")).lower()
+        if outcome in _GRADLE_RED_OUTCOMES:
+            red.append(row)
+        elif outcome in _GRADLE_GREEN_OUTCOMES:
+            green.append(row)
+        else:
+            unclassified.append(row)
+    red.sort(key=_gradle_row_sort_key)
+    green.sort(key=_gradle_row_sort_key)
+    ordered = [*red, *green, *unclassified]
+    kept_rows = list(ordered[:row_cap])
+    dropped_red = max(0, len(red) - row_cap)
+    # Every dropped row that is not a red: passing, skipped, and any row whose
+    # outcome the parser did not state (which could never have been sealed).
+    dropped_green = len(ordered) - len(kept_rows) - dropped_red
+    harvested_files = {
+        str(row.get("report_path") or "") for row in ordered if isinstance(row, Mapping)
+    } - {""}
+    kept_files = {
+        str(row.get("report_path") or "") for row in kept_rows if isinstance(row, Mapping)
+    } - {""}
+    dropped_files = len(harvested_files - kept_files)
+
+    disclosures: Optional[Dict[str, Any]] = None
+    if groups or ordered:
+        disclosures = {
+            "rows_source": GRADLE_ROWS_SOURCE,
+            # Completeness is a claim about reds, and it needs a witness: the
+            # summaries state how many reds the reports declared. With no
+            # readable summary — or with one the fold could not read whole —
+            # there is no witness, so no completeness is claimed.
+            "red_rows_complete": bool(groups)
+            and not unreadable
+            and not dropped_red
+            and min(len(red), row_cap) >= declared_red,
+        }
+        if dropped_green or dropped_red:
+            disclosures["rows_truncated"] = {
+                "dropped_green": dropped_green,
+                "dropped_files": dropped_files,
+                **({"dropped_red": dropped_red} if dropped_red else {}),
+            }
+    return summary_section, kept_rows, disclosures
+
+
 def _validate_evidence_omissions(value: Any, *, receipt: Mapping[str, Any]) -> None:
     """Each entry names one observability field this receipt could not carry.
 
@@ -1825,6 +2137,10 @@ def validate_receipt_v2(
             receipt=receipt,
             report_claims=report_claims,
         )
+    if "gradle_suite_summaries" in receipt:
+        _validate_gradle_suite_summaries(receipt.get("gradle_suite_summaries"), receipt=receipt)
+    if "gradle_row_disclosure" in receipt:
+        _validate_gradle_row_disclosure(receipt.get("gradle_row_disclosure"), receipt=receipt)
     if "capability_observations" in receipt:
         _validate_capability_observations(receipt.get("capability_observations"))
     if "module_outcomes" in receipt:
@@ -1903,6 +2219,8 @@ def build_receipt(
     output_content_hash: Optional[str] = None,
     testcase_outcomes: Optional[Mapping[str, Any]] = None,
     testcase_execution_rows: Optional[Mapping[str, Any]] = None,
+    gradle_suite_summaries: Optional[Mapping[str, Any]] = None,
+    gradle_row_disclosure: Optional[Mapping[str, Any]] = None,
     contract_id: Optional[str] = None,
     contract_hash: Optional[str] = None,
     execution_binding: Optional[str] = None,
@@ -2029,6 +2347,37 @@ def build_receipt(
                 receipt=receipt,
                 report_claims=attached_report_claims,
             ),
+        )
+    # Gradle test evidence (evidence study 2026-08-30): the complete per
+    # (project, task-dir) totals, and what the bounded identity harvest beside
+    # them had to drop. Both are attached through the same gate as every other
+    # observability field — a summary the receipt cannot carry becomes a stated
+    # omission, never a silent absence and never a voided receipt.
+    # The copy is conditional so that a value which is not a mapping at all
+    # reaches the VALIDATOR (and becomes a stated omission) instead of raising
+    # out of `dict()` here, where nothing would catch it and the whole receipt
+    # would be lost to a field that only describes it.
+    summaries = (
+        dict(gradle_suite_summaries)
+        if isinstance(gradle_suite_summaries, Mapping)
+        else gradle_suite_summaries
+    )
+    if summaries:
+        _attach(
+            "gradle_suite_summaries",
+            summaries,
+            lambda value: _validate_gradle_suite_summaries(value, receipt=receipt),
+        )
+    disclosure = (
+        dict(gradle_row_disclosure)
+        if isinstance(gradle_row_disclosure, Mapping)
+        else gradle_row_disclosure
+    )
+    if disclosure:
+        _attach(
+            "gradle_row_disclosure",
+            disclosure,
+            lambda value: _validate_gradle_row_disclosure(value, receipt=receipt),
         )
     # Spec §C8: what a PHYSICAL probe observed about a resolved capability.
     # A dispatch that probed nothing states nothing — the key is absent, never
@@ -2223,6 +2572,8 @@ def record_invocation(
     compliance: Optional[str] = None,
     capability_observations: Optional[Sequence[Mapping[str, Any]]] = None,
     module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
+    gradle_suite_summaries: Optional[Mapping[str, Any]] = None,
+    gradle_row_disclosure: Optional[Mapping[str, Any]] = None,
     cached_report_roots: Optional[Iterable[str]] = None,
     excluded_claimed_paths: Optional[int] = None,
     effective_jdk: Optional[Mapping[str, Any]] = None,
@@ -2314,6 +2665,12 @@ def record_invocation(
         compliance=compliance,
         capability_observations=capability_observations,
         module_outcomes=module_outcomes,
+        # Harvested by the runner that knows its own report layout (the Gradle
+        # tool synchronously, the obligation on settlement) and carried through
+        # this ONE assembly point, so the detached path cannot diverge from the
+        # synchronous one by lacking a field only the caller could supply.
+        gradle_suite_summaries=gradle_suite_summaries,
+        gradle_row_disclosure=gradle_row_disclosure,
         cached_report_roots=cached_report_roots,
         excluded_claimed_paths=excluded_claimed_paths,
         effective_jdk=effective_jdk,

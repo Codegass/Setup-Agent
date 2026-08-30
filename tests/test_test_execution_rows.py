@@ -4,10 +4,12 @@ import shlex
 import subprocess
 import sys
 
+import pytest
 from test_container_io import FakeContainer
 from test_invocation_receipts import HASH_A, FakeExecute, ok, receipts_written
 
 from sag.agent import invocation_receipts
+from sag.agent.invocation_receipts import assemble_gradle_test_rows
 from sag.agent.receipt_test_rows import (
     _CONTAINER_REPORT_ROW_PARSER,
     diagnostic_testcase_outcomes,
@@ -639,3 +641,311 @@ def test_gradle_project_dir_mapping_requires_static_settings_proof():
         "/workspace/proj/modules/public-api": ":api",
     }
     assert dynamic is None
+
+
+# ---------------------------------------------------------------------------
+# Gradle test evidence (evidence study 2026-08-30, docs/superpowers/reports/
+# gradle-evidence-20260830.md). The measured kafka run left 27,219 tests' worth
+# of XML on disk and reported none of it. These cover the pure fold that turns
+# such a harvest into the two receipt facts it may state: complete per
+# (project, task-dir) totals, and a bounded, red-first identity sample that
+# discloses its own truncation.
+# ---------------------------------------------------------------------------
+
+GRADLE_ROOT = "/workspace/proj"
+
+
+def _suite(module, task, *, tests=1, failures=0, errors=0, skipped=0):
+    return {
+        "module": module,
+        "task": task,
+        "tests": tests,
+        "failures": failures,
+        "errors": errors,
+        "skipped": skipped,
+    }
+
+
+def _gradle_row(module, name, outcome, *, ordinal=1, task="test", digest=HASH_A):
+    return {
+        "report_path": f"{GRADLE_ROOT}/{module}/build/test-results/{task}/TEST-{name}.xml",
+        "report_sha256": digest,
+        "classname": "com.acme.SuiteTest",
+        "name": name,
+        "source_file": None,
+        "outcome": outcome,
+        "reason": None,
+        "execution_ordinal": ordinal,
+    }
+
+
+def test_gradle_summaries_fold_per_module_and_task_dir_not_per_module():
+    """geode writes `test-results/test` AND `test-results/distributedTest`.
+
+    Folding on the module alone would silently merge two different task runs
+    into one row and lose which task produced which count.
+    """
+    section, rows, disclosures = assemble_gradle_test_rows(
+        [
+            _suite(":core", "test", tests=10, failures=1, skipped=2),
+            _suite(":core", "test", tests=5, errors=1),
+            _suite(":core", "distributedTest", tests=7),
+        ],
+        [],
+    )
+
+    assert section["suites"] == [
+        {
+            "module": ":core",
+            "task": "distributedTest",
+            "xml_files": 1,
+            "tests": 7,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        },
+        {
+            "module": ":core",
+            "task": "test",
+            "xml_files": 2,
+            "tests": 15,
+            "failures": 1,
+            "errors": 1,
+            "skipped": 2,
+        },
+    ]
+    assert "truncated" not in section and "unreadable_suites" not in section
+    assert rows == []
+    # The summaries witness two reds that no row carries: nothing may claim the
+    # red identities are complete.
+    assert disclosures == {"rows_source": "gradle_xml", "red_rows_complete": False}
+
+
+def test_a_gradle_harvest_that_found_nothing_states_absence_and_never_a_zero():
+    """ofbiz-plugins left no XML at all. Absence is missing, not zero."""
+
+    assert assemble_gradle_test_rows([], []) == (None, [], None)
+    assert assemble_gradle_test_rows(None, None) == (None, [], None)
+    # A harvest whose every entry was unreadable is equally not a zero count:
+    # no suite survives, so the section is absent and the caller must record an
+    # evidence omission rather than publish an empty summary.
+    section, rows, disclosures = assemble_gradle_test_rows([{"module": ":a"}], [])
+    assert section is None and rows == []
+    assert disclosures is None
+
+
+def test_gradle_row_cap_drops_greens_before_reds_and_counts_every_drop():
+    reds = [_gradle_row("clients", f"red{index}", "failed", ordinal=index) for index in range(1, 3)]
+    greens = [
+        _gradle_row("streams", f"green{index}", "passed", ordinal=index) for index in range(1, 5)
+    ]
+
+    section, rows, disclosures = assemble_gradle_test_rows(
+        [_suite(":clients", "test", tests=6, failures=2)],
+        [*greens, *reds],
+        row_cap=3,
+    )
+
+    assert [row["name"] for row in rows] == ["red1", "red2", "green1"]
+    assert disclosures == {
+        "rows_source": "gradle_xml",
+        # Every red the summaries account for survived the cap.
+        "red_rows_complete": True,
+        "rows_truncated": {"dropped_green": 3, "dropped_files": 3},
+    }
+    assert section["suites"][0]["failures"] == 2
+
+
+def test_a_cap_that_cannot_hold_the_reds_withdraws_the_completeness_claim():
+    reds = [_gradle_row("clients", f"red{index}", "error", ordinal=index) for index in range(1, 4)]
+
+    _section, rows, disclosures = assemble_gradle_test_rows(
+        [_suite(":clients", "test", tests=3, errors=3)],
+        [*reds, _gradle_row("clients", "green", "passed", ordinal=9)],
+        row_cap=2,
+    )
+
+    assert [row["name"] for row in rows] == ["red1", "red2"]
+    assert disclosures["red_rows_complete"] is False
+    # A dropped red is disclosed as a count, not only as a withdrawn claim.
+    # Two reports (red3's and the green's) lost every row they contributed.
+    assert disclosures["rows_truncated"] == {
+        "dropped_green": 1,
+        "dropped_files": 2,
+        "dropped_red": 1,
+    }
+
+
+def test_dropped_files_counts_only_reports_that_lost_every_row():
+    shared = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-shared.xml"
+    kept = dict(_gradle_row("clients", "red", "failed"), report_path=shared)
+    also_shared = dict(_gradle_row("clients", "green", "passed"), report_path=shared, ordinal=2)
+    elsewhere = _gradle_row("streams", "other", "passed", ordinal=1)
+
+    _section, rows, disclosures = assemble_gradle_test_rows(
+        [_suite(":clients", "test", tests=3, failures=1)],
+        [kept, also_shared, elsewhere],
+        row_cap=1,
+    )
+
+    assert [row["name"] for row in rows] == ["red"]
+    # Two rows were dropped but only ONE report lost its whole representation.
+    assert disclosures["rows_truncated"] == {"dropped_green": 2, "dropped_files": 1}
+
+
+def test_gradle_summary_cap_keeps_red_bearing_pairs_and_states_what_it_dropped():
+    summaries = [_suite(f":green{index:03d}", "test", tests=1) for index in range(20)]
+    summaries.append(_suite(":zzz-red", "test", tests=1, failures=1))
+
+    section, _rows, disclosures = assemble_gradle_test_rows(summaries, [], summary_cap=3)
+
+    modules = [suite["module"] for suite in section["suites"]]
+    assert ":zzz-red" in modules
+    assert len(section["suites"]) == 3
+    assert section["truncated"] is True
+    assert section["dropped_suites"] == 18
+    # The cap that dropped summaries did not touch the rows, so no row
+    # truncation is claimed — but the unseen red keeps completeness withdrawn.
+    assert "rows_truncated" not in disclosures
+    assert disclosures["red_rows_complete"] is False
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"module": ":a", "task": "test", "tests": 1, "failures": 0, "errors": 0},
+        {"module": "", "task": "test", "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+        {"module": ":a", "task": "", "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+        {"module": ":a", "task": "test", "tests": -1, "failures": 0, "errors": 0, "skipped": 0},
+        {"module": ":a", "task": "test", "tests": True, "failures": 0, "errors": 0, "skipped": 0},
+        {"module": ":a", "task": "test", "tests": "4", "failures": 0, "errors": 0, "skipped": 0},
+        "not a mapping",
+    ],
+)
+def test_an_unreadable_summary_is_counted_and_never_summed_into_a_smaller_total(malformed):
+    section, _rows, disclosures = assemble_gradle_test_rows(
+        [_suite(":clients", "test", tests=4), malformed],
+        [_gradle_row("clients", "green", "passed")],
+    )
+
+    assert section["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 4,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+    assert section["unreadable_suites"] == 1
+    # Part of the witness is missing, so the red count it would have declared
+    # is unknown and completeness cannot be claimed.
+    assert disclosures["red_rows_complete"] is False
+
+
+def test_red_completeness_needs_a_summary_witness_that_the_rows_satisfy():
+    row = _gradle_row("clients", "red", "failed")
+
+    _s, _r, agreeing = assemble_gradle_test_rows([_suite(":c", "test", tests=1, failures=1)], [row])
+    _s, _r, short = assemble_gradle_test_rows([_suite(":c", "test", tests=2, failures=2)], [row])
+    _s, _r, unwitnessed = assemble_gradle_test_rows([], [row])
+
+    assert agreeing["red_rows_complete"] is True
+    # The reports declared two failures and only one identity was harvested.
+    assert short["red_rows_complete"] is False
+    # No summary at all is no witness at all — never a vacuous claim.
+    assert unwitnessed == {"rows_source": "gradle_xml", "red_rows_complete": False}
+
+
+def test_harvested_module_and_task_text_is_collapsed_before_a_receipt_sees_it():
+    """The kafka lesson, applied one field earlier.
+
+    A receipt identifier may not carry control text, and a field that carries
+    it is dropped to an omission at assembly. Collapsing here keeps the
+    evidence instead of losing the section to its own whitespace.
+    """
+    section, _rows, _disclosures = assemble_gradle_test_rows(
+        [_suite(" :clients\n ", "test\ttest", tests=1)],
+        [],
+    )
+
+    assert section["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test test",
+            "xml_files": 1,
+            "tests": 1,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+
+
+def test_rows_a_parser_could_not_classify_lose_their_slot_before_any_red_does():
+    unclassified = dict(_gradle_row("clients", "mystery", "passed"), outcome="")
+
+    _section, rows, disclosures = assemble_gradle_test_rows(
+        [_suite(":clients", "test", tests=2, failures=1)],
+        [unclassified, _gradle_row("clients", "red", "failed", ordinal=2)],
+        row_cap=1,
+    )
+
+    assert [row["name"] for row in rows] == ["red"]
+    assert disclosures["red_rows_complete"] is True
+    assert disclosures["rows_truncated"] == {"dropped_green": 1, "dropped_files": 1}
+
+
+def test_capped_gradle_rows_still_seal_through_the_one_maven_row_contract():
+    """The rows this fold returns are the SAME rows, only ordered and bounded.
+
+    Downstream must not learn a second row shape: identity sealing, the
+    execution-id material and `validate_testcase_execution_row` are unchanged.
+    """
+    harvest = [
+        _gradle_row("clients", "greenOne", "passed", ordinal=1),
+        _gradle_row("clients", "redOne", "failed", ordinal=2),
+    ]
+    _section, rows, disclosures = assemble_gradle_test_rows(
+        [_suite(":clients", "test", tests=2, failures=1)],
+        harvest,
+        row_cap=1,
+    )
+    for row in rows:
+        row["report_path"] = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-c.xml"
+
+    envelope = seal_testcase_execution_rows(
+        {"schema_version": 2, "status": "complete", "report_count": 1, "rows": rows},
+        run_id=RUN_ID,
+        receipt_id="inv-gradle-test-0031",
+        tool="gradle",
+        target_sha="a" * 40,
+        domain_id=GRADLE_ROOT,
+        working_directory=GRADLE_ROOT,
+        module_outcomes=[{"module": ":clients", "status": "attempted"}],
+        gradle_project_map={
+            GRADLE_ROOT: ":root",
+            f"{GRADLE_ROOT}/clients": ":clients",
+        },
+    )
+
+    assert envelope["status"] == "complete"
+    assert len(envelope["rows"]) == 1
+    sealed = envelope["rows"][0]
+    assert sealed["module_coordinate"] == ":clients"
+    assert sealed["framework"] == "junit-xml"
+    assert sealed["outcome"] == "failed"
+    assert (
+        validate_testcase_execution_row(
+            sealed,
+            receipt_id="inv-gradle-test-0031",
+            run_id=RUN_ID,
+            target_sha="a" * 40,
+            domain_id=GRADLE_ROOT,
+            report_claims={(sealed["report_path"], sealed["report_sha256"])},
+        )
+        == sealed
+    )
+    assert disclosures["rows_truncated"]["dropped_green"] == 1
