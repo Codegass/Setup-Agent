@@ -709,43 +709,125 @@ def download(path: str, destination: Path) -> None:
         raise HarvestError(f"gh api {path} failed: {detail[-1] if detail else 'no detail'}")
 
 
+# The same noise vocabulary the selector walks past: a workflow whose name or
+# path matches proves nothing about build or test outcomes.  Dependabot runs
+# additionally report a virtual path under dynamic/ that is not a fetchable
+# workflow file.
+NOISE_WORKFLOWS = (
+    "codeql", "dependabot", "copilot", "label", "stale", "docs", "website",
+    "site", "sonar", "triage", "comment", "notify", "lint-pr", "semantic",
+    "dco", "analyze", "dependency review", "license", "scorecard",
+)
+
+
+def _is_noise_run(run: dict) -> bool:
+    text = f"{run.get('name') or ''} {run.get('path') or ''}".lower()
+    return str(run.get("path") or "").startswith("dynamic/") or any(
+        token in text for token in NOISE_WORKFLOWS
+    )
+
+
+_RUN_ID_IN_URL = re.compile(r"/actions/runs/(\d+)")
+
+
 def fetch_snapshot(repo: str, sha: str, out_dir: Path) -> Path:
-    """Pull one revision's run evidence into ``out_dir`` and return it."""
+    """Pull one revision's run evidence into ``out_dir`` and return it.
+
+    The commit's own check-run surface is the authority on what CI concluded
+    here — merge-queue and workflow_run-triggered workflows stamp checks on a
+    commit whose ``actions/runs?head_sha`` listing is empty (kafka trunk), and
+    dependabot noise dominates that listing elsewhere (curator).  So the
+    courier reads check-runs first, converts them to the jobs shape the
+    assembler already understands, and follows their details_url run ids only
+    to collect JUnit pool artifacts and workflow configs.  Attempt 1 of the
+    d3 freeze (2026-08-30) read one recency-picked run instead and harvested
+    noise or nothing; this is the repair.
+    """
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    runs = fetch(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")
-    completed = [
-        run
-        for run in (runs.get("workflow_runs") if isinstance(runs, dict) else []) or []
-        if isinstance(run, dict) and run.get("status") == "completed"
-    ]
-    if not completed:
-        raise HarvestError(f"{repo}@{sha} has no completed workflow run to harvest")
-    run = sorted(completed, key=lambda item: (str(item.get("run_started_at") or ""), item["id"]))[
-        -1
-    ]
-    run_id = run["id"]
 
-    (out_dir / METADATA_FILE).write_text(canonical_json(run), encoding="utf-8")
-    jobs = fetch(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
-    (out_dir / JOBS_FILE).write_text(canonical_json(jobs), encoding="utf-8")
+    checks: list[dict] = []
+    for page in (1, 2):
+        body = fetch(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}")
+        page_runs = (body.get("check_runs") if isinstance(body, dict) else []) or []
+        checks.extend(run for run in page_runs if isinstance(run, dict))
+        if len(page_runs) < 100:
+            break
+    # The raw check surface is the one artifact a later re-assembly cannot
+    # re-derive offline (it carries the check-to-run attribution a
+    # per-workflow laundering vet will need), so it is kept verbatim.
+    (out_dir / "check-runs.json").write_text(canonical_json(checks), encoding="utf-8")
+    signal_checks = [
+        check
+        for check in checks
+        if str(check.get("status") or "") == "completed"
+        and not any(token in str(check.get("name") or "").lower() for token in NOISE_WORKFLOWS)
+    ]
+
+    run_ids: list[int] = []
+    for check in signal_checks:
+        match = _RUN_ID_IN_URL.search(str(check.get("details_url") or ""))
+        if match and int(match.group(1)) not in run_ids:
+            run_ids.append(int(match.group(1)))
+    listed = fetch(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")
+    for run in (listed.get("workflow_runs") if isinstance(listed, dict) else []) or []:
+        if (
+            isinstance(run, dict)
+            and run.get("status") == "completed"
+            and not _is_noise_run(run)
+            and run["id"] not in run_ids
+        ):
+            run_ids.append(run["id"])
+
+    merged_jobs: list[dict] = [
+        {"name": str(check.get("name") or "").strip(), "conclusion": check.get("conclusion")}
+        for check in signal_checks
+        if str(check.get("name") or "").strip()
+    ]
+    seen_workflow_paths: set[str] = set()
+    signal_runs: list[dict] = []
+    for run_id in run_ids:
+        try:
+            run = fetch(f"repos/{repo}/actions/runs/{run_id}")
+        except HarvestError:
+            continue
+        if not isinstance(run, dict) or _is_noise_run(run):
+            continue
+        signal_runs.append(run)
+        artifacts = fetch(f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")
+        (out_dir / f"run-{run_id}-artifacts.json").write_text(
+            canonical_json(artifacts), encoding="utf-8"
+        )
+        for artifact in (artifacts.get("artifacts") if isinstance(artifacts, dict) else []) or []:
+            name = str(artifact.get("name") or "").strip()
+            destination = out_dir / f"{name}.zip"
+            if not name.startswith("junit-xml") or destination.exists():
+                continue
+            download(f"repos/{repo}/actions/artifacts/{artifact['id']}/zip", destination)
+        seen_workflow_paths.add(str(run.get("path") or "").strip())
+
+    if not merged_jobs and not signal_runs:
+        raise HarvestError(f"{repo}@{sha} has no completed non-noise check or workflow run")
+
+    if signal_runs:
+        signal_runs.sort(key=lambda item: (str(item.get("run_started_at") or ""), item["id"]))
+        (out_dir / "runs-index.json").write_text(canonical_json(signal_runs), encoding="utf-8")
+        (out_dir / METADATA_FILE).write_text(canonical_json(signal_runs[-1]), encoding="utf-8")
+
+    (out_dir / JOBS_FILE).write_text(canonical_json({"jobs": merged_jobs}), encoding="utf-8")
     statuses = fetch(f"repos/{repo}/commits/{sha}/status")
     (out_dir / STATUSES_FILE).write_text(canonical_json(statuses), encoding="utf-8")
-    artifacts = fetch(f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")
-    (out_dir / ARTIFACTS_FILE).write_text(canonical_json(artifacts), encoding="utf-8")
 
-    for artifact in (artifacts.get("artifacts") if isinstance(artifacts, dict) else []) or []:
-        name = str(artifact.get("name") or "").strip()
-        if not name.startswith("junit-xml"):
+    for workflow_path in sorted(seen_workflow_paths):
+        if not workflow_path or workflow_path.startswith("dynamic/"):
             continue
-        download(
-            f"repos/{repo}/actions/artifacts/{artifact['id']}/zip",
-            out_dir / f"{name}.zip",
-        )
-
-    workflow_path = str(run.get("path") or "").strip()
-    if workflow_path:
-        body = fetch(f"repos/{repo}/contents/{workflow_path}?ref={sha}")
+        try:
+            body = fetch(f"repos/{repo}/contents/{workflow_path}?ref={sha}")
+        except HarvestError:
+            # A workflow file that moved between the run and the harvest is a
+            # gap in the vet, not a reason to drop the whole snapshot; the
+            # assembler discloses the un-vetted state on its own.
+            continue
         content = body.get("content") if isinstance(body, dict) else None
         if isinstance(content, str):
             workflows = out_dir / WORKFLOWS_DIR
