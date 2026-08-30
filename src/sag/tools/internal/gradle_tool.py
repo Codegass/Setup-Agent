@@ -20,7 +20,9 @@ from sag.agent.invocation_contracts import (
 from sag.agent.invocation_receipts import (
     DECLARED_OMISSION_REASONS,
     GRADLE_DISCOVERY_INCOMPLETE,
+    GRADLE_NO_CLAIMED_TEST_REPORTS,
     GRADLE_NO_TEST_REPORTS,
+    GRADLE_ROW_SAMPLE_UNREADABLE,
     GRADLE_SUITE_TOTALS_UNREADABLE,
     TESTCASE_FILE_CAP,
     TESTCASE_OUTCOME_CAP,
@@ -136,13 +138,20 @@ def _gradle_module_outcomes(output: str) -> List[Dict[str, str]]:
 # exists for left 1,176 report files and 27,219 executed tests on disk and its
 # receipt reported none of it.
 #
-# Two tiers, because one read cannot do both jobs. Tier 1 sums every report's
-# `<testsuite>` root attributes, which is the COMPLETE count and costs a fixed
-# few kilobytes per file. Tier 2 samples per-testcase identities under the
-# existing tag bounds, red-bearing reports first, and states what it dropped.
-# Neither tier ever reads a report whole: kafka's largest single XML is
-# 137.8 MB against a 16 MB receipt canonical budget, so a whole-file read is
-# impossible by construction, not merely expensive.
+# Two tiers, because one read cannot do both jobs. Tier 1 sums the
+# `<testsuite>` root attributes of every report THIS INVOCATION CLAIMS, which
+# is the COMPLETE count for it and costs a fixed few kilobytes per file. Tier 2
+# samples per-testcase identities from the same claim set under the existing tag
+# bounds, red-bearing reports first, and states what it dropped. Neither tier
+# ever reads a report whole: kafka's largest single XML is 137.8 MB against a
+# 16 MB receipt canonical budget, so a whole-file read is impossible by
+# construction, not merely expensive.
+#
+# Both tiers answer to the receipt's own `report_delta`, and the scan is wider
+# than that on purpose — the tree holds every earlier attempt's leftovers too.
+# What discovery proves is presence and absence; what the delta decides is
+# whose. A count summed off a file the delta refused to claim would be another
+# dispatch's tests wearing this receipt's identity.
 
 # Reports discovery will hand on. kafka measured 1,176 and geode 1,167, so this
 # is a safety bound rather than an expected one; a discovery that hits it says
@@ -153,6 +162,13 @@ GRADLE_XML_FILE_CAP = 2048
 # the same read whether the file is 438 bytes or 137.8 MB.
 GRADLE_SUITE_HEAD_BYTES = 4096
 _GRADLE_REPORT_COUNT_MARKER = "###sag-gradle-xml-count###"
+# `find`'s OWN exit status, carried in band. `2>/dev/null` throws its errors
+# away and the pipeline's status belongs to `awk`, so without this line a find
+# that never read the tree — a workdir that vanished, a subtree it could not
+# descend — is indistinguishable from one that read it all and found nothing.
+# The scan has to state that it finished; the marker alone only states that
+# `awk` did.
+_GRADLE_FIND_STATUS_MARKER = "###sag-gradle-find-status###"
 # Gradle writes reports per TASK: `build/test-results/<task>/TEST-*.xml`. geode
 # writes `distributedTest` beside `test`, so the task dir is discovered, never
 # assumed. `binary/` under it is Gradle's own internal result store and holds
@@ -286,20 +302,31 @@ def _gradle_discover_reports(execute, working_directory: str) -> GradleReportDis
 
     `awk` prints the bounded path list and then the TRUE total, so a bound that
     fired states exactly how many reports it left behind instead of silently
-    handing back a short list. No marker line means the scan did not finish,
-    and an unfinished scan proves nothing about absence.
+    handing back a short list.
+
+    Completeness is `find`'s to state, not `awk`'s. The END block runs whatever
+    happened upstream — over a partial list, over no list at all — so a marker
+    line proves only that the last stage of the pipeline ran. `find` therefore
+    prints its OWN exit status into the stream, and a scan whose `find` did not
+    return 0 is an unfinished scan: it proves nothing about absence, and
+    "no reports found" from a directory it never read is the exact false
+    absence claim `GradleReportDiscovery` exists to forbid.
     """
 
     root = str(working_directory or "").strip().rstrip("/")
     if not root:
         return GradleReportDiscovery((), 0, False)
     program = (
-        f"NR<={GRADLE_XML_FILE_CAP} {{ print }} "
-        f'END {{ printf "%s%d\\n", "{_GRADLE_REPORT_COUNT_MARKER}", NR }}'
+        f'index($0, "{_GRADLE_FIND_STATUS_MARKER}") == 1 '
+        f"{{ status = substr($0, {len(_GRADLE_FIND_STATUS_MARKER) + 1}); next }} "
+        f"count < {GRADLE_XML_FILE_CAP} {{ print }} "
+        f"{{ count++ }} "
+        f'END {{ printf "%s%d %s\\n", "{_GRADLE_REPORT_COUNT_MARKER}", count, status }}'
     )
     command = (
-        f"find {shlex.quote(root)} -type f -path {shlex.quote(_GRADLE_REPORT_GLOB)} "
-        f"! -path {shlex.quote(_GRADLE_BINARY_GLOB)} 2>/dev/null "
+        f"{{ find {shlex.quote(root)} -type f -path {shlex.quote(_GRADLE_REPORT_GLOB)} "
+        f"! -path {shlex.quote(_GRADLE_BINARY_GLOB)} 2>/dev/null; "
+        f"printf '%s%d\\n' {shlex.quote(_GRADLE_FIND_STATUS_MARKER)} \"$?\"; }} "
         f"| LC_ALL=C sort | awk {shlex.quote(program)}"
     )
     output = _gradle_untruncated_output(execute, command)
@@ -307,17 +334,20 @@ def _gradle_discover_reports(execute, working_directory: str) -> GradleReportDis
         return GradleReportDiscovery((), 0, False)
     paths: List[str] = []
     total: Optional[int] = None
+    scan_status: Optional[str] = None
     for line in output.splitlines():
         line = line.strip()
         if line.startswith(_GRADLE_REPORT_COUNT_MARKER):
+            counted, _, status = line[len(_GRADLE_REPORT_COUNT_MARKER) :].partition(" ")
             try:
-                total = int(line[len(_GRADLE_REPORT_COUNT_MARKER) :])
+                total = int(counted)
             except ValueError:
                 total = None
+            scan_status = status.strip()
             continue
         if line.startswith("/"):
             paths.append(line)
-    if total is None or total < len(paths):
+    if total is None or scan_status != "0" or total < len(paths):
         return GradleReportDiscovery((), 0, False)
     return GradleReportDiscovery(tuple(paths), total, True)
 
@@ -447,23 +477,29 @@ def _gradle_identity_rows(
     execute,
     paths: Sequence[str],
     claims: Mapping[str, str],
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     """Bounded per-testcase identities from the reports this receipt claims.
 
-    Tag tokens only, `TESTCASE_TAG_CAP` per report, `TESTCASE_FILE_CAP` reports
-    — the maven-side bound, unchanged. Each report's tokens are headed by the
-    digest of the file they were read from, and a digest the receipt's report
-    delta does not claim contributes nothing: an identity is only this
-    invocation's when the bytes behind it are.
+    Tag tokens only, `TESTCASE_TAG_CAP` per report — the maven-side bound,
+    unchanged; the caller has already applied `TESTCASE_FILE_CAP` so the file
+    set this read covers and the file set the disclosure discloses are one
+    list. Each report's tokens are headed by the digest of the file they were
+    read from, and a digest the receipt's report delta does not claim
+    contributes nothing: an identity is only this invocation's when the bytes
+    behind it are.
+
+    `None` is the round trip that did not complete, and it is a different fact
+    from `[]` (it ran and the claimed bytes yielded no identity). Only the
+    second is a sample; the first is no sample at all, and a disclosure written
+    over it would describe rows the receipt does not carry.
     """
 
-    selected = [path for path in paths if path in claims][:TESTCASE_FILE_CAP]
-    if not selected:
+    if not paths:
         return []
-    command = "; ".join(report_tag_command(path, tag_cap=TESTCASE_TAG_CAP) for path in selected)
+    command = "; ".join(report_tag_command(path, tag_cap=TESTCASE_TAG_CAP) for path in paths)
     output = _gradle_untruncated_output(execute, command)
     if output is None:
-        return []
+        return None
     return parse_report_tag_rows(output, report_claims=claims)
 
 
@@ -480,13 +516,14 @@ def gradle_test_harvest(
     is exactly what a detached job holds at settlement — so the settled path
     states what the synchronous one does instead of quietly lacking it.
 
-    Reports found and summed become totals, and a bound that fired becomes a
-    recorded drop. The two failures are told apart by what the scan PROVED. A
-    scan that never finished proved nothing and states nothing — unknown is an
-    absent key here as it is for every other v2 fact. A scan that finished is
-    proof, and everything after it is a statement: reports that exist and could
-    not be summed, and a test run that left none at all, are both recorded
-    omissions. The one thing this never returns is a zero.
+    Reports this invocation CLAIMS, found and summed, become totals, and a
+    bound that fired becomes a recorded drop. The failures are told apart by
+    what the scan PROVED. A scan that never finished proved nothing and states
+    nothing — unknown is an absent key here as it is for every other v2 fact. A
+    scan that finished is proof, and everything after it is a statement:
+    reports that exist and could not be summed, a tree whose every report
+    belongs to some earlier dispatch, and a test run that left none at all are
+    all recorded omissions. The one thing this never returns is a zero.
     """
 
     if not test_dispatch:
@@ -501,29 +538,73 @@ def gradle_test_harvest(
         # ofbiz-plugins: the task ran and wrote no XML. That is missing
         # evidence, not a clean zero, and the two must never look alike.
         return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_TEST_REPORTS))
-    entries = _gradle_suite_head_entries(execute, discovery.paths, working_directory)
-    if entries is None:
-        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
     claims = {
         str((entry or {}).get("path") or ""): str((entry or {}).get("sha256") or "").lower()
         for bucket in ("new", "changed", "cached")
         for entry in (delta or {}).get(bucket) or ()
         if isinstance(entry, Mapping)
     }
+    # THE binding, and it is the same one the identity rows already answered to.
+    # Discovery is a tree scan: it finds every report the tree holds, including
+    # byte-identical leftovers from an earlier dispatch that `report_delta`
+    # deliberately put in no bucket, and — at settlement — reports a LATER
+    # dispatch wrote. Summing those would state another invocation's tests as
+    # this receipt's, so only the delta's own reports are summed. A repair loop
+    # re-running `:clients:test` over a full reactor's leftovers is the ordinary
+    # case, not the exotic one.
+    claimed = tuple(path for path in discovery.paths if path in claims)
+    if not claimed:
+        # Reports exist and none is this dispatch's. Proved, so stated.
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_CLAIMED_TEST_REPORTS))
+    listed = set(discovery.paths)
+    # What the DISCOVERY bound cost this receipt: claimed reports the capped
+    # listing never named, so they could never be summed. Reports the bound
+    # left out that this invocation does not claim cost it nothing — they were
+    # never its evidence — and counting them would withdraw red-completeness on
+    # every scoped re-run over a large tree.
+    unsummarized = sum(
+        1
+        for path in claims
+        if path not in listed and _gradle_report_identity(path, working_directory) is not None
+    )
+    entries = _gradle_suite_head_entries(execute, claimed, working_directory)
+    if entries is None:
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
+    tests_reported: Dict[str, int] = {}
+    for entry in entries:
+        total = entry.get("tests")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            continue
+        key = _gradle_module_outcome_key(str(entry.get("module") or ""))
+        if key:
+            tests_reported[key] = tests_reported.get(key, 0) + total
     ordered = _gradle_red_first(entries)
-    rows = _gradle_identity_rows(execute, ordered, claims)
+    sampled = ordered[:TESTCASE_FILE_CAP]
+    rows = _gradle_identity_rows(execute, sampled, claims)
     summaries, kept_rows, disclosure = assemble_gradle_test_rows(
         entries,
-        rows,
+        rows or [],
         # The identity sample IS the receipt's bounded diagnostic list, so it is
         # bounded by that list's own cap; disclosing drops against a larger one
         # would describe rows the receipt does not carry.
         row_cap=TESTCASE_OUTCOME_CAP,
-        harvested_files=[path for path in ordered if path in claims],
-        unsummarized_files=max(0, discovery.total - len(discovery.paths)),
+        harvested_files=ordered if rows is not None else (),
+        unsummarized_files=unsummarized,
     )
     if summaries is None:
         return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
+    if rows is None:
+        # The totals stand — a different read produced them — but there is no
+        # sample, so nothing may be disclosed about one. The receipt states the
+        # counts, names the measurement it could not make, and leaves its
+        # bounded list to the transports below.
+        return GradleTestHarvest(
+            suite_summaries=summaries,
+            module_tests_reported=tests_reported,
+            omissions=_gradle_omissions(
+                GRADLE_ROW_SAMPLE_UNREADABLE, fields=("gradle_row_disclosure",)
+            ),
+        )
     outcomes = diagnostic_testcase_outcomes(
         {
             # `diagnostic_testcase_outcomes` marks the list truncated for any
@@ -534,14 +615,6 @@ def gradle_test_harvest(
             "rows": kept_rows,
         }
     )
-    tests_reported: Dict[str, int] = {}
-    for entry in entries:
-        total = entry.get("tests")
-        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-            continue
-        key = _gradle_module_outcome_key(str(entry.get("module") or ""))
-        if key:
-            tests_reported[key] = tests_reported.get(key, 0) + total
     return GradleTestHarvest(
         suite_summaries=summaries,
         row_disclosure=disclosure,
@@ -550,22 +623,28 @@ def gradle_test_harvest(
     )
 
 
-def _gradle_omissions(reason: str) -> Tuple[Dict[str, Any], ...]:
-    """The two harvested sections, each stated unavailable for one reason.
+def _gradle_omissions(
+    reason: str,
+    *,
+    fields: Sequence[str] = ("gradle_suite_summaries", "gradle_row_disclosure"),
+) -> Tuple[Dict[str, Any], ...]:
+    """The named harvested sections, each stated unavailable for one reason.
 
     An omission is a claim that something IS missing, so only a scan that ran
     to completion may make one. `GRADLE_DISCOVERY_INCOMPLETE` is therefore not
     in the vocabulary at all: a receipt that could not look has nothing to
     declare, and declaring anyway would turn every unanswered probe into
     evidence of a barren build.
+
+    Both sections fail together for every reason that stops the harvest before
+    it has counts. `fields` is for the one that does not: a totals read that
+    landed and a tag read that did not leaves the summaries standing and only
+    the row disclosure missing.
     """
 
     if reason not in DECLARED_OMISSION_REASONS:
         return ()
-    return tuple(
-        {"field": field, "reasons": [reason]}
-        for field in ("gradle_suite_summaries", "gradle_row_disclosure")
-    )
+    return tuple({"field": field, "reasons": [reason]} for field in fields)
 
 
 def _gradle_module_outcomes_with_counts(

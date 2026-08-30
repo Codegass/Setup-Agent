@@ -159,7 +159,7 @@ class GradleReactor:
 
     def discovery(self) -> str:
         body = "".join(f"{path}\n" for path in self.paths)
-        return f"{body}{COUNT_MARKER}{len(self.paths)}\n"
+        return f"{body}{COUNT_MARKER}{len(self.paths)} 0\n"
 
 
 class ReactorOrchestrator(ReceiptOrchestrator):
@@ -240,9 +240,9 @@ class ReactorOrchestrator(ReceiptOrchestrator):
         if REPORT_MARKER in command:
             self.harvest_commands.append(command)
             return {"exit_code": 0, "output": self._tag_stream(command), "success": True}
-        if command.startswith("find ") and "awk " in command:
+        if COUNT_MARKER in command:
             self.harvest_commands.append(command)
-            body = self.reactor.discovery() if self.reports_on_disk else f"{COUNT_MARKER}0\n"
+            body = self.reactor.discovery() if self.reports_on_disk else f"{COUNT_MARKER}0 0\n"
             return {"exit_code": 0, "output": body, "success": True}
         if command.startswith("git -C ") and command.endswith("rev-parse HEAD"):
             return {"exit_code": 0, "output": f"{TARGET_SHA}\n", "success": True}
@@ -622,7 +622,7 @@ def test_no_command_this_run_issued_can_ship_a_report_whole(tmp_path):
     for command in naming:
         assert "cat " not in command
         bracket = "-exec sha256sum" in command
-        discovery = command.startswith("find ") and "awk " in command
+        discovery = "find " in command and COUNT_MARKER in command
         bounded_tags = REPORT_MARKER in command and "head -n" in command
         assert bracket or discovery or bounded_tags, command
     assert not any("python3 -c" in command for command in naming)

@@ -58,6 +58,7 @@ from sag.tools.internal.gradle_tool import (
     GradleTool,
     _gradle_cached_report_dirs,
     _gradle_module_outcomes,
+    _gradle_report_identity,
 )
 
 ROOT = "/workspace/polaris"
@@ -133,14 +134,15 @@ class JobContainer(ContainerFS):
         # The strict snapshot reader accepts only a PROVEN clean transport
         # (exit_code == 0); a double that omits the code is an incomplete
         # bracket and would honestly claim nothing.
-        if command.startswith("find ") and "awk " in command:
+        if "###sag-gradle-xml-count###" in command:
             # The post-dispatch report harvest's discovery pass: the bounded
-            # path list, then its own count marker. Settlement runs the SAME
-            # harvest the synchronous runner does.
+            # path list, then its own count marker and the scan's own exit
+            # status. Settlement runs the SAME harvest the synchronous runner
+            # does.
             self.commands.append(command)
             paths = sorted(self.reports)
             return {
-                **ok("\n".join([*paths, f"###sag-gradle-xml-count###{len(paths)}"])),
+                **ok("\n".join([*paths, f"###sag-gradle-xml-count###{len(paths)} 0"])),
                 "exit_code": 0,
             }
         if "ATTRIBUTE = re.compile" in command:
@@ -738,6 +740,13 @@ def test_the_module_outcomes_are_the_synchronous_parsers_output():
 def test_a_settled_receipt_states_the_suite_totals_a_synchronous_one_would():
     """Settlement parity. kafka died on the DETACHED path: a harvest wired only
     into the runner would have left that run reporting nothing all over again.
+
+    And the totals are the CLAIMED reports', not the tree's. `TEST-Stranger.xml`
+    sits under this build root, byte-identical before and after, vouched for by
+    no cache hit — `report_delta` puts it in no bucket precisely because it is
+    not this invocation's evidence. A settled harvest scans the whole tree,
+    which at settlement may also hold reports a LATER dispatch wrote, so the
+    scan finds it and the delta is what refuses it.
     """
     orchestrator = _with_obligation(_orchestrator())
 
@@ -745,15 +754,6 @@ def test_a_settled_receipt_states_the_suite_totals_a_synchronous_one_would():
 
     (receipt,) = _receipts(orchestrator)
     assert receipt["gradle_suite_summaries"]["suites"] == [
-        {
-            "module": ":other",
-            "task": "test",
-            "xml_files": 1,
-            "tests": 3,
-            "failures": 0,
-            "errors": 0,
-            "skipped": 0,
-        },
         {
             "module": ":polaris-api",
             "task": "test",
@@ -773,8 +773,17 @@ def test_a_settled_receipt_states_the_suite_totals_a_synchronous_one_would():
             "skipped": 0,
         },
     ]
-    # Totals cover every report ON DISK; identities are bound to the reports
-    # this receipt CLAIMS, and the stranger report is claimed by nobody.
+    # The stranger is on disk and in no bucket, so it is in no total either:
+    # summing it would state another dispatch's three tests as this one's.
+    assert _gradle_report_identity(STRANGER_REPORT, ROOT) == (":other", "test")
+    assert STRANGER_REPORT not in {
+        entry["path"]
+        for bucket in ("new", "changed", "cached")
+        for entry in receipt["report_delta"].get(bucket) or ()
+    }
+    assert ":other" not in {
+        suite["module"] for suite in receipt["gradle_suite_summaries"]["suites"]
+    }
     assert receipt["gradle_row_disclosure"]["rows_source"] == "gradle_xml"
     assert "evidence_omissions" not in receipt
 

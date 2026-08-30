@@ -34,7 +34,9 @@ from test_invocation_receipts import (
 from sag.agent.invocation_receipts import (
     DECLARED_OMISSION_REASONS,
     GRADLE_DISCOVERY_INCOMPLETE,
+    GRADLE_NO_CLAIMED_TEST_REPORTS,
     GRADLE_NO_TEST_REPORTS,
+    GRADLE_ROW_SAMPLE_UNREADABLE,
     GRADLE_SUITE_TOTALS_UNREADABLE,
     TESTCASE_FILE_CAP,
     build_receipt,
@@ -92,17 +94,30 @@ class FakeContainer(ContainerFilesystem):
         self.head_input = None
 
     def execute_command(self, command, **kwargs):
-        if command.startswith("find "):
+        if COUNT_MARKER in command:
             self.commands.append(command)
             return self._reply(self.discovery)
         if "ATTRIBUTE = re.compile" in command:
             self.commands.append(command)
             self.head_input = json.loads(self.files[shlex.split(command)[-1]])
-            return self._reply(self.heads)
+            return self._reply(self._head_reply())
         if REPORT_MARKER in command:
             self.commands.append(command)
             return self._reply(self.tags)
         return super().execute_command(command, **kwargs)
+
+    def _head_reply(self):
+        """A dict of heads answers only for the paths it was ASKED about.
+
+        The reader opens the files the harvest handed it and no others, so a
+        double that answered for a file nobody asked about would hide the whole
+        question of which files the harvest chooses to read.
+        """
+        if not isinstance(self.heads, dict):
+            return self.heads
+        return _head_output(
+            [{"path": path, **self.heads[path]} for path in self.head_input if path in self.heads]
+        )
 
     @staticmethod
     def _reply(payload):
@@ -111,9 +126,10 @@ class FakeContainer(ContainerFilesystem):
         return {"exit_code": 0, "output": payload, "success": True}
 
 
-def _discovery_output(paths, total=None):
+def _discovery_output(paths, total=None, status="0"):
+    """The pipeline's own output: the bounded list, the true total, find's status."""
     body = "\n".join(paths)
-    return f"{body}\n{COUNT_MARKER}{total if total is not None else len(paths)}\n"
+    return f"{body}\n{COUNT_MARKER}{total if total is not None else len(paths)} {status}\n"
 
 
 def _head_output(entries):
@@ -186,13 +202,79 @@ def test_the_file_bound_hands_back_a_capped_list_and_the_true_total():
     assert discovery.complete is True
     assert len(discovery.paths) == 3
     assert discovery.total == GRADLE_XML_FILE_CAP + 9
-    assert f"NR<={GRADLE_XML_FILE_CAP}" in container.commands[0]
+    assert f"count < {GRADLE_XML_FILE_CAP}" in container.commands[0]
 
 
 def test_a_total_smaller_than_the_listing_is_a_broken_scan_not_a_short_one():
     container = FakeContainer(discovery=_discovery_output(["/a.xml", "/b.xml"], total=1))
 
     assert _gradle_discover_reports(container.execute_command, ROOT).complete is False
+
+
+def test_a_scan_whose_find_failed_is_unfinished_however_cleanly_awk_ended():
+    """The marker is `awk`'s statement, and `awk` always gets to make it.
+
+    `find`'s errors go to `/dev/null` and the pipeline's exit code belongs to
+    the last stage, so an END block that ran is no evidence the tree was read.
+    A status the scan itself did not state is the same non-answer.
+    """
+    failed = FakeContainer(discovery=_discovery_output([], total=0, status="1"))
+    unstated = FakeContainer(discovery=f"{COUNT_MARKER}0\n")
+
+    assert _gradle_discover_reports(failed.execute_command, ROOT).complete is False
+    assert _gradle_discover_reports(unstated.execute_command, ROOT).complete is False
+
+
+class ShellContainer:
+    """Runs the harvest's own command through a REAL shell, on this machine.
+
+    The discovery pass is a shell pipeline, and every claim it makes about
+    completeness is a claim about how that pipeline composes `find`, `sort` and
+    `awk`. A double can only ever confirm the parse; this confirms the command.
+    """
+
+    def __init__(self):
+        self.commands = []
+
+    def execute_command(self, command, **kwargs):
+        del kwargs
+        self.commands.append(command)
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+        return {
+            "exit_code": completed.returncode,
+            "output": completed.stdout,
+            "success": completed.returncode == 0,
+        }
+
+
+def test_a_workdir_the_scan_could_not_read_proves_no_absence(tmp_path):
+    """The executed probe: a real `find`, a directory that is not there.
+
+    A settled job whose workdir vanished used to come back
+    `complete=True, total=0` — every stage of the pipeline exits 0 and the END
+    block prints its marker over an empty stream — and the harvest turned that
+    into `gradle_no_test_reports_on_disk`, a proved-absence claim about a tree
+    nothing ever read. The ofbiz case this vocabulary exists for is the
+    opposite: a directory that WAS read and held nothing.
+    """
+    present = tmp_path / "proj" / "m" / "build" / "test-results" / "test"
+    present.mkdir(parents=True)
+    (present / "TEST-a.xml").write_bytes(_fixture("kafka-green-suite.xml"))
+    shell = ShellContainer()
+
+    read = _gradle_discover_reports(shell.execute_command, str(tmp_path / "proj"))
+    unread = _gradle_discover_reports(shell.execute_command, str(tmp_path / "gone"))
+
+    assert read == (((str(present / "TEST-a.xml")),), 1, True)
+    assert unread.complete is False and unread.total == 0
+    # And the harvest over that vanished tree declares nothing at all.
+    harvest = gradle_test_harvest(
+        shell.execute_command,
+        working_directory=str(tmp_path / "gone"),
+        delta={"new": [], "changed": []},
+        test_dispatch=True,
+    )
+    assert harvest == type(harvest)()
 
 
 # --- tier 1: suite totals from a bounded head ------------------------------
@@ -348,10 +430,10 @@ def test_a_discovery_that_could_not_finish_states_nothing_at_all():
 
 
 def test_unreadable_suite_totals_are_an_omission_not_an_empty_summary():
-    paths = [f"{ROOT}/clients/build/test-results/test/TEST-a.xml"]
-    container = FakeContainer(discovery=_discovery_output(paths), heads=None)
+    path = f"{ROOT}/clients/build/test-results/test/TEST-a.xml"
+    container = FakeContainer(discovery=_discovery_output([path]), heads=None)
 
-    harvest = _kafka_harvest(container, delta={"new": [], "changed": []})
+    harvest = _kafka_harvest(container, delta=_delta(("kafka-green-suite.xml", path)))
 
     assert harvest.suite_summaries is None
     assert {entry["reasons"][0] for entry in harvest.omissions} == {GRADLE_SUITE_TOTALS_UNREADABLE}
@@ -372,7 +454,7 @@ def test_a_dispatch_that_ran_no_test_task_harvests_and_states_nothing():
     assert container.commands == []
 
 
-def test_the_harvest_sums_every_report_and_samples_identities_red_first():
+def test_the_harvest_sums_every_claimed_report_and_samples_identities_red_first():
     """The kafka shape in miniature: two task dirs, one red among the greens."""
     red = f"{ROOT}/clients/build/test-results/test/TEST-red.xml"
     green = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
@@ -439,6 +521,125 @@ def test_the_harvest_sums_every_report_and_samples_identities_red_first():
     assert harvest.module_tests_reported == {"clients": 20, "streams": 1}
 
 
+# --- the claim binding: whose tests these are ------------------------------
+
+
+def test_a_scoped_rerun_counts_only_what_it_wrote_over_the_reactors_leftovers():
+    """The failure-repair loop, which is the ordinary case and not an exotic one.
+
+    Dispatch 1 runs `test` across the reactor and leaves XML in every module.
+    Dispatch 2 re-runs `:clients:test` alone: it rewrites clients' report and
+    touches nothing else, so `report_delta` claims clients' bytes and puts
+    every leftover in no bucket — "not this invocation's evidence" is a
+    decision the delta has already made, on hashes, before the harvest looks.
+
+    Discovery still finds them all, because it is a tree scan. Summing what it
+    finds is how a scoped re-run comes to state 9,019 tests it did not run, and
+    how a stale module's failure withdraws a green run's red-completeness. The
+    scan finds; the delta decides whose.
+    """
+    mine = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    stale_red = f"{ROOT}/streams/build/test-results/test/TEST-red.xml"
+    stale_green = f"{ROOT}/metadata/build/test-results/test/TEST-green.xml"
+    container = FakeContainer(
+        discovery=_discovery_output([mine, stale_green, stale_red]),
+        heads={
+            mine: {"tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+            # 9,019 tests across three modules is what a receipt claiming the
+            # tree states; 9,018 of them are dispatch 1's, and two of dispatch
+            # 1's failures are the reds that withdraw this run's completeness.
+            stale_green: {"tests": 8999, "failures": 0, "errors": 0, "skipped": 0},
+            stale_red: {"tests": 19, "failures": 2, "errors": 0, "skipped": 0},
+        },
+        tags=(
+            f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {mine}\n"
+            f"{_fixture('kafka-green-suite.xml').decode()}"
+        ),
+    )
+
+    harvest = _kafka_harvest(container, delta=_delta(("kafka-green-suite.xml", mine)))
+
+    # One module in the totals, and it is the one this dispatch ran.
+    assert harvest.suite_summaries["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 1,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+    # §14.2: a module gains an executed witness only where this dispatch wrote
+    # the report that witnesses it.
+    assert harvest.module_tests_reported == {"clients": 1}
+    # The stale failure is not this run's, so it neither counts as red nor
+    # withdraws the claim that every red in these summaries is in the rows.
+    assert harvest.row_disclosure["red_rows_complete"] is True
+    assert all(node["status"] != "failed" for node in harvest.testcase_outcomes["nodes"])
+    # And the leftovers were never even read: the binding is upstream of both
+    # tiers, not a filter applied to their output.
+    assert container.head_input == [mine]
+    assert stale_red not in container.commands[-1]
+
+
+def test_a_tree_of_nothing_but_leftovers_states_absence_not_another_run_s_totals():
+    """Reports on disk, none of them this dispatch's.
+
+    Every report is byte-identical to what an earlier attempt left and no cache
+    hit vouched for any of it. Stating the tree's totals would hand this
+    receipt tests it did not run; stating a zero would read as a clean project
+    with no tests. It states the one thing it proved — that it wrote none.
+    """
+    stale = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    container = FakeContainer(
+        discovery=_discovery_output([stale]),
+        heads={stale: {"tests": 3, "failures": 0, "errors": 0, "skipped": 0}},
+    )
+
+    harvest = _kafka_harvest(container, delta={"new": [], "changed": []})
+
+    assert harvest.suite_summaries is None and harvest.row_disclosure is None
+    assert harvest.testcase_outcomes is None
+    assert harvest.module_tests_reported == {}
+    assert [entry["field"] for entry in harvest.omissions] == [
+        "gradle_suite_summaries",
+        "gradle_row_disclosure",
+    ]
+    assert all(entry["reasons"] == [GRADLE_NO_CLAIMED_TEST_REPORTS] for entry in harvest.omissions)
+    # Absence-of-mine and absence-on-disk are different facts and never share
+    # a reason: the ofbiz claim stays available for the tree that is empty.
+    assert GRADLE_NO_CLAIMED_TEST_REPORTS != GRADLE_NO_TEST_REPORTS
+
+
+def test_a_tag_read_that_never_landed_keeps_the_totals_and_discloses_no_sample():
+    """A disclosure describes a sample. With no sample there is nothing to say.
+
+    Only the tag round trip failed here — the totals came from a different read
+    and still stand. Attaching a disclosure anyway would state
+    `rows_source: gradle_xml` and a file-by-file drop count beside a receipt
+    carrying no such rows, and `record_invocation` binds its bounded list to
+    the disclosure precisely so the two cannot describe different measurements.
+    """
+    path = f"{ROOT}/clients/build/test-results/test/TEST-red.xml"
+    container = FakeContainer(
+        discovery=_discovery_output([path]),
+        heads=_head_output([{"path": path, "tests": 19, "failures": 1, "errors": 0, "skipped": 0}]),
+        tags=None,
+    )
+
+    harvest = _kafka_harvest(container, delta=_delta(("kafka-red-suite.xml", path)))
+
+    assert harvest.suite_summaries["suites"][0]["tests"] == 19
+    assert harvest.module_tests_reported == {"clients": 19}
+    assert harvest.row_disclosure is None
+    assert harvest.testcase_outcomes is None
+    assert harvest.omissions == (
+        {"field": "gradle_row_disclosure", "reasons": [GRADLE_ROW_SAMPLE_UNREADABLE]},
+    )
+
+
 def test_the_file_bound_states_the_reports_the_sample_never_spoke_for():
     """kafka: 1,176 reports, a 50-file tag bound. The 1,126 are a stated loss."""
     paths = [
@@ -473,8 +674,15 @@ def test_the_file_bound_states_the_reports_the_sample_never_spoke_for():
 
 
 def test_a_discovery_bound_that_fired_withdraws_the_red_completeness_claim():
-    """A red can be hiding in a report nobody read."""
+    """A red can be hiding in a report THIS RUN WROTE that nobody read.
+
+    The bound is counted in the unit that matters: reports this invocation
+    claims and the capped listing never named. Leftovers the bound also left
+    out cost this receipt nothing — they were never its evidence — so a scoped
+    re-run over a huge tree does not forfeit its red claim for them.
+    """
     path = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    unlisted = [f"{ROOT}/clients/build/test-results/test/TEST-unlisted-{n}.xml" for n in range(2)]
     container = FakeContainer(
         discovery=_discovery_output([path], total=GRADLE_XML_FILE_CAP + 3),
         heads=_head_output([{"path": path, "tests": 1, "failures": 0, "errors": 0, "skipped": 0}]),
@@ -484,9 +692,12 @@ def test_a_discovery_bound_that_fired_withdraws_the_red_completeness_claim():
         ),
     )
 
-    harvest = _kafka_harvest(container, delta=_delta(("kafka-green-suite.xml", path)))
+    harvest = _kafka_harvest(
+        container,
+        delta=_delta(*(("kafka-green-suite.xml", claimed) for claimed in (path, *unlisted))),
+    )
 
-    assert harvest.suite_summaries["unsummarized_files"] == GRADLE_XML_FILE_CAP + 2
+    assert harvest.suite_summaries["unsummarized_files"] == len(unlisted)
     assert harvest.row_disclosure["red_rows_complete"] is False
 
 
@@ -607,6 +818,47 @@ def test_a_declared_omission_outside_the_closed_vocabulary_never_lands(declared)
     assert "evidence_omissions" not in _built(declared_omissions=[declared])
 
 
+def test_a_receipt_may_state_its_totals_and_name_the_row_sample_it_lacks():
+    """The two sections fail independently, so they are omitted independently.
+
+    A tag read that did not land takes the identity sample with it and leaves
+    every count standing. The receipt that results carries the totals, names
+    the one measurement it could not make, and carries no disclosure — so no
+    reader can be told about drops from a sample that is not there.
+    """
+    summaries = {
+        "suites": [
+            {
+                "module": ":clients",
+                "task": "test",
+                "xml_files": 1,
+                "tests": 19,
+                "failures": 1,
+                "errors": 0,
+                "skipped": 0,
+            }
+        ]
+    }
+
+    receipt = _built(
+        gradle_suite_summaries=summaries,
+        declared_omissions=[
+            {"field": "gradle_row_disclosure", "reasons": [GRADLE_ROW_SAMPLE_UNREADABLE]}
+        ],
+    )
+
+    assert receipt["gradle_suite_summaries"] == summaries
+    assert "gradle_row_disclosure" not in receipt
+    assert receipt["evidence_omissions"] == [
+        {
+            "field": "gradle_row_disclosure",
+            "status": "unavailable",
+            "reasons": [GRADLE_ROW_SAMPLE_UNREADABLE],
+        }
+    ]
+    assert validate_receipt_v2(receipt)["evidence_omissions"] == receipt["evidence_omissions"]
+
+
 def test_a_declared_omission_cannot_contradict_a_section_the_receipt_carries():
     summaries = {
         "suites": [
@@ -644,8 +896,8 @@ class HarvestingReceiptOrchestrator(ReceiptOrchestrator):
         self.report = report
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
-        if command.startswith("find ") and "awk " in command:
-            return ok(f"{self.report}\n{COUNT_MARKER}1\n")
+        if COUNT_MARKER in command:
+            return ok(f"{self.report}\n{COUNT_MARKER}1 0\n")
         if "ATTRIBUTE = re.compile" in command:
             return ok(
                 json.dumps(
