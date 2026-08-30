@@ -133,13 +133,44 @@ class JobContainer(ContainerFS):
         # The strict snapshot reader accepts only a PROVEN clean transport
         # (exit_code == 0); a double that omits the code is an incomplete
         # bracket and would honestly claim nothing.
+        if command.startswith("find ") and "awk " in command:
+            # The post-dispatch report harvest's discovery pass: the bounded
+            # path list, then its own count marker. Settlement runs the SAME
+            # harvest the synchronous runner does.
+            self.commands.append(command)
+            paths = sorted(self.reports)
+            return {
+                **ok("\n".join([*paths, f"###sag-gradle-xml-count###{len(paths)}"])),
+                "exit_code": 0,
+            }
+        if "ATTRIBUTE = re.compile" in command:
+            self.commands.append(command)
+            paths = json.loads(self.files[shlex.split(command)[-1]])
+            return {
+                **ok(
+                    json.dumps(
+                        {
+                            "status": "complete",
+                            "suites": [
+                                {
+                                    "path": path,
+                                    "tests": 3,
+                                    "failures": 0,
+                                    "errors": 0,
+                                    "skipped": 0,
+                                }
+                                for path in paths
+                            ],
+                        }
+                    )
+                ),
+                "exit_code": 0,
+            }
         if command.startswith("find "):
             self.commands.append(command)
             return {
                 **ok(
-                    "\n".join(
-                        f"{digest}  {path}" for path, digest in sorted(self.reports.items())
-                    )
+                    "\n".join(f"{digest}  {path}" for path, digest in sorted(self.reports.items()))
                 ),
                 "exit_code": 0,
             }
@@ -692,7 +723,60 @@ def test_the_module_outcomes_are_the_synchronous_parsers_output():
     settle_open_obligations(orchestrator)
 
     (receipt,) = _receipts(orchestrator)
-    assert receipt["module_outcomes"] == _gradle_module_outcomes(POLARIS_LOG)
+    parsed = _gradle_module_outcomes(POLARIS_LOG)
+    assert [
+        {"module": entry["module"], "status": entry["status"]}
+        for entry in receipt["module_outcomes"]
+    ] == parsed
+    # The list itself is the parser's; what the settled harvest adds is the
+    # executed witness for the modules whose reports declared their own totals.
+    # Gradle's task stream can never say a module ran tests, and `attempted`
+    # had to stand in for both that and a module that produced nothing.
+    assert [entry.get("tests_reported") for entry in receipt["module_outcomes"]] == [3, 3]
+
+
+def test_a_settled_receipt_states_the_suite_totals_a_synchronous_one_would():
+    """Settlement parity. kafka died on the DETACHED path: a harvest wired only
+    into the runner would have left that run reporting nothing all over again.
+    """
+    orchestrator = _with_obligation(_orchestrator())
+
+    settle_open_obligations(orchestrator)
+
+    (receipt,) = _receipts(orchestrator)
+    assert receipt["gradle_suite_summaries"]["suites"] == [
+        {
+            "module": ":other",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 3,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        },
+        {
+            "module": ":polaris-api",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 3,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        },
+        {
+            "module": ":polaris-core",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 3,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        },
+    ]
+    # Totals cover every report ON DISK; identities are bound to the reports
+    # this receipt CLAIMS, and the stranger report is claimed by nobody.
+    assert receipt["gradle_row_disclosure"]["rows_source"] == "gradle_xml"
+    assert "evidence_omissions" not in receipt
 
 
 def test_a_cache_hit_the_job_vouched_for_is_claimed():

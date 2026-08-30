@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" tests="19" skipped="0" failures="1" errors="0" timestamp="2026-08-26T05:08:32.145Z" hostname="f0248d5e3cbe" time="0.137">
+  <properties/>
+  <testcase name="testUrlCaseInsensitivity()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.01"/>
+  <testcase name="testUrlFullPath()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.001"/>
+  <testcase name="testUrlWithSuperfluousWhitespace()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.002"/>
+  <testcase name="testUrl()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.001"/>
+  <testcase name="testThrowIfURLIsNotAllowed()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.012"/>
+  <testcase name="testFileEmptyString()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.001"/>
+  <testcase name="testFile()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.012"/>
+  <testcase name="testFileWithSuperfluousWhitespace()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.009"/>
+  <testcase name="testUrlInvalidProtocol()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.001"/>
+  <testcase name="testFileDoesNotExist()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.007"/>
+  <testcase name="testUrlFile()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.023"/>
+  <testcase name="testUrlNull()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.004"/>
+  <testcase name="testFileNull()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.0"/>
+  <testcase name="testFileWhitespace()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.001"/>
+  <testcase name="testUrlEmptyString()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.002"/>
+  <testcase name="testThrowIfFileIsNotAllowed()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.006"/>
+  <testcase name="testFileUnreadable()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.019">
+    <failure message="org.opentest4j.AssertionFailedError: Expected org.apache.kafka.common.config.ConfigException to be thrown, but nothing was thrown." type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: Expected org.apache.kafka.common.config.ConfigException to be thrown, but nothing was thrown.
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:152)
+	at app//org.junit.jupiter.api.AssertThrows.assertThrows(AssertThrows.java:73)
+	at app//org.junit.jupiter.api.AssertThrows.assertThrows(AssertThrows.java:35)
+	at app//org.junit.jupiter.api.Assertions.assertThrows(Assertions.java:3128)
+	at app//org.apache.kafka.common.security.oauthbearer.internals.secured.OAuthBearerTest.assertThrowsWithMessage(OAuthBearerTest.java:81)
+	at app//org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest.testFileUnreadable(ConfigurationUtilsTest.java:119)
+	at java.base@17.0.20/java.lang.reflect.Method.invoke(Method.java:569)
+	at java.base@17.0.20/java.util.ArrayList.forEach(ArrayList.java:1511)
+	at java.base@17.0.20/java.util.ArrayList.forEach(ArrayList.java:1511)
+</failure>
+  </testcase>
+  <testcase name="testUrlWhitespace()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.0"/>
+  <testcase name="testUrlMissingProtocol()" classname="org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtilsTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

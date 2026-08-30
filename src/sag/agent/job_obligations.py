@@ -1630,6 +1630,21 @@ def _settle_one(
     if excluded:
         after = {path: digest for path, digest in after.items() if path not in set(excluded)}
     mine = _delta_paths(report_delta(before, after, cached_roots))
+    # The SAME harvest the synchronous path runs, over this job's own settled
+    # window. kafka died on exactly this path; a receipt settled here has to
+    # state what one written in-line would, or the two paths disagree about
+    # what a Gradle run left behind.
+    module_outcomes, harvested = _parse_test_harvest(
+        execute,
+        tool=tool,
+        working_directory=working_directory,
+        delta=report_delta(before, after, cached_roots),
+        module_outcomes=module_outcomes,
+        actions=(
+            _text(obligation.get("effective_action")),
+            _text(obligation.get("requested_action")),
+        ),
+    )
 
     metadata = record_invocation(
         execute,
@@ -1652,6 +1667,7 @@ def _settle_one(
         compliance=obligation.get("compliance"),
         effective_jdk=obligation.get("effective_jdk"),
         module_outcomes=module_outcomes,
+        **harvested,
         cached_report_roots=cached_roots,
         excluded_claimed_paths=len(excluded),
     )
@@ -1919,6 +1935,53 @@ def _parse_outcomes(
         # cached roots either.
         return _reactor_module_outcomes(log), []
     return [], []
+
+
+def _parse_test_harvest(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    *,
+    tool: str,
+    working_directory: str,
+    delta: Mapping[str, Any],
+    module_outcomes: Sequence[Mapping[str, str]],
+    actions: Sequence[str],
+) -> Tuple[Sequence[Mapping[str, Any]], Dict[str, Any]]:
+    """The runner's own post-dispatch report harvest, run at settlement.
+
+    Returns `(module_outcomes, receipt kwargs)`. A detached job holds exactly
+    what the harvest needs — the container, the working directory, its own
+    settled report window and the action it was authorized for — so the settled
+    receipt states the same evidence a synchronous one does. The kafka run this
+    exists for died on THIS path; a harvest wired only into the tool would have
+    left it reporting nothing all over again.
+
+    Imported lazily for the same reason `_parse_outcomes` is: the runners
+    import this module to record their obligations.
+    """
+
+    if tool != "gradle":
+        return module_outcomes, {}
+    from sag.tools.internal.gradle_tool import (
+        _gradle_module_outcomes_with_counts,
+        gradle_test_action,
+        gradle_test_harvest,
+    )
+
+    harvest = gradle_test_harvest(
+        execute,
+        working_directory=working_directory,
+        delta=delta,
+        test_dispatch=gradle_test_action(*actions),
+    )
+    return (
+        _gradle_module_outcomes_with_counts(module_outcomes, harvest.module_tests_reported),
+        {
+            "gradle_suite_summaries": harvest.suite_summaries,
+            "gradle_row_disclosure": harvest.row_disclosure,
+            "harvested_testcase_outcomes": harvest.testcase_outcomes,
+            "declared_omissions": harvest.omissions,
+        },
+    )
 
 
 def _requirements_view(obligation: Mapping[str, Any]) -> Dict[str, Any]:

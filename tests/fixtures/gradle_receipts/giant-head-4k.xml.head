@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" tests="12" skipped="0" failures="0" errors="0" timestamp="2026-08-26T05:07:54.977Z" hostname="f0248d5e3cbe" time="31.463">
+  <properties/>
+  <testcase name="&quot;randomClusterPerturbationsShouldConverge(String).rackAwareStrategy=none&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="10.053"/>
+  <testcase name="&quot;randomClusterPerturbationsShouldConverge(String).rackAwareStrategy=min_traffic&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="10.449"/>
+  <testcase name="&quot;randomClusterPerturbationsShouldConverge(String).rackAwareStrategy=balance_subtopology&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="10.701"/>
+  <testcase name="&quot;assignmentShouldConvergeAfterAddingNode(String).rackAwareStrategy=none&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.03"/>
+  <testcase name="&quot;assignmentShouldConvergeAfterAddingNode(String).rackAwareStrategy=min_traffic&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.012"/>
+  <testcase name="&quot;assignmentShouldConvergeAfterAddingNode(String).rackAwareStrategy=balance_subtopology&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.006"/>
+  <testcase name="&quot;droppingNodesShouldConverge(String).rackAwareStrategy=none&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.015"/>
+  <testcase name="&quot;droppingNodesShouldConverge(String).rackAwareStrategy=min_traffic&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.023"/>
+  <testcase name="&quot;droppingNodesShouldConverge(String).rackAwareStrategy=balance_subtopology&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.063"/>
+  <testcase name="&quot;staticAssignmentShouldConvergeWithTheFirstAssignment(String).rackAwareStrategy=none&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.002"/>
+  <testcase name="&quot;staticAssignmentShouldConvergeWithTheFirstAssignment(String).rackAwareStrategy=min_traffic&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.002"/>
+  <testcase name="&quot;staticAssignmentShouldConvergeWithTheFirstAssignment(String).rackAwareStrategy=balance_subtopology&quot;" classname="org.apache.kafka.streams.processor.internals.assignment.TaskAssignorConvergenceTest" time="0.002"/>
+  <system-out><![CDATA[Seed is 1787720874860
+seed for getRandom: 1787720874988
+[2026-08-26 05:07:55,100] WARN Unable to assign 1 of 5 standby tasks for task [1_0]. There is not enough available capacity. You should increase the number of application instances to maintain the requested number of standby replicas. (org.apache.kafka.streams.processor.internals.assignment.DefaultStandbyTaskAssignor:57)
+[2026-08-26 05:07:55,100] WARN Unable to assign 1 of 5 standby tasks for task [2_0]. There is not enough available capacity. You should increase the number of application instances to maintain the requested number of standby replicas. (org.apache.kafka.streams.processor.internals.assignment.DefaultStandbyTaskAssignor:57)
+[2026-08-26 05:07:55,102] WARN Unable to assign 1 of 5 standby tasks for task [2_1]. There is not enough available capacity. You should increase the number of application instances to maintain the requested number of standby replicas. (org.apache.kafka.streams.processor.internals.assignment.DefaultStandbyTaskAssignor:57)
+[2026-08-26 05:07:55,103] WARN Unable to assign 1 of 5 standby tasks for task [2_2]. There is not enough available c

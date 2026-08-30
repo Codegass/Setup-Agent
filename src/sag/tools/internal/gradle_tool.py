@@ -1,10 +1,11 @@
 """Gradle tool with comprehensive error handling and Gradle-specific features."""
 
+import hashlib
 import json
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -17,12 +18,26 @@ from sag.agent.invocation_contracts import (
     ensure_dispatch_contract,
 )
 from sag.agent.invocation_receipts import (
+    DECLARED_OMISSION_REASONS,
+    GRADLE_DISCOVERY_INCOMPLETE,
+    GRADLE_NO_TEST_REPORTS,
+    GRADLE_SUITE_TOTALS_UNREADABLE,
+    TESTCASE_FILE_CAP,
+    TESTCASE_OUTCOME_CAP,
+    TESTCASE_TAG_CAP,
+    assemble_gradle_test_rows,
+    parse_report_tag_rows,
     record_invocation,
+    report_delta,
+    report_tag_command,
     snapshot_reports,
 )
 from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
+from sag.agent.receipt_test_rows import diagnostic_testcase_outcomes
 from sag.evidence import EvidenceAssessment, TestStats
+from sag.runtime.container_io import resolve_control_execute
+from sag.utils.container_io import write_container_text_atomic
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
@@ -40,7 +55,7 @@ from .build_utils import (
     dispatch_hold_policy,
     harvest_detached_evidence,
 )
-from .dispatch_argv import gradle_task_tokens
+from .dispatch_argv import bare_gradle_task, gradle_task_tokens
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 # Gradle prints no reactor summary; what it prints is per-task outcomes:
@@ -112,6 +127,469 @@ def _gradle_module_outcomes(output: str) -> List[Dict[str, str]]:
         if (outcome or "").upper() == "FAILED":
             statuses[module] = "failure"
     return [{"module": module, "status": statuses[module]} for module in order]
+
+
+# --- Post-dispatch test-report harvest -------------------------------------
+#
+# Grounded in a measured study of three Gradle projects' own containers
+# (docs/superpowers/reports/gradle-evidence-20260830.md). The kafka run this
+# exists for left 1,176 report files and 27,219 executed tests on disk and its
+# receipt reported none of it.
+#
+# Two tiers, because one read cannot do both jobs. Tier 1 sums every report's
+# `<testsuite>` root attributes, which is the COMPLETE count and costs a fixed
+# few kilobytes per file. Tier 2 samples per-testcase identities under the
+# existing tag bounds, red-bearing reports first, and states what it dropped.
+# Neither tier ever reads a report whole: kafka's largest single XML is
+# 137.8 MB against a 16 MB receipt canonical budget, so a whole-file read is
+# impossible by construction, not merely expensive.
+
+# Reports discovery will hand on. kafka measured 1,176 and geode 1,167, so this
+# is a safety bound rather than an expected one; a discovery that hits it says
+# how many reports it left unsummed.
+GRADLE_XML_FILE_CAP = 2048
+# A JUnit report's root `<testsuite>` tag is its first element, on the second
+# line after the XML declaration. 4 KB is many times what that tag needs and is
+# the same read whether the file is 438 bytes or 137.8 MB.
+GRADLE_SUITE_HEAD_BYTES = 4096
+_GRADLE_REPORT_COUNT_MARKER = "###sag-gradle-xml-count###"
+# Gradle writes reports per TASK: `build/test-results/<task>/TEST-*.xml`. geode
+# writes `distributedTest` beside `test`, so the task dir is discovered, never
+# assumed. `binary/` under it is Gradle's own internal result store and holds
+# no report this engine may read.
+_GRADLE_REPORT_GLOB = "*/build/test-results/*/*.xml"
+_GRADLE_REPORT_MARKER = "/build/test-results/"
+_GRADLE_BINARY_GLOB = "*/binary/*"
+# Read the FIRST `<testsuite ...>` open tag out of a bounded head and take the
+# four counts it declares. `\b` is what keeps `<testsuites>` from matching: a
+# wrapper element states no counts of its own. A head that yields no such tag
+# is counted as unreadable and never guessed at.
+_GRADLE_SUITE_HEAD_READER = r"""
+import json
+import re
+import sys
+
+SUITE = re.compile(rb"<testsuite\b[^>]*>")
+ATTRIBUTE = re.compile(rb'([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*"([^"]*)"')
+FIELDS = (b"tests", b"failures", b"errors", b"skipped")
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        paths = json.load(handle)
+except Exception:
+    print(json.dumps({"status": "unavailable", "suites": []}))
+    raise SystemExit(0)
+
+suites = []
+for path in paths:
+    entry = {"path": path}
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(HEAD_BYTES)
+    except Exception:
+        suites.append(entry)
+        continue
+    match = SUITE.search(head)
+    if match is not None:
+        attributes = dict(ATTRIBUTE.findall(match.group(0)))
+        for field in FIELDS:
+            try:
+                value = int(attributes[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value >= 0:
+                entry[field.decode()] = value
+    suites.append(entry)
+
+print(json.dumps({"status": "complete", "suites": suites}, separators=(",", ":")))
+"""
+_GRADLE_HEAD_INPUT_DIR = "/workspace/.setup_agent/.gradle-suite-head-input"
+# The task names whose reports are test evidence. A dispatch that ran none of
+# them harvests nothing and states nothing: `assemble` leaving no test XML is
+# not missing evidence, it is a build.
+_GRADLE_TEST_ACTIONS = frozenset(
+    {"test", "check", "integrationtest", "functionaltest", "distributedtest", "build"}
+)
+
+
+class GradleReportDiscovery(NamedTuple):
+    """What is on disk under the build's own report layout.
+
+    `complete` is the load-bearing bit. A discovery that did not run to its
+    marker knows nothing, and "no reports found" from an unfinished scan would
+    be the exact lie the ofbiz case exists to forbid — absence is only
+    claimable when the scan proved it.
+    """
+
+    paths: Tuple[str, ...]
+    total: int
+    complete: bool
+
+
+class GradleTestHarvest(NamedTuple):
+    """One dispatch's test evidence, in the shapes the receipt carries."""
+
+    suite_summaries: Optional[Dict[str, Any]] = None
+    row_disclosure: Optional[Dict[str, Any]] = None
+    testcase_outcomes: Optional[Dict[str, Any]] = None
+    module_tests_reported: Mapping[str, int] = {}
+    omissions: Tuple[Dict[str, Any], ...] = ()
+
+
+def gradle_test_action(*actions: Any) -> bool:
+    """Whether any of these action strings names Gradle test work."""
+
+    for action in actions:
+        for token in gradle_task_tokens(action) or ():
+            if bare_gradle_task(token).lower() in _GRADLE_TEST_ACTIONS:
+                return True
+    return False
+
+
+def _gradle_report_identity(path: str, working_directory: str) -> Optional[tuple]:
+    """`(project path, task dir)` for one report, or None when unprovable.
+
+    The project path is Gradle's own (`:root`, `:clients`, `:connect:api`) and
+    is derived from the report's location under the build root — the same
+    boundary `receipt_test_rows._report_module_root` uses. A report outside the
+    dispatch's own working directory belongs to no project this dispatch ran.
+    """
+
+    text = str(path or "").strip()
+    prefix, separator, tail = text.partition(_GRADLE_REPORT_MARKER)
+    if not separator or "/" not in tail:
+        return None
+    task = tail.split("/", 1)[0].strip()
+    root = str(working_directory or "").rstrip("/")
+    if not task or not root:
+        return None
+    if prefix != root and not prefix.startswith(root + "/"):
+        return None
+    relative = prefix[len(root) :].strip("/")
+    return (":" + relative.replace("/", ":") if relative else ":root"), task
+
+
+def _gradle_module_outcome_key(project_path: str) -> str:
+    """The project path as `_gradle_module_outcomes` spells it.
+
+    That parser strips the leading colon off every path it reads from the task
+    stream and writes the root project as `:root`. Merging counts into its list
+    has to speak its grammar, not a second one.
+    """
+
+    coordinate = str(project_path or "").strip()
+    return coordinate if coordinate == ":root" else coordinate.lstrip(":")
+
+
+def _gradle_discover_reports(execute, working_directory: str) -> GradleReportDiscovery:
+    """Every test report on disk under this build root, in ONE round trip.
+
+    `awk` prints the bounded path list and then the TRUE total, so a bound that
+    fired states exactly how many reports it left behind instead of silently
+    handing back a short list. No marker line means the scan did not finish,
+    and an unfinished scan proves nothing about absence.
+    """
+
+    root = str(working_directory or "").strip().rstrip("/")
+    if not root:
+        return GradleReportDiscovery((), 0, False)
+    program = (
+        f"NR<={GRADLE_XML_FILE_CAP} {{ print }} "
+        f'END {{ printf "%s%d\\n", "{_GRADLE_REPORT_COUNT_MARKER}", NR }}'
+    )
+    command = (
+        f"find {shlex.quote(root)} -type f -path {shlex.quote(_GRADLE_REPORT_GLOB)} "
+        f"! -path {shlex.quote(_GRADLE_BINARY_GLOB)} 2>/dev/null "
+        f"| LC_ALL=C sort | awk {shlex.quote(program)}"
+    )
+    output = _gradle_untruncated_output(execute, command)
+    if output is None:
+        return GradleReportDiscovery((), 0, False)
+    paths: List[str] = []
+    total: Optional[int] = None
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith(_GRADLE_REPORT_COUNT_MARKER):
+            try:
+                total = int(line[len(_GRADLE_REPORT_COUNT_MARKER) :])
+            except ValueError:
+                total = None
+            continue
+        if line.startswith("/"):
+            paths.append(line)
+    if total is None or total < len(paths):
+        return GradleReportDiscovery((), 0, False)
+    return GradleReportDiscovery(tuple(paths), total, True)
+
+
+def _gradle_untruncated_output(execute, command: str) -> Optional[str]:
+    """One evidence read on the MACHINE path, or None when it did not complete.
+
+    The presentation path clamps output at ~10,000 characters; 1,176 report
+    paths is far past that, and a clamped list would decide the harvest's claim
+    set instead of the run doing it. The TypeError fallback keeps narrow test
+    doubles working, exactly as `snapshot_reports` does.
+
+    Unlike `snapshot_reports` this accepts the ordinary executor when no clean
+    control executor is exposed, because nothing read here can launder a claim:
+    the receipt's claim set is the hash bracket's delta, and an identity row
+    still has to match a digest that bracket recorded before it counts.
+    """
+
+    control = resolve_control_execute(execute) or execute
+    if not callable(control):
+        return None
+    try:
+        try:
+            result = control(command, truncate_output=False) or {}
+        except TypeError as exc:
+            if "truncate_output" not in str(exc):
+                raise
+            result = control(command) or {}
+    except Exception as exc:  # evidence collection never breaks the runner
+        logger.debug(f"gradle report harvest read skipped: {exc}")
+        return None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("success") is False
+        or result.get("dispatch_status")
+        or result.get("exit_code") not in (None, 0)
+    ):
+        return None
+    return str(result.get("output") or "")
+
+
+def _gradle_suite_head_entries(
+    execute,
+    paths: Sequence[str],
+    working_directory: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """One `{module, task, tests, failures, errors, skipped}` per report.
+
+    The path list is written into the container and passed by ONE argument, so
+    a reactor with thousands of reports can never approach ARG_MAX — the same
+    transport `receipt_test_rows.read_delta_testcase_rows` uses, and for the
+    same reason. Only the four declared counts come back; report bodies never
+    cross the boundary and never reach model-visible output.
+
+    Returns None when the transport itself did not complete. A report whose
+    head carried no parsable `<testsuite>` root comes back WITHOUT counts, and
+    the fold counts it as unreadable rather than summing a zero into a total.
+    """
+
+    if not paths:
+        return []
+    body = json.dumps(list(paths), ensure_ascii=False, separators=(",", ":"))
+    # Named for its own content, not for a process-salted `hash()`: two
+    # concurrent harvests of different trees cannot collide, and re-running the
+    # same one is idempotent.
+    slug = hashlib.sha256(body.encode("utf-8")).hexdigest()[:24]
+    input_path = f"{_GRADLE_HEAD_INPUT_DIR}/{slug}.json"
+    if not write_container_text_atomic(execute, input_path, body, validate_json=True).persisted:
+        return None
+    script = _GRADLE_SUITE_HEAD_READER.replace("HEAD_BYTES", str(GRADLE_SUITE_HEAD_BYTES))
+    command = f"python3 -c {shlex.quote(script)} {shlex.quote(input_path)}"
+    try:
+        output = _gradle_untruncated_output(execute, command)
+    finally:
+        try:
+            execute(f"rm -f -- {shlex.quote(input_path)}")
+        except Exception:
+            pass
+    if output is None:
+        return None
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError) as exc:
+        logger.debug(f"gradle suite totals unreadable: {exc}")
+        return None
+    if not isinstance(payload, Mapping) or payload.get("status") != "complete":
+        return None
+    suites = payload.get("suites")
+    if not isinstance(suites, list):
+        return None
+    entries: List[Dict[str, Any]] = []
+    for suite in suites:
+        if not isinstance(suite, Mapping):
+            continue
+        identity = _gradle_report_identity(str(suite.get("path") or ""), working_directory)
+        if identity is None:
+            continue
+        module, task = identity
+        entry: Dict[str, Any] = {"module": module, "task": task, "path": suite.get("path")}
+        for field in ("tests", "failures", "errors", "skipped"):
+            if field in suite:
+                entry[field] = suite.get(field)
+        entries.append(entry)
+    return entries
+
+
+def _gradle_red_first(entries: Sequence[Mapping[str, Any]]) -> List[str]:
+    """Report paths, every red-bearing one before every other.
+
+    kafka's 8 reds live among 27,219 tests in 1,176 reports. Any bound applied
+    to a list that is not ordered this way loses them, and a run that cannot
+    name its failures has reported nothing a repair can act on.
+    """
+
+    def rank(entry: Mapping[str, Any]) -> tuple:
+        failures = entry.get("failures")
+        errors = entry.get("errors")
+        red = (failures if isinstance(failures, int) else 0) + (
+            errors if isinstance(errors, int) else 0
+        )
+        return (0 if red > 0 else 1, str(entry.get("path") or ""))
+
+    return [str(entry.get("path") or "") for entry in sorted(entries, key=rank)]
+
+
+def _gradle_identity_rows(
+    execute,
+    paths: Sequence[str],
+    claims: Mapping[str, str],
+) -> List[Dict[str, Any]]:
+    """Bounded per-testcase identities from the reports this receipt claims.
+
+    Tag tokens only, `TESTCASE_TAG_CAP` per report, `TESTCASE_FILE_CAP` reports
+    — the maven-side bound, unchanged. Each report's tokens are headed by the
+    digest of the file they were read from, and a digest the receipt's report
+    delta does not claim contributes nothing: an identity is only this
+    invocation's when the bytes behind it are.
+    """
+
+    selected = [path for path in paths if path in claims][:TESTCASE_FILE_CAP]
+    if not selected:
+        return []
+    command = "; ".join(report_tag_command(path, tag_cap=TESTCASE_TAG_CAP) for path in selected)
+    output = _gradle_untruncated_output(execute, command)
+    if output is None:
+        return []
+    return parse_report_tag_rows(output, report_claims=claims)
+
+
+def gradle_test_harvest(
+    execute,
+    *,
+    working_directory: str,
+    delta: Mapping[str, Any],
+    test_dispatch: bool,
+) -> GradleTestHarvest:
+    """Harvest one terminal Gradle test dispatch's report evidence.
+
+    Derivable from `(execute, working_directory, delta, action)` alone, which
+    is exactly what a detached job holds at settlement — so the settled path
+    states what the synchronous one does instead of quietly lacking it.
+
+    Reports found and summed become totals, and a bound that fired becomes a
+    recorded drop. The two failures are told apart by what the scan PROVED. A
+    scan that never finished proved nothing and states nothing — unknown is an
+    absent key here as it is for every other v2 fact. A scan that finished is
+    proof, and everything after it is a statement: reports that exist and could
+    not be summed, and a test run that left none at all, are both recorded
+    omissions. The one thing this never returns is a zero.
+    """
+
+    if not test_dispatch:
+        return GradleTestHarvest()
+    discovery = _gradle_discover_reports(execute, working_directory)
+    if not discovery.complete:
+        # No omission: see `_gradle_omissions`. A scan that never finished
+        # proved neither presence nor absence, and only proof may be stated.
+        logger.debug(f"{GRADLE_DISCOVERY_INCOMPLETE} under {working_directory}")
+        return GradleTestHarvest()
+    if not discovery.total:
+        # ofbiz-plugins: the task ran and wrote no XML. That is missing
+        # evidence, not a clean zero, and the two must never look alike.
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_TEST_REPORTS))
+    entries = _gradle_suite_head_entries(execute, discovery.paths, working_directory)
+    if entries is None:
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
+    claims = {
+        str((entry or {}).get("path") or ""): str((entry or {}).get("sha256") or "").lower()
+        for bucket in ("new", "changed", "cached")
+        for entry in (delta or {}).get(bucket) or ()
+        if isinstance(entry, Mapping)
+    }
+    ordered = _gradle_red_first(entries)
+    rows = _gradle_identity_rows(execute, ordered, claims)
+    summaries, kept_rows, disclosure = assemble_gradle_test_rows(
+        entries,
+        rows,
+        # The identity sample IS the receipt's bounded diagnostic list, so it is
+        # bounded by that list's own cap; disclosing drops against a larger one
+        # would describe rows the receipt does not carry.
+        row_cap=TESTCASE_OUTCOME_CAP,
+        harvested_files=[path for path in ordered if path in claims],
+        unsummarized_files=max(0, discovery.total - len(discovery.paths)),
+    )
+    if summaries is None:
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
+    outcomes = diagnostic_testcase_outcomes(
+        {
+            # `diagnostic_testcase_outcomes` marks the list truncated for any
+            # status but "complete", which is exactly right here: a sample that
+            # dropped anything is a sample, and the disclosure beside it says
+            # by how much.
+            "status": "complete" if not (disclosure or {}).get("rows_truncated") else "bounded",
+            "rows": kept_rows,
+        }
+    )
+    tests_reported: Dict[str, int] = {}
+    for entry in entries:
+        total = entry.get("tests")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            continue
+        key = _gradle_module_outcome_key(str(entry.get("module") or ""))
+        if key:
+            tests_reported[key] = tests_reported.get(key, 0) + total
+    return GradleTestHarvest(
+        suite_summaries=summaries,
+        row_disclosure=disclosure,
+        testcase_outcomes=outcomes,
+        module_tests_reported=tests_reported,
+    )
+
+
+def _gradle_omissions(reason: str) -> Tuple[Dict[str, Any], ...]:
+    """The two harvested sections, each stated unavailable for one reason.
+
+    An omission is a claim that something IS missing, so only a scan that ran
+    to completion may make one. `GRADLE_DISCOVERY_INCOMPLETE` is therefore not
+    in the vocabulary at all: a receipt that could not look has nothing to
+    declare, and declaring anyway would turn every unanswered probe into
+    evidence of a barren build.
+    """
+
+    if reason not in DECLARED_OMISSION_REASONS:
+        return ()
+    return tuple(
+        {"field": field, "reasons": [reason]}
+        for field in ("gradle_suite_summaries", "gradle_row_disclosure")
+    )
+
+
+def _gradle_module_outcomes_with_counts(
+    module_outcomes: Sequence[Mapping[str, Any]],
+    tests_reported: Mapping[str, int],
+) -> List[Dict[str, Any]]:
+    """The task stream's module list, with an executed witness where proved.
+
+    Enrich only — never extend. `module_outcomes` is the coverage denominator,
+    and a module that appears here solely because a report file survived from
+    an earlier invocation would inflate it. A module Gradle did not name in
+    THIS dispatch's task stream is not this dispatch's module.
+    """
+
+    enriched: List[Dict[str, Any]] = []
+    for entry in module_outcomes or ():
+        if not isinstance(entry, Mapping):
+            continue
+        row = dict(entry)
+        total = tests_reported.get(str(row.get("module") or ""))
+        if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+            row["tests_reported"] = total
+        enriched.append(row)
+    return enriched
 
 
 class GradleTool(BaseTool):
@@ -757,6 +1235,16 @@ class GradleTool(BaseTool):
             result.update(obligation.metadata())
             return
         after = snapshot_reports(self.orchestrator.execute_command, [working_directory])
+        # What this dispatch left on disk, read under the caps the receipt
+        # records. It runs HERE, after the bracket and before the receipt is
+        # assembled, because the report tree is only this invocation's evidence
+        # for as long as no other dispatch has touched it.
+        harvest = gradle_test_harvest(
+            self.orchestrator.execute_command,
+            working_directory=working_directory,
+            delta=report_delta(before, after, cached_report_roots),
+            test_dispatch=gradle_test_action(requested, requested or "build"),
+        )
         self._pending_invocation_receipt = record_invocation(
             self.orchestrator.execute_command,
             tool="gradle",
@@ -774,7 +1262,13 @@ class GradleTool(BaseTool):
             # must be able to tell.
             lifecycle_state=result.get("lifecycle_state"),
             termination_reason=result.get("termination_reason"),
-            module_outcomes=module_outcomes,
+            module_outcomes=_gradle_module_outcomes_with_counts(
+                module_outcomes or (), harvest.module_tests_reported
+            ),
+            gradle_suite_summaries=harvest.suite_summaries,
+            gradle_row_disclosure=harvest.row_disclosure,
+            harvested_testcase_outcomes=harvest.testcase_outcomes,
+            declared_omissions=harvest.omissions,
             cached_report_roots=cached_report_roots,
             output=result.get("full_output") or result.get("output"),
             requirements=requirements,

@@ -128,6 +128,24 @@ _GRADLE_SUITE_COUNT_FIELDS = ("tests", "failures", "errors", "skipped")
 _GRADLE_SUITE_FIELDS = frozenset({"module", "task", "xml_files", *_GRADLE_SUITE_COUNT_FIELDS})
 _GRADLE_RED_OUTCOMES = frozenset({"failed", "error"})
 _GRADLE_GREEN_OUTCOMES = frozenset({"passed", "skipped"})
+# The line a bounded per-report tag read prints before each report's tags, so
+# one round trip over many reports still attributes every tag to the file it
+# came from. It carries that file's digest, because a row is only evidence of
+# THIS invocation when the bytes it was read from are the bytes the receipt's
+# own report delta claims.
+REPORT_TAG_MARKER = "###sag-report###"
+_REPORT_TAG_HEADER_RE = re.compile(r"^([0-9a-f]{64})\s+(\S.*)$")
+# The reasons an ENGINE harvest may state for a field it could not carry. A
+# declared omission is still engine-written evidence, so its vocabulary is
+# closed: a runner may say which measurement failed, never write free prose
+# into the receipt.
+GRADLE_NO_TEST_REPORTS = "gradle_no_test_reports_on_disk"
+GRADLE_SUITE_TOTALS_UNREADABLE = "gradle_suite_totals_unreadable"
+DECLARED_OMISSION_REASONS = frozenset({GRADLE_NO_TEST_REPORTS, GRADLE_SUITE_TOTALS_UNREADABLE})
+# Not an omission reason: a scan that never ran proved nothing, and an
+# unanswered probe must stay an absent key rather than becoming a receipt-level
+# claim that the build produced no test evidence.
+GRADLE_DISCOVERY_INCOMPLETE = "gradle_report_discovery_incomplete"
 # Python setup/build/compile observations are part of the immutable receipt,
 # never ToolResult prose.  Refuse an observation that cannot fit this exact
 # canonical budget: truncating a package list, artifact list, or source/PYC
@@ -1419,6 +1437,112 @@ def read_testcase_outcomes(
     return outcomes
 
 
+def report_tag_command(path: str, *, tag_cap: int = TESTCASE_TAG_CAP) -> str:
+    """One report's bounded tag read, headed by the digest of the bytes read.
+
+    The digest is the point. `read_testcase_outcomes` reads tags and can say
+    nothing about WHICH version of a report produced them, so its stream cannot
+    be bound to an invocation. Hashing and grepping the same path inside one
+    shell command means the caller can compare the digest against the receipt's
+    own `report_delta` claim and refuse a report the delta does not name.
+
+    Nothing here reads a whole report into anything: `grep -oE` streams, and
+    the per-file bound cuts the token list at `tag_cap`. That is what makes it
+    usable on kafka's 137.8 MB single XML, which no receipt-bound transport can
+    ever slurp against a 16 MB canonical budget.
+    """
+
+    quoted = shlex.quote(str(path))
+    return (
+        f"{{ printf %s {shlex.quote(REPORT_TAG_MARKER)}; sha256sum {quoted} 2>/dev/null; echo; "
+        f"grep -oE {shlex.quote(TESTCASE_TAG_PATTERN)} {quoted} 2>/dev/null "
+        f"| head -n {int(tag_cap)}; }}"
+    )
+
+
+def parse_report_tag_rows(
+    output: str,
+    *,
+    report_claims: Optional[Mapping[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """A marked, per-report tag stream -> one row per testcase, attributed.
+
+    Rows carry the same keys the in-container exact parser emits, so the fold
+    that orders and bounds them, the diagnostic projection and the row contract
+    all keep working on one row shape.
+
+    `report_claims` is `path -> sha256` as the receipt's report delta states it.
+    When given, a report whose header digest does not match its claim
+    contributes NO rows: bytes that are not the bytes this invocation is
+    accountable for are not this invocation's evidence, and a mismatch is
+    silence rather than a guess. A report the claims do not name at all is
+    likewise dropped — discovery is wider than the delta on purpose, and only
+    the delta can bind an identity to this receipt.
+    """
+
+    rows: List[Dict[str, Any]] = []
+    for chunk in str(output or "").split(REPORT_TAG_MARKER)[1:]:
+        header, _, body = chunk.partition("\n")
+        match = _REPORT_TAG_HEADER_RE.match(header.strip())
+        if match is None:
+            continue
+        digest, path = match.group(1), match.group(2).strip()
+        if report_claims is not None and str(report_claims.get(path) or "").lower() != digest:
+            continue
+        rows.extend(_report_tag_rows(body, path=path, digest=digest))
+    return rows
+
+
+def _report_tag_rows(body: str, *, path: str, digest: str) -> List[Dict[str, Any]]:
+    """One report's token stream -> its rows, in the order the file states them.
+
+    Same closing rule as `_parse_testcase_tags`: a node whose closing tag the
+    per-file bound cut still closes when the next testcase opens, so a
+    truncated read reports fewer rows and never a wrong one. Unlike the
+    diagnostic parser this does NOT deduplicate by identity — a report may
+    legitimately repeat a testcase element, and each one is an execution.
+    """
+
+    rows: List[Dict[str, Any]] = []
+    pending: Optional[Dict[str, Any]] = None
+
+    def close(row: Optional[Dict[str, Any]]) -> None:
+        if row is not None:
+            rows.append(row)
+
+    for match in _TESTCASE_TAG_RE.finditer(body or ""):
+        closing, tag, attributes = match.group(1), match.group(2), match.group(3)
+        self_closing = attributes.rstrip().endswith("/")
+        if tag == "testcase":
+            close(pending)
+            pending = None
+            if closing or len(rows) >= TESTCASE_PARSE_CAP:
+                continue
+            name = _tag_attribute(attributes, "name")
+            if not name:
+                continue
+            pending = {
+                "report_path": path,
+                "report_sha256": digest,
+                "classname": _tag_attribute(attributes, "classname"),
+                "name": name,
+                "source_file": None,
+                "outcome": "passed",
+                "reason": None,
+                "execution_ordinal": len(rows) + 1,
+            }
+            if self_closing:
+                close(pending)
+                pending = None
+        elif pending is not None:
+            pending["outcome"] = {"skipped": "skipped", "failure": "failed"}.get(tag, "error")
+            reason = _tag_attribute(attributes, "message")
+            if reason:
+                pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
+    close(pending)
+    return rows[:TESTCASE_PARSE_CAP]
+
+
 def _receipt_text(
     value: Any,
     field: str,
@@ -1569,15 +1693,30 @@ def _validate_module_outcomes(value: Any) -> None:
     This list is the coverage DENOMINATOR, so it is never clipped to fit: a
     module the build never tried is untried, not missing, and a truncated list
     would state a smaller reactor than the one that ran.
+
+    `tests_reported` is the one OPTIONAL addition and it closes MS-1 §14.2's
+    ambiguity for the modules that can close it. Gradle states no per-module
+    verdict, so `attempted` has to cover both "ran its tests" and "ran a task
+    and produced nothing" — and a whole reactor of `attempted` is why kafka's
+    19 modules and 27,219 tests read as unknown. A module whose report files
+    declare their own suite totals has PROVEN it executed tests; the count is
+    that proof, written by the harvest, absent when nothing proved it. It never
+    replaces `status`: an executed module can still have failed.
     """
 
     if not isinstance(value, list) or not value or len(value) > RECEIPT_MODULE_OUTCOMES_MAX_ITEMS:
         raise ValueError("receipt module_outcomes is invalid")
     for module in value:
-        if not isinstance(module, Mapping) or set(module) != {"module", "status"}:
+        if (
+            not isinstance(module, Mapping)
+            or not {"module", "status"}.issubset(module)
+            or set(module) - {"module", "status", "tests_reported"}
+        ):
             raise ValueError("receipt module_outcomes entry shape is invalid")
         _receipt_text(module.get("module"), "module_outcomes.module")
         _receipt_text(module.get("status"), "module_outcomes.status")
+        if "tests_reported" in module:
+            _receipt_count(module.get("tests_reported"), "module_outcomes.tests_reported")
 
 
 def _receipt_count(value: Any, field: str, *, minimum: int = 0) -> int:
@@ -1606,7 +1745,7 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
     if str(receipt.get("tool") or "").strip().lower() != "gradle":
         raise ValueError("receipt gradle_suite_summaries requires the gradle runner")
     if not isinstance(value, Mapping) or not set(value).issubset(
-        {"suites", "truncated", "dropped_suites", "unreadable_suites"}
+        {"suites", "truncated", "dropped_suites", "unreadable_suites", "unsummarized_files"}
     ):
         raise ValueError("receipt gradle_suite_summaries shape is invalid")
     suites = value.get("suites")
@@ -1639,6 +1778,17 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
     if "unreadable_suites" in value:
         _receipt_count(
             value.get("unreadable_suites"), "gradle_suite_summaries.unreadable_suites", minimum=1
+        )
+    # Reports discovery found and the FILE bound never summed — a different
+    # fact from `unreadable_suites` (a report whose head yielded no parsable
+    # `<testsuite>` root) and from `dropped_suites` (a (project, task) pair the
+    # pair bound dropped). Without it a totals section over 2,048 of 5,000
+    # reports would read as the whole project.
+    if "unsummarized_files" in value:
+        _receipt_count(
+            value.get("unsummarized_files"),
+            "gradle_suite_summaries.unsummarized_files",
+            minimum=1,
         )
 
 
@@ -1679,13 +1829,17 @@ def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -
     if not {"dropped_green", "dropped_files"}.issubset(truncation):
         raise ValueError("receipt gradle_row_disclosure.rows_truncated is incomplete")
     green = _receipt_count(truncation.get("dropped_green"), "gradle_row_disclosure.dropped_green")
-    _receipt_count(truncation.get("dropped_files"), "gradle_row_disclosure.dropped_files")
+    files = _receipt_count(truncation.get("dropped_files"), "gradle_row_disclosure.dropped_files")
     red = 0
     if "dropped_red" in truncation:
         red = _receipt_count(
             truncation.get("dropped_red"), "gradle_row_disclosure.dropped_red", minimum=1
         )
-    if not green and not red:
+    # A file-level bound is a loss even when no row it would have produced was
+    # ever built: kafka's 50-file tag bound leaves 1,126 reports unspoken for,
+    # and a truncation record that refused to say so would be the silent cap
+    # this schema exists to forbid.
+    if not green and not red and not files:
         raise ValueError("receipt gradle_row_disclosure.rows_truncated dropped nothing")
     if red and complete is not False:
         raise ValueError("receipt gradle_row_disclosure cannot drop a red and claim completeness")
@@ -1733,6 +1887,8 @@ def assemble_gradle_test_rows(
     *,
     summary_cap: int = GRADLE_SUITE_SUMMARY_CAP,
     row_cap: int = GRADLE_TESTCASE_ROW_CAP,
+    harvested_files: Optional[Sequence[str]] = None,
+    unsummarized_files: int = 0,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Fold one Gradle harvest into `(summary_section, rows, disclosures)`.
 
@@ -1743,6 +1899,19 @@ def assemble_gradle_test_rows(
     `testcase_rows` are the parser's raw rows; the rows returned here are the
     same objects in the same shape, only ordered and bounded, so identity
     sealing and `validate_testcase_execution_row` stay the single row contract.
+
+    `unsummarized_files` is what a discovery bound left out entirely — reports
+    that exist and were never summed. It is carried on the summary section and
+    it withdraws the red-completeness claim, because a red can be hiding in a
+    report nobody read.
+
+    `harvested_files` is every report the identity pass was ASKED to cover.
+    Without it `dropped_files` can only count reports whose rows the cap threw
+    away, which understates the loss whenever a file-level bound stopped a
+    report from being read at all — kafka's 1,176 reports against a 50-file tag
+    bound is exactly that case, and a disclosure that reported 0 dropped files
+    there would be false. With it, the count means what it says: reports whose
+    identities this sample does not carry.
 
     Truncation is red-first: a failure or error identity keeps its slot while
     passing and skipped rows lose theirs, and every drop is counted. Absence is
@@ -1761,6 +1930,13 @@ def assemble_gradle_test_rows(
         else GRADLE_TESTCASE_ROW_CAP
     )
 
+    unsummarized = (
+        unsummarized_files
+        if isinstance(unsummarized_files, int)
+        and not isinstance(unsummarized_files, bool)
+        and unsummarized_files > 0
+        else 0
+    )
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     unreadable = 0
     for entry in suite_summaries or ():
@@ -1805,6 +1981,8 @@ def assemble_gradle_test_rows(
             summary_section["dropped_suites"] = dropped_suites
         if unreadable:
             summary_section["unreadable_suites"] = unreadable
+        if unsummarized:
+            summary_section["unsummarized_files"] = unsummarized
 
     red: List[Mapping[str, Any]] = []
     green: List[Mapping[str, Any]] = []
@@ -1828,13 +2006,16 @@ def assemble_gradle_test_rows(
     # Every dropped row that is not a red: passing, skipped, and any row whose
     # outcome the parser did not state (which could never have been sealed).
     dropped_green = len(ordered) - len(kept_rows) - dropped_red
-    harvested_files = {
+    covered_files = {
         str(row.get("report_path") or "") for row in ordered if isinstance(row, Mapping)
     } - {""}
+    # A report the identity pass never reached is a report this sample does not
+    # speak for, exactly like one whose every row lost its slot.
+    covered_files |= {str(path or "").strip() for path in harvested_files or ()} - {""}
     kept_files = {
         str(row.get("report_path") or "") for row in kept_rows if isinstance(row, Mapping)
     } - {""}
-    dropped_files = len(harvested_files - kept_files)
+    dropped_files = len(covered_files - kept_files)
 
     disclosures: Optional[Dict[str, Any]] = None
     if groups or ordered:
@@ -1846,10 +2027,11 @@ def assemble_gradle_test_rows(
             # there is no witness, so no completeness is claimed.
             "red_rows_complete": bool(groups)
             and not unreadable
+            and not unsummarized
             and not dropped_red
             and min(len(red), row_cap) >= declared_red,
         }
-        if dropped_green or dropped_red:
+        if dropped_green or dropped_red or dropped_files:
             disclosures["rows_truncated"] = {
                 "dropped_green": dropped_green,
                 "dropped_files": dropped_files,
@@ -2221,6 +2403,7 @@ def build_receipt(
     testcase_execution_rows: Optional[Mapping[str, Any]] = None,
     gradle_suite_summaries: Optional[Mapping[str, Any]] = None,
     gradle_row_disclosure: Optional[Mapping[str, Any]] = None,
+    declared_omissions: Optional[Sequence[Mapping[str, Any]]] = None,
     contract_id: Optional[str] = None,
     contract_hash: Optional[str] = None,
     execution_binding: Optional[str] = None,
@@ -2396,8 +2579,14 @@ def build_receipt(
     # tried is untried, not missing, and counting it as missing is how a
     # scoped build (`-pl`) or a reactor that stopped early looks like a
     # catastrophe. Absent when the runner stated nothing.
+    # `tests_reported` rides along when the runner PROVED the module executed
+    # tests (its reports declare their own totals); Gradle's task stream alone
+    # can never say that, and `attempted` had to stand in for both.
     modules = [
-        {str(key): entry[key] for key in ("module", "status") if key in entry}
+        {
+            **{str(key): entry[key] for key in ("module", "status") if key in entry},
+            **({"tests_reported": entry["tests_reported"]} if "tests_reported" in entry else {}),
+        }
         for entry in module_outcomes or ()
         if isinstance(entry, Mapping) and entry.get("module")
     ]
@@ -2411,6 +2600,31 @@ def build_receipt(
     if isinstance(excluded_claimed_paths, int) and not isinstance(excluded_claimed_paths, bool):
         if excluded_claimed_paths > 0:
             receipt["excluded_claimed_paths"] = excluded_claimed_paths
+    # An omission the RUNNER states, for evidence the schema never got the
+    # chance to refuse. ofbiz-plugins ran its test task and left no report XML
+    # at all: nothing reached `_attach`, so nothing above can speak, and a
+    # receipt that simply lacks the field is indistinguishable from one whose
+    # harvest never ran. The vocabulary is closed and the field must be an
+    # omittable one, so this stays engine evidence — a runner may name which
+    # measurement it could not make, never write prose into the receipt.
+    stated = {entry["field"] for entry in omissions}
+    for entry in declared_omissions or ():
+        if not isinstance(entry, Mapping):
+            continue
+        field = str(entry.get("field") or "").strip()
+        reasons = sorted(
+            {
+                str(reason).strip()
+                for reason in entry.get("reasons") or ()
+                if str(reason).strip() in DECLARED_OMISSION_REASONS
+            }
+        )
+        if not reasons or field in stated or field in receipt:
+            continue
+        if field not in _RECEIPT_OMITTABLE_EVIDENCE_FIELDS:
+            continue
+        omissions.append({"field": field, "status": "unavailable", "reasons": reasons})
+        stated.add(field)
     if omissions:
         receipt["evidence_omissions"] = sorted(omissions, key=lambda entry: entry["field"])
     return receipt
@@ -2574,6 +2788,8 @@ def record_invocation(
     module_outcomes: Optional[Sequence[Mapping[str, Any]]] = None,
     gradle_suite_summaries: Optional[Mapping[str, Any]] = None,
     gradle_row_disclosure: Optional[Mapping[str, Any]] = None,
+    harvested_testcase_outcomes: Optional[Mapping[str, Any]] = None,
+    declared_omissions: Optional[Sequence[Mapping[str, Any]]] = None,
     cached_report_roots: Optional[Iterable[str]] = None,
     excluded_claimed_paths: Optional[int] = None,
     effective_jdk: Optional[Mapping[str, Any]] = None,
@@ -2657,7 +2873,17 @@ def record_invocation(
             working_directory=working_directory,
         ),
         output_content_hash=output_content_hash(output),
-        testcase_outcomes=(diagnostic_rows or read_testcase_outcomes(execute, resolved_delta)),
+        # Precedence, weakest transport last. A harvest that ran states BOTH
+        # this list and the `gradle_row_disclosure` beside it, and the two are
+        # one measurement: letting a different transport win the list here
+        # would leave the receipt disclosing drops from a sample it does not
+        # carry. Below it, the exact hash-verified parse; below that, the
+        # historical unattributed tag read.
+        testcase_outcomes=(
+            harvested_testcase_outcomes
+            or diagnostic_rows
+            or read_testcase_outcomes(execute, resolved_delta)
+        ),
         testcase_execution_rows=sealed_rows,
         contract_id=contract_id,
         contract_hash=contract_hash,
@@ -2671,6 +2897,7 @@ def record_invocation(
         # synchronous one by lacking a field only the caller could supply.
         gradle_suite_summaries=gradle_suite_summaries,
         gradle_row_disclosure=gradle_row_disclosure,
+        declared_omissions=declared_omissions,
         cached_report_roots=cached_report_roots,
         excluded_claimed_paths=excluded_claimed_paths,
         effective_jdk=effective_jdk,

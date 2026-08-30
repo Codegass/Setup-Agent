@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="org.apache.kafka.common.protocol.ProtocolTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-08-26T05:06:10.960Z" hostname="f0248d5e3cbe" time="0.178">
+  <properties/>
+  <testcase name="testToHtml()" classname="org.apache.kafka.common.protocol.ProtocolTest" time="0.178"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
