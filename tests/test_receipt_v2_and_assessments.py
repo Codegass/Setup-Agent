@@ -573,15 +573,23 @@ def test_output_content_hash_is_absent_when_there_is_no_output_fact():
 # ---------------------------------------------------------------------------
 
 
-def junit_tokens(*entries):
-    """The container's `grep -oE` token stream for JUnit report XMLs."""
+def junit_tokens(*entries, path=SUREFIRE, digest=HASH_A):
+    """One report's tag stream as the container states it: digest, then tags.
+
+    The tokens are headed by the digest of the file they were read from
+    (`report_tag_command`), because a node is this invocation's evidence only
+    when the bytes behind it are the bytes the delta claims. A stream with no
+    header — or one whose header states a digest the delta does not claim —
+    contributes nothing, which is what the P-B tests below assert.
+    """
     tokens = []
     for classname, name, child in entries:
         tokens.append(f'<testcase classname="{classname}" name="{name}" time="0.1">')
         if child:
             tokens.append(child)
         tokens.append("</testcase>")
-    return "\n".join(tokens) + "\n"
+    body = "\n".join(tokens) + "\n"
+    return f"{invocation_receipts.REPORT_TAG_MARKER}{digest}  {path}\n{body}"
 
 
 def test_testcase_outcomes_parse_this_invocations_own_report_delta():
@@ -630,9 +638,11 @@ def test_testcase_outcomes_read_only_the_reports_the_delta_names():
 
 
 def test_testcase_outcomes_record_a_self_closing_passed_node():
-    execute = FakeExecute(
-        rules=[("grep -oE", ok('<testcase classname="a.S" name="t" time="0.1"/>\n'))]
+    stream = (
+        f"{invocation_receipts.REPORT_TAG_MARKER}{HASH_A}  {SUREFIRE}\n"
+        '<testcase classname="a.S" name="t" time="0.1"/>\n'
     )
+    execute = FakeExecute(rules=[("grep -oE", ok(stream))])
     delta = {"new": [{"path": SUREFIRE, "sha256": HASH_A}], "changed": []}
 
     assert read_testcase_outcomes(execute, delta) == {

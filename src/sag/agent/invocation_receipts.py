@@ -1505,20 +1505,36 @@ def read_testcase_outcomes(
     Only the reports named by the delta are read — never a tree scan — and only
     their TAGS cross the transport. A report nobody could read is UNKNOWN, not
     "this invocation ran no tests", so the key stays absent entirely.
+
+    EVERY NODE IS BOUND TO THE BYTES IT CAME FROM (P-B). This is the transport
+    of last resort in `record_invocation`, and WHEN it is reached is the whole
+    problem: exactly when the hash-verified exact read produced no list — which
+    a post-snapshot rewrite is one way to cause. `read_delta_testcase_rows`
+    refuses the rewritten bytes (`report_hash_mismatch`, no rows), and an
+    unbound grep here would then read the SAME rewritten file and seal the
+    identities the exact reader had just refused, routing evidence onto the one
+    transport with no byte binding at all. So the read goes through
+    `report_tag_command`, whose stream heads every report's tags with the
+    digest of the file they were read from, and only tags whose digest is the
+    digest THIS delta claims become nodes. A rewritten report contributes
+    nothing, an unclaimable path is never read, and a list nothing could bind
+    is an absent key — unknown, as everywhere else.
     """
-    paths: List[str] = []
+    claims: Dict[str, str] = {}
     for bucket in ("new", "changed"):
         for entry in (delta or {}).get(bucket) or ():
             path = str((entry or {}).get("path") or "").strip()
-            if path and path not in paths:
-                paths.append(path)
-    if not paths:
+            digest = str((entry or {}).get("sha256") or "").strip().lower()
+            # A claim that states no digest binds nothing, and reading a path
+            # without a binding is the hole itself.
+            if path and digest and path not in claims:
+                claims[path] = digest
+    if not claims:
         return None
+    paths = list(claims)
     truncated = len(paths) > TESTCASE_FILE_CAP
     command = "; ".join(
-        f"grep -oE {shlex.quote(TESTCASE_TAG_PATTERN)} {shlex.quote(path)} 2>/dev/null "
-        f"| head -n {TESTCASE_TAG_CAP}"
-        for path in paths[:TESTCASE_FILE_CAP]
+        report_tag_command(path, tag_cap=TESTCASE_TAG_CAP) for path in paths[:TESTCASE_FILE_CAP]
     )
     try:
         # `grep` exits nonzero when a report simply has no matching tag, so the
@@ -1527,15 +1543,17 @@ def read_testcase_outcomes(
     except Exception as exc:
         logger.debug(f"testcase outcomes unavailable: {exc}")
         return None
-    nodes, seen = _parse_testcase_tags(str(result.get("output") or ""))
-    if not nodes:
+    rows = parse_report_tag_rows(str(result.get("output") or ""), report_claims=claims)
+    if not rows:
         return None
-    if seen > TESTCASE_OUTCOME_CAP:
-        truncated = True
-    outcomes: Dict[str, Any] = {"nodes": nodes[:TESTCASE_OUTCOME_CAP]}
-    if truncated:
-        outcomes["truncated"] = True
-    return outcomes
+    # ONE projection for both row transports. The exact parse and this tag read
+    # now produce the same row shape, so the diagnostic list they fold into
+    # cannot differ in ordering, dedup or cap depending on which one filled it.
+    # A file bound that fired is a partial read, and a partial read is a
+    # truncated list even when every node it did deliver fits.
+    return diagnostic_testcase_outcomes(
+        {"rows": rows, "status": "partial" if truncated else "complete"}
+    )
 
 
 def report_tag_command(path: str, *, tag_cap: int = TESTCASE_TAG_CAP) -> str:
@@ -1547,6 +1565,21 @@ def report_tag_command(path: str, *, tag_cap: int = TESTCASE_TAG_CAP) -> str:
     shell command means the caller can compare the digest against the receipt's
     own `report_delta` claim and refuse a report the delta does not name.
 
+    THE ORDER IS THE BINDING (P-B). Two opens of one path are two reads, and a
+    concurrent dispatch writing the same workdir lands between them. Hashing
+    FIRST and grepping second attributes the SECOND read's bytes to the FIRST
+    read's digest: the tags come from the rewritten report while the header
+    states exactly the digest the delta claims, so fabricated identities enter
+    the receipt claim-bound and indistinguishable from measured ones. Taking
+    the digest LAST cannot do that. The tags are captured before it — bounded
+    by `head`, so the capture is at most `tag_cap` tokens and the variable
+    holding them is the same size the stream already was — and any rewrite that
+    reaches the file before the digest is observed moves the digest OFF the
+    delta's claim, which `parse_report_tag_rows` drops. A rewrite that lands
+    after both reads touched neither. What remains is the conservative
+    direction: a report rewritten between the tags and the digest loses rows it
+    was entitled to. Fewer rows, never a wrong one.
+
     Nothing here reads a whole report into anything: `grep -oE` streams, and
     the per-file bound cuts the token list at `tag_cap`. That is what makes it
     usable on kafka's 137.8 MB single XML, which no receipt-bound transport can
@@ -1555,9 +1588,10 @@ def report_tag_command(path: str, *, tag_cap: int = TESTCASE_TAG_CAP) -> str:
 
     quoted = shlex.quote(str(path))
     return (
-        f"{{ printf %s {shlex.quote(REPORT_TAG_MARKER)}; sha256sum {quoted} 2>/dev/null; echo; "
-        f"grep -oE {shlex.quote(TESTCASE_TAG_PATTERN)} {quoted} 2>/dev/null "
-        f"| head -n {int(tag_cap)}; }}"
+        f"{{ sag_report_tags=$(grep -oE {shlex.quote(TESTCASE_TAG_PATTERN)} {quoted} 2>/dev/null "
+        f"| head -n {int(tag_cap)}); "
+        f"printf %s {shlex.quote(REPORT_TAG_MARKER)}; sha256sum {quoted} 2>/dev/null; echo; "
+        f'printf \'%s\\n\' "$sag_report_tags"; }}'
     )
 
 
@@ -2704,12 +2738,51 @@ def _validate_evidence_omissions(value: Any, *, receipt: Mapping[str, Any]) -> N
         named.add(field)
 
 
+def _canonical_size(value: Any) -> int:
+    """One nested receipt value's canonical byte size, as the receipt dumps it.
+
+    A value JSON cannot state has no canonical size and can never be carried,
+    so it answers as over any bound: the caller refuses it where the refusal
+    costs one field, not at the receipt's own dump where it costs everything.
+    """
+
+    try:
+        return len(
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        return RECEIPT_MAX_CANONICAL_BYTES + 1
+
+
 def _validate_testcase_envelope(
     value: Any,
     *,
     receipt: Mapping[str, Any],
     report_claims: set[tuple[str, str]],
 ) -> None:
+    """The write-time gate on the exact identity sample, bounds included.
+
+    THE STRUCTURAL GUARD IS A CONTRACT, NOT A PRODUCER HABIT (P-A). The row
+    section's worst case — `DELTA_TESTCASE_ROW_CAP` rows of at most
+    `SEALED_ROW_MAX_CANONICAL_BYTES` each — is what the module asserts against
+    the canonical budget at import time, and until now only the PRODUCER held
+    it: `bound_testcase_rows` capped the count and dropped oversize rows, and
+    this validator, the one gate every receipt (written here or read back)
+    passes through, checked neither. A producer bug or a settlement path that
+    assembled its own envelope reintroduced the kafka burst — past ~16 MB
+    canonical the receipt is refused WHOLE, taking the exit code, the argv and
+    the report delta with it, and between the stated bound and that ceiling an
+    over-cap receipt simply persisted in violation of it.
+    Refusing here costs the SAMPLE and nothing else: `_attach` turns this
+    refusal into a stated evidence omission, and the receipt still exists.
+    """
+
     if not isinstance(value, Mapping):
         raise ValueError("receipt testcase_execution_rows must be an object")
     if set(value) - {"schema_version", "status", "report_count", "rows", "reasons"}:
@@ -2733,7 +2806,15 @@ def _validate_testcase_envelope(
         return
     if reasons:
         raise ValueError("receipt testcase_execution_rows complete envelope cannot state reasons")
+    if len(rows) > DELTA_TESTCASE_ROW_CAP:
+        raise ValueError("receipt testcase_execution_rows exceeds its row cap")
     for raw in rows:
+        # Per-row bytes, before the row contract runs: `_required_text` accepts
+        # a five-megabyte `test_name` and would hand back a perfectly canonical
+        # row, so the ceiling the guard multiplies has to be checked where the
+        # rows enter, not assumed of them.
+        if _canonical_size(raw) > SEALED_ROW_MAX_CANONICAL_BYTES:
+            raise ValueError("receipt testcase_execution_rows row exceeds its byte bound")
         try:
             normalized = validate_testcase_execution_row(
                 raw,
@@ -3654,75 +3735,6 @@ def _parse_sha256sum(output: str) -> Dict[str, str]:
             continue
         snapshot[path] = digest
     return snapshot
-
-
-def _parse_testcase_tags(output: str) -> Tuple[List[Dict[str, str]], int]:
-    """The container's tag token stream -> (sorted nodes, nodes seen).
-
-    A tag stream is enough: JUnit puts the outcome in the testcase's child tag
-    and the skip reason in that child's `message` attribute, so the report
-    bodies never have to cross the transport. A node whose closing tag was cut
-    by the per-file bound still closes when the next testcase opens — a
-    truncated read reports fewer nodes, never a wrong one.
-    """
-    nodes: Dict[str, Dict[str, str]] = {}
-    pending: Optional[Dict[str, str]] = None
-
-    def close(node: Optional[Dict[str, str]]) -> None:
-        if node and node["node_id"] not in nodes:
-            nodes[node["node_id"]] = node
-
-    for match in _TESTCASE_TAG_RE.finditer(output or ""):
-        closing, tag, attributes = match.group(1), match.group(2), match.group(3)
-        self_closing = attributes.rstrip().endswith("/")
-        if tag == "testcase":
-            close(pending)
-            pending = None
-            if closing:
-                continue
-            node_id = _testcase_node_id(attributes)
-            if not node_id:
-                continue
-            pending = {"node_id": node_id, "status": "passed"}
-            if self_closing:
-                close(pending)
-                pending = None
-            if len(nodes) >= TESTCASE_PARSE_CAP:
-                break
-        elif pending is not None:
-            if tag == "skipped":
-                pending["status"] = "skipped"
-                reason = _tag_attribute(attributes, "message")
-                if reason:
-                    pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
-            elif tag == "failure":
-                pending["status"] = "failed"
-                # Spec §5 S2: the FAILURE's own message is the distinct typed
-                # evidence (live TVM: the NumPy dtype error) — a failed node
-                # with no reason cannot emit a distinct failure code.
-                reason = _tag_attribute(attributes, "message")
-                if reason:
-                    pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
-            elif tag == "error":
-                pending["status"] = "error"
-                reason = _tag_attribute(attributes, "message")
-                if reason:
-                    pending["reason"] = reason[:SKIP_REASON_MAX_CHARS]
-    close(pending)
-    ordered = sorted(
-        nodes.values(),
-        key=lambda node: (_STATUS_PRIORITY.get(node["status"], 9), node["node_id"]),
-    )
-    return ordered, len(ordered)
-
-
-def _testcase_node_id(attributes: str) -> str:
-    """`<classname>#<name>`, or the bare name when the report has no class."""
-    name = _tag_attribute(attributes, "name")
-    if not name:
-        return ""
-    classname = _tag_attribute(attributes, "classname")
-    return f"{classname}#{name}" if classname else name
 
 
 def _tag_attribute(attributes: str, name: str) -> str:
