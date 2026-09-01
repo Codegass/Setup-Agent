@@ -43,7 +43,10 @@ from test_gradle_receipt_rows_e2e import (
 )
 
 from sag.agent.invocation_receipts import validate_receipt_v2
-from sag.agent.receipt_test_rows import testcase_execution_id as execution_id_of
+from sag.agent.receipt_test_rows import (
+    DELTA_TESTCASE_ROW_CAP,
+    testcase_execution_id as execution_id_of,
+)
 from sag.tools.report_metrics import (
     assemble_report_metrics,
     format_evidence_layer_lines,
@@ -54,6 +57,9 @@ from sag.tools.report_metrics import (
 KAFKA_PASSED = KAFKA_TESTS - KAFKA_REDS - KAFKA_SKIPPED
 SUITE_TOTALS_BASIS = "gradle suite totals over every claimed report"
 BOUNDED_SAMPLE = "(bounded identity sample)"
+BOUNDED_EXECUTIONS_REASON = (
+    "a current receipt stated no suite totals and its identity rows were bounded"
+)
 
 
 @pytest.fixture
@@ -183,6 +189,131 @@ def test_the_counts_survive_the_identity_tier_being_absent_entirely(kafka_run):
     for grain in ("latest_cases", "latest_subjects"):
         assert claimed[grain]["availability"] == "unavailable"
         assert claimed[grain]["executed"] is None
+
+
+# --- the other half of P-A: no totals tier, and the sample is not a total ----
+#
+# The totals tier is what makes 27,219 sayable. Where it is absent — a gradle
+# dispatch whose head-reader transport failed, or ANY maven or pytest dispatch,
+# which never had one — the only execution evidence a receipt holds is its
+# sealed identity rows, and since T1 bounded that read on every runner those
+# rows are a sample of at most `DELTA_TESTCASE_ROW_CAP`. Publishing the sample
+# as the count is the same error the suffix was invented to prevent, committed
+# one field over: it is `available`, it reads as a total, and only a
+# parenthetical distinguishes 2,048 executions from 2,048 of 27,219.
+
+
+def _without_suite_totals(receipt):
+    """The kafka dispatch whose tier-1 head reader failed, receipt and all.
+
+    `record_invocation` reads the totals and the rows over two separate
+    transports, so one can fail while the other seals a complete envelope. The
+    receipt then says so — `gradle_suite_summaries` absent, the omission
+    declared in the engine's own vocabulary — and carries a full, capped,
+    red-complete identity sample beside it.
+    """
+
+    stripped = {field: value for field, value in receipt.items() if field != "gradle_suite_summaries"}
+    stripped["evidence_omissions"] = sorted(
+        [
+            *(stripped.get("evidence_omissions") or []),
+            {
+                "field": "gradle_suite_summaries",
+                "status": "unavailable",
+                "reasons": ["gradle_suite_totals_unreadable"],
+            },
+        ],
+        key=lambda entry: entry["field"],
+    )
+    return validate_receipt_v2(stripped, expected_id=stripped["receipt_id"])
+
+
+def test_a_gradle_run_whose_totals_tier_failed_withholds_the_count_it_cannot_state(
+    kafka_run,
+):
+    """The probe, pinned: 2,048 sealed rows never become 2,048 executions.
+
+    Both transports are real here — the envelope is `complete`, its rows are
+    exactly the cap, its reds are all present — and none of that makes the
+    sample a count of the run. The surface states the bound instead of a
+    fifteenth of the executions.
+    """
+
+    stripped = _without_suite_totals(kafka_run)
+    claimed = _metrics(stripped)["tests"]["claimed"]
+
+    assert stripped["testcase_execution_rows"]["status"] == "complete"
+    assert len(stripped["testcase_execution_rows"]["rows"]) == DELTA_TESTCASE_ROW_CAP
+    assert claimed["receipt_executions"] == {
+        "executed": None,
+        "passed": None,
+        "failed": None,
+        "errors": None,
+        "skipped": None,
+        "availability": "unavailable",
+        "reason": BOUNDED_EXECUTIONS_REASON,
+    }
+    # The identity grains are unharmed: they count the sample, they say so, and
+    # withholding the run's count is not a reason to withhold the names.
+    for grain in ("latest_cases", "latest_subjects"):
+        assert claimed[grain]["availability"] == "available"
+        assert BOUNDED_SAMPLE in claimed[grain]["basis"]
+
+
+def test_a_maven_run_past_the_row_cap_states_no_count_rather_than_its_sample(kafka_run):
+    """The unconditional case: a runner with no totals tier at all.
+
+    Nothing about this is gradle-specific — maven and pytest receipts reach the
+    same shape whenever the run outgrows the cap, which is exactly where an
+    understated count does the most damage.
+    """
+
+    twin = _maven_twin(kafka_run)
+    executions = _metrics(twin)["tests"]["claimed"]["receipt_executions"]
+
+    assert len(twin["testcase_execution_rows"]["rows"]) == DELTA_TESTCASE_ROW_CAP < KAFKA_TESTS
+    assert "gradle_suite_summaries" not in twin
+    assert executions["availability"] == "unavailable"
+    assert executions["executed"] is None
+    assert executions["reason"] == BOUNDED_EXECUTIONS_REASON
+
+
+def test_a_bounded_row_tier_makes_the_sum_beside_it_a_floor_not_a_total(kafka_run):
+    """Partiality is contagious across dispatches, as it is across totals.
+
+    Gradle's totals are whole and maven's rows are capped; added together they
+    are a floor. A floor published as the run's count is the same lie with a
+    larger number on it, so the aggregate is withheld while each receipt's own
+    evidence stays exactly as valid as it was.
+    """
+
+    metrics = assemble_report_metrics(
+        snapshot={
+            "verdict": "partial",
+            "phase_records": [{"phase": "test", "termination": "complete"}],
+            "build_evidence": {"observed": True, "judgment": "success"},
+        },
+        build_evidence={},
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-08-30T12:00:00Z",
+        run_pin={
+            "run_id": kafka_run["run_id"],
+            "target_repo_sha": kafka_run["target_sha"],
+        },
+        persistence={
+            "receipts_expected": 2,
+            "receipts_persisted": 2,
+            "terminal_receipts_unpersisted": 0,
+        },
+        receipt_records=[kafka_run, _second_dispatch(kafka_run)],
+    )
+    executions = metrics["tests"]["claimed"]["receipt_executions"]
+
+    assert validate_report_metrics_v2(metrics) == metrics
+    assert executions["availability"] == "unavailable"
+    assert executions["reason"] == BOUNDED_EXECUTIONS_REASON
 
 
 def _second_dispatch(receipt):

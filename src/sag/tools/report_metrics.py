@@ -119,6 +119,17 @@ _SUITE_TOTALS_PARTIAL_BASIS = "gradle suite totals over the claimed reports the 
 # capped. It qualifies the population, never the count: the sample is exact and
 # holds every red, and what it dropped is on the receipt.
 _BOUNDED_SAMPLE_SUFFIX = " (bounded identity sample)"
+# Why an EXECUTION count is withheld. `latest_subjects` and `latest_cases` are
+# grains OF the sample and stay available under the suffix above — they count
+# exactly the population they name. `receipt_executions` counts the run, and
+# once T1 bounded the exact-row read on every runner, a receipt with no totals
+# tier can offer nothing but its capped sample for that question: 2,048 of
+# 27,219 executions, published as `available` because the sample itself was
+# whole. A count that is a floor is not a total, and P-A forbids the sample
+# standing in for one — so the number is withheld and the bound is named.
+_BOUNDED_EXECUTIONS_REASON = (
+    "a current receipt stated no suite totals and its identity rows were bounded"
+)
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _HEX_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -575,6 +586,7 @@ def _suite_total_executions(
     *,
     rows: Sequence[Mapping[str, Any]],
     complete: bool,
+    rows_bounded: bool = False,
 ) -> dict[str, Any]:
     """The claimed-execution counts a run's suite TOTALS state (plan r2 T5).
 
@@ -588,6 +600,12 @@ def _suite_total_executions(
     dispatch in the same run, whose only execution evidence is its sealed
     identity rows. Each receipt contributes its own tier exactly once, and the
     basis names both when both spoke.
+
+    ``rows_bounded`` says one of those receipts disclosed a cap on that sample.
+    Its executions are then a floor, and a floor added to a total makes the sum
+    a floor: partiality is contagious here exactly as it is in
+    ``SuiteExecutionTotals.__add__``, and an understated aggregate presented as
+    the run's count is the failure P-A names.
     """
 
     if not complete:
@@ -606,6 +624,8 @@ def _suite_total_executions(
     }
     basis = _SUITE_TOTALS_BASIS if totals.complete_claims else _SUITE_TOTALS_PARTIAL_BASIS
     if rows:
+        if rows_bounded:
+            return _all_null_counts(reason=_BOUNDED_EXECUTIONS_REASON)
         try:
             row_counts = aggregate_testcase_execution_rows(rows)["claimed"]["receipt_executions"]
         except TestcaseRowContractError:
@@ -655,7 +675,12 @@ def _receipt_row_projection(
     suite_totals: SuiteExecutionTotals | None = None
     suite_receipts: set[str] = set()
     executions_complete = True
-    sample_bounded = False
+    # Which current receipts disclosed a cap on their sealed identity sample.
+    # Per receipt rather than one flag, because the two tiers are per receipt:
+    # a bound on a receipt that also stated totals costs nothing (the totals
+    # answer the count), while a bound on one that stated none takes the only
+    # execution evidence that receipt had.
+    bounded_receipts: set[str] = set()
 
     def lost_rows(totals: SuiteExecutionTotals | None) -> None:
         """One current receipt's identity sample did not arrive.
@@ -801,7 +826,7 @@ def _receipt_row_projection(
             if isinstance(disclosure, Mapping) and isinstance(
                 disclosure.get("rows_truncated"), Mapping
             ):
-                sample_bounded = True
+                bounded_receipts.add(receipt_id)
         else:
             stale_rows.extend(validated)
             stale_files.update(str(row["report_path"]) for row in validated)
@@ -813,7 +838,7 @@ def _receipt_row_projection(
         try:
             claimed = _decorate_claimed_aggregation(
                 aggregate_testcase_execution_rows(current_rows),
-                sample_bounded=sample_bounded,
+                sample_bounded=bool(bounded_receipts),
             )
         except TestcaseRowContractError:
             lost_rows(suite_totals)
@@ -822,18 +847,31 @@ def _receipt_row_projection(
     # it did not, so a run that mixed a gradle dispatch with a pytest one is
     # summed without either tier being counted twice or standing in for the
     # other.
+    row_tier_rows = [
+        row for row in current_rows if _nonempty_text(row.get("receipt_id")) not in suite_receipts
+    ]
+    # A receipt answering the execution question with a sample it disclosed as
+    # capped answers with a floor. That is a gradle receipt whose totals tier
+    # was unreadable as much as it is a maven one that never had a totals tier
+    # at all, and neither may be published as the run's count.
+    row_tier_bounded = any(
+        _nonempty_text(row.get("receipt_id")) in bounded_receipts for row in row_tier_rows
+    )
     executions = (
         _suite_total_executions(
             suite_totals,
-            rows=[
-                row
-                for row in current_rows
-                if _nonempty_text(row.get("receipt_id")) not in suite_receipts
-            ],
+            rows=row_tier_rows,
             complete=executions_complete,
+            rows_bounded=row_tier_bounded,
         )
         if suite_totals is not None
-        else None
+        else (
+            # No receipt stated totals, so the aggregation below is what the
+            # surface would otherwise publish as the count — and it is bounded.
+            _all_null_counts(reason=_BOUNDED_EXECUTIONS_REASON)
+            if claimed is not None and row_tier_bounded
+            else None
+        )
     )
     stale = (
         _observation_bucket(
