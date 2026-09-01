@@ -133,7 +133,7 @@ def _receipt(receipt_id, sequence, rows, *, target="a" * 40, status="complete"):
         sealed_row["execution_id"] = _testcase_execution_id(sealed_row)
         sealed.append(sealed_row)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": "metrics-v2-run",
         "receipt_id": receipt_id,
         "target_sha": target,
@@ -399,9 +399,9 @@ def test_same_sha_receipt_from_only_another_run_cannot_promote_snapshot_counts()
     )
 
 
-def test_current_v2_receipt_without_delta_or_envelope_cannot_promote_snapshot_counts():
+def test_current_live_receipt_without_delta_or_envelope_cannot_promote_counts():
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "inv-maven-test-empty-0001",
         "run_id": "metrics-v2-run",
         "tool": "maven",

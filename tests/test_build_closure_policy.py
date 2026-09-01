@@ -85,7 +85,7 @@ def _state_with_build_receipt(attempt_id="build-1"):
         source_attempt_id=attempt_id,
     )
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": receipt_id,
         "run_id": "build-policy",
         "tool": "python",

@@ -393,7 +393,7 @@ def _loop_engine(islands, observed_workdirs, *, receipt=True, tool_name="build")
         )
         if receipt:
             durable_receipts[receipt_id] = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "receipt_id": receipt_id,
                 "run_id": run_id,
                 "tool": next(

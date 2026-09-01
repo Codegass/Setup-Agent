@@ -37,11 +37,14 @@ from scripts.panel_category3_evaluator import (  # noqa: E402
 
 SMOKE_PATH = "tests/python/all-platform-minimal-test"
 
-# Invocation receipts (Plan 5 Stage B, schema v1/v2). Both versions are read:
-# v2 only ADDS keys and keeps every v1 key byte-stable, so no assertion here
-# may reject a receipt for carrying the newer version.
+# Invocation receipts (Plan 5 Stage B, schema v1/v2/v3). This verifier walks a
+# RECORDED session directory, so the archives it audits hold every version the
+# engine ever wrote; each newer version only ADDS keys and keeps every earlier
+# key byte-stable, so no assertion here may reject a receipt for carrying a
+# version this list already names. This is a forensic list, never a live
+# reader: the engine itself admits exactly `RECEIPT_SCHEMA_VERSION`.
 RECEIPT_DIRNAME = os.path.join(".setup_agent", "invocation_receipts")
-RECEIPT_SCHEMA_VERSIONS = (1, 2)
+RECEIPT_SCHEMA_VERSIONS = (1, 2, 3)
 
 # Where a session's own events may record a receipt's content hash. Plan 5
 # sessions record none, so the immutability assertion falls back to integrity.

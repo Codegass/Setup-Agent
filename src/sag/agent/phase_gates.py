@@ -25,7 +25,7 @@ from sag.verdict_rates import (
 
 from .control_ownership import BlockerOwner
 from .evidence_records import EvidencePublicationBinding, read_live_published_json_records
-from .invocation_receipts import RECEIPT_DIR, validate_receipt_v2
+from .invocation_receipts import RECEIPT_DIR, RECEIPT_SCHEMA_VERSION, validate_receipt_v2
 from .phase_machine import PhaseClaim, PhaseOutcome
 
 
@@ -130,9 +130,10 @@ LIVE_AT_CLOSE_CONFLICT_PREFIX = "job_live_at_close:"
 _MAX_NAMED_JOBS = 3
 
 # Receipt/assessment schema versions this reader understands. v1 wrote no
-# ``schema_version`` guarantee beyond the constant 1 and v2 only ADDS keys, so
-# both derive identically; an unknown FUTURE version is skipped rather than
-# coerced (spec §C4: no silent coercion).
+# ``schema_version`` guarantee beyond the constant 1 and the live schema
+# (``RECEIPT_SCHEMA_VERSION``) only ADDS keys to it, so both derive
+# identically; any other version is skipped rather than coerced (spec §C4: no
+# silent coercion).
 
 # Failure-class typed codes (spec §C4/§C5). ONLY these turn a receipt
 # semantically failed, overriding its own exit 0. Deliberately small and
@@ -1793,12 +1794,13 @@ def _receipt_order(receipt: Mapping[str, Any]) -> tuple[int, str]:
 def _read_invocation_receipts(
     orchestrator,
 ) -> tuple[tuple[Mapping[str, Any], ...], tuple[str, ...]]:
-    """Every current host-authorized v2 receipt, or one fail-closed conflict.
+    """Every current host-authorized live-schema receipt, or one conflict.
 
     Container files are forensic mirrors, not authority.  Historical v1
-    records and fully valid foreign-run v2 records may remain in a reused
-    container, but an unknown/future/malformed current shape cannot be skipped:
-    it may be the later failure that caps any surveyed domain.
+    records and fully valid foreign-run live-schema records may remain in a
+    reused container, but an unknown/superseded/future/malformed current shape
+    cannot be skipped: it may be the later failure that caps any surveyed
+    domain.
     """
     if orchestrator is None:
         return (), ()
@@ -1809,7 +1811,7 @@ def _read_invocation_receipts(
         version = payload.get("schema_version", 1)
         if version == 1 and not isinstance(version, bool):
             return "forensic"
-        if version != 2 or isinstance(version, bool):
+        if version != RECEIPT_SCHEMA_VERSION or isinstance(version, bool):
             return "current"
         try:
             normalized = validate_receipt_v2(

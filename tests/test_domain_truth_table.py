@@ -103,10 +103,10 @@ TARGET_SHA = "b" * 40
 
 def _receipt(receipt_id, working_directory, outcome):
     # Same attempt facts as the legacy v1 fixture; the strict live ledger only
-    # accepts complete current-run v2 receipts, so the run/cwd/sha binding the
-    # reader now demands is stated explicitly.
+    # accepts complete current-run live-schema receipts, so the run/cwd/sha
+    # binding the reader now demands is stated explicitly.
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": receipt_id,
         "run_id": RUN,
         "tool": "gradle",

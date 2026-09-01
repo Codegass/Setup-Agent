@@ -77,7 +77,7 @@ def _current_build_receipt(receipt, *, root="/workspace/proj"):
     receipt_id = str(receipt.get("receipt_id") or "")
     tool = "gradle" if "gradle" in receipt_id else "maven"
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": _CURRENT_RECEIPT_RUN,
         "tool": tool,
         "requested_action": "compile",

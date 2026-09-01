@@ -105,7 +105,7 @@ def contract_for(
 
 def receipt_for(contract, **overrides):
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "inv-maven-semantic-0001",
         "run_id": contract["run_id"],
         "tool": contract["effective_tool"],

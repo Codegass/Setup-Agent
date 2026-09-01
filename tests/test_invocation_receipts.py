@@ -1507,11 +1507,14 @@ def test_gradle_evidence_sections_stay_absent_when_the_harvest_stated_nothing():
     assert "gradle_row_disclosure" not in receipt
     assert "evidence_omissions" not in receipt
     assert validate_receipt_v2(receipt)["schema_version"] == RECEIPT_SCHEMA_VERSION
-    # The schema version does NOT move for an additive optional field.
-    assert RECEIPT_SCHEMA_VERSION == 2
+    # The schema version does NOT move for an additive optional field. It moved
+    # to 3 in r2 because the MEANING of the gradle sections changed — totals
+    # became load-bearing and identity rows a disclosed sample — and there is
+    # no compatibility machinery: 3 is the only version a live reader admits.
+    assert RECEIPT_SCHEMA_VERSION == 3
 
 
-def test_a_full_gradle_evidence_receipt_validates_on_schema_two():
+def test_a_full_gradle_evidence_receipt_validates_on_the_live_schema():
     from sag.agent.invocation_receipts import validate_receipt_v2
 
     receipt = build_receipt(
@@ -1539,7 +1542,7 @@ def test_a_full_gradle_evidence_receipt_validates_on_schema_two():
     )
 
     validated = validate_receipt_v2(receipt)
-    assert validated["schema_version"] == 2
+    assert validated["schema_version"] == 3
     assert validated["gradle_suite_summaries"]["suites"] == [GRADLE_SUITE]
     assert validated["gradle_row_disclosure"]["rows_truncated"]["dropped_red"] == 2
     assert "evidence_omissions" not in validated

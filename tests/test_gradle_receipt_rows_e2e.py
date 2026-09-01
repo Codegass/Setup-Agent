@@ -663,7 +663,7 @@ def test_a_gradle_receipt_round_trips_its_canonical_bytes_unchanged(tmp_path):
     """
     receipt, _ = _run_reactor(tmp_path, RED_BEARING_LAYOUT)
 
-    assert receipt["schema_version"] == RECEIPT_SCHEMA_VERSION == 2
+    assert receipt["schema_version"] == RECEIPT_SCHEMA_VERSION == 3
     assert {"gradle_suite_summaries", "gradle_row_disclosure"}.issubset(receipt)
 
     first = _canonical(receipt)

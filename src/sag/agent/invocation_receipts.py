@@ -75,7 +75,12 @@ from sag.utils.container_io import (
     compare_publish_container_text_atomic,
 )
 
-RECEIPT_SCHEMA_VERSION = 2
+# The live receipt schema. r2 changed what the gradle sections mean — suite
+# totals are load-bearing, identity rows are a disclosed sample — so the
+# version moves with the meaning. There is no compatibility machinery: every
+# live reader compares for equality against this one number, and a receipt
+# written under an older version is not a live receipt.
+RECEIPT_SCHEMA_VERSION = 3
 RECEIPT_DIR = "/workspace/.setup_agent/invocation_receipts"
 RECEIPT_ID_COLLISION = "receipt_id_collision"
 HOST_PUBLICATION_FAILED = "host_publication_failed"
@@ -2241,7 +2246,7 @@ def validate_receipt_v2(
             raise ValueError("historical receipt exceeds its canonical byte limit")
         return receipt
     if type(schema) is not int or schema != RECEIPT_SCHEMA_VERSION:
-        raise ValueError("receipt schema_version must be v2 when live")
+        raise ValueError(f"receipt schema_version must be v{RECEIPT_SCHEMA_VERSION} when live")
     unknown = set(receipt) - _RECEIPT_V2_FIELDS
     missing = _RECEIPT_V2_REQUIRED_FIELDS - set(receipt)
     if unknown or missing:
@@ -2417,10 +2422,11 @@ def receipt_record_scope(
 ) -> str:
     """Classify only a fully validated old-run receipt outside live authority.
 
-    Unknown, malformed and future schemas intentionally remain ``current`` so
-    the strict live reader rejects the ledger.  A valid schema-v1 receipt is
-    forensic-only; a valid v2 receipt is foreign only when both the host and
-    the record state distinct non-empty run identities.
+    Unknown, malformed, superseded and future schemas intentionally remain
+    ``current`` so the strict live reader rejects the ledger.  A valid
+    schema-v1 receipt is forensic-only; a receipt on the live schema is
+    foreign only when both the host and the record state distinct non-empty
+    run identities.
     """
 
     if not isinstance(payload, Mapping):

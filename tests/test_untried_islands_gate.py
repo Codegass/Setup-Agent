@@ -103,7 +103,7 @@ def _state_with_island_attempts(*roots, succeeded=False):
         )
         receipts.append(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "receipt_id": receipt_id,
                 "run_id": "island-gate",
                 "tool": "maven",
@@ -167,7 +167,7 @@ def test_all_islands_attempted_with_mixed_outcomes_passes_the_policy():
     )
     receipts.append(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "receipt_id": "receipt-island-green",
             "run_id": "island-gate",
             "tool": "gradle",

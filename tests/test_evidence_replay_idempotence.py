@@ -95,8 +95,8 @@ def receipt_v1(receipt_id, working_directory, outcome="completed", *, schema_ver
 
 
 def receipt_v2(receipt_id, working_directory, outcome="completed"):
-    """A v2 receipt: every v1 key byte-identical, plus the Stage 0 additions."""
-    payload = receipt_v1(receipt_id, working_directory, outcome, schema_version=2)
+    """A live-schema receipt: every v1 key byte-identical, plus the additions."""
+    payload = receipt_v1(receipt_id, working_directory, outcome, schema_version=3)
     payload.update(
         {
             "run_id": "run-current",
@@ -178,7 +178,7 @@ class EvidenceOrch:
     # -- records ---------------------------------------------------------
     def write_receipt(self, payload):
         candidate = dict(payload)
-        publish = candidate.get("schema_version") == 2
+        publish = candidate.get("schema_version") == 3
         if publish:
             candidate = complete_receipt(candidate)
         path = self._write(
@@ -595,7 +595,7 @@ def test_a_receipt_without_a_schema_version_key_is_forensic(tmp_path):
 
 def test_an_unknown_future_schema_version_is_skipped_with_a_named_conflict(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=3))
+    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=4))
     orch.write_receipt(receipt_v1("inv-gradle-1-0002", CONSUMER, "completed"))
 
     derived = _gate_domain_states(orch)
@@ -608,10 +608,10 @@ def test_an_unknown_future_schema_version_is_skipped_with_a_named_conflict(tmp_p
 
 
 def test_a_future_receipt_that_renamed_its_keys_is_still_named(tmp_path):
-    """The version is read BEFORE the payload's keys, so a v3 that renamed
+    """The version is read BEFORE the payload's keys, so a v4 that renamed
     ``working_directory`` conflicts loudly instead of vanishing."""
     orch = EvidenceOrch(tmp_path)
-    payload = receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=3)
+    payload = receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=4)
     payload["actual_working_directory"] = payload.pop("working_directory")
     orch.write_receipt(payload)
 
@@ -657,7 +657,7 @@ def test_an_assessment_for_a_missing_receipt_is_a_named_conflict_not_a_crash(tmp
 
 def test_derivation_conflicts_reach_the_build_gate_as_a_named_fact(tmp_path):
     orch = EvidenceOrch(tmp_path)
-    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=3))
+    orch.write_receipt(receipt_v1("inv-gradle-1-0001", PRODUCER, schema_version=4))
 
     gate = check_phase_claim(
         "build",
@@ -1247,7 +1247,7 @@ def test_the_compact_parser_accepts_a_v2_receipt(parser_workspace):
 
 def test_an_unsupported_receipt_version_still_fails_closed_in_the_rollup(parser_workspace):
     payload = receipt_v1("inv-maven-3-0003", str(parser_workspace.primary_root))
-    payload["schema_version"] = 3
+    payload["schema_version"] = 4
     parser_workspace.write_receipt(payload)
 
     _validator, result = _parse(parser_workspace)

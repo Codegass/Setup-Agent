@@ -689,7 +689,7 @@ def _receipt_loop_line(
 
 def _build_receipt(**overrides):
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "receipt-a",
         "run_id": "current-run",
         "tool": "maven",

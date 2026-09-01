@@ -742,7 +742,7 @@ def test_a_module_count_that_is_not_a_count_is_refused(bad):
 
 def _receipt_with_modules(modules):
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "inv-gradle-test-0001",
         "run_id": "run-pytest",
         "tool": "gradle",

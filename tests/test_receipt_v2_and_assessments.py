@@ -347,9 +347,9 @@ class ControlOrch(Orch):
 # ---------------------------------------------------------------------------
 
 
-def test_receipt_v2_is_schema_version_2():
-    assert RECEIPT_SCHEMA_VERSION == 2
-    assert build_receipt(**V1_ARGS)["schema_version"] == 2
+def test_the_live_receipt_schema_version_is_three():
+    assert RECEIPT_SCHEMA_VERSION == 3
+    assert build_receipt(**V1_ARGS)["schema_version"] == 3
 
 
 def test_receipt_v2_keeps_every_v1_key_byte_identical():
@@ -759,7 +759,7 @@ def test_record_invocation_persists_every_v2_fact_it_could_observe():
 
     (receipt,) = receipts_written(execute.commands)
     assert metadata == {"receipt_id": receipt["receipt_id"]}
-    assert receipt["schema_version"] == 2
+    assert receipt["schema_version"] == 3
     assert receipt["target_sha"] == SHA
     assert receipt["config_fingerprint"] == "cfg-7"
     assert "survey_fingerprint" not in receipt

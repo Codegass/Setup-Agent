@@ -2578,15 +2578,18 @@ def dispatch_receipts(
     Wrapper discovery, ``--version`` probes, fixture setup, and post-run checks
     can all contain the wrapper executable in their command text.  None is a
     build dispatch.  A production receipt is the dispatch boundary, so D0
-    counts only schema-v2 receipts with the exact runner/root/action identity.
+    counts only live-schema receipts with the exact runner/root/action
+    identity.
     """
+
+    from sag.agent.invocation_receipts import RECEIPT_SCHEMA_VERSION
 
     selected: list[dict[str, Any]] = []
     for raw in records:
         record = dict(raw)
         actual_cwd = str(record.get("actual_cwd") or record.get("working_directory") or "")
         if (
-            record.get("schema_version") == 2
+            record.get("schema_version") == RECEIPT_SCHEMA_VERSION
             and str(record.get("receipt_id") or "").strip()
             and str(record.get("tool") or "") == tool
             and actual_cwd.rstrip("/") == working_directory.rstrip("/")

@@ -175,7 +175,7 @@ def receipt_for(*, action="test", **overrides):
     """One finalized receipt: exit 0, no report delta, compliant, fresh."""
     contract = contract_for(action)
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "inv-maven-1-0001",
         "run_id": contract["run_id"],
         "tool": "maven",
@@ -780,7 +780,7 @@ def test_explicit_controller_bash_contract_needs_no_project_pin_tuple():
         ),
     )
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "inv-bash-test-0001",
         "run_id": contract["run_id"],
         "tool": "bash",
@@ -1144,7 +1144,7 @@ def test_live_receipt_reader_ignores_only_strict_foreign_and_historical_siblings
     assert read_receipt(execute, current["receipt_id"]) == current
     assert read_receipt(execute, foreign["receipt_id"]) is None
 
-    unknown = {**foreign, "schema_version": 3}
+    unknown = {**foreign, "schema_version": 4}
     execute.files[f"{RECEIPT_DIR}/{foreign['receipt_id']}.json"] = json.dumps(
         unknown,
         sort_keys=True,
@@ -1371,7 +1371,7 @@ def test_backstop_assesses_a_facade_external_receipt_once(
     store = {
         "/workspace/.setup_agent/invocation_receipts/inv-gradle-1-0004.json": _json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "receipt_id": "inv-gradle-1-0004",
                 "run_id": contract["run_id"],
                 "contract_id": contract["contract_id"],

@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from sag.agent.invocation_receipts import RECEIPT_SCHEMA_VERSION
 from sag.agent.receipt_test_rows import (
     ROW_ENVELOPE_VERSION,
     TestcaseRowContractError,
@@ -606,12 +607,12 @@ def _receipt_row_projection(
         if not entries:
             if (
                 declares_test_execution(receipt)
-                and receipt.get("schema_version") == 2
+                and receipt.get("schema_version") == RECEIPT_SCHEMA_VERSION
                 and receipt_target == target
             ):
-                # A current v2 receipt with no report delta is known to exist,
-                # but without a sealed row envelope it cannot authorize the
-                # snapshot's aggregate receipt-scoped counts.
+                # A receipt on the live schema with no report delta is known to
+                # exist, but without a sealed row envelope it cannot authorize
+                # the snapshot's aggregate receipt-scoped counts.
                 current_report_receipt_seen = True
                 current_complete = False
             if isinstance(envelope, Mapping):
@@ -636,7 +637,7 @@ def _receipt_row_projection(
         row_envelope_seen = True
         report_count = envelope.get("report_count")
         if (
-            receipt.get("schema_version") != 2
+            receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
             or envelope.get("schema_version") != ROW_ENVELOPE_VERSION
             or envelope.get("status") != "complete"
             or not receipt_id

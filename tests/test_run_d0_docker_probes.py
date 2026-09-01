@@ -983,7 +983,7 @@ def test_controller_dispatch_scope_freezes_before_body_and_fails_closed(tmp_path
 
 def test_dispatch_count_uses_exact_durable_receipts_not_wrapper_command_mentions():
     exact = {
-        "schema_version": 2,
+        "schema_version": 3,
         "receipt_id": "inv-maven-1",
         "tool": "maven",
         "working_directory": "/workspace/httpcomponents-client",
@@ -1533,7 +1533,7 @@ def _archived_controller_chain(tmp_path):
     receipt_path.write_text(
         d0.canonical_json(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "receipt_id": "inv-gradle-1",
                 "contract_id": contract["contract_id"],
                 "contract_hash": contract["contract_hash"],
