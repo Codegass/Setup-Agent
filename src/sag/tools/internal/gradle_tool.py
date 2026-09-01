@@ -789,9 +789,7 @@ def _gradle_unclaimed_presence(
     measured = GRADLE_NO_TEST_REPORTS if not discovery.total else GRADLE_NO_CLAIMED_TEST_REPORTS
     if test_disposition in ("planned", "blocked"):
         return GradleTestHarvest(omissions=_gradle_omissions(measured))
-    return GradleTestHarvest(
-        omissions=_gradle_omissions(measured, GRADLE_TEST_ABSENCE_UNDECIDED)
-    )
+    return GradleTestHarvest(omissions=_gradle_omissions(measured, GRADLE_TEST_ABSENCE_UNDECIDED))
 
 
 def _gradle_omissions(

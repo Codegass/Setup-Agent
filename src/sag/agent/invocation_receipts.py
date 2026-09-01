@@ -1900,9 +1900,14 @@ def _validate_module_outcomes(value: Any, *, receipt: Mapping[str, Any]) -> None
 
 
 def _receipt_count(value: Any, field: str, *, minimum: int = 0) -> int:
-    """One non-negative integer count. `True` is not 1 and never was."""
+    """One non-negative integer count. `True` is not 1 and never was.
 
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    The int test comes first only so a reader — a type checker included — can
+    see that what is returned is an `int`: the two tests are order-independent
+    for behaviour, because every `bool` is an `int` and neither passes both.
+    """
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
         raise ValueError(f"receipt {field} must be an integer >= {minimum}")
     return value
 
@@ -2361,7 +2366,9 @@ def _gradle_evidence_text(value: Any) -> str:
 
 
 def _gradle_summary_count(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    """One declared suite count, or None when the field states no number."""
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
     return value
 

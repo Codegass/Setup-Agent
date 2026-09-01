@@ -365,18 +365,22 @@ def _run_reactor(
     reports_on_disk=True,
     served_from_cache=False,
     action="test",
+    orchestrator_class=ReactorOrchestrator,
 ):
     """Drive one Gradle dispatch and return `(receipt, orchestrator)`.
 
     `action` is whatever the build calls its test work. Nothing downstream of
     the argv may read it as a category: since r2-T4 the harvest is decided by
     the report delta, so `smokeTest` and `test` take the same path here.
+
+    `orchestrator_class` is for the one thing a fixed double cannot express: a
+    container whose disk CHANGES under the harvest while it runs.
     """
 
     store = tmp_path / "container"
     store.mkdir(exist_ok=True)
     reactor = GradleReactor(store, layout)
-    orchestrator = ReactorOrchestrator(
+    orchestrator = orchestrator_class(
         reactor,
         tmp_path=tmp_path,
         reports_on_disk=reports_on_disk,
@@ -775,6 +779,126 @@ def test_a_cached_custom_task_is_claimed_and_counted_like_any_other(tmp_path):
     assert "evidence_omissions" not in receipt
     executions = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]
     assert executions["executed"] == RED_SUITE_TESTS + GREEN_SUITE_TESTS
+    assert executions["failed"] == RED_SUITE_FAILURES
+
+
+# --- P-B end to end: same-workdir concurrency --------------------------------
+#
+# The window is real and it is not exotic: the hash bracket closes, and only
+# then does the harvest open the files it claims. A repair loop, a second agent,
+# or the same reactor's next dispatch under one working tree can rewrite a
+# report inside it. What the receipt must never do is sum bytes it is not
+# accountable for.
+CONCURRENT_LAYOUT = [
+    ("clients", "test", RED_SUITE, "ConfigurationUtilsTest"),
+    ("streams", "test", GREEN_SUITE, "ProtocolTest"),
+]
+REWRITTEN_REPORT = f"{ROOT}/streams/build/test-results/test/TEST-ProtocolTest.xml"
+# What the OTHER dispatch left there: a whole streams suite, declaring counts
+# large enough that summing them could not be mistaken for a rounding error.
+INTRUDER_TESTS = 9_000
+INTRUDER_REDS = 2
+
+
+class ConcurrentDispatchOrchestrator(ReactorOrchestrator):
+    """The reactor, with a second dispatch writing into it mid-harvest.
+
+    The rewrite lands at the one moment that matters: after the bracket's AFTER
+    snapshot has been taken — so the delta claims the report at the digest this
+    dispatch wrote — and before tier-1 opens the file. Every read after this
+    point sees the intruder's bytes.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.claimed_digest = None
+
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+        if "ATTRIBUTE = re.compile" in command and self.claimed_digest is None:
+            self.claimed_digest = self.reactor.digest(REWRITTEN_REPORT)
+            self.reactor.real(REWRITTEN_REPORT).write_bytes(
+                _kafka_report("streams", 7, INTRUDER_TESTS, INTRUDER_REDS, 0)
+            )
+        return super().execute_command(command, workdir=workdir, timeout=timeout, **kwargs)
+
+
+def test_a_report_rewritten_between_snapshot_and_read_pollutes_no_count(tmp_path):
+    """The P-B probe, from the disk to the metrics: excluded, disclosed, unpolluted.
+
+    Nine thousand executions and two failures appear under this dispatch's own
+    working directory, between its bracket and its read. They are real tests and
+    somebody's evidence — they are not THIS receipt's, because the bytes behind
+    them are not the bytes it claimed, and the only reason anything can tell is
+    that the digest comes back from the same read as the counts.
+
+    So the receipt states 19, not 9,019; it says which file it withheld and why;
+    and it withdraws its own red-completeness claim, because the two failures it
+    refused to count are exactly the kind of thing that could have been hiding
+    in the bytes it refused to read. The receipt itself is never what is lost —
+    a rewrite costs a measurement, and the measurement it costs is disclosed.
+    """
+    receipt, orchestrator = _run_reactor(
+        tmp_path,
+        CONCURRENT_LAYOUT,
+        orchestrator_class=ConcurrentDispatchOrchestrator,
+    )
+
+    # The delta claims both reports, the second at the digest this dispatch
+    # wrote — which is no longer what is on disk.
+    claimed = {entry["path"]: entry["sha256"] for entry in receipt["report_delta"]["new"]}
+    assert claimed[REWRITTEN_REPORT] == orchestrator.claimed_digest
+    assert orchestrator.reactor.digest(REWRITTEN_REPORT) != orchestrator.claimed_digest
+
+    # P-A: the receipt exists, whole and valid. A rewrite costs a measurement,
+    # never the record.
+    assert validate_receipt_v2(receipt, expected_id=receipt["receipt_id"]) == receipt
+    # Not one of the 9,000 executions or 2 failures reached a total.
+    assert receipt["gradle_suite_summaries"]["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 1,
+            "tests": RED_SUITE_TESTS,
+            "failures": RED_SUITE_FAILURES,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+    assert receipt["gradle_suite_summaries"]["post_snapshot_rewrite"] == {
+        "files": 1,
+        "paths": [REWRITTEN_REPORT],
+    }
+    # A red could have been hiding in the bytes this harvest refused, so the
+    # sample beside the totals stops claiming it holds every failure.
+    assert receipt["gradle_row_disclosure"]["red_rows_complete"] is False
+
+    # The sealed exact-row tier is the strict one and stays strict: it seals a
+    # sample only when EVERY claimed report answered at the bytes the delta
+    # claims, and a set it could not verify whole is named, not half-sealed.
+    envelope = receipt["testcase_execution_rows"]
+    assert envelope["status"] == "unavailable"
+    assert envelope["rows"] == []
+    assert "report_hash_mismatch" in envelope["reasons"]
+
+    # The identities the receipt does carry are the harvest's bounded sample,
+    # and the excluded report is in none of them: the harvest never asked for
+    # its tags at all, so no intruder execution has a name in this receipt.
+    diagnostic = receipt["testcase_outcomes"]["nodes"]
+    assert diagnostic[0]["node_id"] == RED_NODE
+    assert {node["node_id"].split("#")[0] for node in diagnostic} == {RED_NODE.split("#")[0]}
+    tag_reads = [command for command in orchestrator.issued if REPORT_MARKER in command]
+    assert tag_reads and not any(REWRITTEN_REPORT in command for command in tag_reads)
+
+    # The module the intruder wrote for is left without a witness rather than
+    # given a zero: this dispatch measured nothing there.
+    assert receipt["module_outcomes"] == [
+        {"module": "clients", "status": "attempted", "tests_reported": RED_SUITE_TESTS},
+        {"module": "streams", "status": "attempted"},
+    ]
+
+    # And the surface a reader actually reads states the unpolluted number.
+    executions = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]
+    assert executions["executed"] == RED_SUITE_TESTS
     assert executions["failed"] == RED_SUITE_FAILURES
 
 

@@ -543,9 +543,10 @@ def test_a_custom_task_s_reports_are_harvested_whatever_the_dispatch_was_called(
         test_disposition=None,
     )
 
-    assert [
-        (suite["task"], suite["tests"]) for suite in harvest.suite_summaries["suites"]
-    ] == [("smokeTest", 1), ("verify-integration", 19)]
+    assert [(suite["task"], suite["tests"]) for suite in harvest.suite_summaries["suites"]] == [
+        ("smokeTest", 1),
+        ("verify-integration", 19),
+    ]
     assert harvest.module_tests_reported == {"payments": 20}
     assert not harvest.omissions
 
