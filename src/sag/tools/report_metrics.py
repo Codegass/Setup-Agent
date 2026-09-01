@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from sag.agent.invocation_receipts import RECEIPT_SCHEMA_VERSION
+from sag.agent.receipt_suite_totals import SuiteExecutionTotals, receipt_suite_totals
 from sag.agent.receipt_test_rows import (
     ROW_ENVELOPE_VERSION,
     TestcaseRowContractError,
@@ -106,6 +107,18 @@ _CONTROL_FIELDS = frozenset(
     }
 )
 _COUNT_FIELDS_SET = frozenset(COUNT_FIELDS)
+# What a claimed-execution count was READ FROM, in the words of the tier that
+# produced it. The r2 gradle receipt carries two tiers over one dispatch — the
+# suite totals every claimed report declared, and a bounded identity sample of
+# the same executions — and a surface that named neither left a reader unable
+# to tell 27,219 executions from the 2,048 rows that were kept of them.
+_ROW_EXECUTIONS_BASIS = "module-qualified receipt execution rows"
+_SUITE_TOTALS_BASIS = "gradle suite totals over every claimed report"
+_SUITE_TOTALS_PARTIAL_BASIS = "gradle suite totals over the claimed reports the read reached"
+# Said of a grain counted from identities the receipt itself disclosed as
+# capped. It qualifies the population, never the count: the sample is exact and
+# holds every red, and what it dropped is on the receipt.
+_BOUNDED_SAMPLE_SUFFIX = " (bounded identity sample)"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _HEX_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -516,8 +529,21 @@ def _receipt_report_entries(receipt: Mapping[str, Any]) -> list[Any]:
     return entries
 
 
-def _decorate_claimed_aggregation(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Add presentation metadata to the shared raw aggregation contract."""
+def _decorate_claimed_aggregation(
+    value: Mapping[str, Any],
+    *,
+    sample_bounded: bool = False,
+) -> dict[str, Any]:
+    """Add presentation metadata to the shared raw aggregation contract.
+
+    ``sample_bounded`` is the r2 disclosure (P-A, MS-1 C11): a contributing
+    receipt states that its identity rows were capped, so every grain counted
+    from those rows counts a SAMPLE. The counts stay exactly what they are —
+    the sample is real and it is complete in reds — but the basis says which
+    population they came from, because "2,048 latest cases" printed beside
+    27,219 executions with no such word reads as a run that retried thirteen
+    times instead of one whose identities were bounded.
+    """
 
     claimed = value.get("claimed")
     if not isinstance(claimed, Mapping):
@@ -532,12 +558,62 @@ def _decorate_claimed_aggregation(value: Mapping[str, Any]) -> dict[str, Any]:
         counts = claimed.get(name)
         if not isinstance(counts, Mapping):
             raise MetricsContractError(f"shared testcase aggregation omitted {name}")
-        decorated[name] = {**dict(counts), "availability": "available", "basis": basis}
+        decorated[name] = {
+            **dict(counts),
+            "availability": "available",
+            "basis": f"{basis}{_BOUNDED_SAMPLE_SUFFIX}" if sample_bounded else basis,
+        }
     return {
         **decorated,
         "retried_cases": _int_or_none(value.get("retried_cases")),
         "flaky_cases": _int_or_none(value.get("flaky_cases")),
     }
+
+
+def _suite_total_executions(
+    totals: SuiteExecutionTotals,
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    complete: bool,
+) -> dict[str, Any]:
+    """The claimed-execution counts a run's suite TOTALS state (plan r2 T5).
+
+    P-A in one function: the totals are load-bearing and the identity rows are
+    a bounded sample of the same executions, so where a receipt states totals
+    they decide the count and the sample never stands in for them. kafka's
+    measured dispatch seals 2,048 rows over 27,219 executions; reading the
+    sample as the count would publish a fifteenth of the run.
+
+    ``rows`` are the rows of receipts that stated NO totals — a maven or pytest
+    dispatch in the same run, whose only execution evidence is its sealed
+    identity rows. Each receipt contributes its own tier exactly once, and the
+    basis names both when both spoke.
+    """
+
+    if not complete:
+        # A current receipt gave neither tier. Its executions are not zero and
+        # they are not the other receipts' — they are unmeasured, and the
+        # aggregate says so rather than publishing a partial as a total.
+        return _all_null_counts(
+            reason="a current receipt stated neither suite totals nor sealed rows"
+        )
+    counts = {
+        "executed": totals.tests,
+        "passed": totals.passed,
+        "failed": totals.failed,
+        "errors": totals.errors,
+        "skipped": totals.skipped,
+    }
+    basis = _SUITE_TOTALS_BASIS if totals.complete_claims else _SUITE_TOTALS_PARTIAL_BASIS
+    if rows:
+        try:
+            row_counts = aggregate_testcase_execution_rows(rows)["claimed"]["receipt_executions"]
+        except TestcaseRowContractError:
+            return _all_null_counts(reason="a current receipt's execution rows were unreadable")
+        for field in COUNT_FIELDS:
+            counts[field] += int(row_counts[field])
+        basis = f"{basis}, and {_ROW_EXECUTIONS_BASIS} for the receipts that stated none"
+    return {**counts, "availability": "available", "basis": basis}
 
 
 def _receipt_row_projection(
@@ -558,6 +634,7 @@ def _receipt_row_projection(
     if receipts is None:
         return {
             "claimed": None,
+            "executions": None,
             "identity_complete": False,
             "current_receipt_seen": False,
             "unattributed": True,
@@ -574,6 +651,27 @@ def _receipt_row_projection(
     unattributed = False
     foreign_run_seen = False
     stale_files: set[str] = set()
+    # The TOTALS tier, which no failure of the identity tier can take away.
+    suite_totals: SuiteExecutionTotals | None = None
+    suite_receipts: set[str] = set()
+    executions_complete = True
+    sample_bounded = False
+
+    def lost_rows(totals: SuiteExecutionTotals | None) -> None:
+        """One current receipt's identity sample did not arrive.
+
+        Identity completeness and EXECUTION completeness stopped being the same
+        question in r2. A receipt that sealed no usable rows can still state,
+        exactly, what its claimed reports declared — that is the 2026-08-26
+        kafka shape, and reading only the identity tier is why 27,219
+        executions surfaced as `unavailable`. The subject and case grains are
+        still lost; the count is not.
+        """
+
+        nonlocal current_complete, executions_complete
+        current_complete = False
+        if totals is None:
+            executions_complete = False
 
     def declares_test_execution(receipt: Mapping[str, Any]) -> bool:
         requested = str(receipt.get("requested_action") or "").strip().lower()
@@ -604,6 +702,21 @@ def _receipt_row_projection(
         claims_valid = len(report_claims) == len(entries) and all(
             path and re.fullmatch(r"[0-9a-f]{64}", digest) for path, digest in report_claims
         )
+        # THE TOTALS TIER (plan r2 T5). Read before any question about the
+        # identity sample, because no answer to that question can subtract from
+        # it: the totals are summed from the claimed reports' own `<testsuite>`
+        # roots, each verified against the digest this delta claims for it, and
+        # they stand whether or not a single identity row was ever sealed.
+        # They are read only for a receipt that named its target and claimed
+        # reports with valid digests — an unbound total is not this run's.
+        totals = (
+            receipt_suite_totals(receipt)
+            if receipt_target == target and receipt_id and entries and claims_valid
+            else None
+        )
+        if totals is not None:
+            suite_totals = totals if suite_totals is None else suite_totals + totals
+            suite_receipts.add(receipt_id)
         if not entries:
             if (
                 declares_test_execution(receipt)
@@ -614,25 +727,25 @@ def _receipt_row_projection(
                 # exist, but without a sealed row envelope it cannot authorize
                 # the snapshot's aggregate receipt-scoped counts.
                 current_report_receipt_seen = True
-                current_complete = False
+                lost_rows(totals)
             if isinstance(envelope, Mapping):
                 row_envelope_seen = True
                 if receipt_target == target:
                     current_report_receipt_seen = True
-                    current_complete = False
+                    lost_rows(totals)
                 else:
                     unattributed = True
             continue
         if not receipt_target:
             unattributed = True
-            current_complete = False
+            lost_rows(totals)
             continue
         is_current = receipt_target == target
         if is_current:
             current_report_receipt_seen = True
         if not isinstance(envelope, Mapping):
             if is_current:
-                current_complete = False
+                lost_rows(totals)
             continue
         row_envelope_seen = True
         report_count = envelope.get("report_count")
@@ -648,14 +761,14 @@ def _receipt_row_projection(
             or report_count != len(report_claims)
         ):
             if is_current:
-                current_complete = False
+                lost_rows(totals)
             else:
                 unattributed = True
             continue
         raw_rows = envelope.get("rows")
         if not isinstance(raw_rows, list):
             if is_current:
-                current_complete = False
+                lost_rows(totals)
             continue
         try:
             validated = [
@@ -674,12 +787,21 @@ def _receipt_row_projection(
                 raise MetricsContractError("receipt testcase envelope contains a non-object row")
         except TestcaseRowContractError:
             if is_current:
-                current_complete = False
+                lost_rows(totals)
             else:
                 unattributed = True
             continue
         if is_current:
             current_rows.extend(validated)
+            # What the universal row bounds withdrew from this sample. It is
+            # the receipt's own disclosure and it qualifies every grain counted
+            # off these rows — a cap that fired is a population change, and a
+            # surface that does not say so has published a silent cap.
+            disclosure = receipt.get("testcase_row_disclosure")
+            if isinstance(disclosure, Mapping) and isinstance(
+                disclosure.get("rows_truncated"), Mapping
+            ):
+                sample_bounded = True
         else:
             stale_rows.extend(validated)
             stale_files.update(str(row["report_path"]) for row in validated)
@@ -689,9 +811,30 @@ def _receipt_row_projection(
     claimed = None
     if current_report_receipt_seen and current_complete:
         try:
-            claimed = _decorate_claimed_aggregation(aggregate_testcase_execution_rows(current_rows))
+            claimed = _decorate_claimed_aggregation(
+                aggregate_testcase_execution_rows(current_rows),
+                sample_bounded=sample_bounded,
+            )
         except TestcaseRowContractError:
-            current_complete = False
+            lost_rows(suite_totals)
+    # Executions, from the tier that can state them completely. Each receipt
+    # contributes once: its totals where it stated them, its sealed rows where
+    # it did not, so a run that mixed a gradle dispatch with a pytest one is
+    # summed without either tier being counted twice or standing in for the
+    # other.
+    executions = (
+        _suite_total_executions(
+            suite_totals,
+            rows=[
+                row
+                for row in current_rows
+                if _nonempty_text(row.get("receipt_id")) not in suite_receipts
+            ],
+            complete=executions_complete,
+        )
+        if suite_totals is not None
+        else None
+    )
     stale = (
         _observation_bucket(
             _count_outcomes(
@@ -706,6 +849,7 @@ def _receipt_row_projection(
     )
     return {
         "claimed": claimed,
+        "executions": executions,
         "identity_complete": claimed is not None,
         "current_receipt_seen": current_report_receipt_seen,
         "unattributed": (
@@ -990,6 +1134,15 @@ def _project_tests(
                 if row_projection.get("unattributed") is True
                 else _zero_counts(basis="no receipt rows matched the current target sha")
             )
+        # P-A, at the surface: totals are load-bearing and identities are a
+        # bounded sample of them, so where a receipt states what its claimed
+        # reports declared, THAT is the claimed-execution count. It overrides
+        # every branch above — including the snapshot's own receipt-scoped
+        # rollup — because each of them answers with the identity tier, and the
+        # identity tier is the one a cap is allowed to shrink.
+        executions = row_projection.get("executions")
+        if isinstance(executions, Mapping):
+            receipt_executions = dict(executions)
         if row_projection.get("unattributed") is True:
             unattributed = _observation_bucket(
                 _all_null_counts(

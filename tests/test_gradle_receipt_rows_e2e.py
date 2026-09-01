@@ -77,7 +77,7 @@ from sag.tools.internal.gradle_tool import (
     GRADLE_SUITE_HEAD_BYTES,
     GradleTool,
 )
-from sag.tools.report_metrics import assemble_report_metrics
+from sag.tools.report_metrics import COUNT_FIELDS, assemble_report_metrics
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gradle_receipts"
 COUNT_MARKER = "###sag-gradle-xml-count###"
@@ -571,9 +571,14 @@ def test_the_run_counts_downstream_are_the_counts_the_reports_declared(tmp_path)
         "errors": 0,
         "skipped": 0,
     }
+    # The two readers, compared to each other directly. The metrics surface
+    # reads tier 1 since r2-T5, so asking IT for the second number would be
+    # asking the same reader twice; the rows are counted here by the shared
+    # aggregation law, off the receipt's own sealed sample.
     declared = suite["tests"]
-    sealed = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]["executed"]
-    assert declared == sealed == 20
+    sealed = aggregate_testcase_execution_rows(receipt["testcase_execution_rows"]["rows"])
+    reported = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]["executed"]
+    assert declared == sealed["claimed"]["receipt_executions"]["executed"] == reported == 20
     # And the module witness the task stream alone could never state.
     assert receipt["module_outcomes"] == [
         {"module": "clients", "status": "attempted", "tests_reported": 20}
@@ -982,12 +987,14 @@ def test_a_kafka_scale_delta_persists_its_receipt_instead_of_bursting_it(tmp_pat
     assert canonical < ROW_SECTION_MAX_CANONICAL_BYTES * ROW_SECTION_BUDGET_SHARE
 
     # 7. Downstream reads it: the run that reported "unavailable" for 27,219
-    # tests now states numbers, and names its failures.
+    # tests now states numbers, and names its failures. The number is the
+    # RUN's, not the sample's — r2-T5 wired the totals tier into the metrics
+    # surface, and `test_gradle_receipt_metrics_e2e` pins the whole shape.
     executions = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]
     assert executions["availability"] == "available"
     assert executions.get("reason") != KAFKA_SESSION_REASON
     assert executions["failed"] == KAFKA_REDS
-    assert executions["executed"] == len(rows)
+    assert executions["executed"] == KAFKA_TESTS > len(rows)
     assert orchestrator.reactor.paths
 
 
@@ -1087,13 +1094,18 @@ def test_the_row_ingestion_is_runner_agnostic_so_no_downstream_change_was_needed
 ):
     """The same rows, ingested identically whichever runner sealed them.
 
-    This is the assertion behind "nothing downstream was modified". The metrics
+    This is the assertion behind "no runner exception was written". The metrics
     projection was written for Maven's receipts; if it carried a Maven-only
     assumption — a runner check, a report-path shape, a `rows_source` it
-    recognized — the Gradle receipt would have projected differently here. It
-    does not. Nothing in `report_metrics`, `report_tool` or the row contract
-    was touched to make the Gradle chain work, and this test fails if a later
-    change makes one of them runner-aware.
+    recognized — the Gradle receipt's ROWS would have projected differently
+    here. They do not, and this test fails if a later change makes the row path
+    runner-aware.
+
+    What r2-T5 did add is not a runner exception: it is a second EVIDENCE TIER,
+    and the twin below carries no such tier because Maven's receipt does not
+    have one. The projection asks what a receipt states, never what tool wrote
+    it — so the counts still agree to the number, and the only difference is
+    the basis each one names for its own count.
     """
     gradle_receipt, _ = _run_reactor(tmp_path, CLIENTS_LAYOUT)
     maven_receipt = _maven_twin(gradle_receipt)
@@ -1101,7 +1113,14 @@ def test_the_row_ingestion_is_runner_agnostic_so_no_downstream_change_was_needed
     gradle_claimed = _metrics(gradle_receipt)["tests"]["claimed"]
     maven_claimed = _metrics(maven_receipt)["tests"]["claimed"]
 
-    for grain in ("receipt_executions", "latest_cases", "latest_subjects"):
+    for grain in ("latest_cases", "latest_subjects"):
         assert gradle_claimed[grain] == maven_claimed[grain]
         assert gradle_claimed[grain]["availability"] == "available"
-    assert gradle_claimed["receipt_executions"]["executed"] == 20
+    gradle_executions = gradle_claimed["receipt_executions"]
+    maven_executions = maven_claimed["receipt_executions"]
+    assert {field: gradle_executions[field] for field in COUNT_FIELDS} == {
+        field: maven_executions[field] for field in COUNT_FIELDS
+    }
+    assert gradle_executions["availability"] == maven_executions["availability"] == "available"
+    assert gradle_executions["basis"] != maven_executions["basis"]
+    assert gradle_executions["executed"] == 20
