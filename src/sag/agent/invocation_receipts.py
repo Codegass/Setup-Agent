@@ -209,6 +209,17 @@ GRADLE_ROW_SAMPLE_UNREADABLE = "gradle_row_sample_unreadable"
 # survive, the surviving totals stand and the exclusion is disclosed on the
 # summary section instead (`post_snapshot_rewrite`).
 GRADLE_REPORTS_REWRITTEN = "gradle_claimed_reports_rewritten"
+# The delta claims reports under THIS build's `build/test-results/` and the
+# harvest can name a (project, task) pair for none of them: no task directory
+# at all (`build/test-results/results.xml`, which a custom `junitXml`
+# destination or an Ant-style writer produces), or Gradle's internal `binary/`
+# store. `snapshot_reports` globs `*/build/test-results/*.xml` and claims those
+# paths; the summary tier states totals per (project, task) and has no honest
+# pair to state them under, so it sums nothing — and says so HERE. The absence
+# reasons are not available to it: `gradle_no_claimed_test_reports` beside a
+# delta whose `new` bucket names a report this dispatch just wrote is the
+# contradiction the delta-direct claim set exists to make unreachable.
+GRADLE_CLAIMS_UNIDENTIFIED = "gradle_claimed_reports_unidentified"
 # Absence measured, and NOTHING on record about what it means. The two reasons
 # above are measurements — "the tree holds no report", "none of them is this
 # dispatch's" — and neither says whether a report was due. Until r2-T4 that
@@ -226,6 +237,7 @@ DECLARED_OMISSION_REASONS = frozenset(
         GRADLE_SUITE_TOTALS_UNREADABLE,
         GRADLE_ROW_SAMPLE_UNREADABLE,
         GRADLE_REPORTS_REWRITTEN,
+        GRADLE_CLAIMS_UNIDENTIFIED,
         GRADLE_TEST_ABSENCE_UNDECIDED,
     }
 )
@@ -1984,11 +1996,15 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
         _receipt_count(
             value.get("unreadable_suites"), "gradle_suite_summaries.unreadable_suites", minimum=1
         )
-    # Reports this receipt CLAIMS that the read's own file bound never covered
-    # — a different fact from `unreadable_suites` (a report whose head yielded
-    # no parsable `<testsuite>` root) and from `dropped_suites` (a (project,
-    # task) pair the pair bound dropped). Without it a totals section over
-    # 4,096 of 9,000 claimed reports would read as the whole project.
+    # Reports this receipt CLAIMS that the summing read never covered: the
+    # read's own file bound cut them, or no (project, task) pair could be named
+    # for them at all (a `build/test-results/` claim with no task directory, or
+    # Gradle's internal `binary/` store). Both are the same fact for a reader —
+    # a claimed report contributing to no total here — and a different fact from
+    # `unreadable_suites` (a report whose head yielded no parsable `<testsuite>`
+    # root) and from `dropped_suites` (a (project, task) pair the pair bound
+    # dropped). Without it a totals section over 4,096 of 9,000 claimed reports
+    # would read as the whole project.
     if "unsummarized_files" in value:
         _receipt_count(
             value.get("unsummarized_files"),
@@ -2412,10 +2428,11 @@ def assemble_gradle_test_rows(
     same objects in the same shape, only ordered and bounded, so identity
     sealing and `validate_testcase_execution_row` stay the single row contract.
 
-    `unsummarized_files` is what a read bound left out entirely — reports this
-    receipt claims and never summed. It is carried on the summary section and
-    it withdraws the red-completeness claim, because a red can be hiding in a
-    report nobody read.
+    `unsummarized_files` is reports this receipt claims and never summed — a
+    read bound that left them out entirely, or a claimed path under the report
+    layout that names no (project, task) pair to sum it under. It is carried on
+    the summary section and it withdraws the red-completeness claim, because a
+    red can be hiding in a report nobody read.
 
     `rewritten_files` are claimed reports whose bytes had already moved when
     the summing read hashed them (P-B). They are excluded from every total

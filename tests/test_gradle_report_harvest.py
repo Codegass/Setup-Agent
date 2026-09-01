@@ -33,6 +33,7 @@ from test_invocation_receipts import (
 
 from sag.agent.invocation_receipts import (
     DECLARED_OMISSION_REASONS,
+    GRADLE_CLAIMS_UNIDENTIFIED,
     GRADLE_DISCOVERY_INCOMPLETE,
     GRADLE_NO_CLAIMED_TEST_REPORTS,
     GRADLE_NO_TEST_REPORTS,
@@ -912,6 +913,91 @@ def test_a_claim_set_the_listing_named_none_of_is_evidence_not_absence():
     assert harvest.module_tests_reported == {"clients": 19}
     assert harvest.omissions == ()
     assert harvest.testcase_outcomes["nodes"][0]["status"] == "failed"
+
+
+def test_a_claim_no_task_dir_names_is_a_measurement_not_an_absence():
+    """The last way an absence could be declared over a report we wrote.
+
+    `snapshot_reports` globs `*/build/test-results/*.xml` — no task directory
+    required — so a build whose junit XML lands straight in `test-results/`
+    (a custom `junitXml` destination, an Ant-style writer) has that file in its
+    delta's `new` bucket. The identity rule needs a `<taskdir>/` segment to name
+    the pair a total would be stated under and refuses it; until this repair the
+    refusal emptied the claim set, discovery answered in its place, and the
+    receipt declared `gradle_no_claimed_test_reports` beside a delta naming the
+    very file the dispatch had just written. The refusal costs a measurement and
+    says so; it never costs the delta its word.
+    """
+    written = f"{ROOT}/app/build/test-results/results.xml"
+    container = FakeContainer(
+        # A tree that DOES hold reports, none of them claimed: exactly the
+        # listing that used to turn this into `gradle_no_claimed_test_reports`.
+        discovery=_discovery_output([f"{ROOT}/clients/build/test-results/test/TEST-old.xml"]),
+    )
+
+    harvest = _kafka_harvest(container, delta=_delta(("kafka-green-suite.xml", written)))
+
+    assert [entry["reasons"] for entry in harvest.omissions] == [
+        [GRADLE_CLAIMS_UNIDENTIFIED],
+        [GRADLE_CLAIMS_UNIDENTIFIED],
+    ]
+    assert GRADLE_CLAIMS_UNIDENTIFIED in DECLARED_OMISSION_REASONS
+    # Neither absence reason is sayable beside a delta that claims a report.
+    assert not {reason for entry in harvest.omissions for reason in entry["reasons"]} & {
+        GRADLE_NO_CLAIMED_TEST_REPORTS,
+        GRADLE_NO_TEST_REPORTS,
+    }
+    assert harvest.suite_summaries is None and harvest.testcase_outcomes is None
+    # And the tree was never scanned: the delta had already answered whose the
+    # reports are, and a listing may not overrule it in either direction.
+    assert not any(COUNT_MARKER in command for command in container.commands)
+
+
+def test_a_claim_that_names_no_pair_is_disclosed_beside_the_totals_that_stand():
+    """One summable claim, one the identity rule refuses: totals AND disclosure.
+
+    P-A holds — the summed report's counts are stated whole — and the refused
+    claim is stated as a report this receipt claims and never summed, which
+    withdraws red-completeness for the same reason a fired read bound does: a
+    red can be hiding in it.
+    """
+    summable = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    unidentified = f"{ROOT}/app/build/test-results/results.xml"
+    container = FakeContainer(
+        heads=_head_output(
+            [_head("kafka-green-suite.xml", summable, tests=1, failures=0, errors=0, skipped=0)]
+        ),
+        tags=(
+            f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {summable}\n"
+            f"{_fixture('kafka-green-suite.xml').decode()}"
+        ),
+    )
+
+    harvest = _kafka_harvest(
+        container,
+        delta=_delta(
+            ("kafka-green-suite.xml", summable),
+            ("kafka-green-suite.xml", unidentified),
+        ),
+    )
+
+    assert harvest.suite_summaries["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 1,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+    assert harvest.suite_summaries["unsummarized_files"] == 1
+    assert harvest.row_disclosure["red_rows_complete"] is False
+    assert harvest.omissions == ()
+    # The read is asked only for reports it could attribute; a file no pair can
+    # be named for is accounted for, never summed under a guessed task.
+    assert container.head_input == [summable]
 
 
 def test_the_claim_read_s_own_bound_is_the_one_that_can_still_cost_a_total():

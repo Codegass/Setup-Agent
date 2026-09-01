@@ -19,6 +19,7 @@ from sag.agent.invocation_contracts import (
 )
 from sag.agent.invocation_receipts import (
     DECLARED_OMISSION_REASONS,
+    GRADLE_CLAIMS_UNIDENTIFIED,
     GRADLE_DISCOVERY_INCOMPLETE,
     GRADLE_NO_CLAIMED_TEST_REPORTS,
     GRADLE_NO_TEST_REPORTS,
@@ -494,11 +495,43 @@ def _gradle_suite_head_entries(
     return entries
 
 
-def _gradle_claimed_report_paths(
+def _gradle_report_layout_claim(path: str, working_directory: str) -> bool:
+    """Whether this claimed path is a report of THIS build's own report tree.
+
+    The weaker half of `_gradle_report_identity`: the path lies under this
+    dispatch's working directory and under a `build/test-results/` layout, but
+    nothing here says a (project, task) pair can be named for it. It is the set
+    `snapshot_reports` claims for a Gradle dispatch — its glob is
+    `*/build/test-results/*.xml`, with no task directory required and no
+    `binary/` exclusion — and therefore the set a harvest has to account for.
+    """
+
+    text = str(path or "").strip()
+    prefix, separator, _ = text.partition(_GRADLE_REPORT_MARKER)
+    root = str(working_directory or "").rstrip("/")
+    if not separator or not root:
+        return False
+    return prefix == root or prefix.startswith(root + "/")
+
+
+class GradleClaimSet(NamedTuple):
+    """The delta's report claims, split by what the harvest can do with them.
+
+    `summable` are the claims a total may be stated for; `unidentified` are the
+    rest of this build's own claimed reports. The second list is never empty
+    quietly: it is what keeps a claim the harvest cannot sum from reading, to a
+    receipt, exactly like a claim the dispatch never made.
+    """
+
+    summable: Tuple[str, ...]
+    unidentified: Tuple[str, ...]
+
+
+def _gradle_claim_set(
     claims: Mapping[str, str],
     working_directory: str,
-) -> Tuple[str, ...]:
-    """Every report path the DELTA claims, in one deterministic order.
+) -> GradleClaimSet:
+    """Every report path the DELTA claims, split and in one deterministic order.
 
     The claim set is the delta's own path list and nothing else. It was gated
     through the discovery listing until r2-T2, which meant a claimed report the
@@ -507,21 +540,36 @@ def _gradle_claimed_report_paths(
     over reports this dispatch demonstrably wrote. A listing bound may cost a
     receipt an unclaimed-presence remark; it may never cost it its evidence.
 
-    A claim is a report of this dispatch's when it carries a real digest, sits
-    under this build root's `test-results/<taskdir>/` layout, and is not
-    Gradle's internal `binary/` store — the same three rules discovery applied,
-    now applied where the claim is made.
+    A claim is SUMMABLE when it carries a real digest, sits under this build
+    root's `test-results/<taskdir>/` layout, and is not Gradle's internal
+    `binary/` store — the same three rules discovery applied, now applied where
+    the claim is made.
+
+    A claim of this tree's that meets the digest rule and not the other two is
+    UNIDENTIFIED, and it stays on the record. `snapshot_reports` globs
+    `*/build/test-results/*.xml`, so a report written straight into
+    `test-results/` with no task directory is claimed by the delta and refused
+    here; dropping it silently put the identity refusal back where the listing
+    bound used to be, and a dispatch that wrote `app/build/test-results/
+    results.xml` could still get `gradle_no_claimed_test_reports` beside a delta
+    naming that very file. A claim this harvest cannot sum is disclosed — as
+    `unsummarized_files` beside totals, as `GRADLE_CLAIMS_UNIDENTIFIED` when
+    there are none — never converted into an absence.
     """
 
-    return tuple(
-        sorted(
-            path
-            for path, digest in (claims or {}).items()
-            if _GRADLE_SHA256_RE.fullmatch(str(digest or ""))
-            and _GRADLE_BINARY_MARKER not in path
+    summable: List[str] = []
+    unidentified: List[str] = []
+    for path, digest in (claims or {}).items():
+        if not _GRADLE_SHA256_RE.fullmatch(str(digest or "")):
+            continue
+        if (
+            _GRADLE_BINARY_MARKER not in path
             and _gradle_report_identity(path, working_directory) is not None
-        )
-    )
+        ):
+            summable.append(path)
+        elif _gradle_report_layout_claim(path, working_directory):
+            unidentified.append(path)
+    return GradleClaimSet(tuple(sorted(summable)), tuple(sorted(unidentified)))
 
 
 def _gradle_claim_bound_entries(
@@ -650,7 +698,10 @@ def gradle_test_harvest(
     is what the meaning defers to (see `_gradle_unclaimed_presence`).
 
     Discovery has one job left, and it is the one only a scan can do: state
-    what is on disk when the delta claims NOTHING. A scan that never finished
+    what is on disk when the delta claims NO report of this tree at all — not
+    when it claims one this harvest happens not to be able to sum, which is a
+    measurement the receipt states as its own (`GRADLE_CLAIMS_UNIDENTIFIED`).
+    A scan that never finished
     proved neither presence nor absence and states nothing — unknown is an
     absent key here as it is for every other v2 fact. A scan that finished is
     proof: a tree holding reports of which none is this dispatch's, and a test
@@ -673,14 +724,25 @@ def gradle_test_harvest(
     # `:clients:test` over a full reactor's leftovers is the ordinary case, not
     # the exotic one, and summing what the tree holds would state 9,018 of
     # another dispatch's tests as this receipt's.
-    claimed = _gradle_claimed_report_paths(claims, working_directory)
+    claim_set = _gradle_claim_set(claims, working_directory)
+    claimed = claim_set.summable
     if not claimed:
+        if claim_set.unidentified:
+            # This dispatch's delta names reports of this build's own tree that
+            # no (project, task) pair can be stated for. There is nothing to sum
+            # and there is equally nothing absent: an absence reason here would
+            # be the receipt denying a file its own delta claims.
+            return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_CLAIMS_UNIDENTIFIED))
         return _gradle_unclaimed_presence(execute, working_directory, test_disposition)
     # The tier-1 read's own bound, and the only one that can now cost this
     # receipt a claimed report's counts. Sorted, so which claims a fired bound
     # leaves out is a property of the paths and not of dict order.
     read = claimed[:GRADLE_CLAIMED_FILE_CAP]
-    unsummarized = len(claimed) - len(read)
+    # Both ways a claimed report ends up contributing to no total: the read
+    # bound cut it, or nothing could name the pair it would be summed under.
+    # Either way a red can be hiding in it, so it is stated, and the
+    # red-completeness claim goes with it.
+    unsummarized = len(claimed) - len(read) + len(claim_set.unidentified)
     entries = _gradle_suite_head_entries(execute, read, working_directory)
     if entries is None:
         return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
@@ -769,7 +831,9 @@ def _gradle_unclaimed_presence(
     `gradle_no_claimed_test_reports` is reachable from HERE and nowhere else,
     which is the point: it now states what the delta proves — that this
     dispatch wrote nothing — and never what a 2,048-entry listing failed to
-    name. A scan that did not finish proves neither presence nor absence and
+    name, nor what an identity rule refused to name (`_gradle_claim_set`
+    reaches this function only when the delta claims no report of this tree at
+    all). A scan that did not finish proves neither presence nor absence and
     declares nothing at all (see `_gradle_omissions`).
 
     Both reasons are MEASUREMENTS. Neither says whether a report was due, and
