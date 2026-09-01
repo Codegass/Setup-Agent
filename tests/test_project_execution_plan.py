@@ -25,6 +25,7 @@ from sag.agent.project_execution_plan import (
     render_plan_system_prompt,
     seal_and_write_project_execution_plan,
     seal_project_execution_plan,
+    sealed_test_disposition_status,
     validate_authored_plan,
     validate_reviewed_document_evidence,
     write_sealed_project_execution_plan,
@@ -618,6 +619,43 @@ def test_strict_read_rejects_authored_or_artifact_tampering_and_extra_fields():
 
 def test_missing_artifact_reads_as_none():
     assert read_sealed_project_execution_plan(FakeContainer()) is None
+
+
+@pytest.mark.parametrize(
+    "authored, expected",
+    [(planned_candidate, "planned"), (blocked_candidate, "blocked"), (candidate, None)],
+)
+def test_the_sealed_disposition_is_readable_as_one_status_or_unknown(authored, expected):
+    """What an evidence collector needs, and nothing else.
+
+    A Gradle harvest that finds no test report has to know whether one was
+    ever due; the only statement of record is this. `None` is unknown — a plan
+    sealed before `test_disposition` existed says nothing, and nothing is not
+    "no".
+    """
+    fake = FakeContainer()
+    write_sealed_project_execution_plan(
+        fake,
+        seal_project_execution_plan(
+            authored(),
+            source_attempt_id=ATTEMPT_ID,
+            claim_sha256=CLAIM_SHA,
+            document_map=document_map(DEVNOTES),
+        ),
+    )
+
+    assert sealed_test_disposition_status(fake) == expected
+
+
+def test_a_disposition_that_cannot_be_read_is_unknown_and_never_raises():
+    """Evidence collection never breaks the runner, and never guesses either."""
+    fake = FakeContainer()
+    fake.files[PROJECT_EXECUTION_PLAN_PATH] = "{not json"
+
+    with pytest.raises(ProjectExecutionPlanReadError):
+        read_sealed_project_execution_plan(fake)
+    assert sealed_test_disposition_status(fake) is None
+    assert sealed_test_disposition_status(FakeContainer()) is None
 
 
 def test_seal_and_write_is_engine_convenience_and_reports_transport_failure():

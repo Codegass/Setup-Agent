@@ -25,6 +25,7 @@ from sag.agent.invocation_receipts import (
     GRADLE_REPORTS_REWRITTEN,
     GRADLE_ROW_SAMPLE_UNREADABLE,
     GRADLE_SUITE_TOTALS_UNREADABLE,
+    GRADLE_TEST_ABSENCE_UNDECIDED,
     TESTCASE_FILE_CAP,
     TESTCASE_OUTCOME_CAP,
     TESTCASE_TAG_CAP,
@@ -38,6 +39,7 @@ from sag.agent.invocation_receipts import (
 )
 from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
+from sag.agent.project_execution_plan import sealed_test_disposition_status
 from sag.agent.receipt_test_rows import diagnostic_testcase_outcomes
 from sag.evidence import EvidenceAssessment, TestStats
 from sag.runtime.container_io import resolve_control_execute
@@ -59,7 +61,7 @@ from .build_utils import (
     dispatch_hold_policy,
     harvest_detached_evidence,
 )
-from .dispatch_argv import bare_gradle_task, gradle_task_tokens
+from .dispatch_argv import gradle_task_tokens
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 # Gradle prints no reactor summary; what it prints is per-task outcomes:
@@ -70,8 +72,15 @@ from .toolchain_manager import ToolchainManager, ToolchainSpec
 # per-module verdict, so this records only what it can prove: the module was
 # attempted, and whether any of its tasks failed outright. `no-source` is an
 # outcome of a task, not of a module, and is deliberately not a module status.
+#
+# The TASK half takes the same character set as the project half (minus `:`,
+# which is the separator): a Gradle task name is whatever the build script
+# named it, and `[A-Za-z0-9_]+` silently dropped every hyphenated one — the
+# whole row, module and outcome with it. A build whose test task is called
+# `integration-test` was invisible to the module list, to the cached-report
+# roots, and to everything downstream of them.
 _GRADLE_TASK_ROW = re.compile(
-    r"^>\s*Task\s+:?([A-Za-z0-9_.:-]*?):([A-Za-z0-9_]+)"
+    r"^>\s*Task\s+:?([A-Za-z0-9_.:-]*?):([A-Za-z0-9_.-]+)"
     r"(?:\s+(FAILED|NO-SOURCE|SKIPPED|UP-TO-DATE|FROM-CACHE))?\s*$",
     re.MULTILINE,
 )
@@ -83,16 +92,24 @@ _GRADLE_TASK_ROW = re.compile(
 # stronger statement than "a file exists on disk": the build system vouches
 # that the report on disk IS this build's result for that task.
 _GRADLE_CURRENT_WITHOUT_REWRITE = ("FROM-CACHE", "UP-TO-DATE")
-# The task whose outputs are test reports. Only its cache hits may claim one.
-_GRADLE_TEST_TASKS = ("test", "integrationTest", "check")
 
 
 def _gradle_cached_report_dirs(output: str, working_directory: str) -> List[str]:
-    """Report directories a cached/up-to-date TEST task vouches for.
+    """Report directories a cached/up-to-date task vouches for.
 
-    Only test tasks, because only they produce test reports; a cached
-    `compileJava` says nothing about any report. The directory is Gradle's own
-    layout for the module the task belongs to.
+    Every such task, and its OWN task dir — `build/test-results/<task>` with
+    the name taken verbatim from the task stream, hyphens and all. There is no
+    list of task names here and there must not be one: the list read
+    `("test", "integrationTest", "check")`, so geode's cached
+    `distributedTest` vouched for nothing and a project whose suite runs under
+    `smokeTest` or `integration-test` lost every cache hit it had.
+
+    A name-free rule needs no name-based safety net either. What makes a
+    directory claimable is that a report of this build's is IN it, and that is
+    `report_delta`'s question, not this function's: a cached `compileJava`
+    names `build/test-results/compileJava`, no file has ever lived there, and
+    the root claims exactly nothing. The vouching is only ever as wide as the
+    reports the task actually wrote.
     """
     root = str(working_directory or "").rstrip("/")
     if not root:
@@ -100,8 +117,6 @@ def _gradle_cached_report_dirs(output: str, working_directory: str) -> List[str]
     dirs: List[str] = []
     for path, task, outcome in _GRADLE_TASK_ROW.findall(str(output or "")):
         if (outcome or "").upper() not in _GRADLE_CURRENT_WITHOUT_REWRITE:
-            continue
-        if task not in _GRADLE_TEST_TASKS:
             continue
         module_path = path.strip(":").replace(":", "/").strip()
         base = f"{root}/{module_path}" if module_path else root
@@ -260,12 +275,6 @@ for path in paths:
 print(json.dumps({"status": "complete", "suites": suites}, separators=(",", ":")))
 """
 _GRADLE_HEAD_INPUT_DIR = "/workspace/.setup_agent/.gradle-suite-head-input"
-# The task names whose reports are test evidence. A dispatch that ran none of
-# them harvests nothing and states nothing: `assemble` leaving no test XML is
-# not missing evidence, it is a build.
-_GRADLE_TEST_ACTIONS = frozenset(
-    {"test", "check", "integrationtest", "functionaltest", "distributedtest", "build"}
-)
 
 
 class GradleReportDiscovery(NamedTuple):
@@ -292,16 +301,6 @@ class GradleTestHarvest(NamedTuple):
     omissions: Tuple[Dict[str, Any], ...] = ()
 
 
-def gradle_test_action(*actions: Any) -> bool:
-    """Whether any of these action strings names Gradle test work."""
-
-    for action in actions:
-        for token in gradle_task_tokens(action) or ():
-            if bare_gradle_task(token).lower() in _GRADLE_TEST_ACTIONS:
-                return True
-    return False
-
-
 def _gradle_report_identity(path: str, working_directory: str) -> Optional[tuple]:
     """`(project path, task dir)` for one report, or None when unprovable.
 
@@ -309,6 +308,11 @@ def _gradle_report_identity(path: str, working_directory: str) -> Optional[tuple
     is derived from the report's location under the build root — the same
     boundary `receipt_test_rows._report_module_root` uses. A report outside the
     dispatch's own working directory belongs to no project this dispatch ran.
+
+    ANY `test-results/<taskdir>/` counts, and the task is that path segment
+    VERBATIM: `distributedTest`, `smokeTest`, `integration-test`. Gradle chose
+    the name when the build script did; a harvest that only recognized a few of
+    them was reading its own list instead of the tree.
     """
 
     text = str(path or "").strip()
@@ -618,13 +622,13 @@ def gradle_test_harvest(
     *,
     working_directory: str,
     delta: Mapping[str, Any],
-    test_dispatch: bool,
+    test_disposition: Optional[str] = None,
 ) -> GradleTestHarvest:
-    """Harvest one terminal Gradle test dispatch's report evidence.
+    """Harvest one terminal Gradle dispatch's report evidence.
 
-    Derivable from `(execute, working_directory, delta, action)` alone, which
-    is exactly what a detached job holds at settlement — so the settled path
-    states what the synchronous one does instead of quietly lacking it.
+    Derivable from `(execute, working_directory, delta, disposition)` alone,
+    which is exactly what a detached job holds at settlement — so the settled
+    path states what the synchronous one does instead of quietly lacking it.
 
     Reports this invocation CLAIMS, read and summed, become totals, and a bound
     that fired becomes a recorded drop. WHOSE the reports are is the delta's
@@ -632,6 +636,18 @@ def gradle_test_harvest(
     build system vouched for, with the digest each was written at, so the claim
     set is enumerated straight from it. A tree scan cannot add to that set and
     since r2-T2 cannot subtract from it either.
+
+    POSITIVE evidence is therefore decided by the delta and nothing else. There
+    is no test-action gate in front of this any more: it read a list of task
+    names (`test`, `check`, `integrationTest`, `functionalTest`,
+    `distributedTest`, `build`), and a project whose suite runs under
+    `smokeTest` or `verify-integration` had its whole harvest skipped over
+    reports it had just written. A dispatch that wrote test reports harvests
+    them whatever it was called.
+
+    ABSENCE is the one thing the delta cannot interpret, and `test_disposition`
+    — `planned`/`blocked` from the sealed plan, `None` when nothing states it —
+    is what the meaning defers to (see `_gradle_unclaimed_presence`).
 
     Discovery has one job left, and it is the one only a scan can do: state
     what is on disk when the delta claims NOTHING. A scan that never finished
@@ -644,8 +660,6 @@ def gradle_test_harvest(
     The one thing this never returns is a zero.
     """
 
-    if not test_dispatch:
-        return GradleTestHarvest()
     claims = {
         str((entry or {}).get("path") or ""): str((entry or {}).get("sha256") or "").lower()
         for bucket in ("new", "changed", "cached")
@@ -661,7 +675,7 @@ def gradle_test_harvest(
     # another dispatch's tests as this receipt's.
     claimed = _gradle_claimed_report_paths(claims, working_directory)
     if not claimed:
-        return _gradle_unclaimed_presence(execute, working_directory)
+        return _gradle_unclaimed_presence(execute, working_directory, test_disposition)
     # The tier-1 read's own bound, and the only one that can now cost this
     # receipt a claimed report's counts. Sorted, so which claims a fired bound
     # leaves out is a property of the paths and not of dict order.
@@ -740,7 +754,11 @@ def gradle_test_harvest(
     )
 
 
-def _gradle_unclaimed_presence(execute, working_directory: str) -> GradleTestHarvest:
+def _gradle_unclaimed_presence(
+    execute,
+    working_directory: str,
+    test_disposition: Optional[str] = None,
+) -> GradleTestHarvest:
     """What the TREE says when the delta claims nothing — discovery's one job.
 
     Absence is the only fact a scan can establish that a delta cannot, and it
@@ -753,23 +771,34 @@ def _gradle_unclaimed_presence(execute, working_directory: str) -> GradleTestHar
     dispatch wrote nothing — and never what a 2,048-entry listing failed to
     name. A scan that did not finish proves neither presence nor absence and
     declares nothing at all (see `_gradle_omissions`).
+
+    Both reasons are MEASUREMENTS. Neither says whether a report was due, and
+    that question is not a scan's to answer — it used to be answered by a
+    task-name allowlist standing in front of the whole harvest, which is how
+    `smokeTest` became "not a test run". The sealed plan's `test_disposition`
+    is the statement of record; where it exists the meaning of this absence is
+    read from it, and where it does not the receipt says so beside the
+    measurement (`GRADLE_TEST_ABSENCE_UNDECIDED`) rather than letting a reader
+    take a bare absence for tests expected and missing.
     """
 
     discovery = _gradle_discover_reports(execute, working_directory)
     if not discovery.complete:
         logger.debug(f"{GRADLE_DISCOVERY_INCOMPLETE} under {working_directory}")
         return GradleTestHarvest()
-    if not discovery.total:
-        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_TEST_REPORTS))
-    return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_CLAIMED_TEST_REPORTS))
+    measured = GRADLE_NO_TEST_REPORTS if not discovery.total else GRADLE_NO_CLAIMED_TEST_REPORTS
+    if test_disposition in ("planned", "blocked"):
+        return GradleTestHarvest(omissions=_gradle_omissions(measured))
+    return GradleTestHarvest(
+        omissions=_gradle_omissions(measured, GRADLE_TEST_ABSENCE_UNDECIDED)
+    )
 
 
 def _gradle_omissions(
-    reason: str,
-    *,
+    *reasons: str,
     fields: Sequence[str] = ("gradle_suite_summaries", "gradle_row_disclosure"),
 ) -> Tuple[Dict[str, Any], ...]:
-    """The named harvested sections, each stated unavailable for one reason.
+    """The named harvested sections, each stated unavailable for these reasons.
 
     An omission is a claim that something IS missing, so only a scan that ran
     to completion may make one. `GRADLE_DISCOVERY_INCOMPLETE` is therefore not
@@ -781,11 +810,16 @@ def _gradle_omissions(
     it has counts. `fields` is for the one that does not: a totals read that
     landed and a tag read that did not leaves the summaries standing and only
     the row disclosure missing.
+
+    More than one reason is the absence case and only it: what the scan
+    measured, and — when nothing states what the absence was supposed to mean —
+    that it does not know.
     """
 
-    if reason not in DECLARED_OMISSION_REASONS:
+    declared = [reason for reason in reasons if reason in DECLARED_OMISSION_REASONS]
+    if not declared:
         return ()
-    return tuple({"field": field, "reasons": [reason]} for field in fields)
+    return tuple({"field": field, "reasons": list(declared)} for field in fields)
 
 
 def _gradle_witnessed_counts(
@@ -1486,7 +1520,11 @@ class GradleTool(BaseTool):
             self.orchestrator.execute_command,
             working_directory=working_directory,
             delta=report_delta(before, after, cached_report_roots),
-            test_dispatch=gradle_test_action(requested, requested or "build"),
+            # What this dispatch WROTE is the delta's to say. What it means
+            # that it wrote nothing is the sealed plan's, and no other reader
+            # of this dispatch knows: `smokeTest` and `assemble` are the same
+            # string to everything downstream of the argv.
+            test_disposition=sealed_test_disposition_status(self.orchestrator),
         )
         self._pending_invocation_receipt = record_invocation(
             self.orchestrator.execute_command,

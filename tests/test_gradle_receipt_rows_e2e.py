@@ -164,9 +164,20 @@ class GradleReactor:
     def digest(self, path: str) -> str:
         return sha256(self.mount[path].read_bytes()).hexdigest()
 
-    def task_stream(self) -> str:
-        lines = [f"> Task :{module}:test" for module in self.modules if module != "root"]
-        lines = lines or ["> Task :test"]
+    def task_stream(self, outcome: str = "") -> str:
+        """Gradle's own per-task lines, naming the TASKS this layout ran.
+
+        One line per (project, task dir) pair the reports were written under,
+        because that is what Gradle prints and what the cached-report roots are
+        derived from. `outcome` is the trailing word — `FROM-CACHE` when the
+        build served the reports rather than rewriting them.
+        """
+        suffix = f" {outcome}" if outcome else ""
+        pairs = dict.fromkeys(
+            (module, task) for _, _, module, task in self.reports if module != "root"
+        )
+        lines = [f"> Task :{module}:{task}{suffix}" for module, task in pairs]
+        lines = lines or [f"> Task :test{suffix}"]
         return "\n".join([*lines, "BUILD SUCCESSFUL in 3s"])
 
     def snapshot(self) -> str:
@@ -186,10 +197,24 @@ class ReactorOrchestrator(ReceiptOrchestrator):
     the rows this receipt seals are a real parse of real JUnit XML.
     """
 
-    def __init__(self, reactor: GradleReactor, *, tmp_path: Path, reports_on_disk=True):
+    def __init__(
+        self,
+        reactor: GradleReactor,
+        *,
+        tmp_path: Path,
+        reports_on_disk=True,
+        served_from_cache=False,
+    ):
+        # A cache hit rewrites nothing: the reports are on disk on BOTH sides
+        # of the bracket, byte-identical, and only the task stream's FROM-CACHE
+        # makes them this dispatch's. That is kafka's `--build-cache` run.
+        before = reactor.snapshot() if served_from_cache else ""
         super().__init__(
-            snapshots=["", reactor.snapshot() if reports_on_disk else ""],
-            monitored_result={"output": reactor.task_stream(), "exit_code": 0},
+            snapshots=[before, reactor.snapshot() if reports_on_disk else ""],
+            monitored_result={
+                "output": reactor.task_stream("FROM-CACHE" if served_from_cache else ""),
+                "exit_code": 0,
+            },
             build_system="gradle",
         )
         self.reactor = reactor
@@ -333,20 +358,37 @@ class ReactorOrchestrator(ReceiptOrchestrator):
         return {"exit_code": 0, "output": "", "success": True}
 
 
-def _run_reactor(tmp_path, layout, *, reports_on_disk=True):
-    """Drive one Gradle test dispatch and return `(receipt, orchestrator)`."""
+def _run_reactor(
+    tmp_path,
+    layout,
+    *,
+    reports_on_disk=True,
+    served_from_cache=False,
+    action="test",
+):
+    """Drive one Gradle dispatch and return `(receipt, orchestrator)`.
+
+    `action` is whatever the build calls its test work. Nothing downstream of
+    the argv may read it as a category: since r2-T4 the harvest is decided by
+    the report delta, so `smokeTest` and `test` take the same path here.
+    """
 
     store = tmp_path / "container"
     store.mkdir(exist_ok=True)
     reactor = GradleReactor(store, layout)
-    orchestrator = ReactorOrchestrator(reactor, tmp_path=tmp_path, reports_on_disk=reports_on_disk)
+    orchestrator = ReactorOrchestrator(
+        reactor,
+        tmp_path=tmp_path,
+        reports_on_disk=reports_on_disk,
+        served_from_cache=served_from_cache,
+    )
     with argv_contract_authority(
         executor="gradle",
-        action="test",
-        expected_argv="--build-cache test",
+        action=action,
+        expected_argv=f"--build-cache {action}",
         cwd=ROOT,
     ):
-        GradleTool(orchestrator).execute(tasks="test", working_directory=ROOT)
+        GradleTool(orchestrator).execute(tasks=action, working_directory=ROOT)
     (receipt,) = receipts_written(orchestrator.receipt_commands)
     return receipt, orchestrator
 
@@ -671,6 +713,66 @@ def test_geodes_second_task_dir_is_counted_as_its_own_suite_and_the_same_module(
     assert executions["failed"] == RED_SUITE_FAILURES
 
 
+def test_a_task_name_no_allowlist_ever_had_flows_end_to_end(tmp_path):
+    """`smokeTest` and `verify-integration`, from the dispatch to the metrics.
+
+    Three separate name gates stood between this run and its own evidence: the
+    action allowlist that decided whether to harvest at all, the task regex
+    that could not read a hyphen, and the cached-roots list of three names.
+    None of them exists any more, so a build whose suite is called whatever the
+    build script called it reports exactly what a `test` run does.
+    """
+    receipt, _ = _run_reactor(
+        tmp_path,
+        [
+            ("payments", "smokeTest", GREEN_SUITE, "ProtocolTest"),
+            ("payments", "verify-integration", RED_SUITE, "ConfigurationUtilsTest"),
+        ],
+        action="smokeTest",
+    )
+
+    assert [suite["task"] for suite in receipt["gradle_suite_summaries"]["suites"]] == [
+        "smokeTest",
+        "verify-integration",
+    ]
+    assert receipt["module_outcomes"] == [
+        {"module": "payments", "status": "attempted", "tests_reported": 20}
+    ]
+    executions = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]
+    assert executions["executed"] == RED_SUITE_TESTS + GREEN_SUITE_TESTS
+    assert executions["failed"] == RED_SUITE_FAILURES
+
+
+def test_a_cached_custom_task_is_claimed_and_counted_like_any_other(tmp_path):
+    """geode's `distributedTest`, served FROM-CACHE — the r1 blind spot.
+
+    Nothing was rewritten: the reports are byte-identical across the bracket
+    and only Gradle's own FROM-CACHE makes them this dispatch's. The cached
+    roots knew `("test", "integrationTest", "check")`, so the delta claimed
+    nothing and the receipt declared an absence over reports sitting on disk.
+    """
+    receipt, _ = _run_reactor(
+        tmp_path,
+        [
+            ("geode-core", "distributedTest", RED_SUITE, "ConfigurationUtilsTest"),
+            ("payments", "verify-integration", GREEN_SUITE, "ProtocolTest"),
+        ],
+        served_from_cache=True,
+        action="distributedTest",
+    )
+
+    assert validate_receipt_v2(receipt) == receipt
+    assert receipt["report_delta"]["new"] == [] and receipt["report_delta"]["changed"] == []
+    assert [entry["path"].rsplit("/", 2)[-2] for entry in receipt["report_delta"]["cached"]] == [
+        "distributedTest",
+        "verify-integration",
+    ]
+    assert "evidence_omissions" not in receipt
+    executions = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]
+    assert executions["executed"] == RED_SUITE_TESTS + GREEN_SUITE_TESTS
+    assert executions["failed"] == RED_SUITE_FAILURES
+
+
 def test_a_test_run_that_left_no_reports_is_missing_downstream_and_never_zero(tmp_path):
     """ofbiz-plugins: the task ran and wrote nothing.
 
@@ -678,6 +780,10 @@ def test_a_test_run_that_left_no_reports_is_missing_downstream_and_never_zero(tm
     metrics surface COUNTS that declaration, and `receipt_executions` stays
     unknown. A zero here would be the worst possible answer — it reads as a
     clean project with no tests.
+
+    No plan is sealed in this run, so nothing states whether a report was ever
+    due — and the receipt says so beside the measurement instead of letting a
+    bare absence read as evidence that tests were expected.
     """
     receipt, _ = _run_reactor(tmp_path, [], reports_on_disk=False)
 
@@ -688,12 +794,18 @@ def test_a_test_run_that_left_no_reports_is_missing_downstream_and_never_zero(tm
         {
             "field": "gradle_row_disclosure",
             "status": "unavailable",
-            "reasons": ["gradle_no_test_reports_on_disk"],
+            "reasons": [
+                "gradle_no_test_reports_on_disk",
+                "gradle_test_absence_disposition_unknown",
+            ],
         },
         {
             "field": "gradle_suite_summaries",
             "status": "unavailable",
-            "reasons": ["gradle_no_test_reports_on_disk"],
+            "reasons": [
+                "gradle_no_test_reports_on_disk",
+                "gradle_test_absence_disposition_unknown",
+            ],
         },
     ]
 

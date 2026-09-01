@@ -73,6 +73,7 @@ from .invocation_receipts import (
     survey_pins,
     validate_receipt_v2,
 )
+from .project_execution_plan import sealed_test_disposition_status
 
 OBLIGATION_SCHEMA_VERSION = 3
 OBLIGATION_DIR = "/workspace/.setup_agent/job_obligations"
@@ -1640,10 +1641,7 @@ def _settle_one(
         working_directory=working_directory,
         delta=report_delta(before, after, cached_roots),
         module_outcomes=module_outcomes,
-        actions=(
-            _text(obligation.get("effective_action")),
-            _text(obligation.get("requested_action")),
-        ),
+        test_disposition=sealed_test_disposition_status(orchestrator),
     )
 
     metadata = record_invocation(
@@ -1944,16 +1942,23 @@ def _parse_test_harvest(
     working_directory: str,
     delta: Mapping[str, Any],
     module_outcomes: Sequence[Mapping[str, str]],
-    actions: Sequence[str],
+    test_disposition: Optional[str],
 ) -> Tuple[Sequence[Mapping[str, Any]], Dict[str, Any]]:
     """The runner's own post-dispatch report harvest, run at settlement.
 
     Returns `(module_outcomes, receipt kwargs)`. A detached job holds exactly
-    what the harvest needs — the container, the working directory, its own
-    settled report window and the action it was authorized for — so the settled
-    receipt states the same evidence a synchronous one does. The kafka run this
-    exists for died on THIS path; a harvest wired only into the tool would have
-    left it reporting nothing all over again.
+    what the harvest needs — the container, the working directory and its own
+    settled report window — so the settled receipt states the same evidence a
+    synchronous one does. The kafka run this exists for died on THIS path; a
+    harvest wired only into the tool would have left it reporting nothing all
+    over again.
+
+    The job's ACTION is no longer among those inputs. It named the harvest's
+    old task-name gate, and a job dispatched as `smokeTest` settled with its
+    reports on disk and nothing in its receipt. What the job wrote is the
+    delta's to answer; what it means that it wrote nothing is the sealed
+    plan's `test_disposition`, which settlement reads for the same run the job
+    belongs to.
 
     Imported lazily for the same reason `_parse_outcomes` is: the runners
     import this module to record their obligations.
@@ -1963,7 +1968,6 @@ def _parse_test_harvest(
         return module_outcomes, {}
     from sag.tools.internal.gradle_tool import (
         _gradle_module_outcomes_with_counts,
-        gradle_test_action,
         gradle_test_harvest,
     )
 
@@ -1971,7 +1975,7 @@ def _parse_test_harvest(
         execute,
         working_directory=working_directory,
         delta=delta,
-        test_dispatch=gradle_test_action(*actions),
+        test_disposition=test_disposition,
     )
     return (
         _gradle_module_outcomes_with_counts(module_outcomes, harvest.module_tests_reported),

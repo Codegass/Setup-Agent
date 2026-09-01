@@ -947,6 +947,29 @@ def read_sealed_project_execution_plan(orchestrator: Any) -> SealedProjectExecut
         raise ProjectExecutionPlanReadError(str(exc)) from exc
 
 
+def sealed_test_disposition_status(orchestrator: Any) -> str | None:
+    """``planned`` / ``blocked`` from the sealed plan, or ``None``.
+
+    The one statement of record about whether unattended test execution was
+    ever due for this run.  Evidence collectors read it to decide what an
+    ABSENCE of test reports means — the alternative, a task-name allowlist in
+    the harvest, read ``smokeTest`` as "not a test run" at all.
+
+    ``None`` is unknown and is never "no": no plan sealed yet, a plan authored
+    before ``test_disposition`` existed, or a read that did not land.  A caller
+    that cannot establish the meaning of an absence discloses that it could
+    not, and never asserts that tests were expected.
+    """
+
+    try:
+        sealed = read_sealed_project_execution_plan(orchestrator)
+    except Exception:  # evidence collection never breaks the runner
+        return None
+    disposition = getattr(getattr(sealed, "plan", None), "test_disposition", None)
+    status = getattr(disposition, "status", None)
+    return status if status in ("planned", "blocked") else None
+
+
 def render_plan_system_prompt(
     value: ProjectExecutionPlan | SealedProjectExecutionPlan | Any,
 ) -> str:

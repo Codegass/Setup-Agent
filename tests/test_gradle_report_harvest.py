@@ -39,6 +39,7 @@ from sag.agent.invocation_receipts import (
     GRADLE_REPORTS_REWRITTEN,
     GRADLE_ROW_SAMPLE_UNREADABLE,
     GRADLE_SUITE_TOTALS_UNREADABLE,
+    GRADLE_TEST_ABSENCE_UNDECIDED,
     TESTCASE_FILE_CAP,
     build_receipt,
     parse_report_tag_rows,
@@ -56,7 +57,6 @@ from sag.tools.internal.gradle_tool import (
     _gradle_module_outcomes_with_counts,
     _gradle_red_first,
     _gradle_report_identity,
-    gradle_test_action,
     gradle_test_harvest,
 )
 
@@ -194,6 +194,47 @@ def test_every_geode_report_resolves_to_its_own_project_and_task_dir():
     ) == (":geode-core", "distributedTest")
 
 
+def test_any_task_dir_resolves_and_the_task_is_that_segment_verbatim():
+    """r2-T4: the name is the path segment, hyphens and all.
+
+    `test-results/<taskdir>` is Gradle's layout and the task is whatever the
+    build script called it. Nothing here matches a name against a list — the
+    list would have to know `smokeTest` and `verify-integration` in advance,
+    which is exactly what it never did.
+    """
+    identities = {
+        _gradle_report_identity(
+            f"/workspace/proj/payments/build/test-results/{task}/TEST-a.xml",
+            "/workspace/proj",
+        )
+        for task in ("smokeTest", "verify-integration", "distributedTest", "test")
+    }
+
+    assert identities == {
+        (":payments", "smokeTest"),
+        (":payments", "verify-integration"),
+        (":payments", "distributedTest"),
+        (":payments", "test"),
+    }
+
+
+def test_a_hyphenated_task_name_survives_the_task_stream():
+    """`[A-Za-z0-9_]+` dropped the whole ROW, not just the task.
+
+    A module whose test task is `verify-integration` had no module outcome, no
+    failure status and no cached-report root: Gradle printed the line and the
+    receipt behaved as though the task had never run.
+    """
+    outcomes = _gradle_module_outcomes(
+        "> Task :payments:verify-integration FAILED\n> Task :ledger:smokeTest\n"
+    )
+
+    assert outcomes == [
+        {"module": "payments", "status": "failure"},
+        {"module": "ledger", "status": "attempted"},
+    ]
+
+
 def test_a_scan_that_never_reached_its_marker_knows_nothing():
     """An unfinished scan must not be readable as "no reports here"."""
     container = FakeContainer(discovery="/workspace/a.xml\n/workspace/b.xml\n")
@@ -283,7 +324,7 @@ def test_a_workdir_the_scan_could_not_read_proves_no_absence(tmp_path):
         shell.execute_command,
         working_directory=str(tmp_path / "gone"),
         delta={"new": [], "changed": []},
-        test_dispatch=True,
+        test_disposition="planned",
     )
     assert harvest == type(harvest)()
 
@@ -428,7 +469,7 @@ def _kafka_harvest(container, *, delta):
         container.execute_command,
         working_directory=ROOT,
         delta=delta,
-        test_dispatch=True,
+        test_disposition="planned",
     )
 
 
@@ -471,19 +512,85 @@ def test_unreadable_suite_totals_are_an_omission_not_an_empty_summary():
     assert {entry["reasons"][0] for entry in harvest.omissions} == {GRADLE_SUITE_TOTALS_UNREADABLE}
 
 
-def test_a_dispatch_that_ran_no_test_task_harvests_and_states_nothing():
-    """`assemble` leaving no test XML is a build, not missing evidence."""
+def test_a_custom_task_s_reports_are_harvested_whatever_the_dispatch_was_called():
+    """The delta claims them, so they are counted. That is the whole rule.
+
+    `smokeTest` and `verify-integration` were in no allowlist, so the harvest
+    returned an empty result over reports the dispatch had just written — and
+    no disposition may suppress that either: POSITIVE evidence is the delta's
+    alone, and here nothing is sealed at all.
+    """
+    smoke = f"{ROOT}/payments/build/test-results/smokeTest/TEST-green.xml"
+    hyphen = f"{ROOT}/payments/build/test-results/verify-integration/TEST-red.xml"
+    container = FakeContainer(
+        discovery=_discovery_output([]),
+        heads=_head_output(
+            [
+                _head("kafka-green-suite.xml", smoke, tests=1, failures=0, errors=0, skipped=0),
+                _head("kafka-red-suite.xml", hyphen, tests=19, failures=1, errors=0, skipped=0),
+            ]
+        ),
+        tags=(
+            f"{REPORT_MARKER}{_digest('kafka-red-suite.xml')}  {hyphen}\n"
+            f"{_fixture('kafka-red-suite.xml').decode()}"
+        ),
+    )
+
+    harvest = gradle_test_harvest(
+        container.execute_command,
+        working_directory=ROOT,
+        delta=_delta(("kafka-green-suite.xml", smoke), ("kafka-red-suite.xml", hyphen)),
+        test_disposition=None,
+    )
+
+    assert [
+        (suite["task"], suite["tests"]) for suite in harvest.suite_summaries["suites"]
+    ] == [("smokeTest", 1), ("verify-integration", 19)]
+    assert harvest.module_tests_reported == {"payments": 20}
+    assert not harvest.omissions
+
+
+def test_an_absence_nobody_sealed_a_disposition_for_is_disclosed_as_unknown():
+    """`assemble` left no XML — and nothing on record says one was due.
+
+    The old answer was a task-name allowlist: `assemble` was not in it, so the
+    harvest declared nothing and the receipt was silent. The name is gone, so
+    the receipt states what it measured and, beside it, that the meaning of
+    that measurement is unestablished. It never becomes "tests were expected".
+    """
     container = FakeContainer(discovery=_discovery_output([], total=0))
 
     harvest = gradle_test_harvest(
         container.execute_command,
         working_directory=ROOT,
         delta={"new": [], "changed": []},
-        test_dispatch=gradle_test_action("assemble"),
+        test_disposition=None,
     )
 
-    assert harvest == type(harvest)()
-    assert container.commands == []
+    assert harvest.suite_summaries is None and harvest.row_disclosure is None
+    assert all(
+        entry["reasons"] == [GRADLE_NO_TEST_REPORTS, GRADLE_TEST_ABSENCE_UNDECIDED]
+        for entry in harvest.omissions
+    )
+
+
+@pytest.mark.parametrize("disposition", ["planned", "blocked"])
+def test_a_sealed_disposition_is_what_an_absence_defers_to(disposition):
+    """With a disposition on record the measurement stands on its own.
+
+    The plan already states whether unattended test execution was ever due, so
+    the receipt does not restate it and does not hedge: it reports the scan.
+    """
+    container = FakeContainer(discovery=_discovery_output([], total=0))
+
+    harvest = gradle_test_harvest(
+        container.execute_command,
+        working_directory=ROOT,
+        delta={"new": [], "changed": []},
+        test_disposition=disposition,
+    )
+
+    assert all(entry["reasons"] == [GRADLE_NO_TEST_REPORTS] for entry in harvest.omissions)
 
 
 def test_the_harvest_sums_every_claimed_report_and_samples_identities_red_first():

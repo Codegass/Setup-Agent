@@ -793,6 +793,25 @@ def test_a_settled_receipt_states_the_suite_totals_a_synchronous_one_would():
     assert "evidence_omissions" not in receipt
 
 
+def test_a_job_dispatched_under_a_custom_task_name_still_settles_its_evidence():
+    """r2-T4: the ACTION is no longer an input to the settled harvest.
+
+    It was, and it was matched against six names. A job detached as
+    `smokeTest` — the ordinary shape for a project whose suite is not called
+    `test` — settled with its reports on disk, its delta claiming them, and a
+    receipt that stated nothing about any of it.
+    """
+    orchestrator = _with_obligation(
+        _orchestrator(), requested_action="smokeTest", effective_action="smokeTest"
+    )
+
+    settle_open_obligations(orchestrator)
+
+    (receipt,) = _receipts(orchestrator)
+    assert [suite["tests"] for suite in receipt["gradle_suite_summaries"]["suites"]] == [3, 3]
+    assert "evidence_omissions" not in receipt
+
+
 def test_a_cache_hit_the_job_vouched_for_is_claimed():
     """`_gradle_cached_report_dirs` runs on the settled path too, so kafka's
     4,686-test lesson survives detachment."""

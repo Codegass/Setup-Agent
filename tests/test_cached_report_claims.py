@@ -25,23 +25,59 @@ KAFKA_TASKS = """> Task :api:test FROM-CACHE
 > Task :core:compileJava FROM-CACHE
 > Task :streams:test FAILED
 """
+# The names no allowlist had (r2-T4). geode's `distributedTest` is measured —
+# it is why the summary unit is the (project, task dir) pair — and a build
+# whose suite runs under `smokeTest` or `verify-integration` is the ordinary
+# case the old three-name list read as "not a test task at all".
+CUSTOM_TASKS = """> Task :geode-core:distributedTest FROM-CACHE
+> Task :payments:smokeTest UP-TO-DATE
+> Task :payments:verify-integration FROM-CACHE
+"""
 
 
-def test_only_cached_test_tasks_vouch_for_a_report_directory():
-    """A cached `compileJava` says nothing about any test report."""
+def test_every_cached_task_vouches_for_its_own_task_dir_by_name():
+    """No allowlist: the task dir is the task's name, taken verbatim.
+
+    `("test", "integrationTest", "check")` was the whole list, so geode's
+    cached `distributedTest` vouched for nothing and its reports could be
+    claimed by no receipt. A hyphenated name did not even survive the task
+    regex.
+    """
+    dirs = _gradle_cached_report_dirs(CUSTOM_TASKS, "/workspace/proj")
+
+    assert dirs == [
+        "/workspace/proj/geode-core/build/test-results/distributedTest",
+        "/workspace/proj/payments/build/test-results/smokeTest",
+        "/workspace/proj/payments/build/test-results/verify-integration",
+    ]
+
+
+def test_a_cached_non_test_task_vouches_for_a_directory_that_holds_nothing():
+    """A cached `compileJava` still says nothing about any test report.
+
+    It names `build/test-results/compileJava`, which no build has ever written
+    into, so the root claims nothing — the DISK decides what a vouched
+    directory is worth, not a list of names this engine keeps.
+    """
     dirs = _gradle_cached_report_dirs(KAFKA_TASKS, "/workspace/kafka")
 
     assert dirs == [
         "/workspace/kafka/api/build/test-results/test",
         "/workspace/kafka/json/build/test-results/test",
+        "/workspace/kafka/core/build/test-results/compileJava",
     ]
+    assert report_delta(
+        {"/workspace/kafka/core/build/test-results/test/TEST-a.xml": "aa"},
+        {"/workspace/kafka/core/build/test-results/test/TEST-a.xml": "aa"},
+        dirs,
+    ) == {"new": [], "changed": []}
 
 
 def test_a_task_that_actually_ran_is_not_a_cache_hit():
     """`:core:test` rewrote its own reports; it belongs in new/changed."""
     dirs = _gradle_cached_report_dirs(KAFKA_TASKS, "/workspace/kafka")
 
-    assert not any("/core/" in directory for directory in dirs)
+    assert "/workspace/kafka/core/build/test-results/test" not in dirs
 
 
 def test_an_unchanged_report_under_a_vouched_directory_is_claimed():

@@ -209,6 +209,16 @@ GRADLE_ROW_SAMPLE_UNREADABLE = "gradle_row_sample_unreadable"
 # survive, the surviving totals stand and the exclusion is disclosed on the
 # summary section instead (`post_snapshot_rewrite`).
 GRADLE_REPORTS_REWRITTEN = "gradle_claimed_reports_rewritten"
+# Absence measured, and NOTHING on record about what it means. The two reasons
+# above are measurements — "the tree holds no report", "none of them is this
+# dispatch's" — and neither says whether a report was due. Until r2-T4 that
+# question was answered by a task-name allowlist, which read `smokeTest` as
+# "not a test run" and lost geode's cached `distributedTest` outright. The
+# sealed plan's `test_disposition` is the only statement of record about
+# whether unattended test execution was planned at all, so a dispatch that ran
+# without one carries this beside the measurement: the absence is real and its
+# meaning is unestablished. It is never evidence that tests were expected.
+GRADLE_TEST_ABSENCE_UNDECIDED = "gradle_test_absence_disposition_unknown"
 DECLARED_OMISSION_REASONS = frozenset(
     {
         GRADLE_NO_TEST_REPORTS,
@@ -216,6 +226,7 @@ DECLARED_OMISSION_REASONS = frozenset(
         GRADLE_SUITE_TOTALS_UNREADABLE,
         GRADLE_ROW_SAMPLE_UNREADABLE,
         GRADLE_REPORTS_REWRITTEN,
+        GRADLE_TEST_ABSENCE_UNDECIDED,
     }
 )
 # Not an omission reason: a scan that never ran proved nothing, and an
