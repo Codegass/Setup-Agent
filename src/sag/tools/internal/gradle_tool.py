@@ -22,6 +22,7 @@ from sag.agent.invocation_receipts import (
     GRADLE_DISCOVERY_INCOMPLETE,
     GRADLE_NO_CLAIMED_TEST_REPORTS,
     GRADLE_NO_TEST_REPORTS,
+    GRADLE_REPORTS_REWRITTEN,
     GRADLE_ROW_SAMPLE_UNREADABLE,
     GRADLE_SUITE_TOTALS_UNREADABLE,
     TESTCASE_FILE_CAP,
@@ -156,7 +157,19 @@ def _gradle_module_outcomes(output: str) -> List[Dict[str, str]]:
 # Reports discovery will hand on. kafka measured 1,176 and geode 1,167, so this
 # is a safety bound rather than an expected one; a discovery that hits it says
 # how many reports it left unsummed.
+#
+# It bounds a LISTING, and since r2-T2 a listing decides nothing about this
+# receipt's evidence: the claim set is enumerated from `report_delta` itself.
+# What this bound can still cost is the unclaimed-presence statement discovery
+# exists to make — never a claimed report's counts.
 GRADLE_XML_FILE_CAP = 2048
+# Claimed reports one tier-1 round trip may cover. The claim set is the delta's
+# now, and the delta is as large as the dispatch's own output (kafka: 1,176),
+# so the read needs its OWN bound — 4,096 entries of `{path, sha256, 4 counts}`
+# is roughly 800 KB of JSON, against a measured worst case under a third of it.
+# A claim this bound leaves out is disclosed as `unsummarized_files`, which
+# withdraws red-completeness: a red can hide in a report nobody summed.
+GRADLE_CLAIMED_FILE_CAP = 4096
 # A JUnit report's root `<testsuite>` tag is its first element, on the second
 # line after the XML declaration. 4 KB is many times what that tag needs and is
 # the same read whether the file is 438 bytes or 137.8 MB.
@@ -176,11 +189,28 @@ _GRADLE_FIND_STATUS_MARKER = "###sag-gradle-find-status###"
 _GRADLE_REPORT_GLOB = "*/build/test-results/*/*.xml"
 _GRADLE_REPORT_MARKER = "/build/test-results/"
 _GRADLE_BINARY_GLOB = "*/binary/*"
+# The same exclusion, applied to the claim set: `report_delta`'s snapshot globs
+# `*/build/test-results/*.xml` without excluding Gradle's internal result store,
+# so the rule that keeps `binary/` away from a report parser has to hold on the
+# path discovery no longer gates.
+_GRADLE_BINARY_MARKER = "/binary/"
+# A digest a delta actually recorded, not whatever a broken snapshot echoed.
+_GRADLE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # Read the FIRST `<testsuite ...>` open tag out of a bounded head and take the
 # four counts it declares. `\b` is what keeps `<testsuites>` from matching: a
 # wrapper element states no counts of its own. A head that yields no such tag
 # is counted as unreadable and never guessed at.
+#
+# The SAME open that yields the head also hashes the file WHOLE (P-B: every
+# count is bound to the bytes it counts). One descriptor, one forward pass: the
+# head is the first chunk of the stream the digest covers, so no window exists
+# in which the counts and the digest could describe different bytes — which is
+# exactly what a report rewritten by a concurrent dispatch under the same
+# workdir would produce. Hashing costs one sequential read of bytes the
+# invocation's own hash bracket already reads twice; it never buffers a report,
+# so kafka's 137.8 MB stream costs 137.8 MB of I/O and 4 KB of memory.
 _GRADLE_SUITE_HEAD_READER = r"""
+import hashlib
 import json
 import re
 import sys
@@ -188,6 +218,7 @@ import sys
 SUITE = re.compile(rb"<testsuite\b[^>]*>")
 ATTRIBUTE = re.compile(rb'([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*"([^"]*)"')
 FIELDS = (b"tests", b"failures", b"errors", b"skipped")
+CHUNK = 1 << 20
 
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
@@ -200,10 +231,18 @@ suites = []
 for path in paths:
     entry = {"path": path}
     try:
+        digest = hashlib.sha256()
         with open(path, "rb") as handle:
             head = handle.read(HEAD_BYTES)
+            digest.update(head)
+            while True:
+                chunk = handle.read(CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        entry["sha256"] = digest.hexdigest()
     except Exception:
-        suites.append(entry)
+        suites.append({"path": path})
         continue
     match = SUITE.search(head)
     if match is not None:
@@ -394,13 +433,18 @@ def _gradle_suite_head_entries(
     paths: Sequence[str],
     working_directory: str,
 ) -> Optional[List[Dict[str, Any]]]:
-    """One `{module, task, tests, failures, errors, skipped}` per report.
+    """One `{module, task, sha256, tests, failures, errors, skipped}` per report.
 
     The path list is written into the container and passed by ONE argument, so
     a reactor with thousands of reports can never approach ARG_MAX — the same
     transport `receipt_test_rows.read_delta_testcase_rows` uses, and for the
-    same reason. Only the four declared counts come back; report bodies never
-    cross the boundary and never reach model-visible output.
+    same reason. Only the four declared counts and the file's digest come back;
+    report bodies never cross the boundary and never reach model-visible output.
+
+    The digest is of the WHOLE file and is taken in the same read as the head,
+    so a caller can bind every count to the bytes it counted (P-B). It is the
+    reader's statement about what it read, not a claim about whose bytes those
+    are: `gradle_test_harvest` compares it against the delta.
 
     Returns None when the transport itself did not complete. A report whose
     head carried no parsable `<testsuite>` root comes back WITHOUT counts, and
@@ -447,11 +491,88 @@ def _gradle_suite_head_entries(
             continue
         module, task = identity
         entry: Dict[str, Any] = {"module": module, "task": task, "path": suite.get("path")}
+        digest = str(suite.get("sha256") or "").strip().lower()
+        if _GRADLE_SHA256_RE.fullmatch(digest):
+            entry["sha256"] = digest
         for field in ("tests", "failures", "errors", "skipped"):
             if field in suite:
                 entry[field] = suite.get(field)
         entries.append(entry)
     return entries
+
+
+def _gradle_claimed_report_paths(
+    claims: Mapping[str, str],
+    working_directory: str,
+) -> Tuple[str, ...]:
+    """Every report path the DELTA claims, in one deterministic order.
+
+    The claim set is the delta's own path list and nothing else. It was gated
+    through the discovery listing until r2-T2, which meant a claimed report the
+    2,048-entry bound never named could not be summed — and, when the bound cut
+    every one of them, the harvest declared `gradle_no_claimed_test_reports`
+    over reports this dispatch demonstrably wrote. A listing bound may cost a
+    receipt an unclaimed-presence remark; it may never cost it its evidence.
+
+    A claim is a report of this dispatch's when it carries a real digest, sits
+    under this build root's `test-results/<taskdir>/` layout, and is not
+    Gradle's internal `binary/` store — the same three rules discovery applied,
+    now applied where the claim is made.
+    """
+
+    return tuple(
+        sorted(
+            path
+            for path, digest in (claims or {}).items()
+            if _GRADLE_SHA256_RE.fullmatch(str(digest or ""))
+            and _GRADLE_BINARY_MARKER not in path
+            and _gradle_report_identity(path, working_directory) is not None
+        )
+    )
+
+
+def _gradle_claim_bound_entries(
+    entries: Sequence[Mapping[str, Any]],
+    claims: Mapping[str, str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The head entries whose bytes are still the delta's, and the ones that moved.
+
+    P-B, at the one place tier-1 could break it: the digest comes back from the
+    same read as the counts, so a report rewritten between the invocation's
+    `after` snapshot and this read is caught here rather than summed. That is
+    the same-workdir concurrency defense — a second dispatch writing under the
+    same tree while this one harvests — and it is also the plain rewrite case a
+    long-running reactor produces on its own.
+
+    An excluded file contributes to NOTHING: not the totals, not the module
+    witnesses, not the identity sample. It is disclosed instead, by count and
+    by a bounded path sample, so the receipt says which measurement it withheld
+    and why. A file whose read yielded no digest at all is not a rewrite claim
+    — it is an unreadable report, and it is passed through without counts so
+    the fold records it as one.
+    """
+
+    kept: List[Dict[str, Any]] = []
+    rewritten: List[str] = []
+    for entry in entries or ():
+        if not isinstance(entry, Mapping):
+            continue
+        path = str(entry.get("path") or "")
+        claimed = str((claims or {}).get(path) or "").lower()
+        digest = str(entry.get("sha256") or "").lower()
+        if not claimed:
+            # Never asked for; a reader that answered anyway states nothing here.
+            continue
+        if not digest:
+            kept.append(
+                {field: entry[field] for field in ("module", "task", "path") if field in entry}
+            )
+            continue
+        if digest != claimed:
+            rewritten.append(path)
+            continue
+        kept.append(dict(entry))
+    return kept, sorted(rewritten)
 
 
 def _gradle_red_first(entries: Sequence[Mapping[str, Any]]) -> List[str]:
@@ -516,28 +637,26 @@ def gradle_test_harvest(
     is exactly what a detached job holds at settlement — so the settled path
     states what the synchronous one does instead of quietly lacking it.
 
-    Reports this invocation CLAIMS, found and summed, become totals, and a
-    bound that fired becomes a recorded drop. The failures are told apart by
-    what the scan PROVED. A scan that never finished proved nothing and states
-    nothing — unknown is an absent key here as it is for every other v2 fact. A
-    scan that finished is proof, and everything after it is a statement:
-    reports that exist and could not be summed, a tree whose every report
-    belongs to some earlier dispatch, and a test run that left none at all are
-    all recorded omissions. The one thing this never returns is a zero.
+    Reports this invocation CLAIMS, read and summed, become totals, and a bound
+    that fired becomes a recorded drop. WHOSE the reports are is the delta's
+    answer and only the delta's: it names every path this dispatch wrote or the
+    build system vouched for, with the digest each was written at, so the claim
+    set is enumerated straight from it. A tree scan cannot add to that set and
+    since r2-T2 cannot subtract from it either.
+
+    Discovery has one job left, and it is the one only a scan can do: state
+    what is on disk when the delta claims NOTHING. A scan that never finished
+    proved neither presence nor absence and states nothing — unknown is an
+    absent key here as it is for every other v2 fact. A scan that finished is
+    proof: a tree holding reports of which none is this dispatch's, and a test
+    run that left none at all, are different recorded omissions. Everything the
+    delta does claim is measured without asking the tree at all.
+
+    The one thing this never returns is a zero.
     """
 
     if not test_dispatch:
         return GradleTestHarvest()
-    discovery = _gradle_discover_reports(execute, working_directory)
-    if not discovery.complete:
-        # No omission: see `_gradle_omissions`. A scan that never finished
-        # proved neither presence nor absence, and only proof may be stated.
-        logger.debug(f"{GRADLE_DISCOVERY_INCOMPLETE} under {working_directory}")
-        return GradleTestHarvest()
-    if not discovery.total:
-        # ofbiz-plugins: the task ran and wrote no XML. That is missing
-        # evidence, not a clean zero, and the two must never look alike.
-        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_TEST_REPORTS))
     claims = {
         str((entry or {}).get("path") or ""): str((entry or {}).get("sha256") or "").lower()
         for bucket in ("new", "changed", "cached")
@@ -545,31 +664,38 @@ def gradle_test_harvest(
         if isinstance(entry, Mapping)
     }
     # THE binding, and it is the same one the identity rows already answered to.
-    # Discovery is a tree scan: it finds every report the tree holds, including
-    # byte-identical leftovers from an earlier dispatch that `report_delta`
-    # deliberately put in no bucket, and — at settlement — reports a LATER
-    # dispatch wrote. Summing those would state another invocation's tests as
-    # this receipt's, so only the delta's own reports are summed. A repair loop
-    # re-running `:clients:test` over a full reactor's leftovers is the ordinary
-    # case, not the exotic one.
-    claimed = tuple(path for path in discovery.paths if path in claims)
+    # `report_delta` puts a byte-identical leftover from an earlier dispatch in
+    # no bucket, so a claim is a report this invocation wrote or the build
+    # system vouched for — never one it merely found. A repair loop re-running
+    # `:clients:test` over a full reactor's leftovers is the ordinary case, not
+    # the exotic one, and summing what the tree holds would state 9,018 of
+    # another dispatch's tests as this receipt's.
+    claimed = _gradle_claimed_report_paths(claims, working_directory)
     if not claimed:
-        # Reports exist and none is this dispatch's. Proved, so stated.
-        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_CLAIMED_TEST_REPORTS))
-    listed = set(discovery.paths)
-    # What the DISCOVERY bound cost this receipt: claimed reports the capped
-    # listing never named, so they could never be summed. Reports the bound
-    # left out that this invocation does not claim cost it nothing — they were
-    # never its evidence — and counting them would withdraw red-completeness on
-    # every scoped re-run over a large tree.
-    unsummarized = sum(
-        1
-        for path in claims
-        if path not in listed and _gradle_report_identity(path, working_directory) is not None
-    )
-    entries = _gradle_suite_head_entries(execute, claimed, working_directory)
+        return _gradle_unclaimed_presence(execute, working_directory)
+    # The tier-1 read's own bound, and the only one that can now cost this
+    # receipt a claimed report's counts. Sorted, so which claims a fired bound
+    # leaves out is a property of the paths and not of dict order.
+    read = claimed[:GRADLE_CLAIMED_FILE_CAP]
+    unsummarized = len(claimed) - len(read)
+    entries = _gradle_suite_head_entries(execute, read, working_directory)
     if entries is None:
         return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
+    # P-B: a count is summed only when the digest read beside it is the digest
+    # the delta claims. Everything downstream — totals, module witnesses, the
+    # identity sample's file list — runs off the bound entries alone.
+    entries, rewritten = _gradle_claim_bound_entries(entries, claims)
+    # A claimed report the read answered for NEITHER way — no counts, no digest,
+    # no line at all — is not a zero and not a silent subtraction: it is an
+    # unreadable report, and the fold counts it as one. Without this a reader
+    # that returned a short list would quietly shrink the claim set.
+    answered = {str(entry.get("path") or "") for entry in entries} | set(rewritten)
+    entries.extend({"path": path} for path in read if path not in answered)
+    if not entries and rewritten:
+        # Every claimed report moved under the read. There is no total to state
+        # and no section to hang the disclosure on, so the receipt names the
+        # measurement it lost and the reason it lost it.
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_REPORTS_REWRITTEN))
     tests_reported: Dict[str, int] = {}
     for entry in entries:
         total = entry.get("tests")
@@ -590,6 +716,7 @@ def gradle_test_harvest(
         row_cap=TESTCASE_OUTCOME_CAP,
         harvested_files=ordered if rows is not None else (),
         unsummarized_files=unsummarized,
+        rewritten_files=rewritten,
     )
     if summaries is None:
         return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
@@ -621,6 +748,30 @@ def gradle_test_harvest(
         testcase_outcomes=outcomes,
         module_tests_reported=tests_reported,
     )
+
+
+def _gradle_unclaimed_presence(execute, working_directory: str) -> GradleTestHarvest:
+    """What the TREE says when the delta claims nothing — discovery's one job.
+
+    Absence is the only fact a scan can establish that a delta cannot, and it
+    is two facts, not one: a tree that holds no report at all (ofbiz-plugins ran
+    its test task and wrote no XML) and a tree whose every report belongs to an
+    earlier dispatch. Both are omissions; neither is a zero.
+
+    `gradle_no_claimed_test_reports` is reachable from HERE and nowhere else,
+    which is the point: it now states what the delta proves — that this
+    dispatch wrote nothing — and never what a 2,048-entry listing failed to
+    name. A scan that did not finish proves neither presence nor absence and
+    declares nothing at all (see `_gradle_omissions`).
+    """
+
+    discovery = _gradle_discover_reports(execute, working_directory)
+    if not discovery.complete:
+        logger.debug(f"{GRADLE_DISCOVERY_INCOMPLETE} under {working_directory}")
+        return GradleTestHarvest()
+    if not discovery.total:
+        return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_TEST_REPORTS))
+    return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_NO_CLAIMED_TEST_REPORTS))
 
 
 def _gradle_omissions(

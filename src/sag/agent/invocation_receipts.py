@@ -128,6 +128,11 @@ SKIP_REASON_MAX_CHARS = 200
 # modules, geode 27) and is a safety bound, not an expected one; exceeding it
 # truncates red-bearing-first and records the drop.
 GRADLE_SUITE_SUMMARY_CAP = 256
+# A post-snapshot rewrite is stated by COUNT, with a sample of paths so the
+# reader can go look. The count is exact; the sample is bounded, because a
+# concurrent dispatch rewriting a whole reactor would otherwise put 1,176 paths
+# into a receipt that already carries them once in its report delta.
+GRADLE_REWRITE_SAMPLE_CAP = 8
 # The per-testcase identity rows were the receipt's one unbounded list. kafka's
 # one measured run left 27,219 executed tests; a sealed row canonicalizes to
 # roughly a kilobyte, so an uncapped envelope blew the 16 MB canonical budget
@@ -197,12 +202,20 @@ GRADLE_NO_CLAIMED_TEST_REPORTS = "gradle_no_claimed_test_reports"
 # from a different read), but there IS no row sample, and a disclosure that
 # described one would be describing a sample the receipt does not carry.
 GRADLE_ROW_SAMPLE_UNREADABLE = "gradle_row_sample_unreadable"
+# Every claimed report's bytes moved between the invocation's own hash bracket
+# and the read that would have summed them — a concurrent dispatch under the
+# same workdir, or a build still writing. The counts on disk are real and they
+# are not this receipt's, so nothing is summed and the loss is named. When SOME
+# survive, the surviving totals stand and the exclusion is disclosed on the
+# summary section instead (`post_snapshot_rewrite`).
+GRADLE_REPORTS_REWRITTEN = "gradle_claimed_reports_rewritten"
 DECLARED_OMISSION_REASONS = frozenset(
     {
         GRADLE_NO_TEST_REPORTS,
         GRADLE_NO_CLAIMED_TEST_REPORTS,
         GRADLE_SUITE_TOTALS_UNREADABLE,
         GRADLE_ROW_SAMPLE_UNREADABLE,
+        GRADLE_REPORTS_REWRITTEN,
     }
 )
 # Not an omission reason: a scan that never ran proved nothing, and an
@@ -1818,7 +1831,14 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
     if str(receipt.get("tool") or "").strip().lower() != "gradle":
         raise ValueError("receipt gradle_suite_summaries requires the gradle runner")
     if not isinstance(value, Mapping) or not set(value).issubset(
-        {"suites", "truncated", "dropped_suites", "unreadable_suites", "unsummarized_files"}
+        {
+            "suites",
+            "truncated",
+            "dropped_suites",
+            "unreadable_suites",
+            "unsummarized_files",
+            "post_snapshot_rewrite",
+        }
     ):
         raise ValueError("receipt gradle_suite_summaries shape is invalid")
     suites = value.get("suites")
@@ -1852,17 +1872,41 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
         _receipt_count(
             value.get("unreadable_suites"), "gradle_suite_summaries.unreadable_suites", minimum=1
         )
-    # Reports discovery found and the FILE bound never summed — a different
-    # fact from `unreadable_suites` (a report whose head yielded no parsable
-    # `<testsuite>` root) and from `dropped_suites` (a (project, task) pair the
-    # pair bound dropped). Without it a totals section over 2,048 of 5,000
-    # reports would read as the whole project.
+    # Reports this receipt CLAIMS that the read's own file bound never covered
+    # — a different fact from `unreadable_suites` (a report whose head yielded
+    # no parsable `<testsuite>` root) and from `dropped_suites` (a (project,
+    # task) pair the pair bound dropped). Without it a totals section over
+    # 4,096 of 9,000 claimed reports would read as the whole project.
     if "unsummarized_files" in value:
         _receipt_count(
             value.get("unsummarized_files"),
             "gradle_suite_summaries.unsummarized_files",
             minimum=1,
         )
+    # P-B's disclosure: claimed reports whose bytes had already moved when the
+    # summing read hashed them, excluded from every total here. The count is
+    # exact and the path sample is bounded, so a rewrite is never a silent
+    # subtraction from a receipt's evidence.
+    if "post_snapshot_rewrite" in value:
+        rewrite = value.get("post_snapshot_rewrite")
+        if not isinstance(rewrite, Mapping) or set(rewrite) != {"files", "paths"}:
+            raise ValueError("receipt gradle_suite_summaries.post_snapshot_rewrite is invalid")
+        files = _receipt_count(
+            rewrite.get("files"),
+            "gradle_suite_summaries.post_snapshot_rewrite.files",
+            minimum=1,
+        )
+        paths = _receipt_text_list(
+            rewrite.get("paths"),
+            "gradle_suite_summaries.post_snapshot_rewrite.paths",
+            cap=GRADLE_REWRITE_SAMPLE_CAP,
+        )
+        # A sample is a subset of what it samples, and an empty one states
+        # nothing a count has not already said.
+        if not paths or len(paths) > files:
+            raise ValueError(
+                "receipt gradle_suite_summaries.post_snapshot_rewrite.paths is invalid"
+            )
 
 
 def _validate_row_disclosure(value: Any, *, field: str, source_id: str) -> None:
@@ -1997,6 +2041,7 @@ def assemble_gradle_test_rows(
     row_cap: int = GRADLE_TESTCASE_ROW_CAP,
     harvested_files: Optional[Sequence[str]] = None,
     unsummarized_files: int = 0,
+    rewritten_files: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Fold one Gradle harvest into `(summary_section, rows, disclosures)`.
 
@@ -2008,10 +2053,17 @@ def assemble_gradle_test_rows(
     same objects in the same shape, only ordered and bounded, so identity
     sealing and `validate_testcase_execution_row` stay the single row contract.
 
-    `unsummarized_files` is what a discovery bound left out entirely — reports
-    that exist and were never summed. It is carried on the summary section and
+    `unsummarized_files` is what a read bound left out entirely — reports this
+    receipt claims and never summed. It is carried on the summary section and
     it withdraws the red-completeness claim, because a red can be hiding in a
     report nobody read.
+
+    `rewritten_files` are claimed reports whose bytes had already moved when
+    the summing read hashed them (P-B). They are excluded from every total
+    above, so the section states the exclusion by count and by a bounded path
+    sample, and the same completeness claim is withdrawn for the same reason: a
+    red can hide in a report this harvest refused as easily as in one it never
+    reached.
 
     `harvested_files` is every report the identity pass was ASKED to cover.
     Without it `dropped_files` can only count reports whose rows the cap threw
@@ -2049,6 +2101,9 @@ def assemble_gradle_test_rows(
         and not isinstance(unsummarized_files, bool)
         and unsummarized_files > 0
         else 0
+    )
+    rewritten = sorted(
+        {text for text in (_gradle_evidence_text(path) for path in rewritten_files or ()) if text}
     )
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
     # `path -> tests the file's own <testsuite> root declares`, kept per FILE
@@ -2103,6 +2158,11 @@ def assemble_gradle_test_rows(
             summary_section["unreadable_suites"] = unreadable
         if unsummarized:
             summary_section["unsummarized_files"] = unsummarized
+        if rewritten:
+            summary_section["post_snapshot_rewrite"] = {
+                "files": len(rewritten),
+                "paths": rewritten[:GRADLE_REWRITE_SAMPLE_CAP],
+            }
 
     red: List[Mapping[str, Any]] = []
     green: List[Mapping[str, Any]] = []
@@ -2169,6 +2229,7 @@ def assemble_gradle_test_rows(
             "red_rows_complete": bool(groups)
             and not unreadable
             and not unsummarized
+            and not rewritten
             and not dropped_red
             and min(len(red), row_cap) >= declared_red,
         }

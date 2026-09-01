@@ -174,7 +174,14 @@ def test_a_detached_death_harvests_its_reports_and_keeps_its_crash(tmp_path):
     assert receipt["exit_code"] == 1
     assert receipt["outcome"] == "failed"
     assert receipt["report_delta"]["new"] == [{"path": GRADLE_REPORT, "sha256": HASH_A}]
-    assert "evidence_omissions" not in receipt
+    # The delta names the report, so the harvest goes straight at it — no tree
+    # scan stands between a claim and its counts. This double answers no
+    # evidence read, so both harvested sections are declared missing by name,
+    # which is the honest statement about a measurement that did not land.
+    assert [entry["reasons"] for entry in receipt["evidence_omissions"]] == [
+        ["gradle_suite_totals_unreadable"],
+        ["gradle_suite_totals_unreadable"],
+    ]
     assert result.metadata["receipt_id"] == receipt["receipt_id"]
 
     # ...and the physical counting path admits them exactly as for a clean run:
@@ -311,8 +318,9 @@ def test_a_partial_harvest_names_the_field_it_had_to_omit(tmp_path):
     assert receipt["exit_code"] == 1
     assert receipt["report_delta"]["new"] == [{"path": GRADLE_REPORT, "sha256": HASH_A}]
     assert "module_outcomes" not in receipt
-    (omission,) = receipt["evidence_omissions"]
-    assert omission["field"] == "module_outcomes"
+    (omission,) = [
+        entry for entry in receipt["evidence_omissions"] if entry["field"] == "module_outcomes"
+    ]
     assert omission["status"] == "unavailable"
     assert omission["reasons"]
 

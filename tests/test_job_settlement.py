@@ -156,6 +156,11 @@ class JobContainer(ContainerFS):
                             "suites": [
                                 {
                                     "path": path,
+                                    # The digest the tier-1 read takes in the
+                                    # same pass as the head: these bytes are
+                                    # the ones the bracket hashed, so every
+                                    # count below is bound to a claim.
+                                    "sha256": self.reports.get(path, ""),
                                     "tests": 3,
                                     "failures": 0,
                                     "errors": 0,

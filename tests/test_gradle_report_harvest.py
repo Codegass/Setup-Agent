@@ -36,6 +36,7 @@ from sag.agent.invocation_receipts import (
     GRADLE_DISCOVERY_INCOMPLETE,
     GRADLE_NO_CLAIMED_TEST_REPORTS,
     GRADLE_NO_TEST_REPORTS,
+    GRADLE_REPORTS_REWRITTEN,
     GRADLE_ROW_SAMPLE_UNREADABLE,
     GRADLE_SUITE_TOTALS_UNREADABLE,
     TESTCASE_FILE_CAP,
@@ -46,6 +47,7 @@ from sag.agent.invocation_receipts import (
 )
 from sag.tools.internal.gradle_tool import (
     _GRADLE_SUITE_HEAD_READER,
+    GRADLE_CLAIMED_FILE_CAP,
     GRADLE_SUITE_HEAD_BYTES,
     GRADLE_XML_FILE_CAP,
     GradleTool,
@@ -134,6 +136,15 @@ def _discovery_output(paths, total=None, status="0"):
 
 def _head_output(entries):
     return json.dumps({"status": "complete", "suites": entries})
+
+
+def _head(name, path, **counts):
+    """One tier-1 entry for a fixture: the counts AND the digest, one read.
+
+    The digest is the fixture's own, so it matches what `_delta` claims — a
+    report whose bytes did not move between the hash bracket and the sum.
+    """
+    return {"path": path, "sha256": _digest(name), **counts}
 
 
 def _delta(*names_and_paths):
@@ -330,11 +341,32 @@ def test_a_head_with_no_parsable_suite_root_is_disclosed_never_guessed(tmp_path)
     payload = _run_head_reader([blank, tmp_path / "does-not-exist.xml"], tmp_path)
 
     # `<testsuites>` is a wrapper and declares nothing; a missing file declares
-    # nothing. Neither entry carries a count, so neither can be summed.
+    # nothing. Neither entry carries a count, so neither can be summed. The file
+    # that WAS read still states the digest of what was read; the one that was
+    # not states nothing at all, and no count can ever be bound to it.
     assert payload["suites"] == [
-        {"path": str(blank)},
+        {"path": str(blank), "sha256": sha256(blank.read_bytes()).hexdigest()},
         {"path": str(tmp_path / "does-not-exist.xml")},
     ]
+
+
+def test_the_digest_a_head_read_states_is_of_the_whole_file_not_its_head(tmp_path):
+    """P-B: the count and the bytes it counts come out of ONE read.
+
+    kafka's 137.8 MB report is summed from its first 4 KB, so a digest of that
+    head would bind the count to almost none of the file it claims — and a
+    rewrite that changed the last testcase in a 137 MB stream would sail
+    through. The digest is `sha256(whole file)`, taken on the same descriptor
+    that yielded the head, and it is the delta's own comparison value.
+    """
+    report = tmp_path / "TEST-giant.xml"
+    report.write_bytes(_fixture("giant-head-4k.xml.head") + b"<!-- " + b"x" * 200_000 + b" -->")
+
+    (entry,) = _run_head_reader([report], tmp_path)["suites"]
+
+    assert entry["tests"] == 12
+    assert entry["sha256"] == sha256(report.read_bytes()).hexdigest()
+    assert entry["sha256"] != sha256(_fixture("giant-head-4k.xml.head")).hexdigest()
 
 
 # --- tier 2: red-first identities under the existing tag bounds -------------
@@ -463,9 +495,11 @@ def test_the_harvest_sums_every_claimed_report_and_samples_identities_red_first(
         discovery=_discovery_output([green, red, distributed]),
         heads=_head_output(
             [
-                {"path": green, "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
-                {"path": red, "tests": 19, "failures": 1, "errors": 0, "skipped": 0},
-                {"path": distributed, "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+                _head("kafka-green-suite.xml", green, tests=1, failures=0, errors=0, skipped=0),
+                _head("kafka-red-suite.xml", red, tests=19, failures=1, errors=0, skipped=0),
+                _head(
+                    "kafka-green-suite.xml", distributed, tests=1, failures=0, errors=0, skipped=0
+                ),
             ]
         ),
         tags="".join(
@@ -544,7 +578,13 @@ def test_a_scoped_rerun_counts_only_what_it_wrote_over_the_reactors_leftovers():
     container = FakeContainer(
         discovery=_discovery_output([mine, stale_green, stale_red]),
         heads={
-            mine: {"tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+            mine: {
+                "sha256": _digest("kafka-green-suite.xml"),
+                "tests": 1,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0,
+            },
             # 9,019 tests across three modules is what a receipt claiming the
             # tree states; 9,018 of them are dispatch 1's, and two of dispatch
             # 1's failures are the reds that withdraw this run's completeness.
@@ -625,7 +665,9 @@ def test_a_tag_read_that_never_landed_keeps_the_totals_and_discloses_no_sample()
     path = f"{ROOT}/clients/build/test-results/test/TEST-red.xml"
     container = FakeContainer(
         discovery=_discovery_output([path]),
-        heads=_head_output([{"path": path, "tests": 19, "failures": 1, "errors": 0, "skipped": 0}]),
+        heads=_head_output(
+            [_head("kafka-red-suite.xml", path, tests=19, failures=1, errors=0, skipped=0)]
+        ),
         tags=None,
     )
 
@@ -649,7 +691,10 @@ def test_the_file_bound_states_the_reports_the_sample_never_spoke_for():
     container = FakeContainer(
         discovery=_discovery_output(paths),
         heads=_head_output(
-            [{"path": path, "tests": 1, "failures": 0, "errors": 0, "skipped": 0} for path in paths]
+            [
+                _head("kafka-green-suite.xml", path, tests=1, failures=0, errors=0, skipped=0)
+                for path in paths
+            ]
         ),
         tags="".join(
             f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {path}\n"
@@ -673,32 +718,290 @@ def test_the_file_bound_states_the_reports_the_sample_never_spoke_for():
     assert "dropped_red" not in truncation
 
 
-def test_a_discovery_bound_that_fired_withdraws_the_red_completeness_claim():
-    """A red can be hiding in a report THIS RUN WROTE that nobody read.
+def test_a_claim_the_discovery_bound_never_named_is_summed_all_the_same():
+    """The false-absence blind spot, closed: the listing gates nothing.
 
-    The bound is counted in the unit that matters: reports this invocation
-    claims and the capped listing never named. Leftovers the bound also left
-    out cost this receipt nothing — they were never its evidence — so a scoped
-    re-run over a huge tree does not forfeit its red claim for them.
+    A 2,048-entry listing over a reactor that holds more used to DECIDE the
+    claim set — a claimed report the bound never named could not be summed, and
+    a run whose claims all fell past the bound declared
+    `gradle_no_claimed_test_reports` over reports it demonstrably wrote. The
+    delta names every path it claims and the digest each was written at; that
+    list is the claim set, and no scan may shorten it.
     """
-    path = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    listed = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
     unlisted = [f"{ROOT}/clients/build/test-results/test/TEST-unlisted-{n}.xml" for n in range(2)]
+    paths = [listed, *unlisted]
     container = FakeContainer(
-        discovery=_discovery_output([path], total=GRADLE_XML_FILE_CAP + 3),
-        heads=_head_output([{"path": path, "tests": 1, "failures": 0, "errors": 0, "skipped": 0}]),
-        tags=(
+        # The listing named ONE of 2,051 reports on disk. It is now irrelevant
+        # to the claim set, and this harvest never even asks for it.
+        discovery=_discovery_output([listed], total=GRADLE_XML_FILE_CAP + 3),
+        heads=_head_output(
+            [
+                _head("kafka-green-suite.xml", path, tests=1, failures=0, errors=0, skipped=0)
+                for path in paths
+            ]
+        ),
+        tags="".join(
             f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {path}\n"
+            f"{_fixture('kafka-green-suite.xml').decode()}"
+            for path in paths
+        ),
+    )
+
+    harvest = _kafka_harvest(
+        container,
+        delta=_delta(*(("kafka-green-suite.xml", path) for path in paths)),
+    )
+
+    # All three claims summed, including the two the listing never named.
+    assert harvest.suite_summaries["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 3,
+            "tests": 3,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+    # The bound cost this receipt nothing, so nothing is disclosed as lost and
+    # the red claim stands.
+    assert "unsummarized_files" not in harvest.suite_summaries
+    assert harvest.row_disclosure["red_rows_complete"] is True
+    assert sorted(container.head_input) == sorted(paths)
+    # And the tree was never scanned at all: the delta had already proved whose
+    # these reports are, so discovery had nothing left to answer.
+    assert not any(COUNT_MARKER in command for command in container.commands)
+
+
+def test_a_claim_set_the_listing_named_none_of_is_evidence_not_absence():
+    """The cap-only claim (plan T7): every claimed report past the bound.
+
+    This is the exact shape that produced `gradle_no_claimed_test_reports` from
+    a listing bound rather than from the delta — a receipt stating it wrote no
+    test report while holding 19 tests and a failure it had just written.
+    """
+    path = f"{ROOT}/clients/build/test-results/test/TEST-red.xml"
+    container = FakeContainer(
+        # A full listing of OTHER reports; this claim is past its bound.
+        discovery=_discovery_output(
+            [f"{ROOT}/m{n}/build/test-results/test/TEST-{n}.xml" for n in range(3)],
+            total=GRADLE_XML_FILE_CAP + 500,
+        ),
+        heads=_head_output(
+            [_head("kafka-red-suite.xml", path, tests=19, failures=1, errors=0, skipped=0)]
+        ),
+        tags=(
+            f"{REPORT_MARKER}{_digest('kafka-red-suite.xml')}  {path}\n"
+            f"{_fixture('kafka-red-suite.xml').decode()}"
+        ),
+    )
+
+    harvest = _kafka_harvest(container, delta=_delta(("kafka-red-suite.xml", path)))
+
+    assert harvest.suite_summaries["suites"][0]["tests"] == 19
+    assert harvest.module_tests_reported == {"clients": 19}
+    assert harvest.omissions == ()
+    assert harvest.testcase_outcomes["nodes"][0]["status"] == "failed"
+
+
+def test_the_claim_read_s_own_bound_is_the_one_that_can_still_cost_a_total():
+    """Bounded, and it says so: the read has a cap, and a cap states its drop.
+
+    Delta-direct claims move the bound from the listing to the read itself, and
+    a bound that fires still withdraws red-completeness — a red can hide in a
+    report this receipt claims and nobody summed.
+    """
+    paths = [
+        f"{ROOT}/m{index}/build/test-results/test/TEST-{index}.xml"
+        for index in range(GRADLE_CLAIMED_FILE_CAP + 3)
+    ]
+    container = FakeContainer(
+        heads=_head_output(
+            [
+                _head("kafka-green-suite.xml", path, tests=1, failures=0, errors=0, skipped=0)
+                for path in paths
+            ]
+        ),
+        tags="".join(
+            f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {path}\n"
+            f"{_fixture('kafka-green-suite.xml').decode()}"
+            for path in sorted(paths)[:TESTCASE_FILE_CAP]
+        ),
+    )
+
+    harvest = _kafka_harvest(
+        container,
+        delta=_delta(*(("kafka-green-suite.xml", path) for path in paths)),
+    )
+
+    assert len(container.head_input) == GRADLE_CLAIMED_FILE_CAP
+    assert harvest.suite_summaries["unsummarized_files"] == 3
+    assert harvest.row_disclosure["red_rows_complete"] is False
+
+
+# --- P-B: a count is bound to the bytes it counts ---------------------------
+
+
+def test_a_report_rewritten_after_the_snapshot_is_excluded_and_disclosed():
+    """The same-workdir concurrency hole, and the plain rewrite beside it.
+
+    The hash bracket closes, and only then does tier-1 read the heads. In
+    between, a second dispatch under the same workdir re-runs `:streams:test`
+    and rewrites its report. The bytes on disk are real and their counts are
+    real — they are simply not the bytes this receipt is accountable for, and
+    the head read alone could not tell: it sums four attributes out of 4 KB.
+
+    So the digest comes back from the SAME read, and a file whose digest is not
+    the delta's claim is excluded from every total, from the module witnesses
+    and from the identity sample — and the exclusion is stated, by count and by
+    path, because a silent subtraction is the failure mode this whole section
+    exists to prevent.
+    """
+    mine = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    rewritten = f"{ROOT}/streams/build/test-results/test/TEST-red.xml"
+    container = FakeContainer(
+        discovery=_discovery_output([mine, rewritten]),
+        heads=_head_output(
+            [
+                _head("kafka-green-suite.xml", mine, tests=1, failures=0, errors=0, skipped=0),
+                {
+                    # A digest no delta of this run ever claimed: whatever the
+                    # other dispatch left, it is not what was bracketed.
+                    "path": rewritten,
+                    "sha256": "ee" * 32,
+                    "tests": 9000,
+                    "failures": 2,
+                    "errors": 0,
+                    "skipped": 0,
+                },
+            ]
+        ),
+        tags=(
+            f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {mine}\n"
             f"{_fixture('kafka-green-suite.xml').decode()}"
         ),
     )
 
     harvest = _kafka_harvest(
         container,
-        delta=_delta(*(("kafka-green-suite.xml", claimed) for claimed in (path, *unlisted))),
+        delta=_delta(
+            ("kafka-green-suite.xml", mine),
+            ("kafka-red-suite.xml", rewritten),
+        ),
     )
 
-    assert harvest.suite_summaries["unsummarized_files"] == len(unlisted)
+    # Not one of the 9,000 tests or 2 failures reached a total.
+    assert harvest.suite_summaries["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 1,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+        }
+    ]
+    assert harvest.module_tests_reported == {"clients": 1}
+    # Stated, not swallowed: the count is exact and the sample names the file.
+    assert harvest.suite_summaries["post_snapshot_rewrite"] == {
+        "files": 1,
+        "paths": [rewritten],
+    }
+    # A red could have been hiding in the bytes this harvest refused.
     assert harvest.row_disclosure["red_rows_complete"] is False
+    # And the excluded report never reached the identity read either.
+    assert rewritten not in container.commands[-1]
+
+
+def test_a_run_whose_every_claim_was_rewritten_states_the_loss_never_a_zero():
+    """No total is constructible, so the receipt names the measurement it lost."""
+    path = f"{ROOT}/clients/build/test-results/test/TEST-red.xml"
+    container = FakeContainer(
+        discovery=_discovery_output([path]),
+        heads=_head_output(
+            [
+                {
+                    "path": path,
+                    "sha256": "ee" * 32,
+                    "tests": 19,
+                    "failures": 1,
+                    "errors": 0,
+                    "skipped": 0,
+                }
+            ]
+        ),
+    )
+
+    harvest = _kafka_harvest(container, delta=_delta(("kafka-red-suite.xml", path)))
+
+    assert harvest.suite_summaries is None and harvest.testcase_outcomes is None
+    assert harvest.module_tests_reported == {}
+    assert [entry["field"] for entry in harvest.omissions] == [
+        "gradle_suite_summaries",
+        "gradle_row_disclosure",
+    ]
+    assert all(entry["reasons"] == [GRADLE_REPORTS_REWRITTEN] for entry in harvest.omissions)
+    assert GRADLE_REPORTS_REWRITTEN in DECLARED_OMISSION_REASONS
+
+
+def test_a_claimed_report_the_read_never_answered_for_is_unreadable_not_absent():
+    """A short answer must never shrink the claim set in silence."""
+    answered = f"{ROOT}/clients/build/test-results/test/TEST-green.xml"
+    silent = f"{ROOT}/streams/build/test-results/test/TEST-green.xml"
+    container = FakeContainer(
+        heads=_head_output(
+            [_head("kafka-green-suite.xml", answered, tests=1, failures=0, errors=0, skipped=0)]
+        ),
+        tags=(
+            f"{REPORT_MARKER}{_digest('kafka-green-suite.xml')}  {answered}\n"
+            f"{_fixture('kafka-green-suite.xml').decode()}"
+        ),
+    )
+
+    harvest = _kafka_harvest(
+        container,
+        delta=_delta(
+            ("kafka-green-suite.xml", answered),
+            ("kafka-green-suite.xml", silent),
+        ),
+    )
+
+    assert harvest.suite_summaries["unreadable_suites"] == 1
+    assert harvest.suite_summaries["suites"][0]["xml_files"] == 1
+    assert harvest.row_disclosure["red_rows_complete"] is False
+
+
+def test_the_receipt_carries_a_rewrite_disclosure_and_refuses_a_hollow_one():
+    """The section states an exact count beside a bounded, non-empty sample."""
+    summaries = {
+        "suites": [
+            {
+                "module": ":clients",
+                "task": "test",
+                "xml_files": 1,
+                "tests": 1,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0,
+            }
+        ],
+        "post_snapshot_rewrite": {"files": 3, "paths": [f"{ROOT}/a.xml", f"{ROOT}/b.xml"]},
+    }
+
+    receipt = _built(gradle_suite_summaries=summaries)
+
+    assert validate_receipt_v2(receipt)["gradle_suite_summaries"] == summaries
+    # A sample larger than what it samples, or none at all, states nothing true.
+    for hollow in (
+        {"files": 1, "paths": [f"{ROOT}/a.xml", f"{ROOT}/b.xml"]},
+        {"files": 2, "paths": []},
+    ):
+        assert "gradle_suite_summaries" not in _built(
+            gradle_suite_summaries={**summaries, "post_snapshot_rewrite": hollow}
+        )
 
 
 # --- module_outcomes gains an executed witness ------------------------------
@@ -906,6 +1209,7 @@ class HarvestingReceiptOrchestrator(ReceiptOrchestrator):
                         "suites": [
                             {
                                 "path": self.report,
+                                "sha256": _digest("kafka-red-suite.xml"),
                                 "tests": 19,
                                 "failures": 1,
                                 "errors": 0,
