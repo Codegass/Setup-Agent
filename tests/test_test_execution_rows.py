@@ -36,6 +36,20 @@ from sag.agent.receipt_test_rows import (
 RUN_ID = "run-pytest"
 
 
+def _surefire_claims(count, root="/workspace/proj"):
+    """`{path: sha}` for `count` more claimed reports under one reactor.
+
+    A disclosure's `dropped_files` counts reports THIS receipt claims, so a
+    stated loss at reactor scale needs a claim set at reactor scale beside it
+    (plan r2 T3).
+    """
+
+    return {
+        f"{root}/m{index // 100}/target/surefire-reports/TEST-c{index:04d}.xml": f"{index:064x}"
+        for index in range(count)
+    }
+
+
 def _parsed(path, *, classname="com.acme.SharedTest", name="roundTrip[size=1]"):
     return {
         "schema_version": 2,
@@ -819,14 +833,18 @@ def test_a_maven_receipt_discloses_its_own_row_bounds_and_keeps_its_totals(monke
         working_directory="/workspace/proj",
         exit_code=0,
         before={},
-        after={path: HASH_A},
+        # A reactor's worth of claimed reports, because the disclosure below
+        # states 1,100 of them dropped: a sample can only drop files this
+        # receipt claims, and the arithmetic is checked at build time now.
+        after={path: HASH_A, **_surefire_claims(1_099)},
         requirements={"build_domains": [{"root": "/workspace/proj", "system": "maven"}]},
     )
 
     (receipt,) = receipts_written(execute.commands)
     assert receipt["exit_code"] == 0
     assert receipt["argv"] == "mvn test"
-    assert receipt["report_delta"]["new"] == [{"path": path, "sha256": HASH_A}]
+    assert len(receipt["report_delta"]["new"]) == 1_100
+    assert {"path": path, "sha256": HASH_A} in receipt["report_delta"]["new"]
     assert len(receipt["testcase_execution_rows"]["rows"]) == 3
     assert receipt["testcase_row_disclosure"] == {
         "rows_source": "delta_xml",
@@ -1548,7 +1566,9 @@ def test_a_stated_row_disclosure_binds_the_diagnostic_list_to_its_own_harvest(mo
         working_directory=GRADLE_ROOT,
         exit_code=0,
         before={},
-        after={path: HASH_A},
+        # Three claimed reports, because the harvest's disclosure below states
+        # three of them dropped and a sample may only drop what it claims.
+        after={path: HASH_A, **_surefire_claims(2, root=GRADLE_ROOT)},
         requirements={"build_domains": [{"root": GRADLE_ROOT, "system": "gradle"}]},
         gradle_row_disclosure={
             "rows_source": "gradle_xml",
@@ -1601,3 +1621,200 @@ def test_without_a_harvest_disclosure_the_receipt_still_falls_back_to_the_exact_
     assert receipt["testcase_outcomes"]["nodes"] == [
         {"node_id": "com.acme.SharedTest#roundTrip[size=1]", "status": "passed"}
     ]
+
+
+# --- the cap arithmetic itself (plan r2 T3.4) -------------------------------
+
+
+class _StatedBoundsContainer(FakeContainer):
+    """A parser that hands back rows plus an accounting of its own choosing."""
+
+    def __init__(self, bounds):
+        super().__init__()
+        self.bounds = bounds
+
+    def execute_command(self, command, **kwargs):
+        if "def declared_count" in command:
+            self.commands.append(command)
+            reports = json.loads(self.files[shlex.split(command)[-1]])
+            rows = [
+                {
+                    "report_path": report["path"],
+                    "report_sha256": report["sha256"],
+                    "classname": "com.acme.ExactTest",
+                    "name": f"case[{index}]",
+                    "source_file": None,
+                    "outcome": "passed",
+                    "execution_ordinal": 1,
+                }
+                for index, report in enumerate(reports)
+            ]
+            return {
+                "exit_code": 0,
+                "output": json.dumps(
+                    {
+                        "status": "complete",
+                        "report_count": len(rows),
+                        "rows": rows,
+                        "reasons": [],
+                        "bounds": {**self.bounds, "kept_rows": len(rows)},
+                    }
+                ),
+            }
+        return super().execute_command(command, **kwargs)
+
+
+def _read_with_bounds(bounds, *, reports=3):
+    container = _StatedBoundsContainer(bounds)
+    entries = [
+        {
+            "path": f"/workspace/proj/m{index}/target/surefire-reports/TEST-{index}.xml",
+            "sha256": f"{index + 1:064x}",
+        }
+        for index in range(reports)
+    ]
+    return read_delta_testcase_rows(
+        container.execute_command,
+        receipt_id="inv-maven-test-0050",
+        delta={"new": entries, "changed": []},
+    )
+
+
+def test_a_read_whose_own_accounting_does_not_add_up_yields_no_sample():
+    """kept + dropped == observed, or there is no sample to disclose.
+
+    The accounting a disclosure is built from is half the container's — it saw
+    rows this side never received — and half this side's. A parser stating
+    27,219 observed, 3 kept and 12 dropped has not described a bound that fired;
+    it has described a read that cannot have happened, and a disclosure built
+    from it would state a loss against a number nobody measured.
+    """
+    honest = _read_with_bounds(
+        {"observed_rows": 27_219, "dropped_green": 27_216, "total_cap_drops": 27_216}
+    )
+    assert honest["status"] == "complete"
+    assert honest["row_bounds"]["kept_rows"] + honest["row_bounds"]["dropped_green"] == 27_219
+
+    impossible = _read_with_bounds(
+        {"observed_rows": 27_219, "dropped_green": 12, "total_cap_drops": 12}
+    )
+    assert impossible["status"] == "unavailable"
+    assert impossible["rows"] == []
+    assert impossible["reasons"] == ["row_bounds_inconsistent"]
+    assert "row_bounds" not in impossible
+    # And with no bounds there is nothing to disclose: the receipt states no
+    # sample rather than a sample nobody can reconcile.
+    assert invocation_receipts.disclose_row_bounds(impossible) is None
+
+
+def test_a_drop_that_answers_to_no_cap_is_refused_the_same_way():
+    """Every dropped row names the bound that took it.
+
+    `dropped_red`/`dropped_green` say WHAT was lost and the three cap counters
+    say WHY. A parser whose two halves disagree is stating a loss with no cause,
+    which is the silent cap wearing a disclosure's clothes.
+    """
+    uncaused = _read_with_bounds(
+        {"observed_rows": 27_219, "dropped_green": 27_216, "total_cap_drops": 0}
+    )
+
+    assert uncaused["status"] == "unavailable"
+    assert uncaused["reasons"] == ["row_bounds_inconsistent"]
+
+
+def test_a_report_declaring_more_outcomes_than_tests_is_unreadable_not_a_total():
+    """Conservation at the file that stated the numbers (plan r2 T3.1).
+
+    One report root claiming two failures over one test has measured nothing
+    the receipt can sum. Folding it in would carry `tests=1, failures=2` into
+    the totals, where the summary validator would refuse the WHOLE section and
+    every other report's counts would go with it. So the file is unreadable —
+    counted, disclosed, and left out of the totals it cannot join.
+    """
+    section, _rows, _disclosures = assemble_gradle_test_rows(
+        [
+            _suite(":clients", "test", tests=20, failures=1, skipped=2),
+            {**_suite(":clients", "test", tests=1), "failures": 2},
+        ],
+        [],
+    )
+
+    assert section["suites"] == [
+        {
+            "module": ":clients",
+            "task": "test",
+            "xml_files": 1,
+            "tests": 20,
+            "failures": 1,
+            "errors": 0,
+            "skipped": 2,
+        }
+    ]
+    assert section["unreadable_suites"] == 1
+    # And what survived is a section the receipt can actually carry.
+    assert (
+        invocation_receipts.validate_receipt_v2(
+            {
+                "schema_version": invocation_receipts.RECEIPT_SCHEMA_VERSION,
+                "receipt_id": "inv-gradle-test-0051",
+                "run_id": RUN_ID,
+                "tool": "gradle",
+                "requested_action": "test",
+                "effective_action": "test",
+                "argv": "./gradlew test",
+                "working_directory": GRADLE_ROOT,
+                "actual_cwd": GRADLE_ROOT,
+                "exit_code": 0,
+                "outcome": "completed",
+                "report_delta": {"new": [], "changed": []},
+                "gradle_suite_summaries": section,
+            }
+        )["gradle_suite_summaries"]["unreadable_suites"]
+        == 1
+    )
+
+
+def test_a_sealed_row_from_a_report_the_receipt_never_claimed_is_unconstructible():
+    """Identity rows are a subset of the claimed report set.
+
+    A row is this invocation's evidence because the bytes it was parsed from
+    are bytes this receipt's own delta claims. Re-point the delta and the row
+    is somebody else's — so the receipt carrying it cannot be written.
+    """
+    path = f"{GRADLE_ROOT}/clients/build/test-results/test/TEST-a.xml"
+    envelope = seal_testcase_execution_rows(
+        _parsed(path),
+        run_id=RUN_ID,
+        receipt_id="inv-gradle-test-0052",
+        tool="gradle",
+        target_sha="a" * 40,
+        domain_id=GRADLE_ROOT,
+        working_directory=GRADLE_ROOT,
+        module_outcomes=[{"module": ":clients", "status": "attempted"}],
+        gradle_project_map={GRADLE_ROOT: ":root", f"{GRADLE_ROOT}/clients": ":clients"},
+    )
+    assert envelope["rows"]
+    receipt = {
+        "schema_version": invocation_receipts.RECEIPT_SCHEMA_VERSION,
+        "receipt_id": "inv-gradle-test-0052",
+        "run_id": RUN_ID,
+        "tool": "gradle",
+        "requested_action": "test",
+        "effective_action": "test",
+        "argv": "./gradlew test",
+        "working_directory": GRADLE_ROOT,
+        "actual_cwd": GRADLE_ROOT,
+        "target_sha": "a" * 40,
+        "domain_id": GRADLE_ROOT,
+        "exit_code": 0,
+        "outcome": "completed",
+        "report_delta": {"new": [{"path": path, "sha256": HASH_A}], "changed": []},
+        "testcase_execution_rows": envelope,
+    }
+
+    assert invocation_receipts.validate_receipt_v2(receipt)["testcase_execution_rows"] == envelope
+
+    stranger = json.loads(json.dumps(receipt))
+    stranger["report_delta"]["new"][0]["path"] = f"{GRADLE_ROOT}/clients/build/other/TEST-a.xml"
+    with pytest.raises(ValueError, match="not bound to its report delta"):
+        invocation_receipts.validate_receipt_v2(stranger)

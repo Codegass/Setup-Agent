@@ -1024,13 +1024,63 @@ def test_module_outcomes_gains_a_count_only_for_modules_the_build_named():
     ]
 
 
-@pytest.mark.parametrize("count", [0, 27219])
+# A zero is NOT one of these: `tests_reported = 0` is the disclosed "ran, found
+# none" and needs the summed reports that found none beside it, which
+# `test_a_module_that_ran_and_found_nothing_is_not_an_execution_witness` states.
+@pytest.mark.parametrize("count", [1, 27219])
 def test_the_receipt_schema_carries_a_module_executed_count(count):
     receipt = _receipt_with_modules(
         [{"module": "clients", "status": "attempted", "tests_reported": count}]
     )
 
     assert validate_receipt_v2(receipt)["module_outcomes"][0]["tests_reported"] == count
+
+
+def test_a_zero_witness_rides_only_where_the_reports_that_found_none_were_summed():
+    """ "Ran, found none" is a statement about files that were read.
+
+    A module whose claimed reports declare no test at all has a fact worth
+    carrying — and it is not an execution witness (plan r2 T3.6). It rides as a
+    stated zero only where the summary section shows the reports that found
+    none; for a module those totals never named, the zero would be a claim
+    about files nobody read, and the module simply carries no count.
+    """
+    from sag.tools.internal.gradle_tool import _gradle_witnessed_counts
+
+    summaries = {
+        "suites": [
+            {
+                "module": ":clients",
+                "task": "test",
+                "xml_files": 1,
+                "tests": 0,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0,
+            }
+        ],
+        "truncated": True,
+        "dropped_suites": 1,
+    }
+
+    witnessed = _gradle_witnessed_counts({"clients": 0, "streams": 0, "core": 7}, summaries)
+
+    assert witnessed == {"clients": 0, "core": 7}
+    # And what survives is a receipt the schema stands behind: the summed zero
+    # reconciles with the section that summed it.
+    receipt = validate_receipt_v2(
+        {
+            **_receipt_with_modules(
+                _gradle_module_outcomes_with_counts(
+                    [{"module": "clients", "status": "attempted"}], witnessed
+                )
+            ),
+            "gradle_suite_summaries": summaries,
+        }
+    )
+    assert receipt["module_outcomes"] == [
+        {"module": "clients", "status": "attempted", "tests_reported": 0}
+    ]
 
 
 @pytest.mark.parametrize("bad", [True, -1, "20", None])

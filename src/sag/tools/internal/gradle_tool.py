@@ -29,6 +29,7 @@ from sag.agent.invocation_receipts import (
     TESTCASE_OUTCOME_CAP,
     TESTCASE_TAG_CAP,
     assemble_gradle_test_rows,
+    module_outcome_key,
     parse_report_tag_rows,
     record_invocation,
     report_delta,
@@ -322,18 +323,6 @@ def _gradle_report_identity(path: str, working_directory: str) -> Optional[tuple
         return None
     relative = prefix[len(root) :].strip("/")
     return (":" + relative.replace("/", ":") if relative else ":root"), task
-
-
-def _gradle_module_outcome_key(project_path: str) -> str:
-    """The project path as `_gradle_module_outcomes` spells it.
-
-    That parser strips the leading colon off every path it reads from the task
-    stream and writes the root project as `:root`. Merging counts into its list
-    has to speak its grammar, not a second one.
-    """
-
-    coordinate = str(project_path or "").strip()
-    return coordinate if coordinate == ":root" else coordinate.lstrip(":")
 
 
 def _gradle_discover_reports(execute, working_directory: str) -> GradleReportDiscovery:
@@ -701,7 +690,7 @@ def gradle_test_harvest(
         total = entry.get("tests")
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
             continue
-        key = _gradle_module_outcome_key(str(entry.get("module") or ""))
+        key = module_outcome_key(entry.get("module"))
         if key:
             tests_reported[key] = tests_reported.get(key, 0) + total
     ordered = _gradle_red_first(entries)
@@ -720,6 +709,7 @@ def gradle_test_harvest(
     )
     if summaries is None:
         return GradleTestHarvest(omissions=_gradle_omissions(GRADLE_SUITE_TOTALS_UNREADABLE))
+    tests_reported = _gradle_witnessed_counts(tests_reported, summaries)
     if rows is None:
         # The totals stand — a different read produced them — but there is no
         # sample, so nothing may be disclosed about one. The receipt states the
@@ -796,6 +786,29 @@ def _gradle_omissions(
     if reason not in DECLARED_OMISSION_REASONS:
         return ()
     return tuple({"field": field, "reasons": [reason]} for field in fields)
+
+
+def _gradle_witnessed_counts(
+    tests_reported: Mapping[str, int],
+    summaries: Optional[Mapping[str, Any]],
+) -> Dict[str, int]:
+    """The per-module counts the receipt may actually stand behind.
+
+    A count of ZERO is not a small witness — it is the disclosed "ran, found
+    none" — and the receipt states it only for a module whose reports it
+    summed. A zero for a module the summary section never named would be a
+    claim about files nobody read, which is the false-absence shape the harvest
+    exists to forbid; the module simply carries no count and stays `attempted`.
+    """
+
+    named = {
+        module_outcome_key(suite.get("module"))
+        for suite in ((summaries or {}).get("suites") or ())
+        if isinstance(suite, Mapping)
+    }
+    return {
+        module: total for module, total in tests_reported.items() if total >= 1 or module in named
+    }
 
 
 def _gradle_module_outcomes_with_counts(

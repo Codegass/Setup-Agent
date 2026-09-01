@@ -1711,6 +1711,24 @@ def _omission_reason(exc: BaseException) -> str:
     return text or "receipt evidence field is unrepresentable"
 
 
+def _refused_field(exc: BaseException) -> Optional[str]:
+    """The receipt field one refusal is about, read from the refusal's text.
+
+    Every raise in this module writes the canonical `receipt <field> ...`
+    shape, and a cross-field refusal names the field it wants WITHDRAWN first,
+    so this is also how `_withdraw_unreconciled` decides which side of a
+    contradiction the receipt loses.
+    """
+
+    message = " ".join(str(exc).split())
+    for token in _RECEIPT_MESSAGE_TOKEN_RE.findall(message):
+        root = str(token).split(".", 1)[0]
+        field = str(_RECEIPT_FIELD_ALIASES.get(root, root))
+        if field in _RECEIPT_V2_FIELDS:
+            return field
+    return None
+
+
 def receipt_refusal_code(exc: BaseException) -> str:
     """`invalid_arguments:<argument>` for one schema refusal.
 
@@ -1720,13 +1738,10 @@ def receipt_refusal_code(exc: BaseException) -> str:
     a caller who cannot tell WHICH argument was refused cannot repair it.
     """
 
-    message = " ".join(str(exc).split())
-    for token in _RECEIPT_MESSAGE_TOKEN_RE.findall(message):
-        root = token.split(".", 1)[0]
-        field = _RECEIPT_FIELD_ALIASES.get(root, root)
-        if field in _RECEIPT_V2_FIELDS:
-            return f"{WRITE_INVALID_ARGUMENTS}:{field}"
-    detail = re.sub(r"_+", "_", _slug(message)).strip("_")[:96]
+    field = _refused_field(exc)
+    if field is not None:
+        return f"{WRITE_INVALID_ARGUMENTS}:{field}"
+    detail = re.sub(r"_+", "_", _slug(" ".join(str(exc).split()))).strip("_")[:96]
     return f"{WRITE_INVALID_ARGUMENTS}:{detail or 'unnamed_argument'}"
 
 
@@ -1773,7 +1788,39 @@ def _validate_capability_observations(value: Any) -> None:
         features.add(observation["feature"])
 
 
-def _validate_module_outcomes(value: Any) -> None:
+def module_outcome_key(coordinate: Any) -> str:
+    """One grammar for a module name, whichever receipt list spells it.
+
+    Gradle's task stream names `:connect:api` and the harvest's project map
+    names it `:connect:api` too — but the reactor parser strips the leading
+    colon off every path it reads and writes the root project as `:root`, while
+    the suite summaries carry Gradle's own path verbatim. Reconciling a module
+    witness against the totals that back it means reading BOTH lists in one
+    grammar; a second spelling here would let a count and its witness disagree
+    by punctuation alone and call it a contradiction.
+    """
+
+    text = " ".join(str(coordinate or "").split())
+    return text if text == ":root" else text.lstrip(":")
+
+
+def module_execution_witnessed(entry: Any) -> bool:
+    """Whether one `module_outcomes` entry PROVES its module executed tests.
+
+    THE witness predicate, and the only reading of `tests_reported` a consumer
+    may take (plan r2 T3). A stated zero is not a small witness: it is the
+    disclosed "ran, found none" — reports were read and they declared no test —
+    and a consumer that treated it as proof of execution would count a module
+    that executed nothing as a module this run covered.
+    """
+
+    if not isinstance(entry, Mapping):
+        return False
+    value = entry.get("tests_reported")
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _validate_module_outcomes(value: Any, *, receipt: Mapping[str, Any]) -> None:
     """The reactor summary, bounded by what a reactor can actually print.
 
     This list is the coverage DENOMINATOR, so it is never clipped to fit: a
@@ -1788,10 +1835,21 @@ def _validate_module_outcomes(value: Any) -> None:
     declare their own suite totals has PROVEN it executed tests; the count is
     that proof, written by the harvest, absent when nothing proved it. It never
     replaces `status`: an executed module can still have failed.
+
+    A witness is only a witness while it reconciles with the totals it was
+    summed from (P-C). The count comes from the same report roots as
+    `gradle_suite_summaries`, so where both speak they state the same number;
+    where the summary section is bounded — a truncated pair list, an unreadable
+    report — the witness may exceed what the section still shows, never fall
+    short of it. And a stated ZERO is not a witness at all: it is the disclosed
+    "ran, found none", so it is carried only for a module whose reports this
+    receipt actually summed to zero, never as a bare claim about files nobody
+    read.
     """
 
     if not isinstance(value, list) or not value or len(value) > RECEIPT_MODULE_OUTCOMES_MAX_ITEMS:
         raise ValueError("receipt module_outcomes is invalid")
+    summed = _suite_totals(receipt)
     for module in value:
         if (
             not isinstance(module, Mapping)
@@ -1799,10 +1857,35 @@ def _validate_module_outcomes(value: Any) -> None:
             or set(module) - {"module", "status", "tests_reported"}
         ):
             raise ValueError("receipt module_outcomes entry shape is invalid")
-        _receipt_text(module.get("module"), "module_outcomes.module")
+        coordinate = _receipt_text(module.get("module"), "module_outcomes.module")
         _receipt_text(module.get("status"), "module_outcomes.status")
-        if "tests_reported" in module:
-            _receipt_count(module.get("tests_reported"), "module_outcomes.tests_reported")
+        if "tests_reported" not in module:
+            continue
+        reported = _receipt_count(module.get("tests_reported"), "module_outcomes.tests_reported")
+        declared = (summed or {}).get("modules", {}).get(module_outcome_key(coordinate))
+        if reported == 0:
+            if declared is None or declared["tests"] != 0:
+                raise ValueError(
+                    "receipt module_outcomes.tests_reported states zero for a module "
+                    "whose reports it never summed"
+                )
+        elif declared is None:
+            if summed is not None and summed["complete_pairs"]:
+                raise ValueError(
+                    "receipt module_outcomes.tests_reported names a module its "
+                    "gradle_suite_summaries never summed"
+                )
+        elif summed is not None and summed["complete_pairs"]:
+            if reported != declared["tests"]:
+                raise ValueError(
+                    "receipt module_outcomes.tests_reported contradicts its "
+                    "gradle_suite_summaries totals"
+                )
+        elif reported < declared["tests"]:
+            raise ValueError(
+                "receipt module_outcomes.tests_reported is smaller than the suite "
+                "totals it was summed from"
+            )
 
 
 def _receipt_count(value: Any, field: str, *, minimum: int = 0) -> int:
@@ -1851,8 +1934,21 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
         module = _receipt_text(suite.get("module"), "gradle_suite_summaries.module")
         task = _receipt_text(suite.get("task"), "gradle_suite_summaries.task")
         _receipt_count(suite.get("xml_files"), "gradle_suite_summaries.xml_files", minimum=1)
-        for field in _GRADLE_SUITE_COUNT_FIELDS:
-            _receipt_count(suite.get(field), f"gradle_suite_summaries.{field}")
+        counts = {
+            field: _receipt_count(suite.get(field), f"gradle_suite_summaries.{field}")
+            for field in _GRADLE_SUITE_COUNT_FIELDS
+        }
+        # Conservation, per suite (plan r2 T3 / P-C). `tests` is the count of
+        # testcases the reports declared and the other three are dispositions
+        # OF those testcases, so their sum cannot exceed it. The owner's live
+        # probe put `tests=1, failures=2` into a receipt and every validator
+        # accepted it, because each field was checked alone: a run that
+        # executed one test and failed two is not a bounded measurement, it is
+        # an engine bug, and it stops being persistable here.
+        if counts["failures"] + counts["errors"] + counts["skipped"] > counts["tests"]:
+            raise ValueError(
+                "receipt gradle_suite_summaries states more outcomes than it ran tests"
+            )
         if (module, task) in seen:
             raise ValueError("receipt gradle_suite_summaries repeats a module task pair")
         seen.add((module, task))
@@ -1997,6 +2093,251 @@ def _validate_testcase_row_disclosure(value: Any) -> None:
     _validate_row_disclosure(value, field="testcase_row_disclosure", source_id=TESTCASE_ROWS_SOURCE)
 
 
+# --- receipt-level reconciliation (plan r2 T3; principle P-C) ---------------
+#
+# Every rule below reads two fields AGAINST each other. None of them is a shape
+# check — each field is already valid on its own, which is exactly how the
+# owner's live probe got `tests=1, failures=2` persisted: a receipt could state
+# suite totals, a module witness and an identity sample that contradicted one
+# another freely, because nothing ever compared them. A receipt's numbers
+# reconcile or the receipt does not carry them.
+#
+# What a contradiction costs is decided by P-A: totals are load-bearing and
+# identities are the sample, so a refusal names the field to WITHDRAW first and
+# `_withdraw_unreconciled` drops that one field. The exit code, the argv, the
+# contract binding and the report delta are never at risk here.
+
+
+def _suite_totals(receipt: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """This receipt's own Gradle totals, folded per module, with their reach.
+
+    Three reaches, because a bounded section is bounded in three different
+    ways. `complete_pairs`: the section still names every (module, task) pair
+    it summed, so a module witness must equal its totals rather than merely
+    cover them. `read_every_report`: no claimed report went unsummed, so the
+    totals account for every red the run produced. `complete_claims`: both, and
+    only then are the totals a witness the identity sample can be measured
+    against row for row.
+
+    Returns ``None`` when the receipt states no totals; the caller then has no
+    witness and reconciles nothing rather than reconciling against zero.
+    """
+
+    section = receipt.get("gradle_suite_summaries")
+    if not isinstance(section, Mapping):
+        return None
+    suites = section.get("suites")
+    if not isinstance(suites, list) or not suites:
+        return None
+    modules: Dict[str, Dict[str, int]] = {}
+    totals = {field: 0 for field in _GRADLE_SUITE_COUNT_FIELDS}
+    for suite in suites:
+        if not isinstance(suite, Mapping):
+            return None
+        bucket = modules.setdefault(
+            module_outcome_key(suite.get("module")),
+            {field: 0 for field in _GRADLE_SUITE_COUNT_FIELDS},
+        )
+        for field in _GRADLE_SUITE_COUNT_FIELDS:
+            count = suite.get(field)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                return None
+            bucket[field] += count
+            totals[field] += count
+    # A report the summing read never got to — bounded out, unparsable, or
+    # excluded because its bytes moved — is a report that could hold a red.
+    # A dropped PAIR is not: the pair cap keeps red-bearing pairs first, so
+    # what it sheds is green, and the totals still count every red it summed.
+    read_every_report = not {
+        "unreadable_suites",
+        "unsummarized_files",
+        "post_snapshot_rewrite",
+    } & set(section)
+    complete_pairs = "truncated" not in section and "unreadable_suites" not in section
+    return {
+        "modules": modules,
+        "totals": totals,
+        "complete_pairs": complete_pairs,
+        "read_every_report": read_every_report,
+        "complete_claims": complete_pairs and read_every_report,
+    }
+
+
+def _carried_identities(receipt: Mapping[str, Any], field: str) -> Optional[Tuple[int, int]]:
+    """`(identities carried, red identities carried)` for one receipt list.
+
+    The two lists a receipt may carry state their outcome under different keys
+    — the sealed rows call it `outcome`, the diagnostic nodes call it `status`
+    — and are otherwise the same measurement for this purpose: how many
+    identities the receipt holds, and how many of them are failures or errors.
+    """
+
+    if field == "testcase_execution_rows":
+        envelope = receipt.get(field)
+        entries = envelope.get("rows") if isinstance(envelope, Mapping) else None
+        key = "outcome"
+    else:
+        envelope = receipt.get(field)
+        entries = envelope.get("nodes") if isinstance(envelope, Mapping) else None
+        key = "status"
+    if not isinstance(entries, list):
+        return None
+    red = sum(
+        1
+        for entry in entries
+        if isinstance(entry, Mapping)
+        and str(entry.get(key) or "").strip().lower() in _GRADLE_RED_OUTCOMES
+    )
+    return len(entries), red
+
+
+def _disclosed_count(truncation: Mapping[str, Any], field: str) -> int:
+    """One stated loss, read as the count it is. Absent means zero lost."""
+
+    value = truncation.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _validate_receipt_reconciliation(receipt: Mapping[str, Any]) -> None:
+    """Refuse a receipt whose own numbers contradict each other."""
+
+    delta = receipt.get("report_delta")
+    claimed_reports = 0
+    if isinstance(delta, Mapping):
+        for bucket in ("new", "changed", "cached"):
+            entries = delta.get(bucket)
+            if isinstance(entries, list):
+                claimed_reports += len(entries)
+    summed = _suite_totals(receipt)
+    rows = _carried_identities(receipt, "testcase_execution_rows")
+    nodes = _carried_identities(receipt, "testcase_outcomes")
+
+    # ONE TRANSPORT PER RECEIPT (hardening the r1 repair). `gradle_row_disclosure`
+    # describes the harvest's own diagnostic list; `testcase_row_disclosure`
+    # describes the exact delta parse's rows, or — when the receipt carries
+    # none — the diagnostic list it produced instead. Two disclosures over ONE
+    # list is the r1 bug in schema form: the receipt would state drops from a
+    # sample the surviving list never came from, and a reader reconciling the
+    # two gets contradictory evidence out of a receipt that validated.
+    if "testcase_row_disclosure" in receipt:
+        if rows is None and nodes is None:
+            raise ValueError(
+                "receipt testcase_row_disclosure describes a list the receipt does not carry"
+            )
+        if rows is None and "gradle_row_disclosure" in receipt:
+            raise ValueError(
+                "receipt testcase_row_disclosure cannot describe the same list as "
+                "gradle_row_disclosure"
+            )
+
+    # THE RED BOUND. Identities are a sample of the executions the totals count,
+    # so a sample can hold fewer reds than the reports declared — never more. A
+    # receipt whose rows carry three failures over totals declaring one is the
+    # `tests=1, failures=2` shape one tier down.
+    if summed is not None and summed["complete_claims"]:
+        declared_red = summed["totals"]["failures"] + summed["totals"]["errors"]
+        for field, carried in (
+            ("testcase_execution_rows", rows),
+            ("testcase_outcomes", nodes),
+        ):
+            if carried is not None and carried[1] > declared_red:
+                raise ValueError(
+                    f"receipt {field} carries more red identities than its "
+                    "gradle_suite_summaries declare"
+                )
+
+    for field, described in (
+        ("gradle_row_disclosure", nodes),
+        ("testcase_row_disclosure", rows if rows is not None else nodes),
+    ):
+        disclosure = receipt.get(field)
+        if not isinstance(disclosure, Mapping):
+            continue
+        truncation = disclosure.get("rows_truncated")
+        truncation = truncation if isinstance(truncation, Mapping) else {}
+        kept, kept_red = described if described is not None else (0, 0)
+        dropped_files = _disclosed_count(truncation, "dropped_files")
+        unread = _disclosed_count(truncation, "unread_rows")
+        # CAP ARITHMETIC, against the two things a receipt can count exactly.
+        # A file this sample dropped is a report this receipt CLAIMS: the
+        # identity pass reads the delta's own claim set and nothing else, so a
+        # disclosure that dropped more files than the delta names is describing
+        # a read that never happened.
+        if dropped_files > claimed_reports:
+            raise ValueError(f"receipt {field} drops more reports than the report_delta claims")
+        # The harvest's sample and the totals beside it come from ONE read, so
+        # the totals' own losses are this sample's losses too: a claimed report
+        # that read never summed can hold a red as easily as one the row cap
+        # cut. (A receipt that carries no totals at all is not covered here —
+        # an absent witness is not a bound that fired, and withdrawing the
+        # disclosure would take its truncation record with it.)
+        if (
+            field == "gradle_row_disclosure"
+            and disclosure.get("red_rows_complete") is True
+            and summed is not None
+            and not summed["read_every_report"]
+        ):
+            raise ValueError(
+                "receipt gradle_row_disclosure claims complete reds beside totals that "
+                "left a claimed report unread"
+            )
+        if summed is None or not summed["complete_claims"]:
+            continue
+        # kept + dropped == observed, and `observed` is what the totals tier
+        # counted for the same reports. The sample may account for fewer
+        # executions than the run had (a file-level bound leaves reports
+        # unspoken for, and `dropped_files` states them) — never for more.
+        accounted = (
+            kept
+            + _disclosed_count(truncation, "dropped_green")
+            + _disclosed_count(truncation, "dropped_red")
+            + unread
+        )
+        if accounted > summed["totals"]["tests"]:
+            raise ValueError(
+                f"receipt {field} accounts for more executions than its "
+                "gradle_suite_summaries declare"
+            )
+        # A row the read never built has no stated outcome, so an unread row
+        # could be a red. The claim survives only where the totals account for
+        # every red and the sample carries them all; without that witness the
+        # bound that fired could be hiding one.
+        if unread and disclosure.get("red_rows_complete") is True:
+            if kept_red < summed["totals"]["failures"] + summed["totals"]["errors"]:
+                raise ValueError(f"receipt {field} claims complete reds over rows it never read")
+
+
+def _withdraw_unreconciled(receipt: Dict[str, Any], omissions: List[Dict[str, Any]]) -> None:
+    """Drop the field that made the contradicting claim, never the receipt.
+
+    P-C says impossible data is unconstructible; P-A says a receipt that cannot
+    hold its evidence discloses what it dropped and never fails to exist. Both
+    hold here, the same way `_attach` holds them for a shape refusal: the
+    refusal names the field to withdraw, that one field goes, the withdrawal is
+    stated as an omission, and the receipt keeps its exit code, its argv, its
+    contract binding and its report delta. Withdrawing one field can expose the
+    next contradiction (a disclosure whose list just left), so this runs until
+    the receipt reconciles or names something it cannot withdraw.
+    """
+
+    for _ in range(len(_RECEIPT_OMITTABLE_EVIDENCE_FIELDS) + 1):
+        try:
+            _validate_receipt_reconciliation(receipt)
+            return
+        except (TypeError, ValueError) as exc:
+            field = _refused_field(exc)
+            if field not in _RECEIPT_OMITTABLE_EVIDENCE_FIELDS or field not in receipt:
+                logger.debug(f"receipt states an unwithdrawable contradiction: {exc}")
+                return
+            logger.debug(f"receipt evidence field {field} contradicts its receipt: {exc}")
+            receipt.pop(field, None)
+            omissions.append(
+                {"field": field, "status": "unavailable", "reasons": [_omission_reason(exc)]}
+            )
+
+
 def _gradle_evidence_text(value: Any) -> str:
     """Collapse harvested text to one receipt-safe line.
 
@@ -2119,19 +2460,30 @@ def assemble_gradle_test_rows(
         )
         module = _gradle_evidence_text(entry.get("module")) if isinstance(entry, Mapping) else ""
         task = _gradle_evidence_text(entry.get("task")) if isinstance(entry, Mapping) else ""
-        if not module or not task or any(count is None for count in counts.values()) or not counts:
+        stated = {field: count for field, count in counts.items() if count is not None}
+        if not module or not task or len(stated) != len(counts) or not counts:
+            unreadable += 1
+            continue
+        # Conservation, at the file that stated the numbers (P-C). A report
+        # root declaring more failures than tests has not measured anything
+        # this receipt can sum, and folding it in would carry the contradiction
+        # into the totals — where the summary validator would refuse the WHOLE
+        # section and the receipt would lose every other report's counts with
+        # it. One file's impossible header costs that file: it is unreadable,
+        # and `unreadable_suites` states it.
+        if stated["failures"] + stated["errors"] + stated["skipped"] > stated["tests"]:
             unreadable += 1
             continue
         bucket = groups.setdefault(
             (module, task),
-            {"module": module, "task": task, "xml_files": 0, **{f: 0 for f in counts}},
+            {"module": module, "task": task, "xml_files": 0, **{f: 0 for f in stated}},
         )
         bucket["xml_files"] += 1
-        for field, count in counts.items():
+        for field, count in stated.items():
             bucket[field] += count
         report_path = _gradle_evidence_text(entry.get("path"))
         if report_path:
-            declared_by_file[report_path] = declared_by_file.get(report_path, 0) + counts["tests"]
+            declared_by_file[report_path] = declared_by_file.get(report_path, 0) + stated["tests"]
 
     declared_red = sum(group["failures"] + group["errors"] for group in groups.values())
     # Red-bearing pairs are the ones a truncated summary must keep; ties break
@@ -2575,13 +2927,17 @@ def validate_receipt_v2(
     if "capability_observations" in receipt:
         _validate_capability_observations(receipt.get("capability_observations"))
     if "module_outcomes" in receipt:
-        _validate_module_outcomes(receipt.get("module_outcomes"))
+        _validate_module_outcomes(receipt.get("module_outcomes"), receipt=receipt)
     if "excluded_claimed_paths" in receipt:
         excluded = receipt.get("excluded_claimed_paths")
         if type(excluded) is not int or excluded <= 0:
             raise ValueError("receipt excluded_claimed_paths must be positive")
     if "evidence_omissions" in receipt:
         _validate_evidence_omissions(receipt.get("evidence_omissions"), receipt=receipt)
+    # Every field above is valid on its own. This is where they answer to each
+    # other (P-C): suite conservation, the module witness, the identity sample's
+    # bounds and the one-transport rule.
+    _validate_receipt_reconciliation(receipt)
 
     canonical = json.dumps(
         receipt, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -2796,7 +3152,15 @@ def build_receipt(
         if isinstance(testcase_row_disclosure, Mapping)
         else testcase_row_disclosure
     )
-    if row_bounds and {"testcase_execution_rows", "testcase_outcomes"} & set(receipt):
+    # And it rides beside its OWN list. With a Gradle harvest disclosure stated,
+    # `testcase_outcomes` is the harvest's list — so this record has a list to
+    # describe only when the exact rows survived. Two disclosures over one list
+    # is the r1 repair's bug, and it is unconstructible here rather than merely
+    # avoided by the caller that happens to know better.
+    if row_bounds and (
+        "testcase_execution_rows" in receipt
+        or ("testcase_outcomes" in receipt and not gradle_row_disclosure)
+    ):
         _attach("testcase_row_disclosure", row_bounds, _validate_testcase_row_disclosure)
     # Gradle test evidence (evidence study 2026-08-30): the complete per
     # (project, task-dir) totals, and what the bounded identity harvest beside
@@ -2858,7 +3222,14 @@ def build_receipt(
         if isinstance(entry, Mapping) and entry.get("module")
     ]
     if modules:
-        _attach("module_outcomes", modules, _validate_module_outcomes)
+        _attach(
+            "module_outcomes",
+            modules,
+            lambda value: _validate_module_outcomes(value, receipt=receipt),
+        )
+    # The fields are all in; now they answer to each other. A contradiction
+    # costs the field that claimed it, exactly as an unrepresentable shape does.
+    _withdraw_unreconciled(receipt, omissions)
     # Plan 8 §3.2. A dispatch that settled LATE states how much of its own
     # write window an intervening receipt had already claimed — first claim
     # wins, and the loss is counted rather than hidden. Absent (never zero) on

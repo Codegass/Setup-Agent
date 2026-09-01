@@ -33,6 +33,13 @@ from test_maven_gradle_tool_contracts import FakeBuildToolOrchestrator
 from test_python_tool import MANIFEST, Orch, ok
 
 from sag.agent.action_intents import action_fingerprint
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    current_evidence_publication_authority,
+    install_evidence_publication_authority,
+    reset_evidence_publication_authority,
+    unavailable_evidence_publication_authority,
+)
 from sag.agent.invocation_contracts import (
     ARGV_EXECUTION_BINDING,
     PYTHON_FACADE_EXECUTION_BINDING,
@@ -42,9 +49,9 @@ from sag.agent.invocation_contracts import (
 from sag.agent.invocation_receipts import (
     HOST_PUBLICATION_FAILED,
     PRODUCER_OBSERVATIONS_MAX_CANONICAL_BYTES,
-    ReportSnapshot,
     RECEIPT_DIR,
     RECEIPT_SCHEMA_VERSION,
+    ReportSnapshot,
     build_receipt,
     next_receipt_id,
     normalize_producer_observations,
@@ -57,15 +64,8 @@ from sag.agent.invocation_receipts import (
     write_receipt,
     write_receipt_result,
 )
-from sag.agent.evidence_publications import (
-    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-    current_evidence_publication_authority,
-    install_evidence_publication_authority,
-    reset_evidence_publication_authority,
-    unavailable_evidence_publication_authority,
-)
-from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
 from sag.tools.internal.python_tool import PYTEST_REPORT_DIR, PythonTool
 
@@ -1474,6 +1474,31 @@ GRADLE_SUITE = {
 GRADLE_DISCLOSURE = {"rows_source": "gradle_xml", "red_rows_complete": True}
 
 
+def _claimed_reports(count, root="/workspace/proj"):
+    """`{path: sha}` for `count` claimed reports, as a snapshot states them.
+
+    A disclosure counts files it dropped OUT OF this receipt's own claim set,
+    so a receipt that states 900 dropped reports has to be a receipt that
+    claimed at least 900 (plan r2 T3). The claims are what make the numbers
+    below a bounded read rather than a number nobody could have measured.
+    """
+
+    return {
+        f"{root}/m{index // 100}/build/test-results/test/TEST-{index:04d}.xml": f"{index:064x}"
+        for index in range(count)
+    }
+
+
+def _claim_delta(count, root="/workspace/proj"):
+    return {
+        "new": [
+            {"path": path, "sha256": digest}
+            for path, digest in sorted(_claimed_reports(count, root).items())
+        ],
+        "changed": [],
+    }
+
+
 def _gradle_receipt(**overrides):
     payload = _canonical_receipt(
         tool="gradle",
@@ -1527,7 +1552,7 @@ def test_a_full_gradle_evidence_receipt_validates_on_the_live_schema():
         working_directory="/workspace/proj",
         exit_code=0,
         before={},
-        after={},
+        after=_claimed_reports(900),
         gradle_suite_summaries={
             "suites": [GRADLE_SUITE],
             "truncated": True,
@@ -1672,33 +1697,37 @@ def test_a_disclosure_cannot_drop_a_red_and_still_claim_the_reds_are_complete():
     """The one claim a sampled row list offers is the one that is checked."""
     from sag.agent.invocation_receipts import validate_receipt_v2
 
+    claims = _claim_delta(900)
     dropped_red = {"dropped_green": 4, "dropped_files": 1, "dropped_red": 2}
     with pytest.raises(ValueError, match="cannot drop a red and claim completeness"):
         validate_receipt_v2(
             _gradle_receipt(
+                report_delta=claims,
                 gradle_row_disclosure={
                     "rows_source": "gradle_xml",
                     "red_rows_complete": True,
                     "rows_truncated": dropped_red,
-                }
+                },
             )
         )
     honest = _gradle_receipt(
+        report_delta=claims,
         gradle_row_disclosure={
             "rows_source": "gradle_xml",
             "red_rows_complete": False,
             "rows_truncated": dropped_red,
-        }
+        },
     )
     assert validate_receipt_v2(honest)["gradle_row_disclosure"]["rows_truncated"] == dropped_red
     # Dropping only greens keeps the claim available — that is the whole point
     # of ordering reds first.
     greens_only = _gradle_receipt(
+        report_delta=claims,
         gradle_row_disclosure={
             "rows_source": "gradle_xml",
             "red_rows_complete": True,
             "rows_truncated": {"dropped_green": 27000, "dropped_files": 900},
-        }
+        },
     )
     assert validate_receipt_v2(greens_only)["gradle_row_disclosure"]["red_rows_complete"] is True
 
@@ -1779,3 +1808,376 @@ def test_record_invocation_carries_the_gradle_sections_to_the_one_assembly_point
     assert len(written) == 1
     assert written[0]["gradle_suite_summaries"]["suites"] == [GRADLE_SUITE]
     assert written[0]["gradle_row_disclosure"] == GRADLE_DISCLOSURE
+
+
+# --- receipt-level reconciliation (plan r2 T3; blocker 3b) ------------------
+#
+# The owner probed the r1 branch live and persisted `tests=1, failures=2`. Every
+# validator up to here checks ONE field's shape, so a receipt could state suite
+# totals, a module witness and an identity sample that contradicted each other
+# freely and still validate. Each test below carries the impossible payload
+# itself and proves the receipt cannot be constructed around it — and, where a
+# writer produces one, that the contradiction costs that one field and never the
+# exit code, the argv, the contract binding or the report delta.
+
+
+def _reconciling_receipt(**overrides):
+    """One gradle receipt whose totals, witness and sample already agree."""
+
+    payload = _gradle_receipt(
+        report_delta=_claim_delta(4),
+        gradle_suite_summaries={
+            "suites": [
+                {
+                    "module": ":clients",
+                    "task": "test",
+                    "xml_files": 4,
+                    "tests": 20,
+                    "failures": 1,
+                    "errors": 0,
+                    "skipped": 2,
+                }
+            ]
+        },
+        module_outcomes=[{"module": "clients", "status": "attempted", "tests_reported": 20}],
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_a_suite_that_failed_more_tests_than_it_ran_is_unconstructible():
+    """THE probe: `tests=1, failures=2`, accepted live on the r1 branch.
+
+    `tests` counts the testcases the reports declared and the other three count
+    dispositions OF those testcases, so their sum cannot exceed it. Conservation
+    is a property of one suite entry, so it is checked where that entry is —
+    and the receipt that would have carried it does not exist.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    impossible = {
+        "module": ":clients",
+        "task": "test",
+        "xml_files": 1,
+        "tests": 1,
+        "failures": 2,
+        "errors": 0,
+        "skipped": 0,
+    }
+    with pytest.raises(ValueError, match="more outcomes than it ran tests"):
+        validate_receipt_v2(_gradle_receipt(gradle_suite_summaries={"suites": [impossible]}))
+    # Every disposition counted and the total exactly spent: legal, because a
+    # suite may end with no test left ungraded.
+    exact = {**impossible, "tests": 4, "failures": 2, "errors": 1, "skipped": 1}
+    assert validate_receipt_v2(_gradle_receipt(gradle_suite_summaries={"suites": [exact]}))
+    # And the writer degrades rather than voiding: the totals section is dropped
+    # alone, with the refusal stated, while the receipt keeps everything else.
+    receipt = build_receipt(
+        receipt_id="inv-gradle-test-0100",
+        run_id="run-gradle",
+        tool="gradle",
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory="/workspace/proj",
+        exit_code=1,
+        before={},
+        after={},
+        gradle_suite_summaries={"suites": [impossible]},
+    )
+    assert "gradle_suite_summaries" not in receipt
+    assert receipt["exit_code"] == 1
+    assert receipt["evidence_omissions"][0]["field"] == "gradle_suite_summaries"
+
+
+def test_a_module_witness_that_contradicts_its_own_suite_totals_is_unconstructible():
+    """`tests_reported` is summed from the same report roots as the totals.
+
+    Where both speak, they state one number. The r1 receipt let them disagree
+    by any margin — a module witnessing 27,219 tests beside totals declaring
+    20 — because nothing ever compared them.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    assert validate_receipt_v2(_reconciling_receipt())["module_outcomes"][0]["tests_reported"] == 20
+    for reported in (19, 21, 27_219):
+        with pytest.raises(ValueError, match="contradicts its gradle_suite_summaries"):
+            validate_receipt_v2(
+                _reconciling_receipt(
+                    module_outcomes=[
+                        {"module": "clients", "status": "attempted", "tests_reported": reported}
+                    ]
+                )
+            )
+    # A witness for a module the complete totals never summed is a count from
+    # nowhere.
+    with pytest.raises(ValueError, match="never summed"):
+        validate_receipt_v2(
+            _reconciling_receipt(
+                module_outcomes=[{"module": "streams", "status": "attempted", "tests_reported": 9}]
+            )
+        )
+
+
+def test_a_bounded_summary_section_lets_the_witness_exceed_it_but_never_fall_short():
+    """A pair cap that fired removes totals, not tests.
+
+    The witness sums every report the harvest read; the section shows the pairs
+    that survived its own bound. So the witness may be LARGER than what the
+    section still displays — and smaller is impossible, because the displayed
+    pairs are part of what the witness summed.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    bounded = {
+        "suites": [
+            {
+                "module": ":clients",
+                "task": "test",
+                "xml_files": 4,
+                "tests": 20,
+                "failures": 1,
+                "errors": 0,
+                "skipped": 2,
+            }
+        ],
+        "truncated": True,
+        "dropped_suites": 3,
+    }
+    larger = _reconciling_receipt(
+        gradle_suite_summaries=bounded,
+        module_outcomes=[{"module": "clients", "status": "attempted", "tests_reported": 900}],
+    )
+    assert validate_receipt_v2(larger)["module_outcomes"][0]["tests_reported"] == 900
+    smaller = _reconciling_receipt(
+        gradle_suite_summaries=bounded,
+        module_outcomes=[{"module": "clients", "status": "attempted", "tests_reported": 19}],
+    )
+    with pytest.raises(ValueError, match="smaller than the suite totals"):
+        validate_receipt_v2(smaller)
+
+
+def test_a_module_that_ran_and_found_nothing_is_not_an_execution_witness():
+    """`tests_reported = 0` is a disclosed state, never proof of execution.
+
+    It says the reports were read and declared no test — "ran, found none" —
+    which is a different fact from a module with no count at all, and a
+    different fact again from a module that executed tests. It is carried only
+    where the reports that found none were actually summed; a bare zero over a
+    receipt that summed nothing is a claim about files nobody read.
+    """
+    from sag.agent.invocation_receipts import module_execution_witnessed, validate_receipt_v2
+
+    ran_found_none = _reconciling_receipt(
+        gradle_suite_summaries={
+            "suites": [
+                {
+                    "module": ":clients",
+                    "task": "test",
+                    "xml_files": 1,
+                    "tests": 0,
+                    "failures": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                }
+            ]
+        },
+        module_outcomes=[{"module": "clients", "status": "attempted", "tests_reported": 0}],
+    )
+    validated = validate_receipt_v2(ran_found_none)
+    assert validated["module_outcomes"][0]["tests_reported"] == 0
+    # Stated, and still not a witness — the one reading every consumer takes.
+    assert module_execution_witnessed(validated["module_outcomes"][0]) is False
+    assert module_execution_witnessed({"module": "clients", "status": "attempted"}) is False
+    assert module_execution_witnessed({"module": "clients", "tests_reported": 1}) is True
+    with pytest.raises(ValueError, match="states zero for a module"):
+        validate_receipt_v2(
+            _gradle_receipt(
+                module_outcomes=[{"module": "clients", "status": "attempted", "tests_reported": 0}]
+            )
+        )
+
+
+def test_an_identity_sample_cannot_carry_more_reds_than_the_totals_declare():
+    """The rows are a sample of the executions the totals counted.
+
+    A sample holds fewer identities than the run had — never more, and never a
+    failure the reports never declared. This is `tests=1, failures=2` one tier
+    down, between the totals and the identities beside them.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    def outcomes(reds):
+        return {
+            "nodes": [
+                {"node_id": f"com.acme.Suite#red{index}", "status": "failed"}
+                for index in range(reds)
+            ]
+        }
+
+    assert validate_receipt_v2(_reconciling_receipt(testcase_outcomes=outcomes(1)))
+    with pytest.raises(ValueError, match="more red identities"):
+        validate_receipt_v2(_reconciling_receipt(testcase_outcomes=outcomes(2)))
+
+
+def test_a_sample_cannot_account_for_more_executions_than_the_run_ran():
+    """kept + dropped == observed, and `observed` is what the totals counted.
+
+    A disclosure stating 27,000 dropped rows beside totals declaring 20 tests
+    is not a bound that fired hard; it is arithmetic that cannot close.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    def disclosure(dropped_green):
+        return {
+            "rows_source": "gradle_xml",
+            "red_rows_complete": False,
+            "rows_truncated": {"dropped_green": dropped_green, "dropped_files": 1},
+        }
+
+    assert validate_receipt_v2(_reconciling_receipt(gradle_row_disclosure=disclosure(20)))
+    with pytest.raises(ValueError, match="more executions than its gradle_suite_summaries"):
+        validate_receipt_v2(_reconciling_receipt(gradle_row_disclosure=disclosure(27_000)))
+
+
+def test_a_disclosure_cannot_drop_more_reports_than_the_receipt_claims():
+    """`dropped_files` counts reports out of THIS receipt's claim set.
+
+    The identity pass reads the delta's own claims and nothing else, so a
+    sample that dropped 900 files on a four-report delta is describing a read
+    that never happened.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    def disclosure(files):
+        return {
+            "rows_source": "gradle_xml",
+            "red_rows_complete": False,
+            "rows_truncated": {"dropped_green": 0, "dropped_files": files},
+        }
+
+    assert validate_receipt_v2(_reconciling_receipt(gradle_row_disclosure=disclosure(4)))
+    with pytest.raises(ValueError, match="drops more reports than the report_delta claims"):
+        validate_receipt_v2(_reconciling_receipt(gradle_row_disclosure=disclosure(900)))
+
+
+def test_one_identity_list_may_not_carry_two_disclosures():
+    """The r1 repair, hardened from a caller's care into a schema rule.
+
+    `gradle_row_disclosure` describes the harvest's diagnostic list;
+    `testcase_row_disclosure` describes the exact delta parse's rows, or — with
+    none carried — the diagnostic list it produced instead. Both over one list
+    means one of them states drops from a sample the surviving list never came
+    from, which is the contradiction the r1 fix made unreachable by convention.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    exact = {
+        "rows_source": "delta_xml",
+        "red_rows_complete": False,
+        "rows_truncated": {"dropped_green": 3, "dropped_files": 1},
+    }
+    contested = _reconciling_receipt(
+        testcase_outcomes={"nodes": [{"node_id": "com.acme.Suite#green", "status": "passed"}]},
+        gradle_row_disclosure={"rows_source": "gradle_xml", "red_rows_complete": False},
+        testcase_row_disclosure=exact,
+    )
+    with pytest.raises(ValueError, match="same list as gradle_row_disclosure"):
+        validate_receipt_v2(contested)
+    # A disclosure with no list at all describes nothing.
+    with pytest.raises(ValueError, match="a list the receipt does not carry"):
+        validate_receipt_v2(_reconciling_receipt(testcase_row_disclosure=exact))
+    # And the writer never assembles the contested pair in the first place: the
+    # exact record has no rows of its own to describe, so it never rides, and
+    # the harvest's list and disclosure stand.
+    receipt = build_receipt(
+        receipt_id="inv-gradle-test-0101",
+        run_id="run-gradle",
+        tool="gradle",
+        requested_action="test",
+        effective_action="test",
+        argv="./gradlew test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={},
+        testcase_outcomes={"nodes": [{"node_id": "com.acme.Suite#green", "status": "passed"}]},
+        gradle_row_disclosure={"rows_source": "gradle_xml", "red_rows_complete": False},
+        testcase_row_disclosure=exact,
+    )
+    assert "testcase_row_disclosure" not in receipt
+    assert receipt["gradle_row_disclosure"] == {
+        "rows_source": "gradle_xml",
+        "red_rows_complete": False,
+    }
+    assert receipt["testcase_outcomes"]["nodes"]
+
+
+def test_complete_reds_over_rows_the_read_never_built_needs_a_witness():
+    """An unread row has no stated outcome, so it could be a red.
+
+    `unread_rows` is the per-file bound's own loss — identities a report
+    declared and the bounded read never delivered. Claiming every red is
+    present over them is only true where the totals account for every red and
+    the sample carries them all.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    unread = {
+        "rows_source": "gradle_xml",
+        "red_rows_complete": True,
+        "rows_truncated": {"dropped_green": 0, "dropped_files": 0, "unread_rows": 3},
+    }
+    with pytest.raises(ValueError, match="complete reds over rows it never read"):
+        validate_receipt_v2(_reconciling_receipt(gradle_row_disclosure=unread))
+    # With the declared red carried, the witness stands behind the claim.
+    witnessed = _reconciling_receipt(
+        gradle_row_disclosure=unread,
+        testcase_outcomes={"nodes": [{"node_id": "com.acme.Suite#red", "status": "failed"}]},
+    )
+    assert validate_receipt_v2(witnessed)["gradle_row_disclosure"]["red_rows_complete"] is True
+    # Withdrawing the claim is always available, and states the same loss.
+    honest = _reconciling_receipt(gradle_row_disclosure={**unread, "red_rows_complete": False})
+    validated = validate_receipt_v2(honest)
+    assert validated["gradle_row_disclosure"]["rows_truncated"]["unread_rows"] == 3
+
+
+@pytest.mark.parametrize(
+    "loss",
+    [
+        {"unreadable_suites": 2},
+        {"unsummarized_files": 900},
+        {"post_snapshot_rewrite": {"files": 1, "paths": ["/workspace/proj/a.xml"]}},
+    ],
+)
+def test_the_totals_own_losses_withdraw_the_harvests_completeness_claim(loss):
+    """One read produced the totals and the sample beside them.
+
+    So a claimed report those totals never summed is a report this sample never
+    saw either — bounded out, unparsable, or excluded because its bytes moved —
+    and any of them can hold a failure. `red_rows_complete` is the one claim a
+    sample offers, and it does not survive a bound that could hide a red.
+
+    A dropped PAIR is different and stays allowed: the pair cap keeps
+    red-bearing pairs first, so what it sheds is green.
+    """
+    from sag.agent.invocation_receipts import validate_receipt_v2
+
+    section = validate_receipt_v2(_reconciling_receipt())["gradle_suite_summaries"]
+    with pytest.raises(ValueError, match="left a claimed report unread"):
+        validate_receipt_v2(
+            _reconciling_receipt(
+                gradle_suite_summaries={**section, **loss},
+                gradle_row_disclosure={"rows_source": "gradle_xml", "red_rows_complete": True},
+            )
+        )
+    stated = _reconciling_receipt(
+        gradle_suite_summaries={**section, **loss},
+        gradle_row_disclosure={"rows_source": "gradle_xml", "red_rows_complete": False},
+    )
+    assert validate_receipt_v2(stated)["gradle_row_disclosure"]["red_rows_complete"] is False
+    capped_pairs = _reconciling_receipt(
+        gradle_suite_summaries={**section, "truncated": True, "dropped_suites": 3},
+        gradle_row_disclosure={"rows_source": "gradle_xml", "red_rows_complete": True},
+    )
+    assert validate_receipt_v2(capped_pairs)["gradle_row_disclosure"]["red_rows_complete"] is True

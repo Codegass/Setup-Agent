@@ -463,6 +463,35 @@ def bound_testcase_rows(
     return kept, bounds
 
 
+def verify_row_bound_arithmetic(bounds: Mapping[str, Any]) -> None:
+    """kept + dropped == observed, and every drop answers to exactly one cap.
+
+    The accounting a disclosure is built from is HALF the container's (it saw
+    rows this side never received) and half this side's, so it is only exact
+    while both halves add up. A parser that stated 27,219 observed, 3 kept and
+    12 dropped is not a bound that fired: it is an accounting that cannot be
+    true, and a disclosure built from it would state a loss no read ever made.
+    That sample is refused whole — the totals tier is a different measurement
+    and keeps its numbers, so nothing load-bearing rides on this (P-A).
+    """
+
+    def count(field: str) -> int:
+        value = bounds.get(field) if isinstance(bounds, Mapping) else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TestcaseRowContractError(f"row bound {field} is not a count")
+        return value
+
+    dropped = count("dropped_red") + count("dropped_green")
+    if count("kept_rows") + dropped != count("observed_rows"):
+        raise TestcaseRowContractError("row bounds do not account for every observed row")
+    # `dropped_red`/`dropped_green` say WHAT was lost; the three cap counters
+    # say WHY. A loss with no cause is the silent cap wearing a disclosure's
+    # clothes, and a cause with no loss is a bound that fired on nothing.
+    capped = count("oversize_row_drops") + count("per_file_cap_drops") + count("total_cap_drops")
+    if capped != dropped:
+        raise TestcaseRowContractError("row bounds drop rows no cap accounts for")
+
+
 def read_delta_testcase_rows(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     *,
@@ -539,6 +568,16 @@ def read_delta_testcase_rows(
         # that emptied the sample it was supposed to protect would be the
         # kafka burst by another route. Bounds ride their own field.
         bounded, bounds = bound_testcase_rows(rows, payload.get("bounds"))
+        try:
+            verify_row_bound_arithmetic(bounds)
+        except TestcaseRowContractError as exc:
+            logger.debug(f"receipt testcase row bounds do not reconcile for {receipt_id}: {exc}")
+            return {
+                "schema_version": ROW_ENVELOPE_VERSION,
+                "status": "unavailable",
+                "rows": [],
+                "reasons": ["row_bounds_inconsistent"],
+            }
         return {
             "schema_version": ROW_ENVELOPE_VERSION,
             "status": (
