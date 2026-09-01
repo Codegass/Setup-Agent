@@ -27,8 +27,14 @@ Scripted-orchestrator style (house pattern, shared with
 tests/test_invocation_contracts.py and tests/test_receipt_v2_and_assessments.py).
 """
 
+import hashlib
 import json
+import re
 import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 from build_requirements_fakes import complete_build_requirements_v1
@@ -76,7 +82,13 @@ from sag.agent.invocation_contracts import (
     expected_observations,
     freeze_contract,
 )
-from sag.agent.invocation_receipts import RECEIPT_DIR, record_invocation, write_receipt_result
+from sag.agent.invocation_receipts import (
+    RECEIPT_DIR,
+    REPORT_TAG_MARKER,
+    TESTCASE_TAG_PATTERN,
+    record_invocation,
+    write_receipt_result,
+)
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
@@ -108,8 +120,25 @@ WIRED_REQUIREMENTS = complete_build_requirements_v1(
 ABSENT = object()
 
 
+def _row_parser_tokens(command):
+    """The receipt's in-container exact row read, or ``None`` otherwise.
+
+    A READ, and it must be answered as one. It arrives in the atomic writer's
+    own `python3 -c <program> <path>` shape and even carries its `json.load`,
+    so without this discrimination the write double answers a receipt's primary
+    evidence read with an empty success — and every maven receipt here silently
+    falls back to the tag transport.
+    """
+    tokens = shlex.split(command) if command.startswith("python3 -c ") else []
+    if tokens[:2] == ["python3", "-c"] and "import xml.etree.ElementTree as ET" in tokens[2]:
+        return tokens
+    return None
+
+
 def _atomic_write_tokens(command):
     """The shared writer's bounded command shape, or ``None`` otherwise."""
+    if _row_parser_tokens(command) is not None:
+        return None
     tokens = (
         shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
     )
@@ -487,6 +516,9 @@ class ContainerFS:
             return {"success": True, "exit_code": 0, "output": frame_named_json_record_stream(records)}
         if "__SAG_FILE_MISSING__" in command:
             return {"success": False, "exit_code": 44, "output": "__SAG_FILE_MISSING__"}
+        row_parser = _row_parser_tokens(command)
+        if row_parser is not None:
+            return self._exact_row_read(row_parser)
         tokens = _atomic_write_tokens(command)
         if tokens is not None:
             if not self.writable and tokens[:2] != ["rm", "-f"]:
@@ -504,12 +536,8 @@ class ContainerFS:
             if path in self.files:
                 return {"success": True, "output": self.files[path]}
             return {"success": False, "output": f"cat: {path}: No such file or directory"}
-        if command.startswith("grep -oE "):
-            # The receipt's per-testcase parse reads report TAGS; the parser
-            # picks them out of whatever the container prints, so the file
-            # itself is a faithful stand-in for the grep output.
-            hits = [body for path, body in self.files.items() if path in command]
-            return {"success": bool(hits), "output": "\n".join(hits)}
+        if REPORT_TAG_MARKER in command:
+            return {"success": True, "output": self._tag_stream(command)}
         if "mv -f " in command and "\n" in command:
             if not self.writable:
                 return {"success": False, "output": "Read-only file system"}
@@ -520,6 +548,63 @@ class ContainerFS:
             self.files[final] = body
             return {"success": True, "output": ""}
         return {"success": True, "output": ""}
+
+    def _exact_row_read(self, tokens):
+        """Run the receipt's OWN parser, for real, over the reports held here.
+
+        The shipped program on a materialized copy of the claimed reports: the
+        digest it verifies is the digest of the bytes this container holds, so
+        a delta claiming bytes these files do not carry loses them here exactly
+        as it would in the container (P-B). A claimed path this double never
+        stored stays absent, and the parser calls it unreadable itself.
+        """
+        claims = json.loads(self.files.get(tokens[3], "") or "[]")
+        container_path = {}
+        with tempfile.TemporaryDirectory() as root:
+            payload = []
+            for claim in claims:
+                path = str(claim.get("path") or "")
+                local = Path(root) / hashlib.sha256(path.encode("utf-8")).hexdigest()
+                body = self.files.get(path)
+                if body is not None:
+                    local.write_text(body, encoding="utf-8")
+                container_path[str(local)] = path
+                payload.append({**claim, "path": str(local)})
+            source = Path(root) / "row-reader-input.json"
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-c", tokens[2], str(source)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        parsed = json.loads(completed.stdout)
+        for row in parsed.get("rows") or ():
+            row["report_path"] = container_path.get(row["report_path"], row["report_path"])
+        return {"success": True, "exit_code": 0, "output": json.dumps(parsed)}
+
+    def _tag_stream(self, command):
+        """`report_tag_command`'s shell, answered as the shell would answer it.
+
+        Each report's tags headed by the digest of the bytes they were read
+        from — the binding the last-resort transport relies on, so a report
+        this container does not hold contributes nothing and a report it does
+        contributes under its own digest, never under the delta's claim.
+        """
+        chunks = []
+        for quoted in re.findall(r"sha256sum (\S+) 2>/dev/null", command):
+            path = shlex.split(quoted)[0]
+            body = self.files.get(path)
+            if body is None:
+                continue
+            digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            tags = "\n".join(
+                match.group(0)
+                for line in body.splitlines()
+                for match in re.finditer(TESTCASE_TAG_PATTERN, line)
+            )
+            chunks.append(f"{REPORT_TAG_MARKER}{digest}  {path}\n{tags}\n")
+        return "".join(chunks)
 
 
 @pytest.fixture(autouse=True)
@@ -1260,10 +1345,12 @@ def test_the_facade_assesses_the_receipt_its_own_dispatch_minted():
 def test_the_facade_records_a_capability_absence_the_receipt_carries():
     orchestrator = ContainerFS(markers={"pom.xml"})
     report = "/workspace/proj/target/surefire-reports/TEST-a.xml"
-    orchestrator.files[report] = (
-        '<testcase classname="a" name="one"><skipped message="need llvm"/></testcase>'
-    )
-    tool, orchestrator = _wired_build_tool(orchestrator, after={report: "c" * 64})
+    body = '<testcase classname="a" name="one"><skipped message="need llvm"/></testcase>'
+    orchestrator.files[report] = body
+    # The delta claims the digest of the bytes on disk, because every reader
+    # under it now verifies that claim in the same read it counts from.
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    tool, orchestrator = _wired_build_tool(orchestrator, after={report: digest})
 
     with build_action_context("envelope-000032", action="test"):
         tool.execute(action="test", working_directory="/workspace/proj")
