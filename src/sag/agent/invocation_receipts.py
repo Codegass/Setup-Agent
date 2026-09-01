@@ -29,6 +29,12 @@ identity harvest beside them kept and what it dropped. They are separate
 measurements from `testcase_execution_rows` and are named separately so no
 reader can mistake a bounded sample for a project-wide rollup.
 
+`testcase_execution_rows` is a bounded sample too, on every runner, and
+`testcase_row_disclosure` states what the bounds took out of it. Nothing
+unbounded may enter a receipt: an over-budget receipt is not truncated, it is
+refused whole, and kafka's 27,219-row delta refused one — with its exit code,
+its argv and its report delta inside it.
+
 When the authorizing contract names an effective JDK, the receipt copies that
 binding and its scoped provenance verbatim. A detached dispatch carries it
 through the job obligation so settlement cannot reconstruct runtime authority
@@ -60,6 +66,10 @@ from loguru import logger
 
 from sag.agent.receipt_structure import promote_structure
 from sag.agent.receipt_test_rows import (
+    DELTA_PER_FILE_ROW_CAP,
+    DELTA_ROW_MAX_JSON_BYTES,
+    DELTA_TESTCASE_ROW_CAP,
+    SEALED_ROW_OVERHEAD_MAX_BYTES,
     TestcaseRowContractError,
     diagnostic_testcase_outcomes,
     read_delta_testcase_rows,
@@ -118,17 +128,48 @@ SKIP_REASON_MAX_CHARS = 200
 # modules, geode 27) and is a safety bound, not an expected one; exceeding it
 # truncates red-bearing-first and records the drop.
 GRADLE_SUITE_SUMMARY_CAP = 256
-# The per-testcase identity rows are the receipt's only unbounded list. kafka's
+# The per-testcase identity rows were the receipt's one unbounded list. kafka's
 # one measured run left 27,219 executed tests; a sealed row canonicalizes to
-# roughly a kilobyte, so an uncapped envelope would blow the 16 MB canonical
-# budget and VOID THE WHOLE RECEIPT at write time (the `_attach` gate checks
+# roughly a kilobyte, so an uncapped envelope blew the 16 MB canonical budget
+# and VOIDED THE WHOLE RECEIPT at write time (the `_attach` gate checks
 # per-field validity, not the byte budget). 2048 rows is ~2 MB — room for the
 # argv, the reactor list and the delta beside it — and no measured project has
-# more than a handful of reds, so the red set always survives the cap.
+# more than a handful of reds, so the red set always survives the cap. It is
+# now ONE cap over every runner: `receipt_test_rows.DELTA_TESTCASE_ROW_CAP`
+# bounds the exact reader to the same number, and the guard below keeps the two
+# aligned.
 GRADLE_TESTCASE_ROW_CAP = 2048
 # The one transport these rows may claim: XML this engine parsed in-container
 # from bytes hash-bound to the receipt's own report delta.
 GRADLE_ROWS_SOURCE = "gradle_xml"
+# The EXACT row transport, and the disclosure that describes its sample. Every
+# runner uses it — `record_invocation` reads the delta the same way for maven,
+# gradle and python — so the disclosure beside it is runner-neutral where
+# `gradle_row_disclosure` (the tag harvest's, and the diagnostic list's) is
+# not. One receipt may carry both: they describe two different lists, each
+# stating its own source.
+TESTCASE_ROWS_SOURCE = "delta_xml"
+# THE STRUCTURAL GUARD (plan r2 T1.3). The exact-row section's worst case is a
+# product of constants, and it has to stay far below the canonical budget —
+# because a receipt that overruns that budget is not truncated, it is REFUSED
+# WHOLE at write time, taking the exit code, the argv, the contract binding and
+# the report delta with it. That is what a kafka-scale delta did: 27,219
+# unbounded rows against 16 MB.
+#
+# Worst case = (rows the reader may return) x (one sealed row's ceiling), and
+# one sealed row is one parsed row (bounded at the reader) plus the
+# receipt-scoped material sealing adds. Measured kafka rows are 328-505 bytes
+# parsed and under 1 KB sealed, so both factors are ceilings, not estimates.
+SEALED_ROW_MAX_CANONICAL_BYTES = DELTA_ROW_MAX_JSON_BYTES + SEALED_ROW_OVERHEAD_MAX_BYTES
+ROW_SECTION_MAX_CANONICAL_BYTES = DELTA_TESTCASE_ROW_CAP * SEALED_ROW_MAX_CANONICAL_BYTES
+# Three quarters of the budget stays free for everything that is NOT a sample:
+# kafka's 1,176-entry report delta, camel's 652-row reactor summary, the argv.
+ROW_SECTION_BUDGET_SHARE = 4
+assert DELTA_TESTCASE_ROW_CAP <= GRADLE_TESTCASE_ROW_CAP, "row caps must stay aligned"
+assert DELTA_PER_FILE_ROW_CAP <= TESTCASE_TAG_CAP, "per-file row caps must stay aligned"
+assert (
+    ROW_SECTION_MAX_CANONICAL_BYTES * ROW_SECTION_BUDGET_SHARE < RECEIPT_MAX_CANONICAL_BYTES
+), "the bounded rows section must stay far below the receipt's canonical budget"
 _GRADLE_SUITE_COUNT_FIELDS = ("tests", "failures", "errors", "skipped")
 _GRADLE_SUITE_FIELDS = frozenset({"module", "task", "xml_files", *_GRADLE_SUITE_COUNT_FIELDS})
 _GRADLE_RED_OUTCOMES = frozenset({"failed", "error"})
@@ -247,6 +288,7 @@ _RECEIPT_V2_OPTIONAL_FIELDS = frozenset(
         "producer_observations_sha256",
         "testcase_outcomes",
         "testcase_execution_rows",
+        "testcase_row_disclosure",
         "gradle_suite_summaries",
         "gradle_row_disclosure",
         "capability_observations",
@@ -265,6 +307,7 @@ _RECEIPT_OMITTABLE_EVIDENCE_FIELDS = frozenset(
     {
         "testcase_outcomes",
         "testcase_execution_rows",
+        "testcase_row_disclosure",
         "gradle_suite_summaries",
         "gradle_row_disclosure",
         "capability_observations",
@@ -1822,31 +1865,35 @@ def _validate_gradle_suite_summaries(value: Any, *, receipt: Mapping[str, Any]) 
         )
 
 
-def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -> None:
-    """What the bounded identity harvest kept, and what it had to drop.
+def _validate_row_disclosure(value: Any, *, field: str, source_id: str) -> None:
+    """One law for every bounded identity sample a receipt carries.
 
     `red_rows_complete` is the only claim a consumer may lean on when the rows
-    are a sample: it says every failure/error identity the harvested summaries
-    account for is present in the rows. It is a claim, so it is refused when it
+    are a sample: it says every failure/error identity the sample's own witness
+    accounts for is present in the rows. It is a claim, so it is refused when it
     contradicts the truncation record beside it.
+
+    `field` and `source_id` are what differ between the two samples a receipt
+    may carry — the Gradle tag harvest's diagnostic list and the exact
+    delta parse's execution rows — and they differ in nothing else: a bound is
+    a bound, and a disclosure that could shed a rule by changing runners would
+    be an invitation to route around it.
     """
 
-    if str(receipt.get("tool") or "").strip().lower() != "gradle":
-        raise ValueError("receipt gradle_row_disclosure requires the gradle runner")
     if not isinstance(value, Mapping) or set(value) - {
         "rows_source",
         "red_rows_complete",
         "rows_truncated",
     }:
-        raise ValueError("receipt gradle_row_disclosure shape is invalid")
+        raise ValueError(f"receipt {field} shape is invalid")
     if not {"rows_source", "red_rows_complete"}.issubset(value):
-        raise ValueError("receipt gradle_row_disclosure must state its source and red completeness")
-    source = _receipt_text(value.get("rows_source"), "gradle_row_disclosure.rows_source")
-    if source != GRADLE_ROWS_SOURCE:
-        raise ValueError("receipt gradle_row_disclosure.rows_source is not a known transport")
+        raise ValueError(f"receipt {field} must state its source and red completeness")
+    source = _receipt_text(value.get("rows_source"), f"{field}.rows_source")
+    if source != source_id:
+        raise ValueError(f"receipt {field}.rows_source is not a known transport")
     complete = value.get("red_rows_complete")
     if complete is not True and complete is not False:
-        raise ValueError("receipt gradle_row_disclosure.red_rows_complete must be a boolean")
+        raise ValueError(f"receipt {field}.red_rows_complete must be a boolean")
     if "rows_truncated" not in value:
         return
     truncation = value.get("rows_truncated")
@@ -1856,33 +1903,54 @@ def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -
         "dropped_red",
         "unread_rows",
     }:
-        raise ValueError("receipt gradle_row_disclosure.rows_truncated shape is invalid")
+        raise ValueError(f"receipt {field}.rows_truncated shape is invalid")
     if not {"dropped_green", "dropped_files"}.issubset(truncation):
-        raise ValueError("receipt gradle_row_disclosure.rows_truncated is incomplete")
-    green = _receipt_count(truncation.get("dropped_green"), "gradle_row_disclosure.dropped_green")
-    files = _receipt_count(truncation.get("dropped_files"), "gradle_row_disclosure.dropped_files")
+        raise ValueError(f"receipt {field}.rows_truncated is incomplete")
+    green = _receipt_count(truncation.get("dropped_green"), f"{field}.dropped_green")
+    files = _receipt_count(truncation.get("dropped_files"), f"{field}.dropped_files")
     red = 0
     if "dropped_red" in truncation:
-        red = _receipt_count(
-            truncation.get("dropped_red"), "gradle_row_disclosure.dropped_red", minimum=1
-        )
+        red = _receipt_count(truncation.get("dropped_red"), f"{field}.dropped_red", minimum=1)
     # Identities a report declared and its bounded read never delivered. A
     # per-file bound is as real a cap as the row cap, and a sample that reported
     # 130 of a file's 1,000 tests while counting nothing dropped would be the
     # silent cap in its purest form.
     unread = 0
     if "unread_rows" in truncation:
-        unread = _receipt_count(
-            truncation.get("unread_rows"), "gradle_row_disclosure.unread_rows", minimum=1
-        )
+        unread = _receipt_count(truncation.get("unread_rows"), f"{field}.unread_rows", minimum=1)
     # A file-level bound is a loss even when no row it would have produced was
     # ever built: kafka's 50-file tag bound leaves 1,126 reports unspoken for,
     # and a truncation record that refused to say so would be the silent cap
     # this schema exists to forbid.
     if not green and not red and not files and not unread:
-        raise ValueError("receipt gradle_row_disclosure.rows_truncated dropped nothing")
+        raise ValueError(f"receipt {field}.rows_truncated dropped nothing")
     if red and complete is not False:
-        raise ValueError("receipt gradle_row_disclosure cannot drop a red and claim completeness")
+        raise ValueError(f"receipt {field} cannot drop a red and claim completeness")
+
+
+def _validate_gradle_row_disclosure(value: Any, *, receipt: Mapping[str, Any]) -> None:
+    """What the bounded Gradle identity HARVEST kept, and what it had to drop.
+
+    Runner-bound on purpose: this describes the tag transport only the Gradle
+    tool runs, and the diagnostic list it produced.
+    """
+
+    if str(receipt.get("tool") or "").strip().lower() != "gradle":
+        raise ValueError("receipt gradle_row_disclosure requires the gradle runner")
+    _validate_row_disclosure(value, field="gradle_row_disclosure", source_id=GRADLE_ROWS_SOURCE)
+
+
+def _validate_testcase_row_disclosure(value: Any) -> None:
+    """What the bounded EXACT row read kept, and what it had to drop.
+
+    Runner-neutral, because the read is: `record_invocation` parses the report
+    delta the same way whatever wrote it, so maven and python receipts answer
+    to the same bounds and disclose them in the same words. It describes
+    `testcase_execution_rows` — the identity sample — and never the totals
+    beside them, which no bound here can touch.
+    """
+
+    _validate_row_disclosure(value, field="testcase_row_disclosure", source_id=TESTCASE_ROWS_SOURCE)
 
 
 def _gradle_evidence_text(value: Any) -> str:
@@ -2112,6 +2180,50 @@ def assemble_gradle_test_rows(
                 **({"unread_rows": unread_rows} if unread_rows else {}),
             }
     return summary_section, kept_rows, disclosures
+
+
+def disclose_row_bounds(parsed: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """State what the universal row bounds took out of one exact read.
+
+    Pure, and it reads only the accounting `read_delta_testcase_rows` returns
+    beside its rows. Nothing here can change a total: the counts live in the
+    suite-summary tier and in `module_outcomes`, and a bound that fired on the
+    identity sample is a fact ABOUT the sample.
+
+    Absent when nothing was dropped — a disclosure exists to state a loss, and
+    an all-zero truncation record beside a complete sample is noise a reader
+    would have to learn to ignore. `red_rows_complete` is asserted only when
+    this read saw every claimed report whole: a red can hide in a report the
+    reader could not parse as easily as in one the cap cut.
+    """
+
+    bounds = parsed.get("row_bounds") if isinstance(parsed, Mapping) else None
+    if not isinstance(bounds, Mapping):
+        return None
+
+    def count(field: str) -> int:
+        value = bounds.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    green = count("dropped_green")
+    red = count("dropped_red")
+    files = count("dropped_files")
+    unparsed = count("unparsed_reports")
+    if not (green or red or files):
+        return None
+    return {
+        "rows_source": TESTCASE_ROWS_SOURCE,
+        "red_rows_complete": (
+            not red and not unparsed and (parsed or {}).get("status") == "complete"
+        ),
+        "rows_truncated": {
+            "dropped_green": green,
+            "dropped_files": files,
+            **({"dropped_red": red} if red else {}),
+        },
+    }
 
 
 def _validate_evidence_omissions(value: Any, *, receipt: Mapping[str, Any]) -> None:
@@ -2393,6 +2505,8 @@ def validate_receipt_v2(
             receipt=receipt,
             report_claims=report_claims,
         )
+    if "testcase_row_disclosure" in receipt:
+        _validate_testcase_row_disclosure(receipt.get("testcase_row_disclosure"))
     if "gradle_suite_summaries" in receipt:
         _validate_gradle_suite_summaries(receipt.get("gradle_suite_summaries"), receipt=receipt)
     if "gradle_row_disclosure" in receipt:
@@ -2476,6 +2590,7 @@ def build_receipt(
     output_content_hash: Optional[str] = None,
     testcase_outcomes: Optional[Mapping[str, Any]] = None,
     testcase_execution_rows: Optional[Mapping[str, Any]] = None,
+    testcase_row_disclosure: Optional[Mapping[str, Any]] = None,
     gradle_suite_summaries: Optional[Mapping[str, Any]] = None,
     gradle_row_disclosure: Optional[Mapping[str, Any]] = None,
     declared_omissions: Optional[Sequence[Mapping[str, Any]]] = None,
@@ -2606,6 +2721,22 @@ def build_receipt(
                 report_claims=attached_report_claims,
             ),
         )
+    # What the universal row bounds withdrew from the sample above (P-A). It
+    # rides beside the rows on EVERY runner, and it is attached through the
+    # same gate as the rows themselves: a disclosure the schema refuses is one
+    # dropped field, never a lost receipt.
+    #
+    # It rides beside a list or not at all. If both identity lists were refused
+    # above, the receipt holds no sample for this record to describe, and a
+    # truncation record over a list nobody can read is contradictory evidence
+    # rather than a disclosure.
+    row_bounds = (
+        dict(testcase_row_disclosure)
+        if isinstance(testcase_row_disclosure, Mapping)
+        else testcase_row_disclosure
+    )
+    if row_bounds and {"testcase_execution_rows", "testcase_outcomes"} & set(receipt):
+        _attach("testcase_row_disclosure", row_bounds, _validate_testcase_row_disclosure)
     # Gradle test evidence (evidence study 2026-08-30): the complete per
     # (project, task-dir) totals, and what the bounded identity harvest beside
     # them had to drop. Both are attached through the same gate as every other
@@ -2924,6 +3055,17 @@ def record_invocation(
         gradle_project_map=gradle_project_map,
     )
     diagnostic_rows = diagnostic_testcase_outcomes(parsed_rows)
+    # The exact read is bounded now (`receipt_test_rows`' universal caps), so
+    # what reaches the receipt is a sample, and a sample states what it lost.
+    # It is disclosed only when the receipt actually CARRIES the sample: with
+    # the sealed rows unavailable and the diagnostic list coming from the
+    # Gradle harvest instead, this disclosure would describe drops from a list
+    # the receipt does not hold — contradictory evidence, and unknown is absent
+    # here as everywhere else.
+    carries_bounded_rows = bool((sealed_rows or {}).get("rows")) or (
+        gradle_row_disclosure is None and bool(diagnostic_rows)
+    )
+    row_bound_disclosure = disclose_row_bounds(parsed_rows) if carries_bounded_rows else None
     receipt = build_receipt(
         receipt_id=resolved_receipt_id,
         run_id=resolved_run_id,
@@ -2966,6 +3108,7 @@ def record_invocation(
             else (diagnostic_rows or read_testcase_outcomes(execute, resolved_delta))
         ),
         testcase_execution_rows=sealed_rows,
+        testcase_row_disclosure=row_bound_disclosure,
         contract_id=contract_id,
         contract_hash=contract_hash,
         execution_binding=execution_binding,

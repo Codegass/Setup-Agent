@@ -53,14 +53,19 @@ from sag.agent.invocation_receipts import (
     RECEIPT_DIR,
     RECEIPT_MAX_CANONICAL_BYTES,
     RECEIPT_SCHEMA_VERSION,
+    ROW_SECTION_BUDGET_SHARE,
+    ROW_SECTION_MAX_CANONICAL_BYTES,
+    SEALED_ROW_MAX_CANONICAL_BYTES,
     TESTCASE_OUTCOME_CAP,
+    TESTCASE_ROWS_SOURCE,
     TESTCASE_TAG_PATTERN,
     build_receipt,
     receipt_record_scope,
     validate_receipt_v2,
 )
 from sag.agent.receipt_test_rows import (
-    _CONTAINER_REPORT_ROW_PARSER,
+    DELTA_TESTCASE_ROW_CAP,
+    _row_parser_program,
     aggregate_testcase_execution_rows,
 )
 from sag.agent.receipt_test_rows import testcase_execution_id as execution_id_of
@@ -96,7 +101,18 @@ RED_SUITE_FAILURES = 1
 GREEN_SUITE_TESTS = 1
 
 
-def _fixture(name: str) -> bytes:
+def _fixture(name) -> bytes:
+    """A committed report's bytes, or a generated report's bytes verbatim.
+
+    The kafka-scale reactor below is 1,176 reports; committing them would be
+    committing 3 MB of XML to prove an arithmetic bound. They are generated to
+    the measured SHAPE instead (files, executions, reds, skips) and travel the
+    same path as the committed ones — written to disk, hashed, and parsed by
+    the real readers.
+    """
+
+    if isinstance(name, (bytes, bytearray)):
+        return bytes(name)
     return (FIXTURES / name).read_bytes()
 
 
@@ -118,6 +134,7 @@ class GradleReactor:
         self.root = ROOT
         self.store = store
         self.mount: dict[str, Path] = {}
+        self.by_real: dict[str, str] = {}
         self.reports = []
         for module, task, fixture, stem in layout:
             relative = f"{module}/" if module else ""
@@ -127,6 +144,7 @@ class GradleReactor:
             real.write_bytes(_fixture(fixture))
             container = f"{ROOT}/{relative}"
             self.mount[container] = real
+            self.by_real[str(real)] = container
             self.reports.append((container, fixture, module or "root", task))
         modules = [module for _, _, module, _ in self.reports]
         self.modules = list(dict.fromkeys(modules))
@@ -141,10 +159,7 @@ class GradleReactor:
         return self.mount[path]
 
     def container(self, real: str) -> str:
-        for candidate, mounted in self.mount.items():
-            if str(mounted) == str(real):
-                return candidate
-        raise KeyError(real)
+        return self.by_real[str(real)]
 
     def digest(self, path: str) -> str:
         return sha256(self.mount[path].read_bytes()).hexdigest()
@@ -210,7 +225,7 @@ class ReactorOrchestrator(ReceiptOrchestrator):
             {**entry, "path": str(self.reactor.real(entry["path"]))}
             for entry in self._input_payload(command)
         ]
-        result = self._run(_CONTAINER_REPORT_ROW_PARSER, payload)
+        result = self._run(_row_parser_program(), payload)
         parsed = json.loads(result["output"])
         for row in parsed.get("rows") or ():
             row["report_path"] = self.reactor.container(row["report_path"])
@@ -345,6 +360,91 @@ RED_BEARING_LAYOUT = [
     (module, "test", RED_SUITE, "ConfigurationUtilsTest")
     for module in ("clients", "metadata", "streams")
 ]
+
+# --- the measured kafka reactor, at its measured scale -----------------------
+#
+# `docs/superpowers/reports/gradle-evidence-20260830.md`: the 2026-08-26 kafka
+# session wrote 1,176 JUnit XML files across 19 modules holding 27,219 executed
+# tests, 8 of them red and 32 skipped, and reported none of it.
+KAFKA_MODULES = (
+    "clients",
+    "connect-api",
+    "connect-json",
+    "connect-runtime",
+    "core",
+    "metadata",
+    "raft",
+    "server-common",
+    "storage",
+    "streams",
+    "streams-scala",
+    "tools",
+    "trogdor",
+    "group-coordinator",
+    "transaction-coordinator",
+    "shell",
+    "examples",
+    "jmh-benchmarks",
+    "generator",
+)
+KAFKA_REPORTS = 1176
+KAFKA_TESTS = 27_219
+KAFKA_REDS = 8
+KAFKA_SKIPPED = 32
+# The red-bearing modules the study cross-checked against the session's own
+# module-failure records.
+KAFKA_RED_MODULES = ("clients", "metadata", "streams")
+
+
+def _kafka_report(module: str, index: int, tests: int, reds: int, skips: int) -> bytes:
+    """One report, declaring in its `<testsuite>` root exactly what it holds."""
+
+    suite = f"org.apache.kafka.{module.replace('-', '.')}.Suite{index:04d}Test"
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<testsuite name="{suite}" tests="{tests}" skipped="{skips}" '
+        f'failures="{reds}" errors="0" time="1.5">',
+    ]
+    for ordinal in range(tests):
+        case = f'<testcase name="case{ordinal:03d}()" classname="{suite}"'
+        if ordinal < reds:
+            lines.append(
+                f'{case}><failure message="expected: &lt;true&gt; but was: &lt;false&gt;" '
+                'type="org.opentest4j.AssertionFailedError"/></testcase>'
+            )
+        elif ordinal < reds + skips:
+            lines.append(f"{case}><skipped/></testcase>")
+        else:
+            lines.append(f"{case}/>")
+    lines.append("</testsuite>")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _kafka_scale_layout():
+    """1,176 reports over 19 modules, summing to the measured 27,219/8/32."""
+
+    base, extra = divmod(KAFKA_TESTS, KAFKA_REPORTS)
+    red_indices = [
+        index
+        for index in range(KAFKA_REPORTS)
+        if KAFKA_MODULES[index % len(KAFKA_MODULES)] in KAFKA_RED_MODULES
+    ][:KAFKA_REDS]
+    skip_indices = set(range(100, 100 + KAFKA_SKIPPED * 7, 7))
+    layout = []
+    for index in range(KAFKA_REPORTS):
+        module = KAFKA_MODULES[index % len(KAFKA_MODULES)]
+        tests = base + (1 if index < extra else 0)
+        reds = 1 if index in set(red_indices) else 0
+        skips = 1 if index in skip_indices else 0
+        layout.append(
+            (
+                module,
+                "test",
+                _kafka_report(module, index, tests, reds, skips),
+                f"Suite{index:04d}Test",
+            )
+        )
+    return layout
 
 
 def _metrics(receipt):
@@ -672,34 +772,111 @@ def test_a_gradle_receipt_round_trips_its_canonical_bytes_unchanged(tmp_path):
     assert _canonical(validate_receipt_v2(json.loads(_canonical(revalidated)))) == first
 
 
-def test_the_sealed_row_envelope_has_a_ceiling_the_summary_section_does_not(tmp_path):
-    """A recorded limit, measured from these rows rather than asserted.
+def test_one_sealed_row_stays_under_the_ceiling_the_structural_guard_assumes(tmp_path):
+    """The guard's constants are ceilings over real rows, not round numbers.
 
-    `testcase_execution_rows` is the receipt's only unbounded list, and the
-    receipt's canonical budget is the only thing bounding it. This measures
-    what one sealed kafka row actually costs and states the consequence: the
-    measured kafka run's 27,219 executions do not fit, and a receipt that
-    exceeded the budget would be refused WHOLE at write time — losing the argv,
-    the exit code and the report delta along with the rows.
+    `invocation_receipts` asserts a constant relation at import: the bounded
+    rows section's worst case — cap x one sealed row's ceiling — stays a
+    quarter of the receipt's canonical budget. That assertion is only worth
+    what its per-row ceiling is worth, so it is measured here against real
+    kafka identities, and the whole relation is recomputed rather than
+    trusted.
 
-    That is the reason the count side is a separate, bounded section: the
-    suite summaries carry a whole reactor's totals in a few hundred entries,
-    at kafka scale and at ofbiz scale alike. This test fails if the ceiling
-    moves, which is the point — the number belongs on the record, not in a
-    comment.
+    The count side needs no such guard, which is the argument for keeping it a
+    separate section: a whole reactor's totals fit in a few hundred entries at
+    kafka scale and at ofbiz scale alike.
     """
     receipt, _ = _run_reactor(tmp_path, CLIENTS_LAYOUT)
 
     rows = receipt["testcase_execution_rows"]["rows"]
-    per_row = sum(len(_canonical(row).encode("utf-8")) + 1 for row in rows) / len(rows)
-    ceiling = int(RECEIPT_MAX_CANONICAL_BYTES / per_row)
+    widest = max(len(_canonical(row).encode("utf-8")) for row in rows)
 
     # Real kafka identities, so the cost is the measured one, not a toy's.
-    assert 500 < per_row < 1000
-    assert 20_000 < ceiling < 27_219, ceiling
-    # Which is the whole argument for the second section: 19 modules of totals,
-    # not 27,219 rows of identity.
+    assert 500 < widest < SEALED_ROW_MAX_CANONICAL_BYTES
+    assert ROW_SECTION_MAX_CANONICAL_BYTES == (
+        DELTA_TESTCASE_ROW_CAP * SEALED_ROW_MAX_CANONICAL_BYTES
+    )
+    assert ROW_SECTION_MAX_CANONICAL_BYTES * ROW_SECTION_BUDGET_SHARE < RECEIPT_MAX_CANONICAL_BYTES
+    # The unbounded read this replaced: one measured run's 27,219 executions,
+    # at the cost measured above, against the budget that refuses a receipt
+    # WHOLE — argv, exit code and report delta included.
+    assert KAFKA_TESTS * widest > RECEIPT_MAX_CANONICAL_BYTES
     assert len(_canonical(receipt["gradle_suite_summaries"]).encode("utf-8")) < 1024
+
+
+def test_a_kafka_scale_delta_persists_its_receipt_instead_of_bursting_it(tmp_path):
+    """The regression this feature exists for, at the scale that broke it.
+
+    1,176 reports and 27,219 executed tests, the measured 2026-08-26 kafka
+    shape, driven through the same real transports as every test above. Before
+    the universal bounds this delta sealed 27,219 identity rows into one
+    receipt and the write-time budget refused the whole thing — no exit code,
+    no argv, no report delta, no evidence of any kind that the run happened.
+
+    What the receipt is required to hold now:
+
+    - itself: the dispatch's own facts, past the strict validator;
+    - the COMPLETE totals — every one of the 27,219 executions, summed from
+      the reports' own `<testsuite>` roots, not from the sample;
+    - a bounded identity sample, capped exactly where the caps say;
+    - all eight reds, because red-first retention is what a bound is for;
+    - exact drop accounting: kept + dropped == observed, to the row;
+    - canonical bytes comfortably under the budget that used to refuse it.
+    """
+    receipt, orchestrator = _run_reactor(tmp_path, _kafka_scale_layout())
+
+    # 1. It exists, and it is a receipt — the strict live reader's own gates.
+    assert validate_receipt_v2(receipt, expected_id=receipt["receipt_id"]) == receipt
+    assert receipt_record_scope(receipt, receipt["run_id"]) == "current"
+    assert receipt["exit_code"] == 0
+    assert receipt["argv"].endswith("--build-cache test")
+    assert len(receipt["report_delta"]["new"]) == KAFKA_REPORTS
+
+    # 2. The totals are complete. No bound below touches them.
+    suites = receipt["gradle_suite_summaries"]["suites"]
+    assert len(suites) == len(KAFKA_MODULES)
+    assert sum(suite["tests"] for suite in suites) == KAFKA_TESTS
+    assert sum(suite["failures"] for suite in suites) == KAFKA_REDS
+    assert sum(suite["errors"] for suite in suites) == 0
+    assert sum(suite["skipped"] for suite in suites) == KAFKA_SKIPPED
+    assert sum(module["tests_reported"] for module in receipt["module_outcomes"]) == KAFKA_TESTS
+
+    # 3. The identities are a sample, capped where the cap says.
+    rows = receipt["testcase_execution_rows"]["rows"]
+    assert receipt["testcase_execution_rows"]["status"] == "complete"
+    assert len(rows) == DELTA_TESTCASE_ROW_CAP
+
+    # 4. Every red survived it. That is the whole ordering principle.
+    reds = [row for row in rows if row["outcome"] in {"failed", "error"}]
+    assert len(reds) == KAFKA_REDS
+    assert {row["module_coordinate"] for row in reds} == {
+        f":{module}" for module in KAFKA_RED_MODULES
+    }
+
+    # 5. The drops are stated exactly, and they reconcile with the observation.
+    disclosure = receipt["testcase_row_disclosure"]
+    assert disclosure["rows_source"] == TESTCASE_ROWS_SOURCE
+    assert disclosure["red_rows_complete"] is True
+    truncation = disclosure["rows_truncated"]
+    assert "dropped_red" not in truncation
+    assert truncation["dropped_green"] == KAFKA_TESTS - DELTA_TESTCASE_ROW_CAP
+    assert len(rows) + truncation["dropped_green"] == KAFKA_TESTS
+    carried = {row["report_path"] for row in rows}
+    assert truncation["dropped_files"] == KAFKA_REPORTS - len(carried)
+
+    # 6. And it fits, with the budget to spare that the guard promises.
+    canonical = len(_canonical(receipt).encode("utf-8"))
+    assert canonical < RECEIPT_MAX_CANONICAL_BYTES
+    assert canonical < ROW_SECTION_MAX_CANONICAL_BYTES * ROW_SECTION_BUDGET_SHARE
+
+    # 7. Downstream reads it: the run that reported "unavailable" for 27,219
+    # tests now states numbers, and names its failures.
+    executions = _metrics(receipt)["tests"]["claimed"]["receipt_executions"]
+    assert executions["availability"] == "available"
+    assert executions.get("reason") != KAFKA_SESSION_REASON
+    assert executions["failed"] == KAFKA_REDS
+    assert executions["executed"] == len(rows)
+    assert orchestrator.reactor.paths
 
 
 @pytest.mark.parametrize(

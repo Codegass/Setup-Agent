@@ -16,12 +16,20 @@ from sag.agent.invocation_receipts import (
     parse_report_tag_rows,
 )
 from sag.agent.receipt_test_rows import (
-    _CONTAINER_REPORT_ROW_PARSER,
+    DELTA_PER_FILE_ROW_CAP,
+    DELTA_REPORT_MAX_BYTES,
+    DELTA_ROW_MAX_JSON_BYTES,
+    DELTA_TESTCASE_ROW_CAP,
+    SEALED_ROW_OVERHEAD_MAX_BYTES,
+    _row_parser_program,
+    bound_testcase_rows,
     diagnostic_testcase_outcomes,
     read_delta_testcase_rows,
     read_gradle_project_map,
     seal_testcase_execution_rows,
-    testcase_execution_id as _testcase_execution_id,
+)
+from sag.agent.receipt_test_rows import testcase_execution_id as _testcase_execution_id
+from sag.agent.receipt_test_rows import (
     validate_testcase_execution_row,
 )
 
@@ -184,7 +192,7 @@ def test_python_source_outside_the_surveyed_domain_is_not_identity_proof():
     assert envelope["rows"] == []
 
 
-def test_delta_row_reader_is_exact_across_new_changed_and_cached_reports_without_a_cap():
+def test_delta_row_reader_is_exact_across_new_changed_and_cached_reports_under_the_bound():
     class ExactParserContainer(FakeContainer):
         def __init__(self):
             super().__init__()
@@ -247,6 +255,11 @@ def test_delta_row_reader_is_exact_across_new_changed_and_cached_reports_without
     assert len(container.parser_input) == 120
     assert container.parser_kwargs == {"truncate_output": False}
     assert not any(".testcase-row-input" in path for path in container.files)
+    # A bound that did not bite states a bound that did not bite: every row
+    # this read observed is a row it carried.
+    assert parsed["row_bounds"]["observed_rows"] == parsed["row_bounds"]["kept_rows"] == 120
+    assert parsed["row_bounds"]["dropped_green"] == 0
+    assert parsed["row_bounds"]["dropped_files"] == 0
 
 
 def test_delta_row_reader_refuses_a_path_with_conflicting_receipt_hashes():
@@ -293,7 +306,7 @@ def test_container_parser_verifies_hash_and_inherits_the_nearest_suite_source_fi
     )
 
     completed = subprocess.run(
-        [sys.executable, "-c", _CONTAINER_REPORT_ROW_PARSER, str(manifest)],
+        [sys.executable, "-c", _row_parser_program(), str(manifest)],
         check=True,
         capture_output=True,
         text=True,
@@ -338,7 +351,7 @@ def test_container_parser_prefers_the_nearest_nested_suite_source_file(tmp_path)
     )
 
     completed = subprocess.run(
-        [sys.executable, "-c", _CONTAINER_REPORT_ROW_PARSER, str(manifest)],
+        [sys.executable, "-c", _row_parser_program(), str(manifest)],
         check=True,
         capture_output=True,
         text=True,
@@ -448,7 +461,7 @@ def test_declared_count_mismatch_invalidates_the_entire_report_envelope(tmp_path
     )
 
     completed = subprocess.run(
-        [sys.executable, "-c", _CONTAINER_REPORT_ROW_PARSER, str(manifest)],
+        [sys.executable, "-c", _row_parser_program(), str(manifest)],
         check=True,
         capture_output=True,
         text=True,
@@ -468,6 +481,425 @@ def test_declared_count_mismatch_invalidates_the_entire_report_envelope(tmp_path
     )
     assert sealed["status"] == "unavailable"
     assert sealed["rows"] == []
+
+
+# --- the universal row bounds (plan r2 T1) ----------------------------------
+
+
+def _report(tmp_path, name, *, cases):
+    """One report on disk plus the manifest entry that claims its bytes."""
+
+    body = "\n".join(['<testsuite tests="%d">' % len(cases), *cases, "</testsuite>"])
+    path = tmp_path / name
+    path.write_text(body)
+    return {"path": str(path), "sha256": hashlib.sha256(body.encode()).hexdigest()}
+
+
+def _case(index, *, outcome="passed", classname="a.Suite", name=None):
+    label = name if name is not None else f"case{index:05d}"
+    opening = f'<testcase classname="{classname}" name="{label}"'
+    if outcome == "failed":
+        return f'{opening}><failure message="boom"/></testcase>'
+    if outcome == "error":
+        return f'{opening}><error message="boom"/></testcase>'
+    if outcome == "skipped":
+        return f"{opening}><skipped/></testcase>"
+    return f"{opening}/>"
+
+
+def _parse_reports(tmp_path, entries):
+    manifest = tmp_path / "reports.json"
+    manifest.write_text(json.dumps(entries))
+    completed = subprocess.run(
+        [sys.executable, "-c", _row_parser_program(), str(manifest)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_a_single_report_over_the_per_file_cap_still_keeps_what_the_budget_holds(tmp_path):
+    """The per-file bound orders the sample; it does not throw rows away.
+
+    One pytest run is one report file. Cutting it at the per-file cap would
+    drop 600 identities the receipt had room for and disclose a loss that never
+    had to happen — a bound has to be the smallest one that holds.
+    """
+    over = DELTA_PER_FILE_ROW_CAP + 600
+    entries = [
+        _report(
+            tmp_path,
+            "TEST-one.xml",
+            cases=[_case(0, outcome="failed", name="theRed")]
+            + [_case(index) for index in range(1, over)],
+        )
+    ]
+
+    parsed = _parse_reports(tmp_path, entries)
+    bounds = parsed["bounds"]
+
+    assert bounds["observed_rows"] == bounds["kept_rows"] == over
+    assert bounds["dropped_green"] == bounds["dropped_red"] == 0
+    assert bounds["per_file_cap_drops"] == 0
+    assert parsed["rows"][0]["name"] == "theRed"
+
+
+def test_the_container_read_keeps_every_red_and_states_what_each_cap_dropped(tmp_path):
+    """One report far past the per-file cap, one small; reds in both.
+
+    Two laws at once. No green anywhere outranks a red — both reds are carried
+    though one arrives 2,400 rows deep. And the rows that lose their slot are
+    the ones the per-file bound demoted, counted under that bound, with
+    kept + dropped equal to what the read observed: the receipt schema calls a
+    cap that cannot say what it cost a silent cap, and refuses to carry one.
+    """
+    over = DELTA_TESTCASE_ROW_CAP + 400
+    entries = [
+        _report(
+            tmp_path,
+            "TEST-big.xml",
+            cases=[_case(index) for index in range(over)]
+            + [_case(over, outcome="failed", name="bigRed")],
+        ),
+        _report(
+            tmp_path,
+            "TEST-small.xml",
+            cases=[_case(0, outcome="error", name="smallRed"), _case(1, name="smallGreen")],
+        ),
+    ]
+    observed = over + 3
+
+    parsed = _parse_reports(tmp_path, entries)
+    bounds = parsed["bounds"]
+
+    # The parse itself is complete: a cap is a disclosure, never a failure.
+    assert parsed["status"] == "complete"
+    assert parsed["reasons"] == []
+    assert parsed["report_count"] == 2
+    assert bounds["observed_rows"] == observed
+    assert bounds["kept_rows"] == len(parsed["rows"]) == DELTA_TESTCASE_ROW_CAP
+    assert bounds["dropped_red"] == 0
+    assert bounds["dropped_green"] == observed - DELTA_TESTCASE_ROW_CAP
+    assert bounds["per_file_cap_drops"] == bounds["dropped_green"]
+    assert bounds["total_cap_drops"] == 0
+    assert bounds["kept_rows"] + bounds["dropped_green"] == bounds["observed_rows"]
+    assert {row["name"] for row in parsed["rows"] if row["outcome"] != "passed"} == {
+        "bigRed",
+        "smallRed",
+    }
+    # The small file kept its slot: that is what the per-file bound is for.
+    assert bounds["dropped_files"] == 0
+    assert "smallGreen" in {row["name"] for row in parsed["rows"]}
+
+
+def test_the_total_cap_spends_the_sample_on_reds_before_any_green(tmp_path):
+    """Reds in the LAST file read still outrank greens from the first.
+
+    A cap applied in file order would have spent the whole sample on the first
+    report's greens and dropped the reds that arrived after it — which is how
+    kafka's 8 failures disappear into 27,219 passes.
+    """
+    # Six full files of greens — each exactly at the per-file cap, so only the
+    # TOTAL cap can bite — and the red arrives in the seventh, last.
+    green_files = 6
+    entries = [
+        _report(
+            tmp_path,
+            f"TEST-green-{number}.xml",
+            cases=[_case(index) for index in range(DELTA_PER_FILE_ROW_CAP)],
+        )
+        for number in range(green_files)
+    ]
+    entries.append(
+        _report(
+            tmp_path,
+            "TEST-late.xml",
+            cases=[_case(0, outcome="failed", name="lateRed"), _case(1, name="lateGreen")],
+        )
+    )
+    observed = green_files * DELTA_PER_FILE_ROW_CAP + 2
+
+    parsed = _parse_reports(tmp_path, entries)
+    bounds = parsed["bounds"]
+
+    assert bounds["observed_rows"] == observed
+    assert bounds["kept_rows"] == DELTA_TESTCASE_ROW_CAP
+    assert [row["name"] for row in parsed["rows"] if row["outcome"] == "failed"] == ["lateRed"]
+    assert bounds["dropped_red"] == 0
+    assert bounds["per_file_cap_drops"] == 0
+    assert bounds["dropped_green"] == observed - DELTA_TESTCASE_ROW_CAP
+    assert bounds["total_cap_drops"] == bounds["dropped_green"]
+    # Every file still contributed a carried row, so none is a dropped file.
+    assert bounds["dropped_files"] == 0
+    assert bounds["kept_rows"] + bounds["dropped_green"] == observed
+
+
+def test_a_report_too_large_to_parse_is_still_hash_bound_and_disclosed(tmp_path):
+    """kafka's 137.8 MB report, in miniature: read whole, parsed never.
+
+    The digest is streamed over the WHOLE file, so what the receipt says about
+    this report is still bound to the bytes the delta claims. What it says is
+    that the sample does not speak for it — a dropped file, and no claim of
+    red completeness — rather than that the report was unreadable, which would
+    empty the envelope of every OTHER report's identities too.
+    """
+    padding = " " * (DELTA_REPORT_MAX_BYTES + 1024)
+    huge = _report(
+        tmp_path,
+        "TEST-huge.xml",
+        cases=[_case(0, outcome="failed", name="hidden"), f"<!--{padding}-->"],
+    )
+    # The comment is not a testcase, so the root's declared count still holds.
+    body = (tmp_path / "TEST-huge.xml").read_text().replace('tests="2"', 'tests="1"')
+    (tmp_path / "TEST-huge.xml").write_text(body)
+    huge["sha256"] = hashlib.sha256(body.encode()).hexdigest()
+    small = _report(tmp_path, "TEST-small.xml", cases=[_case(0, name="survivor")])
+
+    parsed = _parse_reports(tmp_path, [huge, small])
+    bounds = parsed["bounds"]
+
+    assert parsed["status"] == "complete"
+    assert parsed["report_count"] == 2
+    assert [row["name"] for row in parsed["rows"]] == ["survivor"]
+    assert bounds["unparsed_reports"] == 1
+    assert bounds["dropped_files"] == 1
+    assert bounds["observed_rows"] == 1
+    disclosure = invocation_receipts.disclose_row_bounds({**parsed, "row_bounds": bounds})
+    assert disclosure == {
+        "rows_source": "delta_xml",
+        "red_rows_complete": False,
+        "rows_truncated": {"dropped_green": 0, "dropped_files": 1},
+    }
+
+
+def test_a_row_too_wide_for_the_transport_is_dropped_and_counted(tmp_path):
+    """An identity is dropped whole or carried whole; it is never clipped.
+
+    A clipped classname is a different test, and a receipt may not invent one.
+    """
+    entries = [
+        _report(
+            tmp_path,
+            "TEST-wide.xml",
+            cases=[
+                _case(0, name="x" * (DELTA_ROW_MAX_JSON_BYTES + 64)),
+                _case(1, name="ordinary"),
+            ],
+        )
+    ]
+
+    parsed = _parse_reports(tmp_path, entries)
+
+    assert [row["name"] for row in parsed["rows"]] == ["ordinary"]
+    assert parsed["bounds"]["oversize_row_drops"] == 1
+    assert parsed["bounds"]["dropped_green"] == 1
+    assert parsed["bounds"]["observed_rows"] == 2
+
+
+def test_the_host_holds_the_bound_whatever_the_parser_hands_back():
+    """The guarantee, not the optimization.
+
+    The container applies these caps at the source. This is what makes them a
+    property of the receipt rather than of one program: a parser that ignored
+    them — an older image, a doubled transport, a bug — still cannot put an
+    unbounded list into a receipt, and the accounting it did not do is done
+    here.
+    """
+    rows = [
+        {"report_path": "/workspace/proj/a.xml", "outcome": "passed", "name": f"g{index}"}
+        for index in range(DELTA_TESTCASE_ROW_CAP + 500)
+    ]
+    rows.append({"report_path": "/workspace/proj/b.xml", "outcome": "failed", "name": "red"})
+
+    kept, bounds = bound_testcase_rows(rows)
+
+    assert len(kept) == DELTA_TESTCASE_ROW_CAP
+    assert kept[0]["name"] == "red"
+    assert bounds["dropped_red"] == 0
+    assert bounds["dropped_green"] == 501
+    assert bounds["total_cap_drops"] == 501
+    assert bounds["kept_rows"] + bounds["dropped_green"] == bounds["observed_rows"] == len(rows)
+
+
+def test_host_bounds_add_to_the_container_accounting_and_never_replace_it():
+    """Two caps, one arithmetic: what each side dropped is stated once."""
+
+    rows = [
+        {"report_path": "/workspace/proj/a.xml", "outcome": "passed", "name": f"g{index}"}
+        for index in range(DELTA_TESTCASE_ROW_CAP + 10)
+    ]
+
+    # What the container says it saw and dropped: 27,219 observed, of which
+    # these rows are what it kept.
+    kept, bounds = bound_testcase_rows(
+        rows,
+        {
+            "observed_rows": 27_219,
+            "dropped_green": 27_219 - len(rows),
+            "dropped_files": 900,
+        },
+    )
+
+    assert len(kept) == DELTA_TESTCASE_ROW_CAP
+    assert bounds["observed_rows"] == 27_219
+    assert bounds["dropped_green"] == 27_219 - DELTA_TESTCASE_ROW_CAP
+    # Every row came from one file, and that file is still represented.
+    assert bounds["dropped_files"] == 900
+    assert bounds["kept_rows"] + bounds["dropped_green"] == bounds["observed_rows"]
+
+
+def test_the_rows_section_worst_case_is_a_constant_far_under_the_receipt_budget():
+    """The structural guard, recomputed rather than trusted.
+
+    `invocation_receipts` asserts this relation at import time; if the caps or
+    the budget ever move apart, the assert fires there and this states why it
+    exists. A sealed row cannot exceed one parsed row plus the receipt-scoped
+    material sealing adds, and the reader cannot return more rows than the cap.
+    """
+    assert invocation_receipts.SEALED_ROW_MAX_CANONICAL_BYTES == (
+        DELTA_ROW_MAX_JSON_BYTES + SEALED_ROW_OVERHEAD_MAX_BYTES
+    )
+    assert invocation_receipts.ROW_SECTION_MAX_CANONICAL_BYTES == (
+        DELTA_TESTCASE_ROW_CAP * invocation_receipts.SEALED_ROW_MAX_CANONICAL_BYTES
+    )
+    assert (
+        invocation_receipts.ROW_SECTION_MAX_CANONICAL_BYTES
+        * invocation_receipts.ROW_SECTION_BUDGET_SHARE
+        < invocation_receipts.RECEIPT_MAX_CANONICAL_BYTES
+    )
+    # And the bounds stay the harvest's own, which is what makes them one cap
+    # over every runner rather than two that drift.
+    assert DELTA_TESTCASE_ROW_CAP == invocation_receipts.GRADLE_TESTCASE_ROW_CAP
+    assert DELTA_PER_FILE_ROW_CAP <= invocation_receipts.TESTCASE_TAG_CAP
+
+
+def test_a_maven_receipt_discloses_its_own_row_bounds_and_keeps_its_totals(monkeypatch):
+    """P-A on a runner that has no Gradle harvest at all.
+
+    Nothing about the exact read is Gradle's: `record_invocation` parses the
+    delta the same way for maven, and the bound it applies there needs the same
+    disclosure. The receipt keeps its exit code, its argv and its delta; the
+    identity list says it is a sample; the disclosure says by how much.
+    """
+    path = "/workspace/proj/target/surefire-reports/TEST-a.xml"
+    parsed = _parsed(path)
+    parsed["rows"] = [
+        {**parsed["rows"][0], "name": f"case{index}", "execution_ordinal": index + 1}
+        for index in range(3)
+    ]
+    parsed["row_bounds"] = {
+        "observed_rows": 27_219,
+        "kept_rows": 3,
+        "dropped_red": 0,
+        "dropped_green": 27_216,
+        "dropped_files": 1_100,
+        "per_file_cap_drops": 0,
+        "total_cap_drops": 27_216,
+        "oversize_row_drops": 0,
+        "unparsed_reports": 0,
+    }
+    execute = FakeExecute(
+        rules=[
+            ("rev-parse HEAD", ok("d" * 40)),
+            ("command -v", ok("/usr/bin/mvn\nSAGTOOLCHAIN\nApache Maven 3.9\n")),
+        ]
+    )
+    monkeypatch.setattr(invocation_receipts, "read_delta_testcase_rows", lambda *_a, **_k: parsed)
+
+    invocation_receipts.record_invocation(
+        execute,
+        receipt_id="inv-maven-test-0043",
+        run_id=RUN_ID,
+        tool="maven",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="mvn test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={path: HASH_A},
+        requirements={"build_domains": [{"root": "/workspace/proj", "system": "maven"}]},
+    )
+
+    (receipt,) = receipts_written(execute.commands)
+    assert receipt["exit_code"] == 0
+    assert receipt["argv"] == "mvn test"
+    assert receipt["report_delta"]["new"] == [{"path": path, "sha256": HASH_A}]
+    assert len(receipt["testcase_execution_rows"]["rows"]) == 3
+    assert receipt["testcase_row_disclosure"] == {
+        "rows_source": "delta_xml",
+        "red_rows_complete": True,
+        "rows_truncated": {"dropped_green": 27_216, "dropped_files": 1_100},
+    }
+    # The list a reader sees says it is a sample, in its own field.
+    assert receipt["testcase_outcomes"]["truncated"] is True
+    assert invocation_receipts.validate_receipt_v2(receipt) == receipt
+
+
+def test_a_row_disclosure_never_rides_a_receipt_that_carries_no_sample():
+    """A truncation record over a list the receipt does not hold is evidence
+    against itself, so it is not carried at all."""
+
+    receipt = invocation_receipts.build_receipt(
+        receipt_id="inv-maven-test-0045",
+        run_id=RUN_ID,
+        tool="maven",
+        requested_action="test",
+        effective_action="test",
+        argv="mvn test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={},
+        testcase_row_disclosure={
+            "rows_source": "delta_xml",
+            "red_rows_complete": False,
+            "rows_truncated": {"dropped_green": 12, "dropped_files": 3},
+        },
+    )
+
+    assert "testcase_row_disclosure" not in receipt
+    assert "evidence_omissions" not in receipt
+    assert invocation_receipts.validate_receipt_v2(receipt) == receipt
+
+
+def test_a_sample_that_lost_nothing_discloses_nothing(monkeypatch):
+    """A disclosure states a loss. With no loss there is nothing to state, and
+    an all-zero truncation record beside a complete sample is noise a reader
+    would have to learn to ignore."""
+
+    path = "/workspace/proj/target/surefire-reports/TEST-a.xml"
+    parsed = _parsed(path)
+    parsed["row_bounds"] = {"observed_rows": 1, "kept_rows": 1, "dropped_green": 0}
+    execute = FakeExecute(
+        rules=[
+            ("rev-parse HEAD", ok("d" * 40)),
+            ("command -v", ok("/usr/bin/mvn\nSAGTOOLCHAIN\nApache Maven 3.9\n")),
+        ]
+    )
+    monkeypatch.setattr(invocation_receipts, "read_delta_testcase_rows", lambda *_a, **_k: parsed)
+
+    invocation_receipts.record_invocation(
+        execute,
+        receipt_id="inv-maven-test-0044",
+        run_id=RUN_ID,
+        tool="maven",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="mvn test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={path: HASH_A},
+        requirements={"build_domains": [{"root": "/workspace/proj", "system": "maven"}]},
+    )
+
+    (receipt,) = receipts_written(execute.commands)
+    assert "testcase_row_disclosure" not in receipt
+    assert "truncated" not in receipt["testcase_outcomes"]
 
 
 def test_duplicate_testcase_elements_in_one_report_keep_distinct_execution_ids():

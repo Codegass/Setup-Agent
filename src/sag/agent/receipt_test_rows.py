@@ -36,6 +36,63 @@ _REASON_CAP = 200
 _RECEIPT_SEQUENCE_RE = re.compile(r"-(\d+)$")
 _HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ROW_OUTCOMES = frozenset(_OUTCOME_SEVERITY)
+_RED_OUTCOMES = frozenset({"failed", "error"})
+
+# --- the universal row bounds (P-A) ----------------------------------------
+#
+# These hold for EVERY runner, because the receipt they feed is one schema with
+# one canonical byte budget. The measured case they exist for: kafka's
+# 2026-08-26 session left 27,219 executed tests in 1,176 reports, and an
+# unbounded exact read sealed all of them into `testcase_execution_rows` — ~16
+# MB of identity against a 16 MB canonical budget, which does not degrade the
+# sample, it VOIDS the receipt at write time and takes the exit code, the argv
+# and the report delta with it.
+#
+# Nothing unbounded may enter a receipt. Identities are a bounded sample;
+# totals (the suite-summary tier) stay complete; every bound below records what
+# it dropped, and a red row is never dropped while a green survives anywhere.
+#
+# The total cap is `invocation_receipts.GRADLE_TESTCASE_ROW_CAP` and the
+# per-file cap is its `TESTCASE_TAG_CAP` — the harvest's own bounds, restated
+# here because this module may not import the receipt module that imports it.
+# `invocation_receipts` asserts the alignment at import time.
+DELTA_TESTCASE_ROW_CAP = 2048
+# Not a discard: the per-file bound decides which rows get the sample's FIRST
+# slots, so no single report can crowd a reactor's other files out of it. A
+# file's surplus rows are demoted, not thrown away, and are kept whenever the
+# total cap still has room — one pytest report holding 1,000 tests is one file,
+# and cutting it to 400 would drop rows the budget could carry.
+DELTA_PER_FILE_ROW_CAP = 400
+# One parsed row's transport size. A measured kafka identity canonicalizes to
+# roughly 500 bytes; a row twice that is a pathological display name, and it is
+# DROPPED (and counted) rather than clipped — a clipped identity is a different
+# test, and a receipt may not invent one.
+DELTA_ROW_MAX_JSON_BYTES = 1024
+# The largest report this transport will PARSE. kafka's streams report is
+# 137.8 MB of `system-out` around its testcases; a DOM over it costs the
+# container an order of magnitude more, for rows that cannot fit the sample
+# anyway. Its digest is still streamed and verified — the file is disclosed as
+# a dropped file (P-B: what we counted is bound to bytes we read), never as an
+# absence and never as a hash failure.
+DELTA_REPORT_MAX_BYTES = 8 * 1024 * 1024
+# What sealing adds to one parsed row: the receipt-scoped identity material
+# (run/receipt/target/domain/module/framework/disposition/execution_id). Stated
+# as a bound so the rows section's worst case is a constant relation rather
+# than a hope; `invocation_receipts` asserts it against the canonical budget
+# and `tests/test_test_execution_rows.py` measures real sealed rows against it.
+SEALED_ROW_OVERHEAD_MAX_BYTES = 768
+_REPORT_READ_CHUNK_BYTES = 1 << 20
+_ROW_BOUND_FIELDS = (
+    "observed_rows",
+    "kept_rows",
+    "dropped_red",
+    "dropped_green",
+    "dropped_files",
+    "per_file_cap_drops",
+    "total_cap_drops",
+    "oversize_row_drops",
+    "unparsed_reports",
+)
 
 
 class TestcaseRowContractError(ValueError):
@@ -44,11 +101,23 @@ class TestcaseRowContractError(ValueError):
 
 # The input path is the sole argv value.  Report paths therefore never enter a
 # shell command, and a reactor with thousands of reports cannot hit ARG_MAX.
+#
+# The caps arrive as literals through `_row_parser_program`, exactly as the
+# Gradle head reader takes its `HEAD_BYTES`: the program that runs in the
+# container is the program whose bounds this module states.
 _CONTAINER_REPORT_ROW_PARSER = r"""
 import json
 import sys
 import xml.etree.ElementTree as ET
 from hashlib import sha256
+
+PER_FILE_ROW_CAP = ROW_CAP_PER_FILE
+TOTAL_ROW_CAP = ROW_CAP_TOTAL
+ROW_MAX_JSON_BYTES = ROW_CAP_JSON_BYTES
+REPORT_MAX_BYTES = ROW_CAP_REPORT_BYTES
+REASON_MAX_CHARS = ROW_CAP_REASON_CHARS
+READ_CHUNK_BYTES = ROW_CAP_CHUNK_BYTES
+RED = ("failed", "error")
 
 
 def local_name(element):
@@ -72,7 +141,11 @@ def reason(testcase, status):
         return None
     for child in testcase:
         if local_name(child) == wanted:
-            value = " ".join((child.get("message") or "").split())
+            # Collapsed and clipped to the exact bound the receipt's own
+            # diagnostic list clips to, so nothing the receipt would have
+            # carried is lost here and a megabyte-long assertion message
+            # cannot ride a row into the canonical budget.
+            value = " ".join((child.get("message") or "").split())[:REASON_MAX_CHARS]
             return value or None
     return None
 
@@ -113,7 +186,46 @@ def declared_count(root):
     return sum(values) if values else None
 
 
-result = {"status": "complete", "report_count": 0, "rows": [], "reasons": []}
+def row_bytes(row):
+    return len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+# The file's digest always; its bytes only when they are parseable here.
+# Streamed, so a 137.8 MB report costs one chunk of memory to hash, and the
+# digest is over the WHOLE file either way: a count is only bound to bytes
+# that were all read.
+def digest_and_body(path):
+    hasher = sha256()
+    chunks = []
+    size = 0
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            size += len(chunk)
+            if size <= REPORT_MAX_BYTES:
+                chunks.append(chunk)
+            else:
+                del chunks[:]
+    if size > REPORT_MAX_BYTES:
+        return hasher.hexdigest(), None
+    return hasher.hexdigest(), b"".join(chunks)
+
+
+bounds = {
+    "observed_rows": 0,
+    "kept_rows": 0,
+    "dropped_red": 0,
+    "dropped_green": 0,
+    "dropped_files": 0,
+    "per_file_cap_drops": 0,
+    "total_cap_drops": 0,
+    "oversize_row_drops": 0,
+    "unparsed_reports": 0,
+}
+result = {"status": "complete", "report_count": 0, "rows": [], "reasons": [], "bounds": bounds}
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
         reports = json.load(handle)
@@ -121,22 +233,56 @@ except Exception as exc:
     print(json.dumps({"status": "unavailable", "rows": [], "reasons": ["input_unreadable"]}))
     raise SystemExit(0)
 
+# Four buckets in priority order. The per-file cap does not DISCARD a file's
+# surplus rows, it demotes them: a run that fits the sample keeps every row it
+# read (one pytest report is one file, and clipping it to the per-file cap
+# would throw away rows the budget could hold), while a reactor with 1,176
+# reports still spends its first slots on the widest spread of files it can.
+# Reds are ahead of every green in both tiers, which is the one law a bound
+# here may not break.
+primary_red = []
+spill_red = []
+primary_green = []
+spill_green = []
+# Files that produced at least one runtime testcase, and files whose
+# identities this read never built at all. Both are losses when the sample
+# ends up carrying no row from them; neither may go unstated.
+row_files = set()
+unparsed_files = set()
+
+
+def drop(status, cap):
+    bounds[cap] += 1
+    bounds["dropped_red" if status in RED else "dropped_green"] += 1
+
+
 for report in reports:
     path = report.get("path")
     expected = str(report.get("sha256") or "").lower()
     try:
-        with open(path, "rb") as handle:
-            body = handle.read()
-        if sha256(body).hexdigest() != expected:
-            result["status"] = "unavailable"
-            result["reasons"].append("report_hash_mismatch")
-            continue
+        digest, body = digest_and_body(path)
+    except Exception:
+        result["status"] = "unavailable"
+        result["reasons"].append("report_unreadable")
+        continue
+    if digest != expected:
+        result["status"] = "unavailable"
+        result["reasons"].append("report_hash_mismatch")
+        continue
+    # Read and proved to be this receipt's bytes. What a CAP does with it
+    # afterwards is a disclosure, never an unavailability: a bound that
+    # emptied the envelope would be the burst it exists to prevent.
+    result["report_count"] += 1
+    if body is None:
+        bounds["unparsed_reports"] += 1
+        unparsed_files.add(path)
+        continue
+    try:
         root = ET.fromstring(body)
     except Exception:
         result["status"] = "unavailable"
         result["reasons"].append("report_unreadable")
         continue
-    result["report_count"] += 1
     testcases = [element for element in root.iter() if local_name(element) == "testcase"]
     runtime = [element for element in testcases if not collection_node(element)]
     declared = declared_count(root)
@@ -156,21 +302,63 @@ for report in reports:
             map_suite_files(child, nearest)
 
     map_suite_files(root)
+    if runtime:
+        row_files.add(path)
+    bounds["observed_rows"] += len(runtime)
+    file_red = []
+    file_green = []
     for testcase_ordinal, testcase in enumerate(runtime, 1):
         status = outcome(testcase)
-        result["rows"].append(
-            {
-                "report_path": path,
-                "report_sha256": expected,
-                "classname": (testcase.get("classname") or "").strip(),
-                "name": (testcase.get("name") or "").strip(),
-                "source_file": testcase.get("file") or suite_files.get(id(testcase)),
-                "outcome": status,
-                "reason": reason(testcase, status),
-                "execution_ordinal": testcase_ordinal,
-            }
-        )
+        row = {
+            "report_path": path,
+            "report_sha256": expected,
+            "classname": (testcase.get("classname") or "").strip(),
+            "name": (testcase.get("name") or "").strip(),
+            "source_file": testcase.get("file") or suite_files.get(id(testcase)),
+            "outcome": status,
+            "reason": reason(testcase, status),
+            "execution_ordinal": testcase_ordinal,
+        }
+        if row_bytes(row) > ROW_MAX_JSON_BYTES:
+            drop(status, "oversize_row_drops")
+            continue
+        (file_red if status in RED else file_green).append(row)
+    # Red first, inside the file and then across them: one report's 30,000
+    # green tests may not spend the whole sample, and no green anywhere
+    # outranks a red.
+    ordered = file_red + file_green
+    for row in ordered[:PER_FILE_ROW_CAP]:
+        target = primary_red if row["outcome"] in RED else primary_green
+        if len(target) < TOTAL_ROW_CAP:
+            target.append(row)
+        else:
+            drop(row["outcome"], "total_cap_drops")
+    for row in ordered[PER_FILE_ROW_CAP:]:
+        target = spill_red if row["outcome"] in RED else spill_green
+        if len(target) < TOTAL_ROW_CAP:
+            target.append(row)
+        else:
+            drop(row["outcome"], "per_file_cap_drops")
 
+kept = []
+# The cap a dropped row answers to: rows the per-file bound demoted lose their
+# slot to it, everything else to the total bound.
+for bucket, cap in (
+    (primary_red, "total_cap_drops"),
+    (spill_red, "per_file_cap_drops"),
+    (primary_green, "total_cap_drops"),
+    (spill_green, "per_file_cap_drops"),
+):
+    room = TOTAL_ROW_CAP - len(kept)
+    kept.extend(bucket[:room])
+    for row in bucket[room:]:
+        drop(row["outcome"], cap)
+kept_files = set()
+for row in kept:
+    kept_files.add(row["report_path"])
+bounds["kept_rows"] = len(kept)
+bounds["dropped_files"] = len(row_files - kept_files) + len(unparsed_files)
+result["rows"] = kept
 result["reasons"] = sorted(set(result["reasons"]))
 print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 """
@@ -197,13 +385,97 @@ def _delta_reports(delta: Mapping[str, Any]) -> tuple[list[dict[str, str]], bool
     return selected, bool(conflicts)
 
 
+def _row_parser_program() -> str:
+    """The container program with this module's bounds compiled into it."""
+
+    return (
+        _CONTAINER_REPORT_ROW_PARSER.replace("ROW_CAP_PER_FILE", str(DELTA_PER_FILE_ROW_CAP))
+        .replace("ROW_CAP_TOTAL", str(DELTA_TESTCASE_ROW_CAP))
+        .replace("ROW_CAP_JSON_BYTES", str(DELTA_ROW_MAX_JSON_BYTES))
+        .replace("ROW_CAP_REPORT_BYTES", str(DELTA_REPORT_MAX_BYTES))
+        .replace("ROW_CAP_REASON_CHARS", str(_REASON_CAP))
+        .replace("ROW_CAP_CHUNK_BYTES", str(_REPORT_READ_CHUNK_BYTES))
+    )
+
+
+def _row_json_bytes(row: Mapping[str, Any]) -> int:
+    try:
+        return len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        # Unserializable is unsealable and unsendable; treat it as over the
+        # bound so it is dropped and counted rather than carried.
+        return DELTA_ROW_MAX_JSON_BYTES + 1
+
+
+def _row_is_red(row: Any) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    return str(row.get("outcome") or "").strip().lower() in _RED_OUTCOMES
+
+
+def bound_testcase_rows(
+    rows: Sequence[Any],
+    reported: Mapping[str, Any] | None = None,
+) -> tuple[list[Any], dict[str, int]]:
+    """Hold the universal bounds host-side, and account for every drop.
+
+    The container program applies the same bounds at the source — that is what
+    keeps a 27,219-row read off the transport in the first place. This is the
+    guarantee, not the optimization: whatever a parser hands back, what leaves
+    here is at most `DELTA_TESTCASE_ROW_CAP` rows of at most
+    `DELTA_ROW_MAX_JSON_BYTES` each, red rows first, with kept + dropped ==
+    observed at every cap. `reported` is the container's own accounting, which
+    counts rows this side never saw; the two are added, never conflated.
+    """
+
+    bounds = {field: 0 for field in _ROW_BOUND_FIELDS}
+    stated = reported if isinstance(reported, Mapping) else {}
+    for field in _ROW_BOUND_FIELDS:
+        value = stated.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            bounds[field] = value
+    red: list[Any] = []
+    green: list[Any] = []
+    # A row the parser did not state as an object can never be sealed, but it
+    # is still a row: it sorts last, and the cap may take it like any other.
+    unclassified: list[Any] = []
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            unclassified.append(raw)
+            continue
+        if _row_json_bytes(raw) > DELTA_ROW_MAX_JSON_BYTES:
+            bounds["oversize_row_drops"] += 1
+            bounds["dropped_red" if _row_is_red(raw) else "dropped_green"] += 1
+            continue
+        (red if _row_is_red(raw) else green).append(raw)
+    ordered = [*red, *green, *unclassified]
+    kept = ordered[:DELTA_TESTCASE_ROW_CAP]
+    for raw in ordered[len(kept) :]:
+        bounds["total_cap_drops"] += 1
+        bounds["dropped_red" if _row_is_red(raw) else "dropped_green"] += 1
+    covered = {str(row.get("report_path") or "") for row in ordered if isinstance(row, Mapping)}
+    carried = {str(row.get("report_path") or "") for row in kept if isinstance(row, Mapping)}
+    bounds["dropped_files"] += len((covered - carried) - {""})
+    bounds["kept_rows"] = len(kept)
+    # What the whole read saw: the container's own observation when it made
+    # one (it saw the rows this side never received), else what arrived.
+    bounds["observed_rows"] = max(bounds["observed_rows"], len(rows))
+    return kept, bounds
+
+
 def read_delta_testcase_rows(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     *,
     receipt_id: str,
     delta: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
-    """Read every runtime testcase from this receipt's hash-bound reports.
+    """Read a BOUNDED identity sample from this receipt's hash-bound reports.
+
+    Every claimed report is read whole and its digest verified against the
+    delta's claim in the same read; what comes back is at most
+    `DELTA_TESTCASE_ROW_CAP` rows, red first, with `row_bounds` stating exactly
+    what the caps dropped. The counts a consumer needs are the suite-total
+    tier's, and they stay complete however hard these bounds bite.
 
     The temporary input is written through the same bounded atomic transport as
     durable evidence.  Its exact, receipt-scoped path is removed after the one
@@ -232,9 +504,7 @@ def read_delta_testcase_rows(
             "rows": [],
             "reasons": ["row_input_persistence_failed"],
         }
-    command = (
-        f"python3 -c {shlex.quote(_CONTAINER_REPORT_ROW_PARSER)} " f"{shlex.quote(input_path)}"
-    )
+    command = f"python3 -c {shlex.quote(_row_parser_program())} {shlex.quote(input_path)}"
     try:
         try:
             result = execute(command, truncate_output=False) or {}
@@ -264,6 +534,11 @@ def read_delta_testcase_rows(
         reasons = {str(reason) for reason in payload.get("reasons") or () if str(reason).strip()}
         if not report_count_valid:
             reasons.add("report_count_mismatch")
+        # A cap is never a reason: `seal_testcase_execution_rows` turns any
+        # reason into an unavailable envelope with no rows at all, and a bound
+        # that emptied the sample it was supposed to protect would be the
+        # kafka burst by another route. Bounds ride their own field.
+        bounded, bounds = bound_testcase_rows(rows, payload.get("bounds"))
         return {
             "schema_version": ROW_ENVELOPE_VERSION,
             "status": (
@@ -272,7 +547,8 @@ def read_delta_testcase_rows(
                 else "unavailable"
             ),
             "report_count": report_count if report_count_valid else 0,
-            "rows": rows,
+            "rows": bounded,
+            "row_bounds": bounds,
             **({"reasons": sorted(reasons)} if reasons else {}),
         }
     except Exception as exc:
@@ -296,6 +572,20 @@ def _receipt_sequence(receipt_id: str) -> Optional[int]:
         return None
     value = int(match.group(1))
     return value if value >= 1 else None
+
+
+def rows_were_bounded(parsed: Mapping[str, Any] | None) -> bool:
+    """Whether any universal bound took something out of this read."""
+
+    bounds = parsed.get("row_bounds") if isinstance(parsed, Mapping) else None
+    if not isinstance(bounds, Mapping):
+        return False
+    return any(
+        isinstance(bounds.get(field), int)
+        and not isinstance(bounds.get(field), bool)
+        and int(bounds.get(field) or 0) > 0
+        for field in ("dropped_red", "dropped_green", "dropped_files", "unparsed_reports")
+    )
 
 
 def diagnostic_testcase_outcomes(
@@ -337,7 +627,10 @@ def diagnostic_testcase_outcomes(
         key=lambda node: (_DIAGNOSTIC_ORDER[node["status"]], node["node_id"]),
     )
     result: dict[str, Any] = {"nodes": ordered[:_DIAGNOSTIC_CAP]}
-    if seen > _DIAGNOSTIC_CAP or parsed.get("status") != "complete":
+    # A list built from a bounded read is a sample even when it fits: the rows
+    # this projection never saw are as absent from it as the ones its own cap
+    # cut, and `seen` can only count what arrived.
+    if seen > _DIAGNOSTIC_CAP or parsed.get("status") != "complete" or rows_were_bounded(parsed):
         result["truncated"] = True
     return result
 
@@ -900,12 +1193,19 @@ def seal_testcase_execution_rows(
 
 
 __all__ = [
+    "DELTA_PER_FILE_ROW_CAP",
+    "DELTA_REPORT_MAX_BYTES",
+    "DELTA_ROW_MAX_JSON_BYTES",
+    "DELTA_TESTCASE_ROW_CAP",
     "ROW_ENVELOPE_VERSION",
+    "SEALED_ROW_OVERHEAD_MAX_BYTES",
     "TestcaseRowContractError",
     "aggregate_testcase_execution_rows",
+    "bound_testcase_rows",
     "diagnostic_testcase_outcomes",
     "read_delta_testcase_rows",
     "read_gradle_project_map",
+    "rows_were_bounded",
     "seal_testcase_execution_rows",
     "testcase_execution_id",
     "validate_testcase_execution_row",
