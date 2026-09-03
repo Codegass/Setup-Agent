@@ -245,7 +245,7 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
       />
       {hasEvidenceLayers ? (
         <Stat
-          label="Identity coverage"
+          label="Per-test results"
           value={`${r.claimedSubjectMeasured}/${r.total} measured`}
           tone={r.claimedSubjectMeasured === r.total ? "good" : "warn"}
           hint={identityHint}

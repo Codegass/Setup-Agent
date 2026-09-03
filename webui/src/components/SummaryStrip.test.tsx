@@ -112,7 +112,7 @@ describe("SummaryStrip rollup", () => {
     expect(r.passed).toBe(12)
 
     render(<SummaryStrip workspaces={[modern, legacy]} />)
-    const identity = screen.getByText("Identity coverage").parentElement
+    const identity = screen.getByText("Per-test results").parentElement
     const diagnostics = screen.getByText("Diagnostics").parentElement
     expect(identity).not.toBeNull()
     expect(diagnostics).not.toBeNull()
@@ -139,7 +139,7 @@ describe("SummaryStrip rollup", () => {
 
     render(<SummaryStrip workspaces={[measured, unmeasured]} />)
 
-    const identity = screen.getByText("Identity coverage").parentElement
+    const identity = screen.getByText("Per-test results").parentElement
     const verified = screen.getByText("Verified pass rate").parentElement
     expect(within(identity as HTMLElement).getByText("1/2 measured")).toBeInTheDocument()
     expect(within(verified as HTMLElement).getByText("80.0%")).toBeInTheDocument()

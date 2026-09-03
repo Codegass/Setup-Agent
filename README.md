@@ -13,9 +13,11 @@
 - **Container-native execution** powered by `src/sag/docker_orch/`, ensuring each project is built inside an isolated Docker workspace; all context, logs, and reports live inside the container so the agent can inspect and manage them itself.
 - **Engine-owned phase machine** (`src/sag/agent/phase_machine.py`): a `sag project` run advances through a fixed sequence — provision → analyze → build → test → report — with a clean context window per phase, evidence-gated transitions, and an honest `blocked` escape valve that degrades the verdict instead of looping.
 - **Dual-model ReAct loop** in `src/sag/agent/react_engine.py` with live token telemetry (`src/sag/agent/token_tracker.py`); long builds run **detached** (dispatch-and-poll) instead of being killed by a per-command timeout, bounded by a global wall-clock cap.
-- **One verdict everywhere** via the kernel in `src/sag/verdict.py`: the report header, CLI banner, and exit code derive from a single policy and can no longer disagree.
-- **Six intent-driven tools** (`src/sag/tools/`): `bash`, `files`, `build` (Maven/Gradle behind one verb set), `project` (clone/provision/analyze/env), `search` (refs/files/job-logs/web), and `report`, all returning a uniform result envelope where large output becomes a retrievable reference ("links, not dumps").
-- **Evidence-based validation** through `src/sag/agent/physical_validator.py` plus a per-iteration **context journal**, inspectable with `sag inspect` and the Workbench context trace.
+- **One verdict everywhere** via the kernel in `src/sag/verdict.py`: the report header, CLI banner, and exit code derive from a single policy and can no longer disagree. The verdict word answers one question — did SAG's setup run to completion with evidence — and the project's own test failures are reported beside it, never folded into it.
+- **Numbers that mean what they say**: every headline is a count over a stated denominator (`36/36 production Java sources`, `987/987 test outcomes accounted`). A number SAG cannot prove is shown as `unavailable — <reason>` or as a lower bound (`≥2,048`), never as a percentage.
+- **Intent-driven tools** (`src/sag/tools/`): `bash`, `files`, `build` (Maven, Gradle, and Python behind one verb set), `project` (clone/provision/analyze/env), `search` (refs/files/job-logs/web), `report`, `advisor`, and one lifecycle tool (`phase` for setups, `manage_context` for tasks), all returning a uniform result envelope where large output becomes a retrievable reference ("links, not dumps").
+- **Evidence-based validation**: every build/test dispatch leaves a **receipt** (what ran, which report files it wrote, their digests, and the totals those reports declared), the run seals a snapshot from those receipts, and a per-iteration **context journal** is inspectable with `sag inspect` and the Workbench context trace.
+- **An external yardstick**: a run can be measured against the project's own CI on the same commit (`src/sag/metrics/`), so "success" can mean "reached what the project's CI reaches" rather than "reached what the agent planned". Today this runs offline from recorded evidence; see *Measuring against the project's CI*.
 
 ---
 
@@ -27,7 +29,7 @@ In software development, configuring a new project—especially a large open-sou
 
 - **Complete Isolation**: All operations occur within Docker containers, ensuring the host machine is never polluted. This guarantees a clean, reproducible setup every time.
 - **Phase-Structured Execution**: A project setup runs as an engine-owned sequence of phases (provision → analyze → build → test → report). The agent works freely inside a phase; the engine validates real evidence before advancing, so the run cannot drift or quietly give up.
-- **Evidence Over Assertion**: Build and test verdicts come from physical artifacts (`.class`/JAR counts, surefire/Gradle reports), routed through a single verdict policy so the CLI, report, and exit code always agree.
+- **Evidence Over Assertion**: Build and test verdicts come from the receipts of the commands SAG actually ran — the report files a dispatch wrote and the totals those files declare — routed through a single verdict policy so the CLI, report, and exit code always agree. A model's claim that something worked never counts as evidence; a count SAG cannot back is shown as unavailable rather than guessed.
 - **Dual-Model Collaboration**: It can leverage two LLM roles — one for deeper thinking and planning, one for fast action and tool use — to balance efficiency and effectiveness. Both roles are configurable and may use the same model; see the configuration section.
 
 ## ✨ Core Concepts
@@ -59,46 +61,92 @@ A single `bash` tool could handle every interaction, but it would force the agen
 
 - **`bash`** — the granular fallback for anything without a specialized tool; long-running commands dispatch detached and hand back a pollable log.
 - **`files`** — safe, container-aware file read/write/list.
-- **`build`** — one tool over Maven and Gradle behind verb actions (`deps` / `compile` / `test` / `package`); it auto-selects the build system and resolves the registered toolchain, so the model never hand-rolls `mvn`/`gradlew` against a stale PATH.
-- **`project`** — `clone` / `provision` / `analyze` / `env` for repository and toolchain setup.
+- **`build`** — one tool over Maven, Gradle, and Python projects behind verb actions (`deps` / `compile` / `test` / `package`). The build system comes from the survey `analyze` wrote (a mixed repository is not re-guessed from marker files), the registered toolchain is resolved for it, and every dispatch leaves a receipt. The model never hand-rolls `mvn`/`gradlew` against a stale PATH.
+- **`project`** — `clone` / `provision` / `analyze` / `env` for repository and toolchain setup. `analyze` publishes the build-requirements survey that `build` routes on.
 - **`search`** — one retrieval tool over stored output refs, container files, background-job logs, and the web. Large tool output is stored and referenced rather than dumped into the window ("links, not dumps").
-- **`report`** — renders the final setup report from the validated evidence snapshot.
+- **`report`** — renders the final setup report from the sealed evidence snapshot.
+- **`advisor`** — a zero-argument consult the model can call when stuck; the engine answers it (configurable, and ablatable without changing what the model sees).
+- **`phase`** (setups) / **`manage_context`** (tasks) — the one lifecycle verb, described above.
 
-The implementation delegates (Maven/Gradle/system/env/analyzer runners) live under `src/sag/tools/internal/` and are never exposed to the model directly. This lets the agent focus on *what* it needs, not *how* to drive each command.
+The implementation delegates (Maven/Gradle/Python/system/env/analyzer runners) live under `src/sag/tools/internal/` and are never exposed to the model directly. This lets the agent focus on *what* it needs, not *how* to drive each command.
 
 ## 🏗️ System Architecture
 
 SAG is composed of several core components:
 
-1. **CLI (`src/sag/main.py`)**: Entry point for `project`, `run`, `list`, `shell`, `remove`, `ui`, and `inspect`, with optional artifact recording for post-run inspection.
+1. **CLI (`src/sag/main.py`)**: Entry point for `project`, `run`, `list`, `shell`, `remove`, `ui`, `inspect`, and `trajectory`, with optional artifact recording for post-run inspection.
 2. **Configuration Layer (`src/sag/config/`)**: Loads `.env` settings, provider credentials, model presets, and run bounds (iteration cap, wall-clock cap, dispatch windows), and wires logging streams.
 3. **Setup Agent & Contexts (`src/sag/agent/agent.py`, `src/sag/agent/context_manager.py`)**: Orchestrates the workflow, persists trunk/phase contexts inside the container workspace, and initializes the mode-aware tool set.
 4. **Phase Machine (`src/sag/agent/phase_machine.py`, `src/sag/agent/phase_gates.py`, `src/sag/agent/attempt_ledger.py`, `src/sag/agent/context_journal.py`)**: Drives the provision → analyze → build → test → report sequence, gates each transition on physical evidence, compacts long phases, and journals every iteration's context window.
 5. **ReAct Engine & State Evaluation (`src/sag/agent/react_engine.py`, `src/sag/agent/agent_state_evaluator.py`)**: Dual-model reasoning loop with phase-signal handling, clean-window resets, dispatch-and-poll for long builds, a global wall-clock cap, and live token telemetry.
-6. **Verdict & Validation (`src/sag/verdict.py`, `src/sag/agent/physical_validator.py`)**: One verdict kernel feeding the report, CLI, and exit code; artifact and test-report inspection grounding every decision in physical evidence.
-7. **Tool Set (`src/sag/tools/`)**: Six model-facing tools (`bash`, `files`, `build`, `project`, `search`, `report`) over delegates in `src/sag/tools/internal/`.
-8. **Reporting & Test Intelligence (`src/sag/tools/report_tool.py`, `src/sag/testcases/catalog.py`, `src/sag/reporting/`)**: Renders markdown setup reports from the validated snapshot and merges runtime and static test metadata.
-9. **Docker Orchestrator (`src/sag/docker_orch/orch.py`)**: Container lifecycle, volume persistence, detached dispatch, and shell connectivity for every project.
-10. **Web Workbench (`src/sag/web/`, `webui/`)**: A FastAPI + React dashboard for managing workspaces, reading reports/evidence, and inspecting the phase timeline and context journal.
+6. **Receipts, Verdict & Measurement (`src/sag/agent/invocation_receipts.py`, `src/sag/agent/verdict_finalizer.py`, `src/sag/verdict_rates.py`, `src/sag/verdict.py`)**: Every build/test dispatch is sealed into a receipt (command, exit, report files written with digests, declared totals); the finalizer folds receipts and the physical build check into one sealed snapshot; the rates layer turns that snapshot into the headline counts; the verdict kernel feeds the report, CLI, and exit code.
+7. **Tool Set (`src/sag/tools/`)**: Model-facing tools (`bash`, `files`, `build`, `project`, `search`, `report`, `advisor`, `phase`/`manage_context`) over delegates in `src/sag/tools/internal/`.
+8. **Reporting (`src/sag/tools/report_tool.py`, `src/sag/tools/report_metrics.py`)**: Renders markdown setup reports and the evidence-layer metrics (claimed test executions, verified per-test results, diagnostics) that the report and the Web UI both read.
+9. **Success certificates & CI targets (`src/sag/agent/java_success_certificates.py`, `src/sag/metrics/`)**: A typed certificate of what a run proved (scope, build, test execution, test outcome, integrity), and the external-target layer that harvests a project's own CI results for the same commit and grades the run against them. Offline today (see *Measuring against the project's CI*).
+10. **Docker Orchestrator (`src/sag/docker_orch/orch.py`)**: Container lifecycle, volume persistence, detached dispatch, and shell connectivity for every project.
+11. **Web Workbench (`src/sag/web/`, `webui/`)**: A FastAPI + React dashboard for managing workspaces, reading reports/evidence, and inspecting the phase timeline and context journal.
 
 ## 🧠 The Tool Set
-Six model-facing tools, each returning the uniform envelope (`verdict` / `facts` / `output` / `suggestions` / `refs`):
+The model-facing tools, each returning the uniform envelope (`verdict` / `facts` / `output` / `suggestions` / `refs`):
 
 - **`bash`** (`src/sag/tools/bash.py`): container-aware shell for anything without a specialized tool; long-running commands dispatch detached and return a pollable in-container log instead of being hard-killed.
 - **`files`** (`src/sag/tools/file_io.py`): safe file read/write/list inside the container.
-- **`build`** (`src/sag/tools/build/`): one tool over Maven and Gradle — `build(action='deps'|'compile'|'test'|'package')`. Auto-selects the build system and resolves the registered toolchain (correct Maven/JDK), with a backend per ecosystem.
+- **`build`** (`src/sag/tools/build/`): one tool over Maven, Gradle, and Python — `build(action='deps'|'compile'|'test'|'package')`. Routes on the surveyed build system, resolves the registered toolchain (correct Maven/JDK), and seals a receipt per dispatch, with a backend per ecosystem.
 - **`project`** (`src/sag/tools/project_tool.py`): `clone` / `provision` / `analyze` / `env` — repository cloning, JDK/Maven provisioning, project analysis, and runtime-overlay registration.
 - **`search`** (`src/sag/tools/search_tool.py`): one retrieval tool over stored output refs, container files, background-job logs, and the web.
-- **`report`** (`src/sag/tools/report_tool.py`): renders `setup-report-*.md` from the validated evidence snapshot.
+- **`report`** (`src/sag/tools/report_tool.py`): renders `setup-report-*.md` from the sealed evidence snapshot.
+- **`advisor`** (`src/sag/agent/advisor.py`): one delegated consult, always registered so the advisor mode can be switched off without changing the tool surface.
+- **`phase`** / **`manage_context`** (`src/sag/tools/phase_tool.py`, `src/sag/tools/context_tool.py`): the lifecycle verb for setups and tasks respectively.
 
-Delegates (`maven_tool`, `gradle_tool`, `project_setup_tool`, `project_analyzer`, `system_tool`, `env_tool`, `output_search_tool`, `web_search`, `toolchain_manager`) live under `src/sag/tools/internal/`.
+Delegates (`maven_tool`, `gradle_tool`, `python_tool`, `project_setup_tool`, `project_analyzer`, `system_tool`, `env_tool`, `output_search_tool`, `web_search`, `toolchain_manager`) live under `src/sag/tools/internal/`.
 
 ## ✅ Validation & Observability
-- **Verdict Kernel** (`src/sag/verdict.py`): the single source for the run outcome (failed < partial < success), consumed by the report header, CLI banner, and exit code so they can never diverge.
-- **Physical Validator** (`src/sag/agent/physical_validator.py`): inspects build artifacts, XML test reports, and compilation timestamps to ground decisions in physical evidence.
+- **Receipts** (`src/sag/agent/invocation_receipts.py`): every build/test dispatch is sealed with its command line, exit code, the report files it wrote (paths and digests, so a stale report from an earlier run can never be counted), and for Gradle the totals each report declared. Counts that reach the report come only from receipts.
+- **Physical Validator** (`src/sag/agent/physical_validator.py`): checks that a claimed build left real artifacts and that the module scope the survey named was actually covered.
+- **Verdict Kernel & Rates** (`src/sag/verdict.py`, `src/sag/verdict_rates.py`, `src/sag/agent/verdict_finalizer.py`): one sealed snapshot per run; the verdict word (`success` / `partial` / `failed`) and the headline counts are derived from it and consumed by the report header, CLI banner, exit code, and Web UI so they can never diverge.
 - **Context Journal** (`src/sag/agent/context_journal.py`): records each iteration's window composition (segments, token counts, deltas, intro/ledger text) to `/workspace/.setup_agent/contexts/journal/` — replayable via `sag inspect`.
-- **Test Case Catalog** (`src/sag/testcases/catalog.py`): normalizes runtime results, parameterized expansions, and Groovy/Kotlin discovery to keep counts consistent.
+- **Test Case Catalog** (`src/sag/testcases/catalog.py`): normalizes runtime results, parameterized expansions, and Groovy/Kotlin discovery. Static test declarations are kept as a diagnostic only; they are never the denominator of a rate.
 - **Output Storage & Token Tracker** (`src/sag/agent/output_storage.py`, `src/sag/agent/token_tracker.py`): persist verbose tool output under `.setup_agent/` (referenced via `search`), and capture per-step token usage for cost analysis.
+- **Trajectory** (`sag trajectory`): derives a machine-readable trajectory of a recorded session from the authoritative control ledger only — console logs are never read.
+
+## 📏 Reading a Result
+
+A setup answers three different questions, and SAG keeps them apart instead of blending them into one word:
+
+| Question | Where it is answered | Example |
+|---|---|---|
+| Did SAG actually run the build and tests and leave complete evidence? | verdict word, exit code | `SUCCESS`, exit 0 |
+| What did the project's build and tests produce? | the Build / Tests lines, the report's *Test Outcome Accounting* table | `Tests: … failed 0 · errors 0` |
+| Did the run reach what the project's own CI reaches on this commit? | the CI comparison (offline today) | `Test attainment 987/987 · MET` |
+
+When a setup finishes, the CLI prints the verdict and three headline lines:
+
+```text
+🎯 SETUP COMPLETED: ✅ SUCCESS
+Build: SUCCESS · production Java sources 36/36 · modules 1/1 · class files 56 (diagnostic)
+Tests: SUCCESS · outcomes accounted 987/987 · non-skipped passed 926/926 · skipped 61 · failed 0 · errors 0 · static declarations 468 (diagnostic)
+Coverage: unavailable — not collected
+```
+
+How to read them:
+
+- **`36/36 production Java sources`** means every production source file belongs to a module that a *physically verified, fully scoped* build succeeded on. It is only shown as `N/N` when the build command succeeded, real artifacts exist, the build phase validated that success, and the surveyed module scope was covered without conflict. Otherwise the line says `unavailable (36 observed)` and the reason is in the report. It is not a claim that each `.java` file produced one `.class` file — a source can produce zero, one, or many class files, so class files are shown separately as a diagnostic.
+- **`outcomes accounted 987/987`** is a bookkeeping check: every recorded test execution has exactly one outcome (passed, failed, error, or skipped). **`non-skipped passed 926/926`** is the pass rate that matters; skipped tests are reported on their own instead of dragging the rate down.
+- **Static declarations** (`@Test` methods found by scanning source) are informative only. Parameterized, inherited, and dynamic tests make source scans unreliable as a denominator, so SAG never divides by them.
+- **Red tests are project results, not a failed setup.** A run that executed the whole suite with 12 failures is still `SUCCESS` as a setup; the failures are printed on the Tests line and in the report, and the Web UI shows the run as failed-tests. The exit code is `0` only when the sealed verdict is `success`, and `1` otherwise.
+- **`unavailable`** always comes with a reason, and **`≥N`** means a lower bound (for example when a huge test run's per-test list was kept only in part). SAG never turns a partial count into `100%`.
+
+The full setup report (`setup-report-*.md`) carries the same numbers with their sources, and the Web UI's overview shows them as *Build*, *Tests*, and *Coverage* tiles plus a per-workspace breakdown.
+
+## 🧪 Measuring against the project's CI
+
+A green setup only proves that SAG's own plan ran. To know whether the run reached what the project itself considers a working checkout, SAG can compare a run against the project's official CI on the **same commit**:
+
+1. `scripts/d3_select_anchor.py` picks a commit that has completed CI runs, and `scripts/d3_harvest_target.py` collects that commit's CI evidence into a *target record* — per CI job: build conclusion, the tests it ran (with retries folded to their final outcome), and whether the job's green status was laundered by `continue-on-error`.
+2. A run's evidence is turned into a *success certificate* (`scripts/evaluate_java_success_certificates.py`): what scope it proved, whether the build and test execution completed, whether the outcome was clean, and whether the evidence chain is intact.
+3. `sag.metrics.attainment` grades certificate against target: `met` (reached the CI's build and test universe with no new failures), `exceeded`, `partial`, `not_met` (new failures beyond what CI shows), or `invalid` (the run's own counts are not receipt-bound, so no fraction is stated at all). A commit whose CI publishes no case-level results, or none at all, yields an honest *unavailable* — it never turns a complete local run into a failure.
+
+This layer is implemented and tested but not yet wired into live runs; the measurement standard it follows is documented in `docs/superpowers/specs/2026-08-27-sag-ms-1-measurement-standard.md`, and the design rationale in `docs/superpowers/specs/2026-08-27-sag-metrics-v2-proposal.md`.
 
 ## 🧭 End-to-End Flow
 
@@ -112,7 +160,7 @@ flowchart TD
 
     subgraph PhaseWork[Work inside one phase]
         Think["THOUGHT: thinking model plans"]
-        Act["ACTION: action model calls a tool<br/>bash · files · build · project · search · report"]
+        Act["ACTION: action model calls a tool<br/>bash · files · build · project · search · report · advisor"]
         Dispatch["Long build? dispatch detached,<br/>poll the in-container log"]
         Observe["OBSERVATION: envelope (verdict/facts/refs)<br/>large output stored, referenced via `search`"]
         Journal["Context journal records the iteration window<br/>compaction → attempt ledger when long"]
@@ -121,8 +169,8 @@ flowchart TD
     Claim{"model: phase(done | blocked | note)"}
     Gate["Evidence gate (`phase_gates.py`)<br/>artifacts / test reports present?"]
     Advance["Mark phase done/blocked in trunk<br/>advance: provision→analyze→build→test→report"]
-    Verdict["Verdict kernel (`src/sag/verdict.py`)<br/>failed < partial < success"]
-    Report["`report` renders setup-report-*.md<br/>from the validated snapshot"]
+    Verdict["Sealed snapshot → verdict kernel<br/>failed < partial < success · Build / Tests / Coverage lines"]
+    Report["`report` renders setup-report-*.md<br/>from the sealed snapshot"]
     Completion["CLI banner + exit code from the same verdict<br/>optional `--record` artifact export"]
 
     CLI --> Config --> Docker --> AgentInit --> PhaseStart --> Think
@@ -318,7 +366,8 @@ grep -r "BUILD FAILURE\|compilation error" logs/session_<timestamp>/
 
 | Scenario | What to Check |
 |---|---|
-| Build failed | `grep "BUILD FAILURE" /workspace/.setup_agent/contexts/*.json` |
+| Build failed | Read the *Build* line and the reason under it in `setup-report-*.md`; then `sag inspect sag-<project> --phase build` for the iterations |
+| A count shows `unavailable` or `≥N` | The reason is printed beside it in the report; it means SAG could not prove the full number, not that the number is zero |
 | Java version mismatch | `docker exec sag-<project> java -version` and check for `RequireJavaVersion` in logs |
 | Missing dependencies | `docker exec sag-<project> which mvn npm gradle` |
 | Empty tool outputs | Check if stderr is captured in context files |
@@ -352,6 +401,7 @@ SAG provides a clean and powerful set of CLI commands.
 | `sag ui` | Starts the local SAG Workbench web UI. | `sag ui --port 8765` |
 | `sag remove <name>` | Permanently deletes a project, including its container and data volume. | `sag remove sag-flask --force` |
 | `sag inspect <name>` | Replays a run's phase timeline and per-iteration context windows from the container or a recorded session. | `sag inspect sag-flask --phase build` |
+| `sag trajectory <session_dir>` | Derives a machine-readable trajectory (JSON) of a recorded session from its authoritative ledger; console logs are never read. | `sag trajectory logs/session_X --detail full` |
 | `sag version` | Displays SAG's version information. | `sag version` |
 | `sag --help` | Shows the help message. | `sag --help` |
 
@@ -374,6 +424,8 @@ SAG provides a clean and powerful set of CLI commands.
 | `--goal <goal>` | Custom setup goal (default: auto-generated based on project name). |
 | `--ref <handle>` | Set up a specific Git ref, such as a branch, tag, release tag, short commit, or full commit hash. SAG clones the repository, checks out this ref, and records the resolved commit. |
 | `--record` | Save setup artifacts (contexts, reports) to local session logs for debugging and auditing. |
+| `--coverage` | After the verdict is sealed, run an isolated JaCoCo coverage pass (best-effort; fills the *Coverage* line). |
+| `--ui` | Enable the Rich live progress display for this run. |
 
 **Example with a version handle and custom Docker name:**
 ```bash
@@ -394,6 +446,17 @@ sag project https://github.com/apache/commons-cli.git --ref rel/commons-cli-1.11
 | `--task <description>` | **(Required)** The task or requirement for the agent to execute. |
 | `--max-iterations <n>` | Maximum number of agent iterations (overrides `SAG_MAX_ITERATIONS` in configuration). |
 | `--record` | Save setup artifacts (contexts, reports) to local session logs for debugging and auditing. |
+| `--coverage` | Run an isolated JaCoCo coverage pass after the task (best-effort). |
+| `--ui` | Enable the Rich live progress display for this run. |
+
+A task ends only when the model replies `TASK COMPLETE: <summary>` and no tool call is still failing or running; an early claim is refused and the model is told what is unresolved.
+
+#### `sag trajectory <session_dir>`
+
+| Option | Description |
+|---|---|
+| `--follow` | Tail a running session: one JSON delta per line until interrupted. |
+| `--detail [summary\|full]` | `summary` (default): names, codes, timing, tokens. `full`: also the bytes each ref names. |
 
 #### `sag shell <name>`
 
@@ -431,6 +494,9 @@ uv run pytest
 
 # Or execute a focused contract/smoke scenario for faster feedback
 uv run pytest tests/test_report_contract.py
+
+# Web UI unit tests (vitest) and a production build of the bundled assets
+cd webui && npm test -- --run && npm run build
 ```
 
 ## ⚙️ Configuration Explained
@@ -456,11 +522,11 @@ When you run `sag project <url>`, the phase machine drives the run:
 1.  **Environment Initialization**: SAG's Docker Orchestrator spins up an isolated Docker container and a persistent data volume.
 2.  **Trunk & Phases**: A **Trunk Context** is created with the goal and the five phases — provision → analyze → build → test → report.
 3.  **Provision**: The agent clones the repository and installs the toolchain the project needs (e.g. the detected JDK for a Gradle project, a Maven that satisfies the pom's enforced minimum), then claims the phase done.
-4.  **Analyze**: `project(action='analyze')` detects the build system, counts tests, and records special requirements. An honest "unknown" with evidence is acceptable.
-5.  **Build**: `build(action='compile')` compiles via the registered toolchain. Long builds run detached; the agent polls the in-container log instead of the build being killed.
-6.  **Test**: `build(action='test')` runs the suite. A partial pass above the threshold is a valid outcome; if tests genuinely cannot run, the agent records `phase(action='blocked')` with evidence.
+4.  **Analyze**: `project(action='analyze')` surveys the build system, the module scope, the Java requirement, and where the tests live, and publishes that survey as the build-requirements manifest that `build` routes on. An honest "unknown" with evidence is acceptable.
+5.  **Build**: `build(action='compile')` compiles via the registered toolchain and seals a receipt. Long builds run detached; the agent polls the in-container log instead of the build being killed.
+6.  **Test**: `build(action='test')` runs the suite and seals a receipt of the report files it wrote. Failing tests are recorded as the project's result and do not fail the setup; if tests genuinely cannot run, the agent records `phase(action='blocked')` with evidence.
 7.  **Per-phase mechanics**: For each phase the engine opens a clean context window (goal digest + prior phases' key results + the phase objective), validates the model's `done` claim against physical evidence, advances on success, accepts `blocked` honestly, and journals every iteration. A phase is only cut short if continuing would starve the iterations later phases need.
-8.  **Report & Verdict**: `report` renders `setup-report-*.md` from the validated snapshot, and the verdict kernel produces one outcome (success / partial / failed) shared by the report, CLI banner, and exit code. The container is left fully configured for follow-up `sag run --task` work.
+8.  **Report & Verdict**: the finalizer seals one snapshot from the receipts and the physical build check; `report` renders `setup-report-*.md` from it, and the verdict kernel produces one outcome (success / partial / failed) shared by the report, CLI banner, and exit code. The container is left fully configured for follow-up `sag run --task` work.
 
 ## 🎯 Use Cases
 
