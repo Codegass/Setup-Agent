@@ -222,7 +222,7 @@ function RailRow({
                 <TestBar fail={claimedFailed} pass={claimedPassed} total={claimedTotal} />
               </Tooltip>
             ) : subjectLowerBound ? (
-              <Tooltip label={[identityLabel, subjectCounts?.reason, observationLabel].filter(Boolean).join(". ")}>
+              <Tooltip label={[identityLabel, subjectCounts?.reason ? `Source note: ${subjectCounts.reason}` : null, observationLabel].filter(Boolean).join(". ")}>
                 <span className="w-10 text-right font-mono text-[10px] text-status-attention">
                   ≥{subjectLowerBound.executed.toLocaleString()}
                 </span>

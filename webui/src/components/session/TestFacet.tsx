@@ -64,7 +64,7 @@ function LayerRow({
             note,
             fileNote,
             lowerBound ? "Lower bound; complete total unavailable" : null,
-            !available ? counts.reason || "Count details were incomplete" : null,
+            !available ? (counts.reason ? `Source note: ${counts.reason}` : "Count details were incomplete") : null,
           ].filter(Boolean).join(" · ")}
         </div>
       ) : null}
@@ -167,7 +167,7 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
             />
             <LayerRow
               counts={layers.unattributedObservations}
-              label="Observations without test identity"
+              label="Observations without a test name"
               note="Not used in the verified result"
             />
             <LayerRow

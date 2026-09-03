@@ -217,9 +217,9 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
     ? `${r.nonVerdictObservations.toLocaleString()}${r.nonVerdictIncomplete ? "+" : ""}`
     : r.nonVerdictIncomplete ? "Incomplete" : `${r.nonVerdictReportFiles.toLocaleString()} files`
   const identityHint = [
-    `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded complete stable test identities.`,
+    `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded complete per-test results.`,
     r.claimedSubjectPartial
-      ? `${r.claimedSubjectPartial} more recorded truncated identity samples with at least ${r.claimedSubjectLowerBound.toLocaleString()} retained identities.`
+      ? `${r.claimedSubjectPartial} more kept only part of their per-test results, with at least ${r.claimedSubjectLowerBound.toLocaleString()} tests retained.`
       : null,
     r.claimedSubjectUnavailable ? `${r.claimedSubjectUnavailable} were unavailable.` : null,
   ].filter(Boolean).join(" ")

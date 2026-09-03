@@ -481,7 +481,7 @@ export function presentDiagnostics(layers: TestEvidenceLayers | null | undefined
       ? `${formatCount(knownTotal)}+`
       : "Unavailable"
   const summary = exact
-    ? "Excluded from the verified test identity metric."
+    ? "Excluded from the verified per-test results."
     : knownTotal > 0
       ? `At least ${formatCount(knownTotal)} observations were excluded; one or more groups could not be counted.`
       : "One or more diagnostic observation groups could not be counted."
