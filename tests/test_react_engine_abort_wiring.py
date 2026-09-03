@@ -9,9 +9,10 @@ from sag.agent.phase_machine import PhaseMachine, PhaseOutcome, PhaseTermination
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
-from sag.agent.tool_orchestration import ToolOrchestrator
+from sag.agent.stall_diagnostics import CleanupResult
+from sag.agent.tool_orchestration import ToolExecutionRecord, ToolOrchestrator
 from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
-from sag.evidence import OperationOutcome
+from sag.evidence import InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolResult
 
 
@@ -236,3 +237,342 @@ def test_run_task_abnormal_exit_does_not_record_setup_abort():
     assert engine.phase_machine.records == ()
     assert engine.phase_machine.current_phase == "provision"
     assert engine.phase_machine.termination_state() == "open"
+
+
+def test_run_task_plain_or_empty_text_is_not_completion():
+    for text in ("I am still checking the result.", ""):
+        engine = _engine(
+            turn=NativeTurn(text=text, tool_calls=(), model_used="test-model")
+        )
+
+        succeeded = engine.run_react_loop(
+            "perform one task",
+            max_iterations=2,
+            completion_mode="run_task",
+        )
+
+        assert succeeded is False
+        assert engine.current_iteration == 2
+
+
+def test_run_task_prefixed_first_turn_without_task_tool_evidence_is_not_completion():
+    engine = _engine(
+        turn=NativeTurn(
+            text="TASK COMPLETE: claimed complete before checking anything",
+            tool_calls=(),
+            model_used="test-model",
+        )
+    )
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is False
+    assert any(
+        "no task tool evidence" in str(getattr(step, "content", ""))
+        for step in engine.steps
+    )
+
+
+def test_run_task_accepts_only_prefixed_evidence_consistent_completion():
+    engine = _engine(
+        turn=NativeTurn(
+            text="TASK COMPLETE: the requested diagnostic completed successfully",
+            tool_calls=(),
+            model_used="test-model",
+        )
+    )
+    engine.recent_tool_executions = [
+        ToolExecutionRecord(
+            signature="bash:diagnostic",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.SUCCESS,
+            timestamp="2026-07-26 00:00:00",
+        )
+    ]
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is True
+
+
+def test_run_task_rejects_completion_while_latest_execution_is_failed_or_pending():
+    terminal = NativeTurn(
+        text="TASK COMPLETE: claimed complete despite unresolved execution",
+        tool_calls=(),
+        model_used="test-model",
+    )
+    blocking_states = (
+        (InvocationStatus.COMPLETED, OperationOutcome.FAILED),
+        (InvocationStatus.PENDING, OperationOutcome.UNKNOWN),
+    )
+    for invocation_status, operation_outcome in blocking_states:
+        engine = _engine(turn=terminal)
+        engine.recent_tool_executions = [
+            ToolExecutionRecord(
+                signature="build:test",
+                invocation_status=invocation_status,
+                operation_outcome=operation_outcome,
+                timestamp="2026-07-26 00:00:00",
+            )
+        ]
+
+        succeeded = engine.run_react_loop(
+            "perform one task",
+            max_iterations=1,
+            completion_mode="run_task",
+        )
+
+        assert succeeded is False
+
+
+def test_unrelated_job_settlement_does_not_release_a_pending_completion():
+    engine = _engine(
+        turn=NativeTurn(
+            text="TASK COMPLETE: claimed complete despite another live runner",
+            tool_calls=(),
+            model_used="test-model",
+        )
+    )
+    engine.recent_tool_executions = [
+        ToolExecutionRecord(
+            signature="build:test-live",
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            timestamp="2026-07-26 00:00:00",
+        )
+    ]
+    engine._announced_job_settlements = {"some-other-job"}
+    engine.orchestrator = SimpleNamespace()
+    engine._drain_job_barrier = lambda: "cleared"
+    engine._obligations_still_owed = lambda _orchestrator: [
+        {
+            "job_id": "still-open",
+            "process_state": "running",
+            "settlement_state": "pending",
+        }
+    ]
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is False
+
+
+def test_settled_pending_runner_does_not_require_a_redundant_poll():
+    engine = _engine(
+        turn=NativeTurn(
+            text="TASK COMPLETE: detached verification settled successfully",
+            tool_calls=(),
+            model_used="test-model",
+        )
+    )
+    engine.recent_tool_executions = [
+        ToolExecutionRecord(
+            signature="build:test-detached",
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            timestamp="2026-07-26 00:00:00",
+        )
+    ]
+    engine.orchestrator = SimpleNamespace()
+    engine._drain_job_barrier = lambda: "cleared"
+    engine._obligations_still_owed = lambda _orchestrator: [
+        {
+            "job_id": "job-settled",
+            "process_state": "terminal",
+            "settlement_state": "settled",
+            "settled_receipt_id": "receipt-1",
+        }
+    ]
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is True
+
+
+def test_run_task_allows_a_later_success_with_different_params_after_failure():
+    engine = _engine(
+        turn=NativeTurn(
+            text="TASK COMPLETE: retry completed successfully",
+            tool_calls=(),
+            model_used="test-model",
+        )
+    )
+    engine.recent_tool_executions = [
+        ToolExecutionRecord(
+            signature="build:test",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            timestamp="2026-07-26 00:00:00",
+        ),
+        ToolExecutionRecord(
+            signature="build:test:corrected-working-directory",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.SUCCESS,
+            timestamp="2026-07-26 00:01:00",
+        ),
+    ]
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is True
+
+
+def test_run_task_rejects_when_the_last_actual_tool_result_failed():
+    engine = _engine(
+        turn=NativeTurn(
+            text="TASK COMPLETE: claimed complete after the final failure",
+            tool_calls=(),
+            model_used="test-model",
+        )
+    )
+    engine.recent_tool_executions = [
+        ToolExecutionRecord(
+            signature="search:optional-document",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.SUCCESS,
+            timestamp="2026-07-26 00:00:00",
+        ),
+        ToolExecutionRecord(
+            signature="build:test:final-attempt",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            timestamp="2026-07-26 00:01:00",
+        ),
+    ]
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is False
+
+
+def test_run_task_interrupt_captures_pre_barrier_detached_handle_and_cleans_it(monkeypatch):
+    engine = _engine()
+    handle = {
+        "job_id": "job-new",
+        "pid": 4242,
+        "pgid": 4242,
+        "process_identity_token": "a" * 64,
+        "pid_path": "/tmp/sag_jobs/job-new.pid",
+        "pgid_path": "/tmp/sag_jobs/job-new.pgid",
+        "identity_path": "/tmp/sag_jobs/job-new.identity",
+        "log_path": "/tmp/sag_jobs/job-new.log",
+        "exit_code_path": "/tmp/sag_jobs/job-new.log.exit",
+        "working_directory": "/workspace/p",
+    }
+    orchestrator = SimpleNamespace(
+        _detached_handles={},
+        execute_control_command=lambda *_args, **_kwargs: {
+            "success": True,
+            "exit_code": 0,
+            "output": "",
+        },
+    )
+    engine.orchestrator = orchestrator
+    engine._obligations_still_owed = lambda _orchestrator: []
+    cleaned = []
+
+    def cleanup(_execute, job, **_kwargs):
+        cleaned.append(dict(job))
+        return CleanupResult(
+            job_id=job["job_id"],
+            pgid=job["pgid"],
+            code="killed",
+            term_sent=True,
+            kill_sent=True,
+            group_live=False,
+        )
+
+    monkeypatch.setattr(react_engine_module, "cancel_registered_process_group", cleanup)
+
+    class InterruptAfterDispatch:
+        def get_native_turn(self, _messages, **_kwargs):
+            orchestrator._detached_handles[handle["job_id"]] = dict(handle)
+            raise KeyboardInterrupt
+
+    engine.llm_client = InterruptAfterDispatch()
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is False
+    assert cleaned == [handle]
+    assert engine._ephemeral_job_handles()["job-new"] == handle
+    assert engine._termination_cleanup_results["job-new"].code == "killed"
+
+
+def test_run_task_interrupt_cleans_an_already_registered_detached_job(monkeypatch):
+    engine = _engine(error=KeyboardInterrupt())
+    registered = {
+        "job_id": "job-registered",
+        "pid": 5151,
+        "pgid": 5151,
+        "process_identity_token": "b" * 64,
+        "pid_path": "/tmp/sag_jobs/job-registered.pid",
+        "pgid_path": "/tmp/sag_jobs/job-registered.pgid",
+        "identity_path": "/tmp/sag_jobs/job-registered.identity",
+        "log_path": "/tmp/sag_jobs/job-registered.log",
+        "exit_code_path": "/tmp/sag_jobs/job-registered.log.exit",
+        "working_directory": "/workspace/p",
+    }
+    engine.orchestrator = SimpleNamespace(
+        _detached_handles={},
+        execute_control_command=lambda *_args, **_kwargs: {
+            "success": True,
+            "exit_code": 0,
+            "output": "",
+        },
+    )
+    engine._obligations_still_owed = lambda _orchestrator: [registered]
+    engine._drain_job_barrier = lambda: "cleared"
+    cleaned = []
+
+    def cleanup(_execute, job, **_kwargs):
+        cleaned.append(dict(job))
+        return CleanupResult(
+            job_id=job["job_id"],
+            pgid=job["pgid"],
+            code="terminated_after_term",
+            term_sent=True,
+            group_live=False,
+        )
+
+    monkeypatch.setattr(react_engine_module, "cancel_registered_process_group", cleanup)
+
+    succeeded = engine.run_react_loop(
+        "perform one task",
+        max_iterations=1,
+        completion_mode="run_task",
+    )
+
+    assert succeeded is False
+    assert cleaned == [registered]
+    assert engine._termination_cleanup_results["job-registered"].code == (
+        "terminated_after_term"
+    )

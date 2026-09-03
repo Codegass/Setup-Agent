@@ -1,9 +1,12 @@
-"""The band table and rate grains — the spec's §3 contract, edge-exact.
+"""The band table, historical grains, and same-grain snapshot metrics.
 
 Bands: fully==100, most>=75, half>=50, few>0, none==0, unavailable when the
-denominator is absent. Grains are never folded; red tests demote exactly
-fully->most on the cases grain and nothing else (spec §4).
+denominator is absent. The historical heavy-red and unbounded validators remain
+strict, while new canonical test cases account runtime outcomes against runtime
+executions and expose project-owned red separately.
 """
+
+from copy import deepcopy
 
 import pytest
 
@@ -13,6 +16,8 @@ from sag.verdict_rates import (
     demote_heavy_red,
     derived_verdict_word,
     render_rate_lines,
+    render_snapshot_metric_lines,
+    source_scope_coverage,
 )
 
 
@@ -208,3 +213,116 @@ def test_any_unbounded_grain_raises_exactly_one_conflict():
     assert unbounded_conflicts(ok, bad) == (UNBOUNDED_CONFLICT,)
     assert unbounded_conflicts(bad, bad) == (UNBOUNDED_CONFLICT,), "one conflict, not two"
     assert unbounded_conflicts(GrainRate(0, None), ok) == (), "absence is not unboundedness"
+
+
+def _sealed_commons_cli_snapshot() -> dict:
+    return {
+        "schema_version": 4,
+        "verdict": "success",
+        "build_evidence": {
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "source_files": 36,
+            "compiled_classes": 56,
+            "refs": ["receipt://maven-build"],
+        },
+        "test_stats": {
+            "discovered": 468,
+            "judgment": "success",
+            "unique": {
+                "executed": 987,
+                "passed": 926,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 61,
+            },
+        },
+        "rates": {
+            "build": {
+                "modules": GrainRate(1, 1).payload(),
+                "classes": GrainRate(
+                    0,
+                    None,
+                    reason="class files are diagnostic and not comparable to Java source files",
+                ).payload(),
+            },
+            "test": {
+                "cases": GrainRate(987, 987).payload(),
+                "modules": GrainRate(1, 1).payload(),
+            },
+            "coverage": {"status": "unavailable", "reason": "coverage pass not run"},
+        },
+        "conflicts": [],
+        "phase_records": [
+            {
+                "phase": "build",
+                "termination": "completed",
+                "validated_outcome": "success",
+            }
+        ],
+    }
+
+
+def test_source_scope_coverage_requires_independent_full_build_authority():
+    coverage = source_scope_coverage(_sealed_commons_cli_snapshot())
+
+    assert coverage == {
+        "availability": "available",
+        "covered": 36,
+        "total": 36,
+        "basis": "sealed physical build success over validated full module scope",
+        "reason": None,
+        "evidence_refs": ["receipt://maven-build"],
+    }
+
+
+@pytest.mark.parametrize("broken", ["physical", "phase", "modules", "scope_conflict"])
+def test_source_scope_coverage_refuses_incomplete_authority(broken):
+    snapshot = _sealed_commons_cli_snapshot()
+    if broken == "physical":
+        snapshot["build_evidence"]["source"] = "observations"
+    elif broken == "phase":
+        snapshot["phase_records"][0]["validated_outcome"] = "partial"
+    elif broken == "modules":
+        snapshot["rates"]["build"]["modules"] = GrainRate(1, 2).payload()
+    else:
+        snapshot["conflicts"] = ["build_coverage_scope_unverified"]
+
+    coverage = source_scope_coverage(snapshot)
+
+    assert coverage["availability"] == "unavailable"
+    assert coverage["covered"] is None
+    assert coverage["total"] == 36
+    assert coverage["reason"]
+
+
+def test_snapshot_metric_lines_use_same_grain_counts_and_keep_diagnostics():
+    snapshot = _sealed_commons_cli_snapshot()
+
+    assert render_snapshot_metric_lines(snapshot) == [
+        (
+            "Build: SUCCESS · production Java sources 36/36 · modules 1/1 · "
+            "class files 56 (diagnostic)"
+        ),
+        (
+            "Tests: SUCCESS · outcomes accounted 987/987 · "
+            "non-skipped passed 926/926 · skipped 61 · failed 0 · errors 0 · "
+            "static declarations 468 (diagnostic)"
+        ),
+        "Coverage: unavailable — coverage pass not run",
+    ]
+
+
+def test_snapshot_metric_test_state_is_failed_when_runtime_results_are_red():
+    snapshot = deepcopy(_sealed_commons_cli_snapshot())
+    snapshot["test_stats"]["unique"].update(passed=925, failed=1)
+
+    _, test_line, _ = render_snapshot_metric_lines(snapshot)
+
+    assert test_line.startswith("Tests: FAILED · outcomes accounted 987/987")
+    assert "non-skipped passed 925/926" in test_line
+    assert "failed 1 · errors 0" in test_line

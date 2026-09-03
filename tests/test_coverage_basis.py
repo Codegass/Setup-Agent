@@ -1,5 +1,5 @@
 # tests/test_coverage_basis.py
-"""Plan 8 stages 3-4 — a check that could derive nothing said everything passed.
+"""Build-output scope and denominator authority regression tests.
 
 Live evidence: p7d polaris (`logs/session_20260729_111737_22356`). The model
 claimed `partial` while its compile job was still running, and the build gate
@@ -20,11 +20,10 @@ receipt, the failed Java-17 compile, has no such field):
 1. the survey cannot parse polaris's Kotlin settings, so
    `root_shape: single_module`, `build_islands: []` — NO per-module class
    expectation could be derived;
-2. with nothing to check, `_verify_expected_artifacts` returned
-   `class_coverage: 1.0` (physical_validator.py, the `classes_expected > 0`
-   else-branch) and `validate_build_status` read that as ">= threshold". The
-   hard JVM gate catches only the zero-classes case, and the in-flight job had
-   already compiled `build-logic`, so `class_count` was 1,706;
+2. with nothing to check, `_verify_expected_artifacts` historically returned a
+   synthetic class/source fraction and `validate_build_status` read it as a
+   threshold. Class files and source files are now separate grains: the former
+   is diagnostic, while expected output paths and module scope decide;
 3. `module_coverage()` — which KNEW 1/26 — reached the sentence through
    `phase_gates.py:1010-1012`, appended to a string nobody consumed.
 
@@ -233,10 +232,10 @@ def _met_expectation_validator(
 ):
     """A Maven build whose ONE derived class expectation is fully MET on disk.
 
-    The point of the shape: with `all_present` True and `class_coverage` 1.0 at a
-    100% threshold, nothing else in `validate_build_status` stands between this
-    state and a complete success — so whether the build is complete is decided by
-    the §3.5 denominator rung alone, and deleting the cap changes the verdict.
+    The point of the shape: with `all_present` True, the expected-output check
+    allows a complete success. Whether the build is actually complete is then
+    decided by the §3.5 denominator rung alone, and deleting the cap changes the
+    verdict.
     `_verify_expected_artifacts` is the real one: the classes are on the fake
     filesystem and are counted there.
     """
@@ -372,13 +371,10 @@ class ReceiptFilesystem(FakeBuildOrchestrator):
 
 
 # ---------------------------------------------------------------------------
-# §3.4 — coverage carries its basis
+# §3.4 — source census is not class-file coverage
 # ---------------------------------------------------------------------------
-def test_no_derivable_class_expectation_states_no_basis_instead_of_full_coverage():
-    """`classes_expected == 0` is "nothing to check", not "everything passed".
-
-    The old else-branch returned 1.0 and every caller read a met threshold.
-    """
+def test_no_derivable_class_expectation_exposes_no_pseudo_coverage():
+    """No Java-source census must not manufacture a class/source fraction."""
     validator = _polaris_validator()
 
     result = validator._verify_expected_artifacts(
@@ -386,12 +382,13 @@ def test_no_derivable_class_expectation_states_no_basis_instead_of_full_coverage
         [{"path": "/workspace/polaris/build/libs", "type": "jar", "artifact": "main JAR"}],
     )
 
-    assert result["basis"] == "none"
+    assert result["classes_expected"] == 0
     assert "class_coverage" not in result
+    assert "classes_found" not in result
 
 
-def test_a_derived_expectation_still_states_its_fraction():
-    """basis `derived` is today's arithmetic, byte for byte."""
+def test_a_source_bearing_path_needs_output_not_one_class_per_source():
+    """Five class files satisfy an output path derived from ten sources."""
     orch = FakeBuildOrchestrator(
         files={f"/workspace/m/target/classes/C{n}.class" for n in range(5)}
     )
@@ -409,39 +406,35 @@ def test_a_derived_expectation_still_states_its_fraction():
         ],
     )
 
-    assert result["basis"] == "derived"
-    assert result["class_coverage"] == 0.5
+    assert result["all_present"] is True
     assert result["classes_expected"] == 10
-    assert result["classes_found"] == 5
+    assert "class_coverage" not in result
+    assert "classes_found" not in result
 
 
 def test_the_polaris_snapshot_is_partial_and_says_what_it_actually_knows():
-    """1,706 classes is a fact; "100% of expected" was not one."""
+    """Class count is diagnostic; the missing expected output makes it partial."""
     result = _polaris_validator().validate_build_status("polaris")
 
     assert result["success"] is True
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
     assert "build_modules_incomplete" in result["conflicts"]
-    assert "compiled 1,706 classes" in result["reason"]
-    assert "no class-based expectation could be derived" in result["reason"]
-    assert "coverage has no basis" in result["reason"]
+    assert result["evidence"]["class_count"] == 1706
+    assert "1 expected artifact(s) are missing or empty" in result["reason"]
+    assert "main JAR" in result["reason"]
     assert "100%" not in result["reason"]
 
 
-def test_no_basis_with_nothing_compiled_is_blocked_not_partial():
-    """The zero-classes arm of the same rule — the hard JVM gate, stated once.
-
-    Vendored jars are present (so the old `jvm_no_compiled_evidence` branch,
-    which also requires `not has_artifacts`, does not fire); nothing compiled,
-    and nothing could be derived. That is BLOCKED, never a partial credit.
-    """
+def test_missing_resolved_output_with_no_other_output_is_blocked_not_partial():
+    """An absent expected JAR and no other real output is BLOCKED."""
     result = _polaris_validator(class_count=0).validate_build_status("polaris")
 
     assert result["success"] is False
     assert result["build_complete"] is False
     assert result["evidence_status"] == "blocked"
-    assert "compiled" in result["reason"].lower()
+    assert "No real build output found" in result["reason"]
+    assert "main JAR" in result["reason"]
 
 
 def test_a_derived_and_met_jar_expectation_is_a_basis_and_stays_a_full_success():
@@ -481,45 +474,21 @@ def test_an_unmet_expectation_with_no_class_number_names_what_is_missing():
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
     assert "main JAR" in result["reason"]
-    assert "no class-based expectation could be derived" in result["reason"]
+    assert "expected classes" not in result["reason"]
 
 
-def test_a_met_expectation_with_nothing_compiled_is_blocked_not_a_complete_success():
-    """The arm round two re-opened.
-
-    `and not coverage_info["all_present"]` routed basis-`none` with ZERO compiled
-    classes into the met branch, so a jar on disk (checked in, vendored, or left
-    by an earlier build) and nothing compiled graded as a complete success. §3.4
-    mandates BLOCKED for the zero-classes arm, and `jvm_no_compiled_evidence` does
-    not catch it: that branch also requires `not has_artifacts`, and the jar IS an
-    artifact.
-    """
+def test_a_resolved_jar_output_without_java_source_obligation_can_succeed():
+    """A resolved expected JAR is valid for a Kotlin/Scala/Groovy-only module."""
     result = _polaris_validator(class_count=0, jar_on_disk=True).validate_build_status("polaris")
 
-    assert result["success"] is False
-    assert result["build_complete"] is False
-    assert result["evidence_status"] == "blocked"
-    assert "No compiled .class files found for gradle build" in result["reason"]
-    # And the sentence states which of the two zero-class shapes this is: the
-    # expectations were MET and nothing compiled, which is a different fact from
-    # "nothing compiled and the expectations are missing too".
-    assert (
-        "the expected artifact(s) are present (main JAR) but nothing compiled" in result["reason"]
-    )
-    assert "All expected build artifacts found" not in result["reason"]
+    assert result["success"] is True
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert "All expected build artifacts found: main JAR" in result["reason"]
 
 
-def test_the_four_arms_of_the_no_basis_rule_are_pinned_as_a_set():
-    """§3.4's four cases, stated together because fixing one re-opened the other.
-
-    Round one keyed the branch on "no class-based expectation" alone, so a met JAR
-    expectation (a Kotlin module: sources under `src/main/kotlin`, no `classes`
-    entry derived) could not reach a full success. Round two added
-    `and not all_present`, which re-opened the zero-classes direction. The two
-    questions are orthogonal — was a derived expectation MET, and did anything
-    compile — and only pinning the whole table keeps a later fix to one arm from
-    breaking another.
-    """
+def test_the_four_arms_of_a_non_java_expected_output_are_pinned_as_a_set():
+    """Expected-output presence and unrelated class diagnostics are orthogonal."""
 
     def _verdict(**kwargs):
         result = _polaris_validator(**kwargs).validate_build_status("polaris")
@@ -529,21 +498,21 @@ def test_the_four_arms_of_the_no_basis_rule_are_pinned_as_a_set():
     assert _verdict(class_count=1706, jar_on_disk=False) == ("partial", True, False)
     # (expectation unmet, nothing compiled) -> BLOCKED
     assert _verdict(class_count=0, jar_on_disk=False) == ("blocked", False, False)
-    # (expectation MET, classes compiled) -> SUCCESS: a met expectation is a basis
+    # (expectation MET, classes compiled) -> SUCCESS
     assert _verdict(class_count=900, jar_on_disk=True) == ("success", True, True)
-    # (expectation MET, nothing compiled) -> BLOCKED: the hard JVM gate
-    assert _verdict(class_count=0, jar_on_disk=True) == ("blocked", False, False)
+    # (expectation MET, no Java-source obligation) -> SUCCESS
+    assert _verdict(class_count=0, jar_on_disk=True) == ("success", True, True)
 
 
-def test_a_derived_basis_keeps_todays_thresholds_and_messages():
-    """Regression fence: nothing about the derived path moves."""
+def test_missing_expected_outputs_ignore_legacy_thresholds_and_name_the_outputs():
+    """Class/source ratios cannot upgrade or describe a missing output."""
     result = _coverage_validator(0.5, found=["a"], missing=["b", "c", "d"], threshold=0.75)
     result = result.validate_build_status("m")
 
     assert result["success"] is True
     assert result["build_complete"] is False
-    assert "2 of 4 expected classes" in result["reason"]
-    assert "2 short" in result["reason"]
+    assert "3 expected artifact(s) are missing or empty: b, c, d" in result["reason"]
+    assert "expected classes" not in result["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +908,7 @@ def test_a_full_scan_leaves_a_complete_build_complete():
 def test_a_persisted_structure_never_narrows_this_passs_denominator():
     """The P0-F direction, on the #17 narrowing input.
 
-    26 module expectations, 10 of 260 expected classes built. The manifest
+    26 module expectations, with output present only for m0. The manifest
     carries a receipt-proven structure from an earlier SCOPED dispatch
     (`mvn -pl m0` -> modules `['m0']`), while this pass's own dispatches stated
     nothing (`_attempted_module_evidence()` reports no modules — a single-module
@@ -959,9 +928,9 @@ def test_a_persisted_structure_never_narrows_this_passs_denominator():
     assert result["success"] is True
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
-    assert "Built 10 of 260 expected classes" in result["reason"]
-    assert "250 short" in result["reason"]
-    assert "25 module(s) incomplete" in result["reason"]
+    assert "25 expected artifact(s) are missing or empty" in result["reason"]
+    assert "m1 classes (no compiled classes found)" in result["reason"]
+    assert "expected classes" not in result["reason"]
     assert "inv-maven-2-0002" not in result["reason"]
     assert result["evidence"].get("modules_attempted") is None
 
@@ -1043,7 +1012,7 @@ def test_the_unnarrowed_state_cannot_pair_a_passing_verdict_with_a_minority_scan
 
     The gate's composed sentence is the thing the model was shown, so the pin is
     on that string. The verdict is no longer passing; and the clause that DECIDED
-    now leads it, with the coverage check's own finding kept but subordinated — a
+    now leads it, with the artifact check's own finding kept but subordinated — a
     met one-jar expectation is a true fact and stays in the sentence, it just may
     not stand at the head of a sentence whose next clause says 1/26.
     """
@@ -1058,7 +1027,7 @@ def test_the_unnarrowed_state_cannot_pair_a_passing_verdict_with_a_minority_scan
     assert observation.reason.startswith(
         "Not a complete build — the module scan owns the denominator and 1 of 26 modules"
     )
-    assert "(coverage check: All expected build artifacts found: main JAR)" in observation.reason
+    assert "(artifact check: All expected build artifacts found: main JAR)" in observation.reason
     assert "Module coverage: 1/26 built" in observation.reason
     assert "100%" not in observation.reason
 
@@ -1097,9 +1066,8 @@ def test_the_authority_is_the_scoping_outcome_not_the_existence_of_a_receipt():
 def test_the_minority_scan_cap_is_what_stops_a_met_coverage_from_completing():
     """The §3.5 cap itself, pinned where deleting it changes the verdict.
 
-    One derived class expectation, fully met, at a 100% threshold: `all_present`
-    and `class_coverage == 1.0`, so every other arm of `validate_build_status`
-    says complete. What makes this build incomplete is the denominator rung — the
+    One derived output expectation is present, so the artifact check says
+    complete. What makes this build incomplete is the denominator rung — the
     scan owns it (no receipt narrowed anything) and it counted 1 of 26. Delete
     `ModuleBasis.states_a_shortfall`'s scan clause and this build is a full
     success again, which is the p7d polaris grade.
@@ -1111,7 +1079,8 @@ def test_the_minority_scan_cap_is_what_stops_a_met_coverage_from_completing():
     )
     result = validator.validate_build_status("proj")
 
-    assert (coverage["all_present"], coverage["class_coverage"]) == (True, 1.0)
+    assert coverage["all_present"] is True
+    assert "class_coverage" not in coverage
     assert result["success"] is True
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
@@ -1266,7 +1235,8 @@ def test_a_crashed_dispatchs_modules_still_count_as_claimants():
     assert result["evidence_status"] == "partial"
     assert "build_modules_incomplete" in result["conflicts"]
     assert "build_receipt_not_terminal" in result["conflicts"]
-    assert "Built 10 of 260 expected classes" in result["reason"]
+    assert "25 expected artifact(s) are missing or empty" in result["reason"]
+    assert "expected classes" not in result["reason"]
 
 
 def test_two_terminal_dispatches_still_narrow_to_the_union_of_what_they_attempted():
@@ -1313,8 +1283,8 @@ def test_the_capped_reason_names_the_check_that_actually_produced_the_clause():
 
     The capped rewrite subordinates whatever the deciding branch said and
     parenthesises it. On the branch that decided from build FINGERPRINTS no
-    coverage check ran at all (`coverage_info` is None — no expectation of any
-    kind could be derived), and labelling that sentence `coverage check:` tells
+    artifact check ran at all (`coverage_info` is None — no expectation of any
+    kind could be derived), and labelling that sentence `artifact check:` tells
     the model a check produced a finding it never produced.
     """
     validator = _polaris_validator(scan=_polaris_scan())
@@ -1324,7 +1294,7 @@ def test_the_capped_reason_names_the_check_that_actually_produced_the_clause():
 
     assert result["build_complete"] is False
     assert "(build check: Build fingerprints found for gradle project)" in result["reason"]
-    assert "coverage check:" not in result["reason"]
+    assert "artifact check:" not in result["reason"]
 
 
 def test_no_degraded_read_of_the_same_receipts_can_improve_the_verdict():
@@ -1338,9 +1308,9 @@ def test_no_degraded_read_of_the_same_receipts_can_improve_the_verdict():
     degradation must leave the verdict EQUAL or WORSE than the clean read of the
     same container.
 
-    The sharp corner is the met-expectation shape: one expectation for `m0`,
-    fully met at a 100% threshold, so nothing else in `validate_build_status`
-    stands between it and a complete success. Clean, the wide reactor receipt
+    The sharp corner is the met-expectation shape: one expected output for `m0`
+    is present, so nothing else in `validate_build_status` stands between it and
+    a complete success. Clean, the wide reactor receipt
     names 26 modules the expectation list does not contain, the narrowing is
     refused and the verdict capped. Lose that receipt to an unparseable line and
     the scoped `-pl m0` receipt is the only statement left: it narrows cleanly,

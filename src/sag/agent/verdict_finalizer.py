@@ -20,11 +20,9 @@ from sag.utils.container_io import compare_publish_container_text_atomic
 from sag.verdict import COUNT_DERIVED_CONFLICTS, rescue_blocked_build, run_verdict
 from sag.verdict_rates import (
     UNATTRIBUTED_CONFLICT,
-    UNBOUNDED_REASON,
     UNREADABLE_REPORT_CONFLICT,
     GrainRate,
     band_for,
-    demote_heavy_red,
     derived_verdict_word,
     unbounded_conflicts,
 )
@@ -1122,7 +1120,7 @@ def _excluded_volume_clauses(
 
 
 def _census_clauses(stats: SnapshotTestStats) -> list[str]:
-    """What the denominator says about itself, in the grain that uses it.
+    """Diagnostic context for the static declaration census.
 
     Two statements, and they are mutually exclusive on purpose (#39 §2.2/§2.4):
 
@@ -1173,23 +1171,22 @@ def _census_clauses(stats: SnapshotTestStats) -> list[str]:
 
 
 def _cases_reason(stats: SnapshotTestStats, excluded: str) -> str | None:
-    """The one sentence the cases grain carries beside its fraction.
+    """Diagnostics beside same-grain runtime outcome accounting.
 
-    An UNBOUNDED grain opens with the band's own sentence: its numbers are on
-    the line already, so repeating them would say the ratio twice and the
-    reason not at all. Every other grain opens with the counts, because a
-    clause about excluded volume beside a bare fraction leaves a reader
-    guessing which of the two numbers it belongs to.
+    Static declarations remain visible, including census quality and
+    parameterized expansion, but are explicitly not the runtime denominator.
+    Excluded receipt/report volume keeps the same disclosure it had before.
     """
-    clauses = _census_clauses(stats)
+    clauses: list[str] = []
+    if stats.discovered is not None:
+        clauses.append(
+            f"{stats.discovered:,} static test declarations observed "
+            "(diagnostic only; not the runtime denominator)"
+        )
+    clauses.extend(_census_clauses(stats))
     if excluded:
         clauses.append(excluded)
-    if not clauses:
-        return None
-    body = "; ".join(clauses)
-    if stats.unique.executed > (stats.discovered or 0):
-        return f"{UNBOUNDED_REASON} — {body}"
-    return f"{stats.unique.executed}/{stats.discovered} — {body}"
+    return "; ".join(clauses) or None
 
 
 def test_grain_rates(
@@ -1197,7 +1194,14 @@ def test_grain_rates(
     driven_modules: set[str],
     test_modules: set[str],
 ) -> tuple[dict[str, GrainRate], tuple[str, ...]]:
-    """Return execution-based test case and surveyed-module grains."""
+    """Return runtime-outcome accounting and surveyed-module grains.
+
+    The cases grain is one conservation check: every receipt-scoped runtime
+    execution must have exactly one terminal outcome.  Static discovery is a
+    separate diagnostic population and never supplies this denominator.
+    Project-owned failures remain visible in their raw counts and in the
+    snapshot-aware renderer; they do not change setup execution coverage.
+    """
 
     unattributed = _unattributed_executions(stats)
     unattributed_unparseable = _excluded_unparseable(stats.auxiliary_test_stats)
@@ -1212,31 +1216,33 @@ def test_grain_rates(
             unattributed_source=stats.unattributed_source,
         )
     )
-    if stats.discovered:
+    accounted = stats.unique.passed + stats.unique.failed + stats.unique.errors + stats.unique.skipped
+    reason = _cases_reason(stats, excluded)
+    conflicts: tuple[str, ...] = ()
+    if stats.unique.executed > 0 and accounted == stats.unique.executed:
         cases = GrainRate(
-            numerator=stats.unique.executed,
-            denominator=stats.discovered,
-            reason=_cases_reason(stats, excluded),
+            numerator=accounted,
+            denominator=stats.unique.executed,
+            reason=reason,
         )
-    else:
-        # Both volumes or neither: without a denominator the grain shows no
-        # ratio, so the attributed count has to be IN the sentence or a reader
-        # sees the excluded volume alone and reads it as the whole story.
+    elif stats.unique.executed > 0:
+        mismatch = (
+            f"runtime outcomes do not reconcile: {accounted} accounted for "
+            f"{stats.unique.executed} executions"
+        )
         cases = GrainRate(
             0,
             None,
-            reason=(
-                f"{stats.unique.executed} executed, static discovery found no count — {excluded}"
-                if excluded
-                else "static discovery found no count"
-            ),
+            reason=f"{mismatch}; {reason}" if reason else mismatch,
         )
-    cases, conflicts = demote_heavy_red(
-        cases,
-        failed=stats.unique.failed,
-        errors=stats.unique.errors,
-        executed=stats.unique.executed,
-    )
+        conflicts = ("validated_test_stats_invalid",)
+    else:
+        absent = "no receipt-scoped runtime outcomes were accounted"
+        cases = GrainRate(
+            0,
+            None,
+            reason=f"{absent}; {reason}" if reason else absent,
+        )
     if unattributed or unattributed_unparseable:
         # Visibility without authority: the volume is named, never counted.
         # An unclaimed report the parser could not open has no volume to state

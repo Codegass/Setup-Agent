@@ -589,6 +589,13 @@ class GradleBackend:
         kwargs: Dict[str, Any] = {
             "tasks": task,
             "working_directory": working_directory,
+            # The facade promises to run the project's declared entrypoint, not
+            # to opt that project into optional Gradle performance features.
+            # In particular, old but project-owned wrappers (for example
+            # Gradle 2.3) reject --build-cache before running any task.  Keep
+            # cache use available to an explicit internal-tool caller, while
+            # the ecosystem-neutral build facade stays version-compatible.
+            "build_cache": False,
             # Single pre-flight ownership: the facade owns pre-flight/retry/
             # [scope] on this path (see MavenBackend.run).
             "_env_preflight": False,

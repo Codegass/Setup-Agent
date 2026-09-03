@@ -5,12 +5,15 @@ import type { TestEvidenceLayers, TestSummary } from "@/api/types"
 import {
   buildScopeFromRates,
   completeEvidenceCounts,
+  lowerBoundEvidenceCounts,
   presentBuild,
   presentDataNotes,
   presentDiagnostics,
+  presentTestAccounting,
   presentTestRun,
   presentVerifiedIdentities,
   safeRate,
+  sourceScopeFromBuild,
 } from "./evidencePresentation"
 
 function unavailable(reason = "module-qualified subject/case identity was not sealed") {
@@ -80,7 +83,7 @@ describe("evidence presentation", () => {
       available: false,
       value: "Unavailable",
     })
-    expect(presentVerifiedIdentities(test).summary).toMatch(/module-qualified test identities/i)
+    expect(presentVerifiedIdentities(test).summary).toMatch(/module and test names were not sealed/i)
     expect(presentVerifiedIdentities(test).summary).not.toMatch(/tests ran/i)
   })
 
@@ -104,6 +107,112 @@ describe("evidence presentation", () => {
       },
     })))
     expect(claimed).toMatchObject({ available: true, value: "80%", negative: 20 })
+  })
+
+  it("accounts for every Commons CLI receipt outcome without treating skips as failures", () => {
+    const receiptExecutions = {
+      executed: 987,
+      passed: 926,
+      failed: 0,
+      errors: 0,
+      skipped: 61,
+      availability: "available" as const,
+    }
+    const accounting = presentTestAccounting(withLayers({}, layers({
+      claimed: {
+        latestSubjects: unavailable(),
+        latestCases: unavailable(),
+        receiptExecutions,
+      },
+    })))
+
+    expect(accounting).toMatchObject({
+      available: true,
+      accounted: 987,
+      nonSkipped: 926,
+      counts: {
+        executed: 987,
+        passed: 926,
+        failed: 0,
+        errors: 0,
+        skipped: 61,
+      },
+    })
+    expect(accounting.summary).toBe(
+      "Test outcomes recorded 987 / 987 · Non-skipped passed 926 / 926 · Skipped 61 · Failed / errors 0 / 0",
+    )
+  })
+
+  it("does not turn an all-skipped receipt into a non-skipped 0 / 0 ratio", () => {
+    const accounting = presentTestAccounting(withLayers({}, layers({
+      claimed: {
+        latestSubjects: unavailable(),
+        latestCases: unavailable(),
+        receiptExecutions: {
+          executed: 7,
+          passed: 0,
+          failed: 0,
+          errors: 0,
+          skipped: 7,
+          availability: "available",
+        },
+      },
+    })))
+
+    expect(accounting.available).toBe(true)
+    expect(accounting.accounted).toBe(7)
+    expect(accounting.nonSkipped).toBe(0)
+    expect(accounting.summary).toBe(
+      "Test outcomes recorded 7 / 7 · Non-skipped passed unavailable · Skipped 7 · Failed / errors 0 / 0",
+    )
+    expect(accounting.summary).not.toContain("Non-skipped passed 0 / 0")
+  })
+
+  it.each([
+    {
+      label: "bounded",
+      receipt: {
+        executed: 500,
+        passed: 500,
+        failed: 0,
+        errors: 0,
+        skipped: 0,
+        availability: "partial" as const,
+        bound: "lower" as const,
+      },
+      copy: /minimum, not the complete count/i,
+    },
+    {
+      label: "unavailable",
+      receipt: unavailable("receipt outcomes unavailable"),
+      copy: /unavailable/i,
+    },
+    {
+      label: "invalid",
+      receipt: {
+        executed: 2,
+        passed: 2,
+        failed: 1,
+        errors: 0,
+        skipped: 0,
+        availability: "available" as const,
+      },
+      copy: /incomplete or inconsistent/i,
+    },
+  ])("does not fabricate a $label receipt ratio", ({ receipt, copy }) => {
+    const accounting = presentTestAccounting(withLayers({}, layers({
+      claimed: {
+        latestSubjects: unavailable(),
+        latestCases: unavailable(),
+        receiptExecutions: receipt,
+      },
+    })))
+
+    expect(accounting.available).toBe(false)
+    expect(accounting.accounted).toBeNull()
+    expect(accounting.nonSkipped).toBeNull()
+    expect(accounting.summary).toMatch(copy)
+    expect(accounting.summary).not.toMatch(/\d[\d,]* \/ \d/)
   })
 
   it("never presents a Kogito-shaped run with failed results as passed", () => {
@@ -135,6 +244,40 @@ describe("evidence presentation", () => {
     expect(safeRate(0, 0)).toBeNull()
   })
 
+  it("renders a bounded-empty identity sample as an amber zero floor, never a clean zero", () => {
+    const boundedEmpty = {
+      executed: 0,
+      passed: 0,
+      failed: 0,
+      errors: 0,
+      skipped: 0,
+      availability: "partial" as const,
+      bound: "lower" as const,
+      basis: "latest module-qualified subjects (bounded identity sample)",
+      reason: "identity rows were bounded and truncated",
+    }
+    expect(completeEvidenceCounts(boundedEmpty)).toBeNull()
+    expect(lowerBoundEvidenceCounts(boundedEmpty)).toEqual({
+      executed: 0, passed: 0, failed: 0, errors: 0, skipped: 0,
+    })
+
+    const presented = presentVerifiedIdentities(withLayers({}, layers({
+      claimed: {
+        latestSubjects: boundedEmpty,
+        latestCases: unavailable(),
+        receiptExecutions: boundedEmpty,
+      },
+    })))
+    expect(presented).toMatchObject({
+      available: true,
+      partial: true,
+      value: "≥0",
+      tone: "amber",
+      passRate: null,
+    })
+    expect(presented.summary).toMatch(/at least these per-test results were kept/i)
+  })
+
   it("marks a diagnostic total as a lower bound when any bucket is unavailable", () => {
     const result = presentDiagnostics(layers({
       quarantinedObservations: {
@@ -157,8 +300,49 @@ describe("evidence presentation", () => {
       state: "partial", tool: "sealed snapshot", time: "—", note: "", classCount: 4230,
     }, rates)).toMatchObject({
       value: "Partial",
-      summary: "Evidence covers 19 of 26 modules · 4,230 compiled classes · Scope incomplete",
+      summary: "Modules 19 / 26 · Scope incomplete",
     })
+  })
+
+  it("shows comparable production sources but never substitutes compiled classes", () => {
+    const build = {
+      state: "success",
+      tool: "sealed snapshot",
+      time: "—",
+      note: "",
+      classCount: 56,
+      sourceScope: {
+        covered: 36,
+        total: 36,
+        availability: "available" as const,
+        basis: "sealed physical build success over validated full module scope",
+      },
+    }
+    expect(sourceScopeFromBuild(build)).toEqual({ covered: 36, total: 36 })
+    expect(presentBuild(build, {
+      build: { modules: { numerator: 1, denominator: 1, rate: 100, band: "fully" } },
+    })).toMatchObject({
+      value: "Success",
+      summary: "Production Java sources 36 / 36 · Modules 1 / 1",
+    })
+    expect(presentBuild(build).summary).not.toMatch(/class/i)
+  })
+
+  it.each([
+    { availability: "unavailable" as const, covered: null, total: 36 },
+    { availability: "available" as const, covered: 37, total: 36 },
+    { availability: "available" as const, covered: 0, total: 0 },
+  ])("does not show an invalid or unavailable source-scope ratio", (sourceScope) => {
+    const build = {
+      state: "success",
+      tool: "sealed snapshot",
+      time: "—",
+      note: "",
+      classCount: 56,
+      sourceScope,
+    }
+    expect(sourceScopeFromBuild(build)).toBeNull()
+    expect(presentBuild(build).summary).toBe("No comparable build-scope counts were recorded.")
   })
 
   it("presents phases that were never entered without showing zero coverage", () => {
@@ -171,6 +355,7 @@ describe("evidence presentation", () => {
       tone: "neutral",
       summary: "Build was not run.",
       scope: null,
+      sourceScope: null,
     })
 
     expect(presentTestRun({

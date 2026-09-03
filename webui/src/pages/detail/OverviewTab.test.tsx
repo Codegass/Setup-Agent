@@ -120,20 +120,63 @@ describe("OverviewTab", () => {
     expect(onOpenFlow).toHaveBeenCalledTimes(1)
   })
 
-  it("separates the sealed test run, verified identities, and canonical build", () => {
-    render(<OverviewTab detail={makeDetail()} onOpenFlow={() => {}} />)
-    const runTile = screen.getByText("Test run").parentElement
-    expect(runTile).not.toBeNull()
-    expect(within(runTile as HTMLElement).getByText("Failed")).toHaveClass("text-status-failed")
-    expect(within(runTile as HTMLElement).getByText(/1,186 passed · 7 failed · 0 errors/)).toBeInTheDocument()
-    expect(within(runTile as HTMLElement).getByText(/99.4% of non-skipped results passed/)).toBeInTheDocument()
-
-    const identityTile = screen.getByText("Verified test identities").parentElement
-    expect(within(identityTile as HTMLElement).getByText("Unavailable")).toBeInTheDocument()
-    expect(within(identityTile as HTMLElement).getByText(/verified test identities were not produced/i)).toBeInTheDocument()
+  it("shows the Commons CLI source and receipt outcome accounting", () => {
+    const evidenceLayers = unavailableSubjectLayers()
+    evidenceLayers.tests.claimed.receiptExecutions = {
+      executed: 987,
+      passed: 926,
+      failed: 0,
+      errors: 0,
+      skipped: 61,
+      availability: "available",
+    }
+    render(
+      <OverviewTab
+        detail={makeDetail({
+          build: {
+            state: "success",
+            tool: "sealed snapshot",
+            time: "—",
+            note: "Canonical build evidence from verdict.json",
+            classCount: 56,
+            sourceScope: {
+              covered: 36,
+              total: 36,
+              availability: "available",
+              basis: "sealed physical build success over validated full module scope",
+              evidenceRefs: ["output_build"],
+            },
+          },
+          rates: {
+            build: { modules: { numerator: 1, denominator: 1, rate: 100, band: "fully" } },
+          },
+          test: {
+            state: "success",
+            pass: 926,
+            fail: 0,
+            errors: 0,
+            skip: 61,
+            total: 987,
+            evidenceLayers,
+          },
+        })}
+        onOpenFlow={() => {}}
+      />,
+    )
 
     const buildTile = screen.getAllByText("Build")[0].parentElement
-    expect(within(buildTile as HTMLElement).getByText("Passed")).toHaveClass("text-status-success")
+    expect(within(buildTile as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
+    expect(within(buildTile as HTMLElement).getByText(/Production Java sources 36 \/ 36/)).toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).getByText(/Modules 1 \/ 1/)).toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).queryByText(/56 compiled classes/i)).not.toBeInTheDocument()
+
+    const testTile = screen.getAllByText("Tests")[0].parentElement
+    expect(within(testTile as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
+    expect(within(testTile as HTMLElement).getByText(/Test outcomes recorded 987 \/ 987/)).toBeInTheDocument()
+    expect(within(testTile as HTMLElement).getByText(/Non-skipped passed 926 \/ 926/)).toBeInTheDocument()
+    expect(within(testTile as HTMLElement).getByText(/Skipped 61/)).toBeInTheDocument()
+    expect(within(testTile as HTMLElement).getByText(/Failed \/ errors 0 \/ 0/)).toBeInTheDocument()
+    expect(screen.queryByText("Verified per-test results")).not.toBeInTheDocument()
   })
 
   it("shows partial sealed build evidence instead of empty build tiles", () => {
@@ -159,7 +202,8 @@ describe("OverviewTab", () => {
     expect(within(buildTile as HTMLElement).getByText("Partial")).toHaveClass(
       "text-status-attention",
     )
-    expect(within(buildTile as HTMLElement).getByText(/16,221 compiled classes/)).toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).getByText(/scope incomplete/i)).toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).queryByText(/16,221 compiled classes/)).not.toBeInTheDocument()
     expect(screen.queryByText("Build time")).not.toBeInTheDocument()
     expect(screen.getByText("Module details unavailable")).toBeInTheDocument()
   })
@@ -177,17 +221,16 @@ describe("OverviewTab", () => {
       />,
     )
 
-    const runTile = screen.getByText("Test run").parentElement
+    const runTile = screen.getAllByText("Tests")[0].parentElement
     expect(within(runTile as HTMLElement).getByText("Unavailable")).not.toHaveClass("text-status-success")
-    expect(within(runTile as HTMLElement).getByText(/counts were not recorded/i)).toBeInTheDocument()
-    const identityTile = screen.getByText("Verified test identities").parentElement
-    expect(within(identityTile as HTMLElement).getByText("Unavailable")).toBeInTheDocument()
+    expect(within(runTile as HTMLElement).getByText(/did not record its test outcome totals/i)).toBeInTheDocument()
+    expect(screen.queryByText("Verified per-test results")).not.toBeInTheDocument()
     const buildTile = screen.getAllByText("Build")[0].parentElement
     expect(within(buildTile as HTMLElement).getByText("Unavailable")).toBeInTheDocument()
     expect(screen.queryByText("Build time")).not.toBeInTheDocument()
   })
 
-  it("shows a Jackrabbit-shaped 4,722-result run without inventing verified identities", () => {
+  it("keeps diagnostic observations secondary to receipt outcome accounting", () => {
     render(
       <OverviewTab
         detail={makeDetail({
@@ -204,50 +247,13 @@ describe("OverviewTab", () => {
       />,
     )
 
-    const runTile = screen.getByText("Test run").parentElement
-    expect(within(runTile as HTMLElement).getByText("Passed")).toHaveClass("text-status-success")
-    expect(within(runTile as HTMLElement).getByText(/sealed run results: 4,722 passed/i)).toBeInTheDocument()
-    expect(within(runTile as HTMLElement).getByText(/100% of non-skipped results passed/i)).toBeInTheDocument()
-
-    const identityTile = screen.getByText("Verified test identities").parentElement
-    expect(within(identityTile as HTMLElement).getByText("Unavailable")).toBeInTheDocument()
-    expect(within(identityTile as HTMLElement).getByText(/module-qualified test identities were not sealed/i)).toBeInTheDocument()
+    const runTile = screen.getAllByText("Tests")[0].parentElement
+    expect(within(runTile as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
+    expect(within(runTile as HTMLElement).getByText(/Test outcomes recorded 2 \/ 2/i)).toBeInTheDocument()
+    expect(screen.queryByText("Verified per-test results")).not.toBeInTheDocument()
     expect(screen.getByText("Diagnostic observations")).toBeInTheDocument()
     expect(screen.getByText("2,887")).toBeInTheDocument()
     expect(screen.getByText(/2,481 errors/)).toBeInTheDocument()
-  })
-
-  it("shows the formal rate and failures when verified identities are available", () => {
-    const evidenceLayers = unavailableSubjectLayers()
-    evidenceLayers.tests.claimed.latestSubjects = {
-      executed: 276,
-      passed: 179,
-      failed: 24,
-      errors: 44,
-      skipped: 29,
-      availability: "available",
-    } as any
-    render(
-      <OverviewTab
-        detail={makeDetail({
-          test: {
-            state: "partial",
-            pass: 179,
-            fail: 24,
-            errors: 44,
-            skip: 29,
-            total: 276,
-            evidenceLayers,
-          },
-        })}
-        onOpenFlow={() => {}}
-      />,
-    )
-
-    const identityTile = screen.getByText("Verified test identities").parentElement
-    expect(within(identityTile as HTMLElement).getByText("72.5%")).toHaveClass("text-status-failed")
-    expect(within(identityTile as HTMLElement).getByText(/276 verified identities/)).toBeInTheDocument()
-    expect(within(identityTile as HTMLElement).getByText(/24 failed · 44 errors · 29 skipped/)).toBeInTheDocument()
   })
 
   it("shows observed module scope as counts and keeps a partial build amber", () => {
@@ -264,7 +270,7 @@ describe("OverviewTab", () => {
     )
     const partialBuild = screen.getAllByText("Build")[0].parentElement
     expect(within(partialBuild as HTMLElement).getByText("Partial")).toHaveClass("text-status-attention")
-    expect(within(partialBuild as HTMLElement).getByText(/evidence covers 19 of 26 modules/i)).toBeInTheDocument()
+    expect(within(partialBuild as HTMLElement).getByText(/Modules 19 \/ 26/i)).toBeInTheDocument()
     expect(within(partialBuild as HTMLElement).getByText(/scope incomplete/i)).toBeInTheDocument()
     expect(within(partialBuild as HTMLElement).queryByText("73.1%")).not.toBeInTheDocument()
 
@@ -291,38 +297,18 @@ describe("OverviewTab", () => {
       />,
     )
     const cleanBuild = screen.getAllByText("Build")[0].parentElement
-    expect(within(cleanBuild as HTMLElement).getByText("Passed")).toHaveClass("text-status-success")
-    expect(within(cleanBuild as HTMLElement).getByText(/evidence covers 26 of 26 modules/i)).toBeInTheDocument()
+    expect(within(cleanBuild as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
+    expect(within(cleanBuild as HTMLElement).getByText(/Modules 26 \/ 26/i)).toBeInTheDocument()
     expect(within(cleanBuild as HTMLElement).queryByText(/scope incomplete/i)).not.toBeInTheDocument()
   })
 
-  it("renders coverage tiles when the module summary carries rates", () => {
+  it("keeps line and branch coverage in a secondary row", () => {
     render(<OverviewTab detail={makeDetail()} onOpenFlow={() => {}} />)
-    expect(screen.getByText(/line coverage/i)).toBeInTheDocument()
+    const lineCoverage = screen.getByText(/line coverage/i)
+    expect(lineCoverage).toBeInTheDocument()
+    expect(screen.getByText(/branch coverage/i)).toBeInTheDocument()
     expect(screen.getByText("79.2%")).toBeInTheDocument()
-  })
-
-  it("omits coverage tiles when the module summary has no rates", () => {
-    render(
-      <OverviewTab
-        detail={makeDetail({
-          moduleSummary: {
-            modulesTotal: 4,
-            modulesBuilt: 3,
-            modulesFailed: 1,
-            modulesSkipped: 0,
-            modulesWithTestFailures: 2,
-            buildSystems: ["maven"],
-            singleModule: false,
-            lineRate: null,
-            branchRate: null,
-          },
-        })}
-        onOpenFlow={() => {}}
-      />,
-    )
-    expect(screen.queryByText(/line coverage/i)).not.toBeInTheDocument()
-    expect(screen.queryByText(/branch coverage/i)).not.toBeInTheDocument()
+    expect(lineCoverage.parentElement?.parentElement).toHaveClass("mt-3")
   })
 
   it("marks diagnostic observation counts as a lower bound when one group is unavailable", () => {
@@ -370,7 +356,7 @@ describe("OverviewTab", () => {
 
     expect(screen.getByText(title)).toBeInTheDocument()
     expect(screen.getByText(body)).toBeInTheDocument()
-    expect(screen.getByText("Test run")).toBeInTheDocument()
+    expect(screen.getAllByText("Tests")[0]).toBeInTheDocument()
   })
 
   it("translates internal conflicts into secondary data notes", () => {

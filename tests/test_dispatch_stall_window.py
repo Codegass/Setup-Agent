@@ -1119,6 +1119,7 @@ from sag.agent.evidence_publications import (
     reset_evidence_publication_authority,
 )
 from sag.agent.stall_diagnostics import (
+    cancel_registered_process_group,
     cleanup_registered_process_group,
     collect_stall_diagnostic,
     control_stalled_job,
@@ -1569,6 +1570,42 @@ def test_cleanup_refuses_tampered_launcher_identity_before_any_signal(monkeypatc
     )
 
     assert result.code == "registered_identity_unverified"
+    assert "kill -TERM -- -4242" not in harness.commands
+    assert "kill -KILL -- -4242" not in harness.commands
+
+
+def test_explicit_cancellation_terminates_the_registered_process_group():
+    harness = _DiagnosticHarness()
+
+    result = cancel_registered_process_group(
+        harness.execute,
+        _stall_job(),
+        grace_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.code == "killed"
+    assert result.term_sent is True
+    assert result.kill_sent is True
+    assert result.group_live is False
+    assert "kill -TERM -- -4242" in harness.commands
+    assert "kill -KILL -- -4242" in harness.commands
+    assert not any("sag-job-diagnostic" in command for command in harness.commands)
+
+
+def test_explicit_cancellation_refuses_a_tampered_registered_identity():
+    harness = _DiagnosticHarness()
+    harness.files["/tmp/sag_jobs/job-1.pgid"] = "9999"
+
+    result = cancel_registered_process_group(
+        harness.execute,
+        _stall_job(),
+        grace_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.code == "registered_identity_unverified"
+    assert result.group_live is True
     assert "kill -TERM -- -4242" not in harness.commands
     assert "kill -KILL -- -4242" not in harness.commands
 

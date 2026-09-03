@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sag.web.models import (
     BuildSummary,
+    ClaimedTestLayers,
     ContextTrace,
     ContextTraceAction,
     ContextTraceIteration,
@@ -12,7 +13,9 @@ from sag.web.models import (
     ContextTraceTrunk,
     DashboardResponse,
     DockerSummary,
+    EvidenceCountSummary,
     EvidenceGroup,
+    EvidenceLayerProjectionSummary,
     EvidenceRecord,
     ExecutionSessionDetail,
     FileChangeCounts,
@@ -21,8 +24,12 @@ from sag.web.models import (
     FileSnapshotRef,
     ModuleRollup,
     ModuleSummary,
+    MetricsV2EvidenceSummary,
+    ObservationCountSummary,
     ReportDocument,
+    SourceScopeSummary,
     TerminalConnectionState,
+    TestEvidenceLayers,
     TestSummary,
     VerdictSummary,
     WorkspaceSummary,
@@ -30,6 +37,51 @@ from sag.web.models import (
 
 _COMMONS_WORKSPACE_ID = "sag-commons-cli"
 _COMMONS_SESSION_ID = "CC-3"
+
+
+def _commons_test_evidence_layers() -> EvidenceLayerProjectionSummary:
+    unavailable_identity = EvidenceCountSummary(
+        availability="unavailable",
+        reason="demo fixture does not model module-qualified test identities",
+        basis="demo fixture",
+    )
+    no_observations = ObservationCountSummary(
+        executed=0,
+        passed=0,
+        failed=0,
+        errors=0,
+        skipped=0,
+        availability="available",
+        basis="demo fixture: no diagnostic observations",
+    )
+    return EvidenceLayerProjectionSummary(
+        projection_status="metrics-v2-artifact-unavailable",
+        tests=TestEvidenceLayers(
+            claimed=ClaimedTestLayers(
+                latest_subjects=unavailable_identity,
+                latest_cases=unavailable_identity,
+                receipt_executions=EvidenceCountSummary(
+                    executed=320,
+                    passed=312,
+                    failed=8,
+                    errors=0,
+                    skipped=0,
+                    availability="available",
+                    basis="demo fixture: one synthetic Maven test receipt",
+                ),
+            ),
+            quarantined_observations=no_observations,
+            unattributed_observations=no_observations,
+            stale_observations=no_observations,
+        ),
+        evidence=MetricsV2EvidenceSummary(
+            integrity="complete",
+            receipts_expected=1,
+            receipts_persisted=1,
+            terminal_receipts_unpersisted=0,
+            conflict_count=0,
+        ),
+    )
 
 
 def _commons_test_summary() -> TestSummary:
@@ -57,6 +109,7 @@ def _commons_test_summary() -> TestSummary:
         ],
         conflicts=[],
         evidence_refs=["output_demo_tests"],
+        evidence_layers=_commons_test_evidence_layers(),
     )
 
 
@@ -69,8 +122,15 @@ def _commons_build_summary() -> BuildSummary:
         note="Compiled with Maven 3.9.6 and JDK 11 inside the workspace container.",
         system="maven",
         class_count=180,
+        source_scope=SourceScopeSummary(
+            covered=36,
+            total=36,
+            availability="available",
+            basis="demo fixture: complete production Java source scope",
+            evidence_refs=["demo:output_demo_build"],
+        ),
         jar_count=2,
-        module_output_count=1,
+        module_output_count=3,
         artifact_samples=[
             "target/classes/com/demo/App.class",
             "target/demo-1.0.jar",
@@ -132,22 +192,19 @@ def _commons_evidence() -> list[EvidenceGroup]:
 
 
 def _commons_modules() -> list[ModuleSummary]:
-    # A coherent multi-module Maven demo for the commons-cli workspace: one
-    # module with test failures, one clean, one that failed to build. Names,
-    # FQNs, and evidence paths are all commons-cli + Maven (target/) so the
-    # --demo view reads as a single, consistent project (not Kafka under
-    # commons-cli).
+    # A coherent multi-module Maven demo for the commons-cli workspace: all
+    # three modules build, while one retains project-owned test failures.
+    # Names, FQNs, and evidence paths are all commons-cli + Maven (target/) so
+    # the --demo view reads as a single, consistent project.
     return [
         ModuleSummary(
             name="commons-cli-validator",
             path="validator",
-            build_status="failure",
+            build_status="success",
             build_source="reactor",
             class_count=None,
             jar_count=None,
-            build_error_samples=[
-                "[ERROR] OptionValidator.java:[88,21] cannot find symbol: requireNonBlank",
-            ],
+            build_error_samples=[],
             test_source="none",
             failing_names=[],
             failing_count=None,
@@ -210,8 +267,8 @@ def _commons_modules() -> list[ModuleSummary]:
 def _commons_module_summary() -> ModuleRollup:
     return ModuleRollup(
         modules_total=3,
-        modules_built=2,
-        modules_failed=1,
+        modules_built=3,
+        modules_failed=0,
         modules_skipped=0,
         modules_with_test_failures=1,
         build_systems=["maven"],
@@ -425,11 +482,21 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
         verdict=VerdictSummary(
             tone="attention",
             headline=(
-                "Build passed on 2 of 3 modules. 8 of 320 tests failing — "
+                "Build passed on 3 of 3 modules. 8 of 320 tests failing — "
                 "review before promoting"
             ),
             detail=None,
         ),
+        rates={
+            "build": {
+                "modules": {
+                    "numerator": 3,
+                    "denominator": 3,
+                    "rate": 100.0,
+                    "band": "fully",
+                }
+            }
+        },
         model="claude-sonnet-4.5",
         steps=6,
         step_budget=40,

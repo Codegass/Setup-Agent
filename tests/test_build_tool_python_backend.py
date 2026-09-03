@@ -6,6 +6,10 @@ Contract:
   (python markers probe AFTER maven/gradle); a pyproject-only dir is python;
 - verb delegation: deps->setup_env, compile->compile, test->test,
   package->build, install->build all reach python_tool.execute;
+- python scenarios declare manifest test_system="pytest", matching what the
+  production analyzer surveys for a python project (a "maven" declaration on
+  a pyproject-only root is an impossible survey, and test routing now trusts
+  the declared maven/gradle system instead of re-probing markers);
 - the envelope reports facts["system"] == "python";
 - the facade's JDK pre-flight is SKIPPED for python (PythonPreflight already
   runs inside python_tool.setup_env — running it twice would double-provision).
@@ -221,7 +225,9 @@ def test_jvm_repo_with_stray_requirements_txt_stays_maven():
 
 def test_pyproject_only_selects_python():
     python = FakePythonTool()
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     result = _execute(tool, action="compile")
 
@@ -246,7 +252,9 @@ def test_pyproject_only_selects_python():
 )
 def test_verb_reaches_python_tool_with_mapped_operation(verb, operation):
     python = FakePythonTool()
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     result = _execute(tool, action=verb)
 
@@ -260,7 +268,9 @@ def test_verb_reaches_python_tool_with_mapped_operation(verb, operation):
 
 def test_args_and_timeout_pass_through():
     python = FakePythonTool()
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     _execute(tool, action="test", args="-k smoke", timeout=120)
 
@@ -288,7 +298,9 @@ def test_python_materializer_preserves_explicit_values_without_truthiness_rewrit
 
 def test_python_test_envelope_reports_system_python():
     python = FakePythonTool(ToolResult.completed_success(output="3 passed"))
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     result = _execute(tool, action="test")
 
@@ -341,7 +353,9 @@ def test_maven_system_still_runs_jdk_preflight():
 
 def test_python_default_timeout_null_materializes_to_internal_600_authority():
     python = ContractCheckingPythonTool()
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     result = _execute(tool, action="test", exact_timeout=None)
 
@@ -351,7 +365,9 @@ def test_python_default_timeout_null_materializes_to_internal_600_authority():
 
 def test_python_explicit_timeout_is_exact_semantic_authority():
     python = ContractCheckingPythonTool()
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     result = _execute(tool, action="test", timeout=37)
 
@@ -366,7 +382,9 @@ def test_python_changed_explicit_timeout_has_zero_runner_authority():
             return super().execute(**kwargs)
 
     python = TimeoutChangingPythonTool()
-    tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
+    tool, _ = _tool(
+        {"/workspace/p/pyproject.toml"}, python=python, manifest={"test_system": "pytest"}
+    )
 
     result = _execute(tool, action="test", timeout=37)
 

@@ -74,6 +74,7 @@ from sag.agent.receipt_test_rows import (
     diagnostic_testcase_outcomes,
     read_delta_testcase_rows,
     read_gradle_project_map,
+    rows_were_bounded,
     seal_testcase_execution_rows,
     validate_testcase_execution_row,
 )
@@ -3085,6 +3086,21 @@ def receipt_record_scope(
         except (TypeError, ValueError):
             return "current"
         return "forensic"
+    if schema == 2:
+        # Schema 2 was the immediately preceding live shape.  It must never
+        # become current v3 evidence, but a structurally valid old record should
+        # not poison an otherwise fresh ledger merely because a container was
+        # reused.  Validate it against the compatible current field contract by
+        # changing only the version discriminator, then keep the original bytes
+        # forensic.  Incompatible/malformed v2 remains current so the strict
+        # reader rejects it instead of silently hiding corruption.
+        candidate = dict(payload)
+        candidate["schema_version"] = RECEIPT_SCHEMA_VERSION
+        try:
+            validate_receipt_v2(candidate)
+        except (TypeError, ValueError):
+            return "current"
+        return "forensic"
     if schema != RECEIPT_SCHEMA_VERSION:
         return "current"
     try:
@@ -3610,7 +3626,20 @@ def record_invocation(
     # Gradle harvest instead, this disclosure would describe drops from a list
     # the receipt does not hold — contradictory evidence, and unknown is absent
     # here as everywhere else.
-    carries_bounded_rows = bool((sealed_rows or {}).get("rows")) or (
+    # A bound can legitimately retain zero identities: every parsed row may
+    # be over the per-row budget, or the total cap may be injected as zero in
+    # a deterministic probe.  The complete empty envelope is still the sample
+    # produced by this read, and its disclosure is what distinguishes the
+    # lower bound ``0`` from an exact empty test run.  Testing ``bool(rows)``
+    # here erased that distinction at the receipt boundary.
+    exact_sample_carried = isinstance(sealed_rows, Mapping) and (
+        bool(sealed_rows.get("rows"))
+        or (
+            sealed_rows.get("status") == "complete"
+            and rows_were_bounded(parsed_rows)
+        )
+    )
+    carries_bounded_rows = exact_sample_carried or (
         gradle_row_disclosure is None and bool(diagnostic_rows)
     )
     row_bound_disclosure = disclose_row_bounds(parsed_rows) if carries_bounded_rows else None

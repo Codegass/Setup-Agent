@@ -373,8 +373,14 @@ def build_grain_rates(
     """Return the two build grains, and any conflict they expose, with no rescan.
 
     Module scope comes from the summary already produced by
-    :func:`module_coverage`; class substance comes from the physical
-    validator's existing class/source census threaded in by the finalizer.
+    :func:`module_coverage`.  Physical class files and Java source files are
+    deliberately not divided: one source can emit zero, one, or many class
+    files, so their counts are useful diagnostics but not one rate grain.
+
+    ``compiled_classes`` and ``source_files`` remain in the signature because
+    callers still carry both observations into the sealed build snapshot.  The
+    canonical source-scope projection is derived later from build and phase
+    authority, never from their quotient.
     """
 
     summary = (coverage or {}).get("summary") or {}
@@ -412,10 +418,20 @@ def build_grain_rates(
     else:
         modules = GrainRate(0, None, reason="no module scan available")
 
-    if compiled_classes is not None and source_files:
-        classes = GrainRate(numerator=int(compiled_classes), denominator=int(source_files))
-    else:
-        classes = GrainRate(0, None, reason="class census unavailable")
+    diagnostic_parts: list[str] = []
+    if compiled_classes is not None:
+        diagnostic_parts.append(f"{int(compiled_classes)} class files observed")
+    if source_files is not None:
+        diagnostic_parts.append(f"{int(source_files)} production Java sources observed")
+    diagnostic = "; ".join(diagnostic_parts)
+    classes = GrainRate(
+        0,
+        None,
+        reason=(
+            "class files are diagnostic and not comparable to Java source files"
+            + (f" ({diagnostic})" if diagnostic else "")
+        ),
+    )
     return {"modules": modules, "classes": classes}, conflicts
 
 

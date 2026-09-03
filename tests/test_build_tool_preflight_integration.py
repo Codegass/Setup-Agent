@@ -558,7 +558,9 @@ def _steering_lines(result):
 def test_a_runner_that_names_the_java_it_needs_gets_the_provision_call_named():
     gradle = ScriptedBackendTool(ToolResult.completed_failure(output=GEODE_PLUGIN_FAIL))
     orch = ScriptedOrch(
-        java="11", manifest={}, markers=("/workspace/proj/build.gradle",)
+        java="11",
+        manifest={"test_system": "gradle"},
+        markers=("/workspace/proj/build.gradle",),
     )
 
     result = _tool(orch, gradle=gradle).execute(
@@ -677,7 +679,11 @@ def test_the_generic_wording_still_names_the_provision_when_it_asks_for_more():
             output="FAILURE: Build failed.\n> the shadow plugin requires Java 17 to run"
         )
     )
-    orch = ScriptedOrch(java="11", manifest={}, markers=("/workspace/proj/build.gradle",))
+    orch = ScriptedOrch(
+        java="11",
+        manifest={"test_system": "gradle"},
+        markers=("/workspace/proj/build.gradle",),
+    )
 
     result = _tool(orch, gradle=gradle).execute(
         action="test", working_directory="/workspace/proj"
@@ -726,7 +732,7 @@ def test_default_workdir_is_not_retargeted_from_project_name():
         markers=("/workspace/proj/pom.xml",),
         project_name="proj",
     )
-    result = _tool(orch).execute(action="test")  # default "/workspace"
+    result = _tool(orch).execute(action="compile")  # default "/workspace"
     assert result.operation_outcome.value == "unknown"
     assert result.error_code == "BUILD_SYSTEM_NOT_DETECTED"
     assert result.metadata == {
@@ -778,7 +784,10 @@ def test_backends_delegate_with_env_preflight_disabled(marker, action, backend_n
     gradle = ScriptedBackendTool()
     orch = ScriptedOrch(
         java="17",
-        manifest={"java_version": "17"},
+        manifest={
+            "java_version": "17",
+            "test_system": backend_name,
+        },
         markers=(marker,),
     )
     _tool(orch, maven=maven, gradle=gradle).execute(

@@ -463,7 +463,7 @@ def test_the_document_survey_runs_before_the_manifest_is_persisted(monkeypatch):
     monkeypatch.setattr(
         tool,
         "_persist_build_requirements",
-        lambda path, analysis, **kwargs: order.append("manifest"),
+        lambda path, analysis, **kwargs: order.append("manifest") or True,
     )
 
     tool._perform_comprehensive_analysis(ROOT)

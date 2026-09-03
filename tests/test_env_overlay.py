@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import shlex
 
@@ -219,6 +220,54 @@ def test_overlay_authority_recovers_from_host_stream_after_restart(tmp_path):
 
     assert environment["JAVA_HOME"] == "/opt/jdk-21"
     assert environment["PATH"].startswith("/opt/jdk-21/bin:")
+
+
+def test_new_run_bootstrap_resets_foreign_overlay_before_project_lane(tmp_path):
+    orchestrator = FakeEnvOverlayOrchestrator()
+    first = EvidencePublicationAuthority(
+        run_id="run-overlay-first",
+        sink=ControlEventSink(tmp_path / "first-control-events.jsonl"),
+    )
+    first_token = install_evidence_publication_authority(first, orchestrator=orchestrator)
+    try:
+        EnvOverlayStore(orchestrator).register(
+            "java",
+            "/opt/jdk-21/bin/java",
+            env={"JAVA_HOME": "/opt/jdk-21"},
+            activate=True,
+        )
+    finally:
+        reset_evidence_publication_authority(first_token)
+
+    second = EvidencePublicationAuthority(
+        run_id="run-overlay-second",
+        sink=ControlEventSink(tmp_path / "second-control-events.jsonl"),
+    )
+    second_token = install_evidence_publication_authority(second, orchestrator=orchestrator)
+    try:
+        store = EnvOverlayStore(orchestrator)
+        with pytest.raises(EnvOverlayUnavailableError, match="mutable records differ"):
+            store.authorized_environment()
+
+        assert store.bootstrap_current_run() == "reset"
+        head = second.latest_head(ENV_OVERLAY_LOGICAL_ARTIFACT_ID)
+        assert head is not None
+        persisted_raw = orchestrator.files[DEFAULT_OVERLAY_JSON].encode("utf-8")
+        assert head.run_id == "run-overlay-second"
+        assert head.raw_sha256 == hashlib.sha256(persisted_raw).hexdigest()
+        assert head.byte_count == len(persisted_raw)
+        environment = store.authorized_environment()
+    finally:
+        reset_evidence_publication_authority(second_token)
+
+    assert "JAVA_HOME" not in environment
+    assert environment["PATH"] == (
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+    assert json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON]) == {
+        "version": 1,
+        "tools": {},
+    }
 
 
 def test_block_records_exact_executable_without_blocking_other_versions():

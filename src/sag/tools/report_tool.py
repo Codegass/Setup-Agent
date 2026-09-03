@@ -44,6 +44,7 @@ from sag.verdict_rates import (
     HALF_FLOOR,
     band_for,
     render_rate_lines,
+    render_snapshot_metric_lines,
 )
 
 from .base import BaseTool, ToolResult
@@ -70,6 +71,7 @@ def rate_marker(rate: Optional[float]) -> str:
     if rate < 100:
         return "⚠️"
     return "✅"
+
 
 if TYPE_CHECKING:
     from sag.agent.verdict_finalizer import RunVerdictSnapshot
@@ -513,12 +515,17 @@ class ReportTool(BaseTool, UIEventEmitter):
                     actual_accomplishments,
                     report_snapshot,
                 )
-                condensed_output = self._append_evidence_summary_to_output(
-                    condensed_output,
-                    metadata["evidence_status"],
-                    result_test_stats,
-                    result_conflicts,
-                )
+                if self.workflow_mode != "setup":
+                    # The legacy summary is still backed by ``TestStats``, whose
+                    # historical pass-rate denominator includes skips. Canonical
+                    # setup output has already rendered its sealed, same-grain
+                    # metrics above and must not append that second vocabulary.
+                    condensed_output = self._append_evidence_summary_to_output(
+                        condensed_output,
+                        metadata["evidence_status"],
+                        result_test_stats,
+                        result_conflicts,
+                    )
 
                 if self.workflow_mode == "setup":
                     snapshot_status = report_snapshot.get("status") or {}
@@ -890,15 +897,21 @@ class ReportTool(BaseTool, UIEventEmitter):
             lines.append(f"Evidence refs: {'; '.join(refs)}")
         return lines
 
-    def _snapshot_rate_lines(
-        self, snapshot: Optional[Dict[str, Any]]
-    ) -> List[str] | None:
+    def _snapshot_rate_lines(self, snapshot: Optional[Dict[str, Any]]) -> List[str] | None:
         if not isinstance(snapshot, dict):
             return None
+        canonical = snapshot.get("canonical_snapshot")
+        if snapshot.get("mode") == "setup" and isinstance(canonical, dict):
+            lines = render_snapshot_metric_lines(canonical)
+            test_stats = canonical.get("test_stats")
+            if isinstance(test_stats, dict):
+                flaky = test_stats.get("flaky_count")
+                if type(flaky) is int and flaky > 0:
+                    lines[1] += f" · {flaky} flaky"
+            return lines
         if "rates" in snapshot:
             rates = snapshot.get("rates")
         else:
-            canonical = snapshot.get("canonical_snapshot")
             rates = canonical.get("rates") if isinstance(canonical, dict) else None
         if rates is None:
             return None
@@ -1605,6 +1618,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         """Adapt the sealed setup snapshot into the existing render model."""
         tests = snapshot.test_stats
         raw = tests.raw
+        outcomes_accounted = tests.passed + tests.failed + tests.errors + tests.skipped
+        non_skipped = tests.passed + tests.failed + tests.errors
+        non_skipped_pass_pct = (
+            round((tests.passed / non_skipped) * 100.0, 1) if non_skipped > 0 else None
+        )
         expansion_factor = None
         if tests.executed > 0 and raw.executed > tests.executed:
             expansion_factor = raw.executed / tests.executed
@@ -1638,10 +1656,18 @@ class ReportTool(BaseTool, UIEventEmitter):
             "tests_errors_unique": tests.errors,
             "tests_skipped_unique": tests.skipped,
             "tests_flaky": tests.flaky_count,
-            "pass_pct": tests.pass_rate if tests.executed > 0 else None,
+            # Canonical setup reporting does not count skips as failed passes.
+            # The sealed outcome arithmetic remains visible separately below.
+            "pass_pct": non_skipped_pass_pct,
+            "non_skipped_pass_pct": non_skipped_pass_pct,
+            "tests_non_skipped": non_skipped,
+            "test_outcomes_accounted": outcomes_accounted,
+            "test_outcomes_expected": tests.executed,
             "static_test_count": tests.discovered,
             "method_count": None,
-            "execution_rate": tests.execution_rate,
+            # Runtime outcomes and static declarations are different grains.
+            # Keep the declaration count as a diagnostic; publish no ratio.
+            "execution_rate": None,
             "expansion_factor": expansion_factor,
             "parameterized_info": {},
             "modules_expected": None,
@@ -1705,7 +1731,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "class_files": snapshot.build_evidence.compiled_classes,
                 "jar_files": None,
                 "tests_total": tests.executed,
-                "tests_pass_pct": tests.pass_rate if tests.executed > 0 else None,
+                "tests_pass_pct": non_skipped_pass_pct,
                 "build_system": project_info.get("build_system"),
                 "fingerprint_details": {},
                 "refs": list(snapshot.build_evidence.refs),
@@ -2355,7 +2381,27 @@ class ReportTool(BaseTool, UIEventEmitter):
         status["verdict"] = kernel_verdict
         snapshot["status"] = status
 
-        condensed_lines = render_condensed_summary(snapshot).split("\n")
+        if snapshot.get("mode") == "setup":
+            verdict = str(kernel_verdict or "unknown").lower()
+            icon = {
+                "success": "✅",
+                "partial": "⚠️",
+                "failed": "❌",
+            }.get(verdict, "❔")
+            project = snapshot.get("project") or {}
+            project_type = project.get("type", "Unknown")
+            build_system = project.get("build_system", "Unknown")
+            condensed_lines = [
+                f"🎯 SETUP COMPLETED: {icon} {verdict.upper()}",
+                *list(self._snapshot_rate_lines(snapshot) or ()),
+                f"📂 Project: {project_type} ({build_system})",
+                f"📄 Full report saved to: {snapshot['report_path']}",
+            ]
+            conflicts = (snapshot.get("evidence_result") or {}).get("conflicts") or []
+            if conflicts:
+                condensed_lines.append(f"⚠️ Conflicts: {truncate_list(conflicts, 5)}")
+        else:
+            condensed_lines = render_condensed_summary(snapshot).split("\n")
         from sag.tools.report_metrics import format_evidence_layer_lines
 
         condensed_lines.extend(
@@ -4930,6 +4976,17 @@ with open(lock_path,"a+b") as lock:
         phases = snapshot.get("phases", {})
         evidence = snapshot.get("physical_evidence", {})
 
+        if snapshot.get("mode") == "setup":
+            clone_status = "✅ SUCCESS" if phases.get("clone") else "❌ FAILED"
+            lines.extend(
+                [
+                    f"- Repository: {clone_status}",
+                    *[f"- {line}" for line in (self._snapshot_rate_lines(snapshot) or ())],
+                    "",
+                ]
+            )
+            return lines
+
         # Prepare values
         clone_status = "✅ Cloned successfully" if phases.get("clone") else "❌ Clone failed"
 
@@ -5058,6 +5115,51 @@ with open(lock_path,"a+b") as lock:
         # Nothing executed: the metrics/breakdown tables would render collection
         # artifacts under "Executed" headings. Facts only — stop here.
         if not status.get("tests_total"):
+            return lines
+
+        if snapshot.get("mode") == "setup":
+            executed = int(status.get("tests_total") or 0)
+            passed = int(status.get("tests_passed") or 0)
+            failed = int(status.get("tests_failed") or 0)
+            errors = int(status.get("tests_errors") or 0)
+            skipped = int(status.get("tests_skipped") or 0)
+            accounted = passed + failed + errors + skipped
+            non_skipped = passed + failed + errors
+            pass_pct = (passed / non_skipped * 100.0) if non_skipped else None
+            accounting_icon = "✅" if accounted == executed else "⚠️"
+            judgment = str(status.get("test_judgment") or "unknown").upper()
+            judgment_icon = {
+                "SUCCESS": "✅",
+                "PARTIAL": "⚠️",
+                "FAILED": "❌",
+            }.get(judgment, "❔")
+            static_count = status.get("static_test_count")
+
+            lines.extend(
+                [
+                    "### Test Outcome Accounting",
+                    "",
+                    "| Metric | Value | Meaning | Status |",
+                    "|--------|-------|---------|--------|",
+                    f"| **Tests** | {judgment} | Sealed test judgment | " f"{judgment_icon} |",
+                    f"| **Outcomes Accounted** | {accounted}/{executed} | "
+                    f"Passed + failed + errors + skipped | {accounting_icon} |",
+                    f"| **Non-skipped Passed** | {passed}/{non_skipped} "
+                    f"({format_percentage(pass_pct)}) | Skips excluded from the denominator | "
+                    f"{rate_marker(pass_pct)} |",
+                    f"| **Skipped** | {skipped} | Reported separately | 📊 |",
+                    f"| **Failed** | {failed} | Project test outcomes | "
+                    f"{'✅' if failed == 0 else '❌'} |",
+                    f"| **Errors** | {errors} | Project test outcomes | "
+                    f"{'✅' if errors == 0 else '❌'} |",
+                ]
+            )
+            if static_count is not None:
+                lines.append(
+                    f"| **Static Test Declarations** | {static_count} | "
+                    "Diagnostic only; not an execution denominator | 📊 |"
+                )
+            lines.append("")
             return lines
 
         # Test Metrics Summary
@@ -5212,6 +5314,7 @@ with open(lock_path,"a+b") as lock:
         pass_rate = status.get("pass_pct")
         exec_rate = status.get("execution_rate")
         expansion_factor = status.get("expansion_factor")
+        setup_snapshot = snapshot.get("mode") == "setup"
 
         # The last three invented cut-offs: `>= 95` chose "High Pass Rate",
         # `< 90` chose "Low Execution Rate" and `< 80` chose "Incomplete
@@ -5222,13 +5325,21 @@ with open(lock_path,"a+b") as lock:
         # stated and the marker says how it reads. A rate nobody measured is
         # not an observation, so it stays absent rather than arriving as 📊 —
         # but a measured 0.0% IS one, and `if pass_rate` dropped it.
-        if isinstance(pass_rate, (int, float)) and not isinstance(pass_rate, bool):
+        if (
+            not setup_snapshot
+            and isinstance(pass_rate, (int, float))
+            and not isinstance(pass_rate, bool)
+        ):
             lines.append(
                 f"- {rate_marker(pass_rate)} **Pass Rate:** "
                 f"{format_percentage(pass_rate)} of executed tests passed"
             )
 
-        if isinstance(exec_rate, (int, float)) and not isinstance(exec_rate, bool):
+        if (
+            not setup_snapshot
+            and isinstance(exec_rate, (int, float))
+            and not isinstance(exec_rate, bool)
+        ):
             lines.append(
                 f"- {rate_marker(exec_rate)} **Execution Rate:** "
                 f"{format_percentage(exec_rate)} of available tests were run"
@@ -5826,7 +5937,7 @@ with open(lock_path,"a+b") as lock:
             lines.append("")
 
             # Add test metrics if available from snapshot
-            if snapshot:
+            if snapshot and snapshot.get("mode") != "setup":
                 status = snapshot.get("status", {})
                 static_test_count = status.get("static_test_count")
                 tests_total = status.get("tests_total")

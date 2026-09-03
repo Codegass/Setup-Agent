@@ -482,7 +482,7 @@ def test_setup_report_evidence_summary_keeps_failures_and_errors_distinct(tvm_sn
     assert result.test_stats is not None
     assert result.test_stats.failed == 0
     assert result.test_stats.errors == 328
-    assert "0 failed, 328 errors" in result.output
+    assert "failed 0 · errors 328" in result.output
     assert "328 failed" not in result.output
 
 

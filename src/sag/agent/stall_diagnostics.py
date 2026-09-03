@@ -43,6 +43,7 @@ STALL_CONFIRMATION_GRACE_SECONDS = 30
 STALL_CLEANUP_GRACE_SECONDS = 120
 STALL_CONFIRMATION_TRIGGER = "stall_confirmation"
 WALL_GUARD_TRIGGER = "wall_guard"
+CANCEL_CLEANUP_GRACE_SECONDS = 10
 _STALL_SEAL_REASON = "repeated_no_progress"
 
 _JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -680,6 +681,95 @@ def cleanup_registered_process_group(
         group_live=live,
     )
     return _persist_cleanup(execute, result, seal)
+
+
+def cancel_registered_process_group(
+    execute: Callable[..., Any],
+    job: Mapping[str, Any],
+    *,
+    now: Optional[Callable[[], float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    grace_seconds: int = CANCEL_CLEANUP_GRACE_SECONDS,
+    poll_seconds: int = 1,
+) -> CleanupResult:
+    """Terminate one explicitly cancelled registered process group.
+
+    Operator cancellation is termination authority; it is not evidence that a
+    progressing job stalled.  Keep that distinction by skipping the stall
+    diagnostic/seal path while retaining its exact safety boundary: only the
+    launcher-recorded PID == PGID whose live kernel identity still matches may
+    receive TERM/KILL.  The caller records the returned physical close result.
+    """
+
+    identity = _job_identity(job)
+    if identity is None:
+        return CleanupResult(_text(job.get("job_id")), 0, "invalid_registered_job_identity")
+    job_id, pid, pgid = identity
+    now = now or time.monotonic
+    sleep = sleep or time.sleep
+    grace = max(0, int(grace_seconds))
+    interval = max(1, int(poll_seconds))
+
+    if not _process_group_live(execute, pgid):
+        return CleanupResult(job_id, pgid, "already_terminal", group_live=False)
+    if not _registered_identity_matches(
+        execute,
+        job,
+        job_id=job_id,
+        pid=pid,
+        pgid=pgid,
+    ):
+        return CleanupResult(job_id, pgid, "registered_identity_unverified", group_live=True)
+
+    term = _execute(execute, f"kill -TERM -- -{pgid}", timeout=15)
+    if not _succeeded(term):
+        return CleanupResult(job_id, pgid, "term_failed", group_live=True)
+
+    deadline = now() + grace
+    while now() < deadline:
+        if not _process_group_live(execute, pgid):
+            return CleanupResult(
+                job_id,
+                pgid,
+                "terminated_after_term",
+                term_sent=True,
+                group_live=False,
+            )
+        sleep(min(float(interval), max(0.0, deadline - now())))
+
+    if not _process_group_live(execute, pgid):
+        return CleanupResult(
+            job_id,
+            pgid,
+            "terminated_after_term",
+            term_sent=True,
+            group_live=False,
+        )
+    if not _registered_identity_matches(
+        execute,
+        job,
+        job_id=job_id,
+        pid=pid,
+        pgid=pgid,
+    ):
+        return CleanupResult(
+            job_id,
+            pgid,
+            "identity_changed_before_kill",
+            term_sent=True,
+            group_live=True,
+        )
+
+    killed = _execute(execute, f"kill -KILL -- -{pgid}", timeout=15)
+    live = _process_group_live(execute, pgid)
+    return CleanupResult(
+        job_id,
+        pgid,
+        "killed" if _succeeded(killed) and not live else "job_live_at_close",
+        term_sent=True,
+        kill_sent=_succeeded(killed),
+        group_live=live,
+    )
 
 
 def control_stalled_job(
@@ -1426,6 +1516,7 @@ def _digest(value: Any) -> str:
 
 
 __all__ = [
+    "CANCEL_CLEANUP_GRACE_SECONDS",
     "CleanupResult",
     "DiagnosticBundle",
     "DIAGNOSTIC_ROOT",
@@ -1436,6 +1527,7 @@ __all__ = [
     "STALL_CONFIRMATION_GRACE_SECONDS",
     "StallControlResult",
     "cleanup_registered_process_group",
+    "cancel_registered_process_group",
     "collect_stall_diagnostic",
     "control_stalled_job",
     "diagnostic_bundle_ref",

@@ -5,10 +5,13 @@ from datetime import datetime
 from pathlib import Path
 
 from sag.agent.verdict_finalizer import (
+    BuildEvidenceSnapshot,
+    PhaseRecordSnapshot,
     RunVerdictSnapshot,
     SnapshotTestCounts,
     SnapshotTestStats,
 )
+from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.web.models import DockerSummary, WorkspaceSummary
 from sag.web.session_registry import (
     ContainerSessionRegistry,
@@ -17,6 +20,7 @@ from sag.web.session_registry import (
     _build_payload_from_metrics,
     _evidence,
     _matching_log_session_dir,
+    _snapshot_build_payload,
     _snapshot_test_payload,
     _setup_logs,
 )
@@ -167,6 +171,56 @@ def test_snapshot_test_payload_uses_test_judgment_not_overall_verdict():
     assert payload["state"] == "success"
     assert payload["total"] == 4
     assert payload["pass"] == 4
+
+
+def test_snapshot_build_payload_projects_comparable_source_scope_and_keeps_class_output():
+    snapshot = RunVerdictSnapshot(
+        run_id="run-commons-cli",
+        finalized_at="2026-08-31T18:07:35Z",
+        verdict="success",
+        build_evidence=BuildEvidenceSnapshot(
+            observed=True,
+            green=True,
+            judgment="success",
+            source="physical",
+            outcome=OperationOutcome.SUCCESS,
+            evidence_status=EvidenceStatus.VERIFIED,
+            refs=("output_build",),
+            compiled_classes=56,
+            source_files=36,
+        ),
+        rates={
+            "build": {
+                "modules": {
+                    "numerator": 1,
+                    "denominator": 1,
+                    "rate": 100.0,
+                    "band": "fully",
+                }
+            }
+        },
+        phase_records=(
+            PhaseRecordSnapshot(
+                phase="build",
+                attempt_id="build-1",
+                termination="completed",
+                outcome="success",
+                validated_outcome="success",
+            ),
+        ),
+    )
+
+    payload = _snapshot_build_payload(snapshot)
+
+    assert payload["class_count"] == 56
+    assert payload["source_scope"] == {
+        "availability": "available",
+        "covered": 36,
+        "total": 36,
+        "basis": "sealed physical build success over validated full module scope",
+        "reason": None,
+        "evidence_refs": ["output_build"],
+    }
 
 
 def test_setup_artifact_falls_back_to_generic_report_and_uses_its_finish_time():

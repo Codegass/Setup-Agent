@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, Check, CircleCheck, Clock, Gauge, GitBranch, Hammer, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
+import { Activity, AlertTriangle, Check, CircleCheck, Clock, GitBranch, Hammer, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
 import { type MouseEvent as ReactMouseEvent, useState } from "react"
 
 import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
@@ -17,6 +17,7 @@ import {
 } from "@/components/workspace/DeleteWorkspaceDialog"
 import { Tooltip } from "@/components/ui/tooltip"
 import { formatAgo } from "@/lib/relativeTime"
+import { lowerBoundEvidenceCounts } from "@/evidencePresentation"
 import { readStored, writeStored } from "@/lib/safeStorage"
 import { cn } from "@/lib/utils"
 
@@ -54,6 +55,9 @@ function evidenceObservationLabel(test: WorkspaceSummary["test"]): string | null
   ]) {
     if (isFiniteCount(observations.executed)) {
       known += observations.executed
+      if (observations.availability === "partial" || observations.bound === "lower") {
+        incomplete = true
+      }
     } else if (observations.availability === "unavailable" || observations.executed == null) {
       incomplete = true
     }
@@ -111,6 +115,8 @@ function RailRow({
     : []
   const subjectsAvailable = !!subjectCounts
     && subjectCounts.availability !== "unavailable"
+    && subjectCounts.availability !== "partial"
+    && subjectCounts.bound !== "lower"
     && subjectValues.every(isFiniteCount)
     && (subjectCounts.executed as number) === (
       (subjectCounts.passed as number)
@@ -121,6 +127,7 @@ function RailRow({
   const claimedTotal = subjectsAvailable ? subjectCounts.executed as number : 0
   const claimedPassed = subjectsAvailable ? subjectCounts.passed as number : 0
   const claimedFailed = subjectsAvailable ? (subjectCounts.failed as number) + (subjectCounts.errors as number) : 0
+  const subjectLowerBound = lowerBoundEvidenceCounts(subjectCounts)
   const runErrors = workspace.test.errors ?? 0
   const runValues = [workspace.test.pass, workspace.test.fail, runErrors, workspace.test.skip, workspace.test.total]
   const runComponents = workspace.test.pass + workspace.test.fail + runErrors + workspace.test.skip
@@ -133,8 +140,10 @@ function RailRow({
   const observationLabel = evidenceObservationLabel(workspace.test)
   const identityLabel = subjectCounts
     ? subjectsAvailable
-      ? `Stable identities: ${claimedPassed.toLocaleString()} passed and ${claimedFailed.toLocaleString()} failed or errored of ${claimedTotal.toLocaleString()}`
-      : "Stable module and test identities unavailable"
+      ? `Per-test results: ${claimedPassed.toLocaleString()} passed and ${claimedFailed.toLocaleString()} failed or errored of ${claimedTotal.toLocaleString()}`
+      : subjectLowerBound
+        ? `Per-test results: at least ${subjectLowerBound.executed.toLocaleString()} kept; list truncated`
+        : "Per-test results unavailable"
     : null
   const stack = visibleMetadata(workspace.stack)
   const commit = visibleMetadata(workspace.commit)
@@ -211,6 +220,12 @@ function RailRow({
             ) : subjectsAvailable && claimedTotal > 0 ? (
               <Tooltip label={[identityLabel, observationLabel].filter(Boolean).join(". ")}>
                 <TestBar fail={claimedFailed} pass={claimedPassed} total={claimedTotal} />
+              </Tooltip>
+            ) : subjectLowerBound ? (
+              <Tooltip label={[identityLabel, subjectCounts?.reason, observationLabel].filter(Boolean).join(". ")}>
+                <span className="w-10 text-right font-mono text-[10px] text-status-attention">
+                  ≥{subjectLowerBound.executed.toLocaleString()}
+                </span>
               </Tooltip>
             ) : (
               <Tooltip label={["Sealed run results unavailable", identityLabel, observationLabel].filter(Boolean).join(". ")}>
@@ -335,10 +350,6 @@ function pct(num: number, den: number): number | null {
   return den > 0 && num >= 0 && num <= den ? (100 * num) / den : null
 }
 
-function compact(n: number): string {
-  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : n.toLocaleString()
-}
-
 function StatCard({
   icon: Icon,
   label,
@@ -387,10 +398,7 @@ function StatCard({
 function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
   if (!workspaces.length) return null
   const r = rollup(workspaces)
-  const hasEvidenceLayers = r.claimedSubjectWorkspaces > 0
-  const subjects = pct(r.claimedSubjectPassed, r.claimedSubjectExecutedNonSkip)
   const runPass = pct(r.passed, r.executedNonSkip)
-  const measuredIdentityLabel = `${r.claimedSubjectMeasured} measured workspace${r.claimedSubjectMeasured === 1 ? "" : "s"}`
   const measuredRunLabel = `${r.runResultMeasured} measured workspace${r.runResultMeasured === 1 ? "" : "s"}`
   const buildDetail = [
     r.buildSuccess ? `${r.buildSuccess} ok` : null,
@@ -398,12 +406,6 @@ function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
     r.buildFailed ? `${r.buildFailed} failed` : null,
     r.buildUnavailable ? `${r.buildUnavailable} n/a` : null,
   ].filter(Boolean).join(" · ")
-  const subjectDetail = subjects === null ? "measured" : `${subjects.toFixed(0)}% measured subset`
-  const subjectHint = `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded stable test identities${subjects === null ? "" : `; ${r.claimedSubjectPassed.toLocaleString()} of ${r.claimedSubjectExecutedNonSkip.toLocaleString()} passed across ${measuredIdentityLabel}`}`
-  const diagnosticsHint = r.nonVerdictIncomplete
-    ? `At least ${r.nonVerdictObservations.toLocaleString()} diagnostics; some sources were not countable. Excluded from sealed run results.`
-    : `${r.nonVerdictObservations.toLocaleString()} diagnostics were excluded from sealed run results.`
-
   return (
     <div className="mt-2 grid grid-cols-2 gap-2">
       <StatCard
@@ -415,17 +417,6 @@ function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
         tone={r.buildFailed || r.buildPartial ? "warn" : r.buildSuccess ? "good" : "neutral"}
         value={`${r.buildKnown}/${r.total}`}
       />
-      {hasEvidenceLayers ? (
-        <StatCard
-          detail={subjectDetail}
-          hint={subjectHint}
-          icon={CircleCheck}
-          label="Identity coverage"
-          rate={null}
-          tone={r.claimedSubjectMeasured === r.total ? "good" : "warn"}
-          value={`${r.claimedSubjectMeasured}/${r.total}`}
-        />
-      ) : null}
       <StatCard
         detail={runPass === null
           ? `${r.runResultMeasured}/${r.total} measured`
@@ -434,23 +425,11 @@ function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
           ? `${r.runResultMeasured} of ${r.total} workspaces have a sealed run result; there are no non-skipped results to rate`
           : `${r.passed.toLocaleString()} passed, ${r.failed.toLocaleString()} failed, and ${r.errors.toLocaleString()} errors across ${measuredRunLabel} only`}
         icon={CircleCheck}
-        label={runPass === null ? "Run coverage" : "Run results"}
+        label="Run results"
         rate={runPass}
         tone={runPass === null && r.runResultMeasured < r.total ? "warn" : undefined}
         value={runPass === null ? `${r.runResultMeasured}/${r.total}` : undefined}
       />
-      {hasEvidenceLayers && (r.nonVerdictObservations > 0 || r.nonVerdictReportFiles > 0 || r.nonVerdictIncomplete) ? (
-        <StatCard
-          detail="excluded from results"
-          hint={diagnosticsHint}
-          icon={Gauge}
-          label="Diagnostics"
-          rate={null}
-          value={r.nonVerdictObservations > 0
-            ? `${compact(r.nonVerdictObservations)}${r.nonVerdictIncomplete ? "+" : ""}`
-            : r.nonVerdictIncomplete ? "Incomplete" : `${r.nonVerdictReportFiles} files`}
-        />
-      ) : null}
     </div>
   )
 }

@@ -1,5 +1,6 @@
-import type { BuildSummary, EvidenceCountSummary, WorkspaceSummary } from "@/api/types"
+import type { BuildSummary, WorkspaceSummary } from "@/api/types"
 import { Tooltip } from "@/components/ui/tooltip"
+import { completeEvidenceCounts, lowerBoundEvidenceCounts } from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
 /** Fleet-wide rollup band shown above the detail pane. Metrics-v2 subject KPIs
@@ -17,11 +18,11 @@ interface Rollup {
   failed: number
   errors: number
   executedNonSkip: number
-  executed: number
-  declared: number
   claimedSubjectWorkspaces: number
   claimedSubjectMeasured: number
   claimedSubjectUnavailable: number
+  claimedSubjectPartial: number
+  claimedSubjectLowerBound: number
   claimedSubjectPassed: number
   claimedSubjectFailed: number
   claimedSubjectErrors: number
@@ -48,17 +49,6 @@ function buildBucket(state: string): "success" | "partial" | "failed" | "unavail
   return "unavailable"
 }
 
-function hasMeasuredCounts(counts: EvidenceCountSummary): boolean {
-  const values = [counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped]
-  if (counts.availability === "unavailable" || !values.every(isFiniteCount)) return false
-  return (counts.executed as number) === (
-    (counts.passed as number)
-    + (counts.failed as number)
-    + (counts.errors as number)
-    + (counts.skipped as number)
-  )
-}
-
 function hasSealedRunResult(workspace: WorkspaceSummary): boolean {
   const state = workspace.test.state.trim().toLowerCase()
   if (!state || ["none", "unknown", "unavailable", "pending", "not-run", "not_run"].includes(state)) {
@@ -81,11 +71,11 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
     failed: 0,
     errors: 0,
     executedNonSkip: 0,
-    executed: 0,
-    declared: 0,
     claimedSubjectWorkspaces: 0,
     claimedSubjectMeasured: 0,
     claimedSubjectUnavailable: 0,
+    claimedSubjectPartial: 0,
+    claimedSubjectLowerBound: 0,
     claimedSubjectPassed: 0,
     claimedSubjectFailed: 0,
     claimedSubjectErrors: 0,
@@ -116,15 +106,20 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
     if (layers) {
       r.claimedSubjectWorkspaces += 1
       const subjects = layers.claimed.latestSubjects
-      if (!hasMeasuredCounts(subjects)) {
+      const exactSubjects = completeEvidenceCounts(subjects)
+      const boundedSubjects = lowerBoundEvidenceCounts(subjects)
+      if (boundedSubjects) {
+        r.claimedSubjectPartial += 1
+        r.claimedSubjectLowerBound += boundedSubjects.executed
+      } else if (!exactSubjects) {
         r.claimedSubjectUnavailable += 1
       } else {
         r.claimedSubjectMeasured += 1
-        r.claimedSubjectPassed += subjects.passed as number
-        r.claimedSubjectFailed += subjects.failed as number
-        r.claimedSubjectErrors += subjects.errors as number
-        r.claimedSubjectExecutedNonSkip += (subjects.passed as number) + (subjects.failed as number) + (subjects.errors as number)
-        r.claimedSubjectExecuted += subjects.executed as number
+        r.claimedSubjectPassed += exactSubjects.passed
+        r.claimedSubjectFailed += exactSubjects.failed
+        r.claimedSubjectErrors += exactSubjects.errors
+        r.claimedSubjectExecutedNonSkip += exactSubjects.passed + exactSubjects.failed + exactSubjects.errors
+        r.claimedSubjectExecuted += exactSubjects.executed
       }
       for (const observations of [
         layers.quarantinedObservations,
@@ -133,6 +128,9 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
       ]) {
         if (isFiniteCount(observations.executed)) {
           r.nonVerdictObservations += observations.executed
+          if (observations.availability === "partial" || observations.bound === "lower") {
+            r.nonVerdictIncomplete = true
+          }
         } else if (observations.availability === "unavailable" || observations.executed == null) {
           r.nonVerdictIncomplete = true
         }
@@ -148,8 +146,6 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
       r.errors += t.errors ?? 0
       // Skips are "not run". Errors are negative run results and stay in the denominator.
       r.executedNonSkip += t.pass + t.fail + (t.errors ?? 0)
-      r.executed += t.total
-      if (t.declaredTotal && t.declaredTotal > 0) r.declared += t.declaredTotal
     }
   }
   return r
@@ -215,13 +211,18 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
   const hasEvidenceLayers = r.claimedSubjectWorkspaces > 0
   const claimedRate = pct(r.claimedSubjectPassed, r.claimedSubjectExecutedNonSkip)
   const runPassRate = pct(r.passed, r.executedNonSkip)
-  const executionRate = pct(r.executed, r.declared)
   const measuredIdentityLabel = `${r.claimedSubjectMeasured} measured workspace${r.claimedSubjectMeasured === 1 ? "" : "s"}`
   const measuredRunLabel = `${r.runResultMeasured} measured workspace${r.runResultMeasured === 1 ? "" : "s"}`
   const diagnosticValue = r.nonVerdictObservations > 0
     ? `${r.nonVerdictObservations.toLocaleString()}${r.nonVerdictIncomplete ? "+" : ""}`
     : r.nonVerdictIncomplete ? "Incomplete" : `${r.nonVerdictReportFiles.toLocaleString()} files`
-  const identityHint = `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded stable test identities. ${r.total - r.claimedSubjectMeasured} did not.`
+  const identityHint = [
+    `${r.claimedSubjectMeasured} of ${r.total} workspaces recorded complete stable test identities.`,
+    r.claimedSubjectPartial
+      ? `${r.claimedSubjectPartial} more recorded truncated identity samples with at least ${r.claimedSubjectLowerBound.toLocaleString()} retained identities.`
+      : null,
+    r.claimedSubjectUnavailable ? `${r.claimedSubjectUnavailable} were unavailable.` : null,
+  ].filter(Boolean).join(" ")
   const diagnosticHint = r.nonVerdictIncomplete
     ? `At least ${r.nonVerdictObservations.toLocaleString()} diagnostics; some sources were not countable. Excluded from run results.`
     : `${r.nonVerdictObservations.toLocaleString()} diagnostics${r.nonVerdictReportFiles ? ` across ${r.nonVerdictReportFiles.toLocaleString()} files` : ""}. Excluded from run results.`
@@ -258,6 +259,14 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
           hint={`${r.claimedSubjectPassed.toLocaleString()} of ${r.claimedSubjectExecutedNonSkip.toLocaleString()} passed across ${measuredIdentityLabel} only; failures and errors are in the denominator`}
         />
       ) : null}
+      {hasEvidenceLayers && r.claimedSubjectPartial > 0 ? (
+        <Stat
+          label="Tests counted (min)"
+          value={`≥${r.claimedSubjectLowerBound.toLocaleString()}`}
+          tone="warn"
+          hint={`${r.claimedSubjectPartial} workspace${r.claimedSubjectPartial === 1 ? "" : "s"} kept only part of their per-test results; this is a minimum count, not a pass rate`}
+        />
+      ) : null}
       <Stat
         label="Run coverage"
         value={`${r.runResultMeasured}/${r.total} measured`}
@@ -277,14 +286,6 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
           label="Diagnostics"
           value={diagnosticValue}
           hint={diagnosticHint}
-        />
-      ) : null}
-      {executionRate !== null ? (
-        <Stat
-          label="Execution coverage"
-          value={executionRate}
-          tone={rateTone(executionRate)}
-          hint={`${r.executed.toLocaleString()} sealed run results of ${r.declared.toLocaleString()} declared test methods`}
         />
       ) : null}
     </div>

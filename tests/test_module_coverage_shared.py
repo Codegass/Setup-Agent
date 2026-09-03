@@ -633,12 +633,10 @@ def test_checklist_falls_back_to_modules_without_islands():
     assert "Module coverage:" in line
 
 
-def test_build_grain_rates_read_the_summary_and_the_class_census():
+def test_build_grain_rates_keep_class_and_source_counts_diagnostic():
     from sag.agent.module_coverage import build_grain_rates
 
     coverage = {"summary": {"modules_total": 14, "modules_built": 12}}
-    # Returns (grains, conflicts) like its sibling test_grain_rates: a grain
-    # may now expose a contradiction, and the caller must see it.
     grains, conflicts = build_grain_rates(coverage, compiled_classes=3400, source_files=3412)
     assert conflicts == ()
 
@@ -648,8 +646,13 @@ def test_build_grain_rates_read_the_summary_and_the_class_census():
         "numerator": 12,
         "denominator": 14,
     }
-    assert grains["classes"].band == "most"
-    assert grains["classes"].numerator == 3400
+    assert grains["classes"].payload() == {
+        "band": "unavailable",
+        "reason": (
+            "class files are diagnostic and not comparable to Java source files "
+            "(3400 class files observed; 3412 production Java sources observed)"
+        ),
+    }
 
 
 def test_build_grain_rates_type_their_absences():
@@ -664,7 +667,7 @@ def test_build_grain_rates_type_their_absences():
     }
     assert grains["classes"].payload() == {
         "band": "unavailable",
-        "reason": "class census unavailable",
+        "reason": "class files are diagnostic and not comparable to Java source files",
     }
 
 

@@ -167,8 +167,6 @@ def _all_present_validator(threshold=1.0):
         "found": ["a", "b"],
         "missing": [],
         "classes_expected": 4,
-        "classes_found": 4,
-        "class_coverage": 1.0,
     }
     return validator
 
@@ -186,22 +184,22 @@ def test_validate_build_status_full_success_when_all_modules_built():
     assert result["conflicts"] == []
 
 
-def test_validate_build_status_full_success_at_or_above_loosened_threshold():
-    """An env-loosened threshold lets a >= threshold build reach full SUCCESS."""
+def test_validate_build_status_missing_output_is_partial_regardless_of_legacy_threshold():
+    """A legacy threshold cannot turn a missing expected output into success."""
     validator = _coverage_validator(0.75, found=["a", "b", "c"], missing=["d"], threshold=0.75)
 
     result = validator.validate_build_status("m")
 
     assert result["success"] is True
-    assert result["build_complete"] is True
-    assert result["evidence_status"] == "success"
-    assert result["conflicts"] == []
-    assert "75%" in result["reason"]
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "build_modules_incomplete" in result["conflicts"]
+    assert "1 expected artifact(s) are missing or empty: d" in result["reason"]
+    assert "75%" not in result["reason"]
 
 
-def test_validate_build_status_partial_below_coverage_threshold():
-    """Real build output below the threshold is PARTIAL (build happened) — capped
-    at partial by build_modules_incomplete, never a clean success, never a hard fail."""
+def test_validate_build_status_partial_when_expected_outputs_are_missing():
+    """Real output plus missing expected outputs is PARTIAL, never a hard fail."""
     validator = _coverage_validator(0.5, found=["a"], missing=["b", "c", "d"], threshold=0.75)
 
     result = validator.validate_build_status("m")
@@ -210,12 +208,9 @@ def test_validate_build_status_partial_below_coverage_threshold():
     assert result["build_complete"] is False
     assert result["evidence_status"] == "partial"
     assert "build_modules_incomplete" in result["conflicts"]
-    # Counts, not a rounded percentage: live ignite rounded 17,779-of-17,799 to
-    # "Built 100% of expected classes (< 100% threshold)", a sentence that
-    # contradicts itself and states nothing the model can act on.
-    assert "2 of 4 expected classes" in result["reason"]
-    assert "2 short" in result["reason"]
-    assert "incomplete" in result["reason"].lower()
+    assert "3 expected artifact(s) are missing or empty" in result["reason"]
+    assert "b, c, d" in result["reason"]
+    assert "expected classes" not in result["reason"]
 
 
 def test_terminal_root_reactor_receipt_outranks_incomplete_filesystem_census():
@@ -249,9 +244,27 @@ def test_terminal_root_reactor_receipt_outranks_incomplete_filesystem_census():
     assert "filesystem class and module scans are diagnostic" in result["reason"]
 
 
+def test_terminal_root_receipt_cannot_hide_zero_output_for_java_sources():
+    """An exact receipt may outrank counts, but not a source-bearing zero output."""
+    validator = _coverage_validator(0.0, found=[], missing=["classes"], threshold=0.1)
+    validator._terminal_root_maven_reactor_receipt = lambda _project_dir: {
+        "receipt_id": "inv-empty-build",
+        "modules_succeeded": 1,
+        "modules_total": 1,
+        "requested_action": "compile",
+    }
+
+    result = validator.validate_build_status("m")
+
+    assert result["success"] is False
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "blocked"
+    assert "authority" not in result["evidence"]
+    assert "No compiled .class files found" in result["reason"]
+
+
 def test_validate_build_status_strict_default_partial_when_not_all_modules():
-    """Default strict threshold (1.0): a near-complete build (0.99) is PARTIAL,
-    never a full success — every active module must compile for SUCCESS."""
+    """A missing active-module output is PARTIAL independent of configuration."""
     validator = _coverage_validator(0.99, found=["a", "b", "c"], missing=["d"], threshold=1.0)
 
     result = validator.validate_build_status("m")
@@ -276,9 +289,9 @@ def test_validate_build_status_blocked_when_no_real_output():
 
 def test_validate_build_status_zero_classes_no_artifacts_blocked_despite_trivial_coverage():
     """commons-chain regression: 0 compiled classes + no artifacts must be BLOCKED
-    even when no class-based expectation exists (class_coverage defaults to 1.0) or
-    an empty target/classes fingerprint is present. The build verdict must agree
-    with the module scan (0 built), never report a phantom 'Built 100%'."""
+    even when no class-based expectation exists or an empty target/classes
+    fingerprint is present. The build verdict must agree with the module scan
+    (0 built), never report a phantom success."""
     orch = FakeBuildOrchestrator(files={"/workspace/cc/pom.xml"})
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
     validator._get_expected_artifacts = lambda *a, **k: [
@@ -289,8 +302,6 @@ def test_validate_build_status_zero_classes_no_artifacts_blocked_despite_trivial
         "found": [],
         "missing": ["cc.jar"],
         "classes_expected": 0,
-        "classes_found": 0,
-        "class_coverage": 1.0,
     }
 
     result = validator.validate_build_status("cc")
@@ -298,7 +309,8 @@ def test_validate_build_status_zero_classes_no_artifacts_blocked_despite_trivial
     assert result["success"] is False
     assert result["build_complete"] is False
     assert result["evidence_status"] == "blocked"
-    assert "compiled" in result["reason"].lower()
+    assert "No real build output found" in result["reason"]
+    assert "cc.jar" in result["reason"]
 
 
 # ===========================================================================
@@ -758,8 +770,6 @@ def _maven_reactor_verdict_validator(root_pom, extra_poms):
         "found": [item["path"] for item in expected],
         "missing": [],
         "classes_expected": 10,
-        "classes_found": 10,
-        "class_coverage": 1.0,
     }
     validator._check_class_files = lambda _project_dir: {
         "paths": ["/w/p/safe/target/classes/Foo.class"]
@@ -920,8 +930,6 @@ def test_explicit_profile_missing_artifact_cannot_green():
             "found": [path for path in paths if path != foo_path],
             "missing": [foo_path],
             "classes_expected": 20,
-            "classes_found": 10,
-            "class_coverage": 0.5,
         }
 
     validator._verify_expected_artifacts = missing_foo
@@ -984,8 +992,6 @@ def test_pending_profile_dispatch_is_conservative_and_terminal_poll_keeps_denomi
             "found": [path for path in paths if path != foo_path],
             "missing": [foo_path],
             "classes_expected": 20,
-            "classes_found": 10,
-            "class_coverage": 0.5,
         }
 
     validator._verify_expected_artifacts = missing_foo
@@ -1033,8 +1039,6 @@ def test_pending_receipt_without_artifacts_is_not_build_success_evidence():
         "found": [],
         "missing": [item["path"] for item in expected],
         "classes_expected": 0,
-        "classes_found": 0,
-        "class_coverage": 0.0,
     }
     validator._check_class_files = lambda _project_dir: {"paths": []}
     validator._check_jar_files = lambda _project_dir: {"paths": []}
@@ -1075,8 +1079,6 @@ def test_timed_out_profile_dispatch_still_enters_expected_denominator():
             "found": ["/w/p/safe/target/safe-1.jar"],
             "missing": ["/w/p/foo/target/foo-1.jar"],
             "classes_expected": 20,
-            "classes_found": 10,
-            "class_coverage": 0.5,
         }
 
     validator._verify_expected_artifacts = missing_foo
@@ -1119,8 +1121,6 @@ def test_symlinked_receipt_workdir_still_binds_profile_to_current_reactor():
             "found": ["/w/p/safe/target/safe-1.jar"],
             "missing": ["/w/p/foo/target/foo-1.jar"],
             "classes_expected": 20,
-            "classes_found": 10,
-            "class_coverage": 0.5,
         }
 
     validator._verify_expected_artifacts = missing_foo

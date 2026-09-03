@@ -2,12 +2,11 @@ import type { ExecutionSessionDetail } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
 import { NeedsAttention } from "@/components/session/NeedsAttention"
 import {
-  formatRate,
   presentBuild,
   presentDataNotes,
   presentDiagnostics,
+  presentTestAccounting,
   presentTestRun,
-  presentVerifiedIdentities,
 } from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
@@ -46,8 +45,8 @@ function Tile({
 }
 
 /**
- * Overview tab: the always-visible agent goal button (jumps to Flow), KPI tiles
- * synthesized from the test/build/module summaries, the per-module overview table,
+ * Overview tab: the always-visible agent goal button (jumps to Flow), build and
+ * test summaries, the per-module overview table,
  * and the "needs attention" card. Markup/styling mirrors WorkbenchDetail.dc.html
  * lines 100–200 (the Overview block in the AFTER template).
  */
@@ -63,7 +62,7 @@ export function OverviewTab({
   const modules = detail.modules ?? []
   const layers = test.evidenceLayers?.tests
   const run = presentTestRun(test)
-  const identities = presentVerifiedIdentities(test)
+  const accounting = presentTestAccounting(test)
   const diagnostics = presentDiagnostics(layers)
   const dataNotes = presentDataNotes(test.conflicts)
 
@@ -101,52 +100,47 @@ export function OverviewTab({
         </button>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <Tile
-          label="Test run"
-          value={run.stateLabel}
-          sub={
-            run.passRate == null
-              ? run.summary
-              : `${run.summary} · ${formatRate(run.passRate)} of non-skipped results passed`
-          }
-          valueClass={run.valueClass}
-        />
-        <Tile
-          label="Verified test identities"
-          value={identities.value}
-          sub={identities.summary}
-          valueClass={identities.valueClass}
-        />
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Tile
           label="Build"
           value={build.value}
           sub={build.summary}
           valueClass={build.valueClass}
         />
-        {ms?.lineRate != null ? (
-          <Tile
-            label="Line coverage"
-            value={pct1(ms.lineRate)}
-            sub={
-              ms.lineCovered != null && ms.lineTotal != null
-                ? `${ms.lineCovered.toLocaleString()} / ${ms.lineTotal.toLocaleString()} lines`
-                : null
-            }
-          />
-        ) : null}
-        {ms?.branchRate != null ? (
-          <Tile
-            label="Branch coverage"
-            value={pct1(ms.branchRate)}
-            sub={
-              ms.branchCovered != null && ms.branchTotal != null
-                ? `${ms.branchCovered.toLocaleString()} / ${ms.branchTotal.toLocaleString()} branches`
-                : null
-            }
-          />
-        ) : null}
+        <Tile
+          label="Tests"
+          value={run.stateLabel === "Passed" ? "Success" : run.stateLabel}
+          sub={accounting.summary}
+          valueClass={run.valueClass}
+        />
       </div>
+
+      {ms?.lineRate != null || ms?.branchRate != null ? (
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {ms?.lineRate != null ? (
+            <Tile
+              label="Line coverage"
+              value={pct1(ms.lineRate)}
+              sub={
+                ms.lineCovered != null && ms.lineTotal != null
+                  ? `${ms.lineCovered.toLocaleString()} / ${ms.lineTotal.toLocaleString()} lines`
+                  : null
+              }
+            />
+          ) : null}
+          {ms?.branchRate != null ? (
+            <Tile
+              label="Branch coverage"
+              value={pct1(ms.branchRate)}
+              sub={
+                ms.branchCovered != null && ms.branchTotal != null
+                  ? `${ms.branchCovered.toLocaleString()} / ${ms.branchTotal.toLocaleString()} branches`
+                  : null
+              }
+            />
+          ) : null}
+        </div>
+      ) : null}
 
       {layers && diagnostics.hasData ? (
         <section className="mt-3 flex flex-col gap-3 rounded-[10px] border border-border bg-muted/40 px-4 py-3 sm:flex-row sm:items-start sm:justify-between">

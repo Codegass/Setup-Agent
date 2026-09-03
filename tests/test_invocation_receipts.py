@@ -57,6 +57,7 @@ from sag.agent.invocation_receipts import (
     normalize_producer_observations,
     producer_observations_sha256,
     read_producer_observations,
+    receipt_record_scope,
     record_invocation,
     report_delta,
     report_snapshot_complete,
@@ -106,6 +107,22 @@ def minimal_valid_receipt(
         before={},
         after=after or {},
     )
+
+
+def test_compatible_schema_v2_receipt_is_forensic_in_a_v3_run():
+    legacy = minimal_valid_receipt("receipt-legacy-v2")
+    assert legacy["schema_version"] == RECEIPT_SCHEMA_VERSION == 3
+    legacy["schema_version"] = 2
+
+    assert receipt_record_scope(legacy, "run-current-v3") == "forensic"
+
+
+def test_malformed_schema_v2_receipt_still_poison_checks_instead_of_hiding():
+    legacy = minimal_valid_receipt("receipt-malformed-v2")
+    legacy["schema_version"] = 2
+    legacy.pop("report_delta")
+
+    assert receipt_record_scope(legacy, "run-current-v3") == "current"
 
 
 def argv_contract_authority(*, executor, action, expected_argv, cwd="/workspace/proj"):
@@ -363,6 +380,101 @@ def receipts_written(commands):
         for path, body in sorted(filesystem.files.items())
         if path.startswith(f"{RECEIPT_DIR}/") and path.endswith(".json")
     ]
+
+
+def test_bounded_empty_exact_rows_keep_their_disclosure_and_project_as_a_zero_floor(
+    monkeypatch,
+):
+    """Zero retained rows is not proof that the invocation ran zero tests.
+
+    The parser observed one row and the bound retained none.  The receipt must
+    therefore carry both the complete empty envelope and its loss disclosure;
+    metrics may publish the retained zero only as a partial lower bound.
+    """
+
+    import sag.agent.invocation_receipts as invocation_receipts
+    from sag.agent.receipt_test_rows import ROW_ENVELOPE_VERSION
+    from sag.tools.report_metrics import assemble_report_metrics, validate_report_metrics_v2
+
+    parsed = {
+        "schema_version": ROW_ENVELOPE_VERSION,
+        "status": "complete",
+        "report_count": 1,
+        "rows": [],
+        "row_bounds": {
+            "observed_rows": 1,
+            "kept_rows": 0,
+            "dropped_red": 0,
+            "dropped_green": 1,
+            "dropped_files": 1,
+            "per_file_cap_drops": 0,
+            "total_cap_drops": 1,
+            "oversize_row_drops": 0,
+            "unparsed_reports": 0,
+        },
+    }
+    execute = FakeExecute(
+        rules=[
+            ("rev-parse HEAD", ok("d" * 40)),
+            ("command -v", ok("/usr/bin/mvn\nSAGTOOLCHAIN\nApache Maven 3.9\n")),
+        ]
+    )
+    monkeypatch.setattr(
+        invocation_receipts,
+        "read_delta_testcase_rows",
+        lambda *_args, **_kwargs: parsed,
+    )
+
+    record_invocation(
+        execute,
+        receipt_id="inv-maven-test-0099",
+        run_id="run-bounded-empty",
+        tool="maven",
+        attempt=1,
+        requested_action="test",
+        effective_action="test",
+        argv="mvn test",
+        working_directory="/workspace/proj",
+        exit_code=0,
+        before={},
+        after={SUREFIRE: HASH_A},
+        requirements={"build_domains": [{"root": "/workspace/proj", "system": "maven"}]},
+    )
+
+    (receipt,) = receipts_written(execute.commands)
+    assert receipt["testcase_execution_rows"]["status"] == "complete"
+    assert receipt["testcase_execution_rows"]["rows"] == []
+    assert receipt["testcase_row_disclosure"] == {
+        "rows_source": "delta_xml",
+        "red_rows_complete": True,
+        "rows_truncated": {"dropped_green": 1, "dropped_files": 1},
+    }
+
+    metrics = assemble_report_metrics(
+        snapshot={
+            "verdict": "partial",
+            "phase_records": [{"phase": "test", "termination": "complete"}],
+            "build_evidence": {"observed": True, "judgment": "success"},
+        },
+        build_evidence={},
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-09-01T12:00:00Z",
+        run_pin={"run_id": "run-bounded-empty", "target_repo_sha": "d" * 40},
+        persistence={
+            "receipts_expected": 1,
+            "receipts_persisted": 1,
+            "terminal_receipts_unpersisted": 0,
+        },
+        receipt_records=[receipt],
+    )
+    projected = metrics["tests"]["claimed"]["receipt_executions"]
+    assert validate_report_metrics_v2(metrics) == metrics
+    assert projected["executed"] == 0
+    assert projected["availability"] == "partial"
+    assert projected["bound"] == "lower"
+    assert "bounded" in projected["reason"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The test-cases denominator has ONE producer, and it says what it measured (#39).
+"""Static discovery stays diagnostic beside runtime outcome accounting (#39).
 
 Spec: ``docs/superpowers/specs/2026-08-15-test-cases-denominator-design.md``.
 
@@ -8,18 +8,17 @@ never invented:
 * **polaris** (d2r3, ``logs/session_20260814_100129_764872_b92b9a5c90a1_26484``):
   the analyzer sealed ``static_test_count: 1347`` beside a census whose module
   list names 8 modules totalling 593 out of ``by_module_total: 20``, and the
-  verdict sealed ``cases 16496/1347 (unbounded)``. Two producers, one field, no
-  provenance: nothing in the record explains the 754 tests the module list does
-  not account for.
-* **camel** (d2r2/d2r3): ``cases {"band": "unavailable", "reason": "static
-  discovery found no count"}`` — some repositories have no unified census at
-  all, and that is its own answer.
+  the old verdict sealed ``cases 16496/1347 (unbounded)``. The runtime outcome
+  accounting now stays 16496/16496 while both static observations remain named
+  diagnostics.
+* **camel** (d2r2/d2r3): no receipt-scoped runtime outcomes and no unified
+  static census. Both absences remain explicit, and neither becomes ``0/0``.
 * **tapestry-5** (d2r2): ``discovered: 1614`` with ``unique.executed: 2417`` —
   the numerator legitimately exceeds a COMPLETE census because parameterized
   suites and factories expand declarations into executions.
 
-The census is a FLOOR, never a ceiling (spec §1): no assertion here caps or
-scales a numerator to it.
+The census is a diagnostic FLOOR, never a runtime denominator (spec §1): no
+assertion here caps or scales the execution population to it.
 """
 
 from __future__ import annotations
@@ -38,6 +37,7 @@ from sag.case_census import (
     produce_census,
 )
 from sag.project_fact_sheet import project_fact_sheet_metadata
+
 # Aliased: pytest tries to COLLECT any module-level name starting with `Test`,
 # and warns on both of these because they define `__init__`.
 from sag.testcases.catalog import TestCaseCatalog as CaseCatalog
@@ -244,7 +244,7 @@ def test_runner_enumerated_rows_are_the_producer_and_never_mix_languages():
 
 
 # --------------------------------------------------------------------------- #
-# §4 — the three acceptance shapes, on the sealed cases grain.
+# §4 — the three acceptance shapes, beside the sealed outcome-accounting grain.
 # --------------------------------------------------------------------------- #
 
 
@@ -260,9 +260,10 @@ def test_polaris_shape_one_denominator_a_named_floor_and_both_numbers():
         )
     )
 
-    assert payload["denominator"] == POLARIS_MODULE_SUM
+    assert payload["denominator"] == POLARIS_EXECUTED
     assert payload["numerator"] == POLARIS_EXECUTED
-    assert payload["band"] == "unbounded"
+    assert payload["band"] == "fully"
+    assert "593 static test declarations observed" in payload["reason"]
     # The floor is named with the module count missing from it (§2.2) ...
     assert "12 of 20 modules unmeasured" in payload["reason"]
     # ... the rejected total stays visible beside the one that won (§2.1) ...
@@ -291,7 +292,8 @@ def test_camel_quarkus_shape_names_both_totals_when_the_module_list_is_larger():
         )
     )
 
-    assert payload["denominator"] == CAMEL_QUARKUS_MODULE_SUM
+    assert payload["band"] == "unavailable"
+    assert "3,282 static test declarations observed" in payload["reason"]
     assert "3,282 in the module list against a bare total of 2,765" in payload["reason"]
     assert "no module list to explain" not in payload["reason"]
     assert conflicts == ()
@@ -339,11 +341,14 @@ def test_one_fqn_in_two_modules_puts_the_module_sum_above_the_total():
 def test_camel_shape_keeps_todays_unavailable_and_invents_nothing():
     payload, conflicts = _cases(_stats(executed=0, denominator_basis=BASIS_NONE))
 
-    assert payload == {"band": "unavailable", "reason": "static discovery found no count"}
+    assert payload == {
+        "band": "unavailable",
+        "reason": "no receipt-scoped runtime outcomes were accounted",
+    }
     assert conflicts == ()
 
 
-def test_tapestry_shape_keeps_the_unbounded_band_and_states_the_expansion():
+def test_tapestry_shape_accounts_runtime_outcomes_and_states_static_expansion():
     payload, conflicts = _cases(
         _stats(
             executed=TAPESTRY_EXECUTED,
@@ -352,28 +357,38 @@ def test_tapestry_shape_keeps_the_unbounded_band_and_states_the_expansion():
         )
     )
 
-    assert payload["band"] == "unbounded"
+    assert payload["band"] == "fully"
     assert payload["numerator"] == TAPESTRY_EXECUTED
-    assert payload["denominator"] == TAPESTRY_DISCOVERED
+    assert payload["denominator"] == TAPESTRY_EXECUTED
     assert "parameterized expansion over 1,614 declared" in payload["reason"]
-    assert "numerator exceeds denominator" in payload["reason"]
+    assert "1,614 static test declarations observed" in payload["reason"]
+    assert "numerator exceeds denominator" not in payload["reason"]
     assert conflicts == ()
 
 
-def test_a_complete_census_that_bounds_its_numerator_says_nothing_extra():
-    """No new sentence appears where the fraction already speaks (byte-compat)."""
+def test_a_complete_static_census_is_diagnostic_not_the_runtime_denominator():
     payload, _ = _cases(
         _stats(executed=100, discovered=200, denominator_basis=BASIS_COMPLETE),
     )
 
-    assert payload == {"rate": 50.0, "band": "half", "numerator": 100, "denominator": 200}
+    assert payload == {
+        "rate": 100.0,
+        "band": "fully",
+        "numerator": 100,
+        "denominator": 100,
+        "reason": (
+            "200 static test declarations observed "
+            "(diagnostic only; not the runtime denominator)"
+        ),
+    }
 
 
-def test_an_unnamed_basis_keeps_the_recorded_sentence_exactly():
-    """Replayed snapshots predate the basis; silence is the honest render."""
+def test_an_unnamed_basis_still_labels_static_discovery_as_diagnostic():
     payload, _ = _cases(_stats(executed=TAPESTRY_EXECUTED, discovered=TAPESTRY_DISCOVERED))
 
-    assert payload["reason"] == "numerator exceeds denominator; this count cannot bound it"
+    assert payload["reason"] == (
+        "1,614 static test declarations observed " "(diagnostic only; not the runtime denominator)"
+    )
 
 
 def test_the_partial_floor_is_stated_even_when_the_census_bounds_the_run():
@@ -387,8 +402,13 @@ def test_the_partial_floor_is_stated_even_when_the_census_bounds_the_run():
         )
     )
 
-    assert payload["band"] == "few"
-    assert payload["reason"] == "100/593 — 12 of 20 modules unmeasured"
+    assert payload["band"] == "fully"
+    assert payload["numerator"] == payload["denominator"] == 100
+    assert payload["reason"] == (
+        "593 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "12 of 20 modules unmeasured"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -428,7 +448,7 @@ def test_an_unmeasured_basis_stays_an_absent_key():
 def test_a_census_disagreement_never_downgrades_the_run():
     """It grades the harness's bookkeeping, not what the run executed."""
     assert CENSUS_CONFLICT in ADJUDICATED_CONFLICTS
-    # The unbounded band is a fact about the fraction and keeps its own cap.
+    # Historical malformed fractions still keep their strict validation cap.
     assert UNBOUNDED_CONFLICT not in ADJUDICATED_CONFLICTS
 
 

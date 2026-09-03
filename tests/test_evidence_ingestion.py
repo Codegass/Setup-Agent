@@ -550,7 +550,9 @@ def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path
     assert result.metadata["failed_tests"] == 0
     assert result.metadata["error_tests"] == 0
     assert snapshot.rates["test"]["cases"]["reason"] == (
-        "0/5 — 5 executions reported in tool output but bound to no receipt"
+        "no receipt-scoped runtime outcomes were accounted; "
+        "5 static test declarations observed (diagnostic only; not the runtime denominator); "
+        "5 executions reported in tool output but bound to no receipt"
     )
     assert snapshot.verdict == "partial"
 

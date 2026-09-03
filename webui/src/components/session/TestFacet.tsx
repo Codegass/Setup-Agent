@@ -8,6 +8,7 @@ import {
   completeEvidenceCounts,
   formatCount,
   formatRate,
+  lowerBoundEvidenceCounts,
   presentDiagnostics,
   presentTestRun,
   presentVerifiedIdentities,
@@ -27,6 +28,7 @@ function LayerRow({
   note?: string
 }) {
   const available = completeEvidenceCounts(counts)
+  const lowerBound = lowerBoundEvidenceCounts(counts)
   const fileNote = "reportFileCount" in counts && typeof counts.reportFileCount === "number"
     ? `${counts.reportFileCount.toLocaleString()} report files`
     : null
@@ -37,18 +39,33 @@ function LayerRow({
         <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
           {label}
         </span>
-        <span className="font-mono text-[12px] text-foreground">
-          {available ? `${formatCount(available.passed)} / ${formatCount(available.executed)} passed` : "Unavailable"}
+        <span
+          className={`font-mono text-[12px] ${lowerBound ? "text-status-attention" : "text-foreground"}`}
+        >
+          {available
+            ? `${formatCount(available.passed)} / ${formatCount(available.executed)} passed`
+            : lowerBound
+              ? `≥${formatCount(lowerBound.executed)} retained`
+              : "Unavailable"}
         </span>
       </div>
-      {available && (available.failed > 0 || available.errors > 0 || available.skipped > 0) ? (
+      {(available || lowerBound) && (
+        (available?.failed ?? lowerBound?.failed ?? 0) > 0
+        || (available?.errors ?? lowerBound?.errors ?? 0) > 0
+        || (available?.skipped ?? lowerBound?.skipped ?? 0) > 0
+      ) ? (
         <div className="mt-0.5 text-right font-mono text-[11px] text-muted-foreground">
-          {`${formatCount(available.failed)} failed · ${formatCount(available.errors)} errors · ${formatCount(available.skipped)} skipped`}
+          {`${formatCount((available ?? lowerBound)!.failed)} failed · ${formatCount((available ?? lowerBound)!.errors)} errors · ${formatCount((available ?? lowerBound)!.skipped)} skipped`}
         </div>
       ) : null}
       {!available || note ? (
         <div className="mt-0.5 text-right font-mono text-[11px] text-muted-foreground">
-          {[note, fileNote, !available ? counts.reason || "Count details were incomplete" : null].filter(Boolean).join(" · ")}
+          {[
+            note,
+            fileNote,
+            lowerBound ? "Lower bound; complete total unavailable" : null,
+            !available ? counts.reason || "Count details were incomplete" : null,
+          ].filter(Boolean).join(" · ")}
         </div>
       ) : null}
     </div>
@@ -98,7 +115,7 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
       <div className="border-t border-border p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-semibold text-foreground">Verified test identities</div>
+            <div className="text-[13px] font-semibold text-foreground">Verified per-test results</div>
             <p className="mt-0.5 max-w-[70ch] text-[12px] leading-relaxed text-muted-foreground">
               {identities.summary}
             </p>
@@ -142,7 +159,7 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
           </summary>
           <div className="mt-2">
             <LayerRow counts={layers.claimed.latestCases} label="Verified test cases" />
-            <LayerRow counts={layers.claimed.receiptExecutions} label="Recorded tool runs" />
+            <LayerRow counts={layers.claimed.receiptExecutions} label="Recorded test executions" />
             <LayerRow
               counts={layers.quarantinedObservations}
               label="Excluded observations"

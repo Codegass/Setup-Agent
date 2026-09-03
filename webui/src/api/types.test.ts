@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import type { ExecutionSessionDetail, TestSummary } from "./types"
+import type { BuildSummary, EvidenceCountSummary, ExecutionSessionDetail, TestSummary } from "./types"
 
 const verdictContract = {
   verdict: {
@@ -37,6 +37,33 @@ const testContract = {
   rawExecutions: 987,
 } satisfies TestSummary
 
+const boundedCountContract = {
+  executed: 0,
+  passed: 0,
+  failed: 0,
+  errors: 0,
+  skipped: 0,
+  availability: "partial",
+  bound: "lower",
+  basis: "bounded identity sample",
+  reason: "sample truncated",
+} satisfies EvidenceCountSummary
+
+const buildContract = {
+  state: "success",
+  tool: "sealed snapshot",
+  time: "—",
+  note: "Canonical build evidence from verdict.json",
+  classCount: 56,
+  sourceScope: {
+    covered: 36,
+    total: 36,
+    availability: "available",
+    basis: "sealed physical build success over validated full module scope",
+    evidenceRefs: ["output_build"],
+  },
+} satisfies BuildSummary
+
 describe("sealed verdict API types", () => {
   it("models canonical authority and legacy labeling fields", () => {
     expect(verdictContract.verdict.source).toBe("snapshot")
@@ -48,5 +75,16 @@ describe("sealed verdict API types", () => {
   it("models raw execution diagnostics separately from the primary total", () => {
     expect(testContract.total).toBe(328)
     expect(testContract.rawExecutions).toBe(987)
+  })
+
+  it("models retained counts as an explicit lower bound", () => {
+    expect(boundedCountContract.availability).toBe("partial")
+    expect(boundedCountContract.bound).toBe("lower")
+  })
+
+  it("models comparable production source scope separately from class outputs", () => {
+    expect(buildContract.classCount).toBe(56)
+    expect(buildContract.sourceScope.covered).toBe(36)
+    expect(buildContract.sourceScope.total).toBe(36)
   })
 })

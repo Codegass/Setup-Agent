@@ -61,6 +61,10 @@ class MetricRef:
     disposition: str
     grain: str
     counts: Mapping[str, int | None]
+    availability: str = "available"
+    bound: str | None = None
+    basis: str | None = None
+    reason: str | None = None
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -145,6 +149,64 @@ def validate_count_object(value: Any, path: str = "counts") -> dict[str, int | N
         if result["executed"] != outcomes:
             raise EvaluationError(f"{path}.executed must equal passed + failed + errors + skipped")
     return result
+
+
+def validate_count_measurement(value: Any, path: str = "counts") -> dict[str, Any]:
+    """Validate counts together with their exact/partial/unavailable reach.
+
+    Historical evaluator fixtures predate the availability metadata, so a
+    fully numeric legacy fixture remains exact and an all-null one remains
+    unavailable.  A live ``partial`` measurement is stricter: it must retain a
+    reconciled numeric tuple, state ``bound=lower`` and explain why the
+    measurement is incomplete.
+    It can therefore be printed as ``≥N`` without ever entering exact rate or
+    delta arithmetic.
+    """
+
+    raw = _mapping(value, path)
+    counts = validate_count_object(raw, path)
+    explicit = "availability" in raw
+    availability = raw.get("availability")
+    if availability is None and not explicit:
+        availability = "unavailable" if counts["executed"] is None else "available"
+    if availability not in {"available", "partial", "unavailable"}:
+        raise EvaluationError(f"{path}.availability is unsupported")
+
+    numeric = counts["executed"] is not None
+    if availability == "unavailable":
+        if numeric:
+            raise EvaluationError(f"{path} unavailable counts must be null")
+        if explicit:
+            _nonempty_string(raw.get("reason"), f"{path}.reason")
+        if raw.get("bound") is not None:
+            raise EvaluationError(f"{path}.bound is invalid for unavailable counts")
+    elif availability == "partial":
+        if not numeric:
+            raise EvaluationError(f"{path} partial counts must be numeric")
+        if raw.get("bound") != "lower":
+            raise EvaluationError(f"{path}.bound must be 'lower' for partial counts")
+        _nonempty_string(raw.get("basis"), f"{path}.basis")
+        _nonempty_string(raw.get("reason"), f"{path}.reason")
+    else:
+        if not numeric:
+            raise EvaluationError(f"{path} available counts must be numeric")
+        if raw.get("bound") is not None:
+            raise EvaluationError(f"{path}.bound is invalid for available counts")
+
+    return {
+        **counts,
+        "availability": availability,
+        "bound": raw.get("bound"),
+        "basis": raw.get("basis"),
+        "reason": raw.get("reason"),
+    }
+
+
+def _measurement_display(measurement: Mapping[str, Any]) -> str:
+    executed = measurement.get("executed")
+    if not isinstance(executed, int):
+        return "unavailable"
+    return f"≥{executed:,}" if measurement.get("bound") == "lower" else f"{executed:,}"
 
 
 def _identity_material(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -253,7 +315,7 @@ def aggregate_v2_tests(
 
 def _validate_observation_bucket(value: Any, path: str) -> dict[str, Any]:
     raw = _mapping(value, path)
-    counts = validate_count_object(raw, path)
+    counts = validate_count_measurement(raw, path)
     report_file_count = raw.get("report_file_count")
     if report_file_count is not None:
         report_file_count = _nonnegative_int(report_file_count, f"{path}.report_file_count")
@@ -358,7 +420,7 @@ def validate_v2_project(value: Any, path: str = "project") -> Mapping[str, Any]:
     tests = _mapping(project.get("tests"), f"{path}.tests")
     claimed = _mapping(tests.get("claimed"), f"{path}.tests.claimed")
     for field in ("latest_subjects", "latest_cases", "receipt_executions"):
-        validate_count_object(claimed.get(field), f"{path}.tests.claimed.{field}")
+        validate_count_measurement(claimed.get(field), f"{path}.tests.claimed.{field}")
     for disposition in OBSERVATION_DISPOSITIONS:
         field = f"{disposition}_observations"
         _validate_observation_bucket(tests.get(field), f"{path}.tests.{field}")
@@ -454,13 +516,20 @@ def select_metric(project: Any, *, grain: str, disposition: str) -> MetricRef:
     """Select one explicitly tagged metric surface from a v2 project."""
 
     validated = validate_v2_project(project)
-    counts = validate_count_object(_selected_counts(validated, grain, disposition), "metric.counts")
+    measurement = validate_count_measurement(
+        _selected_counts(validated, grain, disposition),
+        "metric.counts",
+    )
     return MetricRef(
         schema_version=METRICS_V2_SCHEMA_VERSION,
         identity_version=str(validated["identity_version"]),
         disposition=disposition,
         grain=grain,
-        counts=counts,
+        counts={field: measurement[field] for field in COUNT_FIELDS},
+        availability=str(measurement["availability"]),
+        bound=measurement.get("bound"),
+        basis=measurement.get("basis"),
+        reason=measurement.get("reason"),
     )
 
 
@@ -477,13 +546,37 @@ def compare_metric_refs(baseline: MetricRef, candidate: MetricRef) -> dict[str, 
         right = getattr(candidate, field)
         if left != right:
             raise EvaluationError(f"comparison rejected: {field} differs ({left!r} != {right!r})")
-    left_counts = validate_count_object(baseline.counts, "baseline.counts")
-    right_counts = validate_count_object(candidate.counts, "candidate.counts")
+    left_measurement = validate_count_measurement(
+        {
+            **baseline.counts,
+            "availability": baseline.availability,
+            **({"bound": baseline.bound} if baseline.bound is not None else {}),
+            **({"basis": baseline.basis} if baseline.basis is not None else {}),
+            **({"reason": baseline.reason} if baseline.reason is not None else {}),
+        },
+        "baseline.counts",
+    )
+    right_measurement = validate_count_measurement(
+        {
+            **candidate.counts,
+            "availability": candidate.availability,
+            **({"bound": candidate.bound} if candidate.bound is not None else {}),
+            **({"basis": candidate.basis} if candidate.basis is not None else {}),
+            **({"reason": candidate.reason} if candidate.reason is not None else {}),
+        },
+        "candidate.counts",
+    )
+    left_counts = {field: left_measurement[field] for field in COUNT_FIELDS}
+    right_counts = {field: right_measurement[field] for field in COUNT_FIELDS}
+    exact_pair = (
+        left_measurement["availability"] == "available"
+        and right_measurement["availability"] == "available"
+    )
     delta: dict[str, int | None] = {}
     for field in COUNT_FIELDS:
         left = left_counts[field]
         right = right_counts[field]
-        delta[field] = None if left is None or right is None else right - left
+        delta[field] = None if not exact_pair or left is None or right is None else right - left
     return {
         "schema_version": baseline.schema_version,
         "identity_version": baseline.identity_version,
@@ -492,6 +585,21 @@ def compare_metric_refs(baseline: MetricRef, candidate: MetricRef) -> dict[str, 
         "baseline": left_counts,
         "candidate": right_counts,
         "delta": delta,
+        "baseline_measurement": {
+            "availability": left_measurement["availability"],
+            "bound": left_measurement["bound"],
+            "display": _measurement_display(left_measurement),
+            "basis": left_measurement["basis"],
+            "reason": left_measurement["reason"],
+        },
+        "candidate_measurement": {
+            "availability": right_measurement["availability"],
+            "bound": right_measurement["bound"],
+            "display": _measurement_display(right_measurement),
+            "basis": right_measurement["basis"],
+            "reason": right_measurement["reason"],
+        },
+        "delta_comparable": exact_pair,
     }
 
 
@@ -573,11 +681,22 @@ def compare_project_metrics(
     return result
 
 
-def _sum_counts(vectors: Iterable[Mapping[str, Any]]) -> dict[str, int | None]:
-    validated = [validate_count_object(vector) for vector in vectors]
+def _sum_counts(vectors: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    raw_vectors = list(vectors)
+    validated = [validate_count_measurement(vector) for vector in raw_vectors]
+    carries_metadata = any("availability" in vector or "bound" in vector for vector in raw_vectors)
     if not validated or any(vector["executed"] is None for vector in validated):
-        return {field: None for field in COUNT_FIELDS}
-    totals: dict[str, int | None] = {}
+        unavailable: dict[str, Any] = {field: None for field in COUNT_FIELDS}
+        if carries_metadata:
+            unavailable.update(
+                {
+                    "availability": "unavailable",
+                    "reason": "one or more project measurements were unavailable",
+                    "display": "unavailable",
+                }
+            )
+        return unavailable
+    totals: dict[str, Any] = {}
     for field in COUNT_FIELDS:
         total = 0
         for vector in validated:
@@ -585,6 +704,31 @@ def _sum_counts(vectors: Iterable[Mapping[str, Any]]) -> dict[str, int | None]:
             assert value is not None
             total += value
         totals[field] = total
+    partial = any(vector["availability"] == "partial" for vector in validated)
+    if carries_metadata:
+        partial_reasons = sorted(
+            {
+                str(vector["reason"])
+                for vector in validated
+                if vector["availability"] == "partial" and vector.get("reason")
+            }
+        )
+        totals.update(
+            {
+                "availability": "partial" if partial else "available",
+                **({"bound": "lower"} if partial else {}),
+                "basis": "sum of project measurements",
+                **(
+                    {
+                        "reason": "one or more project measurements were lower bounds: "
+                        + "; ".join(partial_reasons)
+                    }
+                    if partial
+                    else {}
+                ),
+                "display": f"≥{totals['executed']:,}" if partial else f"{totals['executed']:,}",
+            }
+        )
     return totals
 
 
@@ -644,13 +788,13 @@ def evaluate_v2_campaign(projects: Sequence[Mapping[str, Any]]) -> dict[str, Any
             and isinstance(recurrence, int)
             and recurrence <= MAX_TERMINAL_REFUSAL_RECURRENCES
         )
-        subjects = validate_count_object(
+        subjects = validate_count_measurement(
             _mapping(_mapping(project["tests"], "tests")["claimed"], "claimed")["latest_subjects"],
             "latest_subjects",
         )
         subject_executed = subjects["executed"]
         subject_passed = subjects["passed"]
-        if subject_executed not in (None, 0):
+        if subjects["availability"] == "available" and subject_executed not in (None, 0):
             assert subject_executed is not None
             assert subject_passed is not None
             subject_pass_rates.append(subject_passed / subject_executed)

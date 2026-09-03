@@ -137,12 +137,93 @@ def test_build_marker_probe_quotes_working_directory_with_spaces():
 
 def test_gradle_kts_project_routes_test_to_gradle_backend():
     gradle = FakeBackendTool()
-    tool = _tool({"build.gradle.kts"}, gradle=gradle)
+    manifest = complete_build_requirements_v1(
+        project_root="/workspace/p",
+        build_system="gradle",
+    )
+    orchestrator = MarkerOrchestrator(
+        {"build.gradle.kts"},
+        files={REQUIREMENTS_PATH: json.dumps(manifest)},
+    )
+    tool = BuildTool(orchestrator, gradle_tool=gradle)
 
     result = tool.execute(action="test", working_directory="/workspace/p")
 
     assert gradle.calls and gradle.calls[0]["tasks"] == "test"
     assert result.facts["system"] == "gradle"
+
+
+def test_mixed_jvm_root_routes_test_to_the_manifest_test_system():
+    manifest = complete_build_requirements_v1(
+        project_root="/workspace/p",
+        build_system="gradle",
+    )
+    orchestrator = MarkerOrchestrator(
+        {"pom.xml", "build.gradle", "gradlew"},
+        files={REQUIREMENTS_PATH: json.dumps(manifest)},
+    )
+    maven = FakeBackendTool()
+    gradle = FakeBackendTool()
+
+    result = BuildTool(
+        orchestrator,
+        maven_tool=maven,
+        gradle_tool=gradle,
+    ).execute(action="test", working_directory="/workspace/p")
+
+    assert result.succeeded
+    assert maven.calls == []
+    assert gradle.calls and gradle.calls[0]["tasks"] == "test"
+    assert gradle.calls[0]["build_cache"] is False
+    assert result.facts["system"] == "gradle"
+
+
+def test_mixed_jvm_root_still_routes_compile_by_the_build_marker_priority():
+    manifest = complete_build_requirements_v1(
+        project_root="/workspace/p",
+        build_system="gradle",
+    )
+    orchestrator = MarkerOrchestrator(
+        {"pom.xml", "build.gradle"},
+        files={REQUIREMENTS_PATH: json.dumps(manifest)},
+    )
+    maven = FakeBackendTool()
+    gradle = FakeBackendTool()
+
+    result = BuildTool(
+        orchestrator,
+        maven_tool=maven,
+        gradle_tool=gradle,
+    ).execute(action="compile", working_directory="/workspace/p")
+
+    assert result.succeeded
+    assert maven.calls and maven.calls[0]["command"] == "compile"
+    assert gradle.calls == []
+
+
+def test_declared_gradle_test_system_never_falls_back_to_maven():
+    manifest = complete_build_requirements_v1(
+        project_root="/workspace/p",
+        build_system="gradle",
+    )
+    orchestrator = MarkerOrchestrator(
+        {"pom.xml"},
+        files={REQUIREMENTS_PATH: json.dumps(manifest)},
+    )
+    maven = FakeBackendTool()
+    gradle = FakeBackendTool()
+
+    result = BuildTool(
+        orchestrator,
+        maven_tool=maven,
+        gradle_tool=gradle,
+    ).execute(action="test", working_directory="/workspace/p")
+
+    assert result.error_code == "BUILD_TEST_SYSTEM_CONFLICT"
+    assert result.metadata["runner_dispatched"] is False
+    assert result.facts["declared_test_system"] == "gradle"
+    assert maven.calls == []
+    assert gradle.calls == []
 
 
 @pytest.mark.parametrize(

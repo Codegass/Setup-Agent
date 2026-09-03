@@ -111,8 +111,37 @@ def test_session_endpoint_returns_session_detail():
     response = client.get("/api/sessions/CC-3")
 
     assert response.status_code == 200
-    assert response.json()["id"] == "CC-3"
-    assert response.json()["reportDoc"]["title"].startswith("setup-report")
+    payload = response.json()
+    assert payload["id"] == "CC-3"
+    assert payload["reportDoc"]["title"].startswith("setup-report")
+    assert payload["build"]["sourceScope"] == {
+        "covered": 36,
+        "total": 36,
+        "availability": "available",
+        "basis": "demo fixture: complete production Java source scope",
+        "reason": None,
+        "evidenceRefs": ["demo:output_demo_build"],
+    }
+    assert payload["test"]["evidenceLayers"]["tests"]["claimed"]["receiptExecutions"] == {
+        "executed": 320,
+        "passed": 312,
+        "failed": 8,
+        "errors": 0,
+        "skipped": 0,
+        "availability": "available",
+        "bound": None,
+        "reason": None,
+        "basis": "demo fixture: one synthetic Maven test receipt",
+    }
+    assert payload["rates"]["build"]["modules"] == {
+        "numerator": 3,
+        "denominator": 3,
+        "rate": 100.0,
+        "band": "fully",
+    }
+    assert payload["moduleSummary"]["modulesBuilt"] == 3
+    assert payload["moduleSummary"]["modulesFailed"] == 0
+    assert payload["verdict"]["headline"].startswith("Build passed on 3 of 3 modules.")
 
 
 def test_dashboard_stream_emits_sse_snapshot():

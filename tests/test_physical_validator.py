@@ -332,7 +332,11 @@ def test_build_artifacts_complete_excludes_wrapper_jar():
 def test_validate_build_status_maven_unaffected():
     """Regression: Maven build validation (commons-cli-style) still succeeds."""
     orch = FakeBuildOrchestrator(
-        files={"/workspace/mvn/pom.xml", "/workspace/mvn/target/foo-1.0.jar"},
+        files={
+            "/workspace/mvn/pom.xml",
+            "/workspace/mvn/target/foo-1.0.jar",
+            "/workspace/mvn/target/classes/Foo.class",
+        },
         dirs={"/workspace/mvn/target/classes"},
     )
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
@@ -569,12 +573,12 @@ def test_shared_command_tracker_threads_real_maven_build_into_validator_evidence
 
 
 # ===========================================================================
-# Loosened build-green: source-weighted module-coverage threshold
+# Expected output presence and production-source census
 # ===========================================================================
-def test_verify_expected_artifacts_reports_source_weighted_coverage():
-    """coverage = sum(min(found, expected)) / sum(expected), weighted by source size."""
-    big = {f"/workspace/p/big/target/classes/C{i}.class" for i in range(95)}
-    small = {f"/workspace/p/small/target/classes/C{i}.class" for i in range(5)}
+def test_verify_expected_artifacts_requires_output_not_one_class_per_source():
+    """A source-bearing path needs bytecode, not one class for every source."""
+    big = {"/workspace/p/big/target/classes/C.class"}
+    small = {"/workspace/p/small/target/classes/C.class"}
     # the 'missing' module (100 sources) produced no classes
     orch = FakeBuildOrchestrator(files=big | small)
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
@@ -602,14 +606,25 @@ def test_verify_expected_artifacts_reports_source_weighted_coverage():
     result = validator._verify_expected_artifacts("/workspace/p", expected)
 
     assert result["all_present"] is False
+    assert len(result["found"]) == 2
+    assert result["missing"] == ["missing (no compiled classes found)"]
+    # This is the production-source census retained for the user-facing N/N
+    # source metric. It is never compared with the class-file diagnostic.
     assert result["classes_expected"] == 200
-    assert result["classes_found"] == 100  # 95 + 5 + 0
-    assert result["class_coverage"] == 0.5
+    assert "classes_found" not in result
+    assert "class_coverage" not in result
 
 
 def _coverage_validator(coverage, found, missing, threshold):
-    """A validator wired to reach Priority 2 with a controlled coverage result."""
-    orch = FakeBuildOrchestrator(files={"/workspace/m/pom.xml", "/workspace/m/target/app.jar"})
+    """A validator with controlled expected-output presence.
+
+    ``coverage`` remains in this legacy test helper's signature so old callers
+    can state whether any bytecode exists; it is not a verdict ratio.
+    """
+    files = {"/workspace/m/pom.xml", "/workspace/m/target/app.jar"}
+    if coverage > 0:
+        files.add("/workspace/m/target/classes/A.class")
+    orch = FakeBuildOrchestrator(files=files)
     validator = PhysicalValidator(
         docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=threshold
     )
@@ -617,12 +632,10 @@ def _coverage_validator(coverage, found, missing, threshold):
         {"type": "classes", "min_count": 1, "path": "x", "artifact": "x"}
     ]
     validator._verify_expected_artifacts = lambda *a, **k: {
-        "all_present": False,
+        "all_present": not missing,
         "found": found,
         "missing": missing,
         "classes_expected": 4,
-        "classes_found": int(round(coverage * 4)),
-        "class_coverage": coverage,
     }
     return validator
 
@@ -633,7 +646,8 @@ def _coverage_validator(coverage, found, missing, threshold):
 # evidence word and the sentence come out of ONE branch, graded on execution.
 # ===========================================================================
 def test_settings_build_coverage_threshold_default():
-    # All active modules must compile for SUCCESS -> default is 100%.
+    # The setting remains accepted for configuration/replay compatibility even
+    # though class/source thresholds no longer decide build completeness.
     assert DEFAULT_BUILD_COVERAGE_THRESHOLD == 1.0
     assert Config().build_coverage_threshold == 1.0
 

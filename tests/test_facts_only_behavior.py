@@ -152,6 +152,159 @@ def test_analyzer_failure_is_typed_and_only_engine_projects_explanatory_prose():
     assert '"schema":"sag.project-analysis-error"' not in observation
 
 
+@pytest.mark.parametrize(
+    ("failure", "exception_type"),
+    (("false", "RuntimeError"), ("exception", "OSError")),
+)
+def test_public_analyze_fails_when_requirements_persistence_fails(
+    monkeypatch,
+    failure,
+    exception_type,
+):
+    import sag.tools.internal.build_preflight as build_preflight
+
+    def failed_write(_orchestrator, _data):
+        if failure == "exception":
+            raise OSError("requirements store unavailable")
+        return False
+
+    monkeypatch.setattr(build_preflight, "write_build_requirements", failed_write)
+
+    result = ProjectAnalyzerTool(SurveyOrch()).execute(
+        action="analyze",
+        project_path="/workspace/proj",
+    )
+
+    assert result.error == "ANALYSIS_EXCEPTION"
+    assert json.loads(result.output)["facts"]["exception_type"] == exception_type
+
+
+def test_public_analyze_requires_a_strict_live_requirements_reread(monkeypatch):
+    import sag.tools.internal.build_preflight as build_preflight
+
+    monkeypatch.setattr(
+        build_preflight,
+        "read_live_build_requirements",
+        lambda _orchestrator: SimpleNamespace(
+            complete=False,
+            conflict="stream_unreadable",
+            payload=None,
+        ),
+    )
+
+    result = ProjectAnalyzerTool(SurveyOrch()).execute(
+        action="analyze",
+        project_path="/workspace/proj",
+    )
+
+    error = json.loads(result.output)
+    assert result.error == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert error["facts"]["reason"] == "requirements_read_incomplete"
+
+
+def test_public_analyze_rejects_a_stale_revision_after_a_dropped_rewrite(monkeypatch):
+    import sag.tools.internal.build_preflight as build_preflight
+
+    orchestrator = SurveyOrch()
+    tool = ProjectAnalyzerTool(orchestrator)
+    assert tool.execute(action="analyze", project_path="/workspace/proj").error is None
+
+    orchestrator.config_seed = "pyproject-v2"
+    monkeypatch.setattr(
+        build_preflight,
+        "write_build_requirements",
+        lambda _orchestrator, _data: True,
+    )
+
+    result = tool.execute(action="analyze", project_path="/workspace/proj")
+
+    error = json.loads(result.output)
+    assert result.error == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert error["facts"]["reason"] == "requirements_survey_mismatch"
+
+
+def test_ensure_facts_replaces_unpublished_foreign_manifest_without_inheriting_it():
+    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH, read_live_build_requirements
+
+    orchestrator = SurveyOrch()
+    foreign = complete_build_requirements_v1(
+        project_root="/workspace/proj",
+        java_version="21",
+        java_version_source="maven-compiler",
+    )
+    orchestrator.files[REQUIREMENTS_PATH] = json.dumps(foreign, indent=2, sort_keys=True)
+
+    assert ProjectAnalyzerTool(orchestrator).ensure_facts("/workspace/proj") == "created"
+
+    live = read_live_build_requirements(orchestrator)
+    assert live.complete is True
+    assert live.conflict is None
+    assert live.payload is not None
+    assert live.payload["java_version"] is None
+    assert live.payload["java_version_source"] is None
+    assert live.payload["survey"]["survey_fingerprint"] != foreign["survey"]["survey_fingerprint"]
+
+
+def test_public_analyze_allows_a_typed_document_map_partial(monkeypatch):
+    import sag.tools.internal.build_preflight as build_preflight
+
+    tool = ProjectAnalyzerTool(SurveyOrch())
+
+    def unavailable_map(_path, analysis):
+        analysis["survey_conflicts"] = [{"kind": "document_map_failed"}]
+        return None
+
+    monkeypatch.setattr(tool, "_survey_documents_and_claims", unavailable_map)
+
+    result = tool.execute(action="analyze", project_path="/workspace/proj")
+    live = build_preflight.read_live_build_requirements(tool.docker_orchestrator)
+
+    assert result.error is None
+    assert live.complete is True
+    assert live.payload["survey"]["document_map_fingerprint"] is None
+
+
+def test_public_analyze_rejects_a_declared_pin_that_no_longer_matches_live_map(monkeypatch):
+    from sag.agent import document_map
+
+    mapped = {
+        "entries": [],
+        "document_map_fingerprint": document_map.document_map_fingerprint([]),
+        "partial_map": [],
+    }
+    persisted_map = document_map.document_map_payload(mapped)
+    tool = ProjectAnalyzerTool(SurveyOrch())
+    reads = 0
+
+    def surveyed_map(_path, analysis):
+        analysis["document_map_fingerprint"] = mapped["document_map_fingerprint"]
+        return mapped
+
+    def mismatched_after_manifest_write(_orchestrator):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return SimpleNamespace(complete=True, conflict=None, payload=persisted_map)
+        return SimpleNamespace(
+            complete=True,
+            conflict=None,
+            payload={**persisted_map, "document_map_fingerprint": "f" * 64},
+        )
+
+    monkeypatch.setattr(tool, "_survey_documents_and_claims", surveyed_map)
+    monkeypatch.setattr(document_map, "read_live_document_map", mismatched_after_manifest_write)
+
+    result = tool.execute(
+        action="analyze",
+        project_path="/workspace/proj",
+    )
+
+    error = json.loads(result.output)
+    assert reads == 2
+    assert result.error == "BUILD_REQUIREMENTS_UNAVAILABLE"
+    assert error["facts"]["reason"] == "document_map_pin_mismatch"
+
+
 def test_typed_analysis_error_json_remains_valid_and_bounded():
     metadata = project_analysis_error_metadata(
         "ANALYSIS_EXCEPTION",

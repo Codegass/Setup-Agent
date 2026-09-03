@@ -119,14 +119,17 @@ _SUITE_TOTALS_PARTIAL_BASIS = "gradle suite totals over the claimed reports the 
 # capped. It qualifies the population, never the count: the sample is exact and
 # holds every red, and what it dropped is on the receipt.
 _BOUNDED_SAMPLE_SUFFIX = " (bounded identity sample)"
-# Why an EXECUTION count is withheld. `latest_subjects` and `latest_cases` are
-# grains OF the sample and stay available under the suffix above — they count
-# exactly the population they name. `receipt_executions` counts the run, and
-# once T1 bounded the exact-row read on every runner, a receipt with no totals
-# tier can offer nothing but its capped sample for that question: 2,048 of
-# 27,219 executions, published as `available` because the sample itself was
-# whole. A count that is a floor is not a total, and P-A forbids the sample
-# standing in for one — so the number is withheld and the bound is named.
+_BOUNDED_SAMPLE_REASON = (
+    "one or more receipt identity samples were bounded and truncated; "
+    "counts cover only retained rows"
+)
+# Why an EXECUTION count is only a lower bound. `latest_subjects` and
+# `latest_cases` are grains OF the retained sample, while
+# `receipt_executions` asks about the run. Once T1 bounded the exact-row read
+# on every runner, a receipt with no totals tier can offer only its capped
+# sample for that question: 2,048 of 27,219 executions. The retained number is
+# still useful evidence, but it must be published as `partial`, never as an
+# exact total or as unavailable.
 _BOUNDED_EXECUTIONS_REASON = (
     "a current receipt stated no suite totals and its identity rows were bounded"
 )
@@ -190,6 +193,13 @@ def _validate_count_bucket(
     availability = value.get("availability")
     if availability == "available":
         expected = _COUNT_FIELDS_SET | {"availability", "basis"}
+    elif availability == "partial":
+        expected = _COUNT_FIELDS_SET | {
+            "availability",
+            "basis",
+            "bound",
+            "reason",
+        }
     elif availability == "unavailable":
         expected = _COUNT_FIELDS_SET | {"availability", "reason"}
     else:
@@ -210,7 +220,7 @@ def _validate_count_bucket(
         if not unparseable:
             raise MetricsContractError(f"{label}.unparseable must be a positive count")
 
-    if availability == "available":
+    if availability in {"available", "partial"}:
         counts: dict[str, int] = {}
         for field in COUNT_FIELDS:
             item = _strict_nonnegative_int_or_none(value.get(field), label=f"{label}.{field}")
@@ -220,6 +230,10 @@ def _validate_count_bucket(
         if counts["executed"] != sum(counts[field] for field in COUNT_FIELDS[1:]):
             raise MetricsContractError(f"{label} executed count is inconsistent")
         _strict_nonempty_text(value.get("basis"), label=f"{label}.basis")
+        if availability == "partial":
+            if value.get("bound") != "lower":
+                raise MetricsContractError(f"{label}.bound must be lower for partial counts")
+            _strict_nonempty_text(value.get("reason"), label=f"{label}.reason")
     else:
         if any(value.get(field) is not None for field in COUNT_FIELDS):
             raise MetricsContractError(f"{label} unavailable counts must be null")
@@ -438,6 +452,32 @@ def _all_null_counts(*, reason: str) -> dict[str, Any]:
     }
 
 
+def _lower_bound_counts(
+    value: Mapping[str, Any],
+    *,
+    basis: str,
+    reason: str = _BOUNDED_SAMPLE_REASON,
+) -> dict[str, Any]:
+    """Publish a reconciled retained sample as a floor, never as a total.
+
+    All five numbers are exact for the rows the receipt retained.  ``bound``
+    states how they relate to the run population: omitted rows can only raise
+    them.  This is deliberately distinct from ``unavailable`` because even an
+    empty bounded sample proves a lower bound of zero, while still being very
+    different from an exact empty run.
+    """
+
+    known = _known_counts(value, basis=basis)
+    if known is None:
+        raise MetricsContractError("lower-bound counts are incomplete")
+    return {
+        **known,
+        "availability": "partial",
+        "bound": "lower",
+        "reason": reason,
+    }
+
+
 def _known_counts(
     value: Mapping[str, Any] | None,
     *,
@@ -569,11 +609,14 @@ def _decorate_claimed_aggregation(
         counts = claimed.get(name)
         if not isinstance(counts, Mapping):
             raise MetricsContractError(f"shared testcase aggregation omitted {name}")
-        decorated[name] = {
-            **dict(counts),
-            "availability": "available",
-            "basis": f"{basis}{_BOUNDED_SAMPLE_SUFFIX}" if sample_bounded else basis,
-        }
+        decorated[name] = (
+            _lower_bound_counts(
+                counts,
+                basis=f"{basis}{_BOUNDED_SAMPLE_SUFFIX}",
+            )
+            if sample_bounded
+            else {**dict(counts), "availability": "available", "basis": basis}
+        )
     return {
         **decorated,
         "retried_cases": _int_or_none(value.get("retried_cases")),
@@ -623,9 +666,15 @@ def _suite_total_executions(
         "skipped": totals.skipped,
     }
     basis = _SUITE_TOTALS_BASIS if totals.complete_claims else _SUITE_TOTALS_PARTIAL_BASIS
-    if rows:
-        if rows_bounded:
-            return _all_null_counts(reason=_BOUNDED_EXECUTIONS_REASON)
+    reasons: list[str] = []
+    if not totals.complete_claims:
+        disclosed = ", ".join(totals.disclosed_bounds) or "not recorded"
+        reasons.append(
+            "gradle suite totals were incomplete "
+            f"(disclosed bounds: {disclosed}); counts cover only the claimed reports "
+            "the read reached"
+        )
+    if rows or rows_bounded:
         try:
             row_counts = aggregate_testcase_execution_rows(rows)["claimed"]["receipt_executions"]
         except TestcaseRowContractError:
@@ -633,6 +682,11 @@ def _suite_total_executions(
         for field in COUNT_FIELDS:
             counts[field] += int(row_counts[field])
         basis = f"{basis}, and {_ROW_EXECUTIONS_BASIS} for the receipts that stated none"
+        if rows_bounded:
+            basis = f"{basis}{_BOUNDED_SAMPLE_SUFFIX}"
+            reasons.append(_BOUNDED_EXECUTIONS_REASON)
+    if reasons:
+        return _lower_bound_counts(counts, basis=basis, reason="; ".join(reasons))
     return {**counts, "availability": "available", "basis": basis}
 
 
@@ -854,9 +908,9 @@ def _receipt_row_projection(
     # capped answers with a floor. That is a gradle receipt whose totals tier
     # was unreadable as much as it is a maven one that never had a totals tier
     # at all, and neither may be published as the run's count.
-    row_tier_bounded = any(
-        _nonempty_text(row.get("receipt_id")) in bounded_receipts for row in row_tier_rows
-    )
+    # A bounded receipt may retain zero rows.  Receipt identity, not row
+    # presence, decides whether this tier is a floor.
+    row_tier_bounded = bool(bounded_receipts - suite_receipts)
     executions = (
         _suite_total_executions(
             suite_totals,
@@ -866,9 +920,13 @@ def _receipt_row_projection(
         )
         if suite_totals is not None
         else (
-            # No receipt stated totals, so the aggregation below is what the
-            # surface would otherwise publish as the count — and it is bounded.
-            _all_null_counts(reason=_BOUNDED_EXECUTIONS_REASON)
+            # No receipt stated totals, so the retained identity sample is the
+            # only execution evidence.  Keep its proven counts, including a
+            # bounded-empty zero, but mark them as a lower bound.
+            {
+                **dict(claimed["receipt_executions"]),
+                "reason": _BOUNDED_EXECUTIONS_REASON,
+            }
             if claimed is not None and row_tier_bounded
             else None
         )
@@ -1587,11 +1645,20 @@ def _format_counts(value: Any) -> str:
         if isinstance(file_count, int):
             details.append(f"{file_count} report files observed")
         return f"unavailable ({'; '.join(details)})" if details else "unavailable"
-    return (
+    rendered = (
         f"{value.get('passed')}/{value.get('executed')} passed, "
         f"{value.get('failed')} failed, {value.get('errors')} errors, "
         f"{value.get('skipped')} skipped"
     )
+    if value.get("availability") == "partial" and value.get("bound") == "lower":
+        reason = str(value.get("reason") or "bounded sample")
+        return (
+            f"≥{value.get('executed')} executions retained: "
+            f"{value.get('passed')} passed, {value.get('failed')} failed, "
+            f"{value.get('errors')} errors, {value.get('skipped')} skipped "
+            f"(lower bound; {reason})"
+        )
+    return rendered
 
 
 def format_evidence_layer_lines(metrics: Mapping[str, Any] | None) -> list[str]:

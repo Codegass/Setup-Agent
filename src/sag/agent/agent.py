@@ -167,6 +167,7 @@ class SetupAgent:
             # its tools. Publication authority is run-scoped even when those
             # tool objects are reused.
             self._initialize_control_recording()
+            self._bootstrap_continuation_overlay(workflow_mode)
             return  # Already initialized
 
         # Initialize ErrorLogger with container workspace path
@@ -186,6 +187,7 @@ class SetupAgent:
         # lane refuses to run without the authority, so every construction-time
         # container op below depends on this ordering.
         self._initialize_control_recording()
+        self._bootstrap_continuation_overlay(workflow_mode)
 
         # Initialize context manager with container-based workspace
         self.context_manager = ContextManager(
@@ -231,6 +233,16 @@ class SetupAgent:
                     logger.debug(f"Set UI manager for tool: {tool.name}")
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
+
+    def _bootstrap_continuation_overlay(self, workflow_mode: str) -> None:
+        """Establish this command's overlay authority before project-lane I/O."""
+
+        if workflow_mode not in {"run_task", "legacy"}:
+            return
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        status = EnvOverlayStore(self.orchestrator).bootstrap_current_run()
+        self.agent_logger.info(f"Continuation environment overlay: {status}")
 
     def _initialize_control_recording(self) -> None:
         session_logger = get_session_logger()
@@ -1123,6 +1135,27 @@ class SetupAgent:
                 self.console.print(f"[bold red]❌ Failed to load project context: {e}[/bold red]")
                 return False
 
+            # A continuation still needs the harness-owned framework survey.
+            # It is a prerequisite for the model's strategy, not work the
+            # model should have to rediscover after build/test dispatch starts.
+            survey_status = str(
+                self.react_engine._ensure_project_facts() or "failed"
+            ).strip().lower()
+            if survey_status not in {"created", "present"}:
+                self.agent_logger.error(
+                    "Framework project survey failed before run-task model execution"
+                )
+                self.console.print(
+                    "[bold red]❌ Project survey unavailable; task was not started.[/bold red]"
+                )
+                return False
+            self.agent_logger.info(f"Framework project survey: {survey_status}")
+            # Completion evidence is command-scoped. A long-lived agent may
+            # reuse its engine, but an earlier task's successful tool call must
+            # not authorize a first-turn completion in this task. Clear in
+            # place because ToolOrchestrator holds this exact list reference.
+            self.react_engine.recent_tool_executions.clear()
+
             # Step 2.5: Complete setup phase
             self._emit(
                 EventType.PHASE_COMPLETE,
@@ -1148,7 +1181,19 @@ class SetupAgent:
             )
 
             # Step 6: Update last comment in container and handle completion
-            if success:
+            cancelled = bool(getattr(self.react_engine, "last_run_cancelled", False))
+            if cancelled:
+                self.orchestrator.update_last_comment(f"Task cancelled: {task_description}")
+                if self.config.ui_mode:
+                    self._emit(
+                        EventType.PHASE_ERROR,
+                        "Task cancelled",
+                        phase=PhaseType.BUILD,
+                        level="warning",
+                    )
+                else:
+                    self.console.print("[bold yellow]Task cancelled.[/bold yellow]")
+            elif success:
                 self.orchestrator.update_last_comment(f"Task completed: {task_description}")
                 if self.config.ui_mode:
                     self._emit(
@@ -1183,7 +1228,9 @@ class SetupAgent:
             else:
                 self._provide_task_summary(success, task_description)
 
-            cmd_logger.info(f"Task execution completed: success={success}")
+            cmd_logger.info(
+                f"Task execution completed: success={success}, cancelled={cancelled}"
+            )
             return success
 
         except Exception as e:

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, cast
 
 from sag.agent.evidence_publications import (
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
     ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
     MutablePublicationObservation,
     evidence_publication_authority_for,
@@ -77,6 +78,64 @@ class EnvOverlayStore:
         if warnings:
             result["warnings"] = warnings
         return result
+
+    def bootstrap_current_run(self) -> str:
+        """Give a new run an honest empty overlay before project-lane I/O.
+
+        A container can outlive the command that published its overlay.  The
+        next command owns a new host publication stream, so the old JSON is
+        forensic rather than current runtime authority.  Normal project-lane
+        commands cannot even load context while those bytes remain unmatched.
+
+        This controller-only bootstrap does not adopt or derive from the old
+        body.  It compare-and-replaces the exact bytes with the canonical empty
+        overlay and publishes that empty revision as the new run's genesis.
+        Installed binaries remain in the container; only stale activation
+        claims are discarded and may be re-established by normal preflight.
+
+        Returns ``"present"`` when this run already owns a head, ``"absent"``
+        when no overlay exists and no bootstrap is needed, and ``"reset"``
+        after replacing a foreign-run overlay.
+        """
+
+        authority = evidence_publication_authority_for(self.orchestrator)
+        head = authority.latest_head(ENV_OVERLAY_LOGICAL_ARTIFACT_ID)
+        if head is not None:
+            return "present"
+
+        previous = self._read_file(self.overlay_json)
+        if previous is None:
+            return "absent"
+
+        payload = self._canonical_overlay_json(self._empty_overlay())
+        # Reuse the store's one production/test-double CAS boundary.  The
+        # previous bytes are a compare token only; no field is parsed or
+        # preserved from the foreign body.
+        self._loaded_raw = previous
+        if not self._compare_publish_json(payload):
+            raise EnvOverlayUnavailableError(
+                "new-run overlay bootstrap could not replace the foreign revision"
+            )
+
+        publication = publish_evidence_revision(
+            self.orchestrator,
+            record_kind="env_overlay",
+            record_id=ENV_OVERLAY_RECORD_ID,
+            logical_artifact_id=ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+            raw=payload.encode("utf-8"),
+            expected_previous_raw_sha256=EVIDENCE_PUBLICATION_GENESIS_SHA256,
+        )
+        if not publication.published:
+            raise EnvOverlayUnavailableError(
+                "new-run empty overlay reached the container but host publication failed: "
+                f"{publication.status}: {publication.detail}"
+            )
+
+        # The shell projection is forensic only, but keeping it synchronized
+        # avoids showing stale activation claims to a human inspecting the
+        # container after the reset.
+        self._write_file(self.overlay_script, self._render_shell_script(self._empty_overlay()))
+        return "reset"
 
     def authorized_environment(
         self,

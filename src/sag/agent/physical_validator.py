@@ -1145,25 +1145,6 @@ def decide_test_evidence(
     )
 
 
-def _coverage_basis(coverage_info: Dict[str, Any]) -> str:
-    """Does the CLASS-weighted coverage fraction have a basis? (Plan 8 §3.4)
-
-    `derived` when class expectations were derived and the fraction is stated;
-    `none` when they were not, which is why `class_coverage` is then absent
-    rather than 1.0. It says nothing about the other expectations: a jar or file
-    expectation is still a basis, and a met one still decides — "no class-based
-    expectation" and "no expectation of any kind" are different facts.
-
-    Stated by `_verify_expected_artifacts`; inferred from the expectation count
-    for a caller that predates the field, so an old rollup still classifies the
-    same way it always did rather than defaulting to "met".
-    """
-    stated = str((coverage_info or {}).get("basis") or "").strip()
-    if stated in ("derived", "none"):
-        return stated
-    return "derived" if int((coverage_info or {}).get("classes_expected") or 0) > 0 else "none"
-
-
 def _format_build_duration(seconds: float) -> str:
     """Human-friendly build duration.
 
@@ -1200,8 +1181,9 @@ class PhysicalValidator:
             docker_orchestrator: Docker orchestrator for command execution
             project_path: Base path of the project in container
             compilation_recency_hours: Hours to consider compilation as recent (default 1)
-            build_coverage_threshold: Minimum source-weighted compiled-class coverage
-                (fraction 0-1) for a multi-module build to count as green.
+            build_coverage_threshold: Legacy compatibility setting. Build completeness
+                is decided by receipts, expected outputs, and module scope; class/source
+                ratios no longer decide the verdict.
             command_tracker: Shared CommandTracker recording build/test commands
                 and the build's wall-clock duration. validate_build_status reads
                 the last recorded build off it to surface build_time/build_command
@@ -3493,7 +3475,6 @@ class PhysicalValidator:
         if terminal_reactor is not None:
             evidence.update(
                 {
-                    "authority": "terminal_reactor_receipt",
                     "terminal_reactor_receipt_id": terminal_reactor["receipt_id"],
                     "reactor_modules_succeeded": terminal_reactor["modules_succeeded"],
                     "reactor_modules_total": terminal_reactor["modules_total"],
@@ -3706,18 +3687,24 @@ class PhysicalValidator:
             if scoped_artifacts
             else None
         )
-        # Rate-banded verdict v4 reuses this existing source-weighted census
-        # beside the physical class count.  No second source-tree scan is
-        # permitted at evidence close.
+        # Keep the production-source census gathered while deriving expected
+        # outputs. It is a source count for reporting, never a denominator for
+        # class files: Java sources and generated/inner classes are not the same
+        # grain. No second source-tree scan is permitted at evidence close.
         evidence["source_files"] = (
             int(coverage_info.get("classes_expected") or 0)
             if isinstance(coverage_info, dict)
             and int(coverage_info.get("classes_expected") or 0) > 0
             else None
         )
-        threshold = self.build_coverage_threshold
         class_count = artifacts_result.get("class_count", 0)
-        has_real_output = evidence["has_build_fingerprints"] or class_count > 0
+        has_source_obligation = bool(
+            isinstance(coverage_info, dict) and int(coverage_info.get("classes_expected") or 0) > 0
+        )
+        has_verified_expected_output = bool(
+            isinstance(coverage_info, dict) and coverage_info.get("found")
+        )
+        has_real_output = class_count > 0 or has_verified_expected_output
         # Plan 8 §3.5: ONE scan, two consumers. The walk happens here, the gate
         # renders its checklist from this same object (module_scan holds it),
         # and the denominator's authority is a stated ladder — a terminal
@@ -3750,18 +3737,17 @@ class PhysicalValidator:
             structure=receipt_structure,
         )
 
-        # Hard JVM gate (Part 1 principle, applied to EVERY branch): a maven/gradle
-        # build is green only with compiled .class evidence. With zero compiled
-        # classes AND no real build artifacts, it is BLOCKED — even if a coverage
-        # default (no class-based expectation could be derived, so class_coverage
-        # falls back to 1.0) or an empty target/classes fingerprint would otherwise
-        # pass. Without this, commons-chain (0 classes, non-standard src layout) was
-        # reported "Built 100% of expected classes" while the module scan showed
-        # 0/1 built — the build verdict and the module report contradicting.
+        # Hard JVM zero-output guard. When the survey found Java production
+        # sources, zero bytecode cannot satisfy that obligation, even if a JAR
+        # or compiler metadata already exists. If no expectations could be
+        # derived at all, zero bytecode likewise prevents an arbitrary stray JAR
+        # from turning green. A resolved, expected JAR remains valid evidence for
+        # a no-Java-source Kotlin/Scala/Groovy module; a terminal root receipt may
+        # also prove a source-free aggregator build below.
         jvm_no_compiled_evidence = (
             build_system in ("maven", "gradle")
             and class_count == 0
-            and not evidence["has_artifacts"]
+            and (has_source_obligation or coverage_info is None)
         )
 
         if build_system == "python" and python_build is not None:
@@ -3776,146 +3762,41 @@ class PhysicalValidator:
             success, complete = False, False
             reason = (
                 f"No compiled .class files found for {build_system} build — nothing "
-                f"compiled (an empty target/classes dir or a coverage default is not "
-                f"proof of compilation)"
+                f"compiled (an empty output directory, build metadata, or an existing "
+                f"JAR is not proof of compilation)"
             )
-        elif (
-            coverage_info is not None
-            and _coverage_basis(coverage_info) == "none"
-            and (not coverage_info["all_present"] or class_count == 0)
-        ):
-            # Plan 8 §3.4 (P2): no CLASS-weighted expectation could be derived,
-            # so there is no fraction to grade — and the expectations that WERE
-            # derived are not met. The check states that and the caller decides;
-            # it never reads "nothing to measure" as "everything passed", which
-            # is how p7d polaris earned "Built 100% of expected classes" from a
-            # `class_coverage` that defaulted to 1.0.
-            #
-            # TWO independent questions, and each has its own arm. Round one
-            # keyed the branch on "no class-based expectation" alone and a met
-            # JAR expectation could not reach a full success; round two added
-            # `and not all_present` and re-opened the zero-classes direction, so
-            # a build that compiled NOTHING beside a jar on disk graded complete.
-            # The table, entered on either trigger:
-            #
-            #  * nothing compiled -> BLOCKED, whether or not the derived
-            #    expectations are met. This is the hard JVM gate (commons-chain,
-            #    0 classes under a non-standard src layout); the
-            #    `jvm_no_compiled_evidence` branch above catches only the case
-            #    with no artifacts at all, and a checked-in or stale jar IS an
-            #    artifact. Measuring compilation in `.class` files is a JVM-only
-            #    contract, and this whole chain is JVM-only by construction: for
-            #    any other build system `expected_artifacts` is `[]` (see where it
-            #    is derived above), so `coverage_info` is None and no arm here is
-            #    reachable. An extra `build_system in ("maven", "gradle")` test
-            #    would be dead code that reads like a live guard.
-            #  * classes compiled, an expectation unmet -> PARTIAL. Real output
-            #    happened; how much of the project it is remains unknown, and the
-            #    sentence names the artifacts that are missing rather than
-            #    implying nothing was expected.
-            #
-            # A met expectation WITH classes compiled never reaches here: it is a
-            # basis, it decided, and the Kotlin/Scala/Groovy module whose parsers
-            # emit only the JAR expectation still gets its full success below.
-            absent = coverage_info.get("missing") or []
-            listed = ", ".join(absent[:5]) + (" ..." if len(absent) > 5 else "")
-            named = f" ({listed})" if absent else ""
-            if class_count > 0:
-                success, complete = True, False
-                reason = (
-                    f"compiled {class_count:,} classes; {len(absent)} expected "
-                    f"artifact(s) missing{named} and no class-based expectation "
-                    f"could be derived — coverage has no basis"
-                )
-            elif coverage_info["all_present"]:
-                success, complete = False, False
-                present = ", ".join(coverage_info.get("found") or [])
-                reason = (
-                    f"No compiled .class files found for {build_system} build — the "
-                    f"expected artifact(s) are present ({present}) but nothing compiled, "
-                    f"and no class-based expectation could be derived; an existing JAR is "
-                    f"not evidence this build compiled the project"
-                )
-            else:
-                success, complete = False, False
-                reason = (
-                    f"No compiled .class files found for {build_system} build — nothing "
-                    f"compiled, and no class-based expectation could be derived, so "
-                    f"coverage has no basis"
-                )
         elif coverage_info is not None:
-            # `class_coverage` is ABSENT when nothing class-based was expected
-            # (Plan 8 §3.4), and absent is not 1.0 — the old `.get(..., 1.0)`
-            # default is what read "nothing to measure" as a met threshold. The
-            # only way into this branch without a fraction is with every derived
-            # expectation present, which decides on its own.
-            coverage = coverage_info.get("class_coverage")
             missing = coverage_info.get("missing", [])
-            if coverage_info["all_present"] or (coverage is not None and coverage >= threshold):
+            if coverage_info["all_present"]:
                 success, complete = True, True
                 reason = (
                     f"All expected build artifacts found: "
                     f"{', '.join(coverage_info['found'][:5])}"
-                    if coverage_info["all_present"]
-                    else (
-                        f"Built {(coverage or 0) * 100:.0f}% of expected classes "
-                        f"(>= {threshold * 100:.0f}% threshold)"
-                    )
                 )
-            elif (coverage or 0) > 0 or has_real_output:
-                # Real build output, but some ACTIVE modules did not compile —
-                # honest PARTIAL, not a clean success.
-                #
-                # Counts, not a rounded percentage. Live ignite: 17,779 classes
-                # compiled and 20 short across four modules rounded to "Built
-                # 100% of expected classes (< 100% threshold)" — a sentence
-                # that contradicts itself and tells the model nothing it can
-                # act on.
+            elif has_real_output:
+                # Real JVM output exists, but one or more expected module
+                # outputs are absent. The missing artifact paths and the module
+                # scan decide completeness; the unrelated source/class counts
+                # remain diagnostics only.
                 success, complete = True, False
-                found_classes = coverage_info.get("classes_found", 0)
-                expected_classes = coverage_info.get("classes_expected", 0)
-                shortfall = max(expected_classes - found_classes, 0)
+                listed = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
                 reason = (
-                    f"Built {found_classes} of {expected_classes} expected classes"
-                    + (f", {shortfall} short" if shortfall else "")
-                    + f" (below the {threshold * 100:.0f}% threshold); "
-                    + f"{len(missing)} module(s) incomplete"
-                    + (f": {', '.join(missing[:5])}" if missing else "")
-                    + (" ..." if len(missing) > 5 else "")
+                    f"Build output found, but {len(missing)} expected artifact(s) "
+                    f"are missing or empty" + (f": {listed}" if listed else "")
                 )
             else:
                 success, complete = False, False
                 reason = (
-                    f"Only {(coverage or 0) * 100:.0f}% of expected classes built "
-                    f"(< {threshold * 100:.0f}% threshold) — missing: "
-                    f"{', '.join(missing[:8])}" + (" ..." if len(missing) > 8 else "")
+                    "No real build output found; expected artifact(s) are missing or empty"
+                    + (f": {', '.join(missing[:8])}" if missing else "")
+                    + (" ..." if len(missing) > 8 else "")
                 )
 
         elif evidence["has_build_fingerprints"]:
-            # Fingerprints but no determinable per-module expectations (e.g. an
-            # aggregator/empty root pom with no parseable modules or sources):
-            # treat as a real, complete build (nothing to be incomplete against).
-            #
-            # STATED PLAINLY (Plan 8 §3.4, and NOT changed here): this — not the
-            # branch above — is the arm where NO expectation of any kind could be
-            # derived, so §3.4's own words ("basis none, classes > 0 -> PARTIAL;
-            # classes = 0 -> BLOCKED") describe THIS branch, and this branch
-            # returns a complete build. The consequence is exact: the "no
-            # class-based expectation could be derived / coverage has no basis"
-            # sentence above is unreachable for an input that derived NOTHING; it
-            # only ever speaks for an input that derived a jar-or-file expectation
-            # and no class expectation (which is the p7d polaris shape, and is why
-            # polaris does reach it).
-            #
-            # Left at today's verdict deliberately, and measured rather than
-            # assumed: routing `coverage_info is None` to partial/blocked for
-            # maven/gradle turns three long-standing fences red — including
-            # `test_validate_build_status_maven_unaffected` (commons-cli shape:
-            # pom.xml, a jar, an empty target/classes, no derivable expectation)
-            # and `test_build_validation_refs_prefer_artifact_samples`. That is a
-            # verdict change for every single-module JVM project whose sources we
-            # cannot enumerate, which is a spec decision and not this round's
-            # finding. It is unchanged from main, so it is not a regression here.
+            # Fingerprints are a fallback only when the survey derived no
+            # expected-artifact list. The zero-output guard above still requires
+            # real bytecode for JVM projects, and the module scan below can still
+            # cap completeness.
             success, complete = True, True
             reason = f"Build fingerprints found for {build_system} project"
 
@@ -3981,7 +3862,7 @@ class PhysicalValidator:
                     # sentence a coverage finding states something untrue about
                     # where it came from (Category 3).
                     if reason:
-                        label = "coverage check" if coverage_info is not None else "build check"
+                        label = "artifact check" if coverage_info is not None else "build check"
                         found_clause = f" ({label}: {reason})"
                     else:
                         found_clause = ""
@@ -4008,7 +3889,11 @@ class PhysicalValidator:
                 complete = False
             reason = f"{reason} · {basis.phrase()}" if reason else basis.phrase()
 
-        if terminal_reactor is not None:
+        terminal_receipt_can_complete = terminal_reactor is not None and (
+            not has_source_obligation or class_count > 0
+        )
+        if terminal_receipt_can_complete:
+            evidence["authority"] = "terminal_reactor_receipt"
             success, complete = True, True
             reason = (
                 f"Root Maven {terminal_reactor['requested_action']} receipt "
@@ -7958,25 +7843,24 @@ class PhysicalValidator:
         """
         Verify that expected artifacts actually exist.
         """
-        # classes_expected / classes_found accumulate a SOURCE-WEIGHTED coverage:
-        # each module contributes its source-file count, so building the large
-        # modules counts more than the tiny ones. class_coverage (computed at the
-        # end) lets validate_build_status accept a "most of the code compiled" build.
+        # ``classes_expected`` is a legacy-named production-source census used by
+        # the report as ``source_files``. It is intentionally NOT compared with
+        # class-file counts: one Java source may emit zero, one, or many class
+        # files. Class files remain a separate diagnostic grain.
         result = {
             "all_present": True,
             "found": [],
             "missing": [],
             "classes_expected": 0,
-            "classes_found": 0,
         }
 
         for expected in expected_artifacts:
-            artifact_found = False
-
             if expected["type"] == "classes":
                 min_expected = expected.get("min_count", 1)
                 result["classes_expected"] += min_expected
-                # For .class files, check if directory has sufficient class files
+                # A source-bearing output path is present when it contains real
+                # compiled output. Requiring one class per source is invalid for
+                # generated, package-only, inner-class, and mixed-language builds.
                 class_count_cmd = (
                     f"find {expected['path']} -name '*.class' -type f 2>/dev/null | wc -l"
                 )
@@ -7986,19 +7870,13 @@ class PhysicalValidator:
 
                 if class_count_result["success"]:
                     class_count = int(class_count_result["output"].strip() or 0)
-                    # Partial credit toward coverage (capped at the module's expectation).
-                    result["classes_found"] += min(class_count, min_expected)
-
-                    # We expect at least as many .class files as .java files
-                    # (could be more due to inner classes, anonymous classes, etc.)
-                    if class_count >= min_expected:
-                        artifact_found = True
+                    if class_count > 0:
                         result["found"].append(
                             f"{expected['artifact']} ({class_count} classes found)"
                         )
                     else:
                         result["missing"].append(
-                            f"{expected['artifact']} (found {class_count}, expected >={min_expected})"
+                            f"{expected['artifact']} (no compiled classes found)"
                         )
                         result["all_present"] = False
                 else:
@@ -8015,7 +7893,6 @@ class PhysicalValidator:
                 )
 
                 if check_result["success"] and check_result.get("output", "").strip():
-                    artifact_found = True
                     result["found"].append(expected["artifact"])
                 else:
                     result["missing"].append(expected["artifact"])
@@ -8029,25 +7906,11 @@ class PhysicalValidator:
                 )
 
                 if check_result["success"] and check_result.get("output", "").strip():
-                    artifact_found = True
                     result["found"].append(expected["artifact"])
                 else:
                     result["missing"].append(expected["artifact"])
                     result["all_present"] = False
 
-        # Source-weighted fraction of expected classes actually produced —
-        # stated ONLY when there was something to measure against. Plan 8 §3.4
-        # (P2, "no basis is its own answer"): the old else-branch returned 1.0
-        # for "nothing class-based was expected", and p7d polaris read that as
-        # a met threshold — "Built 100% of expected classes" over a survey that
-        # had derived no expectation at all. A basis of `none` carries NO
-        # `class_coverage` key, so no caller can compare against a number
-        # nothing produced.
-        if result["classes_expected"] > 0:
-            result["basis"] = "derived"
-            result["class_coverage"] = result["classes_found"] / result["classes_expected"]
-        else:
-            result["basis"] = "none"
         return result
 
     def _validate_gradle_cache(self, project_dir: str) -> Dict[str, any]:

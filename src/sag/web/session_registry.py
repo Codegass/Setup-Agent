@@ -861,13 +861,17 @@ def _snapshot_test_payload(
 
 
 def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
+    from sag.verdict_rates import source_scope_coverage
+
     build = snapshot.build_evidence
+    source_scope = source_scope_coverage(snapshot.model_dump(mode="json"))
     if _snapshot_phase_reached(snapshot, "build") is False:
         return {
             "state": "not_attempted",
             "tool": "—",
             "note": "Run stopped before the Build phase",
             "class_count": None,
+            "source_scope": source_scope,
             "evidence_refs": [],
         }
     return {
@@ -875,6 +879,7 @@ def _snapshot_build_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
         "tool": "sealed snapshot",
         "note": "Canonical build evidence from verdict.json",
         "class_count": build.compiled_classes,
+        "source_scope": source_scope,
         "evidence_refs": list(build.refs),
     }
 

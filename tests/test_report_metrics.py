@@ -1,4 +1,10 @@
-from sag.tools.report_metrics import assemble_report_metrics
+import pytest
+
+from sag.tools.report_metrics import (
+    MetricsContractError,
+    assemble_report_metrics,
+    validate_report_metrics_v2,
+)
 
 
 def _snapshot(*, receipt_scoped=False):
@@ -273,3 +279,49 @@ def test_control_bundle_hash_covers_cache_seed_and_host_pins():
     ]["control_bundle_hash"]
 
     assert first != second
+
+
+def test_partial_count_bucket_requires_a_numeric_lower_bound_and_reason():
+    metrics = _assemble(_snapshot(receipt_scoped=True))
+    partial = {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "availability": "partial",
+        "bound": "lower",
+        "basis": "bounded identity sample",
+        "reason": "the sample retained no rows after truncation",
+    }
+    metrics["tests"]["claimed"]["latest_subjects"] = partial
+
+    assert validate_report_metrics_v2(metrics) == metrics
+
+    for missing in ("bound", "basis", "reason"):
+        broken = {**partial}
+        broken.pop(missing)
+        metrics["tests"]["claimed"]["latest_subjects"] = broken
+        with pytest.raises(MetricsContractError):
+            validate_report_metrics_v2(metrics)
+
+
+def test_web_api_model_preserves_partial_lower_bound_metadata():
+    from sag.web.models import EvidenceCountSummary
+
+    payload = {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "availability": "partial",
+        "bound": "lower",
+        "basis": "bounded identity sample",
+        "reason": "sample truncated",
+    }
+
+    assert EvidenceCountSummary.model_validate(payload).model_dump(
+        by_alias=True,
+        exclude_none=True,
+    ) == payload

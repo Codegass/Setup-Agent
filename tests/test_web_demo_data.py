@@ -41,18 +41,52 @@ def test_demo_session_locks_local_ui_demo_facts():
     assert detail.build.tool == "Maven 3.9.6"
     assert "JDK 11" in detail.build.note
     assert detail.build.artifact == "target/commons-cli-1.6.0.jar"
+    assert detail.build.module_output_count == 3
+    assert detail.build.source_scope is not None
+    assert detail.build.source_scope.availability == "available"
+    assert (detail.build.source_scope.covered, detail.build.source_scope.total) == (36, 36)
+    assert detail.build.source_scope.basis is not None
+    assert detail.build.source_scope.basis.startswith("demo fixture:")
+    assert detail.test.evidence_layers is not None
+    receipt = detail.test.evidence_layers.tests.claimed.receipt_executions
+    assert receipt.availability == "available"
+    assert (receipt.executed, receipt.passed, receipt.failed, receipt.errors, receipt.skipped) == (
+        320,
+        312,
+        8,
+        0,
+        0,
+    )
+    assert receipt.executed == receipt.passed + receipt.failed + receipt.errors + receipt.skipped
+    assert receipt.basis is not None
+    assert receipt.basis.startswith("demo fixture:")
     assert "HelpFormatter" in evidence_text
     assert detail.report_doc is not None
     assert detail.report_doc.title == "setup-report-2026-06-06T0216.md"
+    assert detail.rates == {
+        "build": {
+            "modules": {
+                "numerator": 3,
+                "denominator": 3,
+                "rate": 100.0,
+                "band": "fully",
+            }
+        }
+    }
+    assert detail.verdict is not None
+    assert "Build passed on 3 of 3 modules" in detail.verdict.headline
 
 
 def test_demo_session_detail_has_modules():
     detail = get_demo_session("CC-3")
     assert detail.modules, "demo detail should include modules"
     assert detail.module_summary is not None
-    assert detail.module_summary.modules_total >= 2
+    assert detail.module_summary.modules_total == 3
+    assert detail.module_summary.modules_built == 3
+    assert detail.module_summary.modules_failed == 0
     by_path = {m.path: m for m in detail.modules}
-    assert by_path["validator"].build_status == "failure"
+    assert by_path["validator"].build_status == "success"
+    assert by_path["validator"].build_error_samples == []
     assert by_path["core"].failing_count == 2
     assert detail.module_summary.modules_with_test_failures == 1
 

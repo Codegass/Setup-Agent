@@ -33,10 +33,11 @@ import json
 import re
 
 from build_requirements_fakes import complete_python_build_requirements_v1
+from container_evidence_fakes import ContainerFS, add_published_mutable_json
+
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.report_tool import ReportTool
-from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 # ---------------------------------------------------------------------------
 # House fixtures
@@ -182,21 +183,255 @@ def test_setup_report_leads_with_rate_lines_and_derives_the_word_once():
     }
     snapshot = _sealed_snapshot(
         verdict="partial",
-        conflicts=("test_failures_heavy",),
+        conflicts=("metrics_conflict",),
         rates=rates,
-        failed=60,
-        errors=20,
+        build_system="maven",
     )
+    snapshot["canonical_snapshot"]["build_evidence"].update(
+        {
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "source_files": 36,
+            "compiled_classes": 56,
+        }
+    )
+    snapshot["canonical_snapshot"]["phase_records"] = [
+        {
+            "phase": "build",
+            "termination": "completed",
+            "validated_outcome": "success",
+        }
+    ]
+    snapshot["canonical_snapshot"]["test_stats"] = {
+        "discovered": 468,
+        "unique": {
+            "executed": 987,
+            "passed": 926,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 61,
+        },
+        "judgment": "success",
+    }
 
     lines = _tool()._render_console_evidence_result(snapshot)
 
     assert lines[:3] == [
-        "Build:    modules 14/14 (fully) · classes 3400/3412 (most)",
-        "Tests:    cases 100/100 (most) · modules 1/2 (half) — 60 failed, 20 errors (project-owned)",
+        "Build: SUCCESS · production Java sources 36/36 · modules 14/14 · "
+        "class files 56 (diagnostic)",
+        "Tests: SUCCESS · outcomes accounted 987/987 · non-skipped passed 926/926 · "
+        "skipped 61 · failed 0 · errors 0 · static declarations 468 (diagnostic)",
         "Coverage: 55.5% line (jacoco-injected)",
     ]
     assert lines[3] == "Verdict (derived): partial"
     assert sum("partial" in line.lower() for line in lines) == 1
+
+
+def _commons_metric_snapshot():
+    """A sealed setup report carrying the two formerly mixed-grain ratios."""
+    rates = {
+        "build": {
+            "modules": {
+                "rate": 100.0,
+                "band": "fully",
+                "numerator": 1,
+                "denominator": 1,
+            },
+            "classes": {
+                "band": "unbounded",
+                "numerator": 56,
+                "denominator": 36,
+            },
+        },
+        "test": {
+            "cases": {
+                "band": "unbounded",
+                "numerator": 987,
+                "denominator": 468,
+            },
+            "modules": {"band": "unavailable", "reason": "not surveyed"},
+        },
+        "coverage": {"status": "unavailable", "reason": "coverage pass not run"},
+    }
+    snapshot = _sealed_snapshot(
+        verdict="success",
+        rates=rates,
+        build_system="maven",
+    )
+    snapshot["canonical_snapshot"]["build_evidence"].update(
+        {
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "source_files": 36,
+            "compiled_classes": 56,
+        }
+    )
+    snapshot["canonical_snapshot"]["phase_records"] = [
+        {
+            "phase": "build",
+            "termination": "completed",
+            "validated_outcome": "success",
+        }
+    ]
+    snapshot["canonical_snapshot"]["test_stats"] = {
+        "discovered": 468,
+        "unique": {
+            "executed": 987,
+            "passed": 926,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 61,
+        },
+        "judgment": "success",
+    }
+    snapshot["status"].update(
+        {
+            "tests_total": 987,
+            "tests_passed": 926,
+            "tests_failed": 0,
+            "tests_errors": 0,
+            "tests_skipped": 61,
+            "tests_flaky": 0,
+            "test_judgment": "success",
+            "static_test_count": 468,
+            # Deliberately retain the historical values: canonical renderers
+            # must ignore both mixed-grain summaries.
+            "pass_pct": 93.8,
+            "execution_rate": 100.0,
+        }
+    )
+    snapshot["physical_evidence"].update(
+        {
+            "class_files": 56,
+            "tests_total": 987,
+            "tests_pass_pct": 93.8,
+        }
+    )
+    return snapshot
+
+
+def test_canonical_report_surfaces_use_same_grain_metrics_only():
+    tool = _tool()
+    snapshot = _commons_metric_snapshot()
+
+    headline = "\n".join(tool._render_console_evidence_result(snapshot))
+    dashboard = "\n".join(tool._render_summary_dashboard(snapshot))
+    diagnostics = "\n".join(tool._render_detailed_test_analysis(snapshot))
+    issues = "\n".join(tool._render_issues_recommendations(snapshot))
+    execution = "\n".join(
+        tool._render_execution_details_simplified(
+            snapshot,
+            {
+                "total_runtime": 1,
+                "total_iterations": 1,
+                "total_thoughts": 1,
+                "total_actions": 1,
+                "successful_actions": 1,
+                "success_rate": 100,
+            },
+        )
+    )
+    condensed = tool._generate_condensed_log_output("success", "setup-report.md", {}, snapshot)
+    rendered = "\n".join((headline, dashboard, diagnostics, issues, execution, condensed))
+
+    assert "Build: SUCCESS · production Java sources 36/36 · modules 1/1" in rendered
+    assert "class files 56 (diagnostic)" in rendered
+    assert "Tests: SUCCESS · outcomes accounted 987/987" in rendered
+    assert "non-skipped passed 926/926" in rendered
+    assert "skipped 61 · failed 0 · errors 0" in rendered
+    assert "static declarations 468 (diagnostic)" in rendered
+    assert "| **Outcomes Accounted** | 987/987 |" in diagnostics
+    assert "| **Non-skipped Passed** | 926/926 (100.0%) |" in diagnostics
+    assert "| **Skipped** | 61 |" in diagnostics
+
+    assert "56/36" not in rendered
+    assert "987/468" not in rendered
+    assert "Execution Rate" not in rendered
+    assert "**Pass Rate**" not in rendered
+    assert "**Test Coverage:**" not in rendered
+
+
+def test_setup_snapshot_adapter_uses_non_skipped_pass_denominator():
+    from sag.agent.verdict_finalizer import RunVerdictSnapshot
+
+    sealed = RunVerdictSnapshot(
+        run_id="commons-metrics",
+        finalized_at="2026-09-02T12:00:00Z",
+        verdict="success",
+        build_evidence={
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "compiled_classes": 56,
+            "source_files": 36,
+        },
+        test_stats={
+            "discovered": 468,
+            "unique": {
+                "executed": 987,
+                "passed": 926,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 61,
+            },
+            "raw": {
+                "executed": 987,
+                "passed": 926,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 61,
+            },
+            "judgment": "success",
+        },
+        rates={
+            "build": {
+                "modules": {
+                    "rate": 100.0,
+                    "band": "fully",
+                    "numerator": 1,
+                    "denominator": 1,
+                },
+                "classes": {"band": "unavailable", "reason": "diagnostic only"},
+            },
+            "test": {
+                "cases": {
+                    "rate": 100.0,
+                    "band": "fully",
+                    "numerator": 987,
+                    "denominator": 987,
+                },
+                "modules": {"band": "unavailable", "reason": "not surveyed"},
+            },
+            "coverage": {"status": "unavailable", "reason": "coverage pass not run"},
+        },
+        phase_records=(
+            {
+                "phase": "build",
+                "attempt_id": "build-1",
+                "termination": "completed",
+                "outcome": "success",
+                "validated_outcome": "success",
+            },
+        ),
+    )
+
+    adapted = _tool()._build_report_snapshot(
+        sealed,
+        report_filename="setup-report.md",
+        project_info={"type": "Maven Java Project", "build_system": "Maven"},
+    )
+
+    assert adapted["status"]["test_outcomes_accounted"] == 987
+    assert adapted["status"]["test_outcomes_expected"] == 987
+    assert adapted["status"]["tests_non_skipped"] == 926
+    assert adapted["status"]["pass_pct"] == 100.0
+    assert adapted["status"]["execution_rate"] is None
+    assert adapted["physical_evidence"]["tests_pass_pct"] == 100.0
 
 
 def _render(tool, snapshot):
@@ -542,16 +777,26 @@ def test_collection_facts_are_read_from_the_evidence_result_projection():
     assert "ImportError: libtvm_ffi.so: cannot open shared object file" in text
 
 
-def test_run_without_collection_errors_renders_the_ordinary_test_section():
-    """Regression lock: a clean executed run is rendered exactly as before."""
+def test_run_without_collection_errors_renders_outcome_accounting():
+    """A clean sealed run uses same-grain outcome accounting."""
     snapshot = _sealed_snapshot(verdict="success")
-    snapshot["status"].update({"tests_total": 982, "tests_passed": 921, "pass_pct": 93.8})
+    snapshot["status"].update(
+        {
+            "tests_total": 982,
+            "tests_passed": 921,
+            "tests_failed": 0,
+            "tests_errors": 0,
+            "tests_skipped": 61,
+            "pass_pct": 93.8,
+        }
+    )
 
     text = _render_tests(_tool(), snapshot)
 
     assert "Test collection failed" not in text
     assert "Latest test attempt" not in text
-    assert "| **Unique Tests Executed** | 982 |" in text
+    assert "| **Outcomes Accounted** | 982/982 |" in text
+    assert "| **Non-skipped Passed** | 921/921 (100.0%) |" in text
 
 
 def test_no_tests_and_no_collection_facts_renders_no_test_section():

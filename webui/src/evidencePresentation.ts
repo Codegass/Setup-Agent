@@ -27,8 +27,17 @@ export interface TestRunPresentation extends CompleteEvidenceCounts {
   summary: string
 }
 
+export interface TestAccountingPresentation {
+  available: boolean
+  counts: CompleteEvidenceCounts | null
+  accounted: number | null
+  nonSkipped: number | null
+  summary: string
+}
+
 export interface IdentityPresentation {
   available: boolean
+  partial: boolean
   value: string
   tone: ResultTone
   valueClass?: string
@@ -55,12 +64,18 @@ export interface BuildScopePresentation {
   incomplete: boolean
 }
 
+export interface SourceScopePresentation {
+  covered: number
+  total: number
+}
+
 export interface BuildPresentation {
-  value: "Passed" | "Failed" | "Partial" | "Not run" | "Unavailable"
+  value: "Success" | "Failed" | "Partial" | "Not run" | "Unavailable"
   tone: ResultTone
   valueClass?: string
   summary: string
   scope: BuildScopePresentation | null
+  sourceScope: SourceScopePresentation | null
 }
 
 const DATA_NOTE_COPY: Record<string, string> = {
@@ -120,7 +135,12 @@ export function presentDataNotes(conflicts: string[] | null | undefined): string
 export function completeEvidenceCounts(
   counts: EvidenceCountSummary | ObservationCountSummary | null | undefined,
 ): CompleteEvidenceCounts | null {
-  if (!counts || counts.availability === "unavailable") return null
+  if (
+    !counts
+    || counts.availability === "unavailable"
+    || counts.availability === "partial"
+    || counts.bound === "lower"
+  ) return null
   if (![counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped].every(finiteCount)) {
     return null
   }
@@ -136,6 +156,31 @@ export function completeEvidenceCounts(
     return null
   }
   return complete
+}
+
+/**
+ * Return the exact retained counts only when the artifact explicitly says
+ * they are a lower bound on a larger population.  Keeping this separate from
+ * completeEvidenceCounts prevents a truncated sample from producing a pass
+ * percentage or a green status.
+ */
+export function lowerBoundEvidenceCounts(
+  counts: EvidenceCountSummary | ObservationCountSummary | null | undefined,
+): CompleteEvidenceCounts | null {
+  if (!counts || counts.availability !== "partial" || counts.bound !== "lower") return null
+  if (![counts.executed, counts.passed, counts.failed, counts.errors, counts.skipped].every(finiteCount)) {
+    return null
+  }
+  const retained = {
+    executed: counts.executed as number,
+    passed: counts.passed as number,
+    failed: counts.failed as number,
+    errors: counts.errors as number,
+    skipped: counts.skipped as number,
+  }
+  return retained.executed === retained.passed + retained.failed + retained.errors + retained.skipped
+    ? retained
+    : null
 }
 
 function resultState(value: string | undefined): {
@@ -215,18 +260,80 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
   }
 }
 
+/**
+ * Present the receipt-scoped outcome ledger. This is an accounting check, not
+ * a claim about discovery coverage: ratios are shown only for one complete,
+ * internally reconciled receipt count set.
+ */
+export function presentTestAccounting(test: TestSummary): TestAccountingPresentation {
+  const receiptExecutions = test.evidenceLayers?.tests.claimed.receiptExecutions
+  if (!receiptExecutions) {
+    return {
+      available: false,
+      counts: null,
+      accounted: null,
+      nonSkipped: null,
+      summary: "This run did not record its test outcome totals.",
+    }
+  }
+
+  const counts = completeEvidenceCounts(receiptExecutions)
+  if (!counts) {
+    const bounded = receiptExecutions.availability === "partial"
+      || receiptExecutions.bound === "lower"
+    return {
+      available: false,
+      counts: null,
+      accounted: null,
+      nonSkipped: null,
+      summary: bounded
+        ? "The recorded test totals are a minimum, not the complete count; no completion ratio is shown."
+        : receiptExecutions.availability === "unavailable"
+          ? "Recorded test totals are unavailable for this run."
+          : "The recorded test totals are incomplete or inconsistent; no completion ratio is shown.",
+    }
+  }
+  if (counts.executed <= 0) {
+    return {
+      available: false,
+      counts: null,
+      accounted: null,
+      nonSkipped: null,
+      summary: "No test outcomes were recorded.",
+    }
+  }
+
+  const accounted = counts.passed + counts.failed + counts.errors + counts.skipped
+  const nonSkipped = counts.passed + counts.failed + counts.errors
+  const nonSkippedSummary = nonSkipped > 0
+    ? `Non-skipped passed ${formatCount(counts.passed)} / ${formatCount(nonSkipped)}`
+    : "Non-skipped passed unavailable"
+  return {
+    available: true,
+    counts,
+    accounted,
+    nonSkipped,
+    summary: [
+      `Test outcomes recorded ${formatCount(accounted)} / ${formatCount(counts.executed)}`,
+      nonSkippedSummary,
+      `Skipped ${formatCount(counts.skipped)}`,
+      `Failed / errors ${formatCount(counts.failed)} / ${formatCount(counts.errors)}`,
+    ].join(" · "),
+  }
+}
+
 export function humanizeIdentityGap(reason: string | null | undefined): string {
   const normalized = reason?.trim().toLowerCase() ?? ""
   if (normalized.includes("module-qualified") || normalized.includes("subject/case identity")) {
-    return "Module-qualified test identities were not sealed for this run."
+    return "Per-test results with module and test names were not sealed for this run."
   }
   if (normalized.includes("receipt") && normalized.includes("identity")) {
-    return "Some test results were missing the module and stable test identity needed for verification."
+    return "Some test results were missing the module and test name needed for verification."
   }
   if (normalized.includes("artifact") || normalized.includes("metrics")) {
-    return "Verified test identity metrics were not produced for this run."
+    return "Verified per-test metrics were not produced for this run."
   }
-  return "Verified test identities were not recorded for this run."
+  return "Verified per-test results were not recorded for this run."
 }
 
 export function presentVerifiedIdentities(test: TestSummary): IdentityPresentation {
@@ -234,14 +341,40 @@ export function presentVerifiedIdentities(test: TestSummary): IdentityPresentati
   if (!subjects) {
     return {
       available: false,
+      partial: false,
       value: "Unavailable",
       tone: "neutral",
       counts: null,
       nonSkipped: null,
       negative: null,
       passRate: null,
-      summary: "Verified test identities were not produced for this run.",
+      summary: "Verified per-test results were not produced for this run.",
       rawReason: null,
+    }
+  }
+
+  const lowerBound = lowerBoundEvidenceCounts(subjects)
+  if (lowerBound) {
+    const negative = lowerBound.failed + lowerBound.errors
+    const reason = subjects.reason?.trim() || "Only part of the per-test list was kept."
+    const retained = [
+      `${formatCount(lowerBound.passed)} passed`,
+      `${formatCount(lowerBound.failed)} failed`,
+      `${formatCount(lowerBound.errors)} errors`,
+      lowerBound.skipped > 0 ? `${formatCount(lowerBound.skipped)} skipped` : null,
+    ].filter((part): part is string => part !== null).join(" · ")
+    return {
+      available: true,
+      partial: true,
+      value: `≥${formatCount(lowerBound.executed)}`,
+      tone: "amber",
+      valueClass: "text-status-attention",
+      counts: lowerBound,
+      nonSkipped: null,
+      negative,
+      passRate: null,
+      summary: `At least these per-test results were kept: ${retained}. ${reason}`,
+      rawReason: reason,
     }
   }
 
@@ -249,6 +382,7 @@ export function presentVerifiedIdentities(test: TestSummary): IdentityPresentati
   if (!counts) {
     return {
       available: false,
+      partial: false,
       value: "Unavailable",
       tone: "neutral",
       counts: null,
@@ -266,7 +400,7 @@ export function presentVerifiedIdentities(test: TestSummary): IdentityPresentati
   const value = passRate == null ? "Recorded" : formatRate(passRate)
   const tone: ResultTone = negative > 0 ? "red" : passRate == null ? "neutral" : "green"
   const summary = [
-    `${formatCount(counts.executed)} verified identities`,
+    `${formatCount(counts.executed)} tests verified by name`,
     `${formatCount(counts.failed)} failed`,
     `${formatCount(counts.errors)} errors`,
     counts.skipped > 0 ? `${formatCount(counts.skipped)} skipped` : null,
@@ -274,6 +408,7 @@ export function presentVerifiedIdentities(test: TestSummary): IdentityPresentati
 
   return {
     available: true,
+    partial: false,
     value,
     tone,
     valueClass: tone === "green"
@@ -321,6 +456,7 @@ export function presentDiagnostics(layers: TestEvidenceLayers | null | undefined
       exact = false
     } else {
       knownTotal += bucket.executed
+      if (bucket.availability === "partial" || bucket.bound === "lower") exact = false
     }
 
     const complete = completeEvidenceCounts(bucket)
@@ -386,6 +522,23 @@ export function buildScopeFromRates(
   }
 }
 
+export function sourceScopeFromBuild(build: BuildSummary): SourceScopePresentation | null {
+  const sourceScope = build.sourceScope
+  const covered = sourceScope?.covered
+  const total = sourceScope?.total
+  if (
+    sourceScope?.availability !== "available"
+    || !Number.isInteger(covered)
+    || !Number.isInteger(total)
+    || (covered as number) < 0
+    || (total as number) <= 0
+    || (covered as number) > (total as number)
+  ) {
+    return null
+  }
+  return { covered: covered as number, total: total as number }
+}
+
 export function presentBuild(
   build: BuildSummary,
   rates?: Record<string, unknown> | null,
@@ -397,23 +550,25 @@ export function presentBuild(
       tone: "neutral",
       summary: "Build was not run.",
       scope: null,
+      sourceScope: null,
     }
   }
   const scope = buildScopeFromRates(rates, build.state)
+  const sourceScope = sourceScopeFromBuild(build)
   const facts = [
-    scope ? `Evidence covers ${formatCount(scope.observed)} of ${formatCount(scope.expected)} modules` : null,
-    finiteCount(build.classCount) ? `${formatCount(build.classCount)} compiled classes` : null,
-    build.tool && !["—", "-", "sealed snapshot", "unknown"].includes(build.tool.trim().toLowerCase())
-      ? build.tool.trim()
+    sourceScope
+      ? `Production Java sources ${formatCount(sourceScope.covered)} / ${formatCount(sourceScope.total)}`
       : null,
+    scope ? `Modules ${formatCount(scope.observed)} / ${formatCount(scope.expected)}` : null,
     scope?.incomplete || state.label === "Partial" ? "Scope incomplete" : null,
   ].filter((fact): fact is string => fact !== null)
 
   return {
-    value: state.label,
+    value: state.label === "Passed" ? "Success" : state.label,
     tone: state.tone,
     valueClass: state.valueClass,
+    sourceScope,
     scope,
-    summary: facts.join(" · ") || "No verified build result was recorded.",
+    summary: facts.join(" · ") || "No comparable build-scope counts were recorded.",
   }
 }

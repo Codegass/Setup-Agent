@@ -646,10 +646,12 @@ def test_unattributed_executions_name_the_volume_in_the_cases_grain():
     )
     payload = grains["cases"].payload()
 
-    assert payload["numerator"] == 0
-    assert payload["denominator"] == 9754
+    assert payload["band"] == "unavailable"
     assert payload["reason"] == (
-        "0/9754 — 10,448 executions visible on disk but bound to no receipt"
+        "no receipt-scoped runtime outcomes were accounted; "
+        "9,754 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "10,448 executions visible on disk but bound to no receipt"
     )
     assert UNATTRIBUTED_CONFLICT in conflicts
 
@@ -684,7 +686,8 @@ def test_the_named_conflict_reaches_the_sealed_verdict():
     assert "10,448 executions" in rates["test"]["cases"]["reason"]
     # Anti-fabrication: visibility without authority. The excluded volume is
     # named, never promoted into the numerator.
-    assert rates["test"]["cases"]["numerator"] == 0
+    assert rates["test"]["cases"]["band"] == "unavailable"
+    assert "numerator" not in rates["test"]["cases"]
     # The sentence must survive the sealed-snapshot schema, or the run aborts
     # on its own verdict at finalize.
     validate_verdict_snapshot_v3(snapshot.model_dump(mode="json"))
@@ -710,13 +713,14 @@ def test_auxiliary_volume_is_disclosed_even_when_the_headline_is_not_zero():
 
     assert UNATTRIBUTED_CONFLICT in conflicts
     assert grains["cases"].payload()["reason"] == (
-        "50/100 — 4 executions visible on disk but bound to no receipt"
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "4 executions visible on disk but bound to no receipt"
     )
 
 
 def test_one_receipted_test_cannot_launder_the_geode_corpus():
-    """geode with a single attributed execution: 1/9754 stays 1/9754, and the
-    10,448 unattributed executions are still named next to it."""
+    """One attributed execution is accounted; excluded volume stays named."""
     stats = SnapshotTestStats(
         discovered=9754,
         unique=SnapshotTestCounts(executed=1, passed=1),
@@ -734,13 +738,16 @@ def test_one_receipted_test_cannot_launder_the_geode_corpus():
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert UNATTRIBUTED_CONFLICT in conflicts
+    assert grains["cases"].payload()["numerator"] == 1
+    assert grains["cases"].payload()["denominator"] == 1
     assert grains["cases"].payload()["reason"] == (
-        "1/9754 — 10,448 executions visible on disk but bound to no receipt"
+        "9,754 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "10,448 executions visible on disk but bound to no receipt"
     )
 
 
-def test_the_disclosure_names_both_numbers_without_a_denominator():
-    """No discovered count is no excuse to state only one of the two volumes."""
+def test_the_disclosure_survives_without_a_static_diagnostic_count():
     stats = SnapshotTestStats(
         discovered=None,
         unique=SnapshotTestCounts(executed=50, passed=50),
@@ -752,8 +759,9 @@ def test_the_disclosure_names_both_numbers_without_a_denominator():
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert UNATTRIBUTED_CONFLICT in conflicts
+    assert grains["cases"].payload()["numerator"] == 50
+    assert grains["cases"].payload()["denominator"] == 50
     assert grains["cases"].payload()["reason"] == (
-        "50 executed, static discovery found no count — "
         "4 executions visible on disk but bound to no receipt"
     )
 
@@ -823,7 +831,11 @@ def test_deleting_the_unattributed_reports_never_changes_the_verdict_word():
     assert UNATTRIBUTED_CONFLICT in conflicts
     assert grain_rates(with_reports, driven_modules=set(), test_modules=set())[0][
         "cases"
-    ].payload()["reason"] == ("50/100 — 4 executions visible on disk but bound to no receipt")
+    ].payload()["reason"] == (
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "4 executions visible on disk but bound to no receipt"
+    )
     # Neither their presence nor their deletion moves the word.
     assert _verdict_for(with_reports) == "success"
     assert _verdict_for(without_reports) == "success"
@@ -865,7 +877,9 @@ def test_stale_volume_is_named_separately_from_auxiliary_volume():
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert grains["cases"].payload()["reason"] == (
-        "50/100 — 4 executions visible on disk but bound to no receipt, 6 under rewritten claims"
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "4 executions visible on disk but bound to no receipt, 6 under rewritten claims"
     )
     assert UNATTRIBUTED_CONFLICT in conflicts
     # Stale volume is disclosed, never counted.
@@ -886,7 +900,11 @@ def test_stale_volume_alone_is_still_disclosed():
 
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
-    assert grains["cases"].payload()["reason"] == "50/100 — 6 executions under rewritten claims"
+    assert grains["cases"].payload()["reason"] == (
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "6 executions under rewritten claims"
+    )
     assert UNATTRIBUTED_CONFLICT not in conflicts
 
 
@@ -1094,7 +1112,10 @@ def test_an_unpartitioned_rollup_is_unattributed_volume_not_a_headline():
     assert snapshot.test_stats.auxiliary_test_stats == _counts(10448)
     assert UNATTRIBUTED_CONFLICT in snapshot.conflicts
     assert snapshot.rates["test"]["cases"]["reason"] == (
-        "0/9754 — 10,448 executions visible on disk but bound to no receipt"
+        "no receipt-scoped runtime outcomes were accounted; "
+        "9,754 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "10,448 executions visible on disk but bound to no receipt"
     )
     # `receipt_scoped` stays absent: the routing states the provenance, it does
     # not invent one.
@@ -1369,7 +1390,9 @@ def test_the_disclosure_names_the_reports_under_intact_claims():
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert grains["cases"].payload()["reason"] == (
-        "50/100 — 2 unparseable reports under receipt claims"
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "2 unparseable reports under receipt claims"
     )
     assert "test_report_parse_error" in conflicts
     assert UNATTRIBUTED_CONFLICT not in conflicts
@@ -1404,7 +1427,9 @@ def test_all_three_doors_are_named_in_one_sentence():
     grains, _ = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert grains["cases"].payload()["reason"] == (
-        "50/100 — 4 executions visible on disk but bound to no receipt "
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "4 executions visible on disk but bound to no receipt "
         "(1 unparseable report), 6 under rewritten claims, "
         "1 unparseable report under receipt claims"
     )
@@ -1444,7 +1469,7 @@ def test_an_unreadable_claimed_report_is_counted_and_pathed(tmp_path, monkeypatc
         "TEST-Truncated.xml"
     ]
     assert snapshot.rates["test"]["cases"]["reason"] == (
-        "25 executed, static discovery found no count — 1 unparseable report under receipt claims"
+        "1 unparseable report under receipt claims"
     )
 
 
@@ -1522,7 +1547,9 @@ def test_the_disclosure_names_the_reports_it_could_not_read():
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert grains["cases"].payload()["reason"] == (
-        "50/100 — 4 executions visible on disk but bound to no receipt "
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "4 executions visible on disk but bound to no receipt "
         "(1 unparseable report), 2 unparseable reports under rewritten claims"
     )
     assert UNATTRIBUTED_CONFLICT in conflicts
@@ -1549,7 +1576,9 @@ def test_an_unmeasurable_excluded_volume_still_names_itself():
     grains, conflicts = grain_rates(stats, driven_modules=set(), test_modules=set())
 
     assert grains["cases"].payload()["reason"] == (
-        "50/100 — 1 unparseable report visible on disk but bound to no receipt"
+        "100 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "1 unparseable report visible on disk but bound to no receipt"
     )
     assert UNATTRIBUTED_CONFLICT in conflicts
 
@@ -1627,9 +1656,12 @@ def test_the_console_disclosure_names_where_the_number_came_from():
 
     assert UNATTRIBUTED_CONFLICT in snapshot.conflicts
     assert snapshot.rates["test"]["cases"]["reason"] == (
-        "0/200 — 120 executions reported in tool output but bound to no receipt"
+        "no receipt-scoped runtime outcomes were accounted; "
+        "200 static test declarations observed "
+        "(diagnostic only; not the runtime denominator); "
+        "120 executions reported in tool output but bound to no receipt"
     )
-    assert snapshot.rates["test"]["cases"]["numerator"] == 0
+    assert snapshot.rates["test"]["cases"]["band"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------

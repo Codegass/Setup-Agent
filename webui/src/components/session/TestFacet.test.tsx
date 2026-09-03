@@ -94,12 +94,12 @@ describe("TestFacet", () => {
     expect(screen.getByText(/100% of non-skipped results passed/i)).toBeInTheDocument()
     expect(screen.getByRole("img", { name: /2 passed, 0 failed, 2 total/i })).toBeInTheDocument()
 
-    expect(screen.getByText("Verified test identities")).toBeInTheDocument()
+    expect(screen.getByText("Verified per-test results")).toBeInTheDocument()
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0)
-    expect(screen.getByText(/module-qualified test identities were not sealed/i)).toBeInTheDocument()
+    expect(screen.getByText(/module and test names were not sealed/i)).toBeInTheDocument()
 
     expect(screen.getByText("Evidence details")).toBeInTheDocument()
-    expect(screen.getByText("Recorded tool runs")).toBeInTheDocument()
+    expect(screen.getByText("Recorded test executions")).toBeInTheDocument()
     expect(screen.getByText("2 / 2 passed")).toBeInTheDocument()
     expect(screen.getByText("Excluded observations")).toBeInTheDocument()
     expect(screen.getByText("267 / 2,887 passed")).toBeInTheDocument()
@@ -107,6 +107,29 @@ describe("TestFacet", () => {
     expect(screen.getByText("2,887")).toBeInTheDocument()
     expect(screen.getByText("Evidence records")).toBeInTheDocument()
     expect(screen.getByText("Complete")).toBeInTheDocument()
+  })
+
+  it("shows incomplete suite totals as a named lower bound, not an exact tool-run rate", () => {
+    const incompleteTotals = JSON.parse(JSON.stringify(igniteShape))
+    incompleteTotals.test.evidenceLayers.tests.claimed.receiptExecutions = {
+      executed: 2048,
+      passed: 2040,
+      failed: 8,
+      errors: 0,
+      skipped: 0,
+      availability: "partial",
+      bound: "lower",
+      basis: "gradle suite totals over the claimed reports the read reached",
+      reason: "gradle suite totals were incomplete (disclosed bounds: unsummarized_files)",
+    }
+
+    render(<TestFacet detail={incompleteTotals} />)
+
+    expect(screen.getByText("Recorded test executions")).toBeInTheDocument()
+    expect(screen.getByText("≥2,048 retained")).toHaveClass("text-status-attention")
+    expect(screen.getByText(/lower bound; complete total unavailable/i)).toBeInTheDocument()
+    expect(screen.getByText(/disclosed bounds: unsummarized_files/i)).toBeInTheDocument()
+    expect(screen.queryByText("2,040 / 2,048 passed")).not.toBeInTheDocument()
   })
 
   it("counts errors as negative non-skipped results", () => {

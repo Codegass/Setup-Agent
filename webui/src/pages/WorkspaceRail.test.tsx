@@ -104,7 +104,7 @@ describe("WorkspaceRail", () => {
 
     expect(screen.getByRole("img", { name: /2 passed, 0 failed, 2 total/i })).toBeInTheDocument()
     expect(screen.getByText(/sealed run: 2 passed/i)).toBeInTheDocument()
-    expect(screen.getByText(/stable module and test identities unavailable/i)).toBeInTheDocument()
+    expect(screen.getByText(/per-test results unavailable/i)).toBeInTheDocument()
     expect(screen.getAllByText(/2,887 additional diagnostics.*excluded from the sealed run result/i).length).toBeGreaterThan(0)
   })
 
@@ -137,7 +137,7 @@ describe("WorkspaceRail", () => {
     expect(screen.getByText("abc123")).toBeInTheDocument()
   })
 
-  it("reports measured identity coverage without discarding unmeasured workspaces", () => {
+  it("keeps identity attribution in row tooltips instead of a Fleet KPI", () => {
     const measuredLayers = evidenceLayers()
     measuredLayers.tests.claimed.latestSubjects = {
       executed: 10, passed: 8, failed: 1, errors: 1, skipped: 0,
@@ -156,9 +156,11 @@ describe("WorkspaceRail", () => {
       />,
     )
 
-    const identityCard = screen.getByText("Identity coverage").parentElement
-    expect(within(identityCard as HTMLElement).getByText("1/2")).toBeInTheDocument()
-    expect(within(identityCard as HTMLElement).getByText("80% measured subset")).toBeInTheDocument()
+    expect(screen.queryByText("Identity coverage")).not.toBeInTheDocument()
+    expect(screen.getByText("Build coverage")).toBeInTheDocument()
+    expect(screen.getByText("Run results")).toBeInTheDocument()
+    expect(screen.getByText(/per-test results: 8 passed and 2 failed or errored of 10/i)).toBeInTheDocument()
+    expect(screen.getByText(/per-test results unavailable/i)).toBeInTheDocument()
   })
 
   it("marks diagnostic totals as lower bounds when a source is unavailable", () => {
@@ -174,8 +176,8 @@ describe("WorkspaceRail", () => {
       />,
     )
 
-    expect(screen.getByText("2,887+")).toBeInTheDocument()
-    expect(screen.getByText(/at least 2,887 diagnostics/i)).toBeInTheDocument()
+    expect(screen.queryByText("Diagnostics")).not.toBeInTheDocument()
+    expect(screen.getByText(/at least 2,887 additional diagnostics.*excluded from the sealed run result/i)).toBeInTheDocument()
   })
 
   it("orders attention-needing workspaces first", () => {

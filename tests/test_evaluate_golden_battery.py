@@ -23,6 +23,7 @@ from scripts.evaluate_golden_battery import (
     main,
     recompute_legacy_v1,
     subject_key,
+    validate_count_measurement,
     validate_count_object,
     validate_v2_project,
     verify_fixture_manifest,
@@ -383,6 +384,106 @@ def test_count_object_uses_all_numeric_or_all_null_fields():
     inconsistent = {"executed": 3, "passed": 2, "failed": 0, "errors": 0, "skipped": 0}
     with pytest.raises(EvaluationError, match="must equal"):
         validate_count_object(inconsistent)
+
+
+def test_lower_bound_measurement_keeps_counts_but_cannot_make_a_rate_or_delta():
+    baseline = _project()
+    candidate = _project()
+    candidate["tests"]["claimed"]["latest_subjects"] = {
+        "executed": 2,
+        "passed": 2,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "availability": "partial",
+        "bound": "lower",
+        "basis": "latest module-qualified subjects (bounded identity sample)",
+        "reason": "identity rows were bounded and truncated",
+    }
+
+    measurement = validate_count_measurement(
+        candidate["tests"]["claimed"]["latest_subjects"]
+    )
+    assert measurement["executed"] == 2
+    assert measurement["bound"] == "lower"
+
+    compared = compare_project_metrics(
+        baseline,
+        candidate,
+        baseline_grain="subject",
+        baseline_disposition="claimed",
+    )
+    assert compared["candidate_measurement"] == {
+        "availability": "partial",
+        "bound": "lower",
+        "display": "≥2",
+        "basis": "latest module-qualified subjects (bounded identity sample)",
+        "reason": "identity rows were bounded and truncated",
+    }
+    assert compared["delta_comparable"] is False
+    assert set(compared["delta"].values()) == {None}
+
+    campaign = evaluate_v2_campaign([candidate])
+    assert campaign["project_macro"]["median_project_subject_pass_rate"] is None
+    assert campaign["diagnostic_totals"]["claimed"]["subjects"]["display"] == "≥2"
+    assert campaign["diagnostic_totals"]["claimed"]["subjects"]["bound"] == "lower"
+
+
+def test_incomplete_suite_total_reason_survives_evaluator_projection():
+    baseline = _project()
+    candidate = _project()
+    candidate["tests"]["claimed"]["receipt_executions"] = {
+        "executed": 27219,
+        "passed": 27211,
+        "failed": 8,
+        "errors": 0,
+        "skipped": 0,
+        "availability": "partial",
+        "bound": "lower",
+        "basis": "gradle suite totals over the claimed reports the read reached",
+        "reason": (
+            "gradle suite totals were incomplete (disclosed bounds: unsummarized_files); "
+            "counts cover only the claimed reports the read reached"
+        ),
+    }
+
+    compared = compare_project_metrics(
+        baseline,
+        candidate,
+        baseline_grain="receipt_execution",
+        baseline_disposition="claimed",
+    )
+
+    assert compared["candidate_measurement"]["display"] == "≥27,219"
+    assert "disclosed bounds: unsummarized_files" in compared["candidate_measurement"]["reason"]
+    assert compared["delta_comparable"] is False
+    assert set(compared["delta"].values()) == {None}
+
+    campaign = evaluate_v2_campaign([candidate])
+    aggregate = campaign["diagnostic_totals"]["claimed"]["receipt_executions"]
+    assert aggregate["availability"] == "partial"
+    assert aggregate["bound"] == "lower"
+    assert aggregate["display"] == "≥27,219"
+    assert "disclosed bounds: unsummarized_files" in aggregate["reason"]
+
+
+def test_partial_measurement_requires_lower_bound_metadata():
+    base = {
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "availability": "partial",
+        "bound": "lower",
+        "basis": "bounded identity sample",
+        "reason": "sample truncated",
+    }
+    for missing in ("bound", "basis", "reason"):
+        broken = {**base}
+        broken.pop(missing)
+        with pytest.raises(EvaluationError):
+            validate_count_measurement(broken)
 
 
 def test_campaign_accepts_explicitly_unavailable_identity_diagnostics_without_promoting_them():

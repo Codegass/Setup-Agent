@@ -159,12 +159,27 @@ class ProjectAnalyzerTool(BaseTool):
         if orchestrator is None:
             return "failed"
         try:
+            from sag.agent.evidence_publications import (
+                BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+                evidence_publication_authority_for,
+            )
+
             from .build_preflight import read_live_build_requirements
 
+            authority = evidence_publication_authority_for(orchestrator)
+            current_head = authority.latest_head(BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID)
             live_existing = read_live_build_requirements(orchestrator)
             if not live_existing.complete or live_existing.conflict is not None:
-                return "failed"
-            existing = dict(live_existing.payload or {})
+                # With no current host head, container bytes are a foreign CAS
+                # compare base only. The writer will replace them from fresh
+                # survey facts without reading or preserving their fields. Once
+                # this authority has a head, however, a strict-read failure means
+                # current evidence was lost or contradicted and must fail closed.
+                if current_head is not None:
+                    return "failed"
+                existing = {}
+            else:
+                existing = dict(live_existing.payload or {})
             existing_stamp = (existing.get("survey") or {}) if existing else {}
 
             validated = self._validate_and_discover_project_path(project_path)
@@ -350,6 +365,17 @@ class ProjectAnalyzerTool(BaseTool):
                         analysis_result["context_updated"] = False
                         analysis_result["context_error"] = "TRUNK_CONTEXT_UPDATE_FAILED"
 
+                requirements_problem = self._live_build_requirements_problem(
+                    validated_path,
+                    analysis_result,
+                )
+                if requirements_problem is not None:
+                    return _analysis_failure(
+                        "BUILD_REQUIREMENTS_UNAVAILABLE",
+                        validated_path=validated_path,
+                        reason=requirements_problem,
+                    )
+
                 fact_sheet = self._facts_projected_metadata(analysis_result)
                 return ToolResult.completed_success(
                     output=serialize_project_fact_sheet(fact_sheet),
@@ -367,6 +393,65 @@ class ProjectAnalyzerTool(BaseTool):
                 "ANALYSIS_EXCEPTION",
                 exception_type=type(e).__name__,
             )
+
+    def _live_build_requirements_problem(
+        self,
+        project_path: str,
+        analysis: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return why this survey's persisted handoff is not live authority.
+
+        A successful write attempt is not enough: the public analyzer result is
+        consumed as proof that later build/test readers have a current manifest.
+        Re-read through the strict host-authorized reader and bind its survey
+        stamps back to this analysis. A document-map failure may remain a typed
+        partial survey (a null pin), but a declared pin must still resolve to the
+        same current live map.
+        """
+        from .build_preflight import read_live_build_requirements
+
+        try:
+            live_requirements = read_live_build_requirements(self.docker_orchestrator)
+        except Exception:
+            return "requirements_read_failed"
+        if not live_requirements.complete:
+            return "requirements_read_incomplete"
+        if live_requirements.conflict is not None:
+            return "requirements_read_conflict"
+        if live_requirements.payload is None:
+            return "requirements_missing"
+
+        survey = live_requirements.payload.get("survey") or {}
+        expected_document_pin = str(analysis.get("document_map_fingerprint") or "") or None
+        expected_stamps = {
+            "analyzer_version": SURVEY_FACTS_VERSION,
+            "project_path": project_path,
+            "config_fingerprint": analysis.get("config_fingerprint"),
+            "target_sha": analysis.get("target_sha"),
+            "document_map_fingerprint": expected_document_pin,
+        }
+        if any(survey.get(key) != value for key, value in expected_stamps.items()):
+            return "requirements_survey_mismatch"
+
+        declared_document_pin = survey.get("document_map_fingerprint")
+        if declared_document_pin is None:
+            return None
+
+        from sag.agent.document_map import read_live_document_map
+
+        try:
+            live_document_map = read_live_document_map(self.docker_orchestrator)
+        except Exception:
+            return "document_map_read_failed"
+        if not live_document_map.complete:
+            return "document_map_read_incomplete"
+        if live_document_map.conflict is not None:
+            return "document_map_read_conflict"
+        if live_document_map.payload is None:
+            return "document_map_missing"
+        if live_document_map.payload.get("document_map_fingerprint") != declared_document_pin:
+            return "document_map_pin_mismatch"
+        return None
 
     def _facts_projected_metadata(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Project internal survey state onto the bounded public fact schema.
@@ -457,9 +542,15 @@ class ProjectAnalyzerTool(BaseTool):
             # Persist the phase-1 -> build-tool handoff into the container so
             # MavenTool/GradleTool (which only hold an orchestrator) can run
             # the JDK pre-flight against the analyzed requirements.
-            self._persist_build_requirements(project_path, analysis, document_map=document_map)
+            if not self._persist_build_requirements(
+                project_path,
+                analysis,
+                document_map=document_map,
+            ):
+                raise RuntimeError("build requirements persistence returned false")
         except Exception as exc:
-            logger.warning(f"Build-approach recommendation failed: {exc}")
+            logger.warning(f"Project fact handoff failed: {exc}")
+            raise
 
         # dim (a) deleted: no execution plan is generated and the field is
         # absent from the fact sheet (never an empty list).
@@ -1088,7 +1179,7 @@ class ProjectAnalyzerTool(BaseTool):
         analysis: Dict[str, Any],
         *,
         document_map: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         """Persist the analyzer's build/test requirements manifest (spec §2).
 
         `document_map` is the map this survey just discovered, passed in rather
@@ -1314,7 +1405,7 @@ class ProjectAnalyzerTool(BaseTool):
                 }
             )
 
-        write_build_requirements(self.docker_orchestrator, data)
+        return write_build_requirements(self.docker_orchestrator, data)
 
     def _update_trunk_context_with_facts(self, analysis: Dict[str, Any]) -> bool:
         """Record the survey facts (build system + static test metrics) on the

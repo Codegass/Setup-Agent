@@ -56,7 +56,7 @@ function evidenceLayers(): EvidenceLayerProjectionSummary {
 }
 
 describe("SummaryStrip rollup", () => {
-  it("aggregates builds, pass rate (skips excluded) and execution rate", () => {
+  it("aggregates build and run-result counts without mixing in static declarations", () => {
     const r = rollup([
       ws({
         docker: { status: "running" },
@@ -76,8 +76,14 @@ describe("SummaryStrip rollup", () => {
     expect(r.passed).toBe(100)
     expect(r.errors).toBe(5)
     expect(r.executedNonSkip).toBe(110) // 90+5+5 and 10+0+0 — skips excluded
-    expect(r.executed).toBe(115)
-    expect(r.declared).toBe(250)
+
+    render(<SummaryStrip workspaces={[
+      ws({
+        build: { state: "success", tool: "maven", time: "", note: "" },
+        test: { state: "passed", pass: 90, fail: 5, skip: 10, total: 105, errors: 5, declaredTotal: 200 },
+      }),
+    ]} />)
+    expect(screen.queryByText("Execution coverage")).not.toBeInTheDocument()
   })
 
   it("handles string build states", () => {

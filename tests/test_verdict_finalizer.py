@@ -223,10 +223,11 @@ def test_v4_finalize_round_trip_carries_the_complete_rates_block():
                 "denominator": 14,
             },
             "classes": {
-                "rate": 99.6,
-                "band": "most",
-                "numerator": 3400,
-                "denominator": 3412,
+                "band": "unavailable",
+                "reason": (
+                    "class files are diagnostic and not comparable to Java source files "
+                    "(3400 class files observed; 3412 production Java sources observed)"
+                ),
             },
         },
         "test": {
@@ -235,6 +236,10 @@ def test_v4_finalize_round_trip_carries_the_complete_rates_block():
                 "band": "fully",
                 "numerator": 100,
                 "denominator": 100,
+                "reason": (
+                    "100 static test declarations observed "
+                    "(diagnostic only; not the runtime denominator)"
+                ),
             },
             "modules": {
                 "rate": 50.0,
@@ -276,9 +281,8 @@ def test_interrupted_test_rollup_remains_partial_even_when_all_observed_rows_pas
     assert snapshot.verdict == "partial"
 
 
-def test_heavy_red_v4_is_partial_from_bands_not_failed_by_pass_rate():
-    """The old 80% pass line is gone: execution is full, then heavy red
-    demotes exactly the cases grain to most and records the weak conflict."""
+def test_project_red_does_not_change_runtime_outcome_accounting_or_setup_verdict():
+    """Project-owned red is a user-facing test result, not missing execution."""
     state = RunEvidenceState(run_id="session-heavy-red-v4")
     _set_rate_test_rollup(
         state,
@@ -294,9 +298,11 @@ def test_heavy_red_v4_is_partial_from_bands_not_failed_by_pass_rate():
         project_name="project",
     ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
-    assert "test_failures_heavy" in snapshot.conflicts
-    assert snapshot.rates["test"]["cases"]["band"] == "most"
-    assert snapshot.verdict == "partial"
+    assert "test_failures_heavy" not in snapshot.conflicts
+    assert snapshot.rates["test"]["cases"]["band"] == "fully"
+    assert snapshot.rates["test"]["cases"]["numerator"] == 100
+    assert snapshot.rates["test"]["cases"]["denominator"] == 100
+    assert snapshot.verdict == "success"
 
 
 def test_v3_fixture_payload_loads_with_an_empty_rates_block():
@@ -313,7 +319,7 @@ def test_v3_fixture_payload_loads_with_an_empty_rates_block():
     assert snapshot.rates == {}
 
 
-def test_test_grain_rates_cases_and_modules_with_weak_signal():
+def test_test_grain_rates_account_runtime_outcomes_and_modules():
     from sag.agent.verdict_finalizer import test_grain_rates
 
     stats = SnapshotTestStats(
@@ -340,9 +346,12 @@ def test_test_grain_rates_cases_and_modules_with_weak_signal():
         test_modules={"core", "io"},
     )
 
-    assert grains["cases"].band == "most"
+    assert grains["cases"].band == "fully"
     assert grains["cases"].rate == 100.0
-    assert conflicts == ("test_failures_heavy",)
+    assert grains["cases"].numerator == 100
+    assert grains["cases"].denominator == 100
+    assert "static test declarations" in (grains["cases"].reason or "")
+    assert conflicts == ()
     assert grains["modules"].payload()["numerator"] == 1
     assert grains["modules"].band == "half"
 
@@ -377,7 +386,7 @@ def test_test_grain_rates_type_their_absences():
         test_modules=set(),
     )
 
-    assert grains["cases"].payload()["reason"] == "static discovery found no count"
+    assert grains["cases"].payload()["reason"] == "no receipt-scoped runtime outcomes were accounted"
     assert grains["modules"].payload()["reason"] == "no test modules surveyed"
     assert conflicts == ()
 

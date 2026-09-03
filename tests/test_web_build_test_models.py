@@ -1,4 +1,4 @@
-from sag.web.models import BuildSummary, TestSummary
+from sag.web.models import BuildSummary, SourceScopeSummary, TestSummary
 
 
 def test_build_summary_new_fields_default_and_serialize():
@@ -6,6 +6,13 @@ def test_build_summary_new_fields_default_and_serialize():
         state="success",
         system="maven",
         class_count=115,
+        source_scope=SourceScopeSummary(
+            covered=36,
+            total=36,
+            availability="available",
+            basis="sealed physical build success over validated full module scope",
+            evidence_refs=["output_source_scope"],
+        ),
         jar_count=0,
         module_output_count=3,
         artifact_samples=["target/classes/Foo.class"],
@@ -15,6 +22,14 @@ def test_build_summary_new_fields_default_and_serialize():
     dumped = b.model_dump(mode="json", by_alias=True)
     assert dumped["system"] == "maven"
     assert dumped["classCount"] == 115
+    assert dumped["sourceScope"] == {
+        "covered": 36,
+        "total": 36,
+        "availability": "available",
+        "basis": "sealed physical build success over validated full module scope",
+        "reason": None,
+        "evidenceRefs": ["output_source_scope"],
+    }
     assert dumped["jarCount"] == 0
     assert dumped["moduleOutputCount"] == 3
     assert dumped["artifactSamples"] == ["target/classes/Foo.class"]
@@ -26,10 +41,35 @@ def test_build_summary_defaults_are_empty_not_fake():
     dumped = BuildSummary().model_dump(mode="json", by_alias=True)
     assert dumped["system"] is None
     assert dumped["classCount"] is None
+    assert dumped["sourceScope"] is None
     assert dumped["jarCount"] is None
     assert dumped["artifactSamples"] == []
     assert dumped["warnings"] == []
     assert dumped["evidenceRefs"] == []
+
+
+def test_build_summary_accepts_snake_case_source_scope_projection():
+    dumped = BuildSummary.model_validate(
+        {
+            "source_scope": {
+                "covered": None,
+                "total": 36,
+                "availability": "unavailable",
+                "basis": None,
+                "reason": "build source scope was not sealed",
+                "evidence_refs": ["output_build"],
+            }
+        }
+    ).model_dump(mode="json", by_alias=True)
+
+    assert dumped["sourceScope"] == {
+        "covered": None,
+        "total": 36,
+        "availability": "unavailable",
+        "basis": None,
+        "reason": "build source scope was not sealed",
+        "evidenceRefs": ["output_build"],
+    }
 
 
 def test_test_summary_new_fields_serialize():

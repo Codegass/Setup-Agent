@@ -107,6 +107,7 @@ _EDGE_REFUSALS = {
 RUNTIME_REQUIREMENT_STATE_UNAVAILABLE = "java_runtime_requirement_state_unavailable"
 BUILD_PARAMETER_INVALID = "BUILD_PARAMETER_INVALID"
 BUILD_REQUIREMENTS_UNAVAILABLE = "BUILD_REQUIREMENTS_UNAVAILABLE"
+BUILD_TEST_SYSTEM_CONFLICT = "BUILD_TEST_SYSTEM_CONFLICT"
 
 
 def _absolute_root(value: Any) -> Optional[str]:
@@ -415,8 +416,36 @@ class BuildTool(BaseTool):
             )
         requirements = dict(manifest_read.payload)
 
-        system, checked = self._detect_system(working_directory)
+        # Test routing is already a surveyed fact.  Re-running the generic
+        # marker priority here used to overwrite that fact in mixed JVM repos:
+        # a root containing both pom.xml and Gradle files always selected Maven
+        # because Maven happens to be first in BUILD_MARKERS, even when the
+        # current manifest names Gradle as the test system.  The manifest is the
+        # decision; marker probing below only checks that the named backend is
+        # physically present at the submitted root.
+        declared_test_system = self._declared_test_system(requirements) if verb == "test" else None
+        system, checked = self._detect_system(
+            working_directory,
+            only_system=declared_test_system,
+        )
         if system is None:
+            if declared_test_system is not None:
+                return ToolResult.completed_failure(
+                    output=(
+                        "[routing] the current build requirements declare "
+                        f"test_system={declared_test_system}, but none of that "
+                        "backend's project markers exists at the submitted test root; "
+                        "no fallback backend was dispatched"
+                    ),
+                    error="declared test backend is not present",
+                    error_code=BUILD_TEST_SYSTEM_CONFLICT,
+                    facts={
+                        "declared_test_system": declared_test_system,
+                        "checked": checked,
+                        "working_directory": working_directory,
+                    },
+                    metadata={"runner_dispatched": False},
+                )
             return ToolResult.completed(
                 operation_outcome="unknown",
                 evidence_status="unknown",
@@ -1658,9 +1687,31 @@ class BuildTool(BaseTool):
                     return item
         return None
 
-    def _detect_system(self, working_directory: str):
+    @staticmethod
+    def _declared_test_system(requirements: Mapping[str, Any]) -> Optional[str]:
+        """Return the authoritative JVM test backend, when the survey has one.
+
+        Python and unsupported ecosystems retain their existing marker-based
+        routing for now.  This helper owns only the Maven/Gradle ambiguity that
+        the phase-1 manifest can resolve without inventing a new rule.
+        """
+
+        declared = str(requirements.get("test_system") or "").strip().lower()
+        return declared if declared in {"maven", "gradle"} else None
+
+    def _detect_system(
+        self,
+        working_directory: str,
+        *,
+        only_system: Optional[str] = None,
+    ):
         checked = []
-        for system, markers in BUILD_MARKERS.items():
+        systems = (
+            ((only_system, BUILD_MARKERS[only_system]),)
+            if only_system in BUILD_MARKERS
+            else BUILD_MARKERS.items()
+        )
+        for system, markers in systems:
             for marker in markers:
                 checked.append(marker)
                 marker_path = posixpath.join(working_directory, marker)

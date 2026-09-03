@@ -24,7 +24,10 @@ from types import SimpleNamespace
 
 import pytest
 from test_container_io import FakeContainer
-from build_requirements_fakes import complete_build_requirements_v1
+from build_requirements_fakes import (
+    complete_build_requirements_v1,
+    complete_python_build_requirements_v1,
+)
 from container_evidence_fakes import ContainerFS
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 from test_invocation_receipts import receipts_written as atomic_receipts_written
@@ -1109,7 +1112,14 @@ def test_gradle_contract_pins_the_materialized_tasks():
 def test_python_contract_states_the_action_and_no_argv_it_cannot_know():
     """The venv interpreter and the junit path are resolved inside python_tool;
     the facade never guesses an argv it did not materialize."""
-    tool, orchestrator, _ = _build_tool({"pyproject.toml"})
+    orchestrator = RecordingOrchestrator({"pyproject.toml"})
+    orchestrator.publish_manifest(
+        complete_python_build_requirements_v1(project_root="/workspace/proj")
+    )
+    tool, orchestrator, _ = _build_tool(
+        {"pyproject.toml"},
+        orchestrator=orchestrator,
+    )
 
     with build_action_context(
         "envelope-000003", action="test", working_directory="/workspace/proj"

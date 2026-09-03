@@ -228,7 +228,43 @@ def _without_suite_totals(receipt):
     return validate_receipt_v2(stripped, expected_id=stripped["receipt_id"])
 
 
-def test_a_gradle_run_whose_totals_tier_failed_withholds_the_count_it_cannot_state(
+def _with_incomplete_suite_totals(receipt):
+    """The same sealed totals with one suite pair explicitly truncated."""
+
+    bounded = json.loads(json.dumps(receipt))
+    suites = bounded["gradle_suite_summaries"]["suites"]
+    green_index = next(
+        index
+        for index, suite in enumerate(suites)
+        if suite["tests"] > 0 and suite["failures"] == suite["errors"] == 0
+    )
+    suites.pop(green_index)
+    bounded["gradle_suite_summaries"].update(
+        {"truncated": True, "dropped_suites": 1}
+    )
+    return validate_receipt_v2(bounded, expected_id=bounded["receipt_id"])
+
+
+def test_incomplete_gradle_suite_totals_are_a_named_lower_bound(kafka_run):
+    """A totals tier that did not reach every report is not an exact total."""
+
+    bounded = _with_incomplete_suite_totals(kafka_run)
+    retained = sum(
+        suite["tests"] for suite in bounded["gradle_suite_summaries"]["suites"]
+    )
+    executions = _executions(bounded)
+
+    assert executions["executed"] == retained < KAFKA_TESTS
+    assert executions["availability"] == "partial"
+    assert executions["bound"] == "lower"
+    assert executions["basis"] == (
+        "gradle suite totals over the claimed reports the read reached"
+    )
+    assert "disclosed bounds: truncated" in executions["reason"]
+    assert "counts cover only the claimed reports the read reached" in executions["reason"]
+
+
+def test_a_gradle_run_whose_totals_tier_failed_states_the_retained_floor(
     kafka_run,
 ):
     """The probe, pinned: 2,048 sealed rows never become 2,048 executions.
@@ -244,23 +280,27 @@ def test_a_gradle_run_whose_totals_tier_failed_withholds_the_count_it_cannot_sta
 
     assert stripped["testcase_execution_rows"]["status"] == "complete"
     assert len(stripped["testcase_execution_rows"]["rows"]) == DELTA_TESTCASE_ROW_CAP
-    assert claimed["receipt_executions"] == {
-        "executed": None,
-        "passed": None,
-        "failed": None,
-        "errors": None,
-        "skipped": None,
-        "availability": "unavailable",
-        "reason": BOUNDED_EXECUTIONS_REASON,
-    }
+    executions = claimed["receipt_executions"]
+    assert executions["executed"] == DELTA_TESTCASE_ROW_CAP
+    assert executions["availability"] == "partial"
+    assert executions["basis"] == f"module-qualified receipt execution rows {BOUNDED_SAMPLE}"
+    assert executions["bound"] == "lower"
+    assert executions["reason"] == BOUNDED_EXECUTIONS_REASON
+    assert executions["executed"] == sum(
+        executions[field] for field in ("passed", "failed", "errors", "skipped")
+    )
+    assert "Receipt executions: ≥2048 executions retained" in "\n".join(
+        format_evidence_layer_lines(_metrics(stripped))
+    )
     # The identity grains are unharmed: they count the sample, they say so, and
-    # withholding the run's count is not a reason to withhold the names.
+    # A lower-bound run count is not a reason to discard the retained names.
     for grain in ("latest_cases", "latest_subjects"):
-        assert claimed[grain]["availability"] == "available"
+        assert claimed[grain]["availability"] == "partial"
+        assert claimed[grain]["bound"] == "lower"
         assert BOUNDED_SAMPLE in claimed[grain]["basis"]
 
 
-def test_a_maven_run_past_the_row_cap_states_no_count_rather_than_its_sample(kafka_run):
+def test_a_maven_run_past_the_row_cap_states_the_sample_as_a_lower_bound(kafka_run):
     """The unconditional case: a runner with no totals tier at all.
 
     Nothing about this is gradle-specific — maven and pytest receipts reach the
@@ -273,8 +313,9 @@ def test_a_maven_run_past_the_row_cap_states_no_count_rather_than_its_sample(kaf
 
     assert len(twin["testcase_execution_rows"]["rows"]) == DELTA_TESTCASE_ROW_CAP < KAFKA_TESTS
     assert "gradle_suite_summaries" not in twin
-    assert executions["availability"] == "unavailable"
-    assert executions["executed"] is None
+    assert executions["availability"] == "partial"
+    assert executions["bound"] == "lower"
+    assert executions["executed"] == DELTA_TESTCASE_ROW_CAP
     assert executions["reason"] == BOUNDED_EXECUTIONS_REASON
 
 
@@ -283,8 +324,8 @@ def test_a_bounded_row_tier_makes_the_sum_beside_it_a_floor_not_a_total(kafka_ru
 
     Gradle's totals are whole and maven's rows are capped; added together they
     are a floor. A floor published as the run's count is the same lie with a
-    larger number on it, so the aggregate is withheld while each receipt's own
-    evidence stays exactly as valid as it was.
+    larger number on it, so the aggregate stays a lower bound while each
+    receipt's own evidence stays exactly as valid as it was.
     """
 
     metrics = assemble_report_metrics(
@@ -312,8 +353,49 @@ def test_a_bounded_row_tier_makes_the_sum_beside_it_a_floor_not_a_total(kafka_ru
     executions = metrics["tests"]["claimed"]["receipt_executions"]
 
     assert validate_report_metrics_v2(metrics) == metrics
-    assert executions["availability"] == "unavailable"
+    assert executions["availability"] == "partial"
+    assert executions["bound"] == "lower"
+    assert executions["executed"] == KAFKA_TESTS + DELTA_TESTCASE_ROW_CAP
     assert executions["reason"] == BOUNDED_EXECUTIONS_REASON
+
+
+def test_incomplete_suite_totals_plus_bounded_rows_keep_both_disclosures(kafka_run):
+    """Two lower-bound tiers stay a floor and preserve both reasons."""
+
+    gradle_receipt = _with_incomplete_suite_totals(kafka_run)
+    metrics = assemble_report_metrics(
+        snapshot={
+            "verdict": "partial",
+            "phase_records": [{"phase": "test", "termination": "complete"}],
+            "build_evidence": {"observed": True, "judgment": "success"},
+        },
+        build_evidence={},
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-08-30T12:00:00Z",
+        run_pin={
+            "run_id": gradle_receipt["run_id"],
+            "target_repo_sha": gradle_receipt["target_sha"],
+        },
+        persistence={
+            "receipts_expected": 2,
+            "receipts_persisted": 2,
+            "terminal_receipts_unpersisted": 0,
+        },
+        receipt_records=[gradle_receipt, _second_dispatch(gradle_receipt)],
+    )
+    executions = metrics["tests"]["claimed"]["receipt_executions"]
+    retained = sum(
+        suite["tests"] for suite in gradle_receipt["gradle_suite_summaries"]["suites"]
+    )
+
+    assert validate_report_metrics_v2(metrics) == metrics
+    assert executions["availability"] == "partial"
+    assert executions["bound"] == "lower"
+    assert executions["executed"] == retained + DELTA_TESTCASE_ROW_CAP
+    assert "disclosed bounds: truncated" in executions["reason"]
+    assert BOUNDED_EXECUTIONS_REASON in executions["reason"]
 
 
 def _second_dispatch(receipt):

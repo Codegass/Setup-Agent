@@ -15,7 +15,7 @@ from loguru import logger
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
-from sag.evidence import OperationOutcome
+from sag.evidence import InvocationStatus, OperationOutcome
 from sag.project_fact_sheet import project_fact_sheet_identity
 from sag.tools.base import (
     BaseTool,
@@ -153,8 +153,10 @@ from .replay import recover_active_repair_context_from_path
 from .stall_diagnostics import (
     STALL_CONFIRMATION_TRIGGER,
     WALL_GUARD_TRIGGER,
+    CleanupResult,
     JobProgressSnapshot,
     StallControlResult,
+    cancel_registered_process_group,
     control_stalled_job,
     probe_job_progress,
 )
@@ -203,6 +205,7 @@ _STRICT_LINEAGE_CONTROL_KINDS = frozenset(
     }
 )
 _REPAIR_GUIDANCE_MAX_BYTES = 32 * 1024
+_RUN_TASK_COMPLETE_PREFIX = "TASK COMPLETE:"
 _REPAIR_PREDISPATCH_REFUSAL_CODES = frozenset(
     {
         "ACTION_INTENT_INVALID",
@@ -1239,6 +1242,192 @@ class ReActEngine(UIEventEmitter):
             handles = {}
             self._job_barrier_ephemeral_handles = handles
         return handles
+
+    def _begin_detached_run_scope(self) -> None:
+        """Freeze which in-memory detached handles predate this executor run."""
+
+        orchestrator = getattr(self, "orchestrator", None)
+        remembered = getattr(orchestrator, "_detached_handles", None)
+        self._detached_handle_baseline = (
+            frozenset(str(job_id) for job_id in remembered)
+            if isinstance(remembered, Mapping)
+            else frozenset()
+        )
+        self._job_barrier_ephemeral_handles = {}
+        self._termination_cleanup_results: Dict[str, CleanupResult] = {}
+        self._termination_cleanup_done = False
+        self.last_run_cancelled = False
+
+    def _capture_unreturned_detached_handles(self) -> None:
+        """Adopt dispatches accepted after run start but interrupted before result return.
+
+        The ordinary barrier registration happens only after a tool result is
+        constructed.  DockerOrchestrator remembers the accepted host handle at
+        dispatch time, so an operator interrupt during the soft-hold polling
+        window can recover that exact identity here without redispatching or
+        guessing from container process names.
+        """
+
+        orchestrator = getattr(self, "orchestrator", None)
+        remembered = getattr(orchestrator, "_detached_handles", None)
+        if not isinstance(remembered, Mapping):
+            return
+        baseline = set(getattr(self, "_detached_handle_baseline", ()) or ())
+        ephemeral = self._ephemeral_job_handles()
+        for remembered_id, raw_handle in remembered.items():
+            job_id = str(remembered_id or "").strip()
+            if not job_id or job_id in baseline or not isinstance(raw_handle, Mapping):
+                continue
+            handle = dict(raw_handle)
+            if str(handle.get("job_id") or "").strip() != job_id:
+                continue
+            ephemeral.setdefault(job_id, handle)
+
+    def _termination_jobs(self) -> Dict[str, Dict[str, Any]]:
+        """Return every durable or just-recovered job this run must close."""
+
+        jobs: Dict[str, Dict[str, Any]] = {}
+        orchestrator = getattr(self, "orchestrator", None)
+        if orchestrator is not None:
+            records = self._obligations_still_owed(orchestrator)
+            if records:
+                for record in records:
+                    job_id = str(record.get("job_id") or "").strip()
+                    if job_id:
+                        jobs[job_id] = dict(record)
+        for job_id, handle in self._ephemeral_job_handles().items():
+            if job_id:
+                jobs.setdefault(job_id, dict(handle))
+        return jobs
+
+    def _terminate_open_jobs(self, reason: EvidenceCloseReason | str) -> Dict[str, CleanupResult]:
+        """TERM/KILL exact registered groups on cancellation or abort.
+
+        This is deliberately separate from stall cleanup: cancellation is
+        operator termination authority, not a claim that a progressing build
+        stalled.  The process helper re-verifies the launcher's PID/PGID/start
+        identity before either signal.  A refusal is retained as an explicit
+        close result rather than silently abandoning the runner.
+        """
+
+        if getattr(self, "_termination_cleanup_done", False):
+            return dict(getattr(self, "_termination_cleanup_results", {}) or {})
+        self._termination_cleanup_done = True
+        self._capture_unreturned_detached_handles()
+        jobs = self._termination_jobs()
+        results: Dict[str, CleanupResult] = {}
+        self._termination_cleanup_results = results
+        if not jobs:
+            return results
+
+        orchestrator = getattr(self, "orchestrator", None)
+        from sag.runtime.container_io import resolve_control_execute
+
+        execute = resolve_control_execute(orchestrator) if orchestrator is not None else None
+        reason_text = str(getattr(reason, "value", reason) or "termination")
+        grace_seconds = max(
+            0,
+            int(getattr(getattr(self, "config", None), "cancel_cleanup_grace_seconds", 10)),
+        )
+        for job_id, job in jobs.items():
+            if not callable(execute):
+                result = CleanupResult(
+                    job_id=job_id,
+                    pgid=int(job.get("pgid") or 0),
+                    code="cleanup_control_transport_unavailable",
+                    group_live=True,
+                )
+            else:
+                result = cancel_registered_process_group(
+                    execute,
+                    job,
+                    grace_seconds=grace_seconds,
+                )
+            results[job_id] = result
+            if result.group_live:
+                logger.warning(
+                    f"Detached job {job_id} remained live during {reason_text}: {result.code}"
+                )
+            else:
+                logger.info(
+                    f"Detached job {job_id} closed during {reason_text}: {result.code}"
+                )
+        return dict(results)
+
+    @staticmethod
+    def _execution_record_state(
+        record: ToolExecutionRecord | Mapping[str, Any],
+    ) -> tuple[str, Optional[InvocationStatus], Optional[OperationOutcome]]:
+        if isinstance(record, ToolExecutionRecord):
+            return record.signature, record.invocation_status, record.operation_outcome
+        signature = str(record.get("signature") or "").strip()
+        try:
+            invocation_status = InvocationStatus(record.get("invocation_status"))
+        except (TypeError, ValueError):
+            invocation_status = None
+        try:
+            operation_outcome = OperationOutcome(record.get("operation_outcome"))
+        except (TypeError, ValueError):
+            operation_outcome = None
+        return signature, invocation_status, operation_outcome
+
+    def _run_task_completion_conflicts(self) -> Tuple[str, ...]:
+        """Structured blockers to a free-form run-task terminal answer."""
+
+        latest: Optional[
+            tuple[str, Optional[InvocationStatus], Optional[OperationOutcome]]
+        ] = None
+        for record in getattr(self, "recent_tool_executions", ()) or ():
+            if not isinstance(record, (ToolExecutionRecord, Mapping)):
+                continue
+            signature, invocation_status, operation_outcome = self._execution_record_state(record)
+            if signature:
+                latest = (signature, invocation_status, operation_outcome)
+
+        conflicts: List[str] = []
+        if latest is None:
+            conflicts.append("no task tool evidence")
+        else:
+            signature, invocation_status, operation_outcome = latest
+            if operation_outcome is OperationOutcome.FAILED:
+                conflicts.append(f"unrepaired failure: {signature}")
+            elif invocation_status is InvocationStatus.PENDING:
+                orchestrator = getattr(self, "orchestrator", None)
+                records = None
+                if orchestrator is not None:
+                    try:
+                        records = self._obligations_still_owed(orchestrator)
+                    except Exception:
+                        records = None
+                if records is None or any(blocks_model(record) for record in records):
+                    conflicts.append(f"unfinished runner: {signature}")
+            elif invocation_status in {
+                InvocationStatus.TIMEOUT,
+                InvocationStatus.CRASHED,
+                InvocationStatus.CANCELLED,
+            }:
+                conflicts.append(f"terminal tool failure: {signature}")
+        for job_id in self._ephemeral_job_handles():
+            conflicts.append(f"unfinished runner: {job_id}")
+        return tuple(conflicts)
+
+    def _run_task_completion_refusal(self, text: str) -> Optional[str]:
+        candidate = str(text or "").strip()
+        if not candidate.startswith(_RUN_TASK_COMPLETE_PREFIX):
+            return (
+                "The task is not closed. Continue with a tool call, or when tool results "
+                f"prove completion reply with {_RUN_TASK_COMPLETE_PREFIX} <summary>."
+            )
+        if not candidate[len(_RUN_TASK_COMPLETE_PREFIX) :].strip():
+            return "TASK COMPLETE requires a non-empty evidence-backed summary."
+        conflicts = self._run_task_completion_conflicts()
+        if conflicts:
+            return (
+                "TASK COMPLETE was rejected because execution state is unresolved: "
+                + "; ".join(conflicts)
+                + ". Repair or close that state before claiming completion."
+            )
+        return None
 
     def _capture_job_barrier_from_result(self) -> bool:
         """Register a detached handle even when its complete ledger write failed."""
@@ -2283,6 +2472,7 @@ class ReActEngine(UIEventEmitter):
         machine = getattr(self, "phase_machine", None)
         if machine is None:
             raise RuntimeError("abort termination is available only for setup runs")
+        self._terminate_open_jobs(EvidenceCloseReason.ABORTED)
         if not machine.is_complete:
             record = machine.record_abort(reason, evidence=[], outcome=PhaseOutcome.FAILED)
             self._record_phase_audit(record)
@@ -2295,6 +2485,7 @@ class ReActEngine(UIEventEmitter):
         machine = getattr(self, "phase_machine", None)
         if machine is None:
             raise RuntimeError("cancel termination is available only for setup runs")
+        self._terminate_open_jobs(EvidenceCloseReason.CANCELLED)
         if not machine.is_complete:
             record = machine.record_abort(reason, evidence=[])
             self._record_phase_audit(record)
@@ -4064,6 +4255,7 @@ class ReActEngine(UIEventEmitter):
         self.current_iteration = 0
         self._phase_iterations = 0
         self._reset_advisor_run_state()
+        self._begin_detached_run_scope()
         if phase_mode:
             self.steps = [self._phase_intro_step()]
             self._journal_intro_dirty = True
@@ -4187,24 +4379,33 @@ class ReActEngine(UIEventEmitter):
                             )
                         )
                     if completion_mode != "setup":
-                        # Run-task mode: a text answer ends the task. Nothing is
-                        # delivered back to a model that is finished, so the
-                        # record states an answer of None rather than inventing
-                        # one — but the response itself is still a turn.
-                        self._seal_turn_record(
-                            actor="model",
-                            t0=turn_started,
-                            t1=self._turn_stamp(),
-                            iteration=getattr(self, "current_iteration", None),
+                        refusal = (
+                            self._run_task_completion_refusal(turn.text)
+                            if completion_mode == "run_task"
+                            else None
                         )
-                        self._export_token_usage_csv()
-                        return True
-                    cue = ReActStep(
-                        step_type=StepType.SYSTEM_GUIDANCE,
-                        content=(
+                        if refusal is None:
+                            # A free-form task ends only on its explicit,
+                            # evidence-consistent terminal sentence. Nothing is
+                            # delivered back to a model that is finished, so
+                            # the record states an answer of None.
+                            self._seal_turn_record(
+                                actor="model",
+                                t0=turn_started,
+                                t1=self._turn_stamp(),
+                                iteration=getattr(self, "current_iteration", None),
+                            )
+                            self._export_token_usage_csv()
+                            return True
+                        cue_text = refusal
+                    else:
+                        cue_text = (
                             "No tool was called. Continue with a tool call, "
                             "or close the phase honestly via phase(...)."
-                        ),
+                        )
+                    cue = ReActStep(
+                        step_type=StepType.SYSTEM_GUIDANCE,
+                        content=cue_text,
                         timestamp=self._get_timestamp(),
                     )
                     self.steps.append(cue)
@@ -4295,8 +4496,10 @@ class ReActEngine(UIEventEmitter):
         except KeyboardInterrupt:
             logger.warning("Native loop cancelled by keyboard interrupt")
             self._export_token_usage_csv()
+            self.last_run_cancelled = True
             if phase_mode:
                 return self.cancel(reason="keyboard interrupt")
+            self._terminate_open_jobs(EvidenceCloseReason.CANCELLED)
             return False
         except Exception as e:
             logger.error(f"Native loop failed: {e}", exc_info=True)
