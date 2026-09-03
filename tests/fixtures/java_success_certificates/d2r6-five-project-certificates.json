@@ -1,0 +1,1771 @@
+{
+  "certificates": [
+    {
+      "assurance": "PROJECTED",
+      "assurance_level": "legacy_projected",
+      "axis_truths": {
+        "build": "PASS",
+        "integrity": "PASS",
+        "scope": "PASS",
+        "test_execution": "PASS",
+        "test_outcome": "PASS"
+      },
+      "blockers": [],
+      "build_status": "success",
+      "build_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:build-step-0",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-268bb7d2aa74-0001"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "plan:build:0"
+        ],
+        "required_set_sha256": "43d2fb3a21eb365f320eaec309879020e76435dd8c1400e9d66fabaf0507c149",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "plan:build:0"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "build_plan_step"
+      },
+      "build_units": {
+        "applicability": "required",
+        "basis_ref": "legacy-projection:verdict.build.modules",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-268bb7d2aa74-0001",
+          "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/verdict.json"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "."
+        ],
+        "required_set_sha256": "fc65d5e9d9a85d8be5faf2b0387bd5d21891aa707f068e01f9b643565820283e",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "."
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "single_maven_project"
+      },
+      "diagnostics": [
+        {
+          "code": "class_source_counts_observed",
+          "evidence_refs": [
+            "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/verdict.json"
+          ],
+          "note": "Class and source counts are different grains and do not affect closure.",
+          "observations": {
+            "compiled_classes": 21,
+            "source_files": 17
+          }
+        }
+      ],
+      "flags": {
+        "authoritative_test_clean": true,
+        "build_axis_success": true,
+        "green_proof_verified": false,
+        "test_execution_closed": true
+      },
+      "integrity": {
+        "evidence": {
+          "applicability": "required",
+          "basis_ref": "legacy-session-durable-artifacts",
+          "closed": 6,
+          "closure_fraction": "6/6",
+          "closure_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "evidence_refs": [
+            "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent",
+            "tests/fixtures/java_success_certificates/d2r6-five-project-source-checksums.json"
+          ],
+          "failed": 0,
+          "failed_ids": [],
+          "failure_attribution": null,
+          "interval": {
+            "denominator": 6,
+            "lower_numerator": 6,
+            "upper_numerator": 6
+          },
+          "missing": 0,
+          "missing_ids": [],
+          "required": 6,
+          "required_ids": [
+            "inv-maven-1-268bb7d2aa74-0001",
+            "inv-maven-1-268bb7d2aa74-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "required_set_sha256": "0359974545c79e8eb138401838c323cd33742285825664476a8b63a991e71e9a",
+          "satisfaction_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "satisfied": 6,
+          "satisfied_ids": [
+            "inv-maven-1-268bb7d2aa74-0001",
+            "inv-maven-1-268bb7d2aa74-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "status": "complete",
+          "success_fraction": "6/6",
+          "unexpected": 0,
+          "unexpected_ids": [],
+          "unit": "evidence_binding"
+        },
+        "status": "complete",
+        "terminal_receipts_unpersisted": 0,
+        "unsettled_jobs": 0
+      },
+      "overall_truth": "PASS",
+      "plan_sha256": "b1d8f8eab0aa8ebea2f059108a81dc9a35533fb37408bb06eb96f1a360248331",
+      "project_id": "tomcat-jakartaee-migration",
+      "promotion_eligible": false,
+      "proof_status": "projected",
+      "result": "repository_green",
+      "result_class": "repository_green",
+      "run_id": "20260826_065703_307583_34a827ad5c81_64137-7-237bc4d9badd",
+      "schema_version": 1,
+      "scope": {
+        "basis_refs": [
+          "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/project_execution_plan.json"
+        ],
+        "closure": "closed",
+        "evidence_epoch": "20260826_065703_307583_34a827ad5c81_64137-7-237bc4d9badd",
+        "kind": "repository_default",
+        "revision": 1,
+        "scope_id": "d2r6:tomcat-jakartaee-migration:repository-default",
+        "subject": {
+          "plan_sha256": "b1d8f8eab0aa8ebea2f059108a81dc9a35533fb37408bb06eb96f1a360248331",
+          "project_id": "tomcat-jakartaee-migration",
+          "run_id": "20260826_065703_307583_34a827ad5c81_64137-7-237bc4d9badd",
+          "target_sha": "50c811bffa4da6e48f5661e6a5a7763ffccdad46"
+        }
+      },
+      "target_sha": "50c811bffa4da6e48f5661e6a5a7763ffccdad46",
+      "test_counts": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 52,
+        "reported": 52,
+        "skipped": 0
+      },
+      "test_execution_status": "complete",
+      "test_outcome_status": "clean",
+      "test_results_authority": "receipt_bound",
+      "test_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-reviewed:project-ci-maven-test",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-268bb7d2aa74-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "entrypoint:maven-test:root"
+        ],
+        "required_set_sha256": "99e1c7a542cb72c2614996ddc981f31909ebb7170f8504b9e46930f6c0ad32b9",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "entrypoint:maven-test:root"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "test_plan_step"
+      },
+      "test_targets": {
+        "applicability": "required",
+        "basis_ref": "legacy-reviewed:root-product-tests",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-268bb7d2aa74-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "maven-project:."
+        ],
+        "required_set_sha256": "2a9b30fed2c06fb3f27c906bc195f9103fb9ceed2a0534c01b0fc7f0d43a20ff",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "maven-project:."
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "single_test_project"
+      },
+      "typed_reason_codes": []
+    },
+    {
+      "assurance": "PROJECTED",
+      "assurance_level": "legacy_projected",
+      "axis_truths": {
+        "build": "PASS",
+        "integrity": "PASS",
+        "scope": "PASS",
+        "test_execution": "PASS",
+        "test_outcome": "PASS"
+      },
+      "blockers": [],
+      "build_status": "success",
+      "build_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:build-step-0",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-cad7d1e4e3ec-0001"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "plan:build:0"
+        ],
+        "required_set_sha256": "f63fc649e356b00478154fa6da9abab2027156b4e738c947b000800b93ba94b8",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "plan:build:0"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "build_plan_step"
+      },
+      "build_units": {
+        "applicability": "required",
+        "basis_ref": "legacy-projection:verdict.build.modules",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-cad7d1e4e3ec-0001",
+          "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/verdict.json"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "."
+        ],
+        "required_set_sha256": "807fea960ee67c57008462b4afa195036b441e5abd9e6fefbca03e880b508848",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "."
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "single_maven_project"
+      },
+      "diagnostics": [
+        {
+          "code": "parameterized_expansion_observed",
+          "evidence_refs": [
+            "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/verdict.json"
+          ],
+          "note": "Runtime invocations and static declarations remain separate grains.",
+          "observations": {
+            "runtime_executions": 1605,
+            "static_declarations": 1163
+          }
+        },
+        {
+          "code": "default_quality_gate_not_executed",
+          "evidence_refs": [
+            "inv-maven-1-cad7d1e4e3ec-0002",
+            "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/project_execution_plan.json"
+          ],
+          "note": "The projection proves repository product tests, not the complete default quality gate.",
+          "observations": {
+            "observed_entrypoint": "mvn test",
+            "planned_entrypoint": "default clean verify and quality checks"
+          }
+        }
+      ],
+      "flags": {
+        "authoritative_test_clean": true,
+        "build_axis_success": true,
+        "green_proof_verified": false,
+        "test_execution_closed": true
+      },
+      "integrity": {
+        "evidence": {
+          "applicability": "required",
+          "basis_ref": "legacy-session-durable-artifacts",
+          "closed": 6,
+          "closure_fraction": "6/6",
+          "closure_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "evidence_refs": [
+            "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent",
+            "tests/fixtures/java_success_certificates/d2r6-five-project-source-checksums.json"
+          ],
+          "failed": 0,
+          "failed_ids": [],
+          "failure_attribution": null,
+          "interval": {
+            "denominator": 6,
+            "lower_numerator": 6,
+            "upper_numerator": 6
+          },
+          "missing": 0,
+          "missing_ids": [],
+          "required": 6,
+          "required_ids": [
+            "inv-maven-1-cad7d1e4e3ec-0001",
+            "inv-maven-1-cad7d1e4e3ec-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "required_set_sha256": "93ee6a7beaf8fdc65251fca6f6896b78b249437fd1b721af54bc88e156594fae",
+          "satisfaction_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "satisfied": 6,
+          "satisfied_ids": [
+            "inv-maven-1-cad7d1e4e3ec-0001",
+            "inv-maven-1-cad7d1e4e3ec-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "status": "complete",
+          "success_fraction": "6/6",
+          "unexpected": 0,
+          "unexpected_ids": [],
+          "unit": "evidence_binding"
+        },
+        "status": "complete",
+        "terminal_receipts_unpersisted": 0,
+        "unsettled_jobs": 0
+      },
+      "overall_truth": "PASS",
+      "plan_sha256": "a64d88817513003fb22412ae01745b8727506f255a193a12079b83c91cc7908d",
+      "project_id": "commons-dbcp",
+      "promotion_eligible": false,
+      "proof_status": "projected",
+      "result": "repository_product_test_green",
+      "result_class": "repository_product_test_green",
+      "run_id": "20260826_060350_409345_ac7428470523_62391-7-65fa4d3cf26e",
+      "schema_version": 1,
+      "scope": {
+        "basis_refs": [
+          "inv-maven-1-cad7d1e4e3ec-0002",
+          "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/project_execution_plan.json"
+        ],
+        "closure": "closed",
+        "evidence_epoch": "20260826_060350_409345_ac7428470523_62391-7-65fa4d3cf26e",
+        "kind": "repository_product_tests",
+        "revision": 1,
+        "scope_id": "d2r6:commons-dbcp:repository-product-tests",
+        "subject": {
+          "plan_sha256": "a64d88817513003fb22412ae01745b8727506f255a193a12079b83c91cc7908d",
+          "project_id": "commons-dbcp",
+          "run_id": "20260826_060350_409345_ac7428470523_62391-7-65fa4d3cf26e",
+          "target_sha": "1088f44f215e684e0e3f33de9aba4019e00a533d"
+        }
+      },
+      "target_sha": "1088f44f215e684e0e3f33de9aba4019e00a533d",
+      "test_counts": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 1596,
+        "reported": 1605,
+        "skipped": 9
+      },
+      "test_execution_status": "complete",
+      "test_outcome_status": "clean",
+      "test_results_authority": "receipt_bound",
+      "test_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-reviewed:repository-product-tests",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-cad7d1e4e3ec-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "entrypoint:maven-test:root"
+        ],
+        "required_set_sha256": "61702239a7eedff7591963689c6b05e637ad0723249ac8ad3f77f2d3d25772d3",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "entrypoint:maven-test:root"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "test_plan_step"
+      },
+      "test_targets": {
+        "applicability": "required",
+        "basis_ref": "legacy-reviewed:root-product-tests",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-cad7d1e4e3ec-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "maven-project:."
+        ],
+        "required_set_sha256": "b1bcfcf651c083f5cdafcf0f1c329f8f05e170416755d0ed6390cab362bb78d5",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "maven-project:."
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "single_test_project"
+      },
+      "typed_reason_codes": []
+    },
+    {
+      "assurance": "PROJECTED",
+      "assurance_level": "legacy_projected",
+      "axis_truths": {
+        "build": "PASS",
+        "integrity": "PASS",
+        "scope": "UNKNOWN",
+        "test_execution": "UNKNOWN",
+        "test_outcome": "UNKNOWN"
+      },
+      "blockers": [],
+      "build_status": "success",
+      "build_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:build-step-0",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-da66e80f658b-0001"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "plan:build:0"
+        ],
+        "required_set_sha256": "4759f3956a0ba4ece7b0fa2458c127b375cafb1e40c6afe1f2eef5cb75cc3ca4",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "plan:build:0"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "build_plan_step"
+      },
+      "build_units": {
+        "applicability": "required",
+        "basis_ref": "inv-maven-1-da66e80f658b-0001:module_outcomes",
+        "closed": 41,
+        "closure_fraction": "41/41",
+        "closure_pair": {
+          "denominator": 41,
+          "numerator": 41
+        },
+        "evidence_refs": [
+          "inv-maven-1-da66e80f658b-0001"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 41,
+          "lower_numerator": 41,
+          "upper_numerator": 41
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 41,
+        "required_ids": [
+          "apache-ignite",
+          "ignite-appserver-test",
+          "ignite-binary-api",
+          "ignite-binary-impl",
+          "ignite-bom",
+          "ignite-calcite",
+          "ignite-checkstyle",
+          "ignite-clients",
+          "ignite-codegen",
+          "ignite-codegen2",
+          "ignite-commons",
+          "ignite-compatibility",
+          "ignite-compress",
+          "ignite-control-utility",
+          "ignite-core",
+          "ignite-dev-utils",
+          "ignite-direct-io",
+          "ignite-extdata-p2p",
+          "ignite-extdata-platform",
+          "ignite-extdata-pluggable",
+          "ignite-extdata-uri",
+          "ignite-extdata-uri-dep",
+          "ignite-grid-unsafe",
+          "ignite-indexing",
+          "ignite-jcl",
+          "ignite-json",
+          "ignite-jta",
+          "ignite-kubernetes",
+          "ignite-log4j2",
+          "ignite-opencensus",
+          "ignite-parent",
+          "ignite-parent-internal",
+          "ignite-rest-http",
+          "ignite-slf4j",
+          "ignite-spring",
+          "ignite-sqlline",
+          "ignite-tools",
+          "ignite-urideploy",
+          "ignite-web",
+          "ignite-websphere-test",
+          "ignite-zookeeper"
+        ],
+        "required_set_sha256": "63d285d4026fd4ef99e0a517246aa30a5da06c336a0a3874f8721a93349b266d",
+        "satisfaction_pair": {
+          "denominator": 41,
+          "numerator": 41
+        },
+        "satisfied": 41,
+        "satisfied_ids": [
+          "apache-ignite",
+          "ignite-appserver-test",
+          "ignite-binary-api",
+          "ignite-binary-impl",
+          "ignite-bom",
+          "ignite-calcite",
+          "ignite-checkstyle",
+          "ignite-clients",
+          "ignite-codegen",
+          "ignite-codegen2",
+          "ignite-commons",
+          "ignite-compatibility",
+          "ignite-compress",
+          "ignite-control-utility",
+          "ignite-core",
+          "ignite-dev-utils",
+          "ignite-direct-io",
+          "ignite-extdata-p2p",
+          "ignite-extdata-platform",
+          "ignite-extdata-pluggable",
+          "ignite-extdata-uri",
+          "ignite-extdata-uri-dep",
+          "ignite-grid-unsafe",
+          "ignite-indexing",
+          "ignite-jcl",
+          "ignite-json",
+          "ignite-jta",
+          "ignite-kubernetes",
+          "ignite-log4j2",
+          "ignite-opencensus",
+          "ignite-parent",
+          "ignite-parent-internal",
+          "ignite-rest-http",
+          "ignite-slf4j",
+          "ignite-spring",
+          "ignite-sqlline",
+          "ignite-tools",
+          "ignite-urideploy",
+          "ignite-web",
+          "ignite-websphere-test",
+          "ignite-zookeeper"
+        ],
+        "status": "complete",
+        "success_fraction": "41/41",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "maven_reactor_module"
+      },
+      "diagnostics": [
+        {
+          "code": "candidate_test_target_surface",
+          "evidence_refs": [
+            "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/contexts/trunk_20260826_012125.json"
+          ],
+          "note": "The 28 modules are a harness-discovered candidate surface, not a sealed model-plan denominator.",
+          "observations": {
+            "candidate_modules": 28,
+            "closed_product_test_modules": 0,
+            "denominator_authority": "harness_candidate"
+          }
+        },
+        {
+          "code": "quality_check_only",
+          "evidence_refs": [
+            "inv-maven-1-da66e80f658b-0002"
+          ],
+          "note": "A clean quality check is retained but is not a product-test success metric.",
+          "observations": {
+            "executed": 1,
+            "module": "modules/checkstyle",
+            "passed": 1
+          }
+        },
+        {
+          "code": "static_test_census_observed",
+          "evidence_refs": [
+            "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/verdict.json"
+          ],
+          "note": "The static census is not the denominator of the quality-check execution.",
+          "observations": {
+            "runtime_executions": 1,
+            "static_declarations": 15104
+          }
+        }
+      ],
+      "flags": {
+        "authoritative_test_clean": false,
+        "build_axis_success": true,
+        "green_proof_verified": false,
+        "test_execution_closed": false
+      },
+      "integrity": {
+        "evidence": {
+          "applicability": "required",
+          "basis_ref": "legacy-session-durable-artifacts",
+          "closed": 6,
+          "closure_fraction": "6/6",
+          "closure_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "evidence_refs": [
+            "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent",
+            "tests/fixtures/java_success_certificates/d2r6-five-project-source-checksums.json"
+          ],
+          "failed": 0,
+          "failed_ids": [],
+          "failure_attribution": null,
+          "interval": {
+            "denominator": 6,
+            "lower_numerator": 6,
+            "upper_numerator": 6
+          },
+          "missing": 0,
+          "missing_ids": [],
+          "required": 6,
+          "required_ids": [
+            "inv-maven-1-da66e80f658b-0001",
+            "inv-maven-1-da66e80f658b-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "required_set_sha256": "b97003f95cf14feccec6be47f43ba6b4ad839ee6fe1c299cced8fca427d81e0b",
+          "satisfaction_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "satisfied": 6,
+          "satisfied_ids": [
+            "inv-maven-1-da66e80f658b-0001",
+            "inv-maven-1-da66e80f658b-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "status": "complete",
+          "success_fraction": "6/6",
+          "unexpected": 0,
+          "unexpected_ids": [],
+          "unit": "evidence_binding"
+        },
+        "status": "complete",
+        "terminal_receipts_unpersisted": 0,
+        "unsettled_jobs": 0
+      },
+      "overall_truth": "UNKNOWN",
+      "plan_sha256": "c21decc10b953808e6b7688bdfeb363a6492349ef5aa111d848e03a78307cedb",
+      "project_id": "ignite",
+      "promotion_eligible": false,
+      "proof_status": "partial",
+      "result": "incomplete",
+      "result_class": "incomplete",
+      "run_id": "20260826_012043_928810_09985a673615_55639-7-dbfa4b18e89f",
+      "schema_version": 1,
+      "scope": {
+        "basis_refs": [
+          "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/project_execution_plan.json",
+          "output_b1589b1a6f25"
+        ],
+        "closure": "partial",
+        "evidence_epoch": "20260826_012043_928810_09985a673615_55639-7-dbfa4b18e89f",
+        "kind": "repository_default",
+        "revision": 1,
+        "scope_id": "d2r6:ignite:repository-default",
+        "subject": {
+          "plan_sha256": "c21decc10b953808e6b7688bdfeb363a6492349ef5aa111d848e03a78307cedb",
+          "project_id": "ignite",
+          "run_id": "20260826_012043_928810_09985a673615_55639-7-dbfa4b18e89f",
+          "target_sha": "d49adada19829f2186dfb5e2e8d12e7d79c1c3a7"
+        }
+      },
+      "target_sha": "d49adada19829f2186dfb5e2e8d12e7d79c1c3a7",
+      "test_counts": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 1,
+        "reported": 1,
+        "skipped": 0
+      },
+      "test_execution_status": "incomplete",
+      "test_outcome_status": "clean",
+      "test_results_authority": "diagnostic",
+      "test_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:test-step-0",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-da66e80f658b-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "plan:test:0"
+        ],
+        "required_set_sha256": "87d4d1bb595fe4c3c1bba2304363a0684c0c207bb12f8aa0b81e3d3a69569082",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "plan:test:0"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "test_plan_step"
+      },
+      "test_targets": {
+        "applicability": "required",
+        "basis_ref": "candidate:trunk:build_recommendation.test_modules",
+        "closed": 0,
+        "closure_fraction": "0/28",
+        "closure_pair": {
+          "denominator": 28,
+          "numerator": 0
+        },
+        "evidence_refs": [
+          "inv-maven-1-da66e80f658b-0002",
+          "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/contexts/trunk_20260826_012125.json"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 28,
+          "lower_numerator": 0,
+          "upper_numerator": 28
+        },
+        "missing": 28,
+        "missing_ids": [
+          "examples",
+          "modules/calcite",
+          "modules/checkstyle",
+          "modules/clients",
+          "modules/compatibility",
+          "modules/compress",
+          "modules/control-utility",
+          "modules/core",
+          "modules/dev-utils",
+          "modules/dev-utils/ignite-modules-test",
+          "modules/direct-io",
+          "modules/extdata/platform",
+          "modules/extdata/pluggable",
+          "modules/indexing",
+          "modules/jcl",
+          "modules/json",
+          "modules/jta",
+          "modules/kubernetes",
+          "modules/log4j2",
+          "modules/numa-allocator",
+          "modules/opencensus",
+          "modules/rest-http",
+          "modules/schedule",
+          "modules/slf4j",
+          "modules/spring",
+          "modules/urideploy",
+          "modules/web",
+          "modules/zookeeper"
+        ],
+        "required": 28,
+        "required_ids": [
+          "examples",
+          "modules/calcite",
+          "modules/checkstyle",
+          "modules/clients",
+          "modules/compatibility",
+          "modules/compress",
+          "modules/control-utility",
+          "modules/core",
+          "modules/dev-utils",
+          "modules/dev-utils/ignite-modules-test",
+          "modules/direct-io",
+          "modules/extdata/platform",
+          "modules/extdata/pluggable",
+          "modules/indexing",
+          "modules/jcl",
+          "modules/json",
+          "modules/jta",
+          "modules/kubernetes",
+          "modules/log4j2",
+          "modules/numa-allocator",
+          "modules/opencensus",
+          "modules/rest-http",
+          "modules/schedule",
+          "modules/slf4j",
+          "modules/spring",
+          "modules/urideploy",
+          "modules/web",
+          "modules/zookeeper"
+        ],
+        "required_set_sha256": "7df331e19cfc5871c04255078eb31ea88e5f4fbd69944811e7ad2e02a2497894",
+        "satisfaction_pair": {
+          "denominator": 28,
+          "numerator": 0
+        },
+        "satisfied": 0,
+        "satisfied_ids": [],
+        "status": "incomplete",
+        "success_fraction": "0/28",
+        "unexpected": 1,
+        "unexpected_ids": [
+          "quality-check:modules/checkstyle"
+        ],
+        "unit": "test_module"
+      },
+      "typed_reason_codes": [
+        {
+          "code": "DIAGNOSTIC_ONLY_OBSERVATION",
+          "defeater_type": "undercutting"
+        },
+        {
+          "code": "MISSING_REQUIRED_IDENTITY",
+          "defeater_type": "incompleteness"
+        },
+        {
+          "code": "UNSEALED_DENOMINATOR",
+          "defeater_type": "undercutting"
+        }
+      ]
+    },
+    {
+      "assurance": "PROJECTED",
+      "assurance_level": "legacy_projected",
+      "axis_truths": {
+        "build": "PASS",
+        "integrity": "PASS",
+        "scope": "UNKNOWN",
+        "test_execution": "UNKNOWN",
+        "test_outcome": "UNKNOWN"
+      },
+      "blockers": [],
+      "build_status": "success",
+      "build_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:build-step-0",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-c4b96afe8387-0001"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "plan:build:0"
+        ],
+        "required_set_sha256": "0bb6bec634adb75d9a0ffa4d457bbe518aa99d53a75372a58f6d0d6851c1554d",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "plan:build:0"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "build_plan_step"
+      },
+      "build_units": {
+        "applicability": "required",
+        "basis_ref": "inv-maven-1-c4b96afe8387-0001:module_outcomes",
+        "closed": 23,
+        "closure_fraction": "23/23",
+        "closure_pair": {
+          "denominator": 23,
+          "numerator": 23
+        },
+        "evidence_refs": [
+          "inv-maven-1-c4b96afe8387-0001"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 23,
+          "lower_numerator": 23,
+          "upper_numerator": 23
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 23,
+        "required_ids": [
+          "Apache Jackrabbit",
+          "Jackrabbit AWS Extension",
+          "Jackrabbit Core",
+          "Jackrabbit Data",
+          "Jackrabbit Integration Tests for OSGi deployments",
+          "Jackrabbit JCA Resource Adapter",
+          "Jackrabbit JCR Client",
+          "Jackrabbit JCR Commons",
+          "Jackrabbit JCR Server",
+          "Jackrabbit JCR Servlets",
+          "Jackrabbit JCR Tests",
+          "Jackrabbit JCR to SPI",
+          "Jackrabbit JCR to WebDAV",
+          "Jackrabbit Parent POM",
+          "Jackrabbit SPI",
+          "Jackrabbit SPI Commons",
+          "Jackrabbit SPI to JCR",
+          "Jackrabbit SPI to WebDAV",
+          "Jackrabbit Standalone",
+          "Jackrabbit Standalone Components",
+          "Jackrabbit VFS Extension",
+          "Jackrabbit Web Application",
+          "Jackrabbit WebDAV Library"
+        ],
+        "required_set_sha256": "7d6aaba14313f0e349338927450ebf3d87576da289e17d5375d2cfc54a3b028c",
+        "satisfaction_pair": {
+          "denominator": 23,
+          "numerator": 23
+        },
+        "satisfied": 23,
+        "satisfied_ids": [
+          "Apache Jackrabbit",
+          "Jackrabbit AWS Extension",
+          "Jackrabbit Core",
+          "Jackrabbit Data",
+          "Jackrabbit Integration Tests for OSGi deployments",
+          "Jackrabbit JCA Resource Adapter",
+          "Jackrabbit JCR Client",
+          "Jackrabbit JCR Commons",
+          "Jackrabbit JCR Server",
+          "Jackrabbit JCR Servlets",
+          "Jackrabbit JCR Tests",
+          "Jackrabbit JCR to SPI",
+          "Jackrabbit JCR to WebDAV",
+          "Jackrabbit Parent POM",
+          "Jackrabbit SPI",
+          "Jackrabbit SPI Commons",
+          "Jackrabbit SPI to JCR",
+          "Jackrabbit SPI to WebDAV",
+          "Jackrabbit Standalone",
+          "Jackrabbit Standalone Components",
+          "Jackrabbit VFS Extension",
+          "Jackrabbit Web Application",
+          "Jackrabbit WebDAV Library"
+        ],
+        "status": "complete",
+        "success_fraction": "23/23",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "maven_reactor_module"
+      },
+      "diagnostics": [
+        {
+          "code": "unexpected_empty_test_run",
+          "evidence_refs": [
+            "inv-maven-1-c4b96afe8387-0002"
+          ],
+          "note": "The selected module completed with exit code zero but produced no product-test reports or cases.",
+          "observations": {
+            "executed": 0,
+            "reports": 0,
+            "target": "jackrabbit-jcr-tests"
+          }
+        }
+      ],
+      "flags": {
+        "authoritative_test_clean": false,
+        "build_axis_success": true,
+        "green_proof_verified": false,
+        "test_execution_closed": false
+      },
+      "integrity": {
+        "evidence": {
+          "applicability": "required",
+          "basis_ref": "legacy-session-durable-artifacts",
+          "closed": 6,
+          "closure_fraction": "6/6",
+          "closure_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "evidence_refs": [
+            "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent",
+            "tests/fixtures/java_success_certificates/d2r6-five-project-source-checksums.json"
+          ],
+          "failed": 0,
+          "failed_ids": [],
+          "failure_attribution": null,
+          "interval": {
+            "denominator": 6,
+            "lower_numerator": 6,
+            "upper_numerator": 6
+          },
+          "missing": 0,
+          "missing_ids": [],
+          "required": 6,
+          "required_ids": [
+            "inv-maven-1-c4b96afe8387-0001",
+            "inv-maven-1-c4b96afe8387-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "required_set_sha256": "62f550b5f77551585509602d18688acf60f83b1f96580033088fadd5d9c04811",
+          "satisfaction_pair": {
+            "denominator": 6,
+            "numerator": 6
+          },
+          "satisfied": 6,
+          "satisfied_ids": [
+            "inv-maven-1-c4b96afe8387-0001",
+            "inv-maven-1-c4b96afe8387-0002",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "status": "complete",
+          "success_fraction": "6/6",
+          "unexpected": 0,
+          "unexpected_ids": [],
+          "unit": "evidence_binding"
+        },
+        "status": "complete",
+        "terminal_receipts_unpersisted": 0,
+        "unsettled_jobs": 0
+      },
+      "overall_truth": "UNKNOWN",
+      "plan_sha256": "5b97464744948518a7cb9f2abf986a97b5586d118f0bb8062492227ae4678b9e",
+      "project_id": "jackrabbit",
+      "promotion_eligible": false,
+      "proof_status": "partial",
+      "result": "incomplete",
+      "result_class": "incomplete",
+      "run_id": "20260826_052316_908838_bdf1459f5bc4_61239-7-f1ad3996e30a",
+      "schema_version": 1,
+      "scope": {
+        "basis_refs": [
+          "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent/project_execution_plan.json"
+        ],
+        "closure": "partial",
+        "evidence_epoch": "20260826_052316_908838_bdf1459f5bc4_61239-7-f1ad3996e30a",
+        "kind": "targeted",
+        "revision": 1,
+        "scope_id": "d2r6:jackrabbit:targeted-jcr-tests",
+        "subject": {
+          "plan_sha256": "5b97464744948518a7cb9f2abf986a97b5586d118f0bb8062492227ae4678b9e",
+          "project_id": "jackrabbit",
+          "run_id": "20260826_052316_908838_bdf1459f5bc4_61239-7-f1ad3996e30a",
+          "target_sha": "5dce857600dae10e562ff3fe24547ee574cc2412"
+        }
+      },
+      "target_sha": "5dce857600dae10e562ff3fe24547ee574cc2412",
+      "test_counts": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 0,
+        "reported": 0,
+        "skipped": 0
+      },
+      "test_execution_status": "incomplete",
+      "test_outcome_status": "empty",
+      "test_results_authority": "receipt_bound",
+      "test_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:jackrabbit-jcr-tests",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-c4b96afe8387-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 1,
+          "upper_numerator": 1
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "entrypoint:maven-test:jackrabbit-jcr-tests"
+        ],
+        "required_set_sha256": "04dbf7072230f79aad75b5adde2a5476c3ee32df4bab5a1787d005548e83cc27",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "satisfied": 1,
+        "satisfied_ids": [
+          "entrypoint:maven-test:jackrabbit-jcr-tests"
+        ],
+        "status": "complete",
+        "success_fraction": "1/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "test_plan_step"
+      },
+      "test_targets": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:jackrabbit-jcr-tests-product-results",
+        "closed": 0,
+        "closure_fraction": "0/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 0
+        },
+        "evidence_refs": [
+          "inv-maven-1-c4b96afe8387-0002"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 0,
+          "upper_numerator": 1
+        },
+        "missing": 1,
+        "missing_ids": [
+          "product-tests:jackrabbit-jcr-tests"
+        ],
+        "required": 1,
+        "required_ids": [
+          "product-tests:jackrabbit-jcr-tests"
+        ],
+        "required_set_sha256": "a39c600d5095f11a9e0643305b61fbde78f50a3b4abf7429cf84ec4e916ba051",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 0
+        },
+        "satisfied": 0,
+        "satisfied_ids": [],
+        "status": "incomplete",
+        "success_fraction": "0/1",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "test_module"
+      },
+      "typed_reason_codes": [
+        {
+          "code": "EMPTY_VERDICT_BEARING_RESULT",
+          "defeater_type": "vacuity"
+        },
+        {
+          "code": "MISSING_REQUIRED_IDENTITY",
+          "defeater_type": "incompleteness"
+        },
+        {
+          "code": "UNSEALED_DENOMINATOR",
+          "defeater_type": "undercutting"
+        }
+      ]
+    },
+    {
+      "assurance": "PROJECTED",
+      "assurance_level": "legacy_projected",
+      "axis_truths": {
+        "build": "FAIL",
+        "integrity": "PASS",
+        "scope": "UNKNOWN",
+        "test_execution": "UNKNOWN",
+        "test_outcome": "UNKNOWN"
+      },
+      "blockers": [],
+      "build_status": "failed",
+      "build_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:root-compile",
+        "closed": 1,
+        "closure_fraction": "1/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "evidence_refs": [
+          "inv-maven-1-c5424ba64552-0001",
+          "inv-maven-1-c5424ba64552-0002"
+        ],
+        "failed": 1,
+        "failed_ids": [
+          "plan:build:0:root-compile"
+        ],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 0,
+          "upper_numerator": 0
+        },
+        "missing": 0,
+        "missing_ids": [],
+        "required": 1,
+        "required_ids": [
+          "plan:build:0:root-compile"
+        ],
+        "required_set_sha256": "a13e3250c1e384c8b13efc7b15d3e27addeae1408ff794a0f358cceb460150b8",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 0
+        },
+        "satisfied": 0,
+        "satisfied_ids": [],
+        "status": "failed",
+        "success_fraction": "0/1",
+        "unexpected": 1,
+        "unexpected_ids": [
+          "runtime:build-retry:guava-shaded-am"
+        ],
+        "unit": "build_plan_step"
+      },
+      "build_units": {
+        "applicability": "required",
+        "basis_ref": "inv-maven-1-c5424ba64552-0001:root-module-outcomes",
+        "closed": 4,
+        "closure_fraction": "4/8",
+        "closure_pair": {
+          "denominator": 8,
+          "numerator": 4
+        },
+        "evidence_refs": [
+          "inv-maven-1-c5424ba64552-0001"
+        ],
+        "failed": 1,
+        "failed_ids": [
+          "Apache Cassandra Java Driver - core"
+        ],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 8,
+          "lower_numerator": 3,
+          "upper_numerator": 7
+        },
+        "missing": 4,
+        "missing_ids": [
+          "Apache Cassandra Java Driver - OSGi tests",
+          "Apache Cassandra Java Driver - distribution tests",
+          "Apache Cassandra Java Driver - integration tests",
+          "Apache Cassandra Java Driver - query builder"
+        ],
+        "required": 8,
+        "required_ids": [
+          "Apache Cassandra Java Driver",
+          "Apache Cassandra Java Driver - Bill Of Materials",
+          "Apache Cassandra Java Driver - OSGi tests",
+          "Apache Cassandra Java Driver - core",
+          "Apache Cassandra Java Driver - distribution tests",
+          "Apache Cassandra Java Driver - guava shaded dep",
+          "Apache Cassandra Java Driver - integration tests",
+          "Apache Cassandra Java Driver - query builder"
+        ],
+        "required_set_sha256": "5040df7fbde548e3c8c162f6306928b2d2ea0be28f051d5a8f2771003b3ee8fd",
+        "satisfaction_pair": {
+          "denominator": 8,
+          "numerator": 3
+        },
+        "satisfied": 3,
+        "satisfied_ids": [
+          "Apache Cassandra Java Driver",
+          "Apache Cassandra Java Driver - Bill Of Materials",
+          "Apache Cassandra Java Driver - guava shaded dep"
+        ],
+        "status": "failed",
+        "success_fraction": "3/8",
+        "unexpected": 0,
+        "unexpected_ids": [],
+        "unit": "maven_reactor_module"
+      },
+      "diagnostics": [
+        {
+          "code": "plan_command_mismatch",
+          "evidence_refs": [
+            "inv-maven-1-c5424ba64552-0003",
+            "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/project_execution_plan.json"
+          ],
+          "note": "The alternate test dispatch cannot close the sealed JDK 17 test-plan step.",
+          "observations": {
+            "observed_profile": "test-jdk-8",
+            "planned_profile": "test-jdk-17"
+          }
+        },
+        {
+          "code": "test_results_unbound",
+          "evidence_refs": [
+            "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/report_metrics.json"
+          ],
+          "note": "Fresh reports were observed, but their rows lack sealed module-qualified identity.",
+          "observations": {
+            "module_qualified_rows": "unavailable",
+            "result_authority": "diagnostic"
+          }
+        },
+        {
+          "code": "selected_reactor_build_observed",
+          "evidence_refs": [
+            "inv-maven-1-c5424ba64552-0002"
+          ],
+          "note": "The selected build is a separate scope and cannot replace the failed repository-root obligation set.",
+          "observations": {
+            "required_modules": 2,
+            "scope": "guava-shaded -am",
+            "succeeded_modules": 2
+          }
+        },
+        {
+          "code": "alternate_test_results_observed",
+          "evidence_refs": [
+            "inv-maven-1-c5424ba64552-0003",
+            "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/verdict.json"
+          ],
+          "note": "The alternate profile produced red diagnostic results that do not satisfy the sealed entrypoint.",
+          "observations": {
+            "errors": 89,
+            "executed": 4590,
+            "passed": 4438,
+            "skipped": 63
+          }
+        }
+      ],
+      "flags": {
+        "authoritative_test_clean": false,
+        "build_axis_success": false,
+        "green_proof_verified": false,
+        "test_execution_closed": false
+      },
+      "integrity": {
+        "evidence": {
+          "applicability": "required",
+          "basis_ref": "legacy-session-durable-artifacts",
+          "closed": 7,
+          "closure_fraction": "7/7",
+          "closure_pair": {
+            "denominator": 7,
+            "numerator": 7
+          },
+          "evidence_refs": [
+            "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent",
+            "tests/fixtures/java_success_certificates/d2r6-five-project-source-checksums.json"
+          ],
+          "failed": 0,
+          "failed_ids": [],
+          "failure_attribution": null,
+          "interval": {
+            "denominator": 7,
+            "lower_numerator": 7,
+            "upper_numerator": 7
+          },
+          "missing": 0,
+          "missing_ids": [],
+          "required": 7,
+          "required_ids": [
+            "inv-maven-1-c5424ba64552-0001",
+            "inv-maven-1-c5424ba64552-0002",
+            "inv-maven-1-c5424ba64552-0003",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "required_set_sha256": "2d72e8f209e7221eeb65eb60bb4a4c625ac2850cb913b5218742d88981ce3d97",
+          "satisfaction_pair": {
+            "denominator": 7,
+            "numerator": 7
+          },
+          "satisfied": 7,
+          "satisfied_ids": [
+            "inv-maven-1-c5424ba64552-0001",
+            "inv-maven-1-c5424ba64552-0002",
+            "inv-maven-1-c5424ba64552-0003",
+            "project-execution-plan",
+            "report-metrics",
+            "source-checksum-manifest",
+            "verdict-snapshot"
+          ],
+          "status": "complete",
+          "success_fraction": "7/7",
+          "unexpected": 0,
+          "unexpected_ids": [],
+          "unit": "evidence_binding"
+        },
+        "status": "complete",
+        "terminal_receipts_unpersisted": 0,
+        "unsettled_jobs": 0
+      },
+      "overall_truth": "FAIL",
+      "plan_sha256": "9761e773b631528aadb41253b577abe21b5937e0781021b74a4cd13785a47292",
+      "project_id": "cassandra-java-driver",
+      "promotion_eligible": false,
+      "proof_status": "projected",
+      "result": "build_failed",
+      "result_class": "build_failed",
+      "run_id": "20260826_052316_908695_2ced0b830f3d_61238-7-421d398651a9",
+      "schema_version": 1,
+      "scope": {
+        "basis_refs": [
+          "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/project_execution_plan.json"
+        ],
+        "closure": "partial",
+        "evidence_epoch": "20260826_052316_908695_2ced0b830f3d_61238-7-421d398651a9",
+        "kind": "repository_default",
+        "revision": 1,
+        "scope_id": "d2r6:cassandra-java-driver:repository-default",
+        "subject": {
+          "plan_sha256": "9761e773b631528aadb41253b577abe21b5937e0781021b74a4cd13785a47292",
+          "project_id": "cassandra-java-driver",
+          "run_id": "20260826_052316_908695_2ced0b830f3d_61238-7-421d398651a9",
+          "target_sha": "d954b5da58ea682ec39d474e241bc4b426d34dc2"
+        }
+      },
+      "target_sha": "d954b5da58ea682ec39d474e241bc4b426d34dc2",
+      "test_counts": {
+        "errors": 89,
+        "failed": 0,
+        "passed": 4438,
+        "reported": 4590,
+        "skipped": 63
+      },
+      "test_execution_status": "incomplete",
+      "test_outcome_status": "red",
+      "test_results_authority": "diagnostic",
+      "test_steps": {
+        "applicability": "required",
+        "basis_ref": "legacy-plan:test-jdk-17-root-verify",
+        "closed": 0,
+        "closure_fraction": "0/1",
+        "closure_pair": {
+          "denominator": 1,
+          "numerator": 0
+        },
+        "evidence_refs": [
+          "inv-maven-1-c5424ba64552-0003",
+          "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/project_execution_plan.json"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": {
+          "denominator": 1,
+          "lower_numerator": 0,
+          "upper_numerator": 1
+        },
+        "missing": 1,
+        "missing_ids": [
+          "plan:test:0:root-verify:test-jdk-17"
+        ],
+        "required": 1,
+        "required_ids": [
+          "plan:test:0:root-verify:test-jdk-17"
+        ],
+        "required_set_sha256": "51b2bec36369c3a46e7f4bd3469ca9d982a326a8aa3192727a09657ffceae266",
+        "satisfaction_pair": {
+          "denominator": 1,
+          "numerator": 0
+        },
+        "satisfied": 0,
+        "satisfied_ids": [],
+        "status": "incomplete",
+        "success_fraction": "0/1",
+        "unexpected": 1,
+        "unexpected_ids": [
+          "runtime:test:root-verify:test-jdk-8"
+        ],
+        "unit": "test_plan_step"
+      },
+      "test_targets": {
+        "applicability": "unknown",
+        "basis_ref": "legacy-review:planned-profile-targets-unresolved",
+        "closed": 0,
+        "closure_fraction": null,
+        "closure_pair": null,
+        "evidence_refs": [
+          "inv-maven-1-c5424ba64552-0003",
+          "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/report_metrics.json"
+        ],
+        "failed": 0,
+        "failed_ids": [],
+        "failure_attribution": null,
+        "interval": null,
+        "missing": 0,
+        "missing_ids": [],
+        "required": 0,
+        "required_ids": [],
+        "required_set_sha256": "68d0bd56b7337d192f986967f4d509908be448b98152961d97774777d52b7b57",
+        "satisfaction_pair": null,
+        "satisfied": 0,
+        "satisfied_ids": [],
+        "status": "unavailable",
+        "success_fraction": null,
+        "unexpected": 1,
+        "unexpected_ids": [
+          "alternate-profile:diagnostic-test-results"
+        ],
+        "unit": "test_module"
+      },
+      "typed_reason_codes": [
+        {
+          "code": "AUTHORITATIVE_BUILD_FAILURE",
+          "defeater_type": "rebutting"
+        },
+        {
+          "code": "DIAGNOSTIC_ONLY_OBSERVATION",
+          "defeater_type": "undercutting"
+        },
+        {
+          "code": "MISSING_REQUIRED_IDENTITY",
+          "defeater_type": "incompleteness"
+        },
+        {
+          "code": "UNSEALED_DENOMINATOR",
+          "defeater_type": "undercutting"
+        }
+      ]
+    }
+  ],
+  "schema_version": 1
+}

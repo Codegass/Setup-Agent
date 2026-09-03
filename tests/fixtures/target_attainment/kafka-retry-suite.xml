@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Real JUnit output harvested from apache/kafka GitHub Actions run 27721225836,
+     artifact junit-xml-17-noflaky-nonew, entry
+     core/17-noflaky-nonew/TEST-kafka.server.ReplicationQuotasTest.xml.
+     The <system-out>/<system-err> CDATA bodies were emptied to keep the fixture
+     small; every testcase element - including the genuine retry pair for
+     shouldBootstrapTwoBrokersWithFollowerThrottle, which failed and then passed
+     - is verbatim. -->
+<testsuite name="kafka.server.ReplicationQuotasTest" tests="4" skipped="0" failures="1" errors="0" timestamp="2026-06-17T22:18:21.933Z" hostname="runnervm7b5n9" time="1818.935">
+  <properties/>
+  <testcase name="shouldBootstrapTwoBrokersWithLeaderThrottle()" classname="kafka.server.ReplicationQuotasTest" time="13.191"/>
+  <testcase name="shouldThrottleOldSegments()" classname="kafka.server.ReplicationQuotasTest" time="5.883"/>
+  <testcase name="shouldBootstrapTwoBrokersWithFollowerThrottle()" classname="kafka.server.ReplicationQuotasTest" time="11.411">
+    <failure message="org.opentest4j.AssertionFailedError: Expected 8504 &gt; 9000.0 ==&gt; expected: &lt;true&gt; but was: &lt;false&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: Expected 8504 &gt; 9000.0 ==&gt; expected: &lt;true&gt; but was: &lt;false&gt;
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+	at app//org.junit.jupiter.api.AssertionFailureBuilder.buildAndThrow(AssertionFailureBuilder.java:132)
+	at app//org.junit.jupiter.api.AssertTrue.failNotTrue(AssertTrue.java:63)
+	at app//org.junit.jupiter.api.AssertTrue.assertTrue(AssertTrue.java:36)
+	at app//org.junit.jupiter.api.Assertions.assertTrue(Assertions.java:214)
+	at app//kafka.server.ReplicationQuotasTest.shouldMatchQuotaReplicatingThroughAnAsymmetricTopology(ReplicationQuotasTest.scala:180)
+	at app//kafka.server.ReplicationQuotasTest.shouldBootstrapTwoBrokersWithFollowerThrottle(ReplicationQuotasTest.scala:75)
+	at java.base@17.0.19/java.lang.reflect.Method.invoke(Method.java:569)
+	at java.base@17.0.19/java.util.ArrayList.forEach(ArrayList.java:1511)
+	at java.base@17.0.19/java.util.ArrayList.forEach(ArrayList.java:1511)
+</failure>
+  </testcase>
+  <testcase name="shouldBootstrapTwoBrokersWithFollowerThrottle()" classname="kafka.server.ReplicationQuotasTest" time="16.36"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

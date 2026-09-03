@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "raw_sources_gitignored": true,
+  "note": "The checked-in input fixture is the reviewable projection snapshot. These hashes bind it to the local D2R6 raw artifacts used during adjudication; a clean clone can reproduce the certificate JSON but cannot independently re-audit the raw logs.",
+  "projects": [
+    {
+      "project_id": "tomcat-jakartaee-migration",
+      "run_id": "20260826_065703_307583_34a827ad5c81_64137-7-237bc4d9badd",
+      "sources": [
+        {"kind": "sealed_plan", "path": "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/project_execution_plan.json", "sha256": "81e7f87df02589911d5ea1113259795cb496db6404e67f0041d43718bf399dca"},
+        {"kind": "build_receipt", "path": "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/invocation_receipts/inv-maven-1-268bb7d2aa74-0001.json", "sha256": "52cf3e107e6d428482cc6c28d015511ec012c41fd395a0b886f33b970d8bd37b"},
+        {"kind": "test_receipt", "path": "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/invocation_receipts/inv-maven-1-268bb7d2aa74-0002.json", "sha256": "0857e0c77449da01059508c9a437c50dd069503023869bd7ee299262244a4d5c"},
+        {"kind": "report_metrics", "path": "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/report_metrics.json", "sha256": "8781447a1b36214530543585f4d7175cacd4a72c58c43efbd49b35ebf6cbbad7"},
+        {"kind": "verdict_snapshot", "path": "logs/session_20260826_065703_307583_34a827ad5c81_64137/.setup_agent/verdict.json", "sha256": "5a96659b026d1d598b6c58bdd76e3d368ff486e60dfe78baf75ba912905428bf"}
+      ]
+    },
+    {
+      "project_id": "commons-dbcp",
+      "run_id": "20260826_060350_409345_ac7428470523_62391-7-65fa4d3cf26e",
+      "sources": [
+        {"kind": "sealed_plan", "path": "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/project_execution_plan.json", "sha256": "80dc1a3bcd6ebe568aee41a90b0d1bb8cb6d13b62b140cab50facbc672220ac1"},
+        {"kind": "build_receipt", "path": "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/invocation_receipts/inv-maven-1-cad7d1e4e3ec-0001.json", "sha256": "1c2630f5ea2bc99093dc2b4dc0bdbe261065e25d05035a04da813bb0ffc0f4e9"},
+        {"kind": "test_receipt", "path": "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/invocation_receipts/inv-maven-1-cad7d1e4e3ec-0002.json", "sha256": "4f2971f7e4a4dc2de289aaadda0fef6e0fc678a0e2c01201249c37d0897d0a07"},
+        {"kind": "report_metrics", "path": "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/report_metrics.json", "sha256": "5e8eb828860ed93d48597eb87659a38a55e29d470e567b7c080224ddff3e2181"},
+        {"kind": "verdict_snapshot", "path": "logs/session_20260826_060350_409345_ac7428470523_62391/.setup_agent/verdict.json", "sha256": "4900a4d0e47ad562f60fdc701e4cf28a6a0ada68488dafd52de8aab54722b091"}
+      ]
+    },
+    {
+      "project_id": "ignite",
+      "run_id": "20260826_012043_928810_09985a673615_55639-7-dbfa4b18e89f",
+      "sources": [
+        {"kind": "sealed_plan", "path": "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/project_execution_plan.json", "sha256": "25a46fb848a222d9595baab616fb839f22d452ec6271e73412cd9345cf6fb880"},
+        {"kind": "build_receipt", "path": "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/invocation_receipts/inv-maven-1-da66e80f658b-0001.json", "sha256": "b6d30ca2ec44808a09b442b55562e1e7ab1a7909d1ebe32d6f46f1b7ddc5ce0e"},
+        {"kind": "test_receipt", "path": "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/invocation_receipts/inv-maven-1-da66e80f658b-0002.json", "sha256": "ac4170c40a2ddfbb22ef5e40653b06e13bc12528f751fd8ca3cde3c0d08b63ef"},
+        {"kind": "report_metrics", "path": "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/report_metrics.json", "sha256": "45dc291d2662498c5ac9a3dd5e6e0475b09c88531b32f2d867d2ef67f4c44bba"},
+        {"kind": "verdict_snapshot", "path": "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/verdict.json", "sha256": "cd01244fc21b5eeb7602f626de1d815cf28d403c96a6915cd834eebab8809fa3"},
+        {"kind": "harness_candidate_surface", "path": "logs/session_20260826_012043_928810_09985a673615_55639/.setup_agent/contexts/trunk_20260826_012125.json", "sha256": "2fd13101d0b8c34c168079813dbbc73a4e8871ed93d853dac667b65b2caab8d9"}
+      ]
+    },
+    {
+      "project_id": "jackrabbit",
+      "run_id": "20260826_052316_908838_bdf1459f5bc4_61239-7-f1ad3996e30a",
+      "sources": [
+        {"kind": "sealed_plan", "path": "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent/project_execution_plan.json", "sha256": "7350a262c52b416eb64a89a22bd1090aae4afe54764a7cbd0c45590336c0a643"},
+        {"kind": "build_receipt", "path": "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent/invocation_receipts/inv-maven-1-c4b96afe8387-0001.json", "sha256": "797db6a596a182d6a55b00834ceec6e7336a058fb1ca15fd3e7bf105933c1d70"},
+        {"kind": "test_receipt", "path": "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent/invocation_receipts/inv-maven-1-c4b96afe8387-0002.json", "sha256": "060653e9d2ae22f8fb5d26be410ec9c4f09b8c80c666fa253333242e54eab28e"},
+        {"kind": "report_metrics", "path": "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent/report_metrics.json", "sha256": "b0a8b360d94982dc2a0aeb67a550491a994df20a0a572d15c81ab56f586d3152"},
+        {"kind": "verdict_snapshot", "path": "logs/session_20260826_052316_908838_bdf1459f5bc4_61239/.setup_agent/verdict.json", "sha256": "8e37106bfe3d28110fa2981f2cf51820abec18e6ee49d9c6529ce63d565e6d60"}
+      ]
+    },
+    {
+      "project_id": "cassandra-java-driver",
+      "run_id": "20260826_052316_908695_2ced0b830f3d_61238-7-421d398651a9",
+      "sources": [
+        {"kind": "sealed_plan", "path": "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/project_execution_plan.json", "sha256": "6c5681abe56a6dfae8a91883de3bfac289fc0db58eba55c03b7286ac8e9ebf05"},
+        {"kind": "failed_root_build_receipt", "path": "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/invocation_receipts/inv-maven-1-c5424ba64552-0001.json", "sha256": "5e206fc7444e914b1af6eb5516b8b257dece6f745821932aa0fd5f201b4ead41"},
+        {"kind": "selected_build_receipt", "path": "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/invocation_receipts/inv-maven-1-c5424ba64552-0002.json", "sha256": "1d5b107b2f533ed25518a15e500c75c71b3b9c4f4c2e4e9c0a2ee91063ece8f5"},
+        {"kind": "alternate_test_receipt", "path": "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/invocation_receipts/inv-maven-1-c5424ba64552-0003.json", "sha256": "7220999720b6831dc2c01d6c982ae2d400246c1d8c5d4d9e1386c165dc6c03df"},
+        {"kind": "report_metrics", "path": "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/report_metrics.json", "sha256": "2e9b2e2ef1a5464442759560262bb2ce847f521627dc5477dc50becab4296e9d"},
+        {"kind": "verdict_snapshot", "path": "logs/session_20260826_052316_908695_2ced0b830f3d_61238/.setup_agent/verdict.json", "sha256": "4562821b6d993c84602f4a5ba384bd17f561b1f5ace3a5d6e9f9771f0ba221e8"}
+      ]
+    }
+  ]
+}
