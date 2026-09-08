@@ -33,7 +33,7 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
@@ -69,6 +69,9 @@ from sag.testcases.results import (
 )
 from sag.utils.container_io import write_container_text_atomic
 from sag.verdict_rates import STALE_CONFLICT, execution_sentence, no_execution_sentence
+
+if TYPE_CHECKING:
+    from sag.agent.attempt_policy import TestCandidateResolution
 
 
 def _census_facts(census: TestCensus) -> Dict[str, Any]:
@@ -1704,16 +1707,14 @@ class PhysicalValidator:
         Returns:
             Dictionary with detailed test statistics and status
         """
+
         if not self.docker_orchestrator:
             return {"valid": False, "error": "No docker orchestrator"}
 
-        cache_key = self._get_cache_key("test_reports", project_dir)
-
-        # Try cache first
-        cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
-            return cached_result
-
+        # Every call owns a fresh evidence read. A project path and a TTL do
+        # not identify the receipt/assessment publication or the current
+        # attempt's survey scope. Caching this aggregate would bypass those
+        # authority checks and let callers mutate a later validation's facts.
         test_result = {
             "valid": False,
             "total_tests": 0,
@@ -1756,13 +1757,12 @@ class PhysicalValidator:
         if receipt_records is None:
             return self._receipt_evidence_failure(
                 test_result,
-                cache_key,
                 "invocation receipt ledger is not host-authorized and complete",
                 [],
             )
         receipts_present = bool(receipt_records)
-        primary_root = self._primary_test_coordinate_root() if receipts_present else None
-        resolution = getattr(self, "_last_test_candidate_resolution", None)
+        resolution = self._resolve_test_candidates() if receipts_present else None
+        primary_root = getattr(getattr(resolution, "primary", None), "root", None) or None
         test_modules = {
             str(candidate.root)
             for candidate in getattr(resolution, "candidates", ())
@@ -1779,7 +1779,6 @@ class PhysicalValidator:
             if compact_result and compact_result.get("receipt_error"):
                 return self._receipt_evidence_failure(
                     test_result,
-                    cache_key,
                     compact_result["receipt_error"],
                     compact_result.get("receipt_error_files") or [],
                 )
@@ -1789,7 +1788,6 @@ class PhysicalValidator:
                 # numerator, so refuse it instead.
                 return self._receipt_evidence_failure(
                     test_result,
-                    cache_key,
                     (
                         "invocation receipts exist but the receipt-scoped report "
                         f"parser could not run in the container ({self._invocation_receipts_dir()})"
@@ -1833,7 +1831,6 @@ class PhysicalValidator:
                         f"{'...' if len(modules_without_tests) > 5 else ''}"
                     )
 
-                self._cache_result(cache_key, test_result)
                 return test_result
 
             if receipts_present:
@@ -1842,7 +1839,6 @@ class PhysicalValidator:
                 # provenance-free discovery is exactly what receipts exist to
                 # replace, so it must never become the receipt-scoped answer.
                 test_result["error"] = "No test report files found"
-                self._cache_result(cache_key, test_result)
                 return test_result
 
             # Step 1: Discover report directories first to avoid massive single-command outputs
@@ -2148,8 +2144,6 @@ class PhysicalValidator:
             test_result["error"] = f"Failed to parse test reports: {str(e)}"
             logger.error(f"Test report parsing failed: {e}")
 
-        # Cache the result
-        self._cache_result(cache_key, test_result)
         return test_result
 
     # --- invocation receipts (Plan 5 Task B2) ------------------------------
@@ -2668,36 +2662,25 @@ class PhysicalValidator:
         directory is presence, and a probe that failed is not."""
         return self._invocation_receipts_state() == _RECEIPTS_PRESENT
 
-    def _primary_test_coordinate_root(self) -> Optional[str]:
-        """attempt_policy's primary test coordinate (Plan 4), or None.
+    def _resolve_test_candidates(self) -> Optional["TestCandidateResolution"]:
+        """Read this call's survey coordinate and its candidate roots together.
 
-        Receipts alone cannot say which invocation is *primary*; that is the
-        survey coordinate's job. There is no legacy-scan fallback behind this
-        any more (universal claim scoping, 2026-08-14). ``None`` means only that
-        `_verified_report_claims` cannot narrow the ledger to one coordinate, so
-        it admits every run-wide receipt's claims; the claim partition itself
-        still runs, and the caller names the missing coordinate out loud
-        (`test_primary_coordinate_unresolved`) rather than pretending it scoped.
-        The resolution is cached on ``_last_test_candidate_resolution`` for the
-        callers that need to say WHY the coordinate is absent.
+        The returned resolution is local to the test-evidence read. Missing
+        coordinates do not authorize an unscoped corpus: the compact parser
+        still counts only verified receipt claims and the caller discloses
+        `test_primary_coordinate_unresolved`.
         """
         try:
             from sag.agent import attempt_policy
 
-            resolution = attempt_policy.resolve_survey_test_candidates(self.docker_orchestrator)
-            self._last_test_candidate_resolution = resolution
+            return attempt_policy.resolve_survey_test_candidates(self.docker_orchestrator)
         except Exception as exc:
-            self._last_test_candidate_resolution = None
             logger.debug(f"Primary test coordinate unresolved: {exc}")
             return None
-        primary = getattr(resolution, "primary", None)
-        root = getattr(primary, "root", None)
-        return root or None
 
     def _receipt_evidence_failure(
         self,
         test_result: Dict[str, any],
-        cache_key: str,
         message: str,
         error_files: List[str],
     ) -> Dict[str, any]:
@@ -2716,7 +2699,6 @@ class PhysicalValidator:
             {*(test_result.get("metrics_conflicts") or ()), "test_receipt_unreadable"}
         )
         test_result["parsing_errors"] = [*(test_result.get("parsing_errors") or []), message]
-        self._cache_result(cache_key, test_result)
         return test_result
 
     def _parse_test_reports_compact_in_container(

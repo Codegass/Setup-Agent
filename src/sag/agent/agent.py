@@ -85,42 +85,73 @@ class SetupAgent:
         # UI Manager for enhanced UI mode
         self.ui_manager: Optional[UIManager] = None
 
-        # Context manager will be initialized after Docker setup
-        self.context_manager = None
-        self.tools = None
-        self.react_engine = None
-        # PhysicalValidator is set during _initialize_tools() once orchestrator
-        # is available; declared here so attribute access is always safe.
-        self.physical_validator = None
-        # Engine-owned phase plan (spec §3.1) — created in setup_project only;
-        # None keeps the legacy free-form path (`sag run --task`, continue).
-        self.phase_machine = None
-        self.context_journal = None
-        self.run_evidence_state = None
-        self.verdict_finalizer = None
-        self.run_termination = None
         self.workflow_mode = "idle"
         self.pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None
-        self.control_event_sink = None
-        self.evidence_publication_authority = unavailable_evidence_publication_authority(
-            "host control-event sink is not initialized"
-        )
-        self._run_pin_template = None
-        self._run_pin_host_path = None
-        self._run_pin_mirror = None
         self._run_pin_write_lock = threading.RLock()
-        # Remembered so the post-loop pin rewrite (which carries the advisor
-        # telemetry) does not drop the SHA the clone already observed.
-        self._observed_target_repo_sha = None
-        # Assigned at command entry and copied into every receipt, exact row,
-        # run pin, and metrics artifact produced by that command.
-        self.run_id = None
+        self.run_id: str | None = None
+        self._clear_command_state()
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
         self.agent_logger.info(
             "Setup Agent initialized (context manager will be initialized after Docker setup)"
         )
+
+    def _clear_command_state(self) -> None:
+        """Retire command-owned objects without changing container history."""
+        self.context_manager = None
+        self.tools = None
+        self.react_engine = None
+        self.physical_validator = None
+        self.phase_machine = None
+        self.context_journal = None
+        self.run_evidence_state = None
+        self.verdict_finalizer = None
+        self.run_termination = None
+        self.pre_finalize_evidence_callback = None
+        self.control_event_sink = None
+        self._run_pin_template = None
+        self._run_pin_host_path = None
+        self._run_pin_mirror = None
+        self._observed_target_repo_sha = None
+        self.ui_manager = None
+        # Tools and legacy summaries create these lazily. Their previous values
+        # must not survive when startup stops before tool assembly.
+        for name in (
+            "report_tool",
+            "command_tracker",
+            "final_verdict",
+            "final_verdict_reason",
+            "_last_test_status",
+            "_last_build_status",
+        ):
+            self.__dict__.pop(name, None)
+        self.evidence_publication_authority = unavailable_evidence_publication_authority(
+            "current command has not initialized host control recording",
+            run_id=self.run_id,
+        )
+
+    def _begin_command(
+        self,
+        workflow_mode: str,
+        project_name: str,
+        command_logger_id: object,
+        *,
+        pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
+    ) -> str:
+        """Start one evidence epoch before any Docker or project operation."""
+        from sag.agent.invocation_receipts import set_active_receipt_run_id
+
+        self.run_id = _active_setup_run_id(command_logger_id)
+        self._clear_command_state()
+        self.workflow_mode = workflow_mode
+        self.project_name = project_name
+        self.pre_finalize_evidence_callback = pre_finalize_evidence_callback
+        set_active_receipt_run_id(self.run_id)
+        install_evidence_publication_authority(
+            self.evidence_publication_authority, orchestrator=self.orchestrator
+        )
+        return self.run_id
 
     def _emit(
         self,
@@ -157,12 +188,14 @@ class SetupAgent:
         """
         from sag.agent.invocation_receipts import set_active_receipt_run_id
 
-        if not getattr(self, "run_id", None):
+        run_id = getattr(self, "run_id", None)
+        if not run_id:
             state_run_id = str(
                 getattr(getattr(self, "run_evidence_state", None), "run_id", "") or ""
             ).strip()
-            self.run_id = state_run_id or _active_setup_run_id(id(self))
-        set_active_receipt_run_id(self.run_id)
+            run_id = state_run_id or _active_setup_run_id(id(self))
+        self.run_id = run_id
+        set_active_receipt_run_id(run_id)
         # Context files remain in the container, but the objects carrying run
         # authority and mode-specific tools belong to this command only.
         self.react_engine = None
@@ -789,20 +822,13 @@ class SetupAgent:
         # Default docker_label to project_name if not provided
         if docker_label is None:
             docker_label = project_name
-        # An early startup failure belongs to the new command. It must never
-        # close the previous command's engine or sealed evidence state.
-        self.react_engine = None
-        self.phase_machine = None
-        self.context_journal = None
-        self.run_evidence_state = None
-        self.verdict_finalizer = None
-        self.run_termination = None
-        self.workflow_mode = "setup"
-        self.pre_finalize_evidence_callback = pre_finalize_evidence_callback
-
-        # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
-        self.run_id = _active_setup_run_id(cmd_logger_id)
+        run_id = self._begin_command(
+            "setup",
+            project_name,
+            cmd_logger_id,
+            pre_finalize_evidence_callback=pre_finalize_evidence_callback,
+        )
         cmd_logger.info(f"Starting project setup: {project_name} (docker_label={docker_label})")
 
         try:
@@ -846,7 +872,7 @@ class SetupAgent:
             from sag.agent.phase_machine import PhaseMachine
 
             self.phase_machine = PhaseMachine()
-            self.run_evidence_state = RunEvidenceState(run_id=self.run_id)
+            self.run_evidence_state = RunEvidenceState(run_id=run_id)
             self.verdict_finalizer = VerdictFinalizer(self.orchestrator)
             self.context_journal = ContextJournal(self.orchestrator)
             # Actual repo directory name (from URL); the phase gates probe
@@ -1024,9 +1050,7 @@ class SetupAgent:
 
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
         """Continue working on an existing project."""
-        self.workflow_mode = "continue"
-        self.project_name = project_name
-        self.run_id = _active_setup_run_id(f"continue-{id(self)}")
+        self._begin_command("continue", project_name, f"continue-{id(self)}")
 
         self.console.print(
             Panel.fit(
@@ -1092,12 +1116,8 @@ class SetupAgent:
 
     def run_task(self, project_name: str, task_description: str) -> bool:
         """Run a specific task on an existing project."""
-        self.workflow_mode = "run_task"
-        self.project_name = project_name
-
-        # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
-        self.run_id = _active_setup_run_id(cmd_logger_id)
+        self._begin_command("run_task", project_name, cmd_logger_id)
         cmd_logger.info(f"Starting task execution: {task_description}")
 
         try:
@@ -1168,10 +1188,8 @@ class SetupAgent:
                 )
                 return False
             self.agent_logger.info(f"Framework project survey: {survey_status}")
-            # Completion evidence is command-scoped. A long-lived agent may
-            # reuse its engine, but an earlier task's successful tool call must
-            # not authorize a first-turn completion in this task. Clear in
-            # place because ToolOrchestrator holds this exact list reference.
+            # Task completion evidence starts after the framework survey.
+            # Clear in place because ToolOrchestrator holds this list reference.
             self.react_engine.recent_tool_executions.clear()
 
             # Step 2.5: Complete setup phase

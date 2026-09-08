@@ -1,12 +1,12 @@
 """Service facade for deleting Docker-based workspaces.
 
 Deleting a workspace means, in this order:
-  1. reject a busy workspace up front (an active launch must not be orphaned),
-  2. build the Docker orchestrator *before* any DB write, so an unreachable
+  1. reserve the workspace, rejecting active launches and follow-up tasks,
+  2. build the Docker orchestrator *before* deleting launch history, so an unreachable
      daemon leaves the launch history intact and the delete stays retryable,
   3. atomically remove its launch-queue rows (a final atomic busy re-check),
   4. remove its Docker container, surfacing a partial failure if it persists,
-  5. best-effort delete the launch log files left behind.
+  5. best-effort delete the launch log files left behind, then release occupancy.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from loguru import logger
 
 from sag.web.launch_queue import LaunchQueueStore, WorkspaceBusyError
 from sag.web.launch_service import DEFAULT_DB_PATH, PROCESS_LOG_ROOT
+from sag.web.workspace_leases import canonical_workspace_id
 
 
 class WorkspaceDeletionError(RuntimeError):
@@ -50,13 +51,9 @@ class WorkspaceService:
     ):
         self._store = store if store is not None else LaunchQueueStore(DEFAULT_DB_PATH)
         self._orchestrator_factory = (
-            orchestrator_factory
-            if orchestrator_factory is not None
-            else _default_orchestrator
+            orchestrator_factory if orchestrator_factory is not None else _default_orchestrator
         )
-        self._launches_root = (
-            Path(launches_root) if launches_root is not None else PROCESS_LOG_ROOT
-        )
+        self._launches_root = Path(launches_root) if launches_root is not None else PROCESS_LOG_ROOT
 
     def delete_workspace(self, workspace_id: str) -> dict:
         """Delete a workspace's queue rows, container, and launch logs.
@@ -66,7 +63,7 @@ class WorkspaceService:
         * Reject a busy workspace up front (``WorkspaceBusyError``) without
           constructing a Docker client, so an active launch is never orphaned
           and busy rejection still works when the daemon is down.
-        * Build the orchestrator *before* deleting any DB rows. Construction
+        * Build the orchestrator *before* deleting any launch history. Construction
           pings the Docker daemon, so an unreachable daemon raises
           ``WorkspaceDeletionError`` while the launch history is still intact
           and the delete stays retryable.
@@ -77,22 +74,26 @@ class WorkspaceService:
           workspace does not silently reappear with its history wiped.
         """
 
-        if self._store.is_workspace_busy(workspace_id):
-            raise WorkspaceBusyError(f"Workspace has an active launch: {workspace_id}")
+        workspace_id = canonical_workspace_id(workspace_id)
+        with self._store.acquire_workspace_lease(workspace_id, "delete") as lease:
+            return self._delete_claimed_workspace(workspace_id, lease.owner_id)
 
+    def _delete_claimed_workspace(self, workspace_id: str, lease_owner: str) -> dict:
         try:
             orchestrator = self._orchestrator_factory(workspace_id)
         except Exception as exc:  # unreachable daemon, bad config, ...
-            # No DB row has been touched yet: leave the queue history intact so
+            # No launch row has been touched: leave the queue history intact so
             # the user can retry once Docker is back.
             raise WorkspaceDeletionError(
                 f"Could not reach Docker to delete {workspace_id}; the launch "
                 "history was left intact. Retry once Docker is available."
             ) from exc
 
-        # Atomic busy re-check + row deletion. Guards the (tiny) window between
-        # the pre-check above and here; on busy it raises and deletes nothing.
-        deleted, process_logs = self._store.delete_workspace_items(workspace_id)
+        # Remove launch history under our delete lease. The queue still checks
+        # executing launches and any foreign lease before changing its rows.
+        deleted, process_logs = self._store.delete_workspace_items(
+            workspace_id, lease_owner=lease_owner
+        )
 
         # remove_project is idempotent for an already-gone container (returns
         # True), but only logs-and-returns-False on a real Docker error. Re-probe

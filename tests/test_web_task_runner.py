@@ -5,6 +5,11 @@ import sag.web.task_runner as task_runner_module
 from sag.web.task_runner import AgentTaskLauncher, TaskRequest, TaskRunner
 
 
+@pytest.fixture(autouse=True)
+def isolated_task_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_runner_module, "DEFAULT_DB_PATH", tmp_path / "task-queue.sqlite3")
+
+
 class FakeLauncher:
     def __init__(self):
         self.calls = []
@@ -154,12 +159,13 @@ def test_agent_task_launcher_starts_daemon_thread_with_generated_session(monkeyp
     assert starts == [True]
     assert captured["daemon"] is True
     assert captured["name"] == "sag-ui-task-UI-12345678"
-    assert captured["args"] == (
+    assert captured["args"][:4] == (
         "UI-12345678",
         "sag-commons-cli",
         "Run formatter tests",
         "CC-3",
     )
+    captured["args"][4].release()
 
 
 def test_agent_task_launcher_records_session_before_starting_thread(monkeypatch):

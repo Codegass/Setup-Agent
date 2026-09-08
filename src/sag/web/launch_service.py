@@ -149,7 +149,7 @@ class LaunchService:
                         "row_index": row_index,
                         "workspace_id": workspace_id,
                         "status": "conflict",
-                        "message": f"Launch already in progress for {workspace_id}",
+                        "message": f"Work already in progress for {workspace_id}",
                     }
                 )
                 continue
@@ -223,7 +223,7 @@ class LaunchService:
                     "row_index": item.row_index,
                     "workspace_id": item.workspace_id,
                     "status": "conflict",
-                    "message": f"Launch already in progress for {item.workspace_id}",
+                    "message": f"Work already in progress for {item.workspace_id}",
                 }
                 for item in conflicting
             )

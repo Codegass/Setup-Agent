@@ -8,7 +8,10 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, StringConstraints
 
+from sag.web.launch_queue import LaunchQueueStore
+from sag.web.launch_service import DEFAULT_DB_PATH
 from sag.web.session_registry import ContainerSessionStore
+from sag.web.workspace_leases import WorkspaceLease, canonical_workspace_id
 
 
 class TaskRequest(BaseModel):
@@ -19,24 +22,49 @@ class TaskRequest(BaseModel):
 class AgentTaskLauncher:
     _agent_run_lock = Lock()
 
-    def __init__(self, session_store: ContainerSessionStore | None = None):
+    def __init__(
+        self,
+        session_store: ContainerSessionStore | None = None,
+        store: LaunchQueueStore | None = None,
+    ):
         self.session_store = session_store if session_store is not None else ContainerSessionStore()
+        self.store = store if store is not None else LaunchQueueStore(DEFAULT_DB_PATH)
 
     def run(self, workspace_id: str, task: str, source_session: str | None) -> str:
+        workspace_id = canonical_workspace_id(workspace_id)
         session_id = f"UI-{uuid.uuid4().hex[:8]}"
-        self.session_store.mark_started(
-            workspace_id=workspace_id,
-            session_id=session_id,
-            task=task,
-            source_session=source_session,
-        )
-        thread = Thread(
-            target=self._run_agent,
-            args=(session_id, workspace_id, task, source_session),
-            daemon=True,
-            name=f"sag-ui-task-{session_id}",
-        )
-        thread.start()
+        lease = self.store.acquire_workspace_lease(workspace_id, "task")
+        recorded = False
+        try:
+            self.session_store.mark_started(
+                workspace_id=workspace_id,
+                session_id=session_id,
+                task=task,
+                source_session=source_session,
+            )
+            recorded = True
+            thread = Thread(
+                target=self._run_agent,
+                args=(session_id, workspace_id, task, source_session, lease),
+                daemon=True,
+                name=f"sag-ui-task-{session_id}",
+            )
+            thread.start()
+        except BaseException:
+            if recorded:
+                try:
+                    self.session_store.mark_finished(
+                        workspace_id=workspace_id,
+                        session_id=session_id,
+                        success=False,
+                        outcome=f"Task did not start: {task}",
+                    )
+                except Exception:
+                    from loguru import logger
+
+                    logger.exception("Failed to record task startup failure for {}", session_id)
+            lease.release()
+            raise
         return session_id
 
     def _run_agent(
@@ -45,6 +73,7 @@ class AgentTaskLauncher:
         workspace_id: str,
         task: str,
         source_session: str | None,
+        workspace_lease: WorkspaceLease | None = None,
     ) -> None:
         from loguru import logger
 
@@ -93,6 +122,9 @@ class AgentTaskLauncher:
                     session_id,
                     workspace_id,
                 )
+            finally:
+                if workspace_lease is not None:
+                    workspace_lease.release()
 
     def _read_project_name(self, orchestrator: Any, fallback: str) -> str:
         """Mechanically resolve a workspace root; ignore project_meta.json."""
@@ -111,10 +143,13 @@ class AgentTaskLauncher:
 
 
 class TaskRunner:
-    def __init__(self, launcher: AgentTaskLauncher | None = None):
-        self.launcher = launcher if launcher is not None else AgentTaskLauncher()
+    def __init__(
+        self, launcher: AgentTaskLauncher | None = None, store: LaunchQueueStore | None = None
+    ):
+        self.launcher = launcher if launcher is not None else AgentTaskLauncher(store=store)
 
     def submit(self, workspace_id: str, request: TaskRequest) -> dict:
+        workspace_id = canonical_workspace_id(workspace_id)
         session_id = self.launcher.run(
             workspace_id,
             request.task,

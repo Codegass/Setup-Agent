@@ -461,9 +461,7 @@ def test_corrupt_receipt_fails_closed_with_the_file_named(bigtop, monkeypatch):
 
 
 @pytest.mark.parametrize("mutation", ("tamper", "delete"))
-def test_host_published_receipt_must_still_exist_with_exact_bytes(
-    bigtop, monkeypatch, mutation
-):
+def test_host_published_receipt_must_still_exist_with_exact_bytes(bigtop, monkeypatch, mutation):
     _bind_primary_coordinate(monkeypatch, bigtop)
     path = bigtop.write_receipt(
         _receipt(
@@ -473,6 +471,9 @@ def test_host_published_receipt_must_still_exist_with_exact_bytes(
         )
     )
     validator, _ = _validator(bigtop)
+    initial = validator.parse_test_reports(str(bigtop.project))
+    assert initial["valid"] is True
+    assert initial["total_tests"] == 50
     if mutation == "tamper":
         # Same JSON meaning, different physical bytes: exact host publication
         # is the live authority, not reparsing a container-controlled body.
@@ -490,9 +491,7 @@ def test_host_published_receipt_must_still_exist_with_exact_bytes(
 
 
 @pytest.mark.parametrize("mutation", ("tamper", "delete"))
-def test_host_published_assessment_ledger_is_complete_and_exact(
-    bigtop, monkeypatch, mutation
-):
+def test_host_published_assessment_ledger_is_complete_and_exact(bigtop, monkeypatch, mutation):
     _bind_primary_coordinate(monkeypatch, bigtop)
     receipt = _receipt(
         "inv-test-1-0001",
@@ -506,6 +505,9 @@ def test_host_published_assessment_ledger_is_complete_and_exact(
     ).payload()
     path = bigtop.write_assessment(assessment)
     validator, _ = _validator(bigtop)
+    initial = validator.parse_test_reports(str(bigtop.project))
+    assert initial["valid"] is True
+    assert initial["total_tests"] == 50
     if mutation == "tamper":
         path.write_bytes(path.read_bytes() + b"\n")
     else:
@@ -778,3 +780,57 @@ def test_a_cached_claim_counts_toward_the_primary_rollup(bigtop, monkeypatch):
 
     assert result["total_tests"] == 50
     assert result["receipt_scoped"] is True
+
+
+def test_second_validation_admits_newly_published_receipts_without_waiting_for_ttl(
+    bigtop, monkeypatch
+):
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    reports = sorted((bigtop.primary_root / "target" / "surefire-reports").glob("*.xml"))
+    bigtop.write_receipt(_receipt("inv-test-1-0001", bigtop.primary_root, new=reports[:1]))
+    validator, orchestrator = _validator(bigtop)
+    first = validator.parse_test_reports(str(bigtop.project))
+    assert first["total_tests"] == 25
+
+    receipt = _receipt("inv-test-1-0002", bigtop.primary_root, new=reports[1:])
+    path = bigtop.write_receipt(receipt)
+    publication = publish_evidence_bytes(
+        orchestrator,
+        record_kind="invocation_receipt",
+        record_id=receipt["receipt_id"],
+        raw=path.read_bytes(),
+        contract_id=receipt.get("contract_id"),
+        contract_hash=receipt.get("contract_hash"),
+    )
+    assert publication.published
+    second = validator.parse_test_reports(str(bigtop.project))
+    assert second["total_tests"] == 50
+    assert first["total_tests"] == 25
+
+
+def test_second_validation_rechecks_report_bytes_against_the_same_receipt(bigtop, monkeypatch):
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    reports = sorted((bigtop.primary_root / "target" / "surefire-reports").glob("*.xml"))
+    bigtop.write_receipt(_receipt("inv-test-1-0001", bigtop.primary_root, new=reports))
+    validator, _ = _validator(bigtop)
+    assert validator.parse_test_reports(str(bigtop.project))["total_tests"] == 50
+    for path in reports:
+        path.write_bytes(path.read_bytes() + b"\n")
+    second = validator.parse_test_reports(str(bigtop.project))
+    assert second["total_tests"] == 0
+    assert sorted(second["stale_test_reports"]) == sorted(map(str, reports))
+
+
+def test_second_validation_rebinds_the_primary_coordinate_with_the_same_ledger(bigtop, monkeypatch):
+    for index, root in enumerate((bigtop.primary_root, bigtop.auxiliary_root), start=1):
+        reports = sorted((root / "target" / "surefire-reports").glob("*.xml"))
+        bigtop.write_receipt(_receipt(f"inv-test-1-{index:04}", root, new=reports))
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    validator, _ = _validator(bigtop)
+    first = validator.parse_test_reports(str(bigtop.project))
+    assert first["total_tests"] == 50
+    _bind_primary_coordinate(monkeypatch, bigtop, root=bigtop.auxiliary_root)
+    second = validator.parse_test_reports(str(bigtop.project))
+    assert second["total_tests"] == 4
+    assert second["test_modules"] == [str(bigtop.auxiliary_root)]
+    assert first["total_tests"] == 50

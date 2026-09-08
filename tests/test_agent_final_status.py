@@ -898,6 +898,7 @@ def test_legacy_verdict_mapper_is_guarded_from_setup_mode():
 
 def test_continue_project_initializes_explicit_legacy_report_mode():
     agent = object.__new__(SetupAgent)
+    agent.orchestrator = SimpleNamespace()
     agent.console = Console(file=StringIO(), force_terminal=False)
     agent.agent_logger = SimpleNamespace(info=lambda *_: None, error=lambda *_: None)
     agent._ensure_container_running = lambda _project_name: True

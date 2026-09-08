@@ -7,11 +7,12 @@ import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 from loguru import logger
 
 from sag.web.launch_queue import LaunchItem, LaunchQueueStore
+from sag.web.workspace_leases import open_lease_lock
 
 
 def default_global_cap() -> int:
@@ -74,20 +75,55 @@ class LaunchScheduler:
         self._thread: threading.Thread | None = None
         self._recovered_ids: set[str] = set()
         self._recovery_complete = False
+        self._owner_handle: BinaryIO | None = None
+        self._owner_guard = threading.RLock()
+        self._owned_children: set[str] = set()
+        self._loop_active = False
+
+    def _acquire_owner(self) -> None:
+        """Called under the instance guard; the file is never unlinked."""
+        if self._owner_handle is not None:
+            return
+        database = self.store.db_path.resolve()
+        path = database.with_name(database.name + ".scheduler.lock")
+        try:
+            handle = open_lease_lock(path, create=True)
+        except FileExistsError:
+            handle = open_lease_lock(path)
+        if handle is None:
+            raise RuntimeError("Another launch scheduler owner is active for this queue")
+        self._owner_handle = handle
+        self._recovery_complete = False
+
+    def _release_owner_if_idle(self) -> None:
+        """Keep ownership through every live child's final database write."""
+        if self._stop.is_set() and not self._loop_active and not self._owned_children:
+            if self._owner_handle is not None:
+                self._owner_handle.close()
+                self._owner_handle = None
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._recovery_complete = False
-        try:
-            self.reconcile_stale()
-            self._recovery_complete = True
-        except Exception:
-            # A failed reconcile must not leave the UI without a scheduler.
-            logger.exception("Stale launch reconcile failed")
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="sag-launch-scheduler")
-        self._thread.start()
+        with self._owner_guard:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._acquire_owner()
+            self._stop.clear()
+            try:
+                self.reconcile_stale()
+            except Exception:
+                logger.exception("Stale launch reconcile failed")
+            self._loop_active = True
+            try:
+                self._thread = threading.Thread(
+                    target=self._loop, daemon=True, name="sag-launch-scheduler"
+                )
+                self._thread.start()
+            except BaseException:
+                self._thread = None
+                self._loop_active = False
+                self._stop.set()
+                self._release_owner_if_idle()
+                raise
 
     def stop(self) -> None:
         self._stop.set()
@@ -96,7 +132,13 @@ class LaunchScheduler:
             self._thread.join(timeout=5)
             if self._thread.is_alive():
                 logger.warning("Launch scheduler thread did not stop within 5s")
-            self._thread = None
+        # A blocked spawn/recovery still owns the guard. Its finally block
+        # releases after it finishes; stop must not hand its queue to a rival.
+        if self._owner_guard.acquire(blocking=False):
+            try:
+                self._release_owner_if_idle()
+            finally:
+                self._owner_guard.release()
 
     def wake(self) -> None:
         """Nudge the worker loop so new submissions start without polling delay."""
@@ -104,28 +146,39 @@ class LaunchScheduler:
         self._wake.set()
 
     def launch_ready(self) -> None:
-        """Start subprocesses for every queued item that has capacity right now."""
-
-        while True:
-            item = self.store.claim_next(self.global_cap, _now())
-            if item is None:
-                return
-            self._start_item(item)
+        """Claim work only after obtaining this queue's scheduler authority."""
+        with self._owner_guard:
+            self._acquire_owner()
+            try:
+                if not self._recovery_complete:
+                    self.reconcile_stale()
+                while not self._stop.is_set():
+                    item = self.store.claim_next(self.global_cap, _now())
+                    if item is None:
+                        return
+                    self._start_item(item)
+            finally:
+                self._release_owner_if_idle()
 
     def reconcile_stale(self) -> None:
-        """Resolve launching/running rows left over from a previous UI run.
-
-        A surviving process keeps its capacity while the scheduler watches it.
-        Its exit status cannot be recovered by a new parent process, so losing
-        it records an unavailable outcome, never inferred setup success.
-        """
-
-        self._recovered_ids.clear()
-        for item in self.store.unfinished_items():
-            if item.pid is not None and _pid_alive(item.pid):
-                self._recovered_ids.add(item.id)
-                continue
-            self._mark_recovery_unavailable(item.id)
+        """Recover old children once per ownership, never infer their exit code."""
+        with self._owner_guard:
+            self._acquire_owner()
+            try:
+                if self._recovery_complete:
+                    self._reconcile_recovered()
+                    return
+                self._recovered_ids.clear()
+                for item in self.store.unfinished_items():
+                    if item.id in self._owned_children:
+                        continue
+                    if item.pid is not None and _pid_alive(item.pid):
+                        self._recovered_ids.add(item.id)
+                    else:
+                        self._mark_recovery_unavailable(item.id)
+                self._recovery_complete = True
+            finally:
+                self._release_owner_if_idle()
 
     def _mark_recovery_unavailable(self, item_id: str) -> None:
         self.store.mark_failed(
@@ -147,19 +200,19 @@ class LaunchScheduler:
                 self._recovered_ids.discard(item_id)
 
     def _loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                if not self._recovery_complete:
-                    # Retry startup failures before creating children of this
-                    # scheduler, so they cannot be mistaken for recovered PIDs.
+        try:
+            while not self._stop.is_set():
+                try:
                     self.reconcile_stale()
-                    self._recovery_complete = True
-                self._reconcile_recovered()
-                self.launch_ready()
-            except Exception:
-                logger.exception("Launch scheduler iteration failed")
-            self._wake.wait(self.poll_interval)
-            self._wake.clear()
+                    self.launch_ready()
+                except Exception:
+                    logger.exception("Launch scheduler iteration failed")
+                self._wake.wait(self.poll_interval)
+                self._wake.clear()
+        finally:
+            with self._owner_guard:
+                self._loop_active = False
+                self._release_owner_if_idle()
 
     def _start_item(self, item: LaunchItem) -> None:
         try:
@@ -167,29 +220,44 @@ class LaunchScheduler:
         except Exception as exc:
             self.store.mark_failed(item.id, f"Failed to start subprocess: {exc}", now=_now())
             return
-        self.store.mark_running(item.id, pid=process.pid, now=_now())
-        threading.Thread(
-            target=self._monitor,
-            args=(item.id, process),
-            daemon=True,
-            name=f"sag-launch-monitor-{item.id}",
-        ).start()
+        self._owned_children.add(item.id)
+        try:
+            self.store.mark_running(item.id, pid=process.pid, now=_now())
+        finally:
+            # Even a failed mark_running must not orphan a child we spawned.
+            # If thread construction/start fails, retain ownership conservatively
+            # until process exit releases the OS lock; never give a rival its row.
+            threading.Thread(
+                target=self._monitor,
+                args=(item.id, process),
+                daemon=True,
+                name=f"sag-launch-monitor-{item.id}",
+            ).start()
 
     def _monitor(self, item_id: str, process: Any) -> None:
+        exited = False
         try:
-            exit_code = process.wait()
-        except Exception as exc:
-            self.store.mark_failed(item_id, f"Lost launch process: {exc}", now=_now())
+            try:
+                exit_code = process.wait()
+                exited = True
+            except Exception as exc:
+                # Losing wait() does not prove the child exited. Keep both
+                # workspace occupancy and scheduler ownership until recovery
+                # can establish liveness after this parent process exits.
+                logger.error("Launch {} wait failed; retaining active occupancy: {}", item_id, exc)
+                return
+            if exit_code == 0:
+                self.store.mark_completed(item_id, exit_code=0, now=_now())
+            else:
+                self.store.mark_failed(
+                    item_id,
+                    f"sag project exited with code {exit_code}",
+                    now=_now(),
+                    exit_code=exit_code,
+                )
+        finally:
             self._wake.set()
-            return
-        if exit_code == 0:
-            self.store.mark_completed(item_id, exit_code=0, now=_now())
-        else:
-            self.store.mark_failed(
-                item_id,
-                f"sag project exited with code {exit_code}",
-                now=_now(),
-                exit_code=exit_code,
-            )
-        # Freed capacity: nudge the scheduler instead of waiting out the poll.
-        self._wake.set()
+            with self._owner_guard:
+                if exited:
+                    self._owned_children.discard(item_id)
+                self._release_owner_if_idle()

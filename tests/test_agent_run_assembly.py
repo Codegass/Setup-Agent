@@ -159,6 +159,78 @@ def test_reassembly_preserves_container_history_files(assembled_agent):
     assert agent.orchestrator.files[historical] == '{"project":"previous"}'
 
 
+@pytest.mark.parametrize("command", ["setup", "continue", "task"])
+def test_every_command_retires_previous_authority_before_container_startup(
+    assembled_agent, monkeypatch, command
+):
+    from sag.agent.evidence_publications import current_evidence_publication_authority
+    from sag.agent.invocation_receipts import active_receipt_run_id
+
+    agent = assembled_agent
+    prepare_setup(agent, "previous-run")
+    previous_engine = agent.react_engine
+    previous_state = agent.run_evidence_state
+    agent.final_verdict = "success"
+    agent.final_verdict_reason = "previous result"
+    agent._last_test_status = {"success": True}
+    agent._last_build_status = {"success": True}
+    agent._run_pin_template = {"run_id": "previous-run"}
+    agent._observed_target_repo_sha = "a" * 40
+    seen = []
+
+    attributes = (
+        "react_engine",
+        "tools",
+        "context_manager",
+        "physical_validator",
+        "report_tool",
+        "command_tracker",
+        "phase_machine",
+        "context_journal",
+        "run_evidence_state",
+        "verdict_finalizer",
+        "control_event_sink",
+        "_run_pin_template",
+        "_run_pin_host_path",
+        "_run_pin_mirror",
+        "_observed_target_repo_sha",
+        "final_verdict",
+        "_last_test_status",
+        "_last_build_status",
+    )
+
+    def startup(_project_name):
+        seen.append(
+            {
+                "run_id": agent.run_id,
+                "project_name": agent.project_name,
+                "receipt_run_id": active_receipt_run_id(),
+                "authority": current_evidence_publication_authority(agent.orchestrator),
+                "components": {attr: getattr(agent, attr, None) for attr in attributes},
+            }
+        )
+        return False
+
+    monkeypatch.setattr(agent, "_setup_docker_environment", startup)
+    monkeypatch.setattr(agent, "_ensure_container_running", startup)
+    if command == "setup":
+        agent.setup_project("https://example.invalid/repo", "next-project", "build")
+    elif command == "continue":
+        assert agent.continue_project("next-project") is False
+    else:
+        assert agent.run_task("next-project", "test") is False
+    assert len(seen) == 1
+    observed = seen[0]
+    assert observed["project_name"] == "next-project"
+    assert observed["run_id"] != "previous-run"
+    assert observed["receipt_run_id"] == observed["run_id"]
+    assert not observed["authority"].available
+    assert observed["authority"].run_id == observed["run_id"]
+    assert all(value is None for value in observed["components"].values()), observed["components"]
+    assert not previous_state.sealed
+    assert previous_engine.run_evidence_state is previous_state
+
+
 @pytest.mark.parametrize("next_run", ["previous-run", "new-command"])
 def test_reassembly_recovers_only_its_own_repair_authority(
     assembled_agent, monkeypatch, tmp_path, next_run

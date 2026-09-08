@@ -72,9 +72,7 @@ class FakeReActEngine:
 
     def run_react_loop(self, **kwargs):
         self.history_at_call = list(self.recent_tool_executions)
-        self.shared_history_at_call = (
-            self.recent_tool_executions is self.tool_orchestrator_history
-        )
+        self.shared_history_at_call = self.recent_tool_executions is self.tool_orchestrator_history
         self.tool_orchestrator_history.append("current-command-result")
         self.calls.append(kwargs)
         return True
@@ -94,12 +92,16 @@ def test_run_task_uses_run_task_completion_without_appending_setup_todo(monkeypa
     agent.max_iterations = 3
     agent.console = Console(file=StringIO())
     agent.ui_manager = None
-    agent.context_manager = FakeRunTaskContextManager()
-    agent.tools = []
-    agent.react_engine = FakeReActEngine()
     agent.agent_logger = FakeLogger()
     agent._ensure_container_running = lambda project_name: True
-    agent._initialize_context_and_tools = lambda workflow_mode="setup": None
+
+    def initialize(workflow_mode="setup"):
+        assert workflow_mode == "run_task"
+        agent.context_manager = FakeRunTaskContextManager()
+        agent.tools = []
+        agent.react_engine = FakeReActEngine()
+
+    agent._initialize_context_and_tools = initialize
     agent._emit = lambda *args, **kwargs: None
     agent._provide_task_summary = lambda success, task_description: None
 
@@ -134,13 +136,17 @@ def test_run_task_does_not_start_model_when_framework_survey_fails(monkeypatch):
     agent.max_iterations = 3
     agent.console = Console(file=StringIO())
     agent.ui_manager = None
-    agent.context_manager = FakeRunTaskContextManager()
-    agent.tools = []
-    agent.react_engine = FakeReActEngine()
-    agent.react_engine.survey_status = "failed"
     agent.agent_logger = FakeLogger()
     agent._ensure_container_running = lambda project_name: True
-    agent._initialize_context_and_tools = lambda workflow_mode="setup": None
+
+    def initialize(workflow_mode="setup"):
+        assert workflow_mode == "run_task"
+        agent.context_manager = FakeRunTaskContextManager()
+        agent.tools = []
+        agent.react_engine = FakeReActEngine()
+        agent.react_engine.survey_status = "failed"
+
+    agent._initialize_context_and_tools = initialize
     agent._emit = lambda *args, **kwargs: None
     agent._provide_task_summary = lambda success, task_description: None
 

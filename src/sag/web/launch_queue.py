@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
+
+from sag.web.workspace_leases import (
+    WorkspaceLease,
+    canonical_workspace_id,
+    open_lease_lock,
+)
 
 ALL_STATUSES = ("queued", "launching", "running", "completed", "failed")
 
 
 class WorkspaceBusyError(RuntimeError):
-    """Raised when a workspace still has a launching or running launch item.
+    """Raised when another launch, task, or delete owns the workspace.
 
     Deleting such a workspace would orphan an in-flight setup, so the store
     refuses and changes nothing.
@@ -53,6 +62,11 @@ CREATE TABLE IF NOT EXISTS launch_items (
 );
 CREATE INDEX IF NOT EXISTS idx_launch_items_status ON launch_items(status);
 CREATE INDEX IF NOT EXISTS idx_launch_items_batch ON launch_items(batch_id);
+CREATE TABLE IF NOT EXISTS workspace_leases (
+    workspace_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('task', 'delete'))
+);
 """
 
 
@@ -95,7 +109,8 @@ class LaunchQueueStore:
     """All SQLite access for the launch queue lives here."""
 
     def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
+        # SQLite aliases must also share the same owner-lock directory.
+        self.db_path = Path(db_path).resolve()
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,23 +125,106 @@ class LaunchQueueStore:
     def _transaction(self, conn: sqlite3.Connection):
         conn.execute("BEGIN IMMEDIATE")
         try:
+            self._reap_abandoned_workspace_leases(conn)
             yield
         except BaseException:
             conn.execute("ROLLBACK")
             raise
         conn.execute("COMMIT")
 
-    def enqueue_batch(self, batch: LaunchBatch, items: list[LaunchItem]) -> list[LaunchItem]:
-        """Admit distinct active workspaces atomically; return conflicting rows."""
+    def _lease_path(self, owner_id: str) -> Path:
+        # Never reuse an owner's file: unlinking/recreating a live lock path
+        # could create two independent locks for the same occupancy.
+        key = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()
+        return self.db_path.parent / f"{self.db_path.name}.leases" / f"{key}.lock"
+
+    def _reap_abandoned_workspace_leases(self, conn: sqlite3.Connection) -> None:
+        for row in conn.execute("SELECT workspace_id, owner_id FROM workspace_leases").fetchall():
+            path = self._lease_path(row["owner_id"])
+            try:
+                handle = open_lease_lock(path)
+            except FileNotFoundError:
+                handle = None
+            else:
+                if handle is None:
+                    continue  # A task/delete still owns the OS lock.
+            try:
+                conn.execute(
+                    "DELETE FROM workspace_leases WHERE workspace_id = ? AND owner_id = ?",
+                    (row["workspace_id"], row["owner_id"]),
+                )
+            finally:
+                if handle is not None:
+                    with contextlib.suppress(OSError):
+                        handle.close()
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _occupied_workspaces(
+        conn: sqlite3.Connection, *, include_queued: bool = True, lease_owner: str | None = None
+    ) -> set[str]:
+        statuses = (
+            "'queued', 'launching', 'running'" if include_queued else "'launching', 'running'"
+        )
+        return {
+            canonical_workspace_id(row[0])
+            for row in conn.execute(
+                f"SELECT workspace_id FROM launch_items WHERE status IN ({statuses})"
+            )
+        } | {
+            canonical_workspace_id(row[0])
+            for row in conn.execute(
+                "SELECT workspace_id FROM workspace_leases WHERE owner_id != ?",
+                (lease_owner or "",),
+            )
+        }
+
+    def acquire_workspace_lease(
+        self, workspace_id: str, operation: Literal["task", "delete"]
+    ) -> WorkspaceLease:
+        if operation not in {"task", "delete"}:
+            raise ValueError("unsupported workspace occupancy operation")
+        workspace_id = canonical_workspace_id(workspace_id)
+        owner_id = uuid4().hex
+        path = self._lease_path(owner_id)
+        handle = open_lease_lock(path, create=True)
+        if handle is None:
+            raise RuntimeError("new workspace lease could not be locked")
+        try:
+            with contextlib.closing(self._connect()) as conn:
+                with self._transaction(conn):
+                    if workspace_id in self._occupied_workspaces(
+                        conn, include_queued=operation == "task"
+                    ):
+                        raise WorkspaceBusyError(f"Workspace is in use: {workspace_id}")
+                    conn.execute(
+                        "INSERT INTO workspace_leases (workspace_id, owner_id, operation) VALUES (?, ?, ?)",
+                        (workspace_id, owner_id, operation),
+                    )
+        except BaseException:
+            with contextlib.suppress(OSError):
+                handle.close()
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+            raise
+        return WorkspaceLease(self, workspace_id, owner_id, handle)
+
+    def _release_workspace_lease(self, workspace_id: str, owner_id: str) -> None:
         with contextlib.closing(self._connect()) as conn:
             with self._transaction(conn):
-                active = {
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT workspace_id FROM launch_items"
-                        " WHERE status IN ('queued', 'launching', 'running')"
-                    )
-                }
+                conn.execute(
+                    "DELETE FROM workspace_leases WHERE workspace_id = ? AND owner_id = ?",
+                    (workspace_id, owner_id),
+                )
+
+    def enqueue_batch(self, batch: LaunchBatch, items: list[LaunchItem]) -> list[LaunchItem]:
+        """Admit distinct active workspaces atomically; return conflicting rows."""
+        items = [
+            replace(item, workspace_id=canonical_workspace_id(item.workspace_id)) for item in items
+        ]
+        with contextlib.closing(self._connect()) as conn:
+            with self._transaction(conn):
+                active = self._occupied_workspaces(conn)
                 admitted: list[LaunchItem] = []
                 rejected: list[LaunchItem] = []
                 for item in items:
@@ -234,6 +332,7 @@ class LaunchQueueStore:
                         "SELECT i.* FROM launch_items i"
                         " JOIN launch_batches b ON b.id = i.batch_id"
                         " WHERE i.status = 'queued'"
+                        "   AND NOT EXISTS (SELECT 1 FROM workspace_leases w WHERE w.workspace_id = i.workspace_id)"
                         "   AND ("
                         "     SELECT COUNT(*) FROM launch_items a"
                         "     WHERE a.batch_id = i.batch_id"
@@ -278,52 +377,46 @@ class LaunchQueueStore:
             return [_item_from_row(row) for row in rows]
 
     def active_workspace_ids(self) -> set[str]:
-        """Workspace ids with a launch currently queued, launching, or running."""
+        """Workspace ids reserved by pending launches or task/delete operations."""
 
         with contextlib.closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT workspace_id FROM launch_items"
-                " WHERE status IN ('queued', 'launching', 'running')"
-            ).fetchall()
-            return {row["workspace_id"] for row in rows}
+            with self._transaction(conn):
+                return self._occupied_workspaces(conn)
 
     def is_workspace_busy(self, workspace_id: str) -> bool:
-        """Return True if the workspace has a ``launching`` or ``running`` item.
+        """Return True for executing launches and task/delete reservations.
 
-        Read-only counterpart to the atomic busy-guard in
+        Counterpart to the atomic busy-guard in
         ``delete_workspace_items``. Lets a caller reject a busy workspace before
         touching Docker, so busy rejection works even when the daemon is down.
+        Dead task/delete reservations are reclaimed before the query.
         """
 
+        workspace_id = canonical_workspace_id(workspace_id)
         with contextlib.closing(self._connect()) as conn:
-            active = conn.execute(
-                "SELECT COUNT(*) FROM launch_items"
-                " WHERE workspace_id = ? AND status IN ('launching', 'running')",
-                (workspace_id,),
-            ).fetchone()[0]
-            return bool(active)
+            with self._transaction(conn):
+                return workspace_id in self._occupied_workspaces(conn, include_queued=False)
 
-    def delete_workspace_items(self, workspace_id: str) -> tuple[int, list[str]]:
+    def delete_workspace_items(
+        self, workspace_id: str, *, lease_owner: str | None = None
+    ) -> tuple[int, list[str]]:
         """Atomically delete every launch_item for ``workspace_id``.
 
-        Inside one ``BEGIN IMMEDIATE`` transaction: refuse (raising
-        ``WorkspaceBusyError`` and deleting nothing) if any matching item is
-        currently ``launching`` or ``running``; otherwise delete the matching
-        items, drop any batch row left with zero items, and return the deleted
-        count together with the removed items' ``process_log`` paths. Zero
-        matching items is a normal success returning ``(0, [])``.
+        Inside one ``BEGIN IMMEDIATE`` transaction: refuse active launches and
+        task/delete leases other than the caller's ``lease_owner``. Otherwise
+        delete the matching items, drop empty batches, and return the deleted
+        count with their ``process_log`` paths. The caller keeps its delete
+        lease until container removal ends. Zero matching items returns ``(0, [])``.
         """
 
+        workspace_id = canonical_workspace_id(workspace_id)
         with contextlib.closing(self._connect()) as conn:
             deleted = 0
             process_logs: list[str] = []
             with self._transaction(conn):
-                active = conn.execute(
-                    "SELECT COUNT(*) FROM launch_items"
-                    " WHERE workspace_id = ? AND status IN ('launching', 'running')",
-                    (workspace_id,),
-                ).fetchone()[0]
-                if active:
+                if workspace_id in self._occupied_workspaces(
+                    conn, include_queued=False, lease_owner=lease_owner
+                ):
                     raise WorkspaceBusyError(f"Workspace has an active launch: {workspace_id}")
 
                 rows = conn.execute(

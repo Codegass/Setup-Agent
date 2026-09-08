@@ -33,6 +33,7 @@ from sag.web.terminal import (
     send_socket,
     terminal_request_allowed,
 )
+from sag.web.workspace_leases import canonical_workspace_id
 from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
 
 
@@ -51,7 +52,6 @@ def create_app(
     terminal_allowed_hosts: set[str] | None = None,
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
-    runner = task_runner if task_runner is not None else TaskRunner()
     terminal_bridge = terminal_adapter if terminal_adapter is not None else TerminalAdapter()
     owns_terminal_bridge = terminal_adapter is None
     terminal_token = secrets.token_urlsafe(32)
@@ -61,6 +61,11 @@ def create_app(
         if host not in {"0.0.0.0", "::", "[::]", "*"}
     }
     launches = launch_service if launch_service is not None else LaunchService()
+    runner = (
+        task_runner
+        if task_runner is not None
+        else TaskRunner(store=getattr(launches, "_store", None))
+    )
     # Share the launch service's store/DB so queue cleanup and launch state stay
     # consistent; a fake launch service without a store falls back to the default.
     workspaces = (
@@ -88,6 +93,12 @@ def create_app(
 
     app = FastAPI(title="SAG Workbench", version=__version__, lifespan=lifespan)
 
+    def workspace_target(workspace_id: str) -> str:
+        try:
+            return canonical_workspace_id(workspace_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/api/workspaces")
     def get_workspaces() -> dict:
         return builder.dashboard().model_dump(mode="json", by_alias=True)
@@ -98,10 +109,15 @@ def create_app(
 
     @app.post("/api/workspaces/{workspace_id}/tasks", status_code=202)
     def submit_task(workspace_id: str, request: TaskRequest) -> dict:
-        return runner.submit(workspace_id, request)
+        workspace_id = workspace_target(workspace_id)
+        try:
+            return runner.submit(workspace_id, request)
+        except WorkspaceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.delete("/api/workspaces/{workspace_id}")
     def delete_workspace(workspace_id: str) -> dict:
+        workspace_id = workspace_target(workspace_id)
         try:
             return workspaces.delete_workspace(workspace_id)
         except WorkspaceBusyError as exc:
