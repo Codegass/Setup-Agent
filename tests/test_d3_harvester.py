@@ -579,3 +579,276 @@ class TestKafkaRunArchive:
         assert "build / JUnit tests Java 17" not in cell_ids
         assert "build / Compile and Check (Merge Ref)" in cell_ids
         assert _has_note(record, "6 checks are already measured by a JUnit pool")
+
+
+from scripts.d3_harvest_target import pool_member_module, read_pool
+
+
+@pytest.mark.parametrize(
+    "member, module",
+    [
+        ("clients/17-noflaky-nonew/TEST-a.xml", "clients"),
+        ("connect/runtime/17-noflaky-nonew/TEST-a.xml", "connect/runtime"),
+        ("streams/integration-tests/17-noflaky-nonew/TEST-a.xml", "streams/integration-tests"),
+        ("core/build/test-results/test/TEST-a.xml", "core"),
+        ("build/test-results/test/TEST-a.xml", "."),
+        ("cli/target/surefire-reports/TEST-a.xml", "cli"),
+        ("target/failsafe-reports/TEST-a.xml", "."),
+        ("cli/TEST-a.xml", "cli"),
+        ("TEST-a.xml", "."),
+    ],
+)
+def test_pool_member_module_reads_every_upload_layout(member, module):
+    assert pool_member_module(member) == module
+
+
+def test_read_pool_states_the_test_bearing_modules(tmp_path):
+    pool = _pool(
+        tmp_path,
+        "junit-xml-17-noflaky-nonew",
+        {
+            "clients/17-noflaky-nonew/TEST-a.xml": _suite("a.A", (("t1", False),)),
+            "connect/runtime/17-noflaky-nonew/TEST-b.xml": _suite("b.B", (("t2", False),)),
+            "clients/17-noflaky-nonew/TEST-c.xml": _suite("c.C", (("t3", True),)),
+        },
+    )
+
+    reading = read_pool(pool)
+
+    assert reading.modules == ("clients", "connect/runtime")
+    assert reading.layout == "upload-prefix"
+
+
+def test_a_pool_cell_carries_its_modules_as_a_lower_bound(tmp_path):
+    snapshot = build_snapshot(
+        tmp_path / "snap",
+        pools={
+            "junit-xml-17-noflaky-nonew": {
+                "clients/17-noflaky-nonew/TEST-a.xml": _suite("a.A", (("t1", False),)),
+                "core/17-noflaky-nonew/TEST-b.xml": _suite("b.B", (("t2", False),)),
+            }
+        },
+    )
+
+    record = _record(snapshot)
+    cell = _cell(record, "junit-xml-17-noflaky-nonew (jdk 17)")
+
+    assert cell.modules == ("clients", "core")
+    assert cell.modules_basis == "test_bearing"
+    assert _has_note(record, "test-bearing lower bound")
+
+
+def test_a_job_log_outranks_the_pool_lower_bound(tmp_path):
+    snapshot = build_snapshot(
+        tmp_path / "snap",
+        pools={
+            "junit-xml-17-noflaky-nonew": {
+                "clients/17-noflaky-nonew/TEST-a.xml": _suite("a.A", (("t1", False),)),
+            }
+        },
+        jobs=(("JUnit tests Java 17", "success"),),
+    )
+    with zipfile.ZipFile(snapshot / "run-1-logs.zip", "w") as archive:
+        archive.writestr(
+            "0_JUnit tests Java 17.txt",
+            "> Task :clients:compileJava\n> Task :core:compileJava\n> Task :generator:compileJava\n",
+        )
+
+    record = _record(snapshot)
+    cell = _cell(record, "junit-xml-17-noflaky-nonew (jdk 17)")
+
+    assert cell.modules == ("clients", "core", "generator")
+    assert cell.modules_basis == "log"
+    assert _has_note(record, "job log")
+
+
+def test_declared_sources_fill_modules_when_no_log_exists(tmp_path, monkeypatch):
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: build (${{ matrix.java }})\n    steps:\n"
+        "      - run: ./gradlew build -x test\n",
+        encoding="utf-8",
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap", jobs=(("build (17)", "success"),), workflow=workflow
+    )
+    sources = snapshot / "sources"
+    sources.mkdir()
+    (sources / "settings.gradle").write_text(
+        "include 'clients', 'core'\nproject(':core').projectDir = file('kafka-core')\n",
+        encoding="utf-8",
+    )
+
+    _verify_test_source(monkeypatch, sources / "settings.gradle", "settings.gradle")
+
+    record = _record(snapshot)
+    cell = _cell(record, "build (17)")
+
+    assert cell.modules == (".", "clients", "kafka-core")
+    assert cell.modules_basis == "declared"
+    assert cell.command == "./gradlew build -x test"
+    assert _has_note(record, "declared reactor")
+
+
+def test_parser_accepts_refetch_flags_on_an_existing_snapshot():
+    from scripts.d3_harvest_target import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--from-dir",
+            "x",
+            "--repo",
+            "apache/kafka",
+            "--sha",
+            "a" * 40,
+            "--fetch-logs",
+            "--fetch-sources",
+        ]
+    )
+
+    assert args.fetch_logs is True
+    assert args.fetch_sources is True
+
+
+def test_multiline_ci_script_survives_harvest_and_parity(tmp_path):
+    from sag.metrics.parity import parity_from_texts
+
+    workflow = tmp_path / "ci.yml"
+    script = "mvn compile\nmvn verify"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: build (17)\n    steps:\n      - run: |\n          mvn compile\n          mvn verify\n"
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap", jobs=(("build (17)", "success"),), workflow=workflow
+    )
+    cell = _cell(_record(snapshot), "build (17)")
+    assert cell.command == script
+    assert parity_from_texts(cell.command, ["mvn compile"]).status == "unknown"
+
+
+def test_unknown_workflow_cwd_cannot_claim_root_scope_or_parity(tmp_path):
+    from sag.metrics.parity import parity_from_texts
+
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: build (17)\n    defaults:\n      run:\n        working-directory: ${{ matrix.directory }}\n    steps:\n      - run: mvn test\n"
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap", jobs=(("build (17)", "success"),), workflow=workflow
+    )
+    cell = _cell(_record(snapshot), "build (17)")
+    assert "${{ matrix.directory }}" in cell.command
+    assert parity_from_texts(cell.command, ["mvn test"]).status == "unknown"
+    assert cell.modules_basis is None
+
+
+def test_fetch_source_refuses_unproven_cache_when_pinned_fetch_fails(tmp_path, monkeypatch):
+    import scripts.d3_harvest_target as harvester
+
+    source = tmp_path / "pom.xml"
+    source.write_text("foreign bytes")
+
+    def unavailable(path):
+        raise HarvestError("offline")
+
+    monkeypatch.setattr(harvester, "fetch", unavailable)
+    assert harvester._fetch_source(REPO, SHA, "pom.xml", source) is False
+
+
+def test_fetch_source_validates_existing_bytes_before_recording_origin(tmp_path, monkeypatch):
+    import base64
+
+    import scripts.d3_harvest_target as harvester
+
+    source = tmp_path / "pom.xml"
+    source.write_text("foreign bytes")
+    monkeypatch.setattr(
+        harvester,
+        "fetch",
+        lambda path: {
+            "type": "file",
+            "encoding": "base64",
+            "content": base64.b64encode(b"pinned bytes").decode(),
+        },
+    )
+    with pytest.raises(HarvestError, match="does not match"):
+        harvester._fetch_source(REPO, SHA, "pom.xml", source)
+    assert source.read_text() == "foreign bytes"
+
+
+def _verify_test_source(monkeypatch, destination, relative_path):
+    """Exercise the courier's real origin writer with a pinned API fixture."""
+    import base64
+
+    import scripts.d3_harvest_target as harvester
+
+    monkeypatch.setattr(
+        harvester,
+        "fetch",
+        lambda path: {
+            "type": "file",
+            "encoding": "base64",
+            "content": base64.b64encode(destination.read_bytes()).decode(),
+        },
+    )
+    assert harvester._fetch_source(REPO, SHA, relative_path, destination)
+
+
+def test_verified_source_cache_requires_subject_path_and_unchanged_bytes(tmp_path, monkeypatch):
+    import scripts.d3_harvest_target as harvester
+
+    source = tmp_path / "pom.xml"
+    source.write_text("pinned bytes")
+    _verify_test_source(monkeypatch, source, "pom.xml")
+
+    def unavailable(path):
+        raise HarvestError("offline")
+
+    monkeypatch.setattr(harvester, "fetch", unavailable)
+    assert harvester._fetch_source(REPO, SHA, "pom.xml", source)
+    assert not harvester._fetch_source("other/repo", SHA, "pom.xml", source)
+    assert not harvester._fetch_source(REPO, "b" * 40, "pom.xml", source)
+    assert not harvester._fetch_source(REPO, SHA, "other/pom.xml", source)
+    source.write_text("changed after verification")
+    assert not harvester._fetch_source(REPO, SHA, "pom.xml", source)
+
+
+def test_literal_workflow_directory_selects_its_verified_pom(tmp_path, monkeypatch):
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: build (17)\n    steps:\n      - working-directory: subproject\n        run: mvn test\n"
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap", jobs=(("build (17)", "success"),), workflow=workflow
+    )
+    sources = snapshot / "sources"
+    (sources / "subproject").mkdir(parents=True)
+    root = sources / "pom.xml"
+    root.write_text(
+        "<project><artifactId>root</artifactId><modules><module>wrong</module></modules></project>"
+    )
+    selected = sources / "subproject" / "pom.xml"
+    selected.write_text("<project><artifactId>selected</artifactId></project>")
+    _verify_test_source(monkeypatch, root, "pom.xml")
+    _verify_test_source(monkeypatch, selected, "subproject/pom.xml")
+    cell = _cell(_record(snapshot), "build (17)")
+    assert cell.modules == (".",)
+    assert cell.modules_basis == "declared"
+    assert cell.command == "cd subproject &&\nmvn test"
+    # Losing the pinned source bytes cannot silently reinstate root scope.
+    selected.write_text("<project><artifactId>changed</artifactId></project>")
+    assert _cell(_record(snapshot), "build (17)").modules_basis is None
+
+
+def test_unmarked_sources_are_not_admitted_by_offline_assembly(tmp_path):
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: build (17)\n    steps:\n      - run: mvn test\n"
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap", jobs=(("build (17)", "success"),), workflow=workflow
+    )
+    sources = snapshot / "sources"
+    sources.mkdir()
+    (sources / "pom.xml").write_text("<project><artifactId>unproven</artifactId></project>")
+    assert _cell(_record(snapshot), "build (17)").modules_basis is None

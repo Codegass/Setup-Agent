@@ -29,7 +29,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-TARGET_RECORD_SCHEMA_VERSION: Literal[1] = 1
+from sag.metrics.module_keys import module_key
+
+TARGET_RECORD_SCHEMA_VERSION: Literal[2] = 2
+ModulesBasis = Literal["log", "declared", "test_bearing"]
 
 BuildOutcome = Literal["ok", "failed", "unknown"]
 # Grade A: the cell's test identities come from parsed JUnit XML.
@@ -72,6 +75,8 @@ class CellTarget(BaseModel):
     flaky_ids: tuple[str, ...] = ()
     skipped: int = Field(default=0, ge=0)
     modules: tuple[str, ...] = ()
+    modules_basis: ModulesBasis | None = None
+    command: str | None = Field(default=None, max_length=2_000)
     grade: CellGrade
     laundered_conclusion: bool = False
     evidence_refs: tuple[str, ...] = ()
@@ -86,6 +91,16 @@ class CellTarget(BaseModel):
         red = _canonical_ids(self.red_ids, label="red ids")
         flaky = _canonical_ids(self.flaky_ids, label="flaky ids")
         modules = _canonical_ids(self.modules, label="modules")
+        for name in modules:
+            if module_key(name) != name:
+                raise ValueError(f"module identity {name!r} is not canonical")
+        if modules and self.modules_basis is None:
+            raise ValueError("modules need a basis stating where they were read from")
+        if self.modules_basis is not None and not modules:
+            raise ValueError("a modules basis needs modules")
+        command = self.command.strip() if self.command is not None else None
+        if command is not None and not command:
+            raise ValueError("command cannot be blank")
         refs = _canonical_ids(self.evidence_refs, label="cell evidence refs")
 
         if executed and self.executed_count != len(executed):
@@ -121,6 +136,7 @@ class CellTarget(BaseModel):
         object.__setattr__(self, "flaky_count", flaky_count)
         object.__setattr__(self, "flaky_ids", flaky)
         object.__setattr__(self, "modules", modules)
+        object.__setattr__(self, "command", command)
         object.__setattr__(self, "evidence_refs", refs)
         return self
 
@@ -130,7 +146,7 @@ class TargetRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = TARGET_RECORD_SCHEMA_VERSION
+    schema_version: Literal[2] = TARGET_RECORD_SCHEMA_VERSION
     repo: str = Field(min_length=3, max_length=256)
     sha: str = Field(min_length=7, max_length=64)
     harvested_at: str = Field(min_length=1, max_length=64)

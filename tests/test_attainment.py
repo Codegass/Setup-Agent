@@ -46,8 +46,11 @@ def _cell(**overrides) -> CellTarget:
         "executed_count": 4,
         "red_count": 0,
         "grade": "A",
+        "modules": (".",),
     }
     payload.update(overrides)
+    if payload.get("modules"):
+        payload.setdefault("modules_basis", "log")
     return CellTarget(**payload)
 
 
@@ -64,9 +67,12 @@ def _record(cell: CellTarget, *, other: CellTarget | None = None) -> TargetRecor
 
 def _view(**overrides) -> CertificateView:
     payload = {
+        "repo": "apache/tomcat-jakartaee-migration",
+        "target_sha": "50c811bffa4da6e48f5661e6a5a7763ffccdad46",
         "authority_ok": True,
         "counts_receipt_bound": True,
         "build_ok": True,
+        "modules": (".",),
         "executed_count": 4,
         "red_count": 0,
     }
@@ -356,26 +362,24 @@ class TestExceededStrictness:
     def test_a_target_without_modules_is_not_exceeded_by_naming_some(self):
         cell = _cell(executed_count=52, red_count=0, modules=())
         result = _judge(_view(executed_count=52, modules=("core", "extra")), cell)
-        assert result.verdict == "met"
-        assert result.alpha_build == Pair(numerator=1, denominator=1)
+        assert result.verdict == "partial"
+        assert result.alpha_build is result.alpha is None
 
     def test_an_unmeasured_test_universe_is_never_strictly_beaten(self):
         """A grade-B zero is unmeasured, not measured at zero, so no run beats it."""
 
         cell = _cell(executed_count=0, red_count=0, grade="B")
         result = _judge(_view(executed_count=5), cell)
-        assert result.verdict == "met"
-        assert result.alpha_test is None
+        assert result.verdict == "partial"
+        assert result.alpha_test is result.alpha is None
         assert TARGET_TEST_UNIVERSE_EMPTY in result.reason_codes
 
-    def test_extra_modules_are_exceeded_even_below_the_execution_target(self):
-        """Spec 4.3 puts the strict-superset arm ahead of the coverage arm."""
+    def test_extra_modules_do_not_hide_an_execution_shortfall(self):
+        """Exceeding one axis cannot compensate for missing the other."""
 
         cell = _cell(executed_count=10, red_count=0, modules=("core",))
         result = _judge(_view(executed_count=5, modules=("core", "extra")), cell)
-        assert result.verdict == "exceeded"
-        # The shortfall is not swallowed by the verdict: alpha and the reason
-        # code still carry it.
+        assert result.verdict == "partial"
         assert result.alpha == Pair(numerator=5, denominator=10)
         assert EXECUTION_BELOW_TARGET in result.reason_codes
 
@@ -383,7 +387,7 @@ class TestExceededStrictness:
         cell = _cell(executed_count=52, red_count=0, modules=())
         result = _judge(_view(executed_count=52, build_ok=False), cell)
         assert result.built is False
-        assert result.alpha_build == Pair(numerator=0, denominator=1)
+        assert result.alpha_build is result.alpha is None
         assert result.verdict == "partial"
         assert BUILD_AXIS_NOT_SUCCESSFUL in result.reason_codes
 
@@ -397,12 +401,12 @@ class TestTargetShapes:
         assert TARGET_WITHOUT_COUNTS in result.reason_codes
         assert result.alpha is None
 
-    def test_a_grade_b_cell_without_counts_is_vacuously_covered_and_says_so(self):
+    def test_a_grade_b_cell_without_counts_cannot_establish_overall_attainment(self):
         cell = _cell(executed_count=0, red_count=0, grade="B")
         result = _judge(_view(executed_count=0), cell)
-        assert result.verdict == "met"
-        assert result.alpha_test is None
-        assert result.alpha == Pair(numerator=1, denominator=1)
+        assert result.verdict == "partial"
+        assert result.alpha_test is result.alpha is None
+        assert result.alpha_build == Pair(numerator=1, denominator=1)
         assert TARGET_TEST_UNIVERSE_EMPTY in result.reason_codes
 
     def test_a_record_without_a_matched_cell_cannot_be_compared(self):
@@ -434,6 +438,7 @@ class TestTomcatShaped:
             executed_count=52,
             red_count=0,
             modules=(".",),
+            modules_basis="log",
             grade="A",
             evidence_refs=("workflow:ci.yml",),
         )
@@ -461,8 +466,216 @@ class TestTomcatShaped:
         certificate = evaluate_java_success_certificate(
             JavaCertificateInput.model_validate(inputs["tomcat-jakartaee-migration"])
         )
-        result = _judge(view_from_certificate(certificate), self._cell())
+        result = _judge(
+            view_from_certificate(certificate, repo="apache/tomcat-jakartaee-migration"),
+            self._cell(),
+        )
         assert result.verdict == "met"
         assert result.executed_observed == 52
         assert result.red_observed == 0
         assert result.alpha == Pair(numerator=52, denominator=52)
+
+
+def test_build_axis_grades_receipt_modules_against_the_cells_universe():
+    cell = _cell(modules=("clients", "core", "storage/storage-api"), modules_basis="log")
+    view = _view(modules=(":clients", "storage/api"))
+
+    result = evaluate_attainment(view, _record(cell))
+
+    assert result.build_form == "modules"
+    assert result.modules_basis == "log"
+    assert result.alpha_build == Pair(numerator=1, denominator=3)
+    assert result.missing_module_ids == ("core", "storage/storage-api")
+    assert result.unmatched_observed_module_ids == ("storage/api",)
+    assert result.built is False
+
+
+def test_a_cell_without_modules_discloses_conclusion_without_scoring_scope():
+    result = evaluate_attainment(_view(), _record(_cell(modules=())))
+
+    assert result.build_form == "conclusion"
+    assert result.modules_basis is None
+    assert result.unmatched_observed_module_ids == ()
+
+
+def test_lifecycle_parity_rides_the_result_and_never_the_score():
+    cell = _cell(command="mvn -V test --file pom.xml")
+    view = _view(commands=("mvn --fail-at-end compile", "mvn test"))
+
+    result = evaluate_attainment(view, _record(cell))
+
+    assert result.lifecycle_parity is not None
+    assert result.lifecycle_parity.status == "equivalent"
+    assert result.verdict == evaluate_attainment(_view(), _record(_cell())).verdict
+
+
+def test_no_command_on_either_side_means_no_parity_claim():
+    assert evaluate_attainment(_view(), _record(_cell())).lifecycle_parity is None
+
+
+@pytest.mark.parametrize(
+    "field, value, reason",
+    [
+        ("repo", None, "COMPARISON_SUBJECT_UNAVAILABLE"),
+        ("target_sha", None, "COMPARISON_SUBJECT_UNAVAILABLE"),
+        ("repo", "other/tomcat-jakartaee-migration", "COMPARISON_SUBJECT_MISMATCH"),
+        ("target_sha", "a" * 40, "COMPARISON_SUBJECT_MISMATCH"),
+        ("target_sha", "50c811b", "COMPARISON_SUBJECT_MISMATCH"),
+    ],
+)
+def test_only_the_same_repository_and_exact_revision_admit_a_comparison(field, value, reason):
+    result = _judge(_view(**{field: value}), _cell())
+    assert result.verdict == "invalid"
+    assert result.valid is False
+    assert result.alpha is result.alpha_build is result.alpha_test is None
+    assert reason in result.reason_codes
+
+
+def test_adapter_carries_revision_but_does_not_invent_repository():
+    certificate = TestCertificateAdapter()._tomcat_certificate()
+    view = view_from_certificate(certificate)
+    assert view.target_sha == certificate.target_sha
+    assert view.repo is None
+    assert _judge(view, _cell()).verdict == "invalid"
+
+
+@pytest.mark.parametrize("executed, modules", [(2, ("core",)), (4, ("core", "io"))])
+def test_removing_either_target_universe_never_improves_attainment(executed, modules):
+    view = _view(executed_count=executed, modules=modules)
+    cell = _cell(grade="B", modules=("core", "io"))
+    baseline = _judge(view, cell)
+    for missing in (
+        _cell(grade="B", modules=()),
+        _cell(grade="B", modules=("core", "io"), executed_count=0),
+        _cell(grade="B", modules=(), executed_count=0),
+    ):
+        result = _judge(view, missing)
+        assert ATTAINMENT_ORDER[result.verdict] <= ATTAINMENT_ORDER[baseline.verdict]
+        assert result.alpha is None
+        assert result.verdict == "partial"
+
+
+def test_module_names_cannot_overrule_an_unsuccessful_local_build():
+    result = _judge(_view(build_ok=False, modules=("core",)), _cell(modules=("core",)))
+    assert not result.built
+    assert result.verdict == "partial"
+    assert BUILD_AXIS_NOT_SUCCESSFUL in result.reason_codes
+
+
+def test_removing_scope_keeps_an_existing_new_red_failure():
+    view = _view(red_count=1)
+    result = _judge(view, _cell(modules=()))
+    assert result.verdict == "not_met"
+    assert result.alpha is result.alpha_build is None
+    assert result.alpha_test == Pair(numerator=4, denominator=4)
+
+
+def test_result_reader_rejects_conclusion_disguised_as_scope_fraction():
+    payload = _judge(_view(), _cell(modules=())).model_dump()
+    payload["alpha_build"] = {"numerator": 1, "denominator": 1}
+    with pytest.raises(ValidationError, match="conclusion supplies no module fraction"):
+        AttainmentResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "reader", [AttainmentResult.model_validate, AttainmentResult.model_validate_json]
+)
+@pytest.mark.parametrize(
+    "view_changes, cell_changes, changes",
+    [
+        ({}, {}, {"valid": False}),
+        ({}, {}, {"target_usable": False}),
+        ({}, {"grade": "A", "executed_count": 0}, {"target_usable": True}),
+        (
+            {},
+            {"grade": "B", "executed_count": 0},
+            {
+                "verdict": "met",
+                "alpha": {"numerator": 1, "denominator": 1},
+                "alpha_test": {"numerator": 1, "denominator": 1},
+            },
+        ),
+        ({"executed_count": 2}, {}, {"verdict": "met"}),
+        ({}, {}, {"verdict": "exceeded"}),
+        ({"executed_count": 5}, {}, {"verdict": "met"}),
+        ({"modules": ()}, {}, {"built": True, "verdict": "met"}),
+        ({}, {}, {"alpha_test": {"numerator": 8, "denominator": 8}}),
+        ({"executed_count": 2}, {}, {"alpha": {"numerator": 1, "denominator": 1}}),
+        ({}, {}, {"alpha_build": {"numerator": 2, "denominator": 1}}),
+        ({}, {}, {"alpha": None}),
+        ({}, {}, {"modules_target": 0, "modules_matched": 0}),
+        ({}, {}, {"missing_module_ids": ("core",)}),
+        ({"red_count": 1}, {}, {"clean": True, "verdict": "met"}),
+        ({"build_ok": False}, {}, {"built": True, "verdict": "met"}),
+        (
+            {"authority_ok": False},
+            {},
+            {
+                "valid": True,
+                "verdict": "met",
+                "alpha": {"numerator": 4, "denominator": 4},
+                "alpha_test": {"numerator": 4, "denominator": 4},
+                "alpha_build": {"numerator": 1, "denominator": 1},
+            },
+        ),
+    ],
+)
+def test_result_reader_rejects_claims_that_contradict_echoed_facts(
+    reader, view_changes, cell_changes, changes
+):
+    payload = _judge(_view(**view_changes), _cell(**cell_changes)).model_dump(mode="json")
+    payload.update(changes)
+    value = json.dumps(payload) if reader.__name__ == "model_validate_json" else payload
+    with pytest.raises(ValidationError):
+        reader(value)
+
+
+@pytest.mark.parametrize("authority_ok", [False, True])
+@pytest.mark.parametrize("build_ok", [False, True])
+@pytest.mark.parametrize("executed", [0, 2, 4, 5])
+@pytest.mark.parametrize("modules", [(), (".",), (".", "extra")])
+@pytest.mark.parametrize("target_modules", [(), (".",), (".", "core")])
+def test_evaluated_result_round_trips_at_reader_boundaries(
+    authority_ok, build_ok, executed, modules, target_modules
+):
+    result = _judge(
+        _view(
+            authority_ok=authority_ok, build_ok=build_ok, executed_count=executed, modules=modules
+        ),
+        _cell(modules=target_modules),
+    )
+    assert AttainmentResult.model_validate(result.model_dump()) == result
+    assert AttainmentResult.model_validate_json(result.model_dump_json()) == result
+
+
+def test_result_reader_preserves_identity_based_red_comparison():
+    # Equal red counts cannot hide a newly red identity.
+    view = _view(executed_ids=("a", "b", "c", "d"), red_count=1, red_ids=("b",))
+    cell = _cell(executed_ids=("a", "b", "c", "d"), red_count=1, red_ids=("a",))
+    result = _judge(view, cell)
+    assert result.clean_form == "ids"
+    assert result.verdict == "not_met"
+    assert AttainmentResult.model_validate_json(result.model_dump_json()) == result
+    payload = result.model_dump()
+    payload.update(clean=True, verdict="met")
+    with pytest.raises(ValidationError, match="cleanliness"):
+        AttainmentResult.model_validate(payload)
+
+
+def test_result_reader_preserves_known_flaky_identity_without_inventing_count_failure():
+    view = _view(executed_ids=("a", "b", "c", "d"), red_count=1, red_ids=("b",))
+    cell = _cell(executed_ids=("a", "b", "c", "d"), flaky_count=1, flaky_ids=("b",))
+    result = _judge(view, cell)
+    assert result.clean_form == "ids"
+    assert result.red_observed > result.red_target
+    assert result.verdict == "met"
+    assert AttainmentResult.model_validate_json(result.model_dump_json()) == result
+
+
+@pytest.mark.parametrize("field", ["missing_module_ids", "unmatched_observed_module_ids"])
+def test_result_reader_rejects_duplicate_module_identities(field):
+    result = _judge(_view(modules=()), _cell(modules=("a", "b")))
+    payload = result.model_dump()
+    payload[field] = ("a", "a")
+    with pytest.raises(ValidationError, match="duplicate"):
+        AttainmentResult.model_validate(payload)

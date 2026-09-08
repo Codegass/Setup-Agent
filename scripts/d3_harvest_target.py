@@ -50,10 +50,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
+import posixpath
 import re
+import shlex
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,8 +69,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from sag.metrics.build_scope import (
+    gradle_declared_projects,
+    gradle_project_directories,
+    maven_declared_modules,
+    parse_ci_command,
+)
+from sag.metrics.ci_logs import job_logs, modules_from_log
 from sag.metrics.ci_vetting import (  # noqa: E402
     LaunderingVet,
+    extract_build_commands,
     extract_cell_jdk,
     extract_cell_os,
     match_cell,
@@ -78,6 +90,7 @@ from sag.metrics.junit_deconvolution import (  # noqa: E402
     deconvolve,
     parse_junit_entries,
 )
+from sag.metrics.module_keys import module_key, module_keys
 from sag.metrics.target_record import (  # noqa: E402
     BuildOutcome,
     CellTarget,
@@ -92,6 +105,8 @@ METADATA_FILE = "run-metadata.json"
 ARTIFACTS_FILE = "run-artifacts.json"
 WORKFLOWS_DIR = "workflows"
 RECORD_FILE = "target_record.json"
+LOGS_GLOB = "run-*-logs.zip"
+SOURCES_DIR = "sources"
 
 # The record layer rejects an identity past 512 characters, and a pool the size
 # of kafka's would bury the record under 36,259 of them.  Past either bound the
@@ -165,6 +180,8 @@ class PoolReading(BaseModel):
     artifact: str
     deconvolved: Deconvolved
     unreadable: tuple[str, ...] = ()
+    modules: tuple[str, ...] = ()
+    layout: str = "unknown"
 
 
 class HarvestedCell(BaseModel):
@@ -231,16 +248,55 @@ def pool_cell_id(pool_id: str) -> str:
     return pool_id if major is None else f"{pool_id} (jdk {major})"
 
 
+# Where a report lives inside an uploaded pool.  A pool that uploaded whole
+# report directories keeps the build's own marker; kafka's upload flattens to
+# `<module>/<pool-id>/<file>`, so the module is everything before the last two
+# segments; a single-file upload is the root.
+_REPORT_DIR_MARKERS = (
+    "build/test-results/",
+    "target/surefire-reports/",
+    "target/failsafe-reports/",
+)
+
+
+def pool_member_module(name: str) -> str:
+    """The canonical module key one pool member's path encodes."""
+
+    path = name.strip("/")
+    for marker in _REPORT_DIR_MARKERS:
+        head, separator, _ = path.partition(marker)
+        if separator:
+            return module_key(head or ".")
+    parts = path.split("/")
+    if len(parts) >= 3:
+        return module_key("/".join(parts[:-2]))
+    if len(parts) == 2:
+        return module_key(parts[0])
+    return "."
+
+
+def _pool_layout(names: list[str]) -> str:
+    if any(marker in name for name in names for marker in _REPORT_DIR_MARKERS):
+        return "report-directory"
+    if any(name.count("/") >= 2 for name in names):
+        return "upload-prefix"
+    return "flat"
+
+
 def read_pool(pool_path: Path) -> PoolReading:
     """Parse and deconvolve every JUnit XML in one pool zip.
 
     Sorted-name order is the document order deconvolution reads: a retry lives
     beside its first attempt in the same suite file, and sorting keeps every
-    pool's assembly reproducible.
+    pool's assembly reproducible.  The member paths are read a second way, for
+    the modules they name: a pool proves a module ran tests, which is the
+    lower bound of what the build built.
     """
 
     entries: list[TestEntry] = []
     unreadable: list[str] = []
+    modules: list[str] = []
+    names: list[str] = []
     try:
         with zipfile.ZipFile(pool_path) as archive:
             names = sorted(name for name in archive.namelist() if name.endswith(".xml"))
@@ -249,6 +305,8 @@ def read_pool(pool_path: Path) -> PoolReading:
                     entries.extend(parse_junit_entries(archive.read(name)))
                 except ValueError:
                     unreadable.append(name)
+                    continue
+                modules.append(pool_member_module(name))
     except (OSError, zipfile.BadZipFile) as exc:
         raise HarvestError(f"{pool_path.name} is not a readable pool archive: {exc}") from exc
 
@@ -257,6 +315,8 @@ def read_pool(pool_path: Path) -> PoolReading:
         artifact=pool_path.name,
         deconvolved=deconvolve(tuple(entries)),
         unreadable=tuple(unreadable),
+        modules=module_keys(modules) if modules else (),
+        layout=_pool_layout(names),
     )
 
 
@@ -312,6 +372,13 @@ def cell_from_pool(reading: PoolReading) -> HarvestedCell:
             "than once and are kept as separate executions"
         )
 
+    if reading.modules:
+        notes.append(
+            f"cell {cell_id}: modules are the test-bearing lower bound read from the "
+            f"pool's report paths ({len(reading.modules)} modules, layout {reading.layout}); "
+            "modules without tests are not visible here"
+        )
+
     cell = CellTarget(
         cell_id=cell_id,
         build="failed" if result.final_red_ids else "ok",
@@ -322,6 +389,8 @@ def cell_from_pool(reading: PoolReading) -> HarvestedCell:
         flaky_count=len(result.flaky_ids),
         flaky_ids=flaky_ids,
         skipped=len(result.final_skipped_ids),
+        modules=reading.modules,
+        modules_basis="test_bearing" if reading.modules else None,
         grade="A",
         evidence_refs=(reading.artifact,),
     )
@@ -465,6 +534,220 @@ def select_matched_cell(
     return widest.cell_id, tuple(notes)
 
 
+def _with_modules(cell: CellTarget, modules: tuple[str, ...], basis: str) -> CellTarget:
+    """A cell restated with a module universe; re-validated, never patched."""
+
+    payload = cell.model_dump(mode="json")
+    payload.update(modules=modules, modules_basis=basis)
+    return CellTarget(**payload)
+
+
+def _cell_for_job(cells: list[CellTarget], pool_ids: list[str], job_name: str) -> int | None:
+    """Index of the cell a job log belongs to: its own check, or the pool covering it."""
+
+    for index, cell in enumerate(cells):
+        if cell.cell_id == job_name:
+            return index
+    covering = [pool_id for pool_id in pool_ids if pool_covers_check(pool_id, job_name)]
+    if len(covering) != 1:
+        return None
+    wanted = pool_cell_id(covering[0])
+    return next((index for index, cell in enumerate(cells) if cell.cell_id == wanted), None)
+
+
+def apply_job_logs(
+    snapshot_dir: Path, cells: list[CellTarget], pool_ids: list[str]
+) -> tuple[str, ...]:
+    """Replace pool lower bounds with the exact universe a job log proves."""
+
+    notes: list[str] = []
+    for zip_path in sorted(snapshot_dir.glob(LOGS_GLOB)):
+        try:
+            logs = job_logs(zip_path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            notes.append(f"{zip_path.name} could not be read as a log archive: {exc}")
+            continue
+        for job_name, text in logs.items():
+            index = _cell_for_job(cells, pool_ids, job_name)
+            if index is None:
+                continue
+            found = modules_from_log(text)
+            if not found.modules:
+                continue
+            previous = cells[index].modules if cells[index].modules_basis == "log" else ()
+            cells[index] = _with_modules(
+                cells[index], module_keys((*previous, *found.modules)), "log"
+            )
+            detail = f"{len(found.modules)} modules built"
+            if found.failed or found.skipped:
+                detail += f", {found.failed} failed, {found.skipped} skipped"
+            notes.append(
+                f"cell {cells[index].cell_id}: modules read from the job log "
+                f"{zip_path.name}/{job_name} ({found.tool}; {detail})"
+            )
+    return tuple(notes)
+
+
+_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\}\}")
+
+
+def _job_matches_check(template: str, check_name: str) -> bool:
+    """A job's `name:` template names a check when its literal tokens all appear."""
+
+    pieces = _EXPRESSION_RE.split(template)
+    pattern = ".*?".join(re.escape(piece) for piece in pieces)
+    if re.fullmatch(pattern, check_name, re.IGNORECASE):
+        return True
+    literal = name_signature(_EXPRESSION_RE.sub(" ", template))
+    return bool(literal) and literal <= name_signature(check_name)
+
+
+def _source_path(root: Path, relative: str) -> Path | None:
+    """Resolve an archived source without granting the archive filesystem access."""
+
+    if "\\" in relative or Path(relative).is_absolute():
+        return None
+    candidate = (root / relative).resolve()
+    return candidate if candidate.is_relative_to(root.resolve()) else None
+
+
+def apply_declared_scope(
+    snapshot_dir: Path,
+    cells: list[CellTarget],
+    workflow_files: tuple[str, ...],
+    *,
+    repo: str,
+    sha: str,
+) -> tuple[str, ...]:
+    """Attach the CI command to each cell and, absent a log, the declared reactor."""
+
+    notes: list[str] = []
+    steps = []
+    for file_name in workflow_files:
+        text = (snapshot_dir / WORKFLOWS_DIR / file_name).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        steps.extend(extract_build_commands(text))
+    if not steps:
+        return ()
+    sources = snapshot_dir / SOURCES_DIR
+    for index, cell in enumerate(cells):
+        matching = [
+            step for step in steps if _job_matches_check(step.job_name_template, cell.cell_id)
+        ]
+        if len({(step.text, step.working_directory) for step in matching}) != 1:
+            continue
+        step = matching[0]
+        command = parse_ci_command(step.text)
+        recorded_command = (
+            step.text
+            if step.working_directory == "."
+            else (f"cd {shlex.quote(step.working_directory)} &&\n{step.text}")
+        )
+        if len(recorded_command) > 2_000:
+            notes.append(f"cell {cell.cell_id}: CI command exceeds the text bound")
+            continue
+        payload = cell.model_dump(mode="json")
+        payload["command"] = recorded_command
+        cells[index] = CellTarget(**payload)
+        if command.unsupported_scope_reason:
+            notes.append(
+                f"cell {cell.cell_id}: declared scope unavailable ({command.unsupported_scope_reason})"
+            )
+            continue
+        notes.append(
+            f"cell {cell.cell_id}: working directory {step.working_directory!r} from {step.working_directory_source}"
+        )
+        if any(marker in step.working_directory for marker in ("$", "`", "~")):
+            notes.append(
+                f"cell {cell.cell_id}: declared scope unavailable (working directory unresolved)"
+            )
+            continue
+        working_root = _source_path(sources, step.working_directory)
+        project_root = (
+            _source_path(working_root, command.project_dir or ".") if working_root else None
+        )
+        if project_root is None:
+            notes.append(
+                f"cell {cell.cell_id}: CI project directory leaves the archived repository"
+            )
+            continue
+        declared: tuple[str, ...] = ()
+        if command.tool == "gradle":
+            settings = next(
+                (
+                    project_root / name
+                    for name in ("settings.gradle", "settings.gradle.kts")
+                    if (project_root / name).is_file()
+                ),
+                None,
+            )
+            if settings is not None and _source_is_verified(
+                settings, repo, sha, settings.relative_to(sources.resolve()).as_posix()
+            ):
+                settings_text = settings.read_text(encoding="utf-8", errors="replace")
+                directories = gradle_project_directories(settings_text)
+                # A directory remap changes names, never the log's observed universe.
+                if cell.modules_basis == "log":
+                    remapped = module_keys(directories.get(key, key) for key in cell.modules)
+                    cells[index] = _with_modules(cells[index], remapped, "log")
+                    if remapped != cell.modules:
+                        notes.append(
+                            f"cell {cell.cell_id}: job log module paths resolved through settings projectDir mappings"
+                        )
+                else:
+                    declared = gradle_declared_projects(settings_text)
+                    selected = {
+                        module_key(task.rsplit(":", 1)[0])
+                        for task in command.goals
+                        if task.startswith(":") and ":" in task[1:]
+                    }
+                    # Qualified tasks alone select their projects; an unqualified
+                    # task may address the complete declared multi-project build.
+                    if selected and all(task.startswith(":") for task in command.goals):
+                        declared = (
+                            module_keys(directories.get(key, key) for key in selected)
+                            if selected <= directories.keys()
+                            else ()
+                        )
+        elif command.tool == "maven" and cell.modules_basis != "log":
+            pom = _source_path(project_root, command.build_file or "pom.xml")
+            if pom is not None and pom.is_dir():
+                pom /= "pom.xml"
+            if pom is not None and _source_is_verified(
+                pom, repo, sha, pom.relative_to(sources.resolve()).as_posix()
+            ):
+
+                def read_pom(relative_dir: str) -> str | None:
+                    child = _source_path(
+                        sources,
+                        str((pom.parent / relative_dir / "pom.xml").relative_to(sources.resolve())),
+                    )
+                    if child is None or not _source_is_verified(
+                        child, repo, sha, child.relative_to(sources.resolve()).as_posix()
+                    ):
+                        return None
+                    return child.read_text(encoding="utf-8", errors="replace")
+
+                declared = maven_declared_modules(
+                    pom.read_text(encoding="utf-8", errors="replace"),
+                    read_pom,
+                    active_profiles=command.profiles,
+                    projects=command.projects,
+                )
+        if declared:
+            cells[index] = _with_modules(cells[index], declared, "declared")
+            notes.append(
+                f"cell {cells[index].cell_id}: modules are the declared reactor under "
+                f"`{payload['command']}` ({len(declared)} modules)"
+            )
+        elif cell.modules_basis != "log":
+            notes.append(
+                f"cell {cell.cell_id}: declared scope unavailable from the archived build definition"
+            )
+    return tuple(notes)
+
+
 def assemble_target_record(
     snapshot_dir: Path,
     *,
@@ -551,6 +834,9 @@ def assemble_target_record(
     if duplicates:
         notes.append(f"{duplicates} repeated check names were collapsed into their first cell")
 
+    notes.extend(apply_job_logs(snapshot_dir, cells, pool_ids))
+    notes.extend(apply_declared_scope(snapshot_dir, cells, workflow_files, repo=repo, sha=sha))
+
     matched_cell: str | None = None
     if jdk_major is not None:
         matched_cell, match_notes = select_matched_cell(tuple(cells), jdk_major)
@@ -626,8 +912,12 @@ def harvest_from_dir(
     """Assemble, write and digest one target record from a snapshot directory."""
 
     found_repo, found_sha = identify_revision(snapshot_dir)
+    if repo and found_repo and repo != found_repo:
+        raise HarvestError("requested repository differs from the archived snapshot")
+    if sha and found_sha and not found_sha.startswith(sha):
+        raise HarvestError("requested commit differs from the archived snapshot")
     repo = repo or found_repo
-    sha = sha or found_sha
+    sha = found_sha or sha
     if not repo:
         raise HarvestError("the snapshot does not name its repository; pass --repo")
     if not sha:
@@ -714,9 +1004,25 @@ def download(path: str, destination: Path) -> None:
 # additionally report a virtual path under dynamic/ that is not a fetchable
 # workflow file.
 NOISE_WORKFLOWS = (
-    "codeql", "dependabot", "copilot", "label", "stale", "docs", "website",
-    "site", "sonar", "triage", "comment", "notify", "lint-pr", "semantic",
-    "dco", "analyze", "dependency review", "license", "scorecard",
+    "codeql",
+    "dependabot",
+    "copilot",
+    "label",
+    "stale",
+    "docs",
+    "website",
+    "site",
+    "sonar",
+    "triage",
+    "comment",
+    "notify",
+    "lint-pr",
+    "semantic",
+    "dco",
+    "analyze",
+    "dependency review",
+    "license",
+    "scorecard",
 )
 
 
@@ -833,7 +1139,143 @@ def fetch_snapshot(repo: str, sha: str, out_dir: Path) -> Path:
             workflows = out_dir / WORKFLOWS_DIR
             workflows.mkdir(parents=True, exist_ok=True)
             (workflows / Path(workflow_path).name).write_bytes(base64.b64decode(content))
+    fetch_logs(repo, out_dir)
+    fetch_sources(repo, sha, out_dir)
     return out_dir
+
+
+_MAX_POM_FETCHES = 400
+
+
+def fetch_logs(repo: str, snapshot_dir: Path) -> tuple[str, ...]:
+    """Download each signal run's log archive; an expired log is a note, not a failure."""
+
+    index_path = snapshot_dir / "runs-index.json"
+    if not index_path.exists():
+        return ("no runs-index.json; nothing to fetch logs for",)
+    notes: list[str] = []
+    for run in _read_json(index_path) or []:
+        if not isinstance(run, dict) or _is_noise_run(run):
+            continue
+        if run.get("status") not in (None, "completed"):
+            continue
+        run_id = run.get("id")
+        if not isinstance(run_id, int):
+            continue
+        destination = snapshot_dir / f"run-{run_id}-logs.zip"
+        if destination.exists():
+            continue
+        try:
+            download(f"repos/{repo}/actions/runs/{run_id}/logs", destination)
+        except HarvestError as exc:
+            # GitHub keeps logs for 90 days; past that the API answers 410.
+            (snapshot_dir / f"run-{run_id}-logs.missing").write_text(str(exc), encoding="utf-8")
+            notes.append(f"run {run_id}: logs unavailable ({exc})")
+    return tuple(notes)
+
+
+def _source_is_verified(destination: Path, repo: str, sha: str, path: str) -> bool:
+    """Admit only bytes tied to this exact repository, commit and source path."""
+    try:
+        origin = json.loads(destination.with_name(destination.name + ".origin.json").read_text())
+        return origin == {
+            "repo": repo,
+            "sha": sha,
+            "path": posixpath.normpath(path),
+            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+        }
+    except (OSError, ValueError):
+        return False
+
+
+def _fetch_source(repo: str, sha: str, path: str, destination: Path) -> bool:
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        raise HarvestError("source provenance requires an exact commit SHA")
+    if _source_is_verified(destination, repo, sha, path):
+        return True
+    try:
+        body = fetch(f"repos/{repo}/contents/{path}?ref={sha}")
+    except HarvestError:
+        return False
+    content = body.get("content") if isinstance(body, dict) else None
+    if not isinstance(content, str):
+        return False
+    if body.get("type") != "file" or body.get("encoding") != "base64":
+        return False
+    try:
+        raw = base64.b64decode("".join(content.split()), validate=True)
+    except ValueError:
+        return False
+    if destination.exists() and destination.read_bytes() != raw:
+        raise HarvestError(f"existing source {path} does not match {repo}@{sha}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(raw)
+    origin = {
+        "repo": repo,
+        "sha": sha,
+        "path": posixpath.normpath(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    destination.with_name(destination.name + ".origin.json").write_text(
+        canonical_json(origin), encoding="utf-8"
+    )
+    return True
+
+
+def fetch_sources(repo: str, sha: str, snapshot_dir: Path) -> tuple[str, ...]:
+    """Fetch the build definition files the declared rung reads, at the pinned sha."""
+
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        revision = fetch(f"repos/{repo}/commits/{sha}")
+        resolved = revision.get("sha") if isinstance(revision, dict) else None
+        if not isinstance(resolved, str) or not re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", resolved
+        ):
+            raise HarvestError("source reference did not resolve to an exact commit SHA")
+        sha = resolved
+    sources = snapshot_dir / SOURCES_DIR
+    notes: list[str] = []
+    for name in ("settings.gradle", "settings.gradle.kts"):
+        if _fetch_source(repo, sha, name, sources / name):
+            notes.append(f"fetched {name}")
+    if not _fetch_source(repo, sha, "pom.xml", sources / "pom.xml"):
+        return tuple(notes) or ("no build definition file found at the root",)
+    notes.append("fetched pom.xml")
+    # Walk the reactor: every child pom named by a <module>, bounded.
+    pending = ["."]
+    visited: set[str] = set()
+    fetched = 0
+    while pending and fetched < _MAX_POM_FETCHES:
+        directory = pending.pop(0)
+        if directory in visited:
+            continue
+        visited.add(directory)
+        pom_path = _source_path(sources, f"{directory}/pom.xml")
+        if pom_path is None or not pom_path.is_file():
+            continue
+        try:
+            root = ET.fromstring(pom_path.read_text(encoding="utf-8", errors="replace"))
+        except ET.ParseError:
+            continue
+        for node in root.iter():
+            if node.tag.rsplit("}", 1)[-1] != "module" or not (node.text or "").strip():
+                continue
+            child = node.text.strip()
+            child_dir = posixpath.normpath(posixpath.join(directory, child))
+            child_pom = _source_path(sources, f"{child_dir}/pom.xml")
+            if child_pom is None or "$" in child_dir:
+                notes.append(f"unresolved module path in {directory}/pom.xml: {child[:200]}")
+                continue
+            if child_dir in visited or child_dir in pending:
+                continue
+            fetched += 1
+            if _fetch_source(repo, sha, f"{child_dir}/pom.xml", child_pom):
+                pending.append(child_dir)
+            if fetched >= _MAX_POM_FETCHES:
+                break
+    if fetched >= _MAX_POM_FETCHES:
+        notes.append(f"reactor walk stopped at {_MAX_POM_FETCHES} poms")
+    return tuple(notes)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -854,6 +1296,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="the harvest timestamp to record (default: now, UTC)",
     )
+    parser.add_argument(
+        "--fetch-logs",
+        action="store_true",
+        help="download job logs into the snapshot (needs --repo)",
+    )
+    parser.add_argument(
+        "--fetch-sources",
+        action="store_true",
+        help="download settings.gradle/pom.xml at --sha into the snapshot",
+    )
     return parser
 
 
@@ -873,6 +1325,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             parser.error("pass --from-dir, or --repo with --sha and --out-dir")
             return 2
+        if args.fetch_logs or args.fetch_sources:
+            if not args.repo:
+                raise HarvestError("--fetch-logs/--fetch-sources need --repo")
+            if args.fetch_logs:
+                for note in fetch_logs(args.repo, snapshot_dir):
+                    print(f"D3 HARVEST: {note}", file=sys.stderr)
+            if args.fetch_sources:
+                if not args.sha:
+                    raise HarvestError("--fetch-sources needs --sha")
+                for note in fetch_sources(args.repo, args.sha, snapshot_dir):
+                    print(f"D3 HARVEST: {note}", file=sys.stderr)
         record, digest, destination = harvest_from_dir(
             snapshot_dir,
             repo=args.repo,

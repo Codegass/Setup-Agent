@@ -57,7 +57,9 @@ class TestCellTargetIdentitySets:
         assert cell.executed_ids == ("x" * 512,)
 
     def test_modules_and_evidence_refs_are_canonicalized_too(self):
-        cell = _cell(modules=(" core ", "clients"), evidence_refs=(" ref:b", "ref:a"))
+        cell = _cell(
+            modules=(" core ", "clients"), modules_basis="log", evidence_refs=(" ref:b", "ref:a")
+        )
         assert cell.modules == ("clients", "core")
         assert cell.evidence_refs == ("ref:a", "ref:b")
 
@@ -212,9 +214,9 @@ class TestLaunderedCells:
 
 class TestTargetRecordShape:
     def test_the_schema_version_is_pinned(self):
-        assert _record().schema_version == TARGET_RECORD_SCHEMA_VERSION == 1
+        assert _record().schema_version == TARGET_RECORD_SCHEMA_VERSION == 2
         with pytest.raises(ValidationError):
-            _record(schema_version=2)
+            _record(schema_version=1)
 
     def test_repo_must_be_owner_slash_name(self):
         assert _record(repo=" apache/kafka ").repo == "apache/kafka"
@@ -300,3 +302,46 @@ class TestTargetRecordDigest:
         assert target_record_sha256(_record()) != target_record_sha256(
             _record(matched_cell="JDK17 ubuntu-latest")
         )
+
+
+from sag.metrics.target_record import TARGET_RECORD_SCHEMA_VERSION, CellTarget
+
+
+def _grade_b(**overrides) -> CellTarget:
+    payload = {
+        "cell_id": "build (17)",
+        "build": "ok",
+        "executed_count": 0,
+        "red_count": 0,
+        "grade": "B",
+    }
+    payload.update(overrides)
+    return CellTarget(**payload)
+
+
+def test_schema_version_is_two_and_strict():
+    assert TARGET_RECORD_SCHEMA_VERSION == 2
+
+
+def test_modules_need_a_basis_and_a_basis_needs_modules():
+    with pytest.raises(ValueError, match="basis"):
+        _grade_b(modules=("clients",))
+    with pytest.raises(ValueError, match="modules"):
+        _grade_b(modules_basis="log")
+
+
+def test_modules_must_be_canonical_keys():
+    with pytest.raises(ValueError, match="canonical"):
+        _grade_b(modules=(":connect:api",), modules_basis="log")
+    cell = _grade_b(modules=("connect/api", "clients"), modules_basis="test_bearing")
+    assert cell.modules == ("clients", "connect/api")
+    assert cell.modules_basis == "test_bearing"
+
+
+def test_command_is_bounded_text_or_absent():
+    assert _grade_b().command is None
+    assert _grade_b(command="  mvn -V test --file pom.xml ").command == "mvn -V test --file pom.xml"
+    with pytest.raises(ValueError):
+        _grade_b(command="x" * 2_001)
+    with pytest.raises(ValueError, match="command"):
+        _grade_b(command="   ")

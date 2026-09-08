@@ -358,8 +358,7 @@ class TestMatchCell:
         assert match.cell_id == "JDK21 ubuntu-latest"
         assert match.exact is False
         assert match.caveat == (
-            "JDK17 is only proven on windows, not on linux; "
-            "matched the nearest above, JDK21"
+            "JDK17 is only proven on windows, not on linux; " "matched the nearest above, JDK21"
         )
 
     def test_a_linux_cell_below_outranks_an_exact_foreign_cell(self):
@@ -368,8 +367,7 @@ class TestMatchCell:
         assert match.cell_id == "JDK11 ubuntu-latest"
         assert match.exact is False
         assert match.caveat == (
-            "JDK17 is only proven on macos, not on linux; "
-            "matched the nearest below, JDK11"
+            "JDK17 is only proven on macos, not on linux; " "matched the nearest below, JDK11"
         )
 
     def test_an_inexact_windows_cell_is_never_substituted(self):
@@ -395,3 +393,61 @@ class TestMatchCell:
         match = match_cell((_cell("JDK17 ubuntu-latest"),), 17)
         with pytest.raises(Exception):
             match.exact = False
+
+
+from sag.metrics.ci_vetting import extract_build_commands
+
+MATRIX_WORKFLOW = """
+name: CI
+on: [push]
+jobs:
+  test:
+    name: JDK${{ matrix.java }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: mvn -V test --file pom.xml --no-transfer-progress
+  lint:
+    steps:
+      - run: echo lint
+"""
+
+
+def test_extract_build_commands_names_the_job_and_its_build_step():
+    steps = extract_build_commands(MATRIX_WORKFLOW)
+
+    assert len(steps) == 1
+    assert steps[0].job_id == "test"
+    assert steps[0].job_name_template == "JDK${{ matrix.java }} ${{ matrix.os }}"
+    assert steps[0].text == "mvn -V test --file pom.xml --no-transfer-progress"
+
+
+def test_an_unparseable_workflow_yields_no_commands():
+    assert extract_build_commands("jobs: [") == ()
+
+
+def test_build_step_preserves_effective_working_directory_and_its_origin():
+    from sag.metrics.ci_vetting import extract_build_commands
+
+    steps = extract_build_commands("""
+defaults:
+  run:
+    working-directory: workflow-root
+jobs:
+  one:
+    steps:
+      - run: mvn test
+  two:
+    defaults:
+      run:
+        working-directory: job-root
+    steps:
+      - run: mvn test
+      - run: mvn verify
+        working-directory: step-root
+""")
+    assert [(s.working_directory, s.working_directory_source) for s in steps] == [
+        ("workflow-root", "workflow_defaults"),
+        ("job-root", "job_defaults"),
+        ("step-root", "step"),
+    ]

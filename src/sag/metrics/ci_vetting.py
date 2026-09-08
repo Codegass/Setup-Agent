@@ -134,9 +134,7 @@ def _vet_actions_jobs(jobs: dict[Any, Any]) -> LaunderingVet:
             # A step builds or tests either through its shell text or through the
             # action it calls, so both name the command this step really runs.
             command = " ".join(
-                text
-                for text in (step.get("run"), step.get("uses"))
-                if isinstance(text, str)
+                text for text in (step.get("run"), step.get("uses")) if isinstance(text, str)
             )
             if _mentions_build_or_test(command):
                 locations.append(f"job:{job_id}/step:{index}")
@@ -153,9 +151,7 @@ def _vet_gitlab_jobs(document: dict[Any, Any]) -> LaunderingVet | None:
     ]
     if not job_ids:
         return None
-    locations = tuple(
-        f"job:{job_id}" for job_id in job_ids if _swallows_failure(document[job_id])
-    )
+    locations = tuple(f"job:{job_id}" for job_id in job_ids if _swallows_failure(document[job_id]))
     return LaunderingVet(laundered=bool(locations), locations=locations)
 
 
@@ -188,6 +184,71 @@ def vet_workflow_config(yaml_text: str) -> LaunderingVet:
     # A shape neither reader understands is disclosed as un-vetted; reporting it
     # clean would be indistinguishable from a config this module actually read.
     return LaunderingVet(laundered=False, locations=("unrecognized-shape",))
+
+
+class BuildCommandStep(BaseModel):
+    """One workflow step that builds or tests, with the job that runs it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    job_id: str
+    job_name_template: str
+    text: str
+    working_directory: str = "."
+    working_directory_source: str = "repository_root"
+
+
+def _step_directory(document: dict, job: dict, step: dict) -> tuple[str, str]:
+    """Resolve the YAML working-directory precedence without evaluating it."""
+    for owner, label in ((step, "step"), (job, "job_defaults"), (document, "workflow_defaults")):
+        config: dict[Any, Any] | None = owner
+        if label != "step":
+            defaults = owner.get("defaults")
+            config = defaults.get("run") if isinstance(defaults, dict) else None
+        if isinstance(config, dict) and "working-directory" in config:
+            value = config["working-directory"]
+            return (
+                (
+                    value.strip()
+                    if isinstance(value, str) and value.strip()
+                    else "${UNKNOWN_WORKING_DIRECTORY}"
+                ),
+                label,
+            )
+    return ".", "repository_root"
+
+
+def extract_build_commands(yaml_text: str) -> tuple[BuildCommandStep, ...]:
+    """Every `run:` step that mentions a build or test, in document order."""
+
+    try:
+        document = yaml.safe_load(yaml_text)
+    except yaml.YAMLError:
+        return ()
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return ()
+    found: list[BuildCommandStep] = []
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        name = job.get("name")
+        template = name if isinstance(name, str) else str(job_id)
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict) or not isinstance(step.get("run"), str):
+                continue
+            if _mentions_build_or_test(step["run"]):
+                working_directory, directory_source = _step_directory(document, job, step)
+                found.append(
+                    BuildCommandStep(
+                        job_id=str(job_id),
+                        job_name_template=template,
+                        text=step["run"].strip(),
+                        working_directory=working_directory,
+                        working_directory_source=directory_source,
+                    )
+                )
+    return tuple(found)
 
 
 def extract_cell_jdk(cell_id: str) -> int | None:
