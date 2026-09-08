@@ -7,6 +7,9 @@
   attainment) and supersedes the "production Java sources N/N" and
   "modules N/M as a verdict input" surfaces introduced by `885ae4a`.
 
+- **Owner clarification during implementation:** missing CI scope is not scored. A local build conclusion cannot become a synthetic 1/1 scope fraction. Missing modules or an unmeasured test universe withhold the overall attainment fraction and cannot establish met/exceeded; known single-axis facts remain visible.
+- **Measured implementation limit:** the frozen Kafka settings use a project-name alias and a composite build, not the literal `projectDir` assignment assumed in the sketch below. Its ambiguous log/pool attribution and unresolved alias remain disclosed; see the [frozen-battery report](../reports/d3-build-scope-20260907.md).
+
 ## The principle
 
 > The yardstick for a build is what the project's own CI built on the same

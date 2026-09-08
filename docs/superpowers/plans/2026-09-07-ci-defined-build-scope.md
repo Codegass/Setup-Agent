@@ -10,6 +10,16 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-07-ci-defined-build-scope-design.md` (decisions), SAG-MS-1 Part IV §22 (`docs/superpowers/specs/2026-08-27-sag-ms-1-measurement-standard.md`) for the attainment algebra.
 
+## Execution status
+
+A1–A9 and B1–B5 are complete. Final validation: 6828 Python tests passed, 22 skipped; 346 frontend tests passed; TypeScript/Vite build and formatting passed. Full mypy has the same 980 pre-existing errors, and all six CI-scope kernel files pass their type check. Work is committed by the external-target and runtime/presentation boundaries; reports record the real experiment limits and the deviations below.
+
+## Implementation decisions, 2026-09-07
+
+The owner confirmed **missing scope is not scored**. This supersedes A7's illustrative conclusion-to-1/1 fallback below: missing CI modules leave `alpha_build` and overall `alpha` unavailable; an unmeasured test universe leaves `alpha_test` and overall `alpha` unavailable. Known single-axis facts remain visible, but both axes must be measured before `met`/`exceeded`. Removing scope cannot improve attainment. The original step sketches remain below as the implementation history; the final code and regression tests implement this correction.
+
+The implementation also preserves complete workflow scripts and working-directory provenance, verifies cached source bytes at the exact commit, validates frozen checksums before migration, and isolates repair recovery by command run. See [architecture review](../reports/ci-defined-build-scope-review-20260907.md), [frozen battery](../reports/d3-build-scope-20260907.md), and [small-project ablations](../reports/ci-scope-small-projects-20260907.md) for final behavior and measured limits.
+
 ## Global Constraints
 
 - Counts come only from authoritative artifacts (receipts, sealed snapshots, harvested CI evidence); never from console text, model claims, or a disk scan used as a denominator.
@@ -60,7 +70,7 @@
 **Interfaces:**
 - Produces: `module_key(raw: object) -> str` (raises `ValueError` on empty), `module_keys(values: Iterable[object]) -> tuple[str, ...]` (sorted, unique).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_module_keys.py
@@ -118,12 +128,12 @@ def test_module_keys_sorts_and_dedupes_across_spellings():
     )
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_module_keys.py`
 Expected: FAIL with `ModuleNotFoundError: No module named 'sag.metrics.module_keys'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```python
 # src/sag/metrics/module_keys.py
@@ -175,12 +185,12 @@ def module_keys(values: Iterable[object]) -> tuple[str, ...]:
 __all__ = ["module_key", "module_keys"]
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest -q tests/test_module_keys.py`
 Expected: PASS (17 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/metrics/module_keys.py tests/test_module_keys.py
@@ -199,7 +209,7 @@ git commit -m "feat: one module grammar for both sides of the CI comparison"
 - Consumes: `module_key` from A1.
 - Produces: `ModulesBasis = Literal["log", "declared", "test_bearing"]`; `CellTarget.modules_basis: ModulesBasis | None`; `CellTarget.command: str | None`; `TARGET_RECORD_SCHEMA_VERSION: Literal[2] = 2`.
 
-- [ ] **Step 1: Write the failing tests** (append to `tests/test_target_record.py`)
+- [x] **Step 1: Write the failing tests** (append to `tests/test_target_record.py`)
 
 ```python
 from sag.metrics.target_record import TARGET_RECORD_SCHEMA_VERSION, CellTarget
@@ -239,12 +249,12 @@ def test_command_is_bounded_text_or_absent():
         _grade_b(command="   ")
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_target_record.py -k "schema_version or basis or canonical or command"`
 Expected: FAIL — `assert 1 == 2`, and `ValidationError: Extra inputs are not permitted` for `modules_basis`/`command`.
 
-- [ ] **Step 3: Implement the schema**
+- [x] **Step 3: Implement the schema**
 
 In `src/sag/metrics/target_record.py`:
 
@@ -296,12 +306,12 @@ In `TargetRecord`:
     schema_version: Literal[2] = TARGET_RECORD_SCHEMA_VERSION
 ```
 
-- [ ] **Step 4: Run the record and attainment tests**
+- [x] **Step 4: Run the record and attainment tests**
 
 Run: `.venv/bin/python -m pytest -q tests/test_target_record.py tests/test_attainment.py tests/test_d3_harvester.py tests/test_d3_selector.py`
 Expected: PASS. If a test builds a record with a literal `"schema_version": 1`, change it to 2 — there is no dual-version reader.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/metrics/target_record.py tests/test_target_record.py tests/test_attainment.py tests/test_d3_harvester.py
@@ -320,7 +330,7 @@ git commit -m "feat: a CI cell states the modules it built and where that list w
 - Consumes: `module_key`, `module_keys` (A1); `ModulesBasis` (A2).
 - Produces: `PoolReading.modules: tuple[str, ...]`, `PoolReading.layout: str`; `pool_member_module(name: str) -> str`.
 
-- [ ] **Step 1: Write the failing tests** (append to `tests/test_d3_harvester.py`; `_suite`, `_pool`, `build_snapshot`, `_record`, `_cell` already exist there)
+- [x] **Step 1: Write the failing tests** (append to `tests/test_d3_harvester.py`; `_suite`, `_pool`, `build_snapshot`, `_record`, `_cell` already exist there)
 
 ```python
 from scripts.d3_harvest_target import pool_member_module, read_pool
@@ -380,12 +390,12 @@ def test_a_pool_cell_carries_its_modules_as_a_lower_bound(tmp_path):
     assert _has_note(record, "test-bearing lower bound")
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_d3_harvester.py -k "pool_member_module or test_bearing or states_the_test_bearing"`
 Expected: FAIL with `ImportError: cannot import name 'pool_member_module'`
 
-- [ ] **Step 3: Implement the rung**
+- [x] **Step 3: Implement the rung**
 
 In `scripts/d3_harvest_target.py`, add the import `from sag.metrics.module_keys import module_key, module_keys` beside the other `sag.metrics` imports, then:
 
@@ -496,12 +506,12 @@ In `cell_from_pool`, before `cell = CellTarget(`:
 
 and pass `modules=reading.modules, modules_basis="test_bearing" if reading.modules else None,` to the `CellTarget(...)` call.
 
-- [ ] **Step 4: Run the harvester tests**
+- [x] **Step 4: Run the harvester tests**
 
 Run: `.venv/bin/python -m pytest -q tests/test_d3_harvester.py`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/d3_harvest_target.py tests/test_d3_harvester.py
@@ -521,7 +531,7 @@ git commit -m "feat: a JUnit pool names the modules that ran tests, as the lower
 - Consumes: `module_key`, `module_keys` (A1).
 - Produces: `LogModules(tool: Literal["gradle","maven"] | None, modules: tuple[str,...], skipped: int, failed: int)`; `modules_from_log(text: str) -> LogModules`; `job_logs(zip_path: Path) -> dict[str, str]` (job name → log text); harvester constant `LOGS_GLOB = "run-*-logs.zip"`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_ci_logs.py
@@ -634,12 +644,12 @@ def test_a_job_log_outranks_the_pool_lower_bound(tmp_path):
     assert _has_note(record, "job log")
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_ci_logs.py tests/test_d3_harvester.py -k "log"`
 Expected: FAIL with `ModuleNotFoundError: No module named 'sag.metrics.ci_logs'`
 
-- [ ] **Step 3: Implement the reader**
+- [x] **Step 3: Implement the reader**
 
 ```python
 # src/sag/metrics/ci_logs.py
@@ -799,12 +809,12 @@ Call site in `assemble_target_record` (after `if not cells: raise ...`):
     notes.extend(apply_job_logs(snapshot_dir, cells, pool_ids))
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest -q tests/test_ci_logs.py tests/test_d3_harvester.py`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/metrics/ci_logs.py scripts/d3_harvest_target.py tests/test_ci_logs.py tests/test_d3_harvester.py
@@ -825,7 +835,7 @@ git commit -m "feat: a job log states the exact modules a CI build ran"
 - Consumes: `module_key`, `module_keys` (A1); `_with_modules` (A4).
 - Produces: `CiCommand(tool, goals, profiles, projects, excluded_tasks, text)`; `parse_ci_command(text) -> CiCommand`; `gradle_declared_projects(settings_text) -> tuple[str, ...]` (canonical dir keys, root included); `maven_declared_modules(root_pom: str, read_pom: Callable[[str], str | None], *, active_profiles=(), projects=()) -> tuple[str, ...]` (reactor display names, the Maven grammar); `maven_default_goal(pom_text) -> str | None`; `extract_build_commands(yaml_text) -> tuple[BuildCommandStep, ...]` with `BuildCommandStep(job_id, job_name_template, text)`; harvester constant `SOURCES_DIR = "sources"`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_build_scope.py
@@ -1010,12 +1020,12 @@ def test_declared_sources_fill_modules_when_no_log_exists(tmp_path):
     assert _has_note(record, "declared reactor")
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_build_scope.py tests/test_ci_vetting.py tests/test_d3_harvester.py -k "declared or parse_ci_command or extract_build_commands or gradle_settings or maven_"`
 Expected: FAIL with `ModuleNotFoundError: No module named 'sag.metrics.build_scope'` and `ImportError: cannot import name 'extract_build_commands'`
 
-- [ ] **Step 3: Implement the parsers**
+- [x] **Step 3: Implement the parsers**
 
 ```python
 # src/sag/metrics/build_scope.py
@@ -1355,12 +1365,12 @@ Call it in `assemble_target_record` right after `notes.extend(apply_job_logs(...
     notes.extend(apply_declared_scope(snapshot_dir, cells, workflow_files))
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest -q tests/test_build_scope.py tests/test_ci_vetting.py tests/test_d3_harvester.py`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/metrics/build_scope.py src/sag/metrics/ci_vetting.py scripts/d3_harvest_target.py tests/test_build_scope.py tests/test_ci_vetting.py tests/test_d3_harvester.py
@@ -1379,7 +1389,7 @@ git commit -m "feat: the reactor a CI command selects is a cell's declared build
 - Consumes: `LOGS_GLOB`, `SOURCES_DIR` (A4/A5); `download`, `fetch`, `HarvestError`.
 - Produces: `fetch_logs(repo: str, snapshot_dir: Path) -> tuple[str, ...]`; `fetch_sources(repo: str, sha: str, snapshot_dir: Path) -> tuple[str, ...]`; CLI flags `--fetch-logs`, `--fetch-sources` usable with `--from-dir` on an existing snapshot.
 
-- [ ] **Step 1: Write the failing parser test**
+- [x] **Step 1: Write the failing parser test**
 
 ```python
 def test_parser_accepts_refetch_flags_on_an_existing_snapshot():
@@ -1393,12 +1403,12 @@ def test_parser_accepts_refetch_flags_on_an_existing_snapshot():
     assert args.fetch_sources is True
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `.venv/bin/python -m pytest -q tests/test_d3_harvester.py -k refetch_flags`
 Expected: FAIL with `error: unrecognized arguments: --fetch-logs --fetch-sources`
 
-- [ ] **Step 3: Implement the fetchers**
+- [x] **Step 3: Implement the fetchers**
 
 ```python
 _MAX_POM_FETCHES = 400
@@ -1503,12 +1513,12 @@ In `main`, after `snapshot_dir` is known and before `harvest_from_dir`:
 
 Also make `fetch_snapshot` call both at its end (before `return out_dir`): `fetch_logs(repo, out_dir)` and `fetch_sources(repo, sha, out_dir)`.
 
-- [ ] **Step 4: Run the parser test**
+- [x] **Step 4: Run the parser test**
 
 Run: `.venv/bin/python -m pytest -q tests/test_d3_harvester.py`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add scripts/d3_harvest_target.py tests/test_d3_harvester.py
@@ -1528,7 +1538,7 @@ git commit -m "feat: the courier brings home the job logs and the build definiti
 - Consumes: `CiCommand`, `parse_ci_command`, `maven_default_goal` (A5); `module_key` (A1); `ModulesBasis` (A2).
 - Produces: `LifecycleParity(status: Literal["equivalent","not_equivalent","unknown"], form: Literal["maven_phases","gradle_tasks","none"], ci_command: str, sag_commands: tuple[str,...], ci_reach: str | None, sag_reach: str | None, missing: tuple[str,...], extra: tuple[str,...])`; `command_parity(ci: CiCommand, sag: Sequence[CiCommand], *, ci_default_goal: str | None = None) -> LifecycleParity`; `CertificateView.commands: tuple[str, ...] = ()`; `AttainmentResult.build_form`, `.modules_basis`, `.unmatched_observed_module_ids`, `.lifecycle_parity`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_parity.py
@@ -1626,12 +1636,12 @@ def test_no_command_on_either_side_means_no_parity_claim():
     assert evaluate_attainment(_view(), _record(_cell())).lifecycle_parity is None
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_parity.py tests/test_attainment.py`
 Expected: FAIL — `ModuleNotFoundError: sag.metrics.parity`; `ValidationError: Extra inputs are not permitted` for `commands`.
 
-- [ ] **Step 3: Implement parity and the attainment changes**
+- [x] **Step 3: Implement parity and the attainment changes**
 
 ```python
 # src/sag/metrics/parity.py
@@ -1793,12 +1803,12 @@ In `evaluate_attainment`, replace the `observed_modules = set(view.modules)` blo
 
 and pass `build_form=build_form, modules_basis=cell.modules_basis, unmatched_observed_module_ids=unmatched_observed, lifecycle_parity=lifecycle_parity` into `AttainmentResult(...)`. Update the module docstring's third rule to add: *the build denominator is the cell's own module universe when it states one; when it states none, the build axis can only say whether SAG's own build succeeded, and the result says so (`build_form="conclusion"`).*
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest -q tests/test_parity.py tests/test_attainment.py tests/test_certificate_v2_surface.py`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/metrics/parity.py src/sag/metrics/attainment.py tests/test_parity.py tests/test_attainment.py
@@ -1815,7 +1825,7 @@ git commit -m "feat: the build axis grades receipts against the CI universe, and
 **Interfaces:**
 - Consumes: `read_pool` (A3), `module_key` (A1), `evaluate_attainment` / `CertificateView` (A7), `CellTarget` / `TargetRecord` (A2).
 
-- [ ] **Step 1: Write the acceptance test** (skips when the archives are absent, exactly like `tests/test_gradle_evidence_reparse.py`)
+- [x] **Step 1: Write the acceptance test** (skips when the archives are absent, exactly like `tests/test_gradle_evidence_reparse.py`)
 
 ```python
 # tests/test_kafka_build_scope_acceptance.py
@@ -1907,12 +1917,12 @@ def test_kafka_build_axis_is_eighteen_of_thirty_four():
 
 Remove the line `assert reading.modules_basis if hasattr(...)` before running — `PoolReading` has no basis field; the cell states it. (It is listed here so the executor does not add one.)
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `.venv/bin/python -m pytest -q tests/test_kafka_build_scope_acceptance.py -rs`
 Expected: PASS (or SKIPPED with the archive reason on a checkout without `logs/`).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/test_kafka_build_scope_acceptance.py
@@ -1931,7 +1941,7 @@ git commit -m "test: kafka's build axis measures eighteen of thirty-four, and na
 **Interfaces:**
 - Consumes: `harvest_from_dir`, `fetch_logs`, `fetch_sources` (A5/A6).
 
-- [ ] **Step 1: Write the driver**
+- [x] **Step 1: Write the driver**
 
 ```python
 # scripts/d3_reassemble_v2.py
@@ -1998,14 +2008,14 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 2: Run offline first, then with `--refetch`**
+- [x] **Step 2: Run offline first, then with `--refetch`**
 
 Run: `.venv/bin/python scripts/d3_reassemble_v2.py` then `.venv/bin/python scripts/d3_reassemble_v2.py --refetch`
 Expected: 23 lines, each naming the seat, v2 digest, basis and count; errors only for seats whose v1 harvest also errored (none expected). Refetch adds logs for runs younger than 90 days and `sources/` for every seat.
 
-- [ ] **Step 3: Write the report** `docs/superpowers/reports/d3-build-scope-20260907.md` with: a table seat → matched cell → basis → module count → command → whether logs were available; the kafka row must read basis `log` or `declared` with `storage/api` resolved (or say why not); a paragraph on how many of the 23 now carry a build universe and at which grade; and the v1→v2 digest pairs. Add `SHA256SUMS` entries for every new file under `logs/d3-freeze-20260830/`.
+- [x] **Step 3: Write the report** `docs/superpowers/reports/d3-build-scope-20260907.md` with: a table seat → matched cell → basis → module count → command → whether logs were available; the kafka row must read basis `log` or `declared` with `storage/api` resolved (or say why not); a paragraph on how many of the 23 now carry a build universe and at which grade; and the v1→v2 digest pairs. Add `SHA256SUMS` entries for every new file under `logs/d3-freeze-20260830/`.
 
-- [ ] **Step 4: Commit** (logs are gitignored; the report and script are not)
+- [x] **Step 4: Commit** (logs are gitignored; the report and script are not)
 
 ```bash
 git add -f docs/superpowers/reports/d3-build-scope-20260907.md
@@ -2023,7 +2033,7 @@ git commit -m "docs: the frozen d3 battery restated with each cell's build unive
 - Modify: `src/sag/verdict.py:72-78`
 - Test: `tests/test_verdict_kernel.py` (new file; the existing `run_verdict` tests live in `tests/test_build_test_verdict.py` and stay there)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from sag.verdict import BUILD_SCOPE_CONFLICTS, run_verdict
@@ -2044,12 +2054,12 @@ def test_scan_scope_conflicts_are_recorded_facts_not_caps():
     assert run_verdict("success", "success", ["build_receipts_unreadable"]) == "partial"
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `.venv/bin/python -m pytest -q tests/test_verdict_kernel.py`
 Expected: FAIL with `ImportError: cannot import name 'BUILD_SCOPE_CONFLICTS'`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/sag/verdict.py`, before `ADJUDICATED_CONFLICTS`:
 
@@ -2073,12 +2083,12 @@ BUILD_SCOPE_CONFLICTS = frozenset(
 
 and add `*BUILD_SCOPE_CONFLICTS,` inside `ADJUDICATED_CONFLICTS`.
 
-- [ ] **Step 4: Run the kernel tests**
+- [x] **Step 4: Run the kernel tests**
 
 Run: `.venv/bin/python -m pytest -q tests/test_verdict_kernel.py tests/test_verdict_rates.py tests/test_verdict_finalizer.py`
 Expected: the new test passes; finalizer/rates tests that assert a scan-scope cap now fail — that is Task B2/B3's work, leave them.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/verdict.py tests/test_verdict_kernel.py
@@ -2094,7 +2104,7 @@ git commit -m "feat: a shortfall against SAG's own module scan is a fact, not a 
 - Modify: `src/sag/agent/verdict_finalizer.py:1748`, `:1886` (call sites)
 - Test: `tests/test_verdict_rates.py`
 
-- [ ] **Step 1: Rewrite the tests**
+- [x] **Step 1: Rewrite the tests**
 
 Delete `test_source_scope_coverage_requires_independent_full_build_authority` and `test_source_scope_coverage_refuses_incomplete_authority`. Replace `test_derived_verdict_word` and the two metric-line tests with:
 
@@ -2166,12 +2176,12 @@ def test_tests_line_names_the_execution_state(judgment, label):
 
 Also change the assertion at the old line ~846 (`derived_verdict_word(grains["modules"], GrainRate(0, 20497)) == "partial"`) to `derived_verdict_word("success", GrainRate(0, 20497)) == "partial"`.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `.venv/bin/python -m pytest -q tests/test_verdict_rates.py`
 Expected: FAIL (signature and line-format mismatches).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/sag/verdict_rates.py`:
 
@@ -2222,12 +2232,12 @@ and the Tests state with:
 
 (delete the `failed + errors > 0 → "FAILED"` override). In `src/sag/agent/verdict_finalizer.py` change both call sites: line 1748 to `derived_verdict_word(snapshot.build_evidence.judgment, test_cases)` and line 1886 to `derived_verdict_word(build.judgment, test_cases_rate)`. Confirm `BuildEvidenceSnapshot.judgment` is the field name (it is used at line 1391).
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest -q tests/test_verdict_rates.py tests/test_verdict_finalizer.py tests/test_web_session_registry.py`
 Expected: `test_verdict_rates.py` passes; `test_web_session_registry.py` fails on the deleted import — that is B4.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/verdict_rates.py src/sag/agent/verdict_finalizer.py tests/test_verdict_rates.py
@@ -2243,7 +2253,7 @@ git commit -m "feat: the verdict word answers execution, and the build line stat
 - Modify: `src/sag/agent/physical_validator.py` (`validate_build_status`: `evidence["build_system"]`, beside the existing `evidence["build_command"]` write near line 3922)
 - Test: `tests/test_verdict_finalizer.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from sag.agent.verdict_finalizer import _physical_judgment
@@ -2263,12 +2273,12 @@ def test_no_output_is_still_failed():
     assert _physical_judgment({"success": False, "evidence": {"build_system": "gradle"}}) == "failed"
 ```
 
-- [ ] **Step 2: Run to verify the first fails**
+- [x] **Step 2: Run to verify the first fails**
 
 Run: `.venv/bin/python -m pytest -q tests/test_verdict_finalizer.py -k "physical_judgment or jvm_build_with_real_output or python_ladder"`
 Expected: the JVM test FAILS (`'partial' != 'success'`).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 def _physical_judgment(status: dict[str, Any]) -> str | None:
@@ -2288,12 +2298,12 @@ def _physical_judgment(status: dict[str, Any]) -> str | None:
 
 In `physical_validator.validate_build_status`, where `evidence["build_command"]` is set (the `command_tracker` block), add one line before it: `evidence["build_system"] = build_system` (the local already in scope there).
 
-- [ ] **Step 4: Run the finalizer, verdict, and report batteries**
+- [x] **Step 4: Run the finalizer, verdict, and report batteries**
 
 Run: `.venv/bin/python -m pytest -q tests/test_verdict_finalizer.py tests/test_build_test_verdict.py tests/test_coverage_basis.py tests/test_report_honesty.py tests/test_cli_project_exit_codes.py tests/test_cli_report_verdict_mirror.py tests/test_mixed_build_module_metrics.py tests/test_jdk_reactor_conflicts.py tests/test_verdict_physical_oracle.py tests/test_module_coverage_shared.py tests/test_snapshot_surface_agreement.py tests/test_python_phase_verdict.py tests/test_python_verifier.py`
 Expected: failures only where a test asserts that a scan-scope shortfall (`build_modules_incomplete`, `reactor_scope_narrowed`, `build_coverage_scope_unverified`, `module_scan_contradicts_physical_build`, or `modules N/M` with N<M) yields `partial`. For each: keep the assertion that the conflict is recorded in `conflicts`; change the verdict expectation to `success` when the physical build succeeded and tests executed fully; keep `partial` when the failure is an evidence-closure conflict or interrupted execution. Any other failure is a regression — stop and report it.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/agent/verdict_finalizer.py src/sag/agent/physical_validator.py tests/
@@ -2309,7 +2319,7 @@ git commit -m "feat: a real build is a real build; the module scan discloses and
 - Modify: `webui/src/api/types.ts:142, 150-157`, `webui/src/evidencePresentation.ts:78, 498-600`
 - Test: `tests/test_web_session_registry.py`, `tests/test_web_build_test_models.py`, `tests/test_web_api.py`, `tests/test_web_demo_data.py`, `webui/src/evidencePresentation.test.ts`, `webui/src/api/types.test.ts`, `webui/src/pages/detail/OverviewTab.test.tsx`
 
-- [ ] **Step 1: Write the failing presentation test** (replace the existing `presentBuild`/`sourceScope` cases in `webui/src/evidencePresentation.test.ts`)
+- [x] **Step 1: Write the failing presentation test** (replace the existing `presentBuild`/`sourceScope` cases in `webui/src/evidencePresentation.test.ts`)
 
 ```ts
 it("states the module scan as a diagnostic sentence and never as a rate", () => {
@@ -2334,12 +2344,12 @@ it("a partial build is partial because of its state, not its scan", () => {
 })
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cd webui && npx vitest run src/evidencePresentation.test.ts`
 Expected: FAIL (`scan` undefined; old summary text).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Python: delete `SourceScopeSummary` and the `source_scope` field from `BuildSummary`; in `session_registry._snapshot_build_payload` delete the import and both `"source_scope": source_scope,` entries; in `demo_data.py` delete every `source_scope` key. Update the four `tests/test_web_*.py` files by deleting their `source_scope`/`sourceScope` assertions.
 
@@ -2358,12 +2368,12 @@ TypeScript: in `types.ts` delete `sourceScope` from `BuildSummary` and the `Sour
 
 with `scan` in `BuildPresentation` in place of `scope`/`sourceScope`. Fix the OverviewTab and types tests accordingly; then `npm run build`.
 
-- [ ] **Step 4: Run everything**
+- [x] **Step 4: Run everything**
 
 Run: `.venv/bin/python -m pytest -q tests/test_web_session_registry.py tests/test_web_build_test_models.py tests/test_web_api.py tests/test_web_demo_data.py && cd webui && npx vitest run && npm run build`
 Expected: PASS; new asset hashes under `src/sag/web/static/assets/`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/sag/web webui/src tests/test_web_*.py
@@ -2377,7 +2387,7 @@ git commit -m "feat: the workbench states the module scan as a diagnostic and dr
 **Files:**
 - Modify: `README.md` (*📏 Reading a Result*, *🧪 Measuring against the project's CI*)
 
-- [ ] **Step 1: Rewrite the README sections**
+- [x] **Step 1: Rewrite the README sections**
 
 In *Reading a Result*, replace the example block and the first three bullets with:
 
@@ -2394,12 +2404,12 @@ Coverage: unavailable — not collected
 
 In *Measuring against the project's CI*, replace step 1's cell description with: *per CI job: build conclusion, the tests it ran (with retries folded to their final outcome), the modules it built — read from the job log (exact), else from the reactor the CI command selects on that commit (exact for the declared scope), else from the JUnit report paths (test-bearing modules only, disclosed as a lower bound) — the command the job ran, and whether the job's green status was laundered by `continue-on-error`.* Add after step 3: *Beside the score, the comparison states lifecycle parity — `CI: mvn -V test · SAG: mvn compile; mvn test · parity: equivalent` — naming any phase or plugin goal SAG did not reach. It never changes the score.* Add a closing sentence: *A project whose CI cannot be harvested gets no scope judgment at all: the local verdict is execution-only and the disk reactor count stays a disclosure.*
 
-- [ ] **Step 2: Full verification**
+- [x] **Step 2: Full verification**
 
 Run: `.venv/bin/python -m pytest -q && .venv/bin/python -m mypy src/sag 2>&1 | tail -1 && .venv/bin/python -m isort --check-only src tests scripts && cd webui && npx vitest run && cd .. && git status --short`
 Expected: pytest green (0 failed); mypy error count ≤ the pre-plan baseline (980); isort clean except the three pre-existing files (`tests/test_explicit_evidence_architecture.py`, `scripts/run_category3_stage2.py`, `scripts/run_category3_panel.py`); vitest green; a clean tree after the commit below.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add README.md

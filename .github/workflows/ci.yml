@@ -1,0 +1,47 @@
+name: Tests and package
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uv sync --extra dev
+      - run: uv run python -m pytest -q
+      - name: Type check the CI scope kernel
+        run: >-
+          uv run mypy --follow-imports=silent
+          src/sag/metrics/module_keys.py src/sag/metrics/target_record.py
+          src/sag/metrics/ci_logs.py src/sag/metrics/build_scope.py
+          src/sag/metrics/parity.py src/sag/metrics/attainment.py
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
