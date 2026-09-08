@@ -2021,7 +2021,7 @@ git commit -m "docs: the frozen d3 battery restated with each cell's build unive
 
 **Files:**
 - Modify: `src/sag/verdict.py:72-78`
-- Test: `tests/test_verdict_kernel.py` (create if absent; otherwise append to the existing verdict kernel test file — `grep -l "run_verdict" tests/*.py` names it)
+- Test: `tests/test_verdict_kernel.py` (new file; the existing `run_verdict` tests live in `tests/test_build_test_verdict.py` and stay there)
 
 - [ ] **Step 1: Write the failing test**
 
