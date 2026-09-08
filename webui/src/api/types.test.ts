@@ -55,13 +55,6 @@ const buildContract = {
   time: "—",
   note: "Canonical build evidence from verdict.json",
   classCount: 56,
-  sourceScope: {
-    covered: 36,
-    total: 36,
-    availability: "available",
-    basis: "sealed physical build success over validated full module scope",
-    evidenceRefs: ["output_build"],
-  },
 } satisfies BuildSummary
 
 describe("sealed verdict API types", () => {
@@ -82,9 +75,7 @@ describe("sealed verdict API types", () => {
     expect(boundedCountContract.bound).toBe("lower")
   })
 
-  it("models comparable production source scope separately from class outputs", () => {
+  it("models class outputs as diagnostic build counts", () => {
     expect(buildContract.classCount).toBe(56)
-    expect(buildContract.sourceScope.covered).toBe(36)
-    expect(buildContract.sourceScope.total).toBe(36)
   })
 })

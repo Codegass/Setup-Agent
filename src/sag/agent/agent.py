@@ -30,7 +30,6 @@ from .control_events import (
     canonical_sha256,
     sanitize_config,
 )
-from .evidence_state import RunEvidenceState
 from .evidence_publications import (
     RUN_PIN_LOGICAL_ARTIFACT_ID,
     EvidencePublicationAuthority,
@@ -42,6 +41,7 @@ from .evidence_publications import (
     unavailable_evidence_publication_authority,
     verify_latest_evidence_bytes,
 )
+from .evidence_state import RunEvidenceState
 from .react_engine import ReActEngine
 from .verdict_finalizer import (
     EvidenceCloseReason,
@@ -100,6 +100,7 @@ class SetupAgent:
         self.verdict_finalizer = None
         self.run_termination = None
         self.workflow_mode = "idle"
+        self.pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None
         self.control_event_sink = None
         self.evidence_publication_authority = unavailable_evidence_publication_authority(
             "host control-event sink is not initialized"
@@ -162,13 +163,18 @@ class SetupAgent:
             ).strip()
             self.run_id = state_run_id or _active_setup_run_id(id(self))
         set_active_receipt_run_id(self.run_id)
-        if self.context_manager is not None:
-            # A long-lived SetupAgent can start a new command/run while keeping
-            # its tools. Publication authority is run-scoped even when those
-            # tool objects are reused.
-            self._initialize_control_recording()
-            self._bootstrap_continuation_overlay(workflow_mode)
-            return  # Already initialized
+        # Context files remain in the container, but the objects carrying run
+        # authority and mode-specific tools belong to this command only.
+        self.react_engine = None
+        self._run_pin_template = None
+        self._observed_target_repo_sha = None
+        if workflow_mode != "setup":
+            self.phase_machine = None
+            self.context_journal = None
+            self.run_evidence_state = None
+            self.verdict_finalizer = None
+            self.run_termination = None
+            self.pre_finalize_evidence_callback = None
 
         # Initialize ErrorLogger with container workspace path
         from sag.agent.error_logger import ErrorLogger
@@ -208,12 +214,11 @@ class SetupAgent:
             context_journal=self.context_journal,
             run_evidence_state=self.run_evidence_state,
             verdict_finalizer=self.verdict_finalizer,
+            physical_validator=getattr(self, "physical_validator", None),
             control_event_sink=self.control_event_sink,
             target_repo_sha_callback=self._record_target_repo_sha,
             orchestrator=self.orchestrator,
-            pre_finalize_evidence_callback=getattr(
-                self, "pre_finalize_evidence_callback", None
-            ),
+            pre_finalize_evidence_callback=getattr(self, "pre_finalize_evidence_callback", None),
         )
         # The advisor tool is a client stub until the engine that owns the
         # consult exists; bind it before the first iteration can call it.
@@ -245,6 +250,9 @@ class SetupAgent:
         self.agent_logger.info(f"Continuation environment overlay: {status}")
 
     def _initialize_control_recording(self) -> None:
+        self.control_event_sink = None
+        self._run_pin_host_path = None
+        self._run_pin_mirror = None
         session_logger = get_session_logger()
         if session_logger is None:
             authority = unavailable_evidence_publication_authority(
@@ -276,7 +284,9 @@ class SetupAgent:
 
         mirror_pin = self._make_run_pin_mirror()
 
-        self.control_event_sink = session_logger.get_control_event_sink(mirror=mirror_event)
+        sink = session_logger.get_control_event_sink(mirror=mirror_event)
+        sink.run_id = self.run_id
+        self.control_event_sink = sink
         self._run_pin_host_path = session_logger.run_pin_path
         self._run_pin_mirror = mirror_pin
         run_id = str(getattr(self, "run_id", "") or "").strip()
@@ -592,12 +602,11 @@ class SetupAgent:
         # observation-only fold sealed bigtop as failed while the gates read
         # the physical tri-state — split-brain between the two new components).
         finalizer = getattr(self, "verdict_finalizer", None)
-        if finalizer is not None and getattr(finalizer, "validator", None) is None:
+        if finalizer is not None:
             finalizer.validator = self.physical_validator
-            if getattr(finalizer, "project_name", None) is None:
-                finalizer.project_name = getattr(self, "project_name", None) or getattr(
-                    self.orchestrator, "project_name", None
-                )
+            finalizer.project_name = getattr(self, "project_name", None) or getattr(
+                self.orchestrator, "project_name", None
+            )
 
         # Stage-1 surface: the legacy tools below are no longer model-facing;
         # they live on as backends/delegates of the build/project/search facades.
@@ -780,6 +789,13 @@ class SetupAgent:
         # Default docker_label to project_name if not provided
         if docker_label is None:
             docker_label = project_name
+        # An early startup failure belongs to the new command. It must never
+        # close the previous command's engine or sealed evidence state.
+        self.react_engine = None
+        self.phase_machine = None
+        self.context_journal = None
+        self.run_evidence_state = None
+        self.verdict_finalizer = None
         self.run_termination = None
         self.workflow_mode = "setup"
         self.pre_finalize_evidence_callback = pre_finalize_evidence_callback
@@ -1009,6 +1025,7 @@ class SetupAgent:
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
         """Continue working on an existing project."""
         self.workflow_mode = "continue"
+        self.project_name = project_name
         self.run_id = _active_setup_run_id(f"continue-{id(self)}")
 
         self.console.print(
@@ -1076,6 +1093,7 @@ class SetupAgent:
     def run_task(self, project_name: str, task_description: str) -> bool:
         """Run a specific task on an existing project."""
         self.workflow_mode = "run_task"
+        self.project_name = project_name
 
         # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
@@ -1138,9 +1156,9 @@ class SetupAgent:
             # A continuation still needs the harness-owned framework survey.
             # It is a prerequisite for the model's strategy, not work the
             # model should have to rediscover after build/test dispatch starts.
-            survey_status = str(
-                self.react_engine._ensure_project_facts() or "failed"
-            ).strip().lower()
+            survey_status = (
+                str(self.react_engine._ensure_project_facts() or "failed").strip().lower()
+            )
             if survey_status not in {"created", "present"}:
                 self.agent_logger.error(
                     "Framework project survey failed before run-task model execution"
@@ -1228,9 +1246,7 @@ class SetupAgent:
             else:
                 self._provide_task_summary(success, task_description)
 
-            cmd_logger.info(
-                f"Task execution completed: success={success}, cancelled={cancelled}"
-            )
+            cmd_logger.info(f"Task execution completed: success={success}, cancelled={cancelled}")
             return success
 
         except Exception as e:
@@ -1659,12 +1675,12 @@ START by working toward the current phase objective shown in my context.
 
         # Log comprehensive status
         if build_status["success"]:
-            # A build is only a full SUCCESS when every active module compiled.
-            # success=True with build_complete=False means real build output but
-            # incomplete module coverage -> the run is capped at PARTIAL (same
-            # rule the report verdict enforces via build_modules_incomplete).
-            build_complete = build_status.get("build_complete", True)
-            if build_complete:
+            from sag.agent.verdict_finalizer import _physical_judgment
+
+            # JVM scan coverage is diagnostic; Python and unknown systems keep
+            # their own completeness, exactly as the finalizer and report do.
+            build_judgment = _physical_judgment(build_status)
+            if build_judgment == "success":
                 logger.info(f"✅ Build validation: SUCCESS - {build_status['reason']}")
             else:
                 logger.warning(f"⚠️ Build validation: PARTIAL - {build_status['reason']}")
@@ -1685,15 +1701,12 @@ START by working toward the current phase objective shown in my context.
                     )
                     return False
 
-                # The suite ran to a terminal state, so the run is a pass on the
-                # test axis — an incomplete-module build still caps the whole run
-                # at PARTIAL, because SUCCESS requires every active module to
-                # have compiled.
-                self.final_verdict = "success" if build_complete else "partial"
-                if not build_complete:
+                # The suite ran; only the build's execution judgment can cap it.
+                self.final_verdict = "success" if build_judgment == "success" else "partial"
+                if build_judgment != "success":
                     logger.warning(
-                        "⚠️ Run capped at PARTIAL: tests executed but not all active "
-                        "modules compiled"
+                        "⚠️ Run capped at PARTIAL: tests executed but build completion "
+                        "was not verified"
                     )
 
                 # Execution-coverage cap: a detected suite that only partly ran

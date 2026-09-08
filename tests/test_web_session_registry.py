@@ -20,9 +20,9 @@ from sag.web.session_registry import (
     _build_payload_from_metrics,
     _evidence,
     _matching_log_session_dir,
+    _setup_logs,
     _snapshot_build_payload,
     _snapshot_test_payload,
-    _setup_logs,
 )
 
 
@@ -173,7 +173,25 @@ def test_snapshot_test_payload_uses_test_judgment_not_overall_verdict():
     assert payload["pass"] == 4
 
 
-def test_snapshot_build_payload_projects_comparable_source_scope_and_keeps_class_output():
+def test_snapshot_test_payload_keeps_red_outcomes_separate_from_execution_state():
+    snapshot = RunVerdictSnapshot(
+        run_id="run-complete-with-red-tests",
+        finalized_at="2026-09-07T20:00:00Z",
+        verdict="success",
+        test_stats=SnapshotTestStats(
+            unique=SnapshotTestCounts(executed=4, passed=2, failed=1, errors=1),
+            raw=SnapshotTestCounts(executed=4, passed=2, failed=1, errors=1),
+            judgment="success",
+        ),
+    )
+
+    payload = _snapshot_test_payload(snapshot, metrics={})
+
+    assert payload["state"] == "success"
+    assert (payload["pass"], payload["fail"], payload["errors"], payload["total"]) == (2, 1, 1, 4)
+
+
+def test_snapshot_build_payload_keeps_diagnostic_class_output_without_source_scope():
     snapshot = RunVerdictSnapshot(
         run_id="run-commons-cli",
         finalized_at="2026-08-31T18:07:35Z",
@@ -213,14 +231,7 @@ def test_snapshot_build_payload_projects_comparable_source_scope_and_keeps_class
     payload = _snapshot_build_payload(snapshot)
 
     assert payload["class_count"] == 56
-    assert payload["source_scope"] == {
-        "availability": "available",
-        "covered": 36,
-        "total": 36,
-        "basis": "sealed physical build success over validated full module scope",
-        "reason": None,
-        "evidence_refs": ["output_build"],
-    }
+    assert "source_scope" not in payload
 
 
 def test_setup_artifact_falls_back_to_generic_report_and_uses_its_finish_time():

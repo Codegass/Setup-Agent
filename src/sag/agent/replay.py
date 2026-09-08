@@ -625,6 +625,8 @@ class ActiveRepairContextState:
 
 def recover_active_repair_context(
     events: Iterable[ControlEvent | Mapping[str, Any]],
+    *,
+    run_id: str | None = None,
 ) -> ActiveRepairContextState:
     """Replay repair open/use/consume state without invoking any producer.
 
@@ -662,6 +664,10 @@ def recover_active_repair_context(
                 "event sequence must be monotonic: "
                 f"expected {expected_sequence}, got {event.sequence}"
             )
+        # Session logs span commands. Validate the complete append-only stream,
+        # then project this run without renumbering its gate references.
+        if run_id is not None and event.run_id != run_id:
+            continue
         payload = event.payload
         if evidence_closed and event.kind != "evidence_publication":
             raise ReplayValidationError("control stream continues after evidence_close")
@@ -932,6 +938,8 @@ def recover_active_repair_context(
 
 def recover_active_repair_context_from_path(
     path: str | Path,
+    *,
+    run_id: str | None = None,
 ) -> ActiveRepairContextState:
     """Read a live JSONL stream strictly and reconstruct restart authority."""
 
@@ -946,7 +954,7 @@ def recover_active_repair_context_from_path(
                     events.append(ControlEvent.model_validate_json(line))
     except (OSError, TypeError, ValueError, ValidationError) as exc:
         raise ReplayValidationError("active repair context stream is invalid") from exc
-    return recover_active_repair_context(events)
+    return recover_active_repair_context(events, run_id=run_id)
 
 
 class InitialFact(BaseModel):

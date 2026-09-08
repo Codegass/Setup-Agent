@@ -386,7 +386,9 @@ def test_test_grain_rates_type_their_absences():
         test_modules=set(),
     )
 
-    assert grains["cases"].payload()["reason"] == "no receipt-scoped runtime outcomes were accounted"
+    assert (
+        grains["cases"].payload()["reason"] == "no receipt-scoped runtime outcomes were accounted"
+    )
     assert grains["modules"].payload()["reason"] == "no test modules surveyed"
     assert conflicts == ()
 
@@ -870,7 +872,7 @@ def test_dominant_complete_basis_supersedes_missing_discovered_without_conflict(
     assert snapshot.test_stats.executed == 0
     assert snapshot.test_stats.auxiliary_test_stats["executed"] == 150
     assert "test_stats_basis_incomparable" not in snapshot.conflicts
-    # No module scan was supplied, so build.modules is unavailable, not fully.
+    # No physical oracle confirmed the build; successful tool claims are insufficient.
     assert snapshot.verdict == "partial"
 
 
@@ -925,7 +927,7 @@ def test_equal_complete_basis_uses_latest_typed_status():
     assert snapshot.test_stats.executed == 0
     assert snapshot.test_stats.auxiliary_test_stats["executed"] == 200
     assert snapshot.conflicts == ("test_executions_unattributed_to_receipts",)
-    # No module scan was supplied, so build.modules is unavailable, not fully.
+    # No physical oracle confirmed the build; successful tool claims are insufficient.
     assert snapshot.verdict == "partial"
 
 
@@ -1011,7 +1013,7 @@ def test_validator_rollup_facts_are_the_canonical_snapshot_basis():
     assert snapshot.test_stats.raw.executed == 5000
     assert snapshot.test_stats.flaky_count == 3
     assert snapshot.conflicts == ("test_errors_detected",)
-    # No module scan was supplied, so build.modules is unavailable, not fully.
+    # No physical oracle confirmed the build; successful tool claims are insufficient.
     assert snapshot.verdict == "partial"
 
 
@@ -1254,3 +1256,147 @@ def test_read_round_trips_the_persisted_immutable_snapshot():
     assert read_back.model_dump_json() == written.model_dump_json()
     with pytest.raises(Exception):
         read_back.verdict = "failed"
+
+
+@pytest.mark.parametrize("system", ["maven", "gradle", "Maven"])
+def test_a_jvm_build_with_real_output_is_success_whatever_the_scan_covered(system):
+    from sag.agent.verdict_finalizer import _physical_judgment
+
+    assert (
+        _physical_judgment(
+            {"success": True, "build_complete": False, "evidence": {"build_system": system}}
+        )
+        == "success"
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence", [{"build_system": "python"}, {"build_system": "unknown"}, {}, None]
+)
+def test_python_and_unknown_build_system_keep_completeness(evidence):
+    from sag.agent.verdict_finalizer import _physical_judgment
+
+    assert (
+        _physical_judgment({"success": True, "build_complete": False, "evidence": evidence})
+        == "partial"
+    )
+
+
+def test_no_output_is_still_failed():
+    from sag.agent.verdict_finalizer import _physical_judgment
+
+    assert (
+        _physical_judgment({"success": False, "evidence": {"build_system": "gradle"}}) == "failed"
+    )
+
+
+@pytest.mark.parametrize("missing_physical", [None, "unavailable"])
+def test_removing_physical_build_confirmation_never_promotes_tool_claims(missing_physical):
+    class Validator(_RateValidator):
+        def validate_build_status(self, project_name):
+            if missing_physical == "unavailable":
+                raise RuntimeError("physical evidence unavailable")
+            return None
+
+    state = RunEvidenceState(run_id="session-no-physical-confirmation")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(output="BUILD SUCCESS", facts={"build_success": True}),
+    )
+    _set_rate_test_rollup(state, passed=100, failed=0, errors=0, driven_modules=["core"])
+    snapshot = VerdictFinalizer(
+        FakeVerdictOrchestrator(),
+        validator=Validator() if missing_physical else None,
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    assert snapshot.build_evidence.source == "observations"
+    assert snapshot.build_evidence.judgment == "success"  # preserved observation fact
+    assert snapshot.verdict == "partial"
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "build_receipts_unreadable",
+        "build_receipt_not_terminal",
+        "build_receipt_scope_unavailable",
+        "build_requirements_unavailable",
+        "module_scan_unreadable",
+        "test_execution_interrupted",
+    ],
+)
+def test_scan_shortfall_does_not_hide_independent_integrity_failure(conflict):
+    class Validator(_RateValidator):
+        def validate_build_status(self, project_name):
+            status = super().validate_build_status(project_name)
+            status["evidence"]["build_system"] = "maven"
+            status["build_complete"] = False
+            status["conflicts"] = ["build_modules_incomplete", conflict]
+            return status
+
+    state = RunEvidenceState(run_id="session-scope-and-integrity")
+    _set_rate_test_rollup(state, passed=100, failed=0, errors=0, driven_modules=["core"])
+    snapshot = VerdictFinalizer(
+        FakeVerdictOrchestrator(),
+        validator=Validator(),
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    assert snapshot.build_evidence.judgment == "success"
+    assert "build_modules_incomplete" in snapshot.conflicts
+    assert conflict in snapshot.conflicts
+    assert snapshot.verdict == "partial"
+
+
+@pytest.mark.parametrize("scan", ["partial", "full", "absent"])
+def test_sealed_jvm_execution_is_independent_of_disk_scan_scope(scan):
+    class Validator(_RateValidator):
+        def validate_build_status(self, project_name):
+            status = super().validate_build_status(project_name)
+            status["evidence"]["build_system"] = "gradle"
+            status["build_complete"] = False
+            status["conflicts"] = ["build_modules_incomplete"]
+            return status
+
+        def module_scan(self, project_name):
+            if scan == "absent":
+                return None
+            result = super().module_scan(project_name)
+            result["summary"]["modules_built"] = 2 if scan == "partial" else 14
+            return result
+
+    state = RunEvidenceState(run_id=f"session-scan-{scan}")
+    _set_rate_test_rollup(state, passed=80, failed=20, errors=0, driven_modules=["core"])
+    orchestrator = FakeVerdictOrchestrator()
+    snapshot = VerdictFinalizer(
+        orchestrator,
+        validator=Validator(),
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    assert snapshot.verdict == "success"
+    assert snapshot.build_evidence.judgment == "success"
+    assert snapshot.test_stats.judgment == "success"
+    assert snapshot.test_stats.unique.failed == 20
+    assert "build_modules_incomplete" in snapshot.conflicts
+    assert read_verdict_snapshot(orchestrator) == snapshot
+
+
+def test_strict_reader_rejects_promoting_observation_only_build_to_success():
+    from sag.agent.verdict_finalizer import validate_verdict_snapshot_v3
+
+    state = RunEvidenceState(run_id="session-observation-promotion")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(output="BUILD SUCCESS"),
+    )
+    _set_rate_test_rollup(state, passed=100, failed=0, errors=0, driven_modules=["core"])
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state,
+        EvidenceCloseReason.TEST_TERMINATED,
+    )
+    assert snapshot.verdict == "partial"
+    payload = snapshot.model_dump(mode="json")
+    payload["verdict"] = "success"
+    with pytest.raises(ValueError, match="build execution and test outcomes"):
+        validate_verdict_snapshot_v3(payload)

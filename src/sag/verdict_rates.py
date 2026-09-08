@@ -55,9 +55,7 @@ EXCLUDED_VOLUME_CONFLICTS = frozenset({UNATTRIBUTED_CONFLICT, STALE_CONFLICT})
 #
 # This is the set the verdict kernel must leave alone: every report fact a run
 # can add or remove without ever changing what it EXECUTED.
-UNCOUNTED_REPORT_CONFLICTS = frozenset(
-    {*EXCLUDED_VOLUME_CONFLICTS, UNREADABLE_REPORT_CONFLICT}
-)
+UNCOUNTED_REPORT_CONFLICTS = frozenset({*EXCLUDED_VOLUME_CONFLICTS, UNREADABLE_REPORT_CONFLICT})
 
 
 # The affirming sentence's opening token. Everything that grades execution
@@ -235,31 +233,17 @@ def unbounded_conflicts(*grains: GrainRate) -> tuple[str, ...]:
     return ()
 
 
-def derived_verdict_word(build_modules: GrainRate, test_cases: GrainRate) -> str:
-    """Derive the legacy word mechanically from two named bands."""
+def derived_verdict_word(build_judgment: str | None, test_cases: GrainRate) -> str:
+    """Judge build execution and complete test outcomes, never disk scan scope.
 
-    if build_modules.band == BAND_NONE:
+    The physical build judgment retains the Python ladder's completeness.
+    Missing or incomparable test evidence cannot establish execution success.
+    """
+    if build_judgment == "failed":
         return "failed"
-    if build_modules.band == BAND_FULLY and test_cases.band == BAND_FULLY:
+    if build_judgment == "success" and test_cases.band == BAND_FULLY:
         return "success"
     return "partial"
-
-
-_BUILD_SCOPE_CONFLICTS = frozenset(
-    {
-        "build_modules_incomplete",
-        "build_coverage_scope_unverified",
-        "reactor_scope_narrowed",
-        "build_receipt_not_terminal",
-        "build_receipt_scope_unavailable",
-        "build_receipts_unreadable",
-        "build_requirements_unavailable",
-        "build_validation_failed",
-        "build_oracle_divergence",
-        "module_scan_unreadable",
-        "module_scan_contradicts_physical_build",
-    }
-)
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -275,108 +259,6 @@ def _word(value: object) -> str:
     return str(enum_value or "").strip().lower()
 
 
-def source_scope_coverage(snapshot_payload: Mapping[str, object]) -> dict[str, object]:
-    """Project production-source scope from an already sealed verdict snapshot.
-
-    This does not map ``.class`` files back to source files.  It reports N/N
-    only when the canonical snapshot independently says that a physical build
-    succeeded, the Build phase validated that success, and the complete module
-    scope was covered without a scope conflict.  Under those conditions a
-    successful full-scope build covers the current production-source census as
-    a scope; it does not claim one bytecode artifact per source.
-
-    The caller remains responsible for supplying the canonical, host-authorized
-    snapshot.  Keeping this helper pure makes the same projection reusable by
-    report and Web readers without another filesystem scan.
-    """
-
-    build = _mapping(snapshot_payload.get("build_evidence"))
-    source_files = _strict_count(build.get("source_files"))
-    refs_value = build.get("refs")
-    refs = (
-        [str(item) for item in refs_value if isinstance(item, str) and item]
-        if isinstance(refs_value, (list, tuple))
-        else []
-    )
-
-    def unavailable(reason: str) -> dict[str, object]:
-        return {
-            "availability": "unavailable",
-            "covered": None,
-            "total": source_files,
-            "basis": None,
-            "reason": reason,
-            "evidence_refs": refs,
-        }
-
-    if source_files is None or source_files <= 0:
-        return unavailable("production Java source census unavailable")
-    if not (
-        build.get("observed") is True
-        and build.get("green") is True
-        and _word(build.get("source")) == "physical"
-        and _word(build.get("judgment")) == "success"
-        and _word(build.get("outcome")) == "success"
-        and _word(build.get("evidence_status")) == "verified"
-    ):
-        return unavailable("sealed physical build success unavailable")
-
-    phase_records = snapshot_payload.get("phase_records")
-    build_records = (
-        [
-            _mapping(item)
-            for item in phase_records
-            if isinstance(item, Mapping) and _word(item.get("phase")) == "build"
-        ]
-        if isinstance(phase_records, (list, tuple))
-        else []
-    )
-    if not build_records:
-        return unavailable("validated Build phase success unavailable")
-    latest_build = build_records[-1]
-    if not (
-        _word(latest_build.get("validated_outcome")) == "success"
-        and _word(latest_build.get("termination")) == "completed"
-    ):
-        return unavailable("latest Build phase did not validate a completed success")
-
-    modules = _mapping(
-        _mapping(_mapping(snapshot_payload.get("rates")).get("build")).get("modules")
-    )
-    module_numerator = _strict_count(modules.get("numerator"))
-    module_denominator = _strict_count(modules.get("denominator"))
-    if not (
-        _word(modules.get("band")) == BAND_FULLY
-        and module_denominator is not None
-        and module_denominator > 0
-        and module_numerator == module_denominator
-    ):
-        return unavailable("full build module scope was not sealed")
-
-    conflicts_value = snapshot_payload.get("conflicts")
-    conflict_codes = (
-        {
-            str(item).strip().lower().split(":", 1)[0]
-            for item in conflicts_value
-            if str(item).strip()
-        }
-        if isinstance(conflicts_value, (list, tuple, set, frozenset))
-        else set()
-    )
-    blocking = sorted(conflict_codes & _BUILD_SCOPE_CONFLICTS)
-    if blocking:
-        return unavailable("build scope conflict: " + ", ".join(blocking))
-
-    return {
-        "availability": "available",
-        "covered": source_files,
-        "total": source_files,
-        "basis": "sealed physical build success over validated full module scope",
-        "reason": None,
-        "evidence_refs": refs,
-    }
-
-
 def render_snapshot_metric_lines(snapshot_payload: Mapping[str, object]) -> list[str]:
     """Render three same-grain, user-facing metric lines from one snapshot."""
 
@@ -386,28 +268,37 @@ def render_snapshot_metric_lines(snapshot_payload: Mapping[str, object]) -> list
     modules = _mapping(build_rates.get("modules"))
     module_numerator = _strict_count(modules.get("numerator"))
     module_denominator = _strict_count(modules.get("denominator"))
+    reactor_total = _strict_count(build.get("reactor_modules_total"))
+    reactor_built = _strict_count(build.get("reactor_modules_succeeded"))
+    module_basis = (
+        "in the build run"
+        if reactor_total is not None
+        and reactor_total > 0
+        and reactor_total == module_denominator
+        and reactor_built == module_numerator
+        else "declared on disk"
+    )
     modules_text = (
-        f"{module_numerator:,}/{module_denominator:,}"
+        f"modules built {module_numerator:,} of {module_denominator:,} {module_basis} (diagnostic)"
         if module_numerator is not None
         and module_denominator is not None
         and module_denominator > 0
-        else "unavailable"
+        else "modules built unavailable"
     )
-    source_coverage = source_scope_coverage(snapshot_payload)
-    source_total = _strict_count(source_coverage.get("total"))
-    if source_coverage.get("availability") == "available":
-        source_text = f"{source_coverage['covered']:,}/{source_coverage['total']:,}"
-    elif source_total is not None:
-        source_text = f"unavailable ({source_total:,} observed)"
-    else:
-        source_text = "unavailable"
     class_files = _strict_count(build.get("compiled_classes"))
-    class_text = f"{class_files:,} (diagnostic)" if class_files is not None else "unavailable"
-    build_state = _word(build.get("judgment")) or "unknown"
-    build_line = (
-        f"Build: {build_state.upper()} · production Java sources {source_text} · "
-        f"modules {modules_text} · class files {class_text}"
+    source_files = _strict_count(build.get("source_files"))
+    class_text = (
+        f"class files {class_files:,} (diagnostic)"
+        if class_files is not None
+        else "class files unavailable"
     )
+    source_text = (
+        f"production Java sources {source_files:,} (diagnostic)"
+        if source_files is not None
+        else "production Java sources unavailable"
+    )
+    build_state = _word(build.get("judgment")) or "unknown"
+    build_line = f"Build: {build_state.upper()} · {modules_text} · {class_text} · {source_text}"
 
     tests = _mapping(snapshot_payload.get("test_stats"))
     unique = _mapping(tests.get("unique"))
@@ -420,15 +311,11 @@ def render_snapshot_metric_lines(snapshot_payload: Mapping[str, object]) -> list
     reconciled = all(value is not None for value in counts) and executed == sum(
         value for value in (passed, failed, errors, skipped) if value is not None
     )
-    if failed is not None and errors is not None and failed + errors > 0:
-        test_state = "FAILED"
-    else:
-        judgment = _word(tests.get("judgment"))
-        test_state = {
-            "success": "SUCCESS",
-            "partial": "PARTIAL",
-            "failed": "FAILED",
-        }.get(judgment, "UNAVAILABLE")
+    test_state = {
+        "success": "EXECUTED",
+        "partial": "INTERRUPTED",
+        "failed": "FAILED TO RUN",
+    }.get(_word(tests.get("judgment")), "UNAVAILABLE")
     outcomes_text = (
         f"{executed:,}/{executed:,}"
         if reconciled and executed is not None and executed > 0

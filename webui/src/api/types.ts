@@ -139,20 +139,10 @@ export interface BuildSummary {
   note: string
   system?: string | null
   classCount?: number | null
-  sourceScope?: SourceScopeSummary | null
   jarCount?: number | null
   moduleOutputCount?: number | null
   artifactSamples?: string[]
   warnings?: string[]
-  evidenceRefs?: string[]
-}
-
-export interface SourceScopeSummary {
-  covered?: number | null
-  total?: number | null
-  availability: "available" | "unavailable"
-  basis?: string | null
-  reason?: string | null
   evidenceRefs?: string[]
 }
 

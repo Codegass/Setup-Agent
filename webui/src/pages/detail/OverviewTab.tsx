@@ -109,7 +109,7 @@ export function OverviewTab({
         />
         <Tile
           label="Tests"
-          value={run.stateLabel === "Passed" ? "Success" : run.stateLabel}
+          value={run.stateLabel}
           sub={accounting.summary}
           valueClass={run.valueClass}
         />

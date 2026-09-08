@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import secrets
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-
 from loguru import logger
 
 from sag import __version__
@@ -23,7 +23,16 @@ from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchVali
 from sag.web.read_model import ReadModelBuilder
 from sag.web.session_registry import UnattributableSessionError
 from sag.web.task_runner import TaskRequest, TaskRunner
-from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
+from sag.web.terminal import (
+    LOOPBACK_HOSTS,
+    TERMINAL_SUBPROTOCOL,
+    TERMINAL_TOKEN_PREFIX,
+    TerminalAdapter,
+    close_socket,
+    recv_socket,
+    send_socket,
+    terminal_request_allowed,
+)
 from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
 
 
@@ -39,11 +48,18 @@ def create_app(
     static_dir: Path | None = None,
     launch_service: LaunchService | None = None,
     workspace_service: WorkspaceService | None = None,
+    terminal_allowed_hosts: set[str] | None = None,
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
     runner = task_runner if task_runner is not None else TaskRunner()
     terminal_bridge = terminal_adapter if terminal_adapter is not None else TerminalAdapter()
     owns_terminal_bridge = terminal_adapter is None
+    terminal_token = secrets.token_urlsafe(32)
+    terminal_hosts = set(LOOPBACK_HOSTS) | {
+        host.strip("[]").lower()
+        for host in terminal_allowed_hosts or ()
+        if host not in {"0.0.0.0", "::", "[::]", "*"}
+    }
     launches = launch_service if launch_service is not None else LaunchService()
     # Share the launch service's store/DB so queue cleanup and launch state stay
     # consistent; a fake launch service without a store falls back to the default.
@@ -274,9 +290,31 @@ def create_app(
             media_type="text/event-stream",
         )
 
+    @app.get("/api/terminal-session")
+    def terminal_session(request: Request) -> JSONResponse:
+        if request.headers.get("x-sag-client") != "workbench" or not terminal_request_allowed(
+            request, terminal_hosts, require_origin=False
+        ):
+            raise HTTPException(
+                status_code=403, detail="Terminal access requires the local workbench."
+            )
+        return JSONResponse({"token": terminal_token}, headers={"Cache-Control": "no-store"})
+
     @app.websocket("/api/workspaces/{workspace_id}/terminal")
     async def workspace_terminal(websocket: WebSocket, workspace_id: str) -> None:
-        await websocket.accept()
+        protocols = websocket.scope.get("subprotocols", [])
+        expected = f"{TERMINAL_TOKEN_PREFIX}{terminal_token}"
+        if (
+            not terminal_request_allowed(websocket, terminal_hosts, require_origin=True)
+            or TERMINAL_SUBPROTOCOL not in protocols
+            or not any(
+                secrets.compare_digest(protocol.encode(), expected.encode())
+                for protocol in protocols
+            )
+        ):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept(subprotocol=TERMINAL_SUBPROTOCOL)
         socket: Any | None = None
         output_task: asyncio.Task[None] | None = None
 

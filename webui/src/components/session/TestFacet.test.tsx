@@ -68,7 +68,7 @@ describe("TestFacet", () => {
   it("shows conclusion + FAILING + a 'View test details' detail for single-module", () => {
     render(<TestFacet detail={single} />)
     expect(screen.getByText(/97\.5% of non-skipped results passed/i)).toBeInTheDocument()
-    expect(screen.getByText(/sealed run results: 312 passed · 8 failed · 0 errors/i)).toBeInTheDocument()
+    expect(screen.getByText(/test results: 312 passed · 8 failed · 0 errors/i)).toBeInTheDocument()
     expect(screen.getByText(/Failing · 2/)).toBeInTheDocument()
     expect(screen.getByText("HelpFormatterTest.testWrappedWidth")).toBeInTheDocument()
     // Single-module gets a "View test details" affordance (not "per-module breakdown").
@@ -76,6 +76,13 @@ describe("TestFacet", () => {
     const btn = screen.getByRole("button", { name: /view test details/i })
     fireEvent.click(btn)
     expect(screen.getByRole("dialog", { name: /test details/i })).toBeInTheDocument()
+  })
+
+  it("shows completed execution beside red project outcomes", () => {
+    render(<TestFacet detail={{ ...single, test: { ...single.test, state: "success" } }} />)
+    expect(screen.getByText("Executed")).toHaveClass("text-status-success")
+    expect(screen.getByText(/test results: 312 passed · 8 failed · 0 errors/i)).toBeInTheDocument()
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument()
   })
 
   it("opens the per-module breakdown modal for a multi-module project", () => {
@@ -88,9 +95,9 @@ describe("TestFacet", () => {
   it("separates a sealed run from verified identities and diagnostic observations", () => {
     render(<TestFacet detail={igniteShape} />)
 
-    expect(screen.getByText("Test run result")).toBeInTheDocument()
-    expect(screen.getByText("Passed")).toHaveClass("text-status-success")
-    expect(screen.getByText(/sealed run results: 2 passed · 0 failed · 0 errors/i)).toBeInTheDocument()
+    expect(screen.getByText("Test execution")).toBeInTheDocument()
+    expect(screen.getByText("Executed")).toHaveClass("text-status-success")
+    expect(screen.getByText(/test results: 2 passed · 0 failed · 0 errors/i)).toBeInTheDocument()
     expect(screen.getByText(/100% of non-skipped results passed/i)).toBeInTheDocument()
     expect(screen.getByRole("img", { name: /2 passed, 0 failed, 2 total/i })).toBeInTheDocument()
 

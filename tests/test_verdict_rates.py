@@ -17,7 +17,6 @@ from sag.verdict_rates import (
     derived_verdict_word,
     render_rate_lines,
     render_snapshot_metric_lines,
-    source_scope_coverage,
 )
 
 
@@ -84,19 +83,20 @@ def test_demoted_band_overrides_the_fraction():
 
 
 @pytest.mark.parametrize(
-    "build_band_args, test_band_args, word",
+    "build_judgment, test_band_args, word",
     [
-        ((0, 14), (100, 100), "failed"),  # none build -> failed
-        ((14, 14), (100, 100), "success"),  # fully + fully -> success
-        ((14, 14), (99, 100), "partial"),
-        ((13, 14), (100, 100), "partial"),
-        ((14, 14), (0, None), "partial"),  # unavailable is never success
+        ("failed", (100, 100), "failed"),
+        ("success", (100, 100), "success"),
+        ("success", (99, 100), "partial"),
+        ("success", (0, None), "partial"),
+        ("partial", (100, 100), "partial"),
+        (None, (100, 100), "partial"),
+        ("unknown", (100, 100), "partial"),
     ],
 )
-def test_derived_verdict_word(build_band_args, test_band_args, word):
-    build = GrainRate(numerator=build_band_args[0], denominator=build_band_args[1])
+def test_derived_verdict_word(build_judgment, test_band_args, word):
     test = GrainRate(numerator=test_band_args[0], denominator=test_band_args[1])
-    assert derived_verdict_word(build, test) == word
+    assert derived_verdict_word(build_judgment, test) == word
 
 
 def test_render_rate_lines_keeps_all_three_grains_visible():
@@ -166,8 +166,7 @@ def test_an_unbounded_grain_cannot_manufacture_success():
     fully = GrainRate(numerator=1, denominator=1)
     unbounded = GrainRate(numerator=1605, denominator=1163)
 
-    assert derived_verdict_word(fully, unbounded) == "partial"
-    assert derived_verdict_word(unbounded, fully) == "partial"
+    assert derived_verdict_word("success", unbounded) == "partial"
 
 
 def test_heavy_red_never_promotes_an_unbounded_grain_into_a_band():
@@ -267,62 +266,66 @@ def _sealed_commons_cli_snapshot() -> dict:
     }
 
 
-def test_source_scope_coverage_requires_independent_full_build_authority():
-    coverage = source_scope_coverage(_sealed_commons_cli_snapshot())
-
-    assert coverage == {
-        "availability": "available",
-        "covered": 36,
-        "total": 36,
-        "basis": "sealed physical build success over validated full module scope",
-        "reason": None,
-        "evidence_refs": ["receipt://maven-build"],
-    }
-
-
-@pytest.mark.parametrize("broken", ["physical", "phase", "modules", "scope_conflict"])
-def test_source_scope_coverage_refuses_incomplete_authority(broken):
-    snapshot = _sealed_commons_cli_snapshot()
-    if broken == "physical":
-        snapshot["build_evidence"]["source"] = "observations"
-    elif broken == "phase":
-        snapshot["phase_records"][0]["validated_outcome"] = "partial"
-    elif broken == "modules":
-        snapshot["rates"]["build"]["modules"] = GrainRate(1, 2).payload()
-    else:
-        snapshot["conflicts"] = ["build_coverage_scope_unverified"]
-
-    coverage = source_scope_coverage(snapshot)
-
-    assert coverage["availability"] == "unavailable"
-    assert coverage["covered"] is None
-    assert coverage["total"] == 36
-    assert coverage["reason"]
-
-
-def test_snapshot_metric_lines_use_same_grain_counts_and_keep_diagnostics():
-    snapshot = _sealed_commons_cli_snapshot()
-
-    assert render_snapshot_metric_lines(snapshot) == [
-        (
-            "Build: SUCCESS · production Java sources 36/36 · modules 1/1 · "
-            "class files 56 (diagnostic)"
-        ),
-        (
-            "Tests: SUCCESS · outcomes accounted 987/987 · "
-            "non-skipped passed 926/926 · skipped 61 · failed 0 · errors 0 · "
-            "static declarations 468 (diagnostic)"
-        ),
+def test_snapshot_metric_lines_state_execution_and_scan_diagnostics():
+    assert render_snapshot_metric_lines(_sealed_commons_cli_snapshot()) == [
+        "Build: SUCCESS · modules built 1 of 1 declared on disk (diagnostic) · class files 56 (diagnostic) · production Java sources 36 (diagnostic)",
+        "Tests: EXECUTED · outcomes accounted 987/987 · non-skipped passed 926/926 · skipped 61 · failed 0 · errors 0 · static declarations 468 (diagnostic)",
         "Coverage: unavailable — coverage pass not run",
     ]
 
 
-def test_snapshot_metric_test_state_is_failed_when_runtime_results_are_red():
+def test_red_tests_remain_executed_and_report_red_counts():
     snapshot = deepcopy(_sealed_commons_cli_snapshot())
     snapshot["test_stats"]["unique"].update(passed=925, failed=1)
-
     _, test_line, _ = render_snapshot_metric_lines(snapshot)
-
-    assert test_line.startswith("Tests: FAILED · outcomes accounted 987/987")
+    assert test_line.startswith("Tests: EXECUTED · outcomes accounted 987/987")
     assert "non-skipped passed 925/926" in test_line
     assert "failed 1 · errors 0" in test_line
+    assert "FAILED" not in test_line
+
+
+def test_partial_scan_is_a_disclosure_not_a_build_grade():
+    snapshot = deepcopy(_sealed_commons_cli_snapshot())
+    snapshot["rates"]["build"]["modules"] = GrainRate(21, 26).payload()
+    snapshot["conflicts"] = ["build_modules_incomplete"]
+    build_line, _, _ = render_snapshot_metric_lines(snapshot)
+    assert build_line.startswith(
+        "Build: SUCCESS · modules built 21 of 26 declared on disk (diagnostic)"
+    )
+    assert "%" not in build_line
+
+
+def test_terminal_reactor_count_is_not_mislabeled_as_disk_scan():
+    snapshot = deepcopy(_sealed_commons_cli_snapshot())
+    snapshot["build_evidence"].update(reactor_modules_succeeded=41, reactor_modules_total=41)
+    snapshot["rates"]["build"]["modules"] = GrainRate(41, 41).payload()
+    build_line, _, _ = render_snapshot_metric_lines(snapshot)
+    assert "modules built 41 of 41 in the build run (diagnostic)" in build_line
+    assert "declared on disk" not in build_line
+
+
+@pytest.mark.parametrize(
+    "judgment, label",
+    [
+        ("success", "EXECUTED"),
+        ("partial", "INTERRUPTED"),
+        ("failed", "FAILED TO RUN"),
+        ("unknown", "UNAVAILABLE"),
+    ],
+)
+def test_tests_line_names_execution_state(judgment, label):
+    snapshot = deepcopy(_sealed_commons_cli_snapshot())
+    snapshot["test_stats"]["judgment"] = judgment
+    assert render_snapshot_metric_lines(snapshot)[1].startswith(f"Tests: {label} ·")
+
+
+def test_missing_diagnostics_are_unavailable_not_zero():
+    snapshot = deepcopy(_sealed_commons_cli_snapshot())
+    snapshot["build_evidence"].pop("compiled_classes")
+    snapshot["build_evidence"].pop("source_files")
+    snapshot["rates"]["build"]["modules"] = GrainRate(0, None).payload()
+    build_line, _, _ = render_snapshot_metric_lines(snapshot)
+    assert (
+        build_line
+        == "Build: SUCCESS · modules built unavailable · class files unavailable · production Java sources unavailable"
+    )

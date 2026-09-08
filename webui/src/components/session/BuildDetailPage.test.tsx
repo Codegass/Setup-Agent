@@ -25,9 +25,11 @@ describe("BuildDetailPage (per-module breakdown)", () => {
     expect(screen.getByText("connect:runtime")).toBeInTheDocument()
   })
 
-  it("shows the module success rate (21/24)", () => {
+  it("keeps module counts diagnostic without deriving a success rate", () => {
     render(<BuildDetailPage detail={multi} />)
-    expect(screen.getByText(/88%/)).toBeInTheDocument()
+    expect(screen.getByText(/module counts are diagnostic/i)).toBeInTheDocument()
+    expect(screen.queryByText("Success rate")).not.toBeInTheDocument()
+    expect(screen.queryByText(/88%/)).not.toBeInTheDocument()
   })
 
   it("notes Gradle best-effort status when the build system is gradle", () => {

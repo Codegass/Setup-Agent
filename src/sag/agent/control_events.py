@@ -1470,6 +1470,14 @@ class ControlEvent(BaseModel):
     source: SourceExcerpt | None = None
     timestamp: str | None = None
     event_id: str | None = None
+    run_id: str | None = Field(default=None, min_length=1, max_length=512)
+
+    @model_serializer(mode="wrap")
+    def _omit_unscoped_run(self, handler):
+        data = handler(self)
+        if self.run_id is None:
+            data.pop("run_id", None)
+        return data
 
     @classmethod
     def model_construct(cls, _fields_set: set[str] | None = None, **values: Any):
@@ -1503,6 +1511,12 @@ class ControlEvent(BaseModel):
     @model_validator(mode="after")
     def _validate_payload(self) -> "ControlEvent":
         model = _PAYLOAD_MODELS[self.kind].model_validate(self.payload)
+        if self.run_id is not None and self.kind in {
+            "evidence_store_bound",
+            "evidence_publication",
+        }:
+            if getattr(model, "run_id", None) != self.run_id:
+                raise ValueError("control event run identity disagrees with its evidence payload")
         # Preserve legacy fixture shape while retaining every field explicitly
         # recorded by new live runs.
         object.__setattr__(
@@ -1635,8 +1649,10 @@ class ControlEventSink:
         mirror: Callable[[str], None] | None = None,
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[int], str] | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.path = Path(path)
+        self.run_id = run_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._mirror = mirror
         self._clock = clock or (
@@ -1687,6 +1703,7 @@ class ControlEventSink:
                 source=resolved_source,
                 timestamp=self._clock(),
                 event_id=self._id_factory(sequence),
+                run_id=self.run_id,
             )
             line = canonical_json(event) + "\n"
             with self.path.open("a", encoding="utf-8") as handle:

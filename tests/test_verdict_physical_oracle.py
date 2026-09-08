@@ -105,7 +105,7 @@ BIGTOP_PHYSICAL = {
     "reason": "not all active modules compiled (islands: test-framework failed)",
     "conflicts": ["build_modules_incomplete"],
     "evidence_status": "partial",
-    "evidence": {"class_count": 121},
+    "evidence": {"build_system": "maven", "class_count": 121},
     "evidence_refs": ["output_gradle_ok"],
 }
 
@@ -139,12 +139,12 @@ def test_physical_oracle_outranks_last_failed_observation_bigtop_shape():
     snapshot = _finalize(_bigtop_state(), validator)
 
     assert validator.calls == ["proj"]
-    assert snapshot.build_evidence.judgment == "partial"
+    assert snapshot.build_evidence.judgment == "success"
     assert snapshot.build_evidence.source == "physical"
     assert snapshot.build_evidence.compiled_classes == 121
     assert "build_modules_incomplete" in snapshot.conflicts
-    # partial build + green tests = the July-13 honest PARTIAL, not failed
-    assert snapshot.verdict == "partial"
+    # Real JVM output and complete tests establish execution; scan scope stays diagnostic.
+    assert snapshot.verdict == "success"
 
 
 def test_physical_failure_grounds_failed_even_without_build_observations_tvm_shape():
@@ -176,9 +176,8 @@ def test_physical_failure_grounds_failed_even_without_build_observations_tvm_sha
 
     assert snapshot.build_evidence.judgment == "failed"
     assert snapshot.build_evidence.source == "physical"
-    # Premise updated 2026-08-10: the physical failure stays in build_evidence;
-    # this fake has no module denominator, so the compatibility word is partial.
-    assert snapshot.verdict == "partial"
+    # Physical failure determines the word even without a module denominator.
+    assert snapshot.verdict == "failed"
 
 
 def test_full_physical_success_with_green_tests_is_success():
@@ -202,7 +201,7 @@ def test_full_physical_success_with_green_tests_is_success():
     )
     snapshot = _finalize(state, validator)
     assert snapshot.build_evidence.judgment == "success"
-    assert snapshot.verdict == "partial"
+    assert snapshot.verdict == "success"
 
 
 def test_terminal_reactor_authority_seals_module_rate_without_class_ratio_conflict():
@@ -286,7 +285,7 @@ def test_fallback_all_failed_observations_is_failed():
     )
     snapshot = _finalize(state, validator=None)
     assert snapshot.build_evidence.judgment == "failed"
-    assert snapshot.verdict == "partial"
+    assert snapshot.verdict == "failed"
 
 
 def test_true_unknown_requires_nothing_observed_anywhere():
@@ -412,7 +411,7 @@ def test_oracle_divergence_with_gate_record_is_a_visible_conflict():
     snapshot = _finalize(state, validator)
     assert snapshot.build_evidence.judgment == "failed"
     assert "build_oracle_divergence" in snapshot.conflicts
-    assert snapshot.verdict == "partial"
+    assert snapshot.verdict == "failed"
 
 
 class ModuleAwareValidator(FakePhysicalValidator):
@@ -498,7 +497,7 @@ def _bigtop_module_validator():
     )
 
 
-def test_module_coverage_conflicts_cap_pathological_aggregator_at_partial():
+def test_module_coverage_conflicts_disclose_pathological_aggregator_scope():
     validator = _bigtop_module_validator()
     state = RunEvidenceState(run_id="session-bigtop-islands")
     state.ingest_tool_result(
@@ -513,8 +512,8 @@ def test_module_coverage_conflicts_cap_pathological_aggregator_at_partial():
     assert snapshot.build_evidence.judgment == "success"  # physical top-level
     assert "build_modules_incomplete" in snapshot.conflicts
     assert "reactor_scope_narrowed" in snapshot.conflicts
-    # coverage shortfall caps the run: never SUCCESS with unbuilt islands
-    assert snapshot.verdict == "partial"
+    # The scan shortfall stays visible without grading execution against disk scope.
+    assert snapshot.verdict == "success"
 
 
 def test_python_projects_keep_module_conflict_suppression():
@@ -541,7 +540,7 @@ def test_python_projects_keep_module_conflict_suppression():
     _green_tests(state)
     snapshot = _finalize(state, validator)
     assert snapshot.conflicts == ()
-    assert snapshot.verdict == "partial"
+    assert snapshot.verdict == "success"
 
 
 def test_pr9_phantom_green_gate_reaches_the_sealed_verdict():
@@ -583,4 +582,4 @@ def test_pr9_phantom_green_gate_reaches_the_sealed_verdict():
     assert snapshot.build_evidence.judgment == "failed"
     assert snapshot.build_evidence.source == "physical"
     assert snapshot.build_evidence.compiled_classes == 0
-    assert snapshot.verdict == "partial"
+    assert snapshot.verdict == "failed"

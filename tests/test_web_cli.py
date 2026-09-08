@@ -103,8 +103,9 @@ def test_run_web_server_mounts_bundled_static_dir(monkeypatch):
     calls = {}
     sentinel_app = object()
 
-    def fake_create_app(read_model, *, static_dir=None):
+    def fake_create_app(read_model, *, static_dir=None, terminal_allowed_hosts=None):
         calls["static_dir"] = static_dir
+        calls["terminal_allowed_hosts"] = terminal_allowed_hosts
         return sentinel_app
 
     def fake_uvicorn_run(app, **kwargs):
@@ -117,6 +118,7 @@ def test_run_web_server_mounts_bundled_static_dir(monkeypatch):
     run_web_server(host="127.0.0.1", port=8765, demo=True)
 
     assert calls["static_dir"] == STATIC_DIR
+    assert calls["terminal_allowed_hosts"] == {"127.0.0.1"}
     assert calls["app"] is sentinel_app
     assert calls["uvicorn"] == {
         "host": "127.0.0.1",

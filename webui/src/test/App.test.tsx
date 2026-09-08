@@ -467,7 +467,7 @@ describe("App", () => {
     expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
     // The Tests tab's sealed-run summary reflects the freshly polled totals.
     fireEvent.click(screen.getByRole("button", { name: /^Tests/ }))
-    expect(screen.getByText(/sealed run results: 430 passed/i)).toBeInTheDocument()
+    expect(screen.getByText(/test results: 430 passed/i)).toBeInTheDocument()
   }, 8000)
 
   it("refreshes completed session details when late metrics arrive", async () => {

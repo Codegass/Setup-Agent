@@ -523,6 +523,7 @@ class ReActEngine(UIEventEmitter):
         orchestrator=None,
         llm_client: Any | None = None,
         pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
+        physical_validator: PhysicalValidator | None = None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -643,13 +644,17 @@ class ReActEngine(UIEventEmitter):
             )
 
         # Initialize physical validator for fact-based validation
-        self.physical_validator = PhysicalValidator(
-            docker_orchestrator=orchestrator,
-            project_path="/workspace",
-            build_coverage_threshold=self.config.build_coverage_threshold,
-            receipt_run_id=(
-                self.run_evidence_state.run_id if self.run_evidence_state is not None else None
-            ),
+        self.physical_validator = (
+            physical_validator
+            if physical_validator is not None
+            else PhysicalValidator(
+                docker_orchestrator=orchestrator,
+                project_path="/workspace",
+                build_coverage_threshold=self.config.build_coverage_threshold,
+                receipt_run_id=(
+                    self.run_evidence_state.run_id if self.run_evidence_state is not None else None
+                ),
+            )
         )
         self._analysis_facts_recovery_attempted = False
         phase_tool = self.tools.get("phase")
@@ -1349,9 +1354,7 @@ class ReActEngine(UIEventEmitter):
                     f"Detached job {job_id} remained live during {reason_text}: {result.code}"
                 )
             else:
-                logger.info(
-                    f"Detached job {job_id} closed during {reason_text}: {result.code}"
-                )
+                logger.info(f"Detached job {job_id} closed during {reason_text}: {result.code}")
         return dict(results)
 
     @staticmethod
@@ -1374,9 +1377,7 @@ class ReActEngine(UIEventEmitter):
     def _run_task_completion_conflicts(self) -> Tuple[str, ...]:
         """Structured blockers to a free-form run-task terminal answer."""
 
-        latest: Optional[
-            tuple[str, Optional[InvocationStatus], Optional[OperationOutcome]]
-        ] = None
+        latest: Optional[tuple[str, Optional[InvocationStatus], Optional[OperationOutcome]]] = None
         for record in getattr(self, "recent_tool_executions", ()) or ():
             if not isinstance(record, (ToolExecutionRecord, Mapping)):
                 continue
@@ -3061,9 +3062,7 @@ class ReActEngine(UIEventEmitter):
             manifest = observed.payload
             module_structure = manifest.get("module_structure")
             modules = (
-                module_structure.get("modules")
-                if isinstance(module_structure, Mapping)
-                else None
+                module_structure.get("modules") if isinstance(module_structure, Mapping) else None
             )
             fields = [
                 ("build_root", manifest.get("build_root")),
@@ -4543,7 +4542,10 @@ class ReActEngine(UIEventEmitter):
         path = getattr(sink, "path", None)
         if path is None:
             return
-        state = recover_active_repair_context_from_path(path)
+        run_id = getattr(getattr(self, "run_evidence_state", None), "run_id", None) or getattr(
+            getattr(self, "physical_validator", None), "receipt_run_id", None
+        )
+        state = recover_active_repair_context_from_path(path, run_id=run_id)
         if state.context is None:
             return
         self._pending_repair_context = state.context

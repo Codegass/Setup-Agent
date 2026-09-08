@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import type { TestEvidenceLayers, TestSummary } from "@/api/types"
 
 import {
-  buildScopeFromRates,
+  moduleScanFromRates,
   completeEvidenceCounts,
   lowerBoundEvidenceCounts,
   presentBuild,
@@ -13,7 +13,6 @@ import {
   presentTestRun,
   presentVerifiedIdentities,
   safeRate,
-  sourceScopeFromBuild,
 } from "./evidencePresentation"
 
 function unavailable(reason = "module-qualified subject/case identity was not sealed") {
@@ -73,7 +72,7 @@ describe("evidence presentation", () => {
     const test = withLayers({ state: "success", pass: 4722, total: 4722 }, layers())
 
     expect(presentTestRun(test)).toMatchObject({
-      stateLabel: "Passed",
+      stateLabel: "Executed",
       passed: 4722,
       failed: 0,
       errors: 0,
@@ -215,7 +214,7 @@ describe("evidence presentation", () => {
     expect(accounting.summary).not.toMatch(/\d[\d,]* \/ \d/)
   })
 
-  it("never presents a Kogito-shaped run with failed results as passed", () => {
+  it("keeps execution complete when the project reports failed and errored tests", () => {
     const run = presentTestRun({
       state: "success",
       pass: 165,
@@ -226,9 +225,9 @@ describe("evidence presentation", () => {
     })
 
     expect(run).toMatchObject({
-      stateLabel: "Failed",
-      tone: "red",
-      valueClass: "text-status-failed",
+      stateLabel: "Executed",
+      tone: "green",
+      valueClass: "text-status-success",
       negative: 63,
       nonSkipped: 228,
     })
@@ -289,60 +288,49 @@ describe("evidence presentation", () => {
     expect(result.summary).toMatch(/at least 266/i)
   })
 
-  it("presents partial build scope as counts, never as a percentage", () => {
-    const rates = {
-      build: { modules: { numerator: 19, denominator: 26, rate: 73.1, band: "most" } },
-    }
-    expect(buildScopeFromRates(rates, "partial")).toEqual({
-      observed: 19, expected: 26, incomplete: true,
-    })
-    expect(presentBuild({
-      state: "partial", tool: "sealed snapshot", time: "—", note: "", classCount: 4230,
-    }, rates)).toMatchObject({
-      value: "Partial",
-      summary: "Modules 19 / 26 · Scope incomplete",
-    })
-  })
+  it("states the module scan as a diagnostic sentence and never as a rate", () => {
+    const rates = { build: { modules: { numerator: 21, denominator: 26, rate: 80.8, band: "most" } } }
+    const build = presentBuild(
+      { state: "success", tool: "sealed snapshot", time: "—", note: "", classCount: 4230 },
+      rates,
+    )
 
-  it("shows comparable production sources but never substitutes compiled classes", () => {
-    const build = {
-      state: "success",
-      tool: "sealed snapshot",
-      time: "—",
-      note: "",
-      classCount: 56,
-      sourceScope: {
-        covered: 36,
-        total: 36,
-        availability: "available" as const,
-        basis: "sealed physical build success over validated full module scope",
-      },
-    }
-    expect(sourceScopeFromBuild(build)).toEqual({ covered: 36, total: 36 })
-    expect(presentBuild(build, {
-      build: { modules: { numerator: 1, denominator: 1, rate: 100, band: "fully" } },
-    })).toMatchObject({
-      value: "Success",
-      summary: "Production Java sources 36 / 36 · Modules 1 / 1",
-    })
-    expect(presentBuild(build).summary).not.toMatch(/class/i)
+    expect(build.value).toBe("Success")
+    expect(build.summary).toBe("Modules built 21 of 26 declared on disk (diagnostic) · Class files 4,230 (diagnostic)")
+    expect(build.summary).not.toMatch(/%/)
+    expect(build.summary).not.toMatch(/scope incomplete/i)
+    expect(build.scan).toEqual({ built: 21, declared: 26 })
   })
 
   it.each([
-    { availability: "unavailable" as const, covered: null, total: 36 },
-    { availability: "available" as const, covered: 37, total: 36 },
-    { availability: "available" as const, covered: 0, total: 0 },
-  ])("does not show an invalid or unavailable source-scope ratio", (sourceScope) => {
-    const build = {
-      state: "success",
-      tool: "sealed snapshot",
-      time: "—",
-      note: "",
-      classCount: 56,
-      sourceScope,
-    }
-    expect(sourceScopeFromBuild(build)).toBeNull()
-    expect(presentBuild(build).summary).toBe("No comparable build-scope counts were recorded.")
+    ["terminal root reactor receipt is authoritative", "Modules built 21 of 26 in the build run (diagnostic)"],
+    ["unknown module count source", "Recorded module counts: 21 built of 26 (diagnostic)"],
+  ])("labels module counts from their existing provenance: %s", (reason, summary) => {
+    const build = presentBuild(
+      { state: "success", tool: "Maven", time: "", note: "" },
+      { build: { modules: { numerator: 21, denominator: 26, reason } } },
+    )
+    expect(build.summary).toBe(summary)
+    expect(build.summary).not.toMatch(/declared on disk|%/)
+    expect(build.scan).toEqual({ built: 21, declared: 26 })
+  })
+
+  it("a partial build is partial because of its state, not its scan", () => {
+    const build = presentBuild({ state: "partial", tool: "Maven", time: "", note: "" }, null)
+
+    expect(build.value).toBe("Partial")
+    expect(build.summary).toBe("Build stopped before completion.")
+  })
+
+  it("does not invent unavailable module or class counts", () => {
+    expect(moduleScanFromRates({ build: { modules: { numerator: null, denominator: null } } })).toBeNull()
+    expect(presentBuild({ state: "success", tool: "Maven", time: "", note: "" }).summary)
+      .toBe("No build counts were recorded.")
+  })
+
+  it("does not let failed test outcomes overwrite interrupted execution", () => {
+    expect(presentTestRun({ state: "partial", pass: 2, fail: 1, errors: 1, skip: 0, total: 4 }))
+      .toMatchObject({ stateLabel: "Partial", negative: 2, tone: "amber" })
   })
 
   it("presents phases that were never entered without showing zero coverage", () => {
@@ -354,8 +342,7 @@ describe("evidence presentation", () => {
       value: "Not run",
       tone: "neutral",
       summary: "Build was not run.",
-      scope: null,
-      sourceScope: null,
+      scan: null,
     })
 
     expect(presentTestRun({

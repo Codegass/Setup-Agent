@@ -97,7 +97,7 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
               {run.stateLabel}
             </div>
             <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-              Test run result
+              Test execution
             </div>
           </div>
           {run.passRate != null ? (

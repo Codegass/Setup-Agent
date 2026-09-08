@@ -165,6 +165,8 @@ def snapshot_factory():
             finalized_at="2026-07-17T12:00:00Z",
             verdict=verdict,
             build_evidence=BuildEvidenceSnapshot(
+                judgment=verdict,
+                source="physical",
                 observed=True,
                 green=verdict == "success",
                 outcome=(

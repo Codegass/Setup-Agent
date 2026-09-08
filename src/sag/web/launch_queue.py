@@ -18,6 +18,7 @@ class WorkspaceBusyError(RuntimeError):
     refuses and changes nothing.
     """
 
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS launch_batches (
     id TEXT PRIMARY KEY,
@@ -115,9 +116,29 @@ class LaunchQueueStore:
             raise
         conn.execute("COMMIT")
 
-    def enqueue_batch(self, batch: LaunchBatch, items: list[LaunchItem]) -> None:
+    def enqueue_batch(self, batch: LaunchBatch, items: list[LaunchItem]) -> list[LaunchItem]:
+        """Admit distinct active workspaces atomically; return conflicting rows."""
         with contextlib.closing(self._connect()) as conn:
             with self._transaction(conn):
+                active = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT workspace_id FROM launch_items"
+                        " WHERE status IN ('queued', 'launching', 'running')"
+                    )
+                }
+                admitted: list[LaunchItem] = []
+                rejected: list[LaunchItem] = []
+                for item in items:
+                    is_active = item.status in {"queued", "launching", "running"}
+                    if is_active and item.workspace_id in active:
+                        rejected.append(item)
+                    else:
+                        admitted.append(item)
+                        if is_active:
+                            active.add(item.workspace_id)
+                if not admitted:
+                    return rejected
                 conn.execute(
                     "INSERT INTO launch_batches"
                     " (id, created_at, concurrency, status, total, accepted, rejected)"
@@ -128,11 +149,11 @@ class LaunchQueueStore:
                         batch.concurrency,
                         batch.status,
                         batch.total,
-                        batch.accepted,
-                        batch.rejected,
+                        len(admitted),
+                        batch.rejected + len(rejected),
                     ),
                 )
-                for item in items:
+                for item in admitted:
                     conn.execute(
                         "INSERT INTO launch_items ("
                         " id, batch_id, row_index, repo_url, name, ref, goal, record,"
@@ -162,13 +183,12 @@ class LaunchQueueStore:
                             item.finished_at,
                         ),
                     )
+        return rejected
 
     def summary_counts(self) -> dict[str, int]:
         counts = {status: 0 for status in ALL_STATUSES}
         with contextlib.closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM launch_items GROUP BY status"
-            )
+            rows = conn.execute("SELECT status, COUNT(*) AS n FROM launch_items GROUP BY status")
             for row in rows:
                 if row["status"] in counts:
                     counts[row["status"]] = row["n"]
@@ -207,8 +227,7 @@ class LaunchQueueStore:
             claimed: LaunchItem | None = None
             with self._transaction(conn):
                 active = conn.execute(
-                    "SELECT COUNT(*) FROM launch_items"
-                    " WHERE status IN ('launching', 'running')"
+                    "SELECT COUNT(*) FROM launch_items" " WHERE status IN ('launching', 'running')"
                 ).fetchone()[0]
                 if active < global_cap:
                     row = conn.execute(
@@ -230,9 +249,7 @@ class LaunchQueueStore:
                             " WHERE id = ?",
                             (now, row["id"]),
                         )
-                        claimed = replace(
-                            _item_from_row(row), status="launching", started_at=now
-                        )
+                        claimed = replace(_item_from_row(row), status="launching", started_at=now)
             return claimed
 
     def mark_running(self, item_id: str, pid: int, now: str) -> None:
@@ -248,9 +265,7 @@ class LaunchQueueStore:
     def mark_completed(self, item_id: str, exit_code: int, now: str) -> None:
         self._finish(item_id, "completed", exit_code=exit_code, error=None, now=now)
 
-    def mark_failed(
-        self, item_id: str, error: str, now: str, exit_code: int | None = None
-    ) -> None:
+    def mark_failed(self, item_id: str, error: str, now: str, exit_code: int | None = None) -> None:
         self._finish(item_id, "failed", exit_code=exit_code, error=error, now=now)
 
     def unfinished_items(self) -> list[LaunchItem]:
@@ -309,13 +324,10 @@ class LaunchQueueStore:
                     (workspace_id,),
                 ).fetchone()[0]
                 if active:
-                    raise WorkspaceBusyError(
-                        f"Workspace has an active launch: {workspace_id}"
-                    )
+                    raise WorkspaceBusyError(f"Workspace has an active launch: {workspace_id}")
 
                 rows = conn.execute(
-                    "SELECT batch_id, process_log FROM launch_items"
-                    " WHERE workspace_id = ?",
+                    "SELECT batch_id, process_log FROM launch_items" " WHERE workspace_id = ?",
                     (workspace_id,),
                 ).fetchall()
                 process_logs = [row["process_log"] for row in rows]
@@ -333,9 +345,7 @@ class LaunchQueueStore:
                         (batch_id,),
                     ).fetchone()[0]
                     if remaining == 0:
-                        conn.execute(
-                            "DELETE FROM launch_batches WHERE id = ?", (batch_id,)
-                        )
+                        conn.execute("DELETE FROM launch_batches WHERE id = ?", (batch_id,))
                     else:
                         # A surviving batch may now have a different makeup (e.g.
                         # its only failed item was removed): recompute its status
@@ -375,14 +385,11 @@ class LaunchQueueStore:
             status = "running"
         else:
             failed = conn.execute(
-                "SELECT COUNT(*) FROM launch_items"
-                " WHERE batch_id = ? AND status = 'failed'",
+                "SELECT COUNT(*) FROM launch_items" " WHERE batch_id = ? AND status = 'failed'",
                 (batch_id,),
             ).fetchone()[0]
             status = "failed" if failed else "completed"
-        conn.execute(
-            "UPDATE launch_batches SET status = ? WHERE id = ?", (status, batch_id)
-        )
+        conn.execute("UPDATE launch_batches SET status = ? WHERE id = ?", (status, batch_id))
 
 
 def _item_payload(row: sqlite3.Row) -> dict:

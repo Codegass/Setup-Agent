@@ -561,3 +561,23 @@ def test_java_artifact_backed_verdict_ignores_phase_termination_on_all_surfaces(
     )
     assert "SUCCESS" in banner.splitlines()[0].upper(), banner
     assert "100" in banner, banner
+
+
+def test_legacy_report_keeps_python_completeness_without_scope_conflicts():
+    tool = ReportTool()
+    accomplishments = _pyyaml7_accomplishments()
+    accomplishments["physical_validation"]["build_status"]["conflicts"] = []
+    snapshot = _build_real_snapshot(tool, accomplishments, _PYYAML_PROJECT_INFO)
+    snapshot["evidence_result"]["conflicts"] = []
+    assert tool._legacy_snapshot_kernel_verdict(snapshot) == "partial"
+
+
+def test_legacy_report_jvm_scan_shortfall_is_diagnostic():
+    tool = ReportTool()
+    accomplishments = _pyyaml7_accomplishments()
+    accomplishments["physical_validation"]["build_status"]["evidence"]["build_system"] = "maven"
+    snapshot = _build_real_snapshot(
+        tool, accomplishments, {"type": "Java Project", "build_system": "maven"}
+    )
+    assert "build_modules_incomplete" in snapshot["evidence_result"]["conflicts"]
+    assert tool._legacy_snapshot_kernel_verdict(snapshot) == "success"

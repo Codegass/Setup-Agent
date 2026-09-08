@@ -1,6 +1,6 @@
 import type * as React from "react"
 
-import type { ExecutionSessionDetail, ModuleRollup } from "@/api/types"
+import type { ExecutionSessionDetail } from "@/api/types"
 import { Card } from "@/components/common/Card"
 import { cn } from "@/lib/utils"
 
@@ -20,24 +20,19 @@ function Stat({ label, value, tone }: { label: string; value: React.ReactNode; t
   )
 }
 
-function successRate(s?: ModuleRollup | null): number | null {
-  const total = s?.modulesTotal ?? 0
-  const built = s?.modulesBuilt ?? 0
-  return total > 0 ? Math.round((built / total) * 100) : null
-}
-
 // Per-module build breakdown — the "detail page", shown in a modal from the Build facet.
 export function BuildDetailPage({ detail }: { detail: ExecutionSessionDetail }) {
   const s = detail.moduleSummary
-  const rate = successRate(s)
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <Stat label="Modules" value={fmtNum(s?.modulesTotal)} />
         <Stat label="Built" value={fmtNum(s?.modulesBuilt)} tone="text-status-success" />
         <Stat label="Failed" value={fmtNum(s?.modulesFailed)} tone="text-status-failed" />
         <Stat label="Skipped" value={fmtNum(s?.modulesSkipped)} />
-        <Stat label="Success rate" value={rate != null ? `${rate}%` : "—"} />
+      </div>
+      <div className="font-mono text-[10px] text-muted-foreground">
+        Module counts are diagnostic. The project's CI defines the build scope.
       </div>
       {(s?.buildSystems ?? []).includes("gradle") ? (
         <div className="font-mono text-[10px] text-muted-foreground">

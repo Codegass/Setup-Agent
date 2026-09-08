@@ -31,21 +31,6 @@ class SystemSummary(WebModel):
     cpu_load: float | None = Field(default=None, serialization_alias="cpuLoad")
 
 
-class SourceScopeSummary(WebModel):
-    """Comparable production-source coverage for a sealed build."""
-
-    covered: int | None = None
-    total: int | None = None
-    availability: Literal["available", "unavailable"] = "unavailable"
-    basis: str | None = None
-    reason: str | None = None
-    evidence_refs: list[str] = Field(
-        default_factory=list,
-        validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
-        serialization_alias="evidenceRefs",
-    )
-
-
 class BuildSummary(WebModel):
     state: str = "none"
     tool: str = "—"
@@ -58,11 +43,6 @@ class BuildSummary(WebModel):
         default=None,
         validation_alias=AliasChoices("class_count", "classCount"),
         serialization_alias="classCount",
-    )
-    source_scope: SourceScopeSummary | None = Field(
-        default=None,
-        validation_alias=AliasChoices("source_scope", "sourceScope"),
-        serialization_alias="sourceScope",
     )
     jar_count: int | None = Field(
         default=None,

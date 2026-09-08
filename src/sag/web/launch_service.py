@@ -204,7 +204,7 @@ class LaunchService:
             )
 
         if items:
-            self._store.enqueue_batch(
+            conflicting = self._store.enqueue_batch(
                 LaunchBatch(
                     id=batch_id,
                     created_at=created_at,
@@ -216,10 +216,22 @@ class LaunchService:
                 ),
                 items,
             )
-            self._scheduler.wake()
+            rejected_ids = {item.id for item in conflicting}
+            accepted = [item for item in accepted if item["launch_id"] not in rejected_ids]
+            rejected.extend(
+                {
+                    "row_index": item.row_index,
+                    "workspace_id": item.workspace_id,
+                    "status": "conflict",
+                    "message": f"Launch already in progress for {item.workspace_id}",
+                }
+                for item in conflicting
+            )
+            if accepted:
+                self._scheduler.wake()
 
         return {
-            "batch_id": batch_id if items else None,
+            "batch_id": batch_id if accepted else None,
             "concurrency": concurrency,
             "accepted": accepted,
             "rejected": rejected,
@@ -237,7 +249,5 @@ class LaunchService:
             return default_concurrency()
         limit = max_concurrency()
         if value < 1 or value > limit:
-            raise LaunchValidationError(
-                f"concurrency must be an integer between 1 and {limit}"
-            )
+            raise LaunchValidationError(f"concurrency must be an integer between 1 and {limit}")
         return value

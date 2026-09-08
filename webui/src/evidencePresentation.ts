@@ -18,7 +18,7 @@ export interface CompleteEvidenceCounts {
 
 export interface TestRunPresentation extends CompleteEvidenceCounts {
   countsAvailable: boolean
-  stateLabel: "Passed" | "Failed" | "Partial" | "Not run" | "Unavailable"
+  stateLabel: "Executed" | "Failed" | "Partial" | "Not run" | "Unavailable"
   tone: ResultTone
   valueClass?: string
   nonSkipped: number
@@ -58,15 +58,9 @@ export interface DiagnosticPresentation {
   summary: string
 }
 
-export interface BuildScopePresentation {
-  observed: number
-  expected: number
-  incomplete: boolean
-}
-
-export interface SourceScopePresentation {
-  covered: number
-  total: number
+export interface ModuleScanPresentation {
+  built: number
+  declared: number
 }
 
 export interface BuildPresentation {
@@ -74,8 +68,7 @@ export interface BuildPresentation {
   tone: ResultTone
   valueClass?: string
   summary: string
-  scope: BuildScopePresentation | null
-  sourceScope: SourceScopePresentation | null
+  scan: ModuleScanPresentation | null
 }
 
 const DATA_NOTE_COPY: Record<string, string> = {
@@ -184,7 +177,7 @@ export function lowerBoundEvidenceCounts(
 }
 
 function resultState(value: string | undefined): {
-  label: TestRunPresentation["stateLabel"]
+  label: "Passed" | "Failed" | "Partial" | "Not run" | "Unavailable"
   tone: ResultTone
   valueClass?: string
 } {
@@ -218,11 +211,11 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
   const observedErrors = countsAvailable ? errors : 0
   const negative = failed + observedErrors
   const nonSkipped = passed + negative
-  // A recorded success cannot override concrete failed or errored results.
-  // Present the run as failed while retaining the original counts below it.
-  const state = countsAvailable && negative > 0
-    ? { label: "Failed" as const, tone: "red" as const, valueClass: "text-status-failed" }
-    : reportedState
+  // Execution status and the project's test outcomes are separate facts.
+  const state = {
+    ...reportedState,
+    label: reportedState.label === "Passed" ? "Executed" as const : reportedState.label,
+  }
   const executed = countsAvailable && finiteCount(test.total)
     ? Math.max(test.total, accounted)
     : accounted
@@ -230,9 +223,9 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
 
   let summary = state.label === "Not run"
     ? "Tests were not run."
-    : "Sealed run counts were not recorded."
+    : "Test counts were not recorded."
   if (state.label !== "Not run" && countsAvailable && accounted === 0) {
-    summary = "No sealed test results were recorded."
+    summary = "No test results were recorded."
   } else if (countsAvailable) {
     const parts = [
       `${formatCount(passed)} passed`,
@@ -240,7 +233,7 @@ export function presentTestRun(test: TestSummary): TestRunPresentation {
       `${formatCount(observedErrors)} errors`,
       skipped > 0 ? `${formatCount(skipped)} skipped` : null,
     ].filter((part): part is string => part !== null)
-    summary = `Sealed run results: ${parts.join(" · ")}`
+    summary = `Test results: ${parts.join(" · ")}`
   }
 
   return {
@@ -495,48 +488,22 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-export function buildScopeFromRates(
+export function moduleScanFromRates(
   rates: Record<string, unknown> | null | undefined,
-  buildState: string,
-): BuildScopePresentation | null {
+): ModuleScanPresentation | null {
   const build = objectValue(rates?.build)
   const modules = objectValue(build?.modules)
-  const observed = modules?.numerator
-  const expected = modules?.denominator
+  const built = modules?.numerator
+  const declared = modules?.denominator
   if (
-    !Number.isInteger(observed)
-    || !Number.isInteger(expected)
-    || (observed as number) < 0
-    || (expected as number) <= 0
-    || (observed as number) > (expected as number)
+    !Number.isInteger(built)
+    || !Number.isInteger(declared)
+    || (built as number) < 0
+    || (declared as number) < 0
   ) {
     return null
   }
-  const band = typeof modules?.band === "string" ? modules.band.toLowerCase() : ""
-  return {
-    observed: observed as number,
-    expected: expected as number,
-    incomplete: normalizedState(buildState) !== "success"
-      || observed !== expected
-      || band !== "fully",
-  }
-}
-
-export function sourceScopeFromBuild(build: BuildSummary): SourceScopePresentation | null {
-  const sourceScope = build.sourceScope
-  const covered = sourceScope?.covered
-  const total = sourceScope?.total
-  if (
-    sourceScope?.availability !== "available"
-    || !Number.isInteger(covered)
-    || !Number.isInteger(total)
-    || (covered as number) < 0
-    || (total as number) <= 0
-    || (covered as number) > (total as number)
-  ) {
-    return null
-  }
-  return { covered: covered as number, total: total as number }
+  return { built: built as number, declared: declared as number }
 }
 
 export function presentBuild(
@@ -549,26 +516,35 @@ export function presentBuild(
       value: "Not run",
       tone: "neutral",
       summary: "Build was not run.",
-      scope: null,
-      sourceScope: null,
+      scan: null,
     }
   }
-  const scope = buildScopeFromRates(rates, build.state)
-  const sourceScope = sourceScopeFromBuild(build)
+  const scan = moduleScanFromRates(rates)
+  const moduleReason = objectValue(objectValue(rates?.build)?.modules)?.reason
+  const moduleBasis = moduleReason === "terminal root reactor receipt is authoritative"
+    ? "in the build run"
+    : moduleReason == null
+      ? "declared on disk"
+      : null
   const facts = [
-    sourceScope
-      ? `Production Java sources ${formatCount(sourceScope.covered)} / ${formatCount(sourceScope.total)}`
+    scan
+      ? moduleBasis
+        ? `Modules built ${formatCount(scan.built)} of ${formatCount(scan.declared)} ${moduleBasis} (diagnostic)`
+        : `Recorded module counts: ${formatCount(scan.built)} built of ${formatCount(scan.declared)} (diagnostic)`
       : null,
-    scope ? `Modules ${formatCount(scope.observed)} / ${formatCount(scope.expected)}` : null,
-    scope?.incomplete || state.label === "Partial" ? "Scope incomplete" : null,
+    Number.isInteger(build.classCount) && (build.classCount as number) >= 0
+      ? `Class files ${formatCount(build.classCount as number)} (diagnostic)`
+      : null,
   ].filter((fact): fact is string => fact !== null)
+  const summary = state.label === "Partial"
+    ? "Build stopped before completion."
+    : facts.join(" · ") || "No build counts were recorded."
 
   return {
     value: state.label === "Passed" ? "Success" : state.label,
     tone: state.tone,
     valueClass: state.valueClass,
-    sourceScope,
-    scope,
-    summary: facts.join(" · ") || "No comparable build-scope counts were recorded.",
+    scan,
+    summary,
   }
 }

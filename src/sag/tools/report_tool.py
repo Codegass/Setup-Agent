@@ -1031,6 +1031,13 @@ class ReportTool(BaseTool, UIEventEmitter):
         build green + no test results = PARTIAL (build verified, tests not),
         never failed; everything else keeps the legacy coercion."""
         coerced = _coerce_kernel_verdict(status.get("overall"))
+        # Python completeness is a physical judgment in its own right. It
+        # cannot depend on a scan conflict that JVM scope now only discloses.
+        build_judgment = status.get("build_judgment")
+        if build_judgment == "failed":
+            return "failed"
+        if build_judgment == "partial" and coerced != "failed":
+            return "partial"
         if coerced != "failed":
             return coerced
         build_green = bool((snapshot.get("phases") or {}).get("build"))
@@ -2148,7 +2155,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         # appropriate to the ecosystem: on python the fingerprint_details ARE
         # the build evidence (venv/pip check/imports/compileall ladder) and the
         # Java "0 .class, 0 .jar" line is suppressed.
-        build_evidence = (physical_validation.get("build_status") or {}).get("evidence") or {}
+        from sag.agent.verdict_finalizer import _physical_judgment
+
+        build_status = physical_validation.get("build_status") or {}
+        status["build_judgment"] = _physical_judgment(build_status)
+        build_evidence = build_status.get("evidence") or {}
         physical_evidence = {
             "class_files": physical_validation.get("class_files"),
             "jar_files": physical_validation.get("jar_files"),
@@ -2190,11 +2201,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             "evidence_result": evidence_result or {},
         }
 
-        # Module-coverage shortfall caps the run at PARTIAL too: a reactor that
-        # built fewer modules than it attempted is not a full success even when
-        # the physical class-coverage check passed. Surface it as the SAME
-        # conflict the build validator emits (build_modules_incomplete) so the
-        # verdict kernel caps it (the conflict is not in ADJUDICATED_CONFLICTS).
+        # Keep module scan shortfalls visible as scope diagnostics. They do
+        # not grade execution; Python completeness is carried independently.
         if (
             status.get("modules_expected")
             and status.get("modules_seen") is not None
@@ -2223,14 +2231,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             if "tests_not_fully_executed" not in ev_conflicts:
                 ev_conflicts.append("tests_not_fully_executed")
 
-        # Scope shortfall caps the run at PARTIAL: tests ran in a strict subset
-        # of the test-bearing modules (leaf-scoped run in a reactor). Same
-        # non-adjudicated conflict mechanism as the two gates above (spec §4).
-        # The module counts are folded into status HERE — not only in the
-        # caller's dashboard passthrough, which runs after this snapshot is
-        # built — because the stored verdict below must already see the cap.
-        # _build_module_metrics is memoized on self, so the caller's later
-        # passthrough reads the identical cached result (no extra scans).
+        # Disclose which test-bearing modules ran without making the disk
+        # scan a target. The memoized metrics are shared with the dashboard.
         try:
             module_metrics = self._build_module_metrics(
                 test_history or self._load_test_history() or {},

@@ -69,9 +69,21 @@ COUNT_DERIVED_CONFLICTS = frozenset({"test_failures_detected", "test_errors_dete
 # removal takes the headline's authority with it (test_receipt_unreadable —
 # without the ledger nothing is attributed and the headline is 0), never a
 # report file a run can delete without changing a single execution it ran.
+# The disk scan describes scope; the project's CI defines the scope target.
+# Evidence-closure and integrity failures remain caps, outside this set.
+BUILD_SCOPE_CONFLICTS = frozenset(
+    {
+        "build_modules_incomplete",
+        "reactor_scope_narrowed",
+        "build_coverage_scope_unverified",
+        "module_scan_contradicts_physical_build",
+    }
+)
+
 ADJUDICATED_CONFLICTS = frozenset(
     {
         *COUNT_DERIVED_CONFLICTS,
+        *BUILD_SCOPE_CONFLICTS,
         CENSUS_CONFLICT,
         *UNCOUNTED_REPORT_CONFLICTS,
     }
@@ -86,8 +98,9 @@ def combine_verdicts(*verdicts: Optional[str]) -> str:
     return min(known, key=_RANK.__getitem__)
 
 
-def run_verdict(machine_outcome: Optional[str], physical_verdict: Optional[str],
-                conflicts: Iterable[str]) -> str:
+def run_verdict(
+    machine_outcome: Optional[str], physical_verdict: Optional[str], conflicts: Iterable[str]
+) -> str:
     base = combine_verdicts(machine_outcome, physical_verdict)
     if any(c not in ADJUDICATED_CONFLICTS for c in conflicts):
         return combine_verdicts(base, "partial")

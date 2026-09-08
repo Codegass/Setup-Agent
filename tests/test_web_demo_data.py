@@ -42,11 +42,6 @@ def test_demo_session_locks_local_ui_demo_facts():
     assert "JDK 11" in detail.build.note
     assert detail.build.artifact == "target/commons-cli-1.6.0.jar"
     assert detail.build.module_output_count == 3
-    assert detail.build.source_scope is not None
-    assert detail.build.source_scope.availability == "available"
-    assert (detail.build.source_scope.covered, detail.build.source_scope.total) == (36, 36)
-    assert detail.build.source_scope.basis is not None
-    assert detail.build.source_scope.basis.startswith("demo fixture:")
     assert detail.test.evidence_layers is not None
     receipt = detail.test.evidence_layers.tests.claimed.receipt_executions
     assert receipt.availability == "available"

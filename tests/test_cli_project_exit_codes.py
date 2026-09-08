@@ -12,6 +12,7 @@ from sag.agent.evidence_publications import (
     reset_evidence_publication_authority,
 )
 from sag.agent.verdict_finalizer import (
+    BuildEvidenceSnapshot,
     ReportDeliveryStatus,
     RunTermination,
     RunTerminationStatus,
@@ -37,6 +38,7 @@ def snapshot_for(verdict):
         run_id=f"cli-{verdict}",
         finalized_at="2026-07-17T12:00:00Z",
         verdict=verdict,
+        build_evidence=BuildEvidenceSnapshot(judgment=verdict, source="physical", observed=True),
         test_stats=SnapshotTestStats(
             discovered=10,
             executed=10,

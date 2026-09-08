@@ -139,13 +139,6 @@ describe("OverviewTab", () => {
             time: "—",
             note: "Canonical build evidence from verdict.json",
             classCount: 56,
-            sourceScope: {
-              covered: 36,
-              total: 36,
-              availability: "available",
-              basis: "sealed physical build success over validated full module scope",
-              evidenceRefs: ["output_build"],
-            },
           },
           rates: {
             build: { modules: { numerator: 1, denominator: 1, rate: 100, band: "fully" } },
@@ -166,12 +159,11 @@ describe("OverviewTab", () => {
 
     const buildTile = screen.getAllByText("Build")[0].parentElement
     expect(within(buildTile as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
-    expect(within(buildTile as HTMLElement).getByText(/Production Java sources 36 \/ 36/)).toBeInTheDocument()
-    expect(within(buildTile as HTMLElement).getByText(/Modules 1 \/ 1/)).toBeInTheDocument()
-    expect(within(buildTile as HTMLElement).queryByText(/56 compiled classes/i)).not.toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).getByText(/Modules built 1 of 1 declared on disk \(diagnostic\)/)).toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).getByText(/Class files 56 \(diagnostic\)/i)).toBeInTheDocument()
 
     const testTile = screen.getAllByText("Tests")[0].parentElement
-    expect(within(testTile as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
+    expect(within(testTile as HTMLElement).getByText("Executed")).toHaveClass("text-status-success")
     expect(within(testTile as HTMLElement).getByText(/Test outcomes recorded 987 \/ 987/)).toBeInTheDocument()
     expect(within(testTile as HTMLElement).getByText(/Non-skipped passed 926 \/ 926/)).toBeInTheDocument()
     expect(within(testTile as HTMLElement).getByText(/Skipped 61/)).toBeInTheDocument()
@@ -202,7 +194,7 @@ describe("OverviewTab", () => {
     expect(within(buildTile as HTMLElement).getByText("Partial")).toHaveClass(
       "text-status-attention",
     )
-    expect(within(buildTile as HTMLElement).getByText(/scope incomplete/i)).toBeInTheDocument()
+    expect(within(buildTile as HTMLElement).getByText("Build stopped before completion.")).toBeInTheDocument()
     expect(within(buildTile as HTMLElement).queryByText(/16,221 compiled classes/)).not.toBeInTheDocument()
     expect(screen.queryByText("Build time")).not.toBeInTheDocument()
     expect(screen.getByText("Module details unavailable")).toBeInTheDocument()
@@ -248,7 +240,7 @@ describe("OverviewTab", () => {
     )
 
     const runTile = screen.getAllByText("Tests")[0].parentElement
-    expect(within(runTile as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
+    expect(within(runTile as HTMLElement).getByText("Executed")).toHaveClass("text-status-success")
     expect(within(runTile as HTMLElement).getByText(/Test outcomes recorded 2 \/ 2/i)).toBeInTheDocument()
     expect(screen.queryByText("Verified per-test results")).not.toBeInTheDocument()
     expect(screen.getByText("Diagnostic observations")).toBeInTheDocument()
@@ -270,8 +262,7 @@ describe("OverviewTab", () => {
     )
     const partialBuild = screen.getAllByText("Build")[0].parentElement
     expect(within(partialBuild as HTMLElement).getByText("Partial")).toHaveClass("text-status-attention")
-    expect(within(partialBuild as HTMLElement).getByText(/Modules 19 \/ 26/i)).toBeInTheDocument()
-    expect(within(partialBuild as HTMLElement).getByText(/scope incomplete/i)).toBeInTheDocument()
+    expect(within(partialBuild as HTMLElement).getByText("Build stopped before completion.")).toBeInTheDocument()
     expect(within(partialBuild as HTMLElement).queryByText("73.1%")).not.toBeInTheDocument()
 
     rerender(
@@ -298,7 +289,7 @@ describe("OverviewTab", () => {
     )
     const cleanBuild = screen.getAllByText("Build")[0].parentElement
     expect(within(cleanBuild as HTMLElement).getByText("Success")).toHaveClass("text-status-success")
-    expect(within(cleanBuild as HTMLElement).getByText(/Modules 26 \/ 26/i)).toBeInTheDocument()
+    expect(within(cleanBuild as HTMLElement).getByText(/Modules built 26 of 26 declared on disk/i)).toBeInTheDocument()
     expect(within(cleanBuild as HTMLElement).queryByText(/scope incomplete/i)).not.toBeInTheDocument()
   })
 

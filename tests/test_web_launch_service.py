@@ -83,9 +83,7 @@ def test_accepted_rows_are_enqueued_with_cli_equivalent_command(tmp_path):
 def test_stored_command_matches_manual_sag_project_invocation(tmp_path):
     service, store, _ = make_service(tmp_path)
 
-    service.submit_batch(
-        request_for({"repo_url": REPO, "ref": "v1.0", "record": True})
-    )
+    service.submit_batch(request_for({"repo_url": REPO, "ref": "v1.0", "record": True}))
 
     claimed = store.claim_next(global_cap=8, now="2026-06-07T10:00:00")
     assert claimed.command == [
@@ -134,9 +132,7 @@ def test_optional_fields_are_trimmed_and_blank_becomes_none(tmp_path):
     service, store, _ = make_service(tmp_path)
 
     service.submit_batch(
-        request_for(
-            {"repo_url": f"  {REPO}  ", "name": "  ", "ref": " v1.0 ", "goal": ""}
-        )
+        request_for({"repo_url": f"  {REPO}  ", "name": "  ", "ref": " v1.0 ", "goal": ""})
     )
 
     claimed = store.claim_next(global_cap=8, now="2026-06-07T10:00:00")
@@ -185,9 +181,7 @@ def test_all_conflicts_creates_no_batch(tmp_path):
 def test_duplicate_workspace_within_batch_is_a_conflict(tmp_path):
     service, _, _ = make_service(tmp_path)
 
-    outcome = service.submit_batch(
-        request_for({"repo_url": REPO}, {"repo_url": REPO})
-    )
+    outcome = service.submit_batch(request_for({"repo_url": REPO}, {"repo_url": REPO}))
 
     assert len(outcome["accepted"]) == 1
     assert outcome["rejected"][0]["status"] == "conflict"
@@ -247,9 +241,7 @@ def test_empty_projects_list_fails_request_validation():
 
 def test_queue_state_reports_defaults_summary_and_batches(tmp_path, monkeypatch):
     service, _, _ = make_service(tmp_path, cpu_count=8, monkeypatch=monkeypatch)
-    outcome = service.submit_batch(
-        request_for({"repo_url": REPO, "ref": "v1.0"}, concurrency=2)
-    )
+    outcome = service.submit_batch(request_for({"repo_url": REPO, "ref": "v1.0"}, concurrency=2))
 
     state = service.queue_state()
 
@@ -314,3 +306,27 @@ def test_pending_launch_for_same_workspace_is_a_conflict(tmp_path):
     assert outcome["rejected"][0]["status"] == "conflict"
     assert "already in progress" in outcome["rejected"][0]["message"]
     assert len(store.list_batches()) == 1
+
+
+def test_concurrent_batches_admit_one_active_launch_per_workspace(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    service, store, scheduler = make_service(tmp_path)
+    store.summary_counts()
+    barrier = Barrier(2)
+
+    def no_workspace(_label):
+        barrier.wait(timeout=2)
+        return False
+
+    service._workspace_exists = no_workspace
+    request = request_for({"repo_url": REPO})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _: service.submit_batch(request), range(2)))
+
+    assert sorted(len(outcome["accepted"]) for outcome in outcomes) == [0, 1]
+    assert sum(len(outcome["rejected"]) for outcome in outcomes) == 1
+    assert store.summary_counts()["queued"] == 1
+    assert len(store.list_batches()) == 1
+    assert scheduler.woken == 1

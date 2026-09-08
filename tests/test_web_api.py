@@ -34,7 +34,7 @@ def test_dashboard_endpoint_returns_workspaces():
 
 def test_static_root_serves_web_ui_index(tmp_path):
     (tmp_path / "index.html").write_text(
-        "<!doctype html><div id=\"root\">SAG Workbench</div>",
+        '<!doctype html><div id="root">SAG Workbench</div>',
         encoding="utf-8",
     )
     app = create_app(ReadModelBuilder(demo_mode=True), static_dir=tmp_path)
@@ -114,14 +114,7 @@ def test_session_endpoint_returns_session_detail():
     payload = response.json()
     assert payload["id"] == "CC-3"
     assert payload["reportDoc"]["title"].startswith("setup-report")
-    assert payload["build"]["sourceScope"] == {
-        "covered": 36,
-        "total": 36,
-        "availability": "available",
-        "basis": "demo fixture: complete production Java source scope",
-        "reason": None,
-        "evidenceRefs": ["demo:output_demo_build"],
-    }
+    assert "sourceScope" not in payload["build"]
     assert payload["test"]["evidenceLayers"]["tests"]["claimed"]["receiptExecutions"] == {
         "executed": 320,
         "passed": 312,
@@ -277,9 +270,7 @@ def test_batch_submit_returns_202_with_accepted_and_rejected_rows():
     assert response.status_code == 202
     assert response.json()["batch_id"] == "BATCH-20260607-abcdef"
     assert len(service.requests) == 1
-    assert service.requests[0].projects[0].repo_url == (
-        "https://github.com/apache/commons-cli.git"
-    )
+    assert service.requests[0].projects[0].repo_url == ("https://github.com/apache/commons-cli.git")
 
 
 def test_batch_submit_returns_409_when_every_row_conflicts():

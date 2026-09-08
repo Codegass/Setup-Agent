@@ -15,6 +15,7 @@ the sealed verdict would disagree (the exact split this campaign just fixed).
 
 from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
+
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.module_coverage import (
     coverage_checklist_line,
@@ -168,13 +169,15 @@ def test_aggregator_shell_verdict_folds_to_success():
     """End-to-end: with the shell uncounted, an otherwise-green run seals SUCCESS
     (the httpcomponents cap folded it to partial)."""
     from container_evidence_fakes import ContainerFS
+
     from sag.agent.evidence_publications import (
         EvidencePublicationAuthority,
         install_evidence_publication_authority,
         reset_evidence_publication_authority,
     )
-    from sag.agent.evidence_state import EvidenceRole, StateScope
+    from sag.agent.evidence_state import EvidenceRole
     from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
+    from sag.agent.evidence_state import StateScope
     from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
     from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
     from sag.tools.base import ToolResult
@@ -843,7 +846,7 @@ def test_the_contradicted_grain_cannot_manufacture_a_failed_word():
     )
 
     # Kafka's real shape: contradicted modules, no tests driven.
-    assert derived_verdict_word(grains["modules"], GrainRate(0, 20497)) == "partial"
+    assert derived_verdict_word("success", GrainRate(0, 20497)) == "partial"
 
 
 def test_module_coverage_states_how_many_modules_the_build_declared():

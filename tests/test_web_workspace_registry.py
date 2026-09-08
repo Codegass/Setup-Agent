@@ -1,3 +1,6 @@
+import pytest
+
+from sag.web.read_model import ReadModelBuilder
 from sag.web.workspace_registry import WorkspaceRegistry
 
 
@@ -122,10 +125,16 @@ def test_workspace_registry_passes_ignore_removed_when_supported():
     assert containers.ignore_removed is True
 
 
-def test_workspace_registry_returns_empty_when_container_list_raises():
+def test_workspace_registry_preserves_discovery_failure():
     client = type("FakeClient", (), {"containers": RaisingContainers()})()
 
-    assert WorkspaceRegistry(client=client).list_workspaces() == []
+    registry = WorkspaceRegistry(client=client)
+    with pytest.raises(RuntimeError, match="docker daemon unavailable"):
+        registry.list_workspaces()
+    dashboard = ReadModelBuilder(workspace_registry=registry).dashboard()
+    assert dashboard.docker.status == "unavailable"
+    assert dashboard.read_status == "unavailable"
+    assert dashboard.read_error is not None
 
 
 def test_workspace_registry_bad_container_does_not_hide_good_container():

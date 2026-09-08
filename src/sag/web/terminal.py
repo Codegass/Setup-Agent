@@ -4,8 +4,47 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import urlsplit
 
 from sag.runtime.exec_env import default_utf8_environment
+
+TERMINAL_SUBPROTOCOL = "sag-terminal-v1"
+TERMINAL_TOKEN_PREFIX = "sag-session."
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def terminal_request_allowed(connection: Any, hosts: set[str], *, require_origin: bool) -> bool:
+    """Verify an actual host allowlist before comparing browser origins."""
+    host_headers = connection.headers.getlist("host")
+    origins = connection.headers.getlist("origin")
+    if len(host_headers) != 1 or len(origins) > 1:
+        return False
+    scheme = "https" if connection.url.scheme in {"https", "wss"} else "http"
+    try:
+        target = urlsplit(f"{scheme}://{host_headers[0]}")
+        if (
+            target.hostname not in hosts
+            or target.username is not None
+            or target.password is not None
+            or target.path
+            or target.query
+            or target.fragment
+        ):
+            return False
+        target_port = target.port or (443 if scheme == "https" else 80)
+        if not origins:
+            return not require_origin
+        origin = urlsplit(origins[0])
+        return (
+            origin.scheme == scheme
+            and origin.hostname == target.hostname
+            and (origin.port or (443 if scheme == "https" else 80)) == target_port
+            and origin.username is None
+            and origin.password is None
+            and not (origin.path or origin.query or origin.fragment)
+        )
+    except ValueError:
+        return False
 
 
 def build_exec_options(shell: str = "/bin/bash") -> dict[str, object]:

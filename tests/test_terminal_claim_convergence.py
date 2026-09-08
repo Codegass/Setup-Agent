@@ -7,9 +7,9 @@ from test_container_io import FakeContainer
 
 from sag.agent.action_intents import ActionIntent, EngineActionIntentFactory
 from sag.agent.control_events import ControlEvent, ControlEventSink
-from sag.agent.invocation_contracts import clear_action_context, current_action_context
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
 from sag.agent.evidence_state import RunEvidenceState
+from sag.agent.invocation_contracts import clear_action_context, current_action_context
 from sag.agent.loop_memory import LoopMemory
 from sag.agent.phase_gates import (
     GateControlDisposition,
@@ -858,12 +858,12 @@ def test_open_event_failure_never_activates_or_guides_the_model():
 
 
 def test_restart_recovers_only_the_durable_open_context(tmp_path):
-    sink = ControlEventSink(tmp_path / "control_events.jsonl")
+    sink = ControlEventSink(tmp_path / "control_events.jsonl", run_id="convergence")
     first = _engine(sink=sink)
     prepared = _open_repair(first)
     context = prepared.context
 
-    restarted = _engine(sink=ControlEventSink(sink.path))
+    restarted = _engine(sink=ControlEventSink(sink.path, run_id="convergence"))
     restarted._pending_repair_context = None
     restarted.guidance.clear()
     restarted._restore_active_repair_context()

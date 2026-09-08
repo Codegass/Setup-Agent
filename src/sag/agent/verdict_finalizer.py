@@ -479,10 +479,27 @@ def _physical_build_status(validator, project_name) -> dict[str, Any] | None:
 def _physical_judgment(status: dict[str, Any]) -> str | None:
     success = status.get("success")
     if success is True:
+        evidence = status.get("evidence")
+        system = (
+            str(evidence.get("build_system") or "").strip().lower()
+            if isinstance(evidence, dict)
+            else ""
+        )
+        # Only known JVM builds use CI to grade scope. Python and unidentified
+        # builds keep their own completeness; missing identity cannot upgrade it.
+        if system in {"maven", "gradle"}:
+            return "success"
         return "success" if status.get("build_complete", True) else "partial"
     if success is False:
         return "failed"
     return None
+
+
+def _build_execution_judgment(build: BuildEvidenceSnapshot) -> str:
+    """Successful command observations alone do not confirm real build output."""
+    if build.judgment == "success" and build.source != "physical":
+        return "partial"
+    return build.judgment
 
 
 def _phase_definitely_not_reached(
@@ -1216,7 +1233,9 @@ def test_grain_rates(
             unattributed_source=stats.unattributed_source,
         )
     )
-    accounted = stats.unique.passed + stats.unique.failed + stats.unique.errors + stats.unique.skipped
+    accounted = (
+        stats.unique.passed + stats.unique.failed + stats.unique.errors + stats.unique.skipped
+    )
     reason = _cases_reason(stats, excluded)
     conflicts: tuple[str, ...] = ()
     if stats.unique.executed > 0 and accounted == stats.unique.executed:
@@ -1745,11 +1764,11 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     )
     expected_verdict = run_verdict(
         _phase_machine_verdict(snapshot.phase_records),
-        derived_verdict_word(build_modules, test_cases),
+        derived_verdict_word(_build_execution_judgment(snapshot.build_evidence), test_cases),
         snapshot.conflicts,
     )
     if snapshot.verdict != expected_verdict:
-        raise ValueError("verdict word does not reconcile with the rate bands")
+        raise ValueError("verdict word does not reconcile with build execution and test outcomes")
     return snapshot
 
 
@@ -1883,7 +1902,7 @@ class VerdictFinalizer:
             input_refs=input_refs,
             verdict=run_verdict(
                 _phase_machine_verdict(state.phase_records),
-                derived_verdict_word(build_modules_rate, test_cases_rate),
+                derived_verdict_word(_build_execution_judgment(build), test_cases_rate),
                 conflicts,
             ),
             build_evidence=build,

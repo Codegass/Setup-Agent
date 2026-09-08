@@ -29,12 +29,7 @@ class WorkspaceRegistry:
         try:
             return list(self.client.containers.list(all=True, ignore_removed=True))
         except TypeError:
-            try:
-                return list(self.client.containers.list(all=True))
-            except Exception:
-                return []
-        except Exception:
-            return []
+            return list(self.client.containers.list(all=True))
 
 
 def _workspace_summary(container: Any) -> WorkspaceSummary | None:

@@ -218,9 +218,9 @@ def test_setup_report_leads_with_rate_lines_and_derives_the_word_once():
     lines = _tool()._render_console_evidence_result(snapshot)
 
     assert lines[:3] == [
-        "Build: SUCCESS · production Java sources 36/36 · modules 14/14 · "
-        "class files 56 (diagnostic)",
-        "Tests: SUCCESS · outcomes accounted 987/987 · non-skipped passed 926/926 · "
+        "Build: SUCCESS · modules built 14 of 14 declared on disk (diagnostic) · "
+        "class files 56 (diagnostic) · production Java sources 36 (diagnostic)",
+        "Tests: EXECUTED · outcomes accounted 987/987 · non-skipped passed 926/926 · "
         "skipped 61 · failed 0 · errors 0 · static declarations 468 (diagnostic)",
         "Coverage: 55.5% line (jacoco-injected)",
     ]
@@ -336,9 +336,9 @@ def test_canonical_report_surfaces_use_same_grain_metrics_only():
     condensed = tool._generate_condensed_log_output("success", "setup-report.md", {}, snapshot)
     rendered = "\n".join((headline, dashboard, diagnostics, issues, execution, condensed))
 
-    assert "Build: SUCCESS · production Java sources 36/36 · modules 1/1" in rendered
+    assert "Build: SUCCESS · modules built 1 of 1 declared on disk (diagnostic)" in rendered
     assert "class files 56 (diagnostic)" in rendered
-    assert "Tests: SUCCESS · outcomes accounted 987/987" in rendered
+    assert "Tests: EXECUTED · outcomes accounted 987/987" in rendered
     assert "non-skipped passed 926/926" in rendered
     assert "skipped 61 · failed 0 · errors 0" in rendered
     assert "static declarations 468 (diagnostic)" in rendered
@@ -491,13 +491,13 @@ def test_failed_build_evidence_blocks_even_when_verdict_is_partial():
 
 def test_unresolved_conflicts_never_report_zero_blockers():
     """Unresolved (non-adjudicated) conflicts are blocking issues, not silence."""
-    snapshot = _sealed_snapshot(verdict="partial", conflicts=["build_modules_incomplete"])
+    snapshot = _sealed_snapshot(verdict="partial", conflicts=["build_receipts_unreadable"])
     text = _render(_tool(), snapshot)
 
     assert "Blockers (0)" not in text
     assert "No blocking issues" not in text
     assert _blocker_count(text) >= 1
-    assert "build_modules_incomplete" in text
+    assert "build_receipts_unreadable" in text
 
 
 def test_clean_sealed_run_still_reports_no_blockers():

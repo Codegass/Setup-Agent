@@ -2,6 +2,8 @@ from io import StringIO
 from types import SimpleNamespace
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
+from container_evidence_fakes import ScriptedOrchestrator, add_published_mutable_json
 from rich.console import Console
 
 from sag.agent.agent import SetupAgent
@@ -17,8 +19,6 @@ from sag.agent.verdict_finalizer import (
 )
 from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.tools.report_tool import ReportTool
-from build_requirements_fakes import complete_build_requirements_v1
-from container_evidence_fakes import ScriptedOrchestrator, add_published_mutable_json
 
 
 def _validator_with_published_manifest() -> PhysicalValidator:
@@ -65,6 +65,35 @@ def _agent_with_validator(validator):
     agent.physical_validator = validator
     agent.workflow_mode = "continue"
     return agent
+
+
+@pytest.mark.parametrize(
+    "system, expected",
+    [("maven", "success"), ("gradle", "success"), ("python", "partial"), ("unknown", "partial")],
+)
+def test_legacy_physical_build_judgment_matches_ecosystem_completeness(system, expected):
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            {
+                "success": True,
+                "build_complete": False,
+                "reason": "scan shortfall",
+                "evidence": {"build_system": system},
+            },
+            {
+                "has_test_reports": True,
+                "total_tests": 100,
+                "passed_tests": 100,
+                "test_exclusions": [],
+                "conflicts": [],
+            },
+            {"static_test_count": 100},
+        )
+    )
+
+    agent._legacy_get_verified_final_status(True)
+
+    assert agent.final_verdict == expected
 
 
 class MetadataOrchestrator:

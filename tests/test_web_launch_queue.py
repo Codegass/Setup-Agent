@@ -41,8 +41,14 @@ def make_item(item_id, batch_id="BATCH-20260607-abcdef", row_index=0, **override
         record=False,
         project_name="commons-cli",
         docker_label="commons-cli",
-        workspace_id="sag-commons-cli",
-        command=["python", "-m", "sag.main", "project", "https://github.com/apache/commons-cli.git"],
+        workspace_id=f"sag-{item_id}",
+        command=[
+            "python",
+            "-m",
+            "sag.main",
+            "project",
+            "https://github.com/apache/commons-cli.git",
+        ],
         process_log=f"logs/project_launches/{batch_id}/{item_id}.log",
         created_at=NOW,
     )
@@ -70,7 +76,7 @@ def test_enqueued_items_persist_across_store_instances(tmp_path):
     assert item["id"] == "LAUNCH-11111111"
     assert item["row_index"] == 0
     assert item["repo_url"] == "https://github.com/apache/commons-cli.git"
-    assert item["workspace_id"] == "sag-commons-cli"
+    assert item["workspace_id"] == "sag-LAUNCH-11111111"
     assert item["ref"] == "rel/commons-cli-1.11.0"
     assert item["status"] == "queued"
     assert item["pid"] is None
@@ -144,9 +150,7 @@ def test_claim_next_takes_oldest_row_and_marks_it_launching(tmp_path):
     assert claimed.id == "LAUNCH-00000001"
     assert claimed.status == "launching"
     assert claimed.started_at == LATER
-    statuses = {
-        item["id"]: item["status"] for item in store.list_batches()[0]["items"]
-    }
+    statuses = {item["id"]: item["status"] for item in store.list_batches()[0]["items"]}
     assert statuses["LAUNCH-00000001"] == "launching"
     assert statuses["LAUNCH-00000002"] == "queued"
 
@@ -355,9 +359,7 @@ def test_delete_workspace_items_removes_only_target_and_returns_logs(tmp_path):
 
     assert deleted == 1
     assert logs == ["logs/project_launches/BATCH-20260607-aaaaaa/LAUNCH-00000001.log"]
-    remaining = {
-        item["id"] for batch in store.list_batches() for item in batch["items"]
-    }
+    remaining = {item["id"] for batch in store.list_batches() for item in batch["items"]}
     assert remaining == {"LAUNCH-00000002"}
     # The batch still has another item, so it must survive.
     assert [batch["id"] for batch in store.list_batches()] == ["BATCH-20260607-aaaaaa"]

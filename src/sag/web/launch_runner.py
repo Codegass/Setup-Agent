@@ -72,19 +72,21 @@ class LaunchScheduler:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._recovered_ids: set[str] = set()
+        self._recovery_complete = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._recovery_complete = False
         try:
             self.reconcile_stale()
+            self._recovery_complete = True
         except Exception:
             # A failed reconcile must not leave the UI without a scheduler.
             logger.exception("Stale launch reconcile failed")
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="sag-launch-scheduler"
-        )
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="sag-launch-scheduler")
         self._thread.start()
 
     def stop(self) -> None:
@@ -113,29 +115,46 @@ class LaunchScheduler:
     def reconcile_stale(self) -> None:
         """Resolve launching/running rows left over from a previous UI run.
 
-        Rows whose process is gone are failed with a restart-recovery message,
-        unless Docker discovery clearly shows the workspace exists (then the
-        setup evidently got far enough to create it, so mark completed). Rows
-        whose process is still alive are left untouched; they are counted
-        against capacity and re-checked on the next UI restart.
+        A surviving process keeps its capacity while the scheduler watches it.
+        Its exit status cannot be recovered by a new parent process, so losing
+        it records an unavailable outcome, never inferred setup success.
         """
 
+        self._recovered_ids.clear()
         for item in self.store.unfinished_items():
             if item.pid is not None and _pid_alive(item.pid):
+                self._recovered_ids.add(item.id)
                 continue
-            if self.workspace_exists(item.docker_label):
-                self.store.mark_completed(item.id, exit_code=0, now=_now())
-            else:
-                self.store.mark_failed(
-                    item.id,
-                    "Launch interrupted by UI restart; process is no longer running.",
-                    now=_now(),
-                    exit_code=item.exit_code,
-                )
+            self._mark_recovery_unavailable(item.id)
+
+    def _mark_recovery_unavailable(self, item_id: str) -> None:
+        self.store.mark_failed(
+            item_id,
+            "Launch interrupted by UI restart; process is no longer running and its exit status is unavailable.",
+            now=_now(),
+        )
+
+    def _reconcile_recovered(self) -> None:
+        if not self._recovered_ids:
+            return
+        unfinished = {item.id: item for item in self.store.unfinished_items()}
+        for item_id in tuple(self._recovered_ids):
+            item = unfinished.get(item_id)
+            if item is None:
+                self._recovered_ids.discard(item_id)
+            elif item.pid is None or not _pid_alive(item.pid):
+                self._mark_recovery_unavailable(item_id)
+                self._recovered_ids.discard(item_id)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                if not self._recovery_complete:
+                    # Retry startup failures before creating children of this
+                    # scheduler, so they cannot be mistaken for recovered PIDs.
+                    self.reconcile_stale()
+                    self._recovery_complete = True
+                self._reconcile_recovered()
                 self.launch_ready()
             except Exception:
                 logger.exception("Launch scheduler iteration failed")
@@ -146,9 +165,7 @@ class LaunchScheduler:
         try:
             process = self.spawn(item.command, Path(item.process_log))
         except Exception as exc:
-            self.store.mark_failed(
-                item.id, f"Failed to start subprocess: {exc}", now=_now()
-            )
+            self.store.mark_failed(item.id, f"Failed to start subprocess: {exc}", now=_now())
             return
         self.store.mark_running(item.id, pid=process.pid, now=_now())
         threading.Thread(

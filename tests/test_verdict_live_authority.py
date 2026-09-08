@@ -3,8 +3,8 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import pytest
-
 from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
+
 from sag.agent.control_events import ControlEventSink
 from sag.agent.evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
@@ -13,11 +13,12 @@ from sag.agent.evidence_publications import (
     install_evidence_publication_authority,
     reset_evidence_publication_authority,
 )
-from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.evidence_records import frame_named_json_record_stream
+from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.verdict_finalizer import (
     VERDICT_LOGICAL_ARTIFACT_ID,
     VERDICT_SNAPSHOT_PATH,
+    BuildEvidenceSnapshot,
     EvidenceCloseReason,
     RunVerdictSnapshot,
     VerdictFinalizer,
@@ -99,6 +100,7 @@ def _snapshot(run_id: str, *, verdict: str = "failed") -> RunVerdictSnapshot:
         run_id=run_id,
         finalized_at="2026-08-09T05:00:00Z",
         verdict=verdict,
+        build_evidence=BuildEvidenceSnapshot(judgment=verdict, source="physical", observed=True),
         rates={
             "build": {
                 "modules": build_modules,

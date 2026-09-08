@@ -21,27 +21,25 @@ import shlex
 import pytest
 from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
-
 from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
 from test_build_tool import FakeBackendTool, MarkerOrchestrator
-
-from sag.agent.evidence_publications import (
-    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
-    EvidencePublicationAuthority,
-    install_evidence_publication_authority,
-)
-from sag.tools.build.build_tool import BuildTool
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 # Reusable fakes/helpers from the original suites.
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
 from test_physical_validator_modules import FakeOrch
 
 import sag.agent.physical_validator as physical_validator_module
+from sag.agent.evidence_publications import (
+    BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    EvidencePublicationAuthority,
+    install_evidence_publication_authority,
+)
 from sag.agent.physical_validator import PhysicalValidator
 from sag.config.settings import Config
-from sag.tools.internal.maven_tool import MavenTool
+from sag.tools.build.build_tool import BuildTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.command_tracker import CommandTracker
+from sag.tools.internal.maven_tool import MavenTool
 from sag.tools.module_metrics import assemble_module_metrics
 from sag.tools.report_tool import ReportTool
 from sag.verdict import run_verdict
@@ -1819,10 +1817,10 @@ def test_analyze_maven_output_parses_ansi_colored_reactor_summary():
 # ===========================================================================
 # 6. Verdict capping: incomplete modules AND low test-execution coverage
 # ===========================================================================
-def test_run_verdict_incomplete_modules_cap_at_partial():
+def test_run_verdict_incomplete_modules_are_scope_diagnostics():
     """build_modules_incomplete is genuine (not threshold-adjudicated) and must cap
     an otherwise-clean run at PARTIAL, never SUCCESS."""
-    assert run_verdict("success", "success", ["build_modules_incomplete"]) == "partial"
+    assert run_verdict("success", "success", ["build_modules_incomplete"]) == "success"
 
 
 def test_run_verdict_tests_not_fully_executed_caps_at_partial():

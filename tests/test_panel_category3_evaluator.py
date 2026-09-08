@@ -11,10 +11,10 @@ from __future__ import annotations
 import hashlib
 
 import pytest
-from verdict_rate_fakes import complete_verdict_rates
-
 from build_requirements_fakes import complete_python_build_requirements_v1
 from container_evidence_fakes import canonical_json, complete_run_pin
+from verdict_rate_fakes import complete_verdict_rates
+
 from sag.agent.control_events import ControlEventSink
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
@@ -28,9 +28,9 @@ from scripts.panel_category3_evaluator import (
     AnchorResult,
     RunArtifacts,
     ToolInvocation,
-    evaluate_probe,
     evaluate_bigtop,
     evaluate_httpcomponents,
+    evaluate_probe,
     evaluate_pyyaml,
     evaluate_tvm,
     probe_arm_verdict,
@@ -966,7 +966,14 @@ def test_loader_rejects_a_published_stampless_manifest(tmp_path):
     session = _write_session(
         tmp_path / "session_stampless",
         verdict="success",
-        build_evidence={"source": "physical"},
+        build_evidence={
+            "observed": True,
+            "judgment": "success",
+            "source": "physical",
+            "green": True,
+            "outcome": "success",
+            "evidence_status": "verified",
+        },
         unique={"executed": 100, "failed": 0},
         events=[],
         manifest={"python_packages": ["yaml"]},  # no survey stamp
@@ -989,7 +996,14 @@ def test_loader_absent_manifest_is_not_present(tmp_path):
     session = _write_session(
         tmp_path / "session_y",
         verdict="success",
-        build_evidence={"source": "physical"},
+        build_evidence={
+            "observed": True,
+            "judgment": "success",
+            "source": "physical",
+            "green": True,
+            "outcome": "success",
+            "evidence_status": "verified",
+        },
         unique={"executed": 1856, "failed": 0},
         events=[],
         manifest=None,

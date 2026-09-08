@@ -58,37 +58,67 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
     resizeObserver?.observe(element)
     window.addEventListener("resize", fit)
 
-    const socket = new WebSocket(buildTerminalWebSocketUrl(workspaceId))
-    socket.binaryType = "arraybuffer"
-
+    let disposed = false
+    let socket: WebSocket | null = null
+    const controller = new AbortController()
     const inputSubscription = term.onData((data) => {
-      if (socket.readyState === WebSocket.OPEN) {
+      if (socket?.readyState === WebSocket.OPEN) {
         socket.send(data)
       }
     })
 
-    socket.onopen = () => {
-      setStatus("connected")
-      term.write(`Connected to ${workspaceId}\r\n`)
-      fit()
+    const connect = async () => {
+      try {
+        const response = await fetch("/api/terminal-session", {
+          headers: { "X-SAG-Client": "workbench" },
+          cache: "no-store",
+          credentials: "same-origin",
+          signal: controller.signal,
+        })
+        if (!response.ok) throw new Error("Terminal session unavailable")
+        const session = await response.json() as { token?: unknown }
+        if (disposed) return
+        if (typeof session.token !== "string" || !session.token) {
+          throw new Error("Terminal session unavailable")
+        }
+        socket = new WebSocket(buildTerminalWebSocketUrl(workspaceId), [
+          "sag-terminal-v1", `sag-session.${session.token}`,
+        ])
+        socket.binaryType = "arraybuffer"
+        socket.onopen = () => {
+          if (disposed) return
+          setStatus("connected")
+          term.write(`Connected to ${workspaceId}\r\n`)
+          fit()
+        }
+        socket.onmessage = (event) => {
+          if (!disposed) void writeTerminalMessage(term, event.data)
+        }
+        socket.onerror = () => {
+          if (disposed) return
+          setStatus("error")
+          setError("Terminal connection failed.")
+          term.write("\r\nTerminal connection failed.\r\n")
+        }
+        socket.onclose = () => {
+          if (!disposed) setStatus((current) => (current === "error" ? current : "closed"))
+        }
+      } catch {
+        if (disposed) return
+        setStatus("error")
+        setError("Terminal connection failed.")
+        term.write("\r\nTerminal connection failed.\r\n")
+      }
     }
-    socket.onmessage = (event) => {
-      void writeTerminalMessage(term, event.data)
-    }
-    socket.onerror = () => {
-      setStatus("error")
-      setError("Terminal connection failed.")
-      term.write("\r\nTerminal connection failed.\r\n")
-    }
-    socket.onclose = () => {
-      setStatus((current) => (current === "error" ? current : "closed"))
-    }
+    void connect()
 
     return () => {
+      disposed = true
+      controller.abort()
       inputSubscription.dispose()
       resizeObserver?.disconnect()
       window.removeEventListener("resize", fit)
-      socket.close()
+      socket?.close()
       term.dispose()
     }
   }, [workspaceId])
