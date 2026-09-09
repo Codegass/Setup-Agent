@@ -98,6 +98,23 @@ def test_docker_daemon_error_is_not_treated_as_an_available_name(monkeypatch):
         campaign.inspect_container("sag-new")
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Error: No such object: sag-new",
+        "error: no such object: sag-new",
+        "No such container: sag-new",
+    ],
+)
+def test_missing_container_inventory_accepts_daemon_message_case(monkeypatch, detail):
+    monkeypatch.setattr(
+        campaign.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=1, stderr=detail),
+    )
+    assert campaign.inspect_container("sag-new") is None
+
+
 def test_completed_attempt_is_returned_without_rerun(tmp_path, monkeypatch):
     project = dict(
         run_key="p-candidate",

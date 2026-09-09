@@ -61,7 +61,8 @@ def inspect_container(name: str) -> dict | None:
     result = subprocess.run(["docker", "inspect", name], capture_output=True, text=True, timeout=30)
     if result.returncode:
         # A daemon error is not evidence that the name is available.
-        if "No such object" in result.stderr or "No such container" in result.stderr:
+        detail = result.stderr.casefold()
+        if "no such object" in detail or "no such container" in detail:
             return None
         raise RuntimeError(f"Container inventory unavailable: {result.stderr[-400:]}")
     return json.loads(result.stdout)[0]
