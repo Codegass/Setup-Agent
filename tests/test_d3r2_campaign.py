@@ -356,3 +356,329 @@ def test_source_patch_preserves_real_staged_binary_and_unstaged_changes(tmp_path
     assert path.read_bytes() == expected
     assert facts["complete"] is True and facts["truncated"] is False
     assert facts["sha256"] == hashlib.sha256(expected).hexdigest()
+
+
+def _job_metadata(directory, entries, *, mirror=False):
+    root = (
+        directory / "container-evidence/.setup_agent"
+        if mirror
+        else directory / "logs/session_fixture/.setup_agent"
+    )
+    path = root / "contexts/output_index.json"
+    campaign.save(path, {ref: {"metadata": value} for ref, value in entries.items()})
+    return path
+
+
+def _job_claim(body, path="/tmp/sag_jobs/e2f08890b266.log"):
+    return {
+        "full_log_path": path,
+        "full_log_bytes": len(body),
+        "full_log_sha256": hashlib.sha256(body).hexdigest(),
+        "output_storage_truncated": True,
+    }
+
+
+def _job_transport(monkeypatch, source):
+    real_run = subprocess.run
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:2] == ["docker", "cp"]
+        assert argv[2].startswith("owned:/tmp/sag_jobs/")
+        return real_run(["/bin/cp", str(source), argv[3]], **kwargs)
+
+    monkeypatch.setattr(campaign.subprocess, "run", run)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"", b"head\n" + b"x" * 1247893 + b"\nTAIL-MUST-SURVIVE\n"],
+    ids=["empty", "long-with-footer"],
+)
+def test_raw_job_archive_copies_complete_file_instead_of_output_storage_summary(
+    tmp_path, monkeypatch, body
+):
+    directory = tmp_path / "attempt"
+    _job_metadata(directory, {"output_ref": _job_claim(body)})
+    physical = tmp_path / "physical.log"
+    physical.write_bytes(body)
+    calls = _job_transport(monkeypatch, physical)
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["complete"] is True, facts
+    assert len(calls) == 1
+    record = facts["files"][0]
+    assert (directory / record["path"]).read_bytes() == body
+    assert record["bytes"] == len(body)
+    assert record["sha256"] == hashlib.sha256(body).hexdigest()
+    assert record["declared_match"] == "exact"
+    assert record["receipt_authority"] == "not_evaluated_by_archiver"
+
+
+def test_raw_job_archive_preserves_conflicting_claims_for_the_same_path(tmp_path, monkeypatch):
+    directory = tmp_path / "attempt"
+    _job_metadata(directory, {"output_a": _job_claim(b"earlier")})
+    _job_metadata(directory, {"output_b": _job_claim(b"later")}, mirror=True)
+    physical = tmp_path / "physical.log"
+    physical.write_bytes(b"later")
+    calls = _job_transport(monkeypatch, physical)
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    record = facts["files"][0]
+    assert len(calls) == 1 and len(record["metadata_claims"]) == 2
+    assert {c["declared_sha256"] for c in record["metadata_claims"]} == {
+        hashlib.sha256(b"earlier").hexdigest(),
+        hashlib.sha256(b"later").hexdigest(),
+    }
+    assert record["declared_match"] == "conflicting_metadata"
+    assert facts["complete"] is False
+    assert (directory / record["path"]).read_bytes() == b"later"
+
+
+@pytest.mark.parametrize("failure", ["missing", "timeout", "mismatch", "symlink"])
+def test_raw_job_archive_never_promotes_unavailable_or_unbound_bytes(
+    tmp_path, monkeypatch, failure
+):
+    directory = tmp_path / "attempt"
+    _job_metadata(directory, {"output_ref": _job_claim(b"expected")})
+
+    def run(argv, **kwargs):
+        if failure == "missing":
+            return SimpleNamespace(returncode=1, stderr="no such file")
+        if failure == "timeout":
+            campaign.Path(argv[3]).write_bytes(b"partial copy")
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        path = campaign.Path(argv[3])
+        if failure == "symlink":
+            path.symlink_to(tmp_path / "unrelated")
+        else:
+            path.write_bytes(b"other")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(campaign.subprocess, "run", run)
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["complete"] is False and facts["files"][0]["complete"] is False
+    if failure == "timeout":
+        assert facts["files"][0]["bytes"] == len(b"partial copy")
+        assert facts["files"][0]["sha256"] == hashlib.sha256(b"partial copy").hexdigest()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"output_storage_truncated": True},
+        _job_claim(b"", "/tmp/sag_jobs/../elsewhere.log"),
+        _job_claim(b"", "/workspace/arbitrary.log"),
+    ],
+)
+def test_raw_job_archive_missing_or_out_of_bounds_path_is_not_not_required(
+    tmp_path, monkeypatch, metadata
+):
+    directory = tmp_path / "attempt"
+    _job_metadata(directory, {"output_ref": metadata})
+    monkeypatch.setattr(
+        campaign.subprocess, "run", lambda *_a, **_k: pytest.fail("must not copy an unscoped path")
+    )
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["complete"] is False and facts["status"] == "incomplete"
+    assert facts["errors"]
+
+
+def test_raw_job_archive_untruncated_output_needs_no_job_file(tmp_path, monkeypatch):
+    directory = tmp_path / "attempt"
+    _job_metadata(directory, {"output_ref": {"output_storage_truncated": False}})
+    monkeypatch.setattr(
+        campaign.subprocess, "run", lambda *_a, **_k: pytest.fail("no referenced raw job file")
+    )
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["complete"] is True and facts["status"] == "not_required"
+
+
+def test_raw_job_archive_reads_journal_when_index_is_absent(tmp_path, monkeypatch):
+    directory = tmp_path / "attempt"
+    journal = directory / "logs/session_fixture/.setup_agent/contexts/full_outputs.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"ref_id": "output_ref", "metadata": _job_claim(b"all")}) + "\n")
+    physical = tmp_path / "physical.log"
+    physical.write_bytes(b"all")
+    _job_transport(monkeypatch, physical)
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert (
+        facts["complete"] is True
+        and facts["files"][0]["metadata_claims"][0]["output_ref"] == "output_ref"
+    )
+
+
+def test_raw_job_archive_corrupt_metadata_is_unavailable(tmp_path, monkeypatch):
+    directory = tmp_path / "attempt"
+    path = _job_metadata(directory, {})
+    path.write_text("{")
+    monkeypatch.setattr(campaign.subprocess, "run", lambda *_a, **_k: pytest.fail("no known path"))
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["complete"] is False and facts["errors"]
+
+
+def test_raw_job_collection_exception_still_stops_owned_container(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        campaign,
+        "inspect_container",
+        lambda *_a: {"Id": "owned", "State": {"Running": True}, "Mounts": []},
+    )
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fail(*_a):
+        raise OSError("raw archive unavailable")
+
+    monkeypatch.setattr(campaign.subprocess, "run", run)
+    monkeypatch.setattr(campaign, "archive_raw_job_logs", fail)
+    directory = tmp_path / "attempt"
+    directory.mkdir()
+    with pytest.raises(OSError, match="raw archive"):
+        campaign.archive_container({"repo": "apache/demo"}, directory, "owned")
+    assert calls[-1] == ["docker", "stop", "--time", "20", "owned"]
+
+
+@pytest.mark.parametrize(
+    "physical,declared,expected",
+    [
+        (b"runner output\n", b"runner output", True),
+        (b"\n", b"", True),
+        (b"runner output\n\n", b"runner output", False),
+        (b"runner output ", b"runner output", False),
+        (b"wrong content\n", b"right content", False),
+    ],
+    ids=["one-lf", "empty-text-one-lf", "two-lfs", "space", "different-content"],
+)
+def test_raw_job_transport_one_lf_variant_is_explicit_and_never_changes_physical_bytes(
+    tmp_path, monkeypatch, physical, declared, expected
+):
+    directory = tmp_path / "attempt"
+    _job_metadata(directory, {"output_ref": _job_claim(declared)})
+    original = tmp_path / "physical.log"
+    original.write_bytes(physical)
+    _job_transport(monkeypatch, original)
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    row = facts["files"][0]
+    assert facts["complete"] is expected
+    assert row["physical_copy_complete"] is True
+    assert (directory / row["path"]).read_bytes() == physical
+    assert row["bytes"] == len(physical)
+    assert row["sha256"] == hashlib.sha256(physical).hexdigest()
+    if expected:
+        assert row["declared_match"] == "normalized_output_match"
+        assert row["transform"] == "remove_one_terminal_lf"
+        assert row["normalized_bytes"] == len(declared)
+        assert row["normalized_sha256"] == hashlib.sha256(declared).hexdigest()
+        assert row["sha256"] != row["normalized_sha256"]
+    else:
+        assert row["declared_match"] == "mismatch"
+        assert "transform" not in row
+
+
+@pytest.mark.parametrize("raw_summary", [None, {"complete": False}, {"complete": True}])
+def test_run_archive_completeness_requires_raw_job_log_collection(
+    tmp_path, monkeypatch, raw_summary
+):
+    target_file = tmp_path / "target.json"
+    target_file.write_text("{}")
+    manifest = {
+        "sources": {"candidate": {"path": str(tmp_path), "sha": "b" * 40, "files": {}}},
+        "config": {"max_wall_clock_seconds": 1},
+        "docker_image_id": "sha256:" + "f" * 64,
+    }
+    project = {
+        "run_key": "subject-candidate",
+        "seat": "subject",
+        "variant": "candidate",
+        "repo": "apache/subject",
+        "sha": "a" * 40,
+        "target_sha256": campaign.digest(target_file),
+        "target_file": str(target_file),
+        "container": "sag-candidate-subject",
+    }
+    payload = {
+        "run_id": "authorized-run",
+        "metrics": {"verdict": "success"},
+        "pin": {
+            "target_repo_sha": project["sha"],
+            "sag_git_sha": "b" * 40,
+            "container_image_digest": manifest["docker_image_id"],
+        },
+    }
+    owned = {
+        "Id": "owned",
+        "Image": manifest["docker_image_id"],
+        "Created": "2099-01-01T00:00:00Z",
+        "Config": {"Labels": {"setup-agent.project": "candidate-subject"}},
+    }
+    inventory = iter([None, owned])
+
+    class FinishedProcess:
+        returncode = 0
+        pid = 123456789
+
+        def __init__(self, *_args, **kwargs):
+            (kwargs["cwd"] / "logs/session_fake").mkdir(parents=True)
+
+        def poll(self):
+            return self.returncode
+
+    diagnostics = {
+        "evidence_copy": {"exit_code": 0},
+        "raw_reports": {"exit_code": 0},
+        "report_discovery": {"exit_code": 0},
+        "stop": {"exit_code": 0},
+    }
+    if raw_summary is not None:
+        diagnostics["raw_job_logs"] = raw_summary
+    monkeypatch.setattr(campaign, "inspect_container", lambda *_a: next(inventory))
+    monkeypatch.setattr(campaign, "archive_container", lambda *_a: diagnostics)
+    monkeypatch.setattr(campaign, "verify_source", lambda *_a: {})
+    monkeypatch.setattr(campaign, "runtime_environment", lambda *_a: {})
+    monkeypatch.setattr(campaign, "effective_config", lambda *_a: {})
+    monkeypatch.setattr(campaign.subprocess, "Popen", FinishedProcess)
+    monkeypatch.setattr(
+        campaign.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
+    )
+    result = campaign.run_one(tmp_path, manifest, project)
+    assert result["evidence_archive_complete"] is (raw_summary == {"complete": True})
+    # Archive completeness never changes the collected local verdict or grants
+    # a receipt authority of its own.
+    assert result["verdict"] == "success" and result["authority_ok"] is True
+
+
+def test_raw_job_metadata_symlink_cannot_read_outside_the_archive(tmp_path, monkeypatch):
+    directory = tmp_path / "attempt"
+    external = tmp_path / "external.json"
+    external.write_text(json.dumps({"output_ref": {"metadata": _job_claim(b"outside")}}))
+    path = directory / "logs/session_fixture/.setup_agent/contexts/output_index.json"
+    path.parent.mkdir(parents=True)
+    path.symlink_to(external)
+    monkeypatch.setattr(
+        campaign.subprocess, "run", lambda *_a, **_k: pytest.fail("unscoped metadata")
+    )
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["complete"] is False and facts["files"] == [] and facts["errors"]
+
+
+@pytest.mark.parametrize("kind", ["dangling-symlink", "directory"])
+def test_raw_job_metadata_damaged_entry_cannot_be_treated_as_absent(tmp_path, monkeypatch, kind):
+    directory = tmp_path / "attempt"
+    path = directory / "logs/session_fixture/.setup_agent/contexts/output_index.json"
+    path.parent.mkdir(parents=True)
+    if kind == "dangling-symlink":
+        path.symlink_to(tmp_path / "missing.json")
+    else:
+        path.mkdir()
+    monkeypatch.setattr(
+        campaign.subprocess, "run", lambda *_a, **_k: pytest.fail("damaged metadata")
+    )
+    facts = campaign.archive_raw_job_logs(directory, directory / "container-evidence", "owned")
+    assert facts["status"] == "incomplete" and facts["complete"] is False
+    assert facts["errors"] and facts["files"] == []

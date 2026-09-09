@@ -381,6 +381,176 @@ def owned_container(data: dict, project: dict, started_at: str, image: str) -> b
     )
 
 
+def _raw_log_hash(path: Path, length: int | None = None) -> str:
+    """Hash physical bytes without retaining a large runner log in memory."""
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        while length is None or length > 0:
+            chunk = stream.read(1024 * 1024 if length is None else min(length, 1024 * 1024))
+            if not chunk:
+                break
+            result.update(chunk)
+            if length is not None:
+                length -= len(chunk)
+    return result.hexdigest()
+
+
+def archive_raw_job_logs(directory: Path, evidence: Path, identity: str) -> dict:
+    """Collect referenced job files; this does not grant receipt or run authority."""
+    result: dict[str, Any] = {
+        "scope": "OutputStorage full_log_path references; physical bytes kept separately from summaries",
+        "receipt_authority": "not_evaluated_by_archiver",
+        "files": [],
+        "errors": [],
+    }
+    roots = [evidence / ".setup_agent"]
+    for session in sorted((directory / "logs").glob("session_*")):
+        roots.extend([session, session / ".setup_agent"])
+    references: dict[str, list[dict]] = {}
+
+    def record(metadata: Any, ref: Any, source: str) -> None:
+        if not isinstance(metadata, dict):
+            raise ValueError("OutputStorage metadata is not an object")
+        path = metadata.get("full_log_path")
+        if path is None:
+            if metadata.get("output_storage_truncated") is True:
+                result["errors"].append(f"{source}:{ref}: truncated output has no full_log_path")
+            return
+        if (
+            not isinstance(path, str)
+            or re.fullmatch(r"/tmp/sag_jobs/[0-9a-f]{12,64}\.log", path) is None
+        ):
+            result["errors"].append(
+                f"{source}:{ref}: full_log_path is outside the job-log boundary"
+            )
+            return
+        # Keep every declaration, including disagreements between index/journal
+        # and host/container mirrors. No last-write-wins evidence repair.
+        references.setdefault(path, []).append(
+            {
+                "metadata_source": source,
+                "output_ref": ref,
+                "declared_bytes": metadata.get("full_log_bytes"),
+                "declared_sha256": metadata.get("full_log_sha256"),
+            }
+        )
+
+    for root in roots:
+        for name in ("output_index.json", "output_index.jsonl", "full_outputs.jsonl"):
+            path = root / "contexts" / name
+            source = str(path.relative_to(directory))
+            if path.is_symlink():
+                result["errors"].append(f"{source}: metadata is a symlink")
+                continue
+            if not path.exists():
+                continue
+            if not path.is_file() or not path.resolve().is_relative_to(directory.resolve()):
+                result["errors"].append(f"{source}: metadata is not a contained regular file")
+                continue
+            try:
+                if path.suffix == ".json":
+                    payload = json.loads(path.read_text())
+                    if not isinstance(payload, dict):
+                        raise ValueError("OutputStorage index is not an object")
+                    for ref, entry in payload.items():
+                        record(entry.get("metadata", {}), ref, source)
+                else:
+                    with path.open() as stream:
+                        for number, line in enumerate(stream, 1):
+                            payload = json.loads(line)
+                            record(
+                                payload.get("metadata", {}),
+                                payload.get("ref_id"),
+                                f"{source}:{number}",
+                            )
+            except (OSError, ValueError, TypeError, AttributeError) as exc:
+                result["errors"].append(f"{source}: {type(exc).__name__}: {exc}")
+
+    for source, claims in sorted(references.items()):
+        path = directory / "raw-job-logs" / posixpath.basename(source)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        item = {
+            "source_path": source,
+            "path": str(path.relative_to(directory)),
+            "metadata_claims": claims,
+            "receipt_authority": "not_evaluated_by_archiver",
+            "exit_code": None,
+            "bytes": None,
+            "sha256": None,
+            "physical_copy_complete": False,
+            "declared_match": "unavailable",
+            "complete": False,
+        }
+        try:
+            copied = subprocess.run(
+                ["docker", "cp", f"{identity}:{source}", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            item.update(exit_code=copied.returncode, error=copied.stderr)
+            if path.is_symlink():
+                item["error"] = "raw job log copy is a symlink, not physical file bytes"
+            elif path.is_file():
+                item.update(bytes=path.stat().st_size, sha256=_raw_log_hash(path))
+                item["physical_copy_complete"] = copied.returncode == 0
+                valid = all(
+                    type(claim["declared_bytes"]) is int
+                    and claim["declared_bytes"] >= 0
+                    and isinstance(claim["declared_sha256"], str)
+                    and re.fullmatch(r"[0-9a-f]{64}", claim["declared_sha256"]) is not None
+                    for claim in claims
+                )
+                if not valid:
+                    item["declared_match"] = "invalid_metadata"
+                else:
+                    expected = {
+                        (claim["declared_bytes"], claim["declared_sha256"]) for claim in claims
+                    }
+                    if len(expected) != 1:
+                        item["declared_match"] = "conflicting_metadata"
+                    else:
+                        size, sha = next(iter(expected))
+                        item["declared_match"] = "mismatch"
+                        if (item["bytes"], item["sha256"]) == (size, sha):
+                            item["declared_match"] = "exact"
+                        elif item["bytes"] == size + 1:
+                            with path.open("rb") as stream:
+                                stream.seek(-1, 2)
+                                terminal_lf = stream.read(1) == b"\n"
+                            normalized_sha = _raw_log_hash(path, size) if terminal_lf else None
+                            if normalized_sha == sha:
+                                # Existing execute_control_command text transport
+                                # strips output. Recognize only this measured one-LF
+                                # case, never rewrite the physical archive file.
+                                item.update(
+                                    declared_match="normalized_output_match",
+                                    transform="remove_one_terminal_lf",
+                                    normalized_bytes=size,
+                                    normalized_sha256=normalized_sha,
+                                )
+                item["complete"] = item["physical_copy_complete"] and item["declared_match"] in {
+                    "exact",
+                    "normalized_output_match",
+                }
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            item["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            # A failed/timeout copy may still leave useful partial physical
+            # bytes. Retain and fingerprint them without claiming completeness.
+            if item["bytes"] is None and not path.is_symlink() and path.is_file():
+                try:
+                    item.update(bytes=path.stat().st_size, sha256=_raw_log_hash(path))
+                except OSError as exc:
+                    item["retained_file_error"] = f"{type(exc).__name__}: {exc}"
+        result["files"].append(item)
+    result["complete"] = not result["errors"] and all(item["complete"] for item in result["files"])
+    result["status"] = (
+        ("complete" if references else "not_required") if result["complete"] else "incomplete"
+    )
+    return result
+
+
 def archive_container(project: dict, directory: Path, identity: str) -> dict:
     data = inspect_container(identity)
     if data is None or data.get("Id") != identity:
@@ -403,6 +573,7 @@ def archive_container(project: dict, directory: Path, identity: str) -> dict:
             timeout=300,
         )
         diagnostics["evidence_copy"] = {"exit_code": copied.returncode, "error": copied.stderr}
+        diagnostics["raw_job_logs"] = archive_raw_job_logs(directory, evidence, identity)
         if data["State"].get("Running"):
             project_path = "/workspace/" + project["repo"].split("/")[-1]
             for label, args in {
@@ -743,6 +914,7 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
                 result["evidence_archive_complete"] = (
                     diagnostics.get("evidence_copy", {}).get("exit_code") == 0
                     and diagnostics.get("raw_reports", {}).get("exit_code") == 0
+                    and diagnostics.get("raw_job_logs", {}).get("complete") is True
                     and diagnostics.get("report_discovery", {}).get("exit_code") == 0
                     and not diagnostics.get("receipt_read_errors")
                     and diagnostics.get("stop", {}).get("exit_code") == 0
