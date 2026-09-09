@@ -486,27 +486,58 @@ def validate_authored_plan(
             # remain byte-for-byte readable.
             from sag.tools.build.backends import source_command_tokens
 
-            for step in (*plan.build_steps, *plan.test_steps):
-                cwd = step.params.get("working_directory")
-                if (
-                    not isinstance(cwd, str)
-                    or not (cwd == "/workspace" or cwd.startswith("/workspace/"))
-                    or posixpath.normpath(cwd) != cwd
-                ):
-                    raise ValueError(
-                        "new execution steps require an explicit canonical workspace working_directory"
+            errors = []
+            first_errors = {}
+            # Check both lanes before reporting: a build error must not hide
+            # an independently invalid test action until the next model turn.
+            groups = (("build_steps", plan.build_steps), ("test_steps", plan.test_steps))
+            for index in range(max(len(steps) for _, steps in groups)):
+                for label, steps in groups:
+                    if index >= len(steps):
+                        continue
+                    step = steps[index]
+                    try:
+                        cwd = step.params.get("working_directory")
+                        if (
+                            not isinstance(cwd, str)
+                            or not (cwd == "/workspace" or cwd.startswith("/workspace/"))
+                            or posixpath.normpath(cwd) != cwd
+                        ):
+                            raise ValueError(
+                                "new execution steps require an explicit canonical workspace working_directory"
+                            )
+                        if step.tool != "build" or step.params.get("action") in {"deps", "native"}:
+                            continue
+                        system = step.params.get("system")
+                        source = step.params.get("source_command")
+                        if system not in {"maven", "gradle", "python"} or not source:
+                            raise ValueError(
+                                "new build execution steps require explicit system and source_command"
+                            )
+                        source_command_tokens(
+                            source, system, step.params.get("action"), step.params.get("args")
+                        )
+                    except (TypeError, ValueError) as exc:
+                        error = f"{label}[{index}]: {exc}"
+                        first_errors.setdefault(label, error)
+                        errors.append(error)
+            if errors:
+                # Four located errors, including the first from each lane,
+                # stay within the existing diagnostic bound even for long argv.
+                prioritized = list(first_errors.values())
+                prioritized += [error for error in errors if error not in prioritized]
+                detail_bound = (MAX_VALIDATION_ERROR_CHARS - 128) // 4
+                lines = [
+                    (
+                        error
+                        if len(error) <= detail_bound
+                        else error[: detail_bound - 23] + " ... (detail truncated)"
                     )
-                if step.tool != "build" or step.params.get("action") in {"deps", "native"}:
-                    continue
-                system = step.params.get("system")
-                source = step.params.get("source_command")
-                if system not in {"maven", "gradle", "python"} or not source:
-                    raise ValueError(
-                        "new build execution steps require explicit system and source_command"
-                    )
-                source_command_tokens(
-                    source, system, step.params.get("action"), step.params.get("args")
-                )
+                    for error in prioritized[:4]
+                ]
+                if len(errors) > 4:
+                    lines.append(f"{len(errors) - 4} additional step errors omitted")
+                raise ValueError("\n".join(lines))
             disposition = plan.test_disposition
             if disposition is not None and disposition.execution_mechanism.lower().startswith(
                 "make "

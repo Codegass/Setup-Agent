@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from test_container_io import FakeContainer
@@ -11,6 +13,7 @@ from sag.agent.document_map import DocumentMapEntry, document_map_fingerprint, e
 from sag.agent.project_execution_plan import (
     MAX_INVENTORY_PROMPT_CHARS,
     MAX_SYSTEM_PROMPT_CHARS,
+    MAX_VALIDATION_ERROR_CHARS,
     PROJECT_EXECUTION_PLAN_PATH,
     ExecutionStep,
     ProjectExecutionPlan,
@@ -808,3 +811,90 @@ def test_new_plan_preserves_ordered_initialization_producer_and_verify_steps():
         == plan["build_steps"][1]["params"]["source_command"]
     )
     assert value.test_success_criteria == tuple(plan["test_success_criteria"])
+
+
+def test_real_source_mismatches_report_both_step_locations_without_changing_plan():
+    path = Path(__file__).parent / "fixtures/d3r1_remediation/commons-cli-plan-params.json"
+    fixture = json.loads(path.read_text())
+    plan = planned_candidate()
+    plan["build_steps"][0]["params"] = fixture["build_params"]
+    plan["test_steps"][0]["params"] = fixture["test_params"]
+    before = deepcopy(plan)
+    old_digest = canonical_authored_plan_sha256(plan)
+
+    with pytest.raises(ProjectExecutionPlanValidationError) as caught:
+        validate_authored_plan(plan, require_test_disposition=True)
+
+    message = str(caught.value)
+    assert "build_steps[0]" in message
+    assert "test_steps[0]" in message
+    assert (
+        "expected args='--errors --show-version --batch-mode --no-transfer-progress clean'"
+        in message
+    )
+    assert "does not execute Maven action=test" in message
+    assert plan == before
+    # Historical read/digest behavior is unchanged; validation refusal does not
+    # rewrite an archived candidate or publish a suggested replacement.
+    assert canonical_authored_plan_sha256(plan) == old_digest
+
+    for key in ("build_steps", "test_steps"):
+        plan[key][0]["params"]["action"] = "verify"
+        plan[key][0]["params"][
+            "args"
+        ] = "--errors --show-version --batch-mode --no-transfer-progress clean"
+    accepted = validate_authored_plan(plan, require_test_disposition=True)
+    assert accepted.test_steps[0].params["action"] == "verify"
+    assert (
+        accepted.build_steps[0].params["source_command"]
+        == fixture["build_params"]["source_command"]
+    )
+
+
+def test_new_plan_step_errors_are_bounded_and_report_omitted_count():
+    plan = planned_candidate()
+    for group in ("build_steps", "test_steps"):
+        step = plan[group][0]
+        step["params"]["source_command"] = "mvn verify"
+        step["params"]["action"] = "test"
+        step["params"]["args"] = ""
+        plan[group] = [deepcopy(step) for _ in range(4)]
+    with pytest.raises(ProjectExecutionPlanValidationError) as caught:
+        validate_authored_plan(plan, require_test_disposition=True)
+    message = str(caught.value)
+    assert len(message) <= MAX_VALIDATION_ERROR_CHARS
+    assert "4 additional step errors omitted" in message
+    assert "build_steps[0]" in message and "test_steps[0]" in message
+
+
+def test_long_source_feedback_is_explicitly_truncated_with_both_lanes_located():
+    plan = planned_candidate()
+    for group in ("build_steps", "test_steps"):
+        step = plan[group][0]
+        step["params"].update(
+            action="verify", source_command="mvn verify -Dlabel=" + "a" * 1400, args=""
+        )
+        plan[group] = [deepcopy(step) for _ in range(2)]
+    with pytest.raises(ProjectExecutionPlanValidationError) as caught:
+        validate_authored_plan(plan, require_test_disposition=True)
+    message = str(caught.value)
+    assert len(message) <= MAX_VALIDATION_ERROR_CHARS
+    assert message.count("(detail truncated)") == 4
+    assert "build_steps[0]" in message and "test_steps[0]" in message
+
+
+def test_first_test_lane_error_is_visible_even_when_preceded_by_many_build_errors():
+    plan = planned_candidate()
+    bad_build = plan["build_steps"][0]
+    bad_build["params"].update(action="verify", args="verify", source_command="mvn verify")
+    plan["build_steps"] = [deepcopy(bad_build) for _ in range(5)]
+    plan["test_steps"] = [deepcopy(plan["test_steps"][0]) for _ in range(5)]
+    plan["test_steps"][4]["params"].update(
+        action="verify", args="verify", source_command="mvn verify"
+    )
+    with pytest.raises(ProjectExecutionPlanValidationError) as caught:
+        validate_authored_plan(plan, require_test_disposition=True)
+    message = str(caught.value)
+    assert "build_steps[0]" in message and "test_steps[4]" in message
+    assert "2 additional step errors omitted" in message
+    assert len(message) <= MAX_VALIDATION_ERROR_CHARS

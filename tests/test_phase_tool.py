@@ -592,7 +592,7 @@ def test_honest_terminal_unpersisted_close_preserves_recovery_disposition():
     assert result.metadata["control_disposition"] == "harness_recovery_required"
 
 
-def test_analysis_facts_recovery_still_runs_before_plan_requirement_is_reported():
+def test_analysis_facts_recovery_still_runs_before_explicit_no_plan_termination():
     class RecoveringGate:
         def __init__(self):
             self.calls = 0
@@ -638,9 +638,11 @@ def test_analysis_facts_recovery_still_runs_before_plan_requirement_is_reported(
 
     result = tool.execute(action="done", outcome="failed", key_results="survey complete")
 
-    assert result.succeeded is False
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_REQUIRED"
-    assert "phase_signal" not in result.metadata
+    assert result.succeeded is True
+    assert result.metadata["phase_signal"] == "done"
+    assert result.metadata["gate_result"]["validated_outcome"] == "unknown"
+    assert result.metadata["gate_result"]["validated_facts"]["analysis.build_entry_ready"] is False
+    assert "execution_plan_candidate" not in result.metadata
     assert gate.calls == 2
     assert surveys == ["survey"]
     audit = result.metadata["gate_result"]["validated_facts"]["run.analysis_recovery"]

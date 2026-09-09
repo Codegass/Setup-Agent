@@ -1,0 +1,19 @@
+{
+  "provenance": "logs/d3r2-paired-v3-20260909/runs/commons-cli-candidate/console.log:49923",
+  "build_params": {
+    "action": "verify",
+    "args": "clean verify",
+    "source_command": "mvn --errors --show-version --batch-mode --no-transfer-progress clean verify",
+    "system": "maven",
+    "working_directory": "/workspace/commons-cli"
+  },
+  "test_params": {
+    "action": "test",
+    "args": "clean verify",
+    "source_command": "mvn --errors --show-version --batch-mode --no-transfer-progress clean verify",
+    "system": "maven",
+    "working_directory": "/workspace/commons-cli"
+  },
+  "event_id": "control-000281",
+  "provenance_line_sha256": "aea1431847a1c437152d68daec2a5883df5b652eda47cde46a6f2317096282d7"
+}

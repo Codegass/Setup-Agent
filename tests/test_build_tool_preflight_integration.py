@@ -20,6 +20,7 @@ maven, passes a -pl module selection).
 import hashlib
 import json
 import shlex
+from pathlib import Path
 
 import pytest
 from build_requirements_fakes import complete_build_requirements_v1
@@ -1414,6 +1415,21 @@ def test_explicit_maven_command_preserves_clean_before_install():
     assert backend.calls[0]["_source_argv"] == ["clean", "install", "-DskipTests"]
 
 
+def test_real_source_mismatch_refuses_dispatch_with_actionable_feedback():
+    path = Path(__file__).parent / "fixtures/d3r1_remediation/commons-cli-plan-params.json"
+    params = json.loads(path.read_text())["build_params"]
+    orch = ScriptedOrch()
+    backend = ScriptedBackendTool()
+    result = _tool(orch, maven=backend).execute(**params)
+    assert result.error_code == "BUILD_PARAMETER_INVALID"
+    assert (
+        "expected args='--errors --show-version --batch-mode --no-transfer-progress clean'"
+        in result.output
+    )
+    assert "extra tokens=['verify']" in result.output
+    assert backend.calls == []
+
+
 def test_explicit_failsafe_verify_is_not_narrowed_to_test():
     orch = ScriptedOrch()
     backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
@@ -1453,6 +1469,39 @@ def test_official_maven_multiphase_source_matches_real_runner_and_contract():
     assert shlex.split(actual)[2:] == shlex.split(source)[1:]
     assert captured[0]["effective_action"] == "verify"
     assert captured[0]["requested_call"]["params"]["source_command"] == source
+
+
+def test_explicit_full_default_goal_and_flags_reach_maven_runner_and_contract_unchanged():
+    flags = "--errors --show-version --batch-mode --no-transfer-progress"
+    quality_goals = (
+        "apache-rat:check japicmp:cmp checkstyle:check spotbugs:check pmd:check javadoc:javadoc"
+    )
+    source = f"mvn {flags} clean verify {quality_goals}"
+    args = f"{flags} clean {quality_goals}"
+    orch = EndToEndOrch([(True, "BUILD SUCCESS")], java="17", manifest={})
+    internal = _internal_maven_tool(orch)
+    captured = []
+    original = internal.execute
+
+    def capture(**kwargs):
+        captured.append(dict(current_contract() or {}))
+        return original(**kwargs)
+
+    internal.execute = capture
+    result = BuildTool(orch, maven_tool=internal).execute(
+        action="verify",
+        system="maven",
+        source_command=source,
+        args=args,
+        working_directory="/workspace/proj",
+    )
+    assert result.succeeded
+    actual = next(command for command in orch.commands if command.startswith("mvn"))
+    assert shlex.split(actual)[1:] == shlex.split(captured[0]["expected_argv"])
+    assert shlex.split(actual)[2:] == shlex.split(source)[1:]
+    assert captured[0]["effective_action"] == "verify"
+    assert captured[0]["requested_call"]["params"]["source_command"] == source
+    assert captured[0]["requested_call"]["params"]["args"] == args
 
 
 def test_explicit_gradle_scoped_source_records_the_actual_task():

@@ -1980,7 +1980,10 @@ class BuildTool(BaseTool):
                 },
                 "args": {
                     "type": "string",
-                    "description": "Extra flags passed through to the underlying tool. "
+                    "description": "Runner options and additional goals/tasks. For Maven with "
+                    "source_command, remove the runner and exactly one action goal; args must "
+                    "contain ALL remaining tokens in source order, including every flag. "
+                    "Example: source_command='mvn -B clean verify', action='verify', args='-B clean'. "
                     "Omit it for Python deps: that action installs only dependencies "
                     "declared by the project; direct install targets are disabled.",
                 },
@@ -1993,7 +1996,7 @@ class BuildTool(BaseTool):
                 "source_command": {
                     "type": "string",
                     "maxLength": 2048,
-                    "description": "Reviewed single runner command matching action/args, e.g. ./mvnw clean install -DskipTests or python -m pytest tests/. Requires system. No Make/shell recipes; split their setup and supported pytest command into ordered steps.",
+                    "description": "Reviewed single runner command matching action/args, e.g. ./mvnw clean install -DskipTests or python -m pytest tests/. Requires system. A test step may use action=verify; action=test does not encode a verify-only source. Bare Maven requires reviewing and explicitly preserving the complete resolved POM defaultGoal, not dropping its quality/plugin goals. No automatic defaultGoal expansion or parameter repair. No Make/shell recipes; split their setup and supported pytest command into ordered steps.",
                 },
                 "timeout": {
                     "type": "integer",

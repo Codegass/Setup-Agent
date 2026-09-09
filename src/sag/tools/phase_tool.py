@@ -33,6 +33,7 @@ from sag.agent.phase_gates import (
     disclosed_live_job_ids,
     gate_observation_text,
     settlement_capped_outcome,
+    validate_phase_claim,
 )
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.agent.project_execution_plan import (
@@ -67,8 +68,10 @@ class PhaseTool(BaseTool):
                 "external impediment; both are checked against physical evidence. "
                 "action='note' records a working note. A rejected terminal claim returns "
                 "typed judge facts; the model chooses its next ordinary project action. "
-                "Analyze action='done' additionally requires execution_plan: the model's "
-                "evidence-linked build/test strategy. test_disposition must be planned with "
+                "Analyze action='done' requires execution_plan to establish the model's "
+                "evidence-linked build/test strategy. Explicit unknown/failed without a plan "
+                "may end Analyze with unresolved strategy; Build and Test remain unauthorized. "
+                "Any supplied plan must still pass validation. test_disposition must be planned with "
                 "at least one test step, or blocked with empty test_steps and a concrete reason "
                 "plus reviewed-document evidence refs. Separately record execution_mechanism, "
                 "verdict_scope, and readiness. Classify verdict_scope from the actual definition "
@@ -679,10 +682,9 @@ class PhaseTool(BaseTool):
                 claim_disposition=ClaimDisposition.CONTRADICTED,
                 validator_state=gate.validator_state,
                 reason=(
-                    "blocked is reserved for external impediments, but the phase "
-                    f"evidence shows a real green build ({gate.reason}). Any remaining "
-                    "modules stay unresolved, and the terminal outcome is bounded by "
-                    "their recorded evidence."
+                    "blocked is reserved for external impediments, but the "
+                    f"{phase} evidence is green ({gate.reason}). The terminal outcome is bounded "
+                    "by the recorded evidence for the remaining scope."
                 ),
                 evidence_refs=gate.evidence_refs,
                 suggestions=gate.suggestions,
@@ -691,6 +693,42 @@ class PhaseTool(BaseTool):
                 claim=claim,
                 control_disposition=gate.control_disposition,
                 blocker_owner=gate.blocker_owner,
+            )
+
+        no_plan_terminal = (
+            phase == "analyze"
+            and verb == "done"
+            and execution_plan is None
+            and plan_candidate is None
+            and claimed_outcome in {PhaseOutcome.UNKNOWN, PhaseOutcome.FAILED}
+            and gate.accepted
+            and gate.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
+        )
+        if no_plan_terminal:
+            # A green survey alone does not establish an execution strategy.
+            # Close through the existing transition policy without upgrading a
+            # no-plan claim or discarding a physically observed analysis failure.
+            gate = validate_phase_claim(
+                claim,
+                (
+                    ValidatorState.RED
+                    if gate.validated_outcome is PhaseOutcome.FAILED
+                    else ValidatorState.UNAVAILABLE
+                ),
+                reason=(
+                    "Analyze ended without an established execution plan; "
+                    "Build and Test were not authorized."
+                ),
+                evidence_refs=gate.evidence_refs,
+                code="analysis_plan_not_established",
+                validated_facts={
+                    **dict(gate.validated_facts),
+                    "analysis.survey_validator_state": gate.validator_state.value,
+                    "analysis.survey_reason": gate.reason,
+                    "analysis.build_entry_ready": False,
+                    "analysis.execution_plan_valid": False,
+                    "analysis.execution_plan_required": True,
+                },
             )
 
         if not gate.accepted:
@@ -718,7 +756,12 @@ class PhaseTool(BaseTool):
                 },
             )
 
-        if phase == "analyze" and verb == "done" and plan_candidate is None:
+        if (
+            phase == "analyze"
+            and verb == "done"
+            and plan_candidate is None
+            and not no_plan_terminal
+        ):
             return self._rejected_claim_result(
                 claim,
                 code="ANALYSIS_EXECUTION_PLAN_REQUIRED",
@@ -794,7 +837,10 @@ class PhaseTool(BaseTool):
                 "execution_plan": {
                     "type": "object",
                     "description": (
-                        "Required only for Analyze action='done'. Your model-authored, "
+                        "Analyze action='done': required to establish an execution strategy. "
+                        "May be omitted only for explicit unknown/failed termination, which "
+                        "does not authorize Build or Test. Any supplied plan is validated. "
+                        "Your model-authored, "
                         "evidence-linked project build/test strategy. Harness inventory "
                         "and extracted claims are hints, not commands."
                     ),
@@ -929,7 +975,9 @@ class PhaseTool(BaseTool):
                                             "type": "object",
                                             "description": (
                                                 "Exact public tool parameters with explicit working_directory. "
-                                                "Build execution steps require system and source_command matching action/args, "
+                                                "Build execution steps require system and source_command matching action/args. "
+                                                "For Maven, args is source_command after removing the runner and one action goal; "
+                                                "preserve every other goal and flag in order. test_steps may use action=verify. "
                                                 "e.g. action=install, system=maven, args='clean -DskipTests', "
                                                 "source_command='./mvnw clean install -DskipTests'. "
                                                 "Keep wrapper setup and producer package/install as preceding steps. "

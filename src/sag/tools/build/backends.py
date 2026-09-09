@@ -8,6 +8,7 @@ later ecosystems (python/node) add a module here, never a schema change.
 import posixpath
 import re
 import shlex
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -76,11 +77,36 @@ def source_command_tokens(
         goal = MavenBackend.VERBS.get(verb)
         remaining = list(body)
         if goal not in remaining:
-            raise ValueError(f"source_command does not execute Maven action={verb}")
+            alternatives = []
+            for action, action_goal in MavenBackend.VERBS.items():
+                if action_goal in body:
+                    other_args = list(body)
+                    other_args.remove(action_goal)
+                    alternatives.append(f"action={action!r}, args={shlex.join(other_args)!r}")
+            guidance = (
+                "if this reviewed source is intended, compatible params include "
+                + " or ".join(alternatives[:2])
+                + "; these suggestions are not applied"
+                if alternatives
+                else "no supported action goal is explicit. For bare Maven, review the effective "
+                "POM defaultGoal and explicitly preserve every resolved goal and option; "
+                "an unresolved defaultGoal is not an executable plan"
+            )
+            raise ValueError(
+                f"source_command does not execute Maven action={verb} (required goal {goal!r}); "
+                f"{guidance}. Do not add an unreviewed goal to source_command"
+            )
         remaining.remove(goal)
         if remaining != supplied:
+            missing = list((Counter(remaining) - Counter(supplied)).elements())
+            extra = list((Counter(supplied) - Counter(remaining)).elements())
             raise ValueError(
-                "Maven source_command differs from action/args; preserve every goal and option"
+                "Maven source_command differs from action/args; "
+                f"expected args={shlex.join(remaining)!r}; "
+                f"missing tokens={missing!r}; extra tokens={extra!r}. "
+                f"Remove the runner and remove exactly one {goal!r} supplied by action; "
+                "keep every other goal and option in source order. "
+                "This encoding suggestion is not applied; re-review source_command if its intent is wrong"
             )
     elif body != supplied:
         # A default Gradle task may be stated in source_command while args
