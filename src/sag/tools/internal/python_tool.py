@@ -873,7 +873,7 @@ class PythonTool(BaseTool):
             after={},
             lifecycle_state=(result.metadata or {}).get("lifecycle_state"),
             termination_reason=(result.metadata or {}).get("termination_reason"),
-            output=result.raw_output or result.output,
+            output=result.raw_output if result.raw_output is not None else result.output,
             requirements=requirements,
             producer_observations=observations,
             **contract_receipt_fields(argv),
@@ -1086,7 +1086,7 @@ class PythonTool(BaseTool):
             # the honest statement that none were expected.
             before={},
             after={},
-            output=rebuilt.raw_output or rebuilt.output,
+            output=rebuilt.raw_output if rebuilt.raw_output is not None else rebuilt.output,
             requirements=requirements,
             capability_observations=observations,
             **contract_receipt_fields(" && ".join(commands)),
@@ -2168,6 +2168,10 @@ class PythonTool(BaseTool):
             result = self._run(command, working_directory, timeout)
             exit_code = result.get("exit_code")
             output = result.get("output") or ""
+            # Bind the same exact runner bytes in the receipt and returned
+            # result. Monitor summaries and tail truncation are display only;
+            # an observed empty stream is still an available raw observation.
+            runner_output = result.get("full_output", output)
             attempt_tag_command = (
                 f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_ATTEMPT_TAG_SCRIPT)} "
                 f"{shlex.quote(report)} {attempt_id}"
@@ -2194,7 +2198,7 @@ class PythonTool(BaseTool):
                     self.orchestrator.execute_command,
                     [working_directory, PYTEST_REPORT_DIR],
                 ),
-                output=result.get("full_output", output),
+                output=runner_output,
                 requirements=requirements,
                 # Bind this dispatch to the semantic contract the build facade
                 # froze. Python semantic receipts intentionally carry no argv
@@ -2362,7 +2366,7 @@ class PythonTool(BaseTool):
             return self._finish(
                 ToolResult.completed_success(
                     output=tail,
-                    raw_output=output,
+                    raw_output=runner_output,
                     raw_data=raw_data,
                     metadata=metadata,
                     test_stats=test_stats,
@@ -2374,7 +2378,7 @@ class PythonTool(BaseTool):
         return self._finish(
             ToolResult.completed_failure(
                 output=tail,
-                raw_output=output,
+                raw_output=runner_output,
                 error=error,
                 error_code=error_code,
                 raw_data=raw_data,
@@ -3229,10 +3233,8 @@ class PythonTool(BaseTool):
 
     @staticmethod
     def _finish(tool_result: ToolResult, preamble: List[str]) -> ToolResult:
-        """Prepend the pre-flight/deviation narration (transparency-by-
-        construction, same pattern as the ported maven/gradle tools)."""
+        """Prepend display narration without changing bound runner evidence."""
         if preamble:
             head = "\n".join(preamble) + "\n"
             tool_result.output = head + (tool_result.output or "")
-            tool_result.raw_output = head + (tool_result.raw_output or "")
         return tool_result

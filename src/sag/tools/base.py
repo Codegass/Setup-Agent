@@ -213,8 +213,8 @@ def canonical_full_output_source(
     output: Any = None,
     error: Any = None,
 ) -> str:
-    """Normalize the canonical full-output source without discarding error-only text."""
-    source = raw_output or output or error or ""
+    """Preserve an observed raw stream, including empty; otherwise retain diagnostics."""
+    source = raw_output if raw_output is not None else (output or error or "")
     if isinstance(source, bytes):
         return source.decode("utf-8", errors="replace")
     return source if isinstance(source, str) else str(source)

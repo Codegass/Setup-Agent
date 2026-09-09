@@ -308,6 +308,28 @@ def test_durable_project_fact_sheet_index_keeps_action_and_schema(tmp_path):
     assert indexed["metadata"]["fact_sheet_version"] == 1
 
 
+@pytest.mark.parametrize("outcome", ["success", "failed"])
+@pytest.mark.parametrize("raw_output", ["", "runner bytes\n"])
+def test_durable_runner_output_ignores_display_narration(tmp_path, outcome, raw_output):
+    storage = OutputStorageManager(tmp_path)
+    result = ToolResult.completed(
+        operation_outcome=outcome,
+        output="Collection: 1 selected\n[monitor display summary]",
+        raw_output=raw_output,
+        error="test runner failed" if outcome == "failed" else None,
+        output_ref_storage=storage,
+    )
+    if outcome == "failed":
+        # Failed construction itself persists the same canonical raw source.
+        assert storage.retrieve_output(result.output_ref) == raw_output
+    attached = attach_durable_output_ref(result, storage, task_id="test", tool_name="build")
+    # Reopen the store so this proves durability, beyond an in-memory field.
+    reader = OutputStorageManager(tmp_path)
+    assert reader.retrieve_output(attached.output_ref) == raw_output
+    assert attached.raw_output == raw_output
+    assert attached.output == result.output
+
+
 def test_metadata_filter_applies_before_result_limit(tmp_path):
     storage = OutputStorageManager(tmp_path)
     target_metadata = {

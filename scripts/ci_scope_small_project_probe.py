@@ -223,6 +223,117 @@ def checked_control(audit, command: str):
     return result
 
 
+def production_target_ablations(
+    audit, state, *, validator, project_path, repo, target, destination
+):
+    """Reassemble the same sealed execution through the live comparison adapter."""
+    from sag.agent.ci_comparison import build_ci_comparison, load_ci_target
+
+    def compare(value):
+        return build_ci_comparison(
+            audit,
+            state,
+            validator=validator,
+            project_root=project_path,
+            repository=repo,
+            target=value,
+        ).model_dump(mode="json")
+
+    result = {"full_target": compare(target), "without_target": compare(None)}
+    if target is not None:
+        for label in ("without_target_scope", "without_test_scope"):
+            payload = target.record.model_dump(mode="json")
+            for cell in payload["cells"]:
+                if cell["cell_id"] != payload["matched_cell"]:
+                    continue
+                if label == "without_target_scope":
+                    cell.update(modules=[], modules_basis=None)
+                else:
+                    # Grade B explicitly discloses that no test pool was retained;
+                    # zero here is not a claim that CI ran zero tests.
+                    cell.update(
+                        grade="B",
+                        executed_count=0,
+                        executed_ids=[],
+                        red_count=0,
+                        red_ids=[],
+                        flaky_count=0,
+                        flaky_ids=[],
+                        skipped=0,
+                    )
+            path = destination / "counterfactual-targets" / f"{label}.json"
+            dump(path, payload)
+            result[label] = compare(load_ci_target(path))
+        full = result["full_target"].get("attainment") or {}
+        no_scope = result["without_target_scope"].get("attainment") or {}
+        no_tests = result["without_test_scope"].get("attainment") or {}
+        for comparison in (no_scope, no_tests):
+            if comparison.get("alpha") is not None or comparison.get("verdict") == "met":
+                raise RuntimeError("deleting target scope retained a scored/met comparison")
+        result["scope_removal_control"] = {
+            "status": "passed" if full.get("alpha") is not None else "positive_control_unavailable",
+            "full_was_scored": full.get("alpha") is not None,
+            "removed_scope_is_unscored": no_scope.get("alpha") is None,
+            "removed_test_scope_is_unscored": no_tests.get("alpha") is None,
+        }
+    result["mode"] = "counterfactual only; same sealed state; never published"
+    dump(destination / "target-counterfactuals.json", result)
+    return result
+
+
+def archive_probe_evidence(destination, audit, epoch, name, project):
+    """Always retain the final host stream and the bytes it currently publishes."""
+    from scripts.run_d0_docker_probes import _verify_archived_evidence_epochs
+
+    archive = destination / "final-evidence"
+    container = archive / "container-1"
+    container.mkdir(parents=True, exist_ok=False)
+    dump(archive / "command-audit.json", audit.records)
+    blobs = container / "command-blobs"
+    blobs.mkdir()
+    for digest, body in audit.blobs.items():
+        (blobs / digest).write_bytes(body)
+    shutil.copy2(epoch.control_event_path, container / "control-events.jsonl")
+    dump(
+        container / "evidence-epoch.json",
+        {
+            "schema_version": 1,
+            "run_id": epoch.run_id,
+            "container_name": name,
+            "host_control_event_path": str(epoch.control_event_path),
+            "control_event_path": "container-1/control-events.jsonl",
+        },
+    )
+    for source, leaf in (
+        ("/workspace/.setup_agent", ".setup_agent"),
+        ("/tmp/sag_jobs", "sag_jobs"),
+    ):
+        subprocess.run(
+            ["docker", "cp", f"{name}:{source}", str(container / leaf)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    with (container / "project-evidence.tar.gz").open("wb") as output:
+        subprocess.run(
+            ["docker", "exec", name, "tar", "czf", "-", "-C", "/workspace", project],
+            stdout=output,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=120,
+        )
+    events = _verify_archived_evidence_epochs(archive)
+    dump(archive / "verified-control-events.json", events)
+    checksums = {
+        str(path.relative_to(archive)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(archive.rglob("*"))
+        if path.is_file()
+    }
+    dump(archive / "checksums.json", checksums)
+    return {"status": "complete", "file_count": len(checksums), "path": str(archive)}
+
+
 def run_project(
     project: str,
     out: Path,
@@ -231,6 +342,63 @@ def run_project(
     experiment_id: str,
     expected_source_sha: str,
     ci_target_file: Path | None = None,
+) -> dict:
+    context = {}
+    result = None
+    failure = None
+    try:
+        result = _run_project_body(
+            project,
+            out,
+            container_name=container_name,
+            experiment_id=experiment_id,
+            expected_source_sha=expected_source_sha,
+            ci_target_file=ci_target_file,
+            evidence_context=context,
+        )
+        return result
+    except BaseException as exc:
+        failure = {"error_type": type(exc).__name__, "error": str(exc)}
+        if "destination" in context:
+            dump(context["destination"] / "failure.json", failure)
+        raise
+    finally:
+        if "epoch" in context:
+            try:
+                archived = archive_probe_evidence(
+                    context["destination"],
+                    context["audit"],
+                    context["epoch"],
+                    container_name,
+                    project,
+                )
+                dump(context["destination"] / "archive-status.json", archived)
+                if result is not None:
+                    result["archive_integrity"] = archived["status"]
+                    dump(context["destination"] / "summary.json", result)
+            except BaseException as exc:
+                dump(
+                    context["destination"] / "archive-status.json",
+                    {
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "original_failure": failure,
+                    },
+                )
+                if failure is None:
+                    raise
+
+
+def _run_project_body(
+    project: str,
+    out: Path,
+    *,
+    container_name: str,
+    experiment_id: str,
+    expected_source_sha: str,
+    ci_target_file: Path | None = None,
+    evidence_context: dict,
 ) -> dict:
     from loguru import logger
 
@@ -289,6 +457,7 @@ def run_project(
     project_path = f"/workspace/{project}"
     destination = out / project
     destination.mkdir(parents=True, exist_ok=False)
+    evidence_context["destination"] = destination
     logger.remove()
     logger.add(str(destination / "engine.log"), level="DEBUG")
     logger.add(sys.stderr, level="WARNING")
@@ -326,6 +495,7 @@ def run_project(
     runtime.audits.append(audit)
     runtime.containers.append(orch)
     epoch = runtime._register_epoch(audit, suffix="real")
+    evidence_context.update(audit=audit, epoch=epoch)
     _install_epoch_authority(epoch.authority, audit)
     set_active_receipt_run_id(epoch.run_id)
     checked_control(audit, "mkdir -p /workspace/.setup_agent /tmp/sag_jobs")
@@ -455,7 +625,7 @@ def run_project(
     dump(destination / "receipts.json", receipts)
     print(f"{project}: tool={result.operation_outcome.value}, receipts={len(receipts)}", flush=True)
 
-    def snapshot(label: str, *, publish: bool = False):
+    def snapshot(label: str, *, publish: bool = False, counterfactuals: bool = False):
         require_frozen_source()
         validator = PhysicalValidator(audit, project_path="/workspace", receipt_run_id=epoch.run_id)
         build = validator.validate_build_status(project)
@@ -492,6 +662,16 @@ def run_project(
                 close_reason="test_terminated",
             )
             verdict = finalizer._snapshot_for_state(state)
+        if counterfactuals:
+            production_target_ablations(
+                audit,
+                state,
+                validator=validator,
+                project_path=project_path,
+                repo=repo,
+                target=target,
+                destination=destination,
+            )
         data = {
             "build": build,
             "tests": test,
@@ -502,7 +682,7 @@ def run_project(
         dump(destination / f"{label}.json", data)
         return data
 
-    full = snapshot("full-evidence")
+    full = snapshot("full-evidence", counterfactuals=True)
     # Archive source and evidence before physically removing anything in these new containers.
     subprocess.run(
         [

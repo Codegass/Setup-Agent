@@ -226,7 +226,7 @@ def test_no_phase_engine_reuses_the_container_epoch_sink_and_run_id(tmp_path):
 
 
 def _archived_publication_epoch(tmp_path, *, mutable=False):
-    from sag.agent.control_events import ControlEventSink, EVIDENCE_PUBLICATION_GENESIS_SHA256
+    from sag.agent.control_events import EVIDENCE_PUBLICATION_GENESIS_SHA256, ControlEventSink
     from sag.agent.evidence_publications import EvidencePublicationAuthority
 
     container = tmp_path / "container-1"
@@ -295,6 +295,55 @@ def test_archive_epoch_recovery_accepts_exact_host_published_bytes(tmp_path):
         "evidence_store_bound",
         "evidence_publication",
     ]
+
+
+@pytest.mark.parametrize("attack", [None, "foreign-run", "invalid-schema"])
+def test_archive_epoch_validates_production_published_verdict(tmp_path, attack):
+    from container_evidence_fakes import ContainerFS
+
+    from sag.agent.evidence_publications import (
+        install_evidence_publication_authority,
+        reset_evidence_publication_authority,
+    )
+    from sag.agent.evidence_state import RunEvidenceState
+    from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
+
+    container, authority, _path, _bodies = _archived_publication_epoch(tmp_path)
+    store_token = hashlib.sha256(str(container.resolve()).encode("utf-8")).hexdigest()
+    orchestrator = _EpochOrchestrator(f"archive-{store_token}")
+    orchestrator.filesystem = ContainerFS()
+    orchestrator.files = orchestrator.filesystem.files
+    token = install_evidence_publication_authority(authority, orchestrator=orchestrator)
+    try:
+        snapshot = VerdictFinalizer(orchestrator).finalize(
+            RunEvidenceState(run_id=authority.run_id), EvidenceCloseReason.ABORTED
+        )
+    finally:
+        reset_evidence_publication_authority(token)
+    raw = orchestrator.files["/workspace/.setup_agent/verdict.json"].encode("utf-8")
+    assert json.loads(raw) == snapshot.model_dump(mode="json")
+    if attack is not None:
+        payload = json.loads(raw)
+        payload["run_id" if attack == "foreign-run" else "schema_version"] = (
+            "foreign-run" if attack == "foreign-run" else 999
+        )
+        revised = json.dumps(payload, sort_keys=True).encode("utf-8")
+        authority.publish_revision(
+            record_kind="verdict",
+            record_id="run-verdict",
+            logical_artifact_id="run-verdict",
+            raw=revised,
+            expected_previous_raw_sha256=hashlib.sha256(raw).hexdigest(),
+        )
+        raw = revised
+    (container / ".setup_agent" / "verdict.json").write_bytes(raw)
+
+    if attack is not None:
+        with pytest.raises(d0.D0Stop, match="verdict.*(invalid|another epoch)"):
+            d0._verify_archived_evidence_epochs(tmp_path)
+    else:
+        events = d0._verify_archived_evidence_epochs(tmp_path)
+        assert len(events) == 3
 
 
 @pytest.mark.parametrize("attack", ["extra", "delete", "tamper"])
@@ -471,6 +520,7 @@ def test_archived_obligation_identity_is_validated_against_the_live_v3_schema():
 
 def test_receipt_writer_fails_when_no_host_publication_authority_is_installed():
     from container_evidence_fakes import ContainerFS
+
     from sag.agent.evidence_publications import (
         install_evidence_publication_authority,
         reset_evidence_publication_authority,
@@ -513,6 +563,7 @@ def test_receipt_writer_fails_when_no_host_publication_authority_is_installed():
 
 def test_strict_container_receipts_requires_named_bytes_and_host_publication(tmp_path):
     from container_evidence_fakes import ContainerFS
+
     from sag.agent.invocation_receipts import RECEIPT_DIR, build_receipt
 
     runtime = _epoch_runtime(tmp_path, probe="gradle-runner-classification")
@@ -1157,6 +1208,7 @@ def test_http_fixture_uses_real_pinned_checkout_and_hides_compatible_maven():
 
 def test_small_real_row_flows_reader_projection_and_public_evaluator():
     from container_evidence_fakes import strict_published_evidence
+
     from sag.agent.invocation_receipts import build_receipt
     from sag.agent.receipt_test_rows import testcase_execution_id
     from sag.tools.report_tool import ReportTool

@@ -1,6 +1,7 @@
 """A deterministic controller plan cites durable, path-bound source bytes."""
 
 import hashlib
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -62,3 +63,82 @@ def test_output_that_cannot_round_trip_never_seals_a_plan(tmp_path, monkeypatch)
     with pytest.raises(OutputPersistenceError):
         seal_probe_plan(runtime, fs, epoch, "commons-cli", probe_steps("commons-cli"))
     assert read_sealed_project_execution_plan(fs) is None
+
+
+def test_production_counterfactuals_remove_scores_without_changing_execution(tmp_path):
+    from test_ci_comparison import ROOT, setup_run
+
+    from scripts.ci_scope_small_project_probe import production_target_ablations
+
+    run = setup_run()
+    run.state.seal(finalized_at="2026-09-09T00:00:00Z", close_reason="test_terminated")
+    execution_files = dict(run.fs.files)
+    result = production_target_ablations(
+        run.fs,
+        run.state,
+        validator=run.validator,
+        project_path=ROOT,
+        repo="apache/example",
+        target=run.target,
+        destination=tmp_path,
+    )
+    assert result["full_target"]["attainment"]["verdict"] == "met"
+    assert result["scope_removal_control"]["status"] == "passed"
+    assert result["without_target_scope"]["attainment"]["alpha_build"] is None
+    assert result["without_test_scope"]["attainment"]["alpha_test"] is None
+    for label in ("without_target_scope", "without_test_scope"):
+        assert result[label]["attainment"]["alpha"] is None
+        assert result[label]["attainment"]["verdict"] != "met"
+        assert (
+            result[label]["certificate_input_sha256"]
+            == result["full_target"]["certificate_input_sha256"]
+        )
+    assert result["without_target"]["status"] == "no_target"
+    assert run.fs.files == execution_files
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_probe_archives_latest_publications_even_when_body_raises(tmp_path, monkeypatch, fails):
+    from scripts import ci_scope_small_project_probe as probe
+
+    archive_calls = []
+    audit = SimpleNamespace(latest_publication="before-run")
+    epoch = object()
+
+    def body(project, out, *, evidence_context, **kwargs):
+        destination = out / project
+        destination.mkdir()
+        evidence_context.update(destination=destination, audit=audit, epoch=epoch)
+        audit.latest_publication = "latest-after-body"
+        if fails:
+            raise RuntimeError("original physical failure")
+        return {"project": project}
+
+    def archive(destination, observed_audit, observed_epoch, name, project):
+        assert project == "commons-cli"
+        archive_calls.append((observed_audit.latest_publication, observed_epoch, name))
+        return {"status": "complete", "file_count": 1}
+
+    monkeypatch.setattr(probe, "_run_project_body", body)
+    monkeypatch.setattr(probe, "archive_probe_evidence", archive)
+    call = lambda: probe.run_project(
+        "commons-cli",
+        tmp_path,
+        container_name="sag-fixture",
+        experiment_id="fixture",
+        expected_source_sha="a" * 40,
+    )
+    if fails:
+        with pytest.raises(RuntimeError, match="original physical failure"):
+            call()
+        assert (
+            json.loads((tmp_path / "commons-cli/failure.json").read_text())["error_type"]
+            == "RuntimeError"
+        )
+    else:
+        assert call()["archive_integrity"] == "complete"
+    assert archive_calls == [("latest-after-body", epoch, "sag-fixture")]
+    assert (
+        json.loads((tmp_path / "commons-cli/archive-status.json").read_text())["status"]
+        == "complete"
+    )

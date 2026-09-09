@@ -1379,7 +1379,7 @@ def _domain_fact(
     test_system = _text(requirements.get("test_system") or nested.get("test_system"))
     test_root = _normalized_root(requirements.get("test_root") or nested.get("test_root"))
     if (
-        test_system in {"maven", "gradle"}
+        test_system in {"maven", "gradle", "pytest"}
         and test_root
         and (directory == test_root or directory.startswith(f"{test_root}/"))
     ):

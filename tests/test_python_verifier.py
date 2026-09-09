@@ -29,8 +29,8 @@ from sag.agent.control_events import canonical_json
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
-    publish_evidence_revision,
     evidence_publication_authority_for,
+    publish_evidence_revision,
 )
 from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.invocation_contracts import (
@@ -38,7 +38,7 @@ from sag.agent.invocation_contracts import (
     PYTHON_FACADE_EXECUTION_BINDING,
     build_contract,
 )
-from sag.agent.invocation_receipts import build_receipt
+from sag.agent.invocation_receipts import build_receipt, nearest_domain_root
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.receipt_test_rows import seal_testcase_execution_rows
 from sag.reporting.utils import render_condensed_summary
@@ -631,9 +631,9 @@ class PublishedDenominatorOrch:
     Live-authority migration: the manifest is a complete v1 document, so the
     contract/receipt pin exactly the fingerprints its survey carries —
     target_sha + survey_fingerprint (both mandatory now that every manifest is
-    stamped) plus config + document-map; a python project has no build_domains
-    and no fact epoch here, so those pins stay absent on BOTH sides, which the
-    pairwise pin semantics read as agreement rather than a binding hole.
+    stamped) plus config + document-map. The explicit pytest test_root supplies
+    the execution domain even without build_domains. There is no fact epoch,
+    so only that pin stays absent on both contract and receipt.
     """
 
     run_id = "run-pytest"
@@ -686,6 +686,8 @@ class PublishedDenominatorOrch:
             python_build_backend=None,
         )
         survey_fingerprint = self.manifest["survey"]["survey_fingerprint"]
+        domain_id = nearest_domain_root(self.manifest, self.project_root)
+        assert domain_id == self.project_root
         params = {
             "action": "test",
             "args": None,
@@ -716,6 +718,7 @@ class PublishedDenominatorOrch:
             ),
             target_sha=self.target_sha,
             survey_fingerprint=survey_fingerprint,
+            domain_id=domain_id,
             config_fingerprint=self.config_fingerprint,
             document_map_fingerprint=self.document_map_fingerprint,
         )
@@ -733,6 +736,7 @@ class PublishedDenominatorOrch:
             after={report_path: report_sha},
             target_sha=self.target_sha,
             survey_fingerprint=survey_fingerprint,
+            domain_id=domain_id,
             config_fingerprint=self.config_fingerprint,
             document_map_fingerprint=self.document_map_fingerprint,
             testcase_execution_rows=rows,
@@ -747,9 +751,9 @@ class PublishedDenominatorOrch:
             receipts=[],
         )
         receipt_raw = canonical_json(receipt)
-        self.filesystem.files[
-            f"/workspace/.setup_agent/invocation_receipts/{receipt_id}.json"
-        ] = receipt_raw
+        self.filesystem.files[f"/workspace/.setup_agent/invocation_receipts/{receipt_id}.json"] = (
+            receipt_raw
+        )
         evidence_publication_authority_for(self).publish_bytes(
             record_kind="invocation_receipt",
             record_id=receipt_id,

@@ -26,6 +26,7 @@ import hashlib
 import json
 import shlex
 
+import pytest
 from build_requirements_fakes import (
     complete_build_requirements_v1,
     complete_python_build_requirements_v1,
@@ -511,16 +512,33 @@ def test_domain_id_also_reads_the_nested_recommendation_shape():
     assert nearest_domain_root(manifest, "/workspace/proj") == "/workspace/proj"
 
 
-def test_single_module_test_root_is_a_surveyed_receipt_domain():
+@pytest.mark.parametrize("test_system", ["maven", "gradle", "pytest"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_single_module_test_root_is_a_surveyed_receipt_domain(test_system, nested):
     """A single-module survey has no island list; its test_root is still the
     exact coordinate that authorizes module-qualified testcase rows."""
     manifest = {
         "test_root": "/workspace/proj",
-        "test_system": "maven",
+        "test_system": test_system,
         "test_islands": [],
     }
+    if nested:
+        manifest = {"build_recommendation": manifest}
 
     assert nearest_domain_root(manifest, "/workspace/proj") == "/workspace/proj"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"test_system": "pytest"},
+        {"test_system": "pytest", "test_root": "/workspace/other"},
+        {"test_system": "pytest", "test_root": "/workspace/proj/tests"},
+        {"test_system": "unknown", "test_root": "/workspace/proj"},
+    ],
+)
+def test_single_python_root_requires_an_explicit_containing_test_survey(manifest):
+    assert nearest_domain_root(manifest, "/workspace/proj") is None
 
 
 def test_toolchain_fingerprint_pairs_the_resolved_path_with_one_version_line():

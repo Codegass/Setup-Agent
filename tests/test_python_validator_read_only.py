@@ -11,6 +11,7 @@ from test_container_io import FakeContainer
 
 from sag.agent.action_intents import action_fingerprint
 from sag.agent.control_events import canonical_json
+from sag.agent.evidence_assessments import read_receipt
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
@@ -37,12 +38,10 @@ from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
-
 # The current-manifest fingerprint tuple every fixture pins. A valid v1 survey
-# carries target-sha + survey + config + document-map fingerprints; a python
-# project carries no build_domains/domain_facts, so contracts and receipts pin
-# exactly this tuple and leave domain/epoch pins absent on BOTH sides, which
-# the pairwise pin semantics read as agreement rather than a binding hole.
+# carries target-sha + survey + config + document-map fingerprints. Its explicit
+# pytest test_root supplies the domain pin even without JVM build_domains;
+# the fact epoch remains absent without domain_facts.
 _CONFIG_FINGERPRINT = "config-current"
 _DOCUMENT_MAP_FINGERPRINT = "d" * 64
 _SITE = "/workspace/proj/.venv/lib/python3.12/site-packages"
@@ -416,9 +415,8 @@ def _receipt(
     run_id=_RUN_ID,
     target_sha=_TARGET_SHA,
     actual_cwd="/workspace/proj",
-    # A python v1 manifest carries no build_domains, so receipts state no
-    # domain_id and bind through the exact actual_cwd (absent-preserving).
-    domain_id=None,
+    # Match the explicit pytest test_root in the current fixture survey.
+    domain_id="/workspace/proj",
     exit_code=0,
     survey_fingerprint=_SURVEY_FINGERPRINT,
     config_fingerprint=_CONFIG_FINGERPRINT,
@@ -678,23 +676,46 @@ def test_current_bound_producer_receipts_make_python_runtime_rungs_readable_only
     assert orch.project_executions == []
 
 
-def test_single_domain_receipt_without_domain_id_uses_exact_actual_cwd_binding():
-    # Premise update (live authority): a python v1 manifest can never carry
-    # build_domains, so the single-domain survey writes no domain_id anywhere;
-    # this pins that the exact actual_cwd binding alone grades completely.
-    setup = _receipt("setup_env", _setup_observations(), suffix="1")
-    compile_receipt = _receipt("compile", _compile_observations(), suffix="2")
+def test_legacy_absent_domain_is_readable_but_cannot_authorize_an_explicit_current_root():
+    setup = _receipt("setup_env", _setup_observations(), suffix="1", domain_id=None)
+    compile_receipt = _receipt("compile", _compile_observations(), suffix="2", domain_id=None)
     assert "domain_id" not in setup
     assert "domain_id" not in compile_receipt
     orch = ProducerReceiptOrch([setup, compile_receipt])
     assert "build_domains" not in orch.manifest
+    assert orch.manifest["test_root"] == "/workspace/proj"
+    assert read_receipt(orch.execute_command, setup["receipt_id"]) == setup
+    assert read_receipt(orch.execute_command, compile_receipt["receipt_id"]) == compile_receipt
 
     status = _producer_status(orch)
 
-    assert status["pip_check_clean"] is True
-    assert status["imports_ok"] is True
-    assert status["compileall_coverage"] == 1.0
-    assert status["complete"] is True
+    assert status["pip_check_clean"] is None
+    assert status["imports_ok"] is None
+    assert status["compileall_coverage"] is None
+    assert status["complete"] is False
+    assert "python_producer_receipt_invalid" in status["metrics_conflicts"]
+
+
+def test_legacy_absent_domain_tuple_still_matches_its_absent_frozen_context():
+    receipt = _receipt("setup_env", _setup_observations(), suffix="1", domain_id=None)
+    orch = ProducerReceiptOrch([receipt])
+    before = canonical_json(receipt)
+    validator = PhysicalValidator(
+        docker_orchestrator=orch, project_path="/workspace", receipt_run_id=_RUN_ID
+    )
+    assert validator._python_producer_contract_valid(
+        receipt,
+        operation="setup_env",
+        project_root="/workspace/proj",
+        target_sha=_TARGET_SHA,
+        survey_fingerprint=_SURVEY_FINGERPRINT,
+        config_fingerprint=_CONFIG_FINGERPRINT,
+        document_map_fingerprint=_DOCUMENT_MAP_FINGERPRINT,
+        domain_id=None,
+        fact_epoch=None,
+    )
+    assert canonical_json(receipt) == before
+    assert "domain_id" not in next(iter(orch.contracts.values()))
 
 
 def test_public_python_build_judgment_projects_receipt_ids_and_verified_basis():

@@ -2745,6 +2745,7 @@ _MUTABLE_ARCHIVE_FILES = {
     "run_pin": "run-pin.json",
     "document_map": "document_map.json",
     "report_metrics": "report_metrics.json",
+    "verdict": "verdict.json",
     # The runtime env overlay is a host-published mutable artifact too: a
     # dynamic-JDK repair advances its head, and an archive that cannot resolve
     # that record cannot verify the epoch it belongs to.
@@ -2858,6 +2859,17 @@ def _validate_archived_semantic_identity(
         normalized = read_report_metrics(payload)
         if not isinstance(normalized, dict) or normalized != payload:
             raise D0Stop("published report metrics is not canonical metrics v2")
+    elif record_kind == "verdict":
+        from sag.agent.verdict_finalizer import validate_verdict_snapshot_v3
+
+        try:
+            snapshot = validate_verdict_snapshot_v3(payload)
+        except (TypeError, ValueError) as exc:
+            raise D0Stop("published verdict is semantically invalid") from exc
+        if record_id != "run-verdict" or snapshot.run_id != run_id:
+            raise D0Stop("published verdict belongs to another epoch or logical artifact")
+        if snapshot.model_dump(mode="json") != payload:
+            raise D0Stop("published verdict is noncanonical")
     return payload
 
 
@@ -3115,8 +3127,7 @@ def _controller_evidence_scope(tool: str, params: Mapping[str, Any]) -> str:
     """
 
     operations = " ".join(
-        str(params.get(key) or "")
-        for key in ("action", "command", "args", "goals", "tasks")
+        str(params.get(key) or "") for key in ("action", "command", "args", "goals", "tasks")
     ).lower()
     if str(tool) in {"build", "maven", "gradle", "python"}:
         if any(token in operations for token in ("test", "verify", "check")):
@@ -3215,18 +3226,21 @@ def _controller_action_scope(
         )
         status = "crashed"
         try:
-            with action_context(
-                envelope_id=binding.envelope_id,
-                intent_source=binding.intent_source,
-                intent_id=binding.intent_id,
-                intent_domain_id=binding.domain_id,
-                intent_exact_params=binding.exact_params,
-                action_fingerprint=binding.action_fingerprint,
-                predecessor_contract_id=binding.predecessor_contract_id,
-            ), bind_tool_result_output_storage(
-                runtime.output_storage_for(scope_audit),
-                task_id=binding.tool_call_id,
-                tool_name=binding.tool,
+            with (
+                action_context(
+                    envelope_id=binding.envelope_id,
+                    intent_source=binding.intent_source,
+                    intent_id=binding.intent_id,
+                    intent_domain_id=binding.domain_id,
+                    intent_exact_params=binding.exact_params,
+                    action_fingerprint=binding.action_fingerprint,
+                    predecessor_contract_id=binding.predecessor_contract_id,
+                ),
+                bind_tool_result_output_storage(
+                    runtime.output_storage_for(scope_audit),
+                    task_id=binding.tool_call_id,
+                    tool_name=binding.tool,
+                ),
             ):
                 yield binding
             status = "completed"
@@ -4437,9 +4451,7 @@ def _probe_http_wrapper_unzip_ablation(runtime: DockerProbeRuntime) -> ProbeObse
 
     # maven-wrapper.properties is a Java properties file: this probe measures
     # whether its bytes changed, not whether it is JSON.
-    control_after = _container_file_facts(
-        control, control_fixture["properties"], expect_json=False
-    )
+    control_after = _container_file_facts(control, control_fixture["properties"], expect_json=False)
     treatment_after = _container_file_facts(
         treatment, treatment_fixture["properties"], expect_json=False
     )

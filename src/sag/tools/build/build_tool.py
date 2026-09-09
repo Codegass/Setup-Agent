@@ -1607,7 +1607,7 @@ class BuildTool(BaseTool):
                     # The complete runner text, while the facade still holds it:
                     # the receipt keeps only its hash, and a fault the build
                     # stated in prose is readable nowhere else.
-                    output=getattr(result, "raw_output", None) or getattr(result, "output", None),
+                    output=(result.raw_output if result.raw_output is not None else result.output),
                     evidence_ref=(
                         str(
                             getattr(result, "output_ref", None)

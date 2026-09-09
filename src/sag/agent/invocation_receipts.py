@@ -3809,7 +3809,7 @@ def _surveyed_domain_roots(manifest: Optional[Mapping[str, Any]]) -> List[str]:
                 add(item.get("root"))
 
     test_system = str(manifest.get("test_system") or nested.get("test_system") or "").strip()
-    if test_system in {"maven", "gradle"}:
+    if test_system in {"maven", "gradle", "pytest"}:
         add(manifest.get("test_root") or nested.get("test_root"))
     return roots
 

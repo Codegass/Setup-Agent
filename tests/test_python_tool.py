@@ -2710,7 +2710,10 @@ def test_native_unready_real_pytest_collection_accepts_owned_concrete_path(tmp_p
 
 
 @pytest.mark.usefixtures("exact_build_facade_authority")
-def test_make_pytest_recipe_keeps_real_failure_and_repaired_receipts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("display_mode", ["normal", "truncated", "empty_runner"])
+def test_make_pytest_recipe_keeps_real_failure_and_repaired_receipts(
+    tmp_path, monkeypatch, display_mode
+):
     """Real pytest/XML, with only container transport and environment activation doubled."""
     from sag.tools.build.build_tool import BuildTool
 
@@ -2744,10 +2747,25 @@ def test_make_pytest_recipe_keeps_real_failure_and_repaired_receipts(tmp_path, m
             [sys.executable, "-m", "pytest", *flags],
             cwd=tmp_path,
             env={**os.environ, "SAG_FIXTURE_READY": "1" if state["ready"] else "0"},
-            capture_output=True,
+            stdout=(
+                subprocess.DEVNULL
+                if not collect and display_mode == "empty_runner"
+                else subprocess.PIPE
+            ),
+            stderr=(
+                subprocess.DEVNULL
+                if not collect and display_mode == "empty_runner"
+                else subprocess.PIPE
+            ),
             text=True,
             check=False,
         )
+        # An executable may write XML while its stdout/stderr are redirected.
+        # Preserve that empty observation even when the monitor adds narration.
+        runner_output = (completed.stdout or "") + (completed.stderr or "")
+        display_output = runner_output
+        if not collect and display_mode != "normal":
+            display_output = "[monitor display summary]\n" + runner_output[-160:]
         if not collect:
             raw = report.read_bytes()
             state["reports"][virtual_report] = hashlib.sha256(raw).hexdigest()
@@ -2757,12 +2775,14 @@ def test_make_pytest_recipe_keeps_real_failure_and_repaired_receipts(tmp_path, m
                     "exit": completed.returncode,
                     "xml": raw,
                     "sha256": state["reports"][virtual_report],
+                    "runner_output": runner_output,
                 }
             )
         return {
             "success": completed.returncode == 0,
             "exit_code": completed.returncode,
-            "output": completed.stdout + completed.stderr,
+            "output": display_output,
+            "full_output": runner_output,
         }
 
     orch = Orch(
@@ -2797,7 +2817,16 @@ def test_make_pytest_recipe_keeps_real_failure_and_repaired_receipts(tmp_path, m
     assert len(receipts) == 2
     assert {receipt["exit_code"] for receipt in receipts} == {0, 1}
     assert len({receipt["receipt_id"] for receipt in receipts}) == 2
-    assert len({receipt["output_content_hash"] for receipt in receipts}) == 2
+    assert len({receipt["output_content_hash"] for receipt in receipts}) == (
+        1 if display_mode == "empty_runner" else 2
+    )
+    for result, receipt, run in zip((failed, repaired), receipts, state["runs"]):
+        assert result.output.startswith("Collection:")
+        assert result.raw_output == run["runner_output"]
+        assert (
+            receipt["output_content_hash"]
+            == hashlib.sha256(result.raw_output.encode("utf-8")).hexdigest()
+        )
     assert all(receipt["tool"] == "python" for receipt in receipts)
     assert all(receipt["working_directory"] == "/workspace/proj" for receipt in receipts)
     assert all(

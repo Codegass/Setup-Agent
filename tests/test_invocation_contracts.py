@@ -23,17 +23,17 @@ import shlex
 from types import SimpleNamespace
 
 import pytest
-from test_container_io import FakeContainer
 from build_requirements_fakes import (
     complete_build_requirements_v1,
     complete_python_build_requirements_v1,
 )
 from container_evidence_fakes import ContainerFS
+from test_container_io import FakeContainer
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 from test_invocation_receipts import receipts_written as atomic_receipts_written
 
-from sag.agent.control_events import canonical_json, canonical_sha256
 from sag.agent.action_intents import action_fingerprint as compute_action_fingerprint
+from sag.agent.control_events import canonical_json, canonical_sha256
 from sag.agent.evidence_assessments import ASSESSMENT_DIR
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
@@ -54,7 +54,9 @@ from sag.agent.invocation_contracts import (
     ActionContext,
     action_context,
     authorized_facade_envelope_id,
-    build_contract as _build_contract_v2,
+)
+from sag.agent.invocation_contracts import build_contract as _build_contract_v2
+from sag.agent.invocation_contracts import (
     clear_action_context,
     compliance_class,
     contract_hash,
@@ -65,7 +67,9 @@ from sag.agent.invocation_contracts import (
     current_contract,
     dispatch_contract,
     ensure_dispatch_contract,
-    freeze_contract as _freeze_contract_v2,
+)
+from sag.agent.invocation_contracts import freeze_contract as _freeze_contract_v2
+from sag.agent.invocation_contracts import (
     read_frozen_contract,
     write_contract,
 )
@@ -263,8 +267,10 @@ def _v2_kwargs(values):
     expected_argv = enriched.get("expected_argv")
     effective_tool = enriched.setdefault(
         "effective_tool",
-        tool if tool in {"maven", "gradle", "bash", "python"} else (
-            "python" if expected_argv is None else "maven"
+        (
+            tool
+            if tool in {"maven", "gradle", "bash", "python"}
+            else ("python" if expected_argv is None else "maven")
         ),
     )
     enriched.setdefault(
@@ -372,6 +378,29 @@ def test_freeze_contract_records_the_v2_fields_and_persists_them_atomically():
     assert max(map(len, orchestrator.commands)) <= 60200
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("test_root", ["/workspace/proj", "/workspace/other", None])
+def test_python_contract_pins_only_an_explicit_containing_test_root(test_root, nested):
+    requirements = {"test_system": "pytest"}
+    if test_root is not None:
+        requirements["test_root"] = test_root
+    if nested:
+        requirements = {"build_recommendation": requirements}
+    contract = freeze_contract(
+        RecordingOrchestrator().execute_command,
+        **{
+            **FREEZE_ARGS,
+            "effective_tool": "python",
+            "effective_action": "test",
+            "expected_argv": None,
+            "requirements": requirements,
+        },
+    )
+    assert contract.get("domain_id") == (
+        "/workspace/proj" if test_root == "/workspace/proj" else None
+    )
+
+
 def test_contract_id_and_hash_recompute_from_the_persisted_payload():
     """Identity is derived, never assigned: a reader recomputes both."""
     orchestrator = RecordingOrchestrator()
@@ -386,9 +415,7 @@ def test_contract_id_and_hash_recompute_from_the_persisted_payload():
 
 def test_contract_requested_call_preserves_null_and_rejects_non_exact_keys():
     args = {
-        key: value
-        for key, value in FREEZE_ARGS.items()
-        if key not in {"requirements", "params"}
+        key: value for key, value in FREEZE_ARGS.items() if key not in {"requirements", "params"}
     }
     contract = build_contract(
         **args,
@@ -522,9 +549,7 @@ def test_live_contract_reader_ignores_only_strict_foreign_and_historical_sibling
     bind_current_host_store(container)
     assert write_contract(container, current) is True
     container.files[f"{CONTRACT_DIR}/{foreign['contract_id']}.json"] = canonical_json(foreign)
-    container.files[f"{CONTRACT_DIR}/{historical['contract_id']}.json"] = canonical_json(
-        historical
-    )
+    container.files[f"{CONTRACT_DIR}/{historical['contract_id']}.json"] = canonical_json(historical)
 
     assert read_frozen_contract(container, current["contract_id"]) == current
     assert read_frozen_contract(container, foreign["contract_id"]) is None
@@ -865,39 +890,48 @@ def test_unrecorded_envelope_is_only_for_sinkless_nonrepair_engine_intent():
     assert second and second.startswith("envelope-unrecorded-")
     assert first != second
 
-    assert authorized_facade_envelope_id(
-        ActionContext(
-            intent_source="model",
-            intent_id="intent-recording",
-            intent_domain_id="domain:recording",
-            intent_exact_params={"action": "test"},
-            action_fingerprint="act-" + "b" * 64,
-            control_recording_active=True,
+    assert (
+        authorized_facade_envelope_id(
+            ActionContext(
+                intent_source="model",
+                intent_id="intent-recording",
+                intent_domain_id="domain:recording",
+                intent_exact_params={"action": "test"},
+                action_fingerprint="act-" + "b" * 64,
+                control_recording_active=True,
+            )
         )
-    ) is None
-    assert authorized_facade_envelope_id(
-        ActionContext(
-            intent_source="model",
-            intent_id="intent-repair",
-            intent_domain_id="domain:repair",
-            intent_exact_params={"action": "test"},
-            action_fingerprint="act-" + "c" * 64,
-            trigger_assessment_id="asm-repair",
-            repair_context_id="rcx-123456789abc",
-            repair_context_sha256="d" * 64,
+        is None
+    )
+    assert (
+        authorized_facade_envelope_id(
+            ActionContext(
+                intent_source="model",
+                intent_id="intent-repair",
+                intent_domain_id="domain:repair",
+                intent_exact_params={"action": "test"},
+                action_fingerprint="act-" + "c" * 64,
+                trigger_assessment_id="asm-repair",
+                repair_context_id="rcx-123456789abc",
+                repair_context_sha256="d" * 64,
+            )
         )
-    ) is None
-    assert authorized_facade_envelope_id(
-        ActionContext(
-            envelope_id="envelope-recorded",
-            intent_source="model",
-            intent_id="intent-recorded",
-            intent_domain_id="domain:recorded",
-            intent_exact_params={"action": "test"},
-            action_fingerprint="act-" + "e" * 64,
-            control_recording_active=True,
+        is None
+    )
+    assert (
+        authorized_facade_envelope_id(
+            ActionContext(
+                envelope_id="envelope-recorded",
+                intent_source="model",
+                intent_id="intent-recorded",
+                intent_domain_id="domain:recorded",
+                intent_exact_params={"action": "test"},
+                action_fingerprint="act-" + "e" * 64,
+                control_recording_active=True,
+            )
         )
-    ) == "envelope-recorded"
+        == "envelope-recorded"
+    )
 
 
 def test_internal_contract_lookup_never_mints_a_second_producer():
@@ -1013,10 +1047,10 @@ def test_contract_receipt_fields_bind_the_receipt_to_the_contract():
     with dispatch_contract(contract):
         assert current_contract() == contract
         assert contract_receipt_fields("mvn --fail-at-end verify") == {
-                "contract_id": contract["contract_id"],
-                "contract_hash": contract["contract_hash"],
-                "execution_binding": "argv_v1",
-                "compliance": "exact",
+            "contract_id": contract["contract_id"],
+            "contract_hash": contract["contract_hash"],
+            "execution_binding": "argv_v1",
+            "compliance": "exact",
         }
     assert current_contract() is None
 
@@ -1207,9 +1241,7 @@ def test_a_dispatch_without_a_recorded_envelope_states_that_absence():
     """A complete sinkless engine intent gets one unique absence per dispatch."""
     tool, orchestrator, _ = _build_tool({"pom.xml"})
 
-    with build_action_context(
-        None, action="compile", working_directory="/workspace/proj"
-    ):
+    with build_action_context(None, action="compile", working_directory="/workspace/proj"):
         tool.execute(action="compile", working_directory="/workspace/proj")
         tool.execute(action="compile", working_directory="/workspace/proj")
 
