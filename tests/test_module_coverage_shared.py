@@ -252,6 +252,8 @@ def test_aggregator_shell_verdict_folds_to_success():
             "unique": {"executed": 2255, "passed": 2255, "failed": 0, "errors": 0, "skipped": 0},
             "raw": {"executed": 2255, "passed": 2255, "failed": 0, "errors": 0, "skipped": 0},
             "receipt_scoped": True,
+            # Isolate module coverage from the independently satisfied test gate.
+            "execution_state": "completed",
         },
         "output_tests",
     )

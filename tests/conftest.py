@@ -4,6 +4,7 @@ import posixpath
 from functools import wraps
 
 import pytest
+from container_evidence_fakes import ContainerFS
 
 from sag.agent.action_intents import action_fingerprint
 from sag.agent.control_events import ControlEventSink
@@ -12,8 +13,6 @@ from sag.agent.evidence_publications import (
     install_evidence_publication_authority,
     reset_evidence_publication_authority,
 )
-from sag.agent.output_storage import OutputStorageManager
-from sag.agent.invocation_receipts import active_receipt_run_id, set_active_receipt_run_id
 from sag.agent.invocation_contracts import (
     ARGV_EXECUTION_BINDING,
     PYTHON_FACADE_EXECUTION_BINDING,
@@ -23,8 +22,9 @@ from sag.agent.invocation_contracts import (
     current_contract,
     dispatch_contract,
 )
+from sag.agent.invocation_receipts import active_receipt_run_id, set_active_receipt_run_id
+from sag.agent.output_storage import OutputStorageManager
 from sag.tools.base import bind_tool_result_output_storage
-from container_evidence_fakes import ContainerFS
 
 
 @pytest.fixture(scope="session")
@@ -162,6 +162,8 @@ def exact_build_facade_authority(monkeypatch):
             "maven_version_requirement",
             "features",
             "definitions",
+            "system",
+            "source_command",
         ):
             value = values.get(key)
             if value is None:
@@ -265,13 +267,20 @@ def exact_internal_runner_authority(monkeypatch):
             public_action = (
                 "test"
                 if any(token in effective.lower() for token in ("test", "verify", "check"))
-                else "compile"
-                if "compile" in effective.lower()
-                else "deps"
-                if "depend" in effective.lower()
-                else "install"
-                if "install" in effective.lower() or "publishtomavenlocal" in effective.lower()
-                else "package"
+                else (
+                    "compile"
+                    if "compile" in effective.lower()
+                    else (
+                        "deps"
+                        if "depend" in effective.lower()
+                        else (
+                            "install"
+                            if "install" in effective.lower()
+                            or "publishtomavenlocal" in effective.lower()
+                            else "package"
+                        )
+                    )
+                )
             )
             contract = _direct_contract(
                 ordinal=next(sequence),

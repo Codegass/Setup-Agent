@@ -341,6 +341,10 @@ def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatc
 
 def test_failed_test_validation_carries_evidence_state(monkeypatch):
     validator = PhysicalValidator(project_path="/workspace")
+    # This report-projection test assumes execution completion is independently proved.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
 
     monkeypatch.setattr(
         validator,

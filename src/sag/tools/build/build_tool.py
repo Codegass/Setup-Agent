@@ -13,6 +13,8 @@ from sag.agent.evidence_assessments import (
     CAPABILITY_PREFIX,
     ControlAssessment,
     assess_dispatch,
+    current_assessment_fingerprints,
+    live_assessment_fingerprints,
     next_control_event_id,
     read_receipt,
     write_assessment,
@@ -28,10 +30,7 @@ from sag.agent.invocation_contracts import (
 )
 from sag.agent.invocation_receipts import (
     active_receipt_run_id,
-    nearest_domain_fact_epoch,
     nearest_domain_root,
-    producer_observations_sha256,
-    python_import_targets,
 )
 from sag.agent.invocation_receipts import target_sha as probe_target_sha
 from sag.runtime.env_overlay import (
@@ -59,21 +58,22 @@ from .backends import (
     PythonBackend,
     native_definition_feature,
     native_feature_definition,
+    source_command_tokens,
 )
 
-_ACTIONS = ("deps", "compile", "test", "package", "install", "native")
+_ACTIONS = ("deps", "compile", "test", "verify", "package", "install", "native")
 
 # Verbs that actually invoke the JDK; `deps` resolution is not gated on a
 # matching toolchain, so it skips the pre-flight (spec §1b: no-op when moot).
 # `native` is python-system machinery and never reaches a JVM toolchain.
-_PREFLIGHT_VERBS = ("compile", "test", "package", "install")
+_PREFLIGHT_VERBS = ("compile", "test", "verify", "package", "install")
 
 # Verbs the domain-edge execution law governs (spec §C2). They are the verbs
 # that PRODUCE something; `deps` resolves coordinates and env/probe verbs only
 # inspect, and refusing those would hide the very mismatch the edge records.
 # `native` repairs the ENVIRONMENT a consumer builds in rather than consuming a
 # producer's artifact, so a locked edge is not a reason to refuse it.
-_EDGE_GATED_VERBS = ("compile", "test", "package", "install")
+_EDGE_GATED_VERBS = ("compile", "test", "verify", "package", "install")
 
 # --- the typed native affordance (spec §C8, plan §Stage E) ------------------
 # The refusal the plan names verbatim: provenance is necessary for a repair and
@@ -293,6 +293,8 @@ class BuildTool(BaseTool):
         maven_version_requirement: Optional[str] = None,
         features: Optional[Sequence[str]] = None,
         definitions: Optional[Mapping[str, str]] = None,
+        system: Optional[str] = None,
+        source_command: Optional[str] = None,
     ) -> ToolResult:
         verb = (action or "").strip().lower()
         if verb not in _ACTIONS:
@@ -340,6 +342,8 @@ class BuildTool(BaseTool):
             ("maven_version_requirement", maven_version_requirement),
             ("features", list(features) if features is not None else None),
             ("definitions", dict(definitions) if definitions is not None else None),
+            ("system", system),
+            ("source_command", source_command),
         ):
             # Preserve the engine-owned exact shape: a normalizer may retain
             # an explicit JSON null, while a genuinely absent default remains
@@ -375,6 +379,19 @@ class BuildTool(BaseTool):
                 detail=parameter_problem,
                 verb=verb,
                 working_directory=working_directory,
+            )
+        requested_system = system
+        source_argv = None
+        try:
+            if system is not None and system not in {"maven", "gradle", "python"}:
+                raise ValueError("system must be maven, gradle, or python")
+            if source_command is not None:
+                if system is None:
+                    raise ValueError("source_command requires an explicit system")
+                source_argv = source_command_tokens(source_command, system, verb, args)
+        except ValueError as exc:
+            return self._parameter_refusal(
+                detail=str(exc), verb=verb, working_directory=working_directory, system=system
             )
 
         # Whether the caller scoped this invocation itself. The normalized
@@ -423,17 +440,31 @@ class BuildTool(BaseTool):
         # current manifest names Gradle as the test system.  The manifest is the
         # decision; marker probing below only checks that the named backend is
         # physically present at the submitted root.
-        declared_test_system = self._declared_test_system(requirements) if verb == "test" else None
+        declared_test_system = (
+            self._declared_test_system(requirements) if verb in {"test", "verify"} else None
+        )
+        # A root JVM declaration does not describe a separately documented
+        # Python client project. An explicit other coordinate still has to
+        # prove its own backend marker below; legacy routing stays unchanged.
+        if requested_system and requirements.get("test_root") != working_directory:
+            declared_test_system = None
+        if requested_system and declared_test_system and requested_system != declared_test_system:
+            return self._parameter_refusal(
+                detail=f"explicit system={requested_system} disagrees with current declared test_system={declared_test_system}; refresh the Analyze plan before changing executor",
+                verb=verb,
+                working_directory=working_directory,
+                system=requested_system,
+            )
         system, checked = self._detect_system(
             working_directory,
-            only_system=declared_test_system,
+            only_system=requested_system or declared_test_system,
         )
         if system is None:
-            if declared_test_system is not None:
+            if declared_test_system is not None or requested_system is not None:
                 return ToolResult.completed_failure(
                     output=(
                         "[routing] the current build requirements declare "
-                        f"test_system={declared_test_system}, but none of that "
+                        f"system={requested_system or declared_test_system}, but none of that "
                         "backend's project markers exists at the submitted test root; "
                         "no fallback backend was dispatched"
                     ),
@@ -466,6 +497,14 @@ class BuildTool(BaseTool):
                     "runner_dispatched": False,
                     "working_directory": working_directory,
                 },
+            )
+
+        if verb == "verify" and system != "maven":
+            return self._parameter_refusal(
+                detail="action=verify is a Maven lifecycle; use the declared backend's test/check action",
+                verb=verb,
+                working_directory=working_directory,
+                system=system,
             )
 
         if maven_version_requirement is not None and system != "maven":
@@ -561,6 +600,13 @@ class BuildTool(BaseTool):
         runtime_scope: Dict[str, str] = {}
         runtime_resolution: Dict[str, Any] = {}
         effective_jdk: Optional[Dict[str, Any]] = None
+        if source_argv is not None and effective_verb != verb:
+            return self._parameter_refusal(
+                detail=f"the surveyed producer needs {effective_verb}, but source_command declares {verb}; preserve an explicit producer step before this invocation",
+                verb=verb,
+                working_directory=working_directory,
+                system=system,
+            )
         if effective_verb != verb:
             preamble_lines.append(
                 "[island] "
@@ -573,7 +619,14 @@ class BuildTool(BaseTool):
                 working_directory,
             )
             runtime_scope = _runtime_domain_scope(requirements, working_directory)
-            static_major = str(requirements.get("java_version") or "").strip() or None
+            java_requirements = requirements.get("java_requirements")
+            # Structured Maven bounds are checked by JdkPreflight. The legacy
+            # major store only contributes independently observed runtime facts.
+            static_major = (
+                None
+                if java_requirements is not None
+                else str(requirements.get("java_version") or "").strip() or None
+            )
             static_source = str(requirements.get("java_version_source") or "").strip() or "unknown"
             if runtime_target_sha and runtime_scope:
                 jdk_store = EnvOverlayStore(self.docker_orchestrator)
@@ -642,6 +695,7 @@ class BuildTool(BaseTool):
                 )
             outcome = JdkPreflight(self.docker_orchestrator).run(
                 runtime_resolution.get("required_major"),
+                requirements=java_requirements,
                 source=(
                     str(runtime_resolution.get("authority") or "unknown")
                     + ":"
@@ -711,6 +765,14 @@ class BuildTool(BaseTool):
                             metadata={"runner_dispatched": False},
                         )
             effective_jdk = _effective_jdk_binding(runtime_resolution, outcome)
+            if "java_constraint_conflict" in outcome.conflicts:
+                return ToolResult.completed_failure(
+                    output=outcome.narration,
+                    error="conflicting Java runtime/compiler requirements",
+                    error_code="JAVA_CONSTRAINT_CONFLICT",
+                    metadata={"runner_dispatched": False},
+                    facts={"java_requirements": java_requirements},
+                )
             if outcome.narration:
                 preamble_lines.append(outcome.narration)
 
@@ -759,8 +821,34 @@ class BuildTool(BaseTool):
         else:
             materialized = backend.materialize(effective_verb, args, working_directory, timeout)
 
+        if source_argv is not None and system != "python":
+            # One declared argv feeds contract prediction and the real runner.
+            # Keep the semantic action separately so a clean/test sequence is
+            # still assessed as a test invocation.
+            materialized["_source_argv"] = list(source_argv)
+            if verb in {"package", "install"}:
+                if (
+                    system == "maven"
+                    and "-DskipTests" in str(materialized.get("extra_args") or "")
+                    and "-DskipTests" not in source_argv
+                ):
+                    materialized["_source_argv"].append("-DskipTests")
+                if (
+                    system == "gradle"
+                    and "-x test" in str(materialized.get("gradle_args") or "")
+                    and not any(
+                        source_argv[i : i + 2] == ["-x", "test"] for i in range(len(source_argv))
+                    )
+                ):
+                    materialized["_source_argv"].extend(["-x", "test"])
         effective_action = backend.effective_action(materialized)
+        if source_argv is not None and system == "gradle":
+            materialized["tasks"] = effective_action
         expected_argv = backend.expected_argv(materialized)
+        if system == "maven" and verb == "test" and "-Dit.test" in (args or ""):
+            preamble_lines.append(
+                "[scope] action=test stops before Failsafe integration-test/verify; -Dit.test does not prove integration tests ran"
+            )
 
         contract = freeze_contract(
             self.docker_orchestrator.execute_command,
@@ -934,7 +1022,11 @@ class BuildTool(BaseTool):
                                 target_sha=runtime_target_sha,
                                 domain_root=runtime_scope["domain_root"],
                                 domain_id=runtime_scope.get("domain_id"),
-                                static_major=requirements.get("java_version"),
+                                static_major=(
+                                    None
+                                    if requirements.get("java_requirements") is not None
+                                    else requirements.get("java_version")
+                                ),
                                 static_source=requirements.get("java_version_source"),
                                 runner_observed=observation,
                             )
@@ -974,6 +1066,7 @@ class BuildTool(BaseTool):
                     retry_outcome = JdkPreflight(self.docker_orchestrator).run(
                         needed,
                         source=f"runner_observed:{source_ref or 'current-output'}",
+                        requirements=requirements.get("java_requirements"),
                     )
                     if retry_outcome.provisioned:
                         post_runtime = active_java_runtime(self.docker_orchestrator)
@@ -1505,7 +1598,10 @@ class BuildTool(BaseTool):
                     self.docker_orchestrator.execute_command,
                     contract=contract,
                     receipt=receipt,
-                    current_fingerprints=self._current_fingerprints(requirements, receipt),
+                    current_fingerprints=live_assessment_fingerprints(
+                        self.docker_orchestrator, receipt
+                    ),
+                    require_bound_output=True,
                     dispatch_status=getattr(result.invocation_status, "value", None),
                     error_code=result.error_code,
                     # The complete runner text, while the facade still holds it:
@@ -1529,42 +1625,8 @@ class BuildTool(BaseTool):
         requirements: Mapping[str, Any],
         receipt: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """The pins the harness can state NOW, without a second probe.
-
-        The survey stamp is the current config/document-map pin, and the
-        receipt's own target sha is the most recent observation of the tree —
-        it was probed AFTER the dispatch, where the contract's was probed
-        before. A pin nobody currently states stays absent, so it can never be
-        read as a mismatch.
-        """
-        current: Dict[str, Any] = {}
-        survey = requirements.get("survey") if isinstance(requirements, Mapping) else None
-        if isinstance(survey, Mapping):
-            for key in ("config_fingerprint", "document_map_fingerprint", "survey_fingerprint"):
-                value = str(survey.get(key) or "").strip()
-                if value:
-                    current[key] = value
-        target_sha = str((receipt or {}).get("target_sha") or "").strip()
-        if target_sha:
-            current["target_sha"] = target_sha
-        current_cwd = str(
-            (receipt or {}).get("actual_cwd") or (receipt or {}).get("working_directory") or ""
-        ).strip()
-        domain_root = nearest_domain_root(requirements, current_cwd)
-        if domain_root:
-            current["domain_id"] = domain_root
-        fact_epoch = nearest_domain_fact_epoch(requirements, current_cwd)
-        if fact_epoch is not None:
-            current["fact_epoch"] = fact_epoch
-        import_targets = (
-            python_import_targets(requirements)
-            if str((receipt or {}).get("tool") or "").strip().lower() == "python"
-            else None
-        )
-        if import_targets is not None:
-            current["python_import_targets"] = import_targets
-            current["python_import_targets_sha256"] = producer_observations_sha256(import_targets)
-        return current
+        """Compatibility projection; production assessment reads host-current facts."""
+        return current_assessment_fingerprints(requirements, receipt)
 
     # --- domain-edge execution law (spec §C2) -------------------------------
 
@@ -1849,7 +1911,6 @@ class BuildTool(BaseTool):
         raw_output = inner.raw_output
         if preamble:
             output = preamble + (output or "")
-            raw_output = preamble + (raw_output or "")
         metadata = dict(inner.metadata)
         metadata.update(
             {
@@ -1924,6 +1985,16 @@ class BuildTool(BaseTool):
                     "declared by the project; direct install targets are disabled.",
                 },
                 "working_directory": {"type": "string", "default": "/workspace"},
+                "system": {
+                    "type": "string",
+                    "enum": ["maven", "gradle", "python"],
+                    "description": "Explicit executor from the Analyze plan; mismatches fail without fallback.",
+                },
+                "source_command": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "description": "Reviewed single runner command matching action/args, e.g. ./mvnw clean install -DskipTests or python -m pytest tests/. Requires system. No Make/shell recipes; split their setup and supported pytest command into ordered steps.",
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Soft window in seconds; long builds detach, never killed",

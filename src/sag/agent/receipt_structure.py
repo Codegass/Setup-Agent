@@ -84,6 +84,33 @@ def module_key(value: str) -> str:
     return "".join(ch for ch in tail.lower() if ch.isalnum())
 
 
+def maven_module_identity_ambiguous(receipt: Mapping[str, Any] | None) -> bool:
+    """Whether one Maven receipt's labels cannot identify distinct modules.
+
+    Reactor rows are occurrences, not coordinates: two equal display names can
+    belong to different modules or different build summaries. Also refuse a
+    collision under the existing coverage matcher rather than letting its set
+    collapse two rows. This detects ambiguity without inventing a new alias or
+    changing the receipt's raw rows. Rebuilds in separate receipts are separate
+    statements and are deliberately not compared here.
+    """
+    payload = receipt or {}
+    if str(payload.get("tool") or "").strip().lower() != "maven":
+        return False
+    seen: set[str] = set()
+    for entry in payload.get("module_outcomes") or ():
+        if not isinstance(entry, Mapping):
+            continue
+        name = " ".join(str(entry.get("module") or "").split())
+        if not name:
+            continue
+        key = module_key(name) or f"\0{name}"
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
 def dispatch_terminated(receipt: Mapping[str, Any] | None) -> bool:
     """Did the dispatch this receipt describes actually END on its own?
 
@@ -135,7 +162,11 @@ def structure_from_receipt(receipt: Mapping[str, Any] | None) -> Optional[Dict[s
     """
     payload = receipt or {}
     receipt_id = str(payload.get("receipt_id") or "").strip()
-    if not receipt_id or not dispatch_terminated(payload):
+    if (
+        not receipt_id
+        or not dispatch_terminated(payload)
+        or maven_module_identity_ambiguous(payload)
+    ):
         return None
     modules: list[str] = []
     for entry in payload.get("module_outcomes") or ():

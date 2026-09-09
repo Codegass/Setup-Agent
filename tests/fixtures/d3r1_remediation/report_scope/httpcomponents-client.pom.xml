@@ -1,0 +1,16 @@
+    <profile>
+      <!--
+        The httpclient5-jakarta-rest-client module is compiled for Java 17, so its class files
+        cannot be read by javac 8 and 11. Builds that select an older toolchain must leave this module
+        out of the reactor by setting -Dhc.jakarta-rest-client.skip.
+      -->
+      <id>jakarta-rest-client</id>
+      <activation>
+        <property>
+          <name>!hc.jakarta-rest-client.skip</name>
+        </property>
+      </activation>
+      <modules>
+        <module>httpclient5-jakarta-rest-client</module>
+      </modules>
+    </profile>

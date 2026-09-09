@@ -19,7 +19,6 @@ a contract binding).
 import json
 
 import pytest
-
 from build_requirements_fakes import complete_build_requirements_v1
 
 from sag.tools.internal.build_preflight import (
@@ -65,13 +64,13 @@ def test_fingerprint_ignores_a_receipt_proven_structure_merge():
 
 def test_fingerprint_changes_when_a_derived_fact_changes():
     base = valid_manifest()
-    moved = valid_manifest(build_root="/workspace/project/submodule",
-                           root_shape="pathological_aggregator",
-                           test_root="/workspace/project/submodule",
-                           build_islands=[{"root": "/workspace/project/submodule",
-                                          "system": "maven"}],
-                           test_islands=[{"root": "/workspace/project/submodule",
-                                         "system": "maven"}])
+    moved = valid_manifest(
+        build_root="/workspace/project/submodule",
+        root_shape="pathological_aggregator",
+        test_root="/workspace/project/submodule",
+        build_islands=[{"root": "/workspace/project/submodule", "system": "maven"}],
+        test_islands=[{"root": "/workspace/project/submodule", "system": "maven"}],
+    )
     assert survey_facts_fingerprint(base) != survey_facts_fingerprint(moved)
 
 
@@ -119,9 +118,7 @@ def test_write_build_requirements_stamps_and_the_live_reader_returns_the_pin():
 
     live = read_live_build_requirements(orch)
     assert live.complete and live.payload is not None
-    assert live.payload["survey"]["survey_fingerprint"] == survey_facts_fingerprint(
-        live.payload
-    )
+    assert live.payload["survey"]["survey_fingerprint"] == survey_facts_fingerprint(live.payload)
 
 
 # ---------------------------------------------------------------------------
@@ -162,3 +159,20 @@ def test_a_frozen_contract_carries_the_pin_and_binding_is_not_unknown():
     absent = dict(current)
     absent.pop("survey_fingerprint")
     assert "survey_fingerprint" in _current_contract_binding_problem(contract, absent)
+
+
+def test_raw_java_constraints_are_validated_and_fingerprinted():
+    requirements = {
+        "runtime": [{"constraint": "[11,17)", "source": "pom.xml:requireJavaVersion"}],
+        "compiler_release": "11",
+        "compiler_source": "pom.xml:maven.compiler.release",
+        "compiler_toolchain": False,
+        "unresolved": [],
+    }
+    manifest = valid_manifest(java_requirements=requirements)
+    assert validate_build_requirements_v1(manifest)["java_requirements"] == requirements
+    changed = json.loads(json.dumps(manifest))
+    changed["java_requirements"]["runtime"][0]["constraint"] = "11"
+    assert survey_facts_fingerprint(changed) != survey_facts_fingerprint(manifest)
+    with pytest.raises(ValueError, match="fingerprint"):
+        validate_build_requirements_v1(changed)

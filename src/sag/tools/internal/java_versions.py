@@ -14,6 +14,8 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64).
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 # `openjdk version "11.0.31"`, `java version "1.8.0_361"` — the quoted string a
@@ -77,3 +79,238 @@ def parse_java_verification(output: str) -> Dict[str, Optional[str]]:
         "java_version": runtime_match.group(1) if runtime_match else None,
         "javac_version": compiler_match.group(1) if compiler_match else None,
     }
+
+
+def _java_version_tuple(raw: Any) -> Optional[tuple[int, ...]]:
+    """Numeric Enforcer versions only; unresolved/qualified versions stay unknown."""
+    value = str(raw or "").strip()
+    if not re.fullmatch(r"\d+(?:[._-]\d+){0,3}", value):
+        return None
+    parts = [int(part) for part in re.split(r"[._-]", value)]
+    if len(parts) > 1 and parts[0] == 1:
+        parts.pop(0)
+    return tuple(parts + [0] * (4 - len(parts)))
+
+
+@dataclass(frozen=True)
+class _JavaRange:
+    lower: Optional[tuple[int, ...]] = None
+    upper: Optional[tuple[int, ...]] = None
+    lower_closed: bool = True
+    upper_closed: bool = True
+
+    def contains(self, version: tuple[int, ...]) -> bool:
+        return not (
+            (
+                self.lower is not None
+                and (version < self.lower or (version == self.lower and not self.lower_closed))
+            )
+            or (
+                self.upper is not None
+                and (version > self.upper or (version == self.upper and not self.upper_closed))
+            )
+        )
+
+    def intersect(self, other: "_JavaRange") -> "_JavaRange":
+        lower = max((v for v in (self.lower, other.lower) if v is not None), default=None)
+        upper = min((v for v in (self.upper, other.upper) if v is not None), default=None)
+        return _JavaRange(
+            lower,
+            upper,
+            all(
+                bound != lower or closed
+                for bound, closed in (
+                    (self.lower, self.lower_closed),
+                    (other.lower, other.lower_closed),
+                )
+            ),
+            all(
+                bound != upper or closed
+                for bound, closed in (
+                    (self.upper, self.upper_closed),
+                    (other.upper, other.upper_closed),
+                )
+            ),
+        )
+
+    @property
+    def empty(self) -> bool:
+        return bool(
+            self.lower is not None
+            and self.upper is not None
+            and (
+                self.lower > self.upper
+                or (self.lower == self.upper and not (self.lower_closed and self.upper_closed))
+            )
+        )
+
+
+def _java_range(raw: Any) -> Optional[_JavaRange]:
+    value = str(raw or "").strip()
+    bare = _java_version_tuple(value)
+    if bare is not None:
+        return _JavaRange(lower=bare)  # Enforcer bare versions are MINIMUMS.
+    if value.startswith("[") and value.endswith("]") and "," not in value:
+        exact = _java_version_tuple(value[1:-1])
+        return _JavaRange(exact, exact) if exact is not None else None
+    match = re.fullmatch(r"([\[(])\s*([^,\[\]()]*),\s*([^,\[\]()]*)\s*([\])])", value)
+    if not match:
+        return None  # Unions and property expressions need Maven's own resolution.
+    start, lower_text, upper_text, end = match.groups()
+    lower = _java_version_tuple(lower_text) if lower_text.strip() else None
+    upper = _java_version_tuple(upper_text) if upper_text.strip() else None
+    if (lower_text.strip() and lower is None) or (upper_text.strip() and upper is None):
+        return None
+    if lower is None and upper is None:
+        return None
+    return _JavaRange(lower, upper, start == "[", end == "]")
+
+
+def java_constraint_matches(constraint: str, version: str) -> Optional[bool]:
+    """Match one supported Enforcer constraint without reducing it to a major."""
+    bound, actual = _java_range(constraint), _java_version_tuple(version)
+    return bound.contains(actual) if bound is not None and actual is not None else None
+
+
+def java_requirements_range(
+    requirements: Dict[str, Any], *, observed_major: Optional[str] = None
+) -> Optional[_JavaRange]:
+    """Intersect the small set of proved JVM constraints, not a Maven model solver."""
+    bound = _JavaRange()
+    for entry in requirements.get("runtime", []):
+        parsed = _java_range(entry.get("constraint"))
+        if parsed is None:
+            return None
+        bound = bound.intersect(parsed)
+    release = requirements.get("compiler_release")
+    if release and not requirements.get("compiler_toolchain"):
+        parsed = _java_range(release)
+        if parsed is None:
+            return None
+        bound = bound.intersect(parsed)
+    if observed_major:
+        major = java_major(observed_major)
+        if major is None:
+            return None
+        bound = bound.intersect(
+            _JavaRange((int(major), 0, 0, 0), (int(major) + 1, 0, 0, 0), True, False)
+        )
+    return bound
+
+
+def java_requirement_candidate(
+    requirements: Dict[str, Any],
+    *,
+    active_version: Optional[str] = None,
+    observed_major: Optional[str] = None,
+) -> Optional[str]:
+    bound = java_requirements_range(requirements, observed_major=observed_major)
+    if bound is None or bound.empty:
+        return None
+    active = _java_version_tuple(active_version)
+    if active is not None and bound.contains(active):
+        return str(active[0])
+    if requirements.get("unresolved"):
+        return None
+    # A major is only an install candidate; the exact activated version is
+    # checked against the full range after provisioning. Never claim that
+    # installing "11" proves [11] or a patch-specific bound.
+    if bound.lower is not None:
+        candidate = bound.lower[0]
+    elif bound.upper is not None:
+        candidate = bound.upper[0] - (not bound.upper_closed)
+    else:
+        return None
+    if candidate < 1:
+        return None
+    major_floor = (candidate, 0, 0, 0)
+    if bound.upper is not None and (
+        major_floor > bound.upper or (major_floor == bound.upper and not bound.upper_closed)
+    ):
+        return None
+    return str(candidate)
+
+
+def maven_java_requirements(poms: list[tuple[str, str]]) -> Dict[str, Any]:
+    """Preserve declared runtime bounds and compiler requirements with their source.
+
+    This does not evaluate Maven profiles, remote parents, toolchain selection,
+    or arbitrary interpolation. Such inputs remain explicit unresolved facts.
+    """
+    result: Dict[str, Any] = {
+        "runtime": [],
+        "compiler_release": None,
+        "compiler_source": None,
+        "compiler_toolchain": False,
+        "unresolved": [],
+    }
+    for content, location in poms:
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            result["unresolved"].append(f"{location}:xml_unreadable")
+            continue
+        for element in root.iter():
+            element.tag = element.tag.rsplit("}", 1)[-1]
+        for rule in root.iter("requireJavaVersion"):
+            raw = (rule.findtext("version") or "").strip()
+            if raw:
+                result["runtime"].append(
+                    {"constraint": raw, "source": f"{location}:requireJavaVersion"}
+                )
+        for profile in root.findall("./profiles/profile"):
+            if any(True for _ in profile.iter("requireJavaVersion")) or any(
+                plugin.findtext("artifactId")
+                in {"maven-compiler-plugin", "maven-toolchains-plugin"}
+                for plugin in profile.iter("plugin")
+            ):
+                result["unresolved"].append(
+                    f"{location}:profile_activation:{profile.findtext('id') or 'unknown'}"
+                )
+        compiler_plugins = [
+            plugin
+            for plugin in root.iter("plugin")
+            if plugin.findtext("artifactId") == "maven-compiler-plugin"
+        ]
+        if result["compiler_release"] is None:
+            compiler_unresolved = []
+            for tag in (
+                "maven.compiler.release",
+                "maven.compiler.target",
+                "maven.compiler.source",
+                "java.version",
+                "release",
+                "target",
+                "source",
+            ):
+                elements = (
+                    root.findall(f"./properties/{tag}")
+                    if "." in tag
+                    else [element for plugin in compiler_plugins for element in plugin.iter(tag)]
+                )
+                values = [(element.text or "").strip() for element in elements]
+                value = next((value for value in values if names_bare_java_major(value)), None)
+                if value:
+                    result["compiler_release"] = java_major(value)
+                    result["compiler_source"] = f"{location}:{tag}"
+                    break
+                if values:
+                    compiler_unresolved.append(f"{location}:{tag}:{values[0]}")
+            if result["compiler_release"] is None:
+                result["unresolved"].extend(compiler_unresolved)
+        if any(
+            plugin.find(".//jdkToolchain") is not None
+            or (
+                plugin.find(".//executable") is not None
+                and any(
+                    (element.text or "").strip().lower() == "true"
+                    for element in plugin.iter("fork")
+                )
+            )
+            for plugin in compiler_plugins
+        ) or any(
+            plugin.findtext("artifactId") == "maven-toolchains-plugin"
+            for plugin in root.iter("plugin")
+        ):
+            result["compiler_toolchain"] = True
+    return result

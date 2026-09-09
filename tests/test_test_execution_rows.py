@@ -214,7 +214,7 @@ def test_delta_row_reader_is_exact_across_new_changed_and_cached_reports_under_t
             self.parser_input = None
 
         def execute_command(self, command, **kwargs):
-            if "def declared_count" in command:
+            if "def declarations_agree" in command:
                 self.commands.append(command)
                 self.parser_kwargs = dict(kwargs)
                 input_path = shlex.split(command)[-1]
@@ -295,7 +295,7 @@ def test_delta_row_reader_refuses_a_path_with_conflicting_receipt_hashes():
         "rows": [],
         "reasons": ["report_delta_conflict"],
     }
-    assert not any("def declared_count" in command for command in container.commands)
+    assert not any("def declarations_agree" in command for command in container.commands)
 
 
 def test_container_parser_verifies_hash_and_inherits_the_nearest_suite_source_file(tmp_path):
@@ -1634,7 +1634,7 @@ class _StatedBoundsContainer(FakeContainer):
         self.bounds = bounds
 
     def execute_command(self, command, **kwargs):
-        if "def declared_count" in command:
+        if "def declarations_agree" in command:
             self.commands.append(command)
             reports = json.loads(self.files[shlex.split(command)[-1]])
             rows = [

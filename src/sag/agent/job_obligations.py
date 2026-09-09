@@ -1300,6 +1300,17 @@ def reconcile_job_obligations(
             )
             if failure:
                 integrity.append(failure)
+            else:
+                # Receipt settlement and assessment publication are distinct.
+                # A restart must be able to finish a partially published bundle.
+                ensure_receipt_assessed(
+                    execute,
+                    obligation.get("settled_receipt_id"),
+                    evidence_ref=_text(obligation.get("settled_receipt_id")),
+                    output_loader=lambda: _read_complete_log(
+                        orchestrator, obligation.get("log_path")
+                    ),
+                )
             continue
         try:
             if process_is_live(obligation):
@@ -1572,7 +1583,7 @@ def _settle_one(
                 integrity_failure=(f"{_text(obligation.get('job_id'))}:receipt_identity_conflict")
             )
         return _finalize_settlement(
-            execute,
+            orchestrator,
             obligation,
             existing_receipt,
             claims,
@@ -1604,7 +1615,7 @@ def _settle_one(
     before = dict(obligation.get("before") or {})
     after = snapshot_reports(execute, [working_directory])
     log = _read_complete_log(orchestrator, obligation.get("log_path"))
-    module_outcomes, cached_roots = _parse_outcomes(tool, log, working_directory)
+    module_outcomes, cached_roots = _parse_outcomes(tool, log or "", working_directory)
 
     # Attribution (spec §3.2). The window is this job's own `before` against
     # its own `after`, and the one real caveat is INTERVENING work: another
@@ -1644,6 +1655,13 @@ def _settle_one(
         test_disposition=sealed_test_disposition_status(orchestrator),
     )
 
+    if tool == "maven":
+        from sag.tools.internal.maven_tool import _reactor_receipt_fields
+
+        reactor_fields = _reactor_receipt_fields(log)
+        module_outcomes = reactor_fields.pop("module_outcomes")
+        harvested.update(reactor_fields)
+
     metadata = record_invocation(
         execute,
         receipt_id=receipt_id,
@@ -1681,7 +1699,7 @@ def _settle_one(
             return _SettlementAttempt(
                 integrity_failure=f"{_text(obligation.get('job_id'))}:receipt_missing"
             )
-        return _finalize_settlement(execute, obligation, receipt, claims)
+        return _finalize_settlement(orchestrator, obligation, receipt, claims, output=log)
 
     persistence_code = _text((metadata or {}).get("receipt_persistence_code")) or (
         "transport_write_failed"
@@ -1700,11 +1718,16 @@ def _settle_one(
 
 
 def _finalize_settlement(
-    execute: Callable[..., Optional[Mapping[str, Any]]],
+    orchestrator: Any,
     obligation: Mapping[str, Any],
     receipt: Mapping[str, Any],
     claims: List[Tuple[Optional[int], Tuple[str, ...]]],
+    *,
+    output: Optional[str] = None,
 ) -> _SettlementAttempt:
+    execute = resolve_control_execute(orchestrator)
+    if execute is None:
+        return _SettlementAttempt(integrity_failure="control_transport_unavailable")
     receipt_id = _text(receipt.get("receipt_id"))
     exit_code = receipt.get("exit_code")
     if not receipt_id or not isinstance(exit_code, int) or isinstance(exit_code, bool):
@@ -1723,7 +1746,13 @@ def _finalize_settlement(
         )
     mine = tuple(_delta_paths(receipt.get("report_delta")))
     claims.append((_receipt_sequence(receipt_id), mine))
-    ensure_receipt_assessed(execute, receipt_id)
+    ensure_receipt_assessed(
+        execute,
+        receipt_id,
+        output=output,
+        evidence_ref=receipt_id,
+        output_loader=lambda: _read_complete_log(orchestrator, obligation.get("log_path")),
+    )
     return _SettlementAttempt(
         settlement=Settlement(
             job_id=_text(obligation.get("job_id")),
@@ -2004,7 +2033,7 @@ def _requirements_view(obligation: Mapping[str, Any]) -> Dict[str, Any]:
     return view
 
 
-def _read_complete_log(orchestrator: Any, log_path: Any) -> str:
+def _read_complete_log(orchestrator: Any, log_path: Any) -> Optional[str]:
     """The job's COMPLETE log, untruncated.
 
     Same reason `collect_detached_result` reads it untruncated: the analysis
@@ -2014,10 +2043,10 @@ def _read_complete_log(orchestrator: Any, log_path: Any) -> str:
     """
     path = _text(log_path)
     if not path:
-        return ""
+        return None
     execute = resolve_control_execute(orchestrator)
     if not callable(execute):
-        return ""
+        return None
     command = f"cat {shlex.quote(path)}"
     try:
         try:
@@ -2026,8 +2055,8 @@ def _read_complete_log(orchestrator: Any, log_path: Any) -> str:
             result = execute(command) or {}
     except Exception as exc:
         logger.debug(f"job log {path} unreadable: {exc}")
-        return ""
-    return str(result.get("output") or "") if _succeeded(result) else ""
+        return None
+    return str(result.get("output") or "") if _succeeded(result) else None
 
 
 def _receipt_claims(

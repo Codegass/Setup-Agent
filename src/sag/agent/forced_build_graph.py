@@ -327,7 +327,8 @@ def _verify_maven(
     parsed_poms: dict[str, ET.Element] = {}
     processed_parents: set[str] = set()
     processed_modules: set[str] = set()
-    stack: set[str] = set()
+    parent_stack: set[str] = set()
+    module_stack: set[str] = set()
 
     def read_pom(pom_path: str) -> tuple[str, ET.Element]:
         resolved_pom, pom_text = _read_contained_file(
@@ -358,24 +359,32 @@ def _verify_maven(
         if depth > max_depth:
             raise _GraphUnavailable("maven_module_depth_exceeded")
         resolved_pom, project = read_pom(pom_path)
-        if resolved_pom in stack:
+        if resolved_pom in parent_stack or (expand_modules and resolved_pom in module_stack):
             raise _GraphUnavailable("maven_module_cycle")
         parent_done = resolved_pom in processed_parents
         modules_done = resolved_pom in processed_modules
         if parent_done and (not expand_modules or modules_done):
             return
-        stack.add(resolved_pom)
+        if expand_modules:
+            module_stack.add(resolved_pom)
         try:
             pom_dir = posixpath.dirname(resolved_pom)
             if not parent_done:
-                parent_path = _maven_parent_path(project, pom_dir)
-                if parent_path is not None and _file_state(orchestrator, parent_path) == "file":
-                    walk_pom(
-                        parent_path,
-                        expand_modules=False,
-                        depth=depth + 1,
-                    )
-                processed_parents.add(resolved_pom)
+                # Inheritance and aggregation are different edge kinds. A
+                # child may inherit a POM whose modules are still expanding;
+                # only an active inheritance chain makes that parent a cycle.
+                parent_stack.add(resolved_pom)
+                try:
+                    parent_path = _maven_parent_path(project, pom_dir)
+                    if parent_path is not None and _file_state(orchestrator, parent_path) == "file":
+                        walk_pom(
+                            parent_path,
+                            expand_modules=False,
+                            depth=depth + 1,
+                        )
+                    processed_parents.add(resolved_pom)
+                finally:
+                    parent_stack.remove(resolved_pom)
             if expand_modules and not modules_done:
                 for raw_module in _maven_module_values(project):
                     child = _resolve_maven_module_path(pom_dir, raw_module)
@@ -394,7 +403,8 @@ def _verify_maven(
                     )
                 processed_modules.add(resolved_pom)
         finally:
-            stack.remove(resolved_pom)
+            if expand_modules:
+                module_stack.remove(resolved_pom)
 
     _verify_maven_config(
         orchestrator,

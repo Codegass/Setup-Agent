@@ -176,6 +176,9 @@ def snapshot_factory():
                 refs=("build.log",),
             ),
             test_stats=SnapshotTestStats(
+                # Success snapshots in this renderer fixture explicitly start
+                # after the independent execution-completion gate has passed.
+                judgment="success" if verdict == "success" else "unknown",
                 discovered=unique_total,
                 executed=unique_total,
                 passed=unique_passed,

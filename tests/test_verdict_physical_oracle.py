@@ -83,7 +83,7 @@ def _green_tests(state, *, total=50):
     Rebased 2026-08-14 (spec amendment item 9): these fixtures are about the
     PHYSICAL BUILD oracle, and a headline test count with no claim partition
     behind it is exactly what the finalizer now declines to publish. The
-    receipt-scoped rollup is what a real test close seals.
+    receipt-scoped rollup and explicit completion are what a real test close seals.
     """
     counts = {"executed": total, "passed": total, "failed": 0, "errors": 0, "skipped": 0}
     state.register_fact(
@@ -94,6 +94,7 @@ def _green_tests(state, *, total=50):
             "unique": dict(counts),
             "raw": dict(counts),
             "receipt_scoped": True,
+            "execution_state": "completed",
         },
         "output_tests",
     )

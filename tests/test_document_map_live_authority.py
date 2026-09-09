@@ -4,8 +4,8 @@ import hashlib
 import json
 
 import pytest
-
 from container_evidence_fakes import ContainerFS
+
 from sag.agent.document_map import (
     DOCUMENT_MAP_LOGICAL_ARTIFACT_ID,
     DOCUMENT_MAP_PATH,
@@ -280,6 +280,57 @@ def test_document_map_validator_returns_the_exact_schema_object():
     assert validate_document_map_v1(payload, DOCUMENT_MAP_LOGICAL_ARTIFACT_ID) == payload
     with pytest.raises(ValueError, match="publication identity"):
         validate_document_map_v1(payload, "renamed-document-map")
+
+
+@pytest.mark.parametrize(
+    "extent",
+    [
+        {"indexed_bytes": 5},
+        {"content_truncated": False},
+        {"indexed_bytes": True, "content_truncated": False},
+        {"indexed_bytes": -1, "content_truncated": False},
+        {"indexed_bytes": 512001, "content_truncated": True},
+        {"indexed_bytes": 5, "content_truncated": "false"},
+        {"indexed_bytes": 5, "content_truncated": True},
+    ],
+)
+def test_document_extent_cannot_claim_an_invalid_or_undisclosed_prefix(extent):
+    payload = _map(entries=[_entry(**extent)])
+    with pytest.raises(ValueError, match="indexed byte extent"):
+        validate_document_map_v1(payload)
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_published_document_extent_round_trips_without_inventing_legacy_extent(truncated):
+    orch = DocumentMapOrchestrator()
+    payload = _map(
+        entries=[
+            _entry(
+                indexed_bytes=5,
+                content_truncated=truncated,
+                discovery_status="truncated" if truncated else "indexed",
+            )
+        ]
+    )
+    assert write_document_map(orch.execute_command, payload)
+    assert read_live_document_map(orch).payload == payload
+    legacy = _map()
+    assert validate_document_map_v1(legacy) == legacy
+    assert "indexed_bytes" not in legacy["entries"][0]
+
+
+def test_published_document_extents_cannot_exceed_the_total_budget(monkeypatch):
+    from sag.agent import document_map
+
+    monkeypatch.setattr(document_map, "MAX_TOTAL_BYTES", 6)
+    payload = _map(
+        entries=[
+            _entry(path=f"{ROOT}/a.md", indexed_bytes=5, content_truncated=False),
+            _entry(path=f"{ROOT}/b.md", indexed_bytes=5, content_truncated=False),
+        ]
+    )
+    with pytest.raises(ValueError, match="total budget"):
+        validate_document_map_v1(payload)
 
 
 def test_domain_facts_derive_partial_conflicts_only_from_the_live_document_map():

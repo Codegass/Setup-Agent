@@ -79,7 +79,7 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # document-map fingerprint the contract freeze pins against. A v10 manifest was
 # written by a survey that produced neither, so reusing it would leave a run
 # with no claims to cite and no map to retrieve from.
-SURVEY_FACTS_VERSION = 12
+SURVEY_FACTS_VERSION = 13
 
 
 def _project_recommendation_coordinates(rec):
@@ -971,7 +971,9 @@ class ProjectAnalyzerTool(BaseTool):
         Returns the map so the caller can hand it to the projection instead of
         reading it back out of the container.
         """
-        execute = getattr(self.docker_orchestrator, "execute_command", None)
+        from sag.runtime.container_io import resolve_control_execute
+
+        execute = resolve_control_execute(self.docker_orchestrator)
         if not callable(execute):
             return None
 
@@ -1032,9 +1034,16 @@ class ProjectAnalyzerTool(BaseTool):
             if not entry_has_extractors(body):
                 continue
             try:
-                text = read_entry_text(execute, body)
+                text = read_entry_text(execute, body, complete_lines_only=True)
             except DocumentSourceChangedError as exc:
                 self._record_survey_conflict(analysis, "document_source_changed", exc)
+                continue
+            if text is None:
+                self._record_survey_conflict(
+                    analysis,
+                    "document_source_unreadable",
+                    RuntimeError(f"indexed document could not be read: {body.get('path')}"),
+                )
                 continue
             if not text:
                 continue
@@ -1265,6 +1274,9 @@ class ProjectAnalyzerTool(BaseTool):
             "build_islands": rec.get("build_islands") or [],
             "test_islands": rec.get("test_islands") or [],
         }
+
+        if "java_requirements" in analysis:
+            data["java_requirements"] = analysis["java_requirements"]
 
         current_document_map: Optional[Dict[str, Any]] = None
         if document_map is not None:

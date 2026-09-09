@@ -224,7 +224,8 @@ def test_setup_report_leads_with_rate_lines_and_derives_the_word_once():
         "skipped 61 · failed 0 · errors 0 · static declarations 468 (diagnostic)",
         "Coverage: 55.5% line (jacoco-injected)",
     ]
-    assert lines[3] == "Verdict (derived): partial"
+    assert lines[3] == "Official CI: unavailable (no sealed comparison)"
+    assert lines[4] == "Verdict (derived): partial"
     assert sum("partial" in line.lower() for line in lines) == 1
 
 

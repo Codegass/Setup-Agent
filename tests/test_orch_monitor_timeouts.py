@@ -153,7 +153,8 @@ def test_stream_death_after_read_timeout_enters_blind_enforcement():
     # The exit code is unknown after stream loss — fail safe, never report a
     # false success from a partial log.
     assert result["success"] is False
-    assert result["exit_code"] == 1
+    assert result["exit_code"] is None
+    assert result["dispatch_status"] == "execution_observation_failed"
     assert "stream was lost" in result["output"]
 
 
@@ -207,3 +208,34 @@ def test_blind_enforcement_liveness_refreshes_silent_timer():
 
     assert result["termination_reason"] == "absolute_timeout"
     assert orchestrator.terminate_calls
+
+
+def test_timeout_keeps_the_observed_exit_separate_from_timeout_status():
+    orchestrator = build_orchestrator()
+    exec_result = SimpleNamespace(output=iter([]), exit_code=143)
+    result = orchestrator._monitor_execution_with_timeouts(
+        exec_result, fresh_state(start_offset=10), silent_timeout=100, absolute_timeout=5
+    )
+    assert result["success"] is False
+    assert result["exit_code"] == 143
+    assert result["observed_exit_code"] == 143
+    assert result["termination_reason"] == "absolute_timeout"
+    assert result["full_output"] == ""
+
+
+def test_stream_loss_never_promotes_a_known_zero_exit_to_complete_observation():
+    orchestrator = build_orchestrator()
+    orchestrator._command_still_running = lambda fragment: False
+    stream = ScriptedStream([(b"prefix", None), ReadTimeoutLike()])
+    result = orchestrator._monitor_execution_with_timeouts(
+        SimpleNamespace(output=stream, exit_code=0),
+        fresh_state(command_fragment="pytest"),
+        silent_timeout=60,
+        absolute_timeout=60,
+    )
+    assert result["success"] is False
+    assert result["exit_code"] == 0
+    assert result["execution_observation_complete"] is False
+    assert result["dispatch_status"] == "execution_observation_failed"
+    assert result["full_output"] == "prefix"
+    assert "stream was lost" in result["output"]

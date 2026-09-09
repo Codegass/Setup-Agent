@@ -1,0 +1,168 @@
+{
+  "purpose": "Frozen D3R1 Maven reactor grammar fixtures. Display labels are not canonical module identities. Repeated labels across or within summaries remain explicit; no alias inference or deduplication.",
+  "source_archive": "logs/d3r1-20260907",
+  "fixtures": [
+    {
+      "project": "rocketmq",
+      "fixture": "rocketmq.txt",
+      "fixture_sha256": "ce9fe5de538f422d4769becd2a6b1b1c1d312729e0e8246aac8e4b6d7b4621fb",
+      "fixture_bytes": 1765,
+      "source": {
+        "source_path": "logs/d3r1-20260907/runs/rocketmq/container-evidence/.setup_agent/contexts/full_outputs.jsonl",
+        "source_sha256": "6aa7d44079e6a53d91ea775bf9d307eabb369d5bd6153232c080977eb876adc0",
+        "source_bytes": 245180,
+        "source_jsonl_line": 29,
+        "source_json_field": "output",
+        "source_output_ref": "output_244176426250",
+        "source_output_sha256": "b686e91621ad78c5038fbf3794a4e6585970066fdebe19f858dfbdca8e2384a5",
+        "source_output_bytes": 131072
+      },
+      "extraction": "Copy each Reactor Summary line through the first following BUILD SUCCESS/FAILURE and its immediately following separator, inclusive. Join disjoint sections directly; preserve all selected UTF-8 bytes, timestamps, names, statuses, line endings and ordering. Line ranges are one-based and inclusive within the source text (decoded output field for JSONL).",
+      "blocks": [
+        {
+          "source_lines": [
+            2603,
+            2626
+          ],
+          "fixture_lines": [
+            1,
+            24
+          ],
+          "sha256": "ce9fe5de538f422d4769becd2a6b1b1c1d312729e0e8246aac8e4b6d7b4621fb",
+          "status_counts": {
+            "SUCCESS": 19
+          },
+          "row_count": 19,
+          "distinct_display_labels": 19,
+          "duplicate_display_labels": [],
+          "padding_counts": {
+            "multiple": 19
+          },
+          "terminal_status": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "project": "camel-examples",
+      "fixture": "camel-examples.txt",
+      "fixture_sha256": "13510d70a6fc82f14d3780ea4659dfd158a633dc7bc5922d7f2ae68e14cea8d2",
+      "fixture_bytes": 19044,
+      "source": {
+        "source_path": "logs/d3r1-20260907/official-ci-supplement/camel-examples/job-98789725213.log",
+        "source_sha256": "9da73811e34590440ae18a383c89f303d0594fa2e36ad408e460dc18e685787e",
+        "source_bytes": 1317441
+      },
+      "extraction": "Copy each Reactor Summary line through the first following BUILD SUCCESS/FAILURE and its immediately following separator, inclusive. Join disjoint sections directly; preserve all selected UTF-8 bytes, timestamps, names, statuses, line endings and ordering. Line ranges are one-based and inclusive within the source text (decoded output field for JSONL).",
+      "blocks": [
+        {
+          "source_lines": [
+            3749,
+            3836
+          ],
+          "fixture_lines": [
+            1,
+            88
+          ],
+          "sha256": "47095a77edb884df74270a84d41f86831af056c5dd37a5e31a57175fe873c4f7",
+          "status_counts": {
+            "SUCCESS": 83
+          },
+          "row_count": 83,
+          "distinct_display_labels": 83,
+          "duplicate_display_labels": [],
+          "padding_counts": {
+            "multiple": 70,
+            "zero": 13
+          },
+          "terminal_status": "SUCCESS"
+        },
+        {
+          "source_lines": [
+            11333,
+            11420
+          ],
+          "fixture_lines": [
+            89,
+            176
+          ],
+          "sha256": "95c490a50d1cc568cc14baf90575f91c5535cebf8ccdf0c5acbefd10dd5880d6",
+          "status_counts": {
+            "SUCCESS": 83
+          },
+          "row_count": 83,
+          "distinct_display_labels": 83,
+          "duplicate_display_labels": [],
+          "padding_counts": {
+            "multiple": 70,
+            "zero": 13
+          },
+          "terminal_status": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "project": "camel",
+      "fixture": "camel.txt",
+      "fixture_sha256": "bc94b2d4c266a42eb49004921d7f24761aeac740b21eb65d32d7575d8f039b6a",
+      "fixture_bytes": 54770,
+      "source": {
+        "source_path": "logs/d3r1-20260907/runs/camel/audit/root-install.log",
+        "source_sha256": "a002ce6454ea0bedaff178cdd4d10d594a3ede6f48ba149315a81835dc993e2d",
+        "source_bytes": 11184335
+      },
+      "extraction": "Copy each Reactor Summary line through the first following BUILD SUCCESS/FAILURE and its immediately following separator, inclusive. Join disjoint sections directly; preserve all selected UTF-8 bytes, timestamps, names, statuses, line endings and ordering. Line ranges are one-based and inclusive within the source text (decoded output field for JSONL).",
+      "blocks": [
+        {
+          "source_lines": [
+            122819,
+            123510
+          ],
+          "fixture_lines": [
+            1,
+            692
+          ],
+          "sha256": "bc94b2d4c266a42eb49004921d7f24761aeac740b21eb65d32d7575d8f039b6a",
+          "status_counts": {
+            "SUCCESS": 649,
+            "FAILURE": 2,
+            "SKIPPED": 36
+          },
+          "row_count": 687,
+          "distinct_display_labels": 685,
+          "duplicate_display_labels": [
+            {
+              "label": "Camel :: Test :: Spring :: JUnit5",
+              "count": 2,
+              "source_lines": [
+                122893,
+                122989
+              ],
+              "fixture_lines": [
+                75,
+                171
+              ]
+            },
+            {
+              "label": "Camel :: Integration Tests",
+              "count": 2,
+              "source_lines": [
+                123502,
+                123503
+              ],
+              "fixture_lines": [
+                684,
+                685
+              ]
+            }
+          ],
+          "padding_counts": {
+            "multiple": 680,
+            "zero": 5,
+            "one": 2
+          },
+          "terminal_status": "FAILURE"
+        }
+      ]
+    }
+  ]
+}

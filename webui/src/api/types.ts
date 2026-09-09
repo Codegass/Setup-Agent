@@ -281,6 +281,11 @@ export interface ExecutionSessionDetail {
   evidenceStatus?: string | null
   canonicalVerdict?: CanonicalVerdict
   rates?: Record<string, unknown> | null
+  ciComparison?: {
+    status: "evaluated" | "no_target" | "no_matched_cell" | "unavailable"
+    attainment?: { verdict: string } | null
+  } | null
+  ciComparisonLines?: string[]
   snapshotStatus?: SnapshotStatus
   legacy?: boolean
   reportDeliveryStatus?: ReportDeliveryStatus | null

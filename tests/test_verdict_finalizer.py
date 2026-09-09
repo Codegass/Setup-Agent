@@ -142,14 +142,20 @@ def _set_rate_test_rollup(
     failed,
     errors,
     driven_modules,
-    execution_state=None,
+    execution_state="completed",
 ):
     execution = (
         {
             "execution_state": execution_state,
-            "execution_reason": "test execution was interrupted after sealed rows",
-            "execution_receipt_ids": ["inv-test-partial"],
-            "interrupted_receipt_ids": ["inv-test-partial"],
+            "execution_receipt_ids": ["inv-test-current"],
+            **(
+                {
+                    "execution_reason": "test execution was interrupted after sealed rows",
+                    "interrupted_receipt_ids": ["inv-test-current"],
+                }
+                if execution_state == "partial"
+                else {}
+            ),
         }
         if execution_state
         else {}
@@ -213,7 +219,7 @@ def test_v4_finalize_round_trip_carries_the_complete_rates_block():
         project_name="project",
     ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
-    assert snapshot.schema_version == 4
+    assert snapshot.schema_version == 5
     assert snapshot.rates == {
         "build": {
             "modules": {
@@ -303,6 +309,51 @@ def test_project_red_does_not_change_runtime_outcome_accounting_or_setup_verdict
     assert snapshot.rates["test"]["cases"]["numerator"] == 100
     assert snapshot.rates["test"]["cases"]["denominator"] == 100
     assert snapshot.verdict == "success"
+
+
+@pytest.mark.parametrize(
+    "execution_state,expected_judgment,expected_verdict",
+    [
+        (None, "unknown", "partial"),
+        ("unknown", "unknown", "partial"),
+        ("failed", "failed", "failed"),
+        ("completed", "success", "success"),
+    ],
+)
+def test_test_completion_is_required_beside_complete_report_counts(
+    execution_state, expected_judgment, expected_verdict
+):
+    """A complete report fraction describes observed rows, not runner completion."""
+    state = RunEvidenceState(run_id="session-test-completion")
+    _set_rate_test_rollup(
+        state,
+        passed=100,
+        failed=0,
+        errors=0,
+        driven_modules=["core", "io"],
+        execution_state=execution_state,
+    )
+    orchestrator = FakeVerdictOrchestrator()
+
+    snapshot = VerdictFinalizer(
+        orchestrator,
+        validator=_RateValidator(),
+        project_name="project",
+    ).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    assert snapshot.test_stats.unique.executed == 100
+    assert snapshot.test_stats.unique.passed == 100
+    assert snapshot.rates["test"]["cases"]["band"] == "fully"
+    assert snapshot.test_stats.judgment == expected_judgment
+    assert snapshot.verdict == expected_verdict
+    assert read_verdict_snapshot(orchestrator) == snapshot
+    if expected_verdict != "success":
+        from sag.agent.verdict_finalizer import validate_verdict_snapshot_v3
+
+        forged = snapshot.model_dump(mode="json")
+        forged["verdict"] = "success"
+        with pytest.raises(ValueError, match="verdict word does not reconcile"):
+            validate_verdict_snapshot_v3(forged)
 
 
 def test_v3_fixture_payload_loads_with_an_empty_rates_block():
@@ -449,7 +500,7 @@ def test_finalization_is_byte_identical_and_uses_compare_publish_cas():
     second = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
     assert first.model_dump_json() == second.model_dump_json()
-    assert first.schema_version == 4
+    assert first.schema_version == 5
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
     assert not any(

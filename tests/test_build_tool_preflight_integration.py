@@ -22,6 +22,7 @@ import json
 import shlex
 
 import pytest
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import ContainerFS, add_published_mutable_json
 
 from sag.agent.action_intents import action_fingerprint
@@ -36,7 +37,6 @@ from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.gradle_tool import GradleTool
-from build_requirements_fakes import complete_build_requirements_v1
 
 pytestmark = pytest.mark.usefixtures(
     "facade_contract_authority",
@@ -264,6 +264,57 @@ def test_matching_jdk_no_narration():
     orch = ScriptedOrch(java="17", manifest={"java_version": "17"})
     result = _tool(orch).execute(action="compile", working_directory="/workspace/proj")
     assert "[pre-flight]" not in (result.output or "")
+
+
+def _structured_java(runtime="11", release="17", toolchain=False):
+    return {
+        "runtime": [{"constraint": runtime, "source": "pom.xml:requireJavaVersion"}],
+        "compiler_release": release,
+        "compiler_source": "pom.xml:maven.compiler.release",
+        "compiler_toolchain": toolchain,
+    }
+
+
+def test_facade_keeps_satisfying_jdk_and_freezes_the_observed_runtime():
+    orch = ScriptedOrch(
+        java="17",
+        manifest={
+            "java_version": "11",
+            "java_version_source": "maven-enforcer",
+            "java_requirements": _structured_java(),
+        },
+    )
+    backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
+    result = _tool(orch, maven=backend).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    assert result.succeeded
+    assert backend.contracts[0]["effective_jdk"]["major"] == "17"
+    assert "requirement_major" not in backend.contracts[0]["effective_jdk"]
+    assert not any("apt-get" in command for command in orch.commands)
+
+
+def test_facade_refuses_exact_runtime_compiler_conflict_before_dispatch():
+    orch = ScriptedOrch(
+        java="17", manifest={"java_version": "11", "java_requirements": _structured_java("[11]")}
+    )
+    backend = ScriptedBackendTool()
+    result = _tool(orch, maven=backend).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    assert result.error_code == "JAVA_CONSTRAINT_CONFLICT"
+    assert backend.calls == []
+    assert not any("apt-get" in command for command in orch.commands)
+
+
+def test_facade_keeps_unresolved_constraints_visible_without_installing():
+    orch = ScriptedOrch(
+        java="17",
+        manifest={"java_version": "11", "java_requirements": _structured_java("${supported.java}")},
+    )
+    result = _tool(orch).execute(action="compile", working_directory="/workspace/proj")
+    assert "constraint resolution is unknown" in result.output
+    assert not any("apt-get" in command for command in orch.commands)
 
 
 def test_contract_records_probe_provenance_when_survey_states_no_jdk_requirement():
@@ -563,9 +614,7 @@ def test_a_runner_that_names_the_java_it_needs_gets_the_provision_call_named():
         markers=("/workspace/proj/build.gradle",),
     )
 
-    result = _tool(orch, gradle=gradle).execute(
-        action="test", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, gradle=gradle).execute(action="test", working_directory="/workspace/proj")
 
     assert len(gradle.calls) == 1, "the sentence is steering, never a second dispatch"
     lines = _steering_lines(result)
@@ -600,9 +649,7 @@ def test_the_engine_that_switched_the_runtime_itself_does_not_also_steer(monkeyp
     )
     orch = ScriptedOrch(java="11", manifest={})
 
-    result = _tool(orch, maven=maven).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, maven=maven).execute(action="compile", working_directory="/workspace/proj")
 
     assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
     assert _steering_lines(result) == []
@@ -615,9 +662,7 @@ def test_a_reprovision_that_could_not_happen_still_names_the_call(monkeypatch):
     maven = ScriptedBackendTool(ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL))
     orch = ScriptedOrch(java="11", manifest={})
 
-    result = _tool(orch, maven=maven).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, maven=maven).execute(action="compile", working_directory="/workspace/proj")
 
     assert "jdk_retry" not in (result.metadata or {})
     assert "project(action='provision', java_version='17')" in _steering_lines(result)[0]
@@ -629,9 +674,7 @@ def test_a_build_that_succeeded_is_never_steered():
     )
     orch = ScriptedOrch(java="17", manifest={})
 
-    result = _tool(orch, maven=maven).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, maven=maven).execute(action="compile", working_directory="/workspace/proj")
 
     assert _steering_lines(result) == []
 
@@ -641,9 +684,7 @@ def test_a_runner_asking_for_the_major_already_active_is_not_steered():
     maven = ScriptedBackendTool(ToolResult.completed_failure(output=REAL_MAVEN_JAVA_FAIL))
     orch = ScriptedOrch(java="17", manifest={})
 
-    result = _tool(orch, maven=maven).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, maven=maven).execute(action="compile", working_directory="/workspace/proj")
 
     assert _steering_lines(result) == []
 
@@ -685,9 +726,7 @@ def test_the_generic_wording_still_names_the_provision_when_it_asks_for_more():
         markers=("/workspace/proj/build.gradle",),
     )
 
-    result = _tool(orch, gradle=gradle).execute(
-        action="test", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, gradle=gradle).execute(action="test", working_directory="/workspace/proj")
 
     assert len(gradle.calls) == 1
     assert "project(action='provision', java_version='17')" in _steering_lines(result)[0]
@@ -1327,3 +1366,171 @@ def test_real_build_and_maven_classes_preserve_requirement_at_resolution_seam():
     # d2r4). It is a resolution, never a dispatch, and the requirement itself
     # crosses the seam unweakened above.
     assert [spec.version_requirement for spec, _ in manager.specs[1:]] == [None]
+
+
+def test_explicit_executor_never_falls_back_to_a_different_root_marker():
+    orch = ScriptedOrch(manifest={"test_system": "gradle"}, markers=("/workspace/proj/pom.xml",))
+    maven = ScriptedBackendTool()
+    gradle = ScriptedBackendTool()
+    result = _tool(orch, maven=maven, gradle=gradle).execute(
+        action="test",
+        system="gradle",
+        source_command="./gradlew test",
+        working_directory="/workspace/proj",
+    )
+    assert not result.succeeded
+    assert not maven.calls and not gradle.calls
+
+
+def test_make_command_is_rejected_before_any_backend_dispatch():
+    orch = ScriptedOrch(
+        manifest={"test_system": "gradle"}, markers=("/workspace/proj/build.gradle",)
+    )
+    gradle = ScriptedBackendTool()
+    result = _tool(orch, gradle=gradle).execute(
+        action="test",
+        args="client-unit-test",
+        system="gradle",
+        source_command="make client-unit-test",
+        working_directory="/workspace/proj",
+    )
+    assert result.error_code == "BUILD_PARAMETER_INVALID"
+    assert gradle.calls == []
+
+
+def test_explicit_maven_command_preserves_clean_before_install():
+    orch = ScriptedOrch()
+    backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
+    result = _tool(orch, maven=backend).execute(
+        action="install",
+        args="clean -DskipTests",
+        system="maven",
+        source_command="./mvnw clean install -DskipTests",
+        working_directory="/workspace/proj",
+    )
+    assert result.succeeded
+    assert backend.contracts[0]["expected_argv"].endswith("clean install -DskipTests")
+    assert backend.calls[0]["command"] == "install"
+    assert backend.calls[0]["_source_argv"] == ["clean", "install", "-DskipTests"]
+
+
+def test_explicit_failsafe_verify_is_not_narrowed_to_test():
+    orch = ScriptedOrch()
+    backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
+    result = _tool(orch, maven=backend).execute(
+        action="verify",
+        args="-Dit.test=SmokeIT",
+        system="maven",
+        source_command="./mvnw verify -Dit.test=SmokeIT",
+        working_directory="/workspace/proj",
+    )
+    assert result.succeeded
+    assert "verify -Dit.test=SmokeIT" in backend.contracts[0]["expected_argv"]
+
+
+def test_official_maven_multiphase_source_matches_real_runner_and_contract():
+    source = "mvn -B -f pom.xml clean verify install -P-use-toolchains,nodoclint"
+    orch = EndToEndOrch([(True, "BUILD SUCCESS")], java="17", manifest={})
+    internal = _internal_maven_tool(orch)
+    captured = []
+    original = internal.execute
+
+    def capture(**kwargs):
+        captured.append(dict(current_contract() or {}))
+        return original(**kwargs)
+
+    internal.execute = capture
+    result = BuildTool(orch, maven_tool=internal).execute(
+        action="verify",
+        system="maven",
+        source_command=source,
+        args="-B -f pom.xml clean install -P-use-toolchains,nodoclint",
+        working_directory="/workspace/proj",
+    )
+    assert result.succeeded
+    actual = next(command for command in orch.commands if command.startswith("mvn"))
+    assert shlex.split(actual)[1:] == shlex.split(captured[0]["expected_argv"])
+    assert shlex.split(actual)[2:] == shlex.split(source)[1:]
+    assert captured[0]["effective_action"] == "verify"
+    assert captured[0]["requested_call"]["params"]["source_command"] == source
+
+
+def test_explicit_gradle_scoped_source_records_the_actual_task():
+    orch = ScriptedOrch(
+        manifest={"test_system": "gradle"}, markers=("/workspace/proj/build.gradle",)
+    )
+    backend = ContractCapturingBackendTool(ToolResult.completed_success(output="BUILD SUCCESS"))
+    result = _tool(orch, gradle=backend).execute(
+        action="test",
+        system="gradle",
+        source_command="./gradlew :client:test --tests SmokeTest",
+        args=":client:test --tests SmokeTest",
+        working_directory="/workspace/proj",
+    )
+    assert result.succeeded
+    assert backend.contracts[0]["effective_action"] == ":client:test"
+    assert backend.calls[0]["tasks"] == ":client:test"
+    assert shlex.split(backend.contracts[0]["expected_argv"])[1:] == [
+        ":client:test",
+        "--tests",
+        "SmokeTest",
+    ]
+
+
+def test_explicit_python_client_root_is_not_overridden_by_jvm_root_declaration():
+    orch = ScriptedOrch(
+        manifest={"test_system": "gradle", "test_root": "/workspace/proj"},
+        markers=("/workspace/proj/build.gradle", "/workspace/proj/client/pyproject.toml"),
+    )
+    python = ContractCapturingBackendTool(ToolResult.completed_success(output="1 passed"))
+    gradle = ScriptedBackendTool()
+    result = BuildTool(orch, python_tool=python, gradle_tool=gradle).execute(
+        action="test",
+        system="python",
+        source_command="uv run --active pytest tests/",
+        args="tests/",
+        working_directory="/workspace/proj/client",
+    )
+    assert result.succeeded
+    assert not gradle.calls
+    assert python.calls[0]["working_directory"] == "/workspace/proj/client"
+
+
+def test_explicit_gradle_source_matches_real_runner_without_hidden_test_flags():
+    class SourceGradleOrch(GradleScriptedOrch):
+        def execute_command(self, cmd, workdir=None, timeout=None):
+            if "&& echo exists || echo missing" in cmd:
+                self.commands.append(cmd)
+                return {
+                    "success": True,
+                    "exit_code": 0,
+                    "output": "exists" if "build.gradle" in cmd else "missing",
+                }
+            return super().execute_command(cmd, workdir, timeout)
+
+    orch = SourceGradleOrch(
+        java="17",
+        manifest={"test_system": "gradle"},
+        build_output="> Task :client:test\nBUILD SUCCESSFUL",
+    )
+    internal = _internal_gradle_tool(orch)
+    captured = []
+    original = internal.execute
+
+    def capture(**kwargs):
+        captured.append(dict(current_contract() or {}))
+        return original(**kwargs)
+
+    internal.execute = capture
+    result = BuildTool(orch, gradle_tool=internal).execute(
+        action="test",
+        system="gradle",
+        source_command="./gradlew :client:test --tests SmokeTest",
+        args=":client:test --tests SmokeTest",
+        working_directory="/workspace/proj",
+    )
+    actual = next(command for command in orch.commands if command.startswith("gradle "))
+    assert shlex.split(actual)[1:] == shlex.split(captured[0]["expected_argv"])
+    assert "ignoreFailures" not in actual
+    assert captured[0]["effective_action"] == ":client:test"
+    assert result.metadata["receipt_id"].startswith("inv-gradle-")

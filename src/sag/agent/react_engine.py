@@ -268,7 +268,17 @@ PHASE_OBJECTIVES = {
         "plan that names the documents and evidence you relied on, the intended build and test "
         "actions, success criteria, constraints, risks, and unresolved questions. Submit that "
         "plan in execution_plan on the terminal phase call; Build cannot start until it is "
-        "validated and sealed. Classify whether the project's declared test entry is suitable "
+        "validated and sealed. Each build execution step must state params.system and "
+        "params.source_command matching its action/args and explicit working_directory. "
+        "Example: build(action='install', system='maven', args='clean -DskipTests', "
+        "source_command='./mvnw clean install -DskipTests', working_directory='/workspace/project'). "
+        "Keep wrapper initialization and upstream artifact installation in preceding ordered steps. "
+        "For a Make-wrapped pytest target, read its recipe and prerequisite definitions, then "
+        "represent setup and the actual pytest command at its own cwd; never pass a Make target "
+        "to Gradle or pytest. If it cannot be represented, record a concrete blocker. "
+        "Use Maven action='verify' for documented Failsafe/verify tasks; test plus -Dit.test "
+        "does not prove integration tests executed. Project-declared deps/native setup needs "
+        "no source_command. Classify whether the project's declared test entry is suitable "
         "for unattended execution from its docs, CI, profiles, and suite definitions. Prefer the "
         "project-declared suite/profile/target; do not use a broad root run merely to discover "
         "whether it stalls. Record test_disposition as planned with at least one evidence-backed "
@@ -8605,7 +8615,13 @@ class ReActEngine(UIEventEmitter):
             metadata = getattr(self._answered_action_result(), "metadata", None) or {}
             receipt_id = str(metadata.get("receipt_id") or "").strip()
             if receipt_id:
-                ensure_receipt_assessed(execute, receipt_id)
+                result = self._answered_action_result()
+                ensure_receipt_assessed(
+                    execute,
+                    receipt_id,
+                    output=getattr(result, "raw_output", None),
+                    evidence_ref=receipt_id,
+                )
         except Exception as exc:
             logger.debug(f"observed-receipt assessment backstop skipped: {exc}")
 

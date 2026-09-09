@@ -59,6 +59,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -422,6 +423,128 @@ def cell_from_check(name: str, conclusion: str, *, laundered: bool) -> CellTarge
     )
 
 
+def cell_from_jenkins_report(
+    report: dict[str, Any],
+    *,
+    cell_id: str,
+    build_url: str,
+    console_text: str,
+    command: str,
+    evidence_refs: tuple[str, ...],
+) -> HarvestedCell:
+    """Read a complete module-scoped Jenkins JUnit API pool for one build.
+
+    The caller pins repository/revision and archives the API and console bytes.
+    Final testcase rows are not retry events: repeated display names remain
+    separate executions, including repeated red rows.
+    """
+    children = report.get("childReports")
+    if not isinstance(children, list) or not children:
+        raise HarvestError("Jenkins report has no module-scoped testcase pool")
+    parent, separator, build_number = build_url.rstrip("/").rpartition("/")
+    if not separator or not build_number.isdigit():
+        raise HarvestError("Jenkins build URL must name one numbered build")
+    modules = modules_from_log(console_text)
+    if (
+        not modules.modules
+        or modules.notes
+        or not re.search(r"^Finished: SUCCESS\s*$", console_text, re.M)
+    ):
+        raise HarvestError("Jenkins console does not prove a complete successful module scope")
+    identities: list[str] = []
+    red_ids: list[str] = []
+    skipped = 0
+    seen_urls: set[str] = set()
+    occurrences: Counter[str] = Counter()
+    for child in children:
+        if not isinstance(child, dict):
+            raise HarvestError("Jenkins child report is malformed")
+        url = (child.get("child") or {}).get("url", "")
+        relative = url.removeprefix(parent + "/") if isinstance(url, str) else ""
+        parts = relative.strip("/").split("/")
+        if (
+            not url.startswith(parent + "/")
+            or len(parts) != 2
+            or parts[1] != build_number
+            or url in seen_urls
+        ):
+            raise HarvestError("Jenkins child report belongs to another or repeated build")
+        seen_urls.add(url)
+        result = child.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("suites"), list):
+            raise HarvestError("Jenkins child report omits testcase suites")
+        counts: Counter[str] = Counter()
+        for suite in result["suites"]:
+            if not isinstance(suite, dict) or not isinstance(suite.get("cases"), list):
+                raise HarvestError("Jenkins suite omits testcase rows")
+            for case in suite["cases"]:
+                if not isinstance(case, dict) or not case.get("className") or not case.get("name"):
+                    raise HarvestError("Jenkins testcase omits its identity")
+                status = case.get("status")
+                outcome = {
+                    "PASSED": "passed",
+                    "FIXED": "passed",
+                    "FAILED": "red",
+                    "REGRESSION": "red",
+                    "SKIPPED": "skipped",
+                }.get(status)
+                if outcome is None or bool(case.get("skipped", False)) != (outcome == "skipped"):
+                    raise HarvestError("Jenkins testcase status is unknown or contradictory")
+                counts[outcome] += 1
+                identity = f"{parts[0]}::{case['className']}#{case['name']}"
+                occurrences[identity] += 1
+                if occurrences[identity] > 1:
+                    identity += f" [duplicate-name {occurrences[identity]}]"
+                identities.append(identity)
+                if outcome == "red":
+                    red_ids.append(identity)
+        for field, outcome in (
+            ("passCount", "passed"),
+            ("failCount", "red"),
+            ("skipCount", "skipped"),
+        ):
+            if type(result.get(field)) is not int or result[field] != counts[outcome]:
+                raise HarvestError("Jenkins child totals contradict testcase rows")
+        skipped += counts["skipped"]
+    for field, count in (
+        ("totalCount", len(identities)),
+        ("failCount", len(red_ids)),
+        ("skipCount", skipped),
+    ):
+        if type(report.get(field)) is not int or report[field] != count:
+            raise HarvestError("Jenkins aggregate totals contradict child testcase rows")
+    retain = lambda values: (
+        tuple(values)
+        if len(values) <= IDENTITY_COUNT_BOUND
+        and all(len(value) <= IDENTITY_CHARACTER_BOUND for value in values)
+        else ()
+    )
+    notes = [
+        "Jenkins JUnit API final testcase rows; repeated names retained as separate executions"
+    ]
+    if identities and not retain(identities):
+        notes.append(
+            "Jenkins executed identities exceed the record bound; full rows remain in the referenced API archive"
+        )
+    return HarvestedCell(
+        cell=CellTarget(
+            cell_id=cell_id,
+            build="ok",
+            executed_count=len(identities),
+            executed_ids=retain(identities),
+            red_count=len(red_ids),
+            red_ids=retain(red_ids),
+            skipped=skipped,
+            modules=modules.modules,
+            modules_basis="log",
+            command=command,
+            grade="A",
+            evidence_refs=evidence_refs,
+        ),
+        notes=tuple(notes),
+    )
+
+
 def read_jobs(snapshot_dir: Path) -> tuple[tuple[str, str], ...]:
     """Return ``(check name, conclusion)`` in the run's own job order."""
 
@@ -561,6 +684,9 @@ def apply_job_logs(
     """Replace pool lower bounds with the exact universe a job log proves."""
 
     notes: list[str] = []
+    original_cells = list(cells)
+    ambiguous_cells: set[int] = set()
+    maven_logs: set[int] = set()
     for zip_path in sorted(snapshot_dir.glob(LOGS_GLOB)):
         try:
             logs = job_logs(zip_path)
@@ -572,6 +698,40 @@ def apply_job_logs(
             if index is None:
                 continue
             found = modules_from_log(text)
+            # Nested tools print paths relative to their own invocation root.
+            # A Gradle ':' emitted inside a Maven job is not repository '.'.
+            # Keep independently established pool bounds until a source/receipt
+            # proves that nested working directory.
+            run_tools = {
+                parse_ci_command(match.group(1)).tool
+                for match in re.finditer(r"##\[group\]Run ([^\r\n]+)", text)
+            } - {"unknown"}
+            if found.tool == "gradle" and "maven" in run_tools:
+                ambiguous_cells.add(index)
+                cells[index] = original_cells[index]
+                notes.append(
+                    f"cell {cells[index].cell_id}: Gradle module scope unavailable: "
+                    "nested or mixed Maven/Gradle invocation has no proven project root"
+                )
+                continue
+            notes.extend(
+                f"cell {cells[index].cell_id}: {note} ({zip_path.name}/{job_name})"
+                for note in found.notes
+            )
+            if found.tool == "maven":
+                if found.notes or index in maven_logs:
+                    ambiguous_cells.add(index)
+                if index in maven_logs:
+                    notes.append(
+                        f"cell {cells[index].cell_id}: Maven module scope unavailable: "
+                        "multiple job logs cannot be merged by display name"
+                    )
+                maven_logs.add(index)
+            if index in ambiguous_cells:
+                # Keep independently proven lower bounds; an earlier/later log
+                # must not hide this cell's unresolved invocation identities.
+                cells[index] = original_cells[index]
+                continue
             if not found.modules:
                 continue
             previous = cells[index].modules if cells[index].modules_basis == "log" else ()
@@ -622,28 +782,39 @@ def apply_declared_scope(
     """Attach the CI command to each cell and, absent a log, the declared reactor."""
 
     notes: list[str] = []
-    steps = []
+    workflows = {}
     for file_name in workflow_files:
         text = (snapshot_dir / WORKFLOWS_DIR / file_name).read_text(
             encoding="utf-8", errors="replace"
         )
-        steps.extend(extract_build_commands(text))
-    if not steps:
+        workflows[file_name] = text
+    if not workflows:
         return ()
     sources = snapshot_dir / SOURCES_DIR
     for index, cell in enumerate(cells):
         matching = [
-            step for step in steps if _job_matches_check(step.job_name_template, cell.cell_id)
+            (file_name, step)
+            for file_name, text in workflows.items()
+            for step in extract_build_commands(text, cell_id=cell.cell_id)
+            if _job_matches_check(step.job_name_template, cell.cell_id)
         ]
-        if len({(step.text, step.working_directory) for step in matching}) != 1:
+        if len({(file_name, step.job_id) for file_name, step in matching}) != 1:
             continue
-        step = matching[0]
-        command = parse_ci_command(step.text)
-        recorded_command = (
-            step.text
-            if step.working_directory == "."
-            else (f"cd {shlex.quote(step.working_directory)} &&\n{step.text}")
+        sequence = [step for _, step in matching]
+        step = sequence[0]
+        recorded_command = "\n".join(
+            (
+                item.text
+                if item.working_directory == "."
+                else (
+                    f"cd {shlex.quote(item.working_directory)} &&\n{item.text}"
+                    if len(sequence) == 1
+                    else f"(cd {shlex.quote(item.working_directory)} &&\n{item.text}\n)"
+                )
+            )
+            for item in sequence
         )
+        command = parse_ci_command(recorded_command if len(sequence) > 1 else step.text)
         if len(recorded_command) > 2_000:
             notes.append(f"cell {cell.cell_id}: CI command exceeds the text bound")
             continue

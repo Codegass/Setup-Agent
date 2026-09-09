@@ -628,6 +628,8 @@ def _session_detail(
         step_budget=_optional_int(item.get("step_budget")),
         canonical_verdict=summary.canonical_verdict,
         rates=item.get("rates") if isinstance(item.get("rates"), dict) else None,
+        ci_comparison=item.get("ci_comparison"),
+        ci_comparison_lines=item.get("ci_comparison_lines") or [],
         snapshot_status=summary.snapshot_status,
         legacy=summary.legacy,
         report_delivery_status=summary.report_delivery_status,
@@ -969,6 +971,9 @@ def _setup_artifact_item(
         verdict_source = "snapshot"
         rates = None
 
+    from sag.agent.ci_comparison import render_ci_comparison_lines
+
+    comparison = snapshot.ci_comparison if snapshot is not None else None
     return {
         "id": session_id,
         "workspace": workspace_id,
@@ -977,6 +982,8 @@ def _setup_artifact_item(
         "evidence_status": evidence_status,
         "canonical_verdict": canonical_verdict,
         "rates": rates,
+        "ci_comparison": comparison.model_dump(mode="json") if comparison else None,
+        "ci_comparison_lines": render_ci_comparison_lines(comparison),
         "snapshot_status": snapshot_status,
         "legacy": legacy,
         "verdict_source": verdict_source,

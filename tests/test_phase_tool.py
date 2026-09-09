@@ -115,6 +115,8 @@ def _authored_execution_plan():
                 "tool": "build",
                 "params": {
                     "action": "compile",
+                    "system": "maven",
+                    "source_command": "./mvnw compile -DskipTests",
                     "working_directory": "/workspace/demo",
                     "args": "-DskipTests",
                 },
@@ -137,6 +139,8 @@ def _authored_execution_plan():
                 "tool": "build",
                 "params": {
                     "action": "test",
+                    "system": "maven",
+                    "source_command": "./mvnw test -Dtest=FocusedSuite",
                     "working_directory": "/workspace/demo",
                     "args": "-Dtest=FocusedSuite",
                 },

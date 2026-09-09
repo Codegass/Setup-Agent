@@ -21,7 +21,9 @@ import base64
 import hashlib
 import json
 import shlex
+from pathlib import Path
 
+import pytest
 from test_container_io import FakeContainer
 from test_python_tool import fail, ok
 
@@ -138,6 +140,16 @@ def framed_inventory(paths):
     return "".join(lines)
 
 
+def framed_source_prefix(content, limit):
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    prefix = raw[:limit]
+    return (
+        f"SAG_FILE_PREFIX_V1\t{len(prefix)}\t{hashlib.sha256(prefix).hexdigest()}\t"
+        f"{int(len(raw) > limit)}\t{base64.b64encode(prefix).decode('ascii')}\n"
+        "SAG_FILE_PREFIX_END_V1\n"
+    )
+
+
 class FakeTree:
     """Container double with a virtual checkout, so probes are observable.
 
@@ -187,12 +199,21 @@ class FakeTree:
         not a publication store, so the host authority binds through this."""
         return self(command, **kwargs)
 
+    def execute_control_command(self, command, **kwargs):
+        return self.execute_command(command, **kwargs)
+
     def __call__(self, command, **kwargs):
         self.commands.append(command)
         self.command_options.append(dict(kwargs))
         tokens = (
             shlex.split(command) if "\n" not in command or command.startswith("python3 -c ") else []
         )
+        if "SAG_FILE_PREFIX_V1" in command:
+            path, limit = tokens[-2:]
+            relative = self.relative(path)
+            if relative in self.unreadable or relative not in self.files:
+                return fail(f"prefix: {path}: unreadable")
+            return ok(framed_source_prefix(self.files[relative], int(limit)))
         atomic_command = (
             tokens[:3] == ["mkdir", "-p", "--"]
             or tokens[:2] in ([":", ">"], ["printf", "%s"], ["rm", "-f"])
@@ -247,7 +268,7 @@ class FakeTree:
         ]
 
     def reads(self):
-        return [command for command in self.commands if command.startswith("head -c ")]
+        return [command for command in self.commands if "SAG_FILE_PREFIX_V1" in command]
 
 
 def paths_of(result):
@@ -411,7 +432,7 @@ def test_entries_are_sorted_by_path_and_read_once_each():
         f"{ROOT}/pom.xml",
     ]
     assert len(execute.reads()) == 3
-    assert f"head -c {MAX_FILE_BYTES}" in execute.reads()[0]
+    assert shlex.split(execute.reads()[0])[-1] == str(MAX_FILE_BYTES)
 
 
 def test_markdown_anywhere_within_the_depth_bound_remains_visible():
@@ -879,6 +900,7 @@ def test_the_byte_budget_stops_at_the_cap_and_the_fingerprint_covers_the_indexed
         f"{ROOT}/c/README.md": "over_budget",
     }
     assert result["document_map_fingerprint"] == document_map_fingerprint(result["entries"])
+    assert [int(shlex.split(command)[-1]) for command in execute.reads()] == [24, 8]
 
 
 def test_a_file_over_the_per_file_budget_is_indexed_truncated_not_dropped(monkeypatch):
@@ -889,6 +911,85 @@ def test_a_file_over_the_per_file_budget_is_indexed_truncated_not_dropped(monkey
 
     assert entry.discovery_status == "truncated"
     assert entry.source_hash == hashlib.sha256(README[:8].encode("utf-8")).hexdigest()
+
+
+class PresentationTruncatingSource(FakeTree):
+    """Ordinary stdout is a display; the encoded machine read must survive it."""
+
+    def __call__(self, command, **kwargs):
+        result = super().__call__(command, **kwargs)
+        if command.startswith("head -c ") or "SAG_FILE_PREFIX_V1" in command:
+            output = result.get("output", "")
+            if kwargs.get("truncate_output", True) and len(output) > 4000:
+                lines = output.splitlines()
+                output = "\n".join([*lines[:25], "[DISPLAY TRUNCATED]", *lines[-25:]])
+            result["output"] = output.strip()
+        return result
+
+
+def test_polaris_makefile_is_indexed_and_reread_from_exact_source_bytes():
+    raw = (
+        Path(__file__).parent / "fixtures/d3r1_remediation/document_source/polaris.Makefile"
+    ).read_bytes()
+    assert len(raw) == 22437
+    source = PresentationTruncatingSource(files={"Makefile": raw.decode("utf-8")})
+    entry = entry_named(discover_document_map(source, ROOT), "Makefile")
+    assert entry.source_hash == hashlib.sha256(raw).hexdigest()
+    text = document_map.read_entry_text(source, entry)
+    assert text.encode("utf-8") == raw
+    assert "client-unit-test:" in text
+    assert entry.indexed_bytes == len(raw)
+    assert entry.content_truncated is False
+
+
+@pytest.mark.parametrize("text", ["# 中文\n\n", "\n# beginning and end\n\n", ""])
+def test_source_digest_and_text_keep_unicode_and_terminal_newlines(text):
+    source = PresentationTruncatingSource(files={"README.md": text})
+    entry = entry_named(discover_document_map(source, ROOT), "README.md")
+    assert entry.source_hash == hashlib.sha256(text.encode()).hexdigest()
+    assert document_map.read_entry_text(source, entry) == text
+
+
+def test_exact_budget_eof_is_not_reported_as_a_prefix(monkeypatch):
+    monkeypatch.setattr(document_map, "MAX_FILE_BYTES", 8)
+    source = FakeTree(files={"README.md": "1234567\n"})
+    entry = entry_named(discover_document_map(source, ROOT), "README.md")
+    assert entry.discovery_status == "indexed"
+    assert entry.content_truncated is False
+    source.files["README.md"] += "x"
+    with pytest.raises(document_map.DocumentSourceChangedError):
+        document_map.read_entry_text(source, entry)
+
+
+def test_budget_split_utf8_indexes_only_complete_characters(monkeypatch):
+    monkeypatch.setattr(document_map, "MAX_FILE_BYTES", 8)
+    source = FakeTree(files={"README.md": "1234567中文\n"})
+    entry = entry_named(discover_document_map(source, ROOT), "README.md")
+    assert entry.indexed_bytes == 7
+    assert entry.content_truncated is True
+    assert entry.source_hash == hashlib.sha256(b"1234567").hexdigest()
+    assert document_map.read_entry_text(source, entry) == "1234567"
+    source.files["README.md"] = "1234567different tail"
+    assert document_map.read_entry_text(source, entry) == "1234567"
+
+
+@pytest.mark.parametrize("fault", ["plain_text", "clipped_footer", "dispatch_failure"])
+def test_invalid_source_transport_never_becomes_an_indexed_document(fault):
+    class InvalidSource(FakeTree):
+        def __call__(self, command, **kwargs):
+            result = super().__call__(command, **kwargs)
+            if "SAG_FILE_PREFIX_V1" in command:
+                if fault == "plain_text":
+                    result["output"] = "# plausible source\n"
+                elif fault == "clipped_footer":
+                    result["output"] = result["output"].splitlines()[0]
+                else:
+                    result["dispatch_status"] = "failed"
+            return result
+
+    result = discover_document_map(InvalidSource(files={"README.md": README}), ROOT)
+    assert result["entries"] == []
+    assert conflict_reasons(result) == {f"{ROOT}/README.md": "unreadable"}
 
 
 def test_a_section_index_over_its_bound_is_cut_and_the_entry_says_truncated(monkeypatch):
@@ -1046,6 +1147,8 @@ def test_an_entry_payload_exposes_no_content_bearing_key():
         "section_index",
         "parser_version",
         "discovery_status",
+        "indexed_bytes",
+        "content_truncated",
     }
 
 

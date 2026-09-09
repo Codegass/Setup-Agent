@@ -429,6 +429,28 @@ def test_a_terminated_job_settles_into_an_ordinary_receipt():
     assert settlements[0].receipt_id == receipt["receipt_id"]
 
 
+@pytest.mark.parametrize("multiple", [False, True])
+def test_maven_settlement_discloses_unresolved_reactor_scope(multiple):
+    log = "[INFO] Reactor Summary:\n[INFO] first ... SUCCESS"
+    if multiple:
+        log += "\n[INFO] BUILD SUCCESS\n[INFO] Reactor Summary:\n[INFO] second ... SUCCESS\n[INFO] BUILD SUCCESS"
+    orchestrator = _with_obligation(
+        _orchestrator(files={LOG_PATH: log}), tool="maven", argv=f"{ROOT}/mvnw test"
+    )
+
+    settle_open_obligations(orchestrator)
+
+    (receipt,) = _receipts(orchestrator)
+    assert receipt["tool"] == "maven"
+    assert receipt["exit_code"] == 0
+    assert "module_outcomes" not in receipt
+    assert any(
+        omission["field"] == "module_outcomes"
+        and "maven_reactor_summary_boundaries_unavailable" in omission["reasons"]
+        for omission in receipt["evidence_omissions"]
+    )
+
+
 def test_an_incomplete_receipt_ledger_blocks_settlement_instead_of_double_claiming():
     orchestrator = HostTerminalOrchestrator()
     orchestrator.filesystem = ReceiptLedgerReadFailingJobContainer(

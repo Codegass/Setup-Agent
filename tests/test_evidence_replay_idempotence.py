@@ -36,13 +36,16 @@ from container_evidence_fakes import (
     add_published_mutable_json,
     canonical_json,
     complete_receipt,
+    complete_run_pin,
     strict_published_evidence,
 )
+from test_container_io import FakeContainer
 
 from sag.agent.attempt_policy import CurrentBuildReceiptScope
 from sag.agent.evidence_assessments import ReceiptAssessment, validate_assessment_v2
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
+    RUN_PIN_LOGICAL_ARTIFACT_ID,
     evidence_publication_authority_for,
 )
 from sag.agent.evidence_records import (
@@ -59,7 +62,6 @@ from sag.agent.phase_gates import (
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.agent.physical_validator import PhysicalValidator
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
-from test_container_io import FakeContainer
 
 WORKSPACE = "/workspace/bigtop"
 PRODUCER = f"{WORKSPACE}/bigtop-data-generators"
@@ -978,6 +980,16 @@ class ParserOrchestrator:
             target_sha="a" * 40,
             run_pin=False,
         )
+        self.pin_path = workspace.workspace / ".setup_agent/run-pin.json"
+        self.pin_raw = add_published_mutable_json(
+            self,
+            self.evidence,
+            path=str(self.pin_path),
+            record_kind="run_pin",
+            record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            payload=complete_run_pin("run-pytest", "a" * 40),
+        )
         authority = evidence_publication_authority_for(self)
         for path in sorted(workspace.receipts_dir.glob("*.json")):
             try:
@@ -1011,6 +1023,12 @@ class ParserOrchestrator:
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         text = command.strip()
+        if str(self.pin_path) in text and "SAG_NAMED_JSON_RECORD_V1" in text:
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream([("run-pin.json", self.pin_raw)]),
+            }
         if text.startswith(
             (
                 "mkdir -p -- ",
@@ -1041,9 +1059,7 @@ class ParserOrchestrator:
             quoted_glob = text.partition(" in ")[2].partition("; do")[0]
             target = shlex.split(quoted_glob)[0]
             directory = Path(target[: -len("/*.json")])
-            records = [
-                (path.name, path.read_bytes()) for path in sorted(directory.glob("*.json"))
-            ]
+            records = [(path.name, path.read_bytes()) for path in sorted(directory.glob("*.json"))]
             return {
                 "exit_code": 0,
                 "success": True,
@@ -1085,6 +1101,7 @@ def parser_workspace(tmp_path, monkeypatch):
         effective_action="test",
         argv="mvn -B test",
         working_directory=str(workspace.primary_root),
+        target_sha="a" * 40,
         exit_code=0,
         before={},
         after={},
@@ -1098,28 +1115,29 @@ def parser_workspace(tmp_path, monkeypatch):
         ],
         "changed": [],
     }
-    workspace.write_receipt(
-        validate_receipt_v2(receipt, expected_id=receipt["receipt_id"])
-    )
+    workspace.write_receipt(validate_receipt_v2(receipt, expected_id=receipt["receipt_id"]))
 
     import sag.agent.attempt_policy as attempt_policy
-    from sag.agent.attempt_policy import TestAttemptRequirement, TestCandidateResolution
+    from sag.agent.attempt_policy import TestReportScope
 
     root = str(workspace.primary_root)
-    requirement = TestAttemptRequirement(
-        root=root,
-        system="maven",
-        required_action={"tool": "build", "params": {"working_directory": root}},
-    )
+    # These tests exercise the published receipt/assessment readers and real
+    # compact parser. Supply the observed coordinate at its own seam; forced
+    # execution eligibility is independent and is not part of this fixture.
     monkeypatch.setattr(
         attempt_policy,
-        "resolve_survey_test_candidates",
-        lambda orchestrator: TestCandidateResolution(
+        "resolve_test_report_scope",
+        lambda orchestrator, **kwargs: TestReportScope(
             status="available",
-            candidates=(requirement,),
+            roots=(root,),
             project_root=str(workspace.project),
             workspace_root=str(workspace.workspace),
-            primary=requirement,
+            primary_root=root,
+            receipt_ids=tuple(
+                receipt["receipt_id"]
+                for receipt in kwargs["receipts"]
+                if receipt["working_directory"] == root
+            ),
         ),
     )
     return workspace
@@ -1153,9 +1171,7 @@ def test_a_well_formed_assessment_does_not_disturb_the_rollup(parser_workspace):
 
 
 def test_a_corrupt_assessment_blocks_evidence_closure_and_names_the_file(parser_workspace):
-    parser_workspace.write_raw_assessment(
-        "asm-0001.json", '{"assessment_id": "asm-0001", "receipt'
-    )
+    parser_workspace.write_raw_assessment("asm-0001.json", '{"assessment_id": "asm-0001", "receipt')
 
     _validator, result = _parse(parser_workspace)
 
@@ -1224,6 +1240,7 @@ def test_the_compact_parser_accepts_a_v2_receipt(parser_workspace):
         effective_action="test",
         argv="mvn -B test",
         working_directory=str(parser_workspace.primary_root),
+        target_sha="a" * 40,
         exit_code=0,
         before={},
         after={},
@@ -1232,11 +1249,9 @@ def test_the_compact_parser_accepts_a_v2_receipt(parser_workspace):
         "new": [],
         "changed": [
             {"path": str(report), "sha256": hashlib.sha256(report.read_bytes()).hexdigest()}
-        ]
+        ],
     }
-    parser_workspace.write_receipt(
-        validate_receipt_v2(payload, expected_id=payload["receipt_id"])
-    )
+    parser_workspace.write_receipt(validate_receipt_v2(payload, expected_id=payload["receipt_id"]))
 
     _validator, result = _parse(parser_workspace)
 

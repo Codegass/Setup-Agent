@@ -22,7 +22,11 @@ from sag.evidence import (
 )
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
-from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metrics
+from sag.tools.module_metrics import (
+    MODULE_METRICS_PATH,
+    MODULE_METRICS_VERSION,
+    assemble_module_metrics,
+)
 
 # Sentinel for memoizing _build_module_metrics (the result can legitimately be
 # None, so None cannot double as "not computed yet").
@@ -902,12 +906,15 @@ class ReportTool(BaseTool, UIEventEmitter):
             return None
         canonical = snapshot.get("canonical_snapshot")
         if snapshot.get("mode") == "setup" and isinstance(canonical, dict):
+            from sag.agent.ci_comparison import render_ci_comparison_lines
+
             lines = render_snapshot_metric_lines(canonical)
             test_stats = canonical.get("test_stats")
             if isinstance(test_stats, dict):
                 flaky = test_stats.get("flaky_count")
                 if type(flaky) is int and flaky > 0:
                     lines[1] += f" · {flaky} flaky"
+            lines.extend(render_ci_comparison_lines(canonical.get("ci_comparison")))
             return lines
         if "rates" in snapshot:
             rates = snapshot.get("rates")
@@ -1276,6 +1283,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             module_metrics = None
         if module_metrics:
             msum = module_metrics.get("module_summary") or {}
+            report_snapshot["status"]["modules_unavailable_reason"] = module_metrics.get("reason")
             report_snapshot["status"]["modules_detected"] = msum.get("modules_total")
             report_snapshot["status"]["modules_built"] = msum.get("modules_built")
             report_snapshot["status"]["modules_failed_count"] = msum.get("modules_failed")
@@ -1426,6 +1434,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         excluded_modules: set[str] = set()
         failed_tests: set[str] = set()
         reactor_records: List[Dict[str, Any]] = []
+        reactor_entries: List[Dict[str, Any]] = []
         failed_modules: List[str] = []
         modules_expected: Optional[int] = None
 
@@ -1478,7 +1487,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "pass_pct": pass_pct,
             }
 
-        for raw_line in raw_lines:
+        for entry_index, raw_line in enumerate(raw_lines, 1):
             line = raw_line.strip()
             if not line:
                 continue
@@ -1500,6 +1509,33 @@ class ReportTool(BaseTool, UIEventEmitter):
             reactor_summary = entry.get("reactor_summary")
             if isinstance(reactor_summary, list):
                 reactor_records.extend(rec for rec in reactor_summary if isinstance(rec, dict))
+            if (
+                reactor_summary
+                or entry.get("reactor_summary_blocks")
+                or entry.get("reactor_ambiguous_labels")
+                or entry.get("reactor_scope_issues")
+            ):
+                # Keep invocation boundaries: equal labels in separate rebuilds
+                # are different evidence from duplicate rows in one summary.
+                reactor_entries.append(
+                    {
+                        "entry_index": entry_index,
+                        **{
+                            key: entry[key]
+                            for key in (
+                                "event",
+                                "timestamp",
+                                "working_directory",
+                                "command",
+                                "reactor_summary",
+                                "reactor_summary_blocks",
+                                "reactor_ambiguous_labels",
+                                "reactor_scope_issues",
+                            )
+                            if key in entry
+                        },
+                    }
+                )
             entry_failed_modules = entry.get("failed_modules")
             if isinstance(entry_failed_modules, list):
                 failed_modules.extend(str(mod) for mod in entry_failed_modules if mod)
@@ -1569,7 +1605,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # ran (build_summary entries) — otherwise the reactor module list would be
         # discarded and the module metrics would fall back to the depth-limited
         # filesystem scan.
-        if not modules_seen and not aggregate_entry and not reactor_records and not failed_modules:
+        if not modules_seen and not aggregate_entry and not reactor_entries and not failed_modules:
             return {}
 
         aggregate_counts = aggregate_entry.get("_normalized_tests", {}) if aggregate_entry else {}
@@ -1608,6 +1644,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         history["exclusions"]["modules"] = sorted(excluded_modules)
         history["failed_tests"] = sorted(failed_tests)
         history["reactor_records"] = reactor_records
+        history["reactor_entries"] = reactor_entries
         history["failed_modules"] = sorted(dict.fromkeys(failed_modules))
         history["flags"]["fail_at_end"] = (
             history["last_cmd"].get("fail_at_end") if history["last_cmd"] else None
@@ -2243,6 +2280,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             module_metrics = None
         if module_metrics:
             msum = module_metrics.get("module_summary") or {}
+            status["modules_unavailable_reason"] = module_metrics.get("reason")
             status["modules_tested"] = msum.get("modules_tested")
             status["modules_test_bearing"] = msum.get("modules_test_bearing")
         if (
@@ -4491,6 +4529,42 @@ with open(lock_path,"a+b") as lock:
             logger.warning(f"Failed to persist report metrics: {exc}")
             return False
 
+    @staticmethod
+    def _reactor_scope_problem(test_history: dict) -> Optional[str]:
+        """Refuse to turn ambiguous or incomplete row occurrences into identities."""
+        from sag.agent.receipt_structure import maven_module_identity_ambiguous
+
+        history = test_history or {}
+        entries = history.get("reactor_entries")
+        if not entries:
+            # Older callers carry only the flattened records. Without entry
+            # boundaries, equal names cannot be assumed to describe retries.
+            entries = [{"reactor_summary": history.get("reactor_records") or []}]
+        for entry in entries:
+            if entry.get("reactor_scope_issues"):
+                return "Maven reactor scope is unavailable: " + ", ".join(
+                    str(issue) for issue in entry["reactor_scope_issues"]
+                )
+            rows = entry.get("reactor_summary") or []
+            if entry.get("reactor_ambiguous_labels") or maven_module_identity_ambiguous(
+                {"tool": "maven", "module_outcomes": rows}
+            ):
+                return "Maven module display names are repeated or collide; their identities are unavailable"
+            blocks = entry.get("reactor_summary_blocks") or []
+            if len(blocks) > 1:
+                return "Multiple Maven summaries in one invocation do not prove one module scope"
+            if blocks:
+                block = blocks[0]
+                if (
+                    not isinstance(block, dict)
+                    or block.get("result") not in {"SUCCESS", "FAILURE"}
+                    or block.get("unparsed_lines")
+                    or block.get("duplicate_labels")
+                    or block.get("row_count") != len(rows)
+                ):
+                    return "Maven reactor summary is incomplete or ambiguous"
+        return None
+
     def _reactor_status_from_history(self, test_history: dict) -> dict:
         """Flatten reactor_summary records from test history into {label: status}.
 
@@ -4498,6 +4572,8 @@ with open(lock_path,"a+b") as lock:
         "Apache Kafka :: Connect :: API"); the metrics assembler normalizes both
         sides so these reconcile with the path-derived scan keys.
         """
+        if self._reactor_scope_problem(test_history):
+            return {}
         status: dict = {}
         records = (test_history or {}).get("reactor_records") or []
         for rec in records:
@@ -4541,6 +4617,21 @@ with open(lock_path,"a+b") as lock:
         return reported in ("python", "pip/poetry")
 
     def _compute_module_metrics(self, test_history: dict, *, generated_at: str):
+        scope_problem = self._reactor_scope_problem(test_history)
+        if scope_problem:
+            # An absent summary may fall back to physical evidence; an
+            # ambiguous summary may not. Preserve its rows and entry boundaries
+            # for review, while every module total remains unavailable.
+            return {
+                "version": MODULE_METRICS_VERSION,
+                "generated_at": generated_at,
+                "status": "unavailable",
+                "reason": scope_problem,
+                "module_summary": None,
+                "modules": [],
+                "reactor_records": (test_history or {}).get("reactor_records") or [],
+                "reactor_entries": (test_history or {}).get("reactor_entries") or [],
+            }
         validator = getattr(self, "physical_validator", None)
         if validator is None:
             return None
@@ -4740,6 +4831,14 @@ with open(lock_path,"a+b") as lock:
         """Markdown 'Submodule Breakdown' section; [] for single-module projects."""
         if not module_metrics:
             return []
+        if module_metrics.get("status") == "unavailable":
+            return [
+                "",
+                "## 🧩 Submodule Breakdown",
+                "",
+                "Module scope unavailable: " + str(module_metrics.get("reason") or "unknown scope"),
+                "",
+            ]
         summary = module_metrics.get("module_summary") or {}
         modules = module_metrics.get("modules") or []
         if summary.get("single_module") or len(modules) <= 1:
@@ -5053,7 +5152,9 @@ with open(lock_path,"a+b") as lock:
             )
             lines.append(f"│ Pass Rate       │ {pass_msg:<32} │")
 
-        if modules_detected:
+        if status.get("modules_unavailable_reason"):
+            lines.append(f"│ Module Coverage │ {'⚠️ unavailable':<32} │")
+        elif modules_detected:
             mod_icon = (
                 "✅" if modules_built >= modules_detected else "⚠️" if modules_built > 0 else "❌"
             )
@@ -5070,6 +5171,9 @@ with open(lock_path,"a+b") as lock:
         lines.append("└─────────────────┴──────────────────────────────────┘")
         lines.append("```")
         lines.append("")
+        if status.get("modules_unavailable_reason"):
+            lines.append("Module scope unavailable: " + str(status["modules_unavailable_reason"]))
+            lines.append("")
 
         return lines
 

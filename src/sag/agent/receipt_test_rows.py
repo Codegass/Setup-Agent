@@ -109,7 +109,9 @@ _CONTAINER_REPORT_ROW_PARSER = r"""
 import json
 import sys
 import xml.etree.ElementTree as ET
+from collections import Counter
 from hashlib import sha256
+from pathlib import PurePosixPath
 
 PER_FILE_ROW_CAP = ROW_CAP_PER_FILE
 TOTAL_ROW_CAP = ROW_CAP_TOTAL
@@ -161,29 +163,58 @@ def collection_node(testcase):
     return False
 
 
-def declared_count(root):
-    # Prefer the document root's aggregate.  Otherwise sum only OUTERMOST
-    # suites: nested suite counts include their children and summing every
-    # testsuite would double count them.
-    try:
-        value = root.get("tests")
-        if value is not None:
-            return max(0, int(value))
-    except (TypeError, ValueError):
-        return None
-    outer = [child for child in root if local_name(child) == "testsuite"]
-    if not outer and local_name(root) == "testsuite":
-        outer = [root]
-    values = []
-    for suite in outer:
+def declarations_agree(root):
+    # Every explicit nested declaration must agree, not just the outer total.
+    for suite in root.iter():
+        if local_name(suite) not in ("testsuite", "testsuites"):
+            continue
         value = suite.get("tests")
         if value is None:
-            return None
+            continue
         try:
-            values.append(max(0, int(value)))
+            count = int(value)
         except (TypeError, ValueError):
-            return None
-    return sum(values) if values else None
+            return False
+        actual = sum(local_name(child) == "testcase" for child in suite.iter())
+        if count < 0 or count != actual:
+            return False
+    return True
+
+
+def report_group(path):
+    for marker in ("/target/surefire-reports/", "/target/failsafe-reports/"):
+        if marker in path:
+            return path.split(marker, 1)[0] + marker.rstrip("/")
+    return str(PurePosixPath(path).parent)
+
+
+def test_key(testcase):
+    return (testcase.get("classname") or "", testcase.get("name") or "", outcome(testcase))
+
+
+def native_testng(root):
+    methods = Counter()
+    for cls in root.iter():
+        if local_name(cls) != "class":
+            continue
+        for method in cls:
+            if local_name(method) != "test-method" or method.get("is-config") == "true":
+                continue
+            status = {"PASS": "passed", "FAIL": "failed", "SKIP": "skipped"}.get(method.get("status"))
+            # Parameter text is not a stable identity contract; retain refusal.
+            if not cls.get("name") or not method.get("name") or not status or any(
+                local_name(child) == "params" for child in method
+            ):
+                raise ValueError("native_testng_identity_unavailable")
+            methods[(cls.get("name"), method.get("name"), status)] += 1
+    counts = Counter()
+    for (_, _, status), count in methods.items():
+        counts[status] += count
+    for attr, value in (("total", sum(methods.values())), ("passed", counts["passed"]),
+                        ("failed", counts["failed"]), ("skipped", counts["skipped"])):
+        if int(root.get(attr, "-1")) != value:
+            raise ValueError("native_testng_count_mismatch")
+    return methods
 
 
 def row_bytes(row):
@@ -256,6 +287,54 @@ def drop(status, cap):
     bounds["dropped_red" if status in RED else "dropped_green"] += 1
 
 
+# Auxiliary formats corroborate an invocation; they do not add a second set of
+# executions. Native TestNG identity is accepted only through its explicit JUnit
+# projection, whose generator marker and full identity/outcome must agree.
+native = {}
+native_seen = {}
+summaries = {}
+verified_auxiliary_paths = set()
+for report in reports:
+    path = report.get("path") or ""
+    if PurePosixPath(path).name not in ("testng-results.xml", "failsafe-summary.xml"):
+        continue
+    try:
+        digest, body = digest_and_body(path)
+        if digest != report.get("sha256") or body is None:
+            continue  # the normal read below reports the exact failure/bound
+        root = ET.fromstring(body)
+        group = report_group(path)
+        if local_name(root) == "testng-results":
+            if group in native:
+                raise ValueError("native_testng_duplicate_summary")
+            methods = native_testng(root)
+            if sum(len(values) for values in native.values()) + len(methods) > TOTAL_ROW_CAP:
+                raise ValueError("native_testng_identity_bound_exceeded")
+            native[group] = methods
+            native_seen[group] = Counter()
+        elif local_name(root) == "failsafe-summary":
+            if group in summaries:
+                raise ValueError("failsafe_duplicate_summary")
+            fields = [local_name(child) for child in root
+                      if local_name(child) in ("completed", "errors", "failures", "skipped")]
+            if len(fields) != len(set(fields)):
+                raise ValueError("failsafe_summary_invalid")
+            values = {local_name(child): int(child.text or "-1") for child in root
+                      if local_name(child) in ("completed", "errors", "failures", "skipped")}
+            if set(values) != {"completed", "errors", "failures", "skipped"} or any(
+                value < 0 for value in values.values()
+            ) or sum(values[key] for key in ("errors", "failures", "skipped")) > values["completed"]:
+                raise ValueError("failsafe_summary_invalid")
+            summaries[group] = values
+        if local_name(root) in ("testng-results", "failsafe-summary"):
+            verified_auxiliary_paths.add(path)
+    except ValueError as exc:
+        result["status"] = "unavailable"
+        result["reasons"].append(str(exc))
+    except Exception:
+        pass  # XML/read failures are reported by the normal read
+
+suite_totals = {}
 for report in reports:
     path = report.get("path")
     expected = str(report.get("sha256") or "").lower()
@@ -283,13 +362,38 @@ for report in reports:
         result["status"] = "unavailable"
         result["reasons"].append("report_unreadable")
         continue
+    kind = local_name(root)
+    group = report_group(path)
+    if kind in ("testng-results", "failsafe-summary"):
+        if path not in verified_auxiliary_paths:
+            result["status"] = "unavailable"
+            result["reasons"].append("auxiliary_report_unverified")
+        continue
+    if kind not in ("testsuite", "testsuites"):
+        result["status"] = "unavailable"
+        result["reasons"].append("unsupported_report_format")
+        continue
     testcases = [element for element in root.iter() if local_name(element) == "testcase"]
-    runtime = [element for element in testcases if not collection_node(element)]
-    declared = declared_count(root)
-    if declared is not None and declared != len(testcases):
+    if not declarations_agree(root):
         result["status"] = "unavailable"
         result["reasons"].append("declared_testcase_count_mismatch")
         continue
+    runtime = [element for element in testcases if not collection_node(element)]
+    if b"Generated by org.testng.reporters.JUnit" in body:
+        represented = Counter(test_key(case) for case in runtime)
+        if group not in native or represented - native[group]:
+            result["status"] = "unavailable"
+            result["reasons"].append("native_testng_projection_unverified")
+            continue
+        selected = []
+        for case in runtime:
+            key = test_key(case)
+            if native_seen[group][key] < native[group][key]:
+                selected.append(case)
+                native_seen[group][key] += 1
+        runtime = selected
+    totals = suite_totals.setdefault(group, Counter())
+    totals.update(outcome(case) for case in runtime)
     suite_files = {}
 
     def map_suite_files(element, inherited=None):
@@ -340,6 +444,17 @@ for report in reports:
         else:
             drop(row["outcome"], "per_file_cap_drops")
 
+for group, methods in native.items():
+    if native_seen[group] != methods:
+        result["status"] = "unavailable"
+        result["reasons"].append("native_testng_identity_unrepresented")
+for group, summary in summaries.items():
+    actual = suite_totals.get(group, Counter())
+    if (summary["completed"] != sum(actual.values()) or summary["errors"] != actual["error"]
+        or summary["failures"] != actual["failed"] or summary["skipped"] != actual["skipped"]):
+        result["status"] = "unavailable"
+        result["reasons"].append("failsafe_summary_count_mismatch")
+
 kept = []
 # The cap a dropped row answers to: rows the per-file bound demoted lose their
 # slot to it, everything else to the total bound.
@@ -359,6 +474,18 @@ for row in kept:
 bounds["kept_rows"] = len(kept)
 bounds["dropped_files"] = len(row_files - kept_files) + len(unparsed_files)
 result["rows"] = kept
+# Fixed-size totals describe this SAME hash-verified read before identity caps.
+# Auxiliary summaries were checked above and never add executions. A file too
+# large to parse or any format/hash/read conflict withdraws complete totals.
+if result["status"] == "complete" and not bounds["unparsed_reports"] and result["report_count"] == len(reports):
+    complete_counts = Counter()
+    for group_counts in suite_totals.values():
+        complete_counts.update(group_counts)
+    result["execution_totals"] = {
+        "reported": sum(complete_counts.values()), "passed": complete_counts["passed"],
+        "failed": complete_counts["failed"], "errors": complete_counts["error"],
+        "skipped": complete_counts["skipped"],
+    }
 result["reasons"] = sorted(set(result["reasons"]))
 print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 """
@@ -578,7 +705,35 @@ def read_delta_testcase_rows(
                 "rows": [],
                 "reasons": ["row_bounds_inconsistent"],
             }
+        totals = payload.get("execution_totals")
+        if totals is not None:
+            fields = {"reported", "passed", "failed", "errors", "skipped"}
+            kept_outcomes = {name: 0 for name in fields - {"reported"}}
+            for row in bounded:
+                field = "errors" if row.get("outcome") == "error" else row.get("outcome")
+                if field in kept_outcomes:
+                    kept_outcomes[field] += 1
+            valid_totals = (
+                isinstance(totals, Mapping)
+                and set(totals) == fields
+                and all(type(value) is int and value >= 0 for value in totals.values())
+                and totals["reported"] == sum(totals[field] for field in fields - {"reported"})
+                and totals["reported"] == bounds["observed_rows"]
+                and all(totals[field] >= value for field, value in kept_outcomes.items())
+                and payload.get("status") == "complete"
+                and not reasons
+                and report_count_valid
+                and not bounds["unparsed_reports"]
+            )
+            if not valid_totals:
+                return {
+                    "schema_version": ROW_ENVELOPE_VERSION,
+                    "status": "unavailable",
+                    "rows": [],
+                    "reasons": ["execution_totals_inconsistent"],
+                }
         return {
+            **({"execution_totals": dict(totals)} if totals is not None else {}),
             "schema_version": ROW_ENVELOPE_VERSION,
             "status": (
                 "complete"

@@ -973,6 +973,7 @@ class GradleTool(BaseTool):
         _env_preflight: bool = True,
         _compile_source_languages: Optional[List[str]] = None,
         _requirements: Optional[Mapping[str, Any]] = None,
+        _source_argv: Optional[List[str]] = None,
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.
@@ -1145,7 +1146,7 @@ class GradleTool(BaseTool):
                 logger.info(f"💡 Current approach will only test modules until first failure!")
 
         # Handle fail_at_end for test tasks
-        if fail_at_end and is_test_task:
+        if fail_at_end and is_test_task and _source_argv is None:
             logger.info("📝 Enabling test failure ignore for fail_at_end with test tasks")
             logger.info("   (Gradle's --continue will process all modules even with failures)")
             # Add test.ignoreFailures property
@@ -1166,6 +1167,7 @@ class GradleTool(BaseTool):
             configure_on_demand,
             build_cache,
             fail_at_end,
+            _source_argv=_source_argv,
         )
 
         # Execute the command
@@ -1375,6 +1377,7 @@ class GradleTool(BaseTool):
                     ),
                     terminal_observation=True,
                 )
+                detached_result.raw_output = full_output
                 if not detached_result.succeeded:
                     detached_result.metadata.update(
                         {
@@ -1408,8 +1411,8 @@ class GradleTool(BaseTool):
                             if result["exit_code"] == 0 and not compile_mismatch
                             else "failed"
                         ),
-                        output=result["output"],
-                        raw_output=result["output"],
+                        output=full_output,
+                        raw_output=full_output,
                         error=compile_mismatch,
                         **evidence_fields,
                         metadata={
@@ -1441,7 +1444,7 @@ class GradleTool(BaseTool):
                         output=self._format_compile_coverage_failure(
                             analysis, compile_mismatch, ref_id
                         ),
-                        raw_output=result["output"],
+                        raw_output=full_output,
                         error=compile_mismatch,
                         error_code="GRADLE_COMPILE_NO_SOURCE_MISMATCH",
                         suggestions=[
@@ -1466,7 +1469,7 @@ class GradleTool(BaseTool):
                 return self._finalize_main_result(
                     ToolResult.completed_success(
                         output=self._format_success_output_enhanced(analysis, ref_id),
-                        raw_output=result["output"],
+                        raw_output=full_output,
                         **evidence_fields,
                         metadata={
                             "command": gradle_cmd,
@@ -1482,7 +1485,7 @@ class GradleTool(BaseTool):
             else:
                 return self._finalize_main_result(
                     self._handle_gradle_error(
-                        result["output"],
+                        full_output,
                         result["exit_code"],
                         gradle_cmd,
                         analysis,
@@ -1523,7 +1526,6 @@ class GradleTool(BaseTool):
         """
         if preamble:
             tool_result.output = preamble + (tool_result.output or "")
-            tool_result.raw_output = preamble + (tool_result.raw_output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
         tool_result.metadata.update(getattr(self, "_pending_log_storage_metadata", {}) or {})
@@ -1793,6 +1795,7 @@ class GradleTool(BaseTool):
         configure_on_demand: bool,
         build_cache: bool,
         fail_at_end: bool = False,
+        _source_argv: Optional[List[str]] = None,
     ) -> str:
         """Build the complete Gradle command."""
         cmd_parts = [executable]
@@ -1825,6 +1828,9 @@ class GradleTool(BaseTool):
         # Add gradle arguments verbatim — the caller's quoting is the caller's
         # (`--tests "*ProducerTest*"`), and re-splitting it here would rewrite
         # a vector the contract already froze.
+        if _source_argv is not None:
+            cmd_parts.extend(shlex.quote(token) for token in _source_argv)
+            return " ".join(cmd_parts)
         if gradle_args:
             cmd_parts.append(gradle_args)
 

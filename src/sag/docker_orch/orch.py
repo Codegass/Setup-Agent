@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import docker
@@ -21,34 +22,9 @@ from sag.runtime.exec_env import DEFAULT_UTF8_ENVIRONMENT, default_utf8_environm
 
 ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
 CONTROL_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-UNKNOWN_EXIT_FAILURE_MARKERS = (
-    "BUILD FAILURE",
-    "BUILD FAILED",
-    "Compilation failure",
-    "[ERROR] Could not resolve",
-    "ERROR: No matching distribution found",
-    "ERROR: Could not find a version that satisfies the requirement",
-    "ERROR: Could not install",
-    "error: subprocess-exited-with-error",
-)
-MAVEN_ENFORCER_VERSION_RANGE_MARKERS = (
-    "Detected Maven Version:",
-    "is not in the allowed range",
-)
 DETACHED_TERMINAL_AUTHORITY = "docker_exec_inspect_v1"
 DETACHED_POLL_TAIL_MAX_BYTES = 6144
 DETACHED_INLINE_OUTPUT_MAX_CHARS = 10000
-
-
-def _has_unknown_exit_failure_marker(output: str) -> bool:
-    """Return True when unknown-exit output contains an explicit terminal failure marker."""
-    normalized_output = output.casefold()
-    if any(marker.casefold() in normalized_output for marker in UNKNOWN_EXIT_FAILURE_MARKERS):
-        return True
-
-    return all(
-        marker.casefold() in normalized_output for marker in MAVEN_ENFORCER_VERSION_RANGE_MARKERS
-    )
 
 
 class DockerOrchestrator:
@@ -916,17 +892,27 @@ class DockerOrchestrator:
                 runtime_environment=runtime_environment,
                 timeout_seconds=absolute_timeout if use_timeout_wrapper else None,
             )
-            # Start the command execution
-            # NOTE: We don't use Docker's workdir parameter here because we handle it
-            # explicitly with cd in the bash command for better compatibility with timeout wrapper
-            exec_result = container.exec_run(
+            # Streaming exec_run cannot expose the final exit code. Retain
+            # the daemon exec id and inspect this exact process after its
+            # stream ends instead of guessing an exit from log text.
+            created = self.client.api.exec_create(
+                container.id,
                 exec_command,
                 workdir=None,  # Handled by cd command in bash
-                stream=True,  # Enable streaming to monitor output
-                demux=True,  # Separate stdout/stderr
                 environment=self._control_exec_environment(),
             )
+            exec_id = created.get("Id") if isinstance(created, dict) else None
+            if not isinstance(exec_id, str) or not exec_id:
+                raise RuntimeError("Docker did not return the monitored exec identity")
+            runner_dispatched = None  # start acceptance is unknown until the response arrives
+            stream = self.client.api.exec_start(exec_id, stream=True, demux=True)
             runner_dispatched = True
+            exec_result = SimpleNamespace(
+                output=stream,
+                exit_code=None,
+                docker_exec_id=exec_id,
+                docker_container_id=container.id,
+            )
 
             # Start CPU monitoring thread if enabled
             cpu_monitor_thread = None
@@ -945,7 +931,7 @@ class DockerOrchestrator:
             result = self._monitor_execution_with_timeouts(
                 exec_result, monitoring_state, silent_timeout, absolute_timeout
             )
-            # ``exec_run`` returned before monitoring began, so even a later
+            # Exec start returned before monitoring began, so even a later
             # stream failure or timeout is a physical dispatch receipt.
             result["runner_dispatched"] = runner_dispatched
 
@@ -963,11 +949,18 @@ class DockerOrchestrator:
                 "environment_overlay_unavailable"
                 if getattr(e, "code", None) == "environment_overlay_unavailable"
                 and not runner_dispatched
-                else ("execution_observation_failed" if runner_dispatched else "dispatch_failed")
+                else (
+                    "execution_observation_failed"
+                    if runner_dispatched is True
+                    else "dispatch_unknown" if runner_dispatched is None else "dispatch_failed"
+                )
             )
             return {
                 "success": False,
-                "exit_code": -1,
+                "exit_code": None if runner_dispatched is not False else -1,
+                "observed_exit_code": None,
+                "exit_code_inferred": False,
+                "execution_observation_complete": False,
                 "output": f"Execution failed: {str(e)}",
                 "termination_reason": "exception",
                 "dispatch_status": dispatch_status,
@@ -2173,6 +2166,7 @@ class DockerOrchestrator:
         """Monitor command execution with dual timeout mechanism."""
 
         output_buffer = []
+        raw_output_buffer = []
         last_chunk_time = time.time()
         saw_stream_read_timeout = False
         stream_broken = False
@@ -2229,6 +2223,7 @@ class DockerOrchestrator:
                 if chunk[0]:  # stdout
                     decoded_chunk = chunk[0].decode("utf-8")
                     output_buffer.append(decoded_chunk)
+                    raw_output_buffer.append(decoded_chunk)
                     monitoring_state["total_output"] += decoded_chunk
                     last_chunk_time = current_time
                     monitoring_state["last_output_time"] = current_time
@@ -2243,6 +2238,7 @@ class DockerOrchestrator:
                 if chunk[1]:  # stderr
                     decoded_chunk = chunk[1].decode("utf-8")
                     output_buffer.append(f"STDERR: {decoded_chunk}")
+                    raw_output_buffer.append(decoded_chunk)
                     last_chunk_time = current_time
                     monitoring_state["last_output_time"] = current_time
 
@@ -2257,36 +2253,49 @@ class DockerOrchestrator:
             # Combine all output
             full_output = "".join(output_buffer)
 
-            # Get final execution result
-            observed_exit_code = exec_result.exit_code
+            # The process exit and output completeness are separate facts.
+            # Docker's stream result commonly has exit_code=None even after
+            # EOF; only a same-exec, same-container terminal inspect can fill it.
+            observed_exit_code = getattr(exec_result, "exit_code", None)
+            exec_id = getattr(exec_result, "docker_exec_id", None)
+            if exec_id is not None:
+                observed_exit_code = None
+                try:
+                    inspected = self.client.api.exec_inspect(exec_id)
+                    candidate = inspected.get("ExitCode")
+                    if (
+                        inspected.get("ID") == exec_id
+                        and inspected.get("ContainerID")
+                        == getattr(exec_result, "docker_container_id", None)
+                        and inspected.get("Running") is False
+                        and type(candidate) is int
+                        and 0 <= candidate <= 255
+                    ):
+                        observed_exit_code = candidate
+                except Exception as exc:
+                    logger.warning(f"Monitored exec terminal inspection unavailable: {exc}")
+            if type(observed_exit_code) is not int or not 0 <= observed_exit_code <= 255:
+                observed_exit_code = None
             exit_code = observed_exit_code
-            exit_code_inferred = observed_exit_code is None
-
-            # For streaming execution, Docker can leave exit_code unknown after the stream ends.
-            if exit_code is None:
-                if monitoring_state.get("stream_lost_exit_unknown"):
-                    # The output is partial (stream died mid-run) so a missing
-                    # failure marker proves nothing — fail safe and tell the
-                    # agent to verify rather than report a false success.
-                    logger.warning(
-                        "Stream lost before completion; reporting failure with unknown exit code"
-                    )
-                    exit_code = 1
-                    full_output += (
-                        "\n[output stream was lost mid-run; the command finished with an "
-                        "unknown exit code — verify the build state before relying on this result]"
-                    )
-                elif _has_unknown_exit_failure_marker(full_output):
-                    logger.warning("Command failure inferred from unknown-exit output")
-                    exit_code = 1
-                else:
-                    exit_code = 0
+            observation_complete = exit_code is not None and not stream_broken
+            complete_output = "".join(raw_output_buffer)
+            if not observation_complete:
+                detail = (
+                    "output stream was lost; terminal exit/output observation is incomplete"
+                    if stream_broken
+                    else "terminal exit code was not observed for this Docker exec"
+                )
+                full_output += f"\n[{detail}; result unavailable]"
 
             # Apply truncation if needed
             if len(full_output) > 10000:
                 full_output = self._truncate_output_smartly(full_output)
 
-            success = exit_code == 0 and monitoring_state["termination_reason"] is None
+            success = (
+                observation_complete
+                and exit_code == 0
+                and monitoring_state["termination_reason"] is None
+            )
 
             # Generate monitoring summary
             monitoring_info = {
@@ -2303,10 +2312,17 @@ class DockerOrchestrator:
 
             return {
                 "success": success,
-                "exit_code": exit_code or 0,
+                "exit_code": exit_code,
                 "observed_exit_code": observed_exit_code,
-                "exit_code_inferred": exit_code_inferred,
+                "exit_code_inferred": False,
                 "output": full_output,
+                "full_output": complete_output,
+                "execution_observation_complete": observation_complete,
+                **(
+                    {"dispatch_status": "execution_observation_failed"}
+                    if not observation_complete
+                    else {}
+                ),
                 "termination_reason": monitoring_state["termination_reason"],
                 "monitoring_info": monitoring_info,
             }
@@ -2315,7 +2331,12 @@ class DockerOrchestrator:
             logger.error(f"Error during execution monitoring: {e}")
             return {
                 "success": False,
-                "exit_code": -1,
+                "exit_code": None,
+                "observed_exit_code": None,
+                "exit_code_inferred": False,
+                "execution_observation_complete": False,
+                "dispatch_status": "execution_observation_failed",
+                "full_output": "".join(raw_output_buffer),
                 "output": f"Monitoring error: {str(e)}",
                 "termination_reason": "monitoring_error",
                 "monitoring_info": monitoring_state,

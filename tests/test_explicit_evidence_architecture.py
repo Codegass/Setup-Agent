@@ -508,6 +508,9 @@ def test_sealed_test_judgment_owns_report_and_terminal_ui(
             "unique": dict(counts),
             "raw": dict(counts),
             "receipt_scoped": True,
+            # Completion is a separate premise of this sealed-surface test;
+            # the red counts above describe completed project assertions.
+            "execution_state": "completed",
         },
         "artifact://test-rollup",
     )

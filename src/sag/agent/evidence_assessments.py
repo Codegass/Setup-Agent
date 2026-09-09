@@ -63,8 +63,14 @@ from sag.agent.invocation_contracts import (
 )
 from sag.agent.invocation_receipts import (
     RECEIPT_DIR,
+    nearest_domain_fact_epoch,
+    nearest_domain_root,
+    output_content_hash,
+    producer_observations_sha256,
+    python_import_targets,
     read_producer_observations,
     receipt_record_scope,
+    target_sha,
     validate_receipt_v2,
 )
 from sag.tools.internal.maven_versions import parse_maven_version, satisfies_maven_floor
@@ -87,6 +93,11 @@ CODE_SLUG_MAX_CHARS = 40
 # any other action.  Candidate extraction walks the complete output but keeps
 # only a bounded number of bounded lines, so a large build log cannot turn the
 # assessor into an unbounded prompt/parser surface.
+EXECUTION_FAULT = "execution_fault"
+ASSESSMENT_BUNDLE_COMPLETE = "assessment_bundle_complete"
+ASSESSMENT_OUTPUT_UNAVAILABLE = "assessment_output_unavailable"
+TEST_FAILURE_EXIT = "test_failure_exit"
+
 PREREQUISITE_EXECUTABLE_MISSING = "prerequisite_executable_missing"
 PREREQUISITE_SERVICE_UNAVAILABLE = "prerequisite_service_unavailable"
 PREREQUISITE_OUTPUT_CANDIDATE_CAP = 64
@@ -295,6 +306,8 @@ class ReceiptAssessment:
             code = "\x00".join(
                 (code, _normalize_endpoint(self.endpoint), _bounded_field(self.scope))
             )
+        elif code == EXECUTION_FAULT:
+            code = "\x00".join((code, _bounded_field(self.name), _bounded_field(self.scope)))
         return assessment_id(self.subject_id, code)
 
     @property
@@ -642,49 +655,120 @@ def _publish_assessment_bytes(execute: Any, identifier: str, raw: bytes) -> bool
 # ---------------------------------------------------------------------------
 
 
+def current_assessment_fingerprints(
+    requirements: Mapping[str, Any], receipt: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Project current verified survey facts and the observed execution scope."""
+    current: Dict[str, Any] = {}
+    survey = requirements.get("survey")
+    if isinstance(survey, Mapping):
+        for key in ("config_fingerprint", "document_map_fingerprint", "survey_fingerprint"):
+            value = _text(survey.get(key))
+            if value:
+                current[key] = value
+    observed_sha = _text(receipt.get("target_sha"))
+    if observed_sha:
+        current["target_sha"] = observed_sha
+    cwd = _text(receipt.get("actual_cwd") or receipt.get("working_directory"))
+    domain = nearest_domain_root(requirements, cwd)
+    if domain:
+        current["domain_id"] = domain
+    epoch = nearest_domain_fact_epoch(requirements, cwd)
+    if epoch is not None:
+        current["fact_epoch"] = epoch
+    if _text(receipt.get("tool")).lower() == "python":
+        targets = python_import_targets(requirements)
+        if targets is not None:
+            current["python_import_targets"] = targets
+            current["python_import_targets_sha256"] = producer_observations_sha256(targets)
+    return current
+
+
+def live_assessment_fingerprints(source: Any, receipt: Mapping[str, Any]) -> Dict[str, Any]:
+    """Read the current host-published survey, run, and checkout; never old contract pins."""
+    from sag.agent.evidence_publications import evidence_publication_authority_for
+    from sag.runtime.container_io import resolve_control_execute
+    from sag.tools.internal.build_preflight import read_live_build_requirements
+
+    authority = evidence_publication_authority_for(source)
+    if _text(getattr(authority, "run_id", None)) != _text(receipt.get("run_id")):
+        return {}
+    current = read_live_build_requirements(source)
+    if not current.complete or current.conflict is not None or current.payload is None:
+        return {}
+    execute = resolve_control_execute(source)
+    if execute is None:
+        return {}
+    cwd = _text(receipt.get("actual_cwd") or receipt.get("working_directory"))
+    return current_assessment_fingerprints(
+        current.payload, {**receipt, "target_sha": target_sha(execute, cwd)}
+    )
+
+
+def _bundle_completion(receipt: Mapping[str, Any]) -> ReceiptAssessment:
+    return ReceiptAssessment(
+        receipt_id=_text(receipt.get("receipt_id")),
+        typed_code=ASSESSMENT_BUNDLE_COMPLETE,
+        fingerprints=_pinned_fingerprints(None, receipt),
+        scope=_text(receipt.get("output_content_hash")),
+        detail="all receipt assessments published from the bound complete runner output",
+        blocker_owner=BlockerOwner.NONE,
+    )
+
+
 def ensure_receipt_assessed(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     receipt_id: Any,
+    *,
+    output: Optional[str] = None,
+    evidence_ref: Optional[str] = None,
+    output_loader: Optional[Callable[[], Optional[str]]] = None,
 ) -> bool:
-    """Backstop: assess a valid dispatched receipt no facade path assessed.
+    """Complete a receipt's immutable assessment bundle, including interrupted publication.
 
-    Detached/external facade dispatches may reach the engine observation seam
-    before an assessment is present. The write is idempotent, so a receipt the
-    facade already assessed is a no-op. This function never mints a contract
-    and never raises.
+    Only an exact host-published completion record can skip work. A primary
+    assessment or a similar filename says nothing about missing diagnostic
+    riders. Replays use the same IDs and existing compare-and-publish protocol.
     """
-    identifier = str(receipt_id or "").strip()
+    identifier = _text(receipt_id)
     if not identifier:
         return False
     try:
-        slug = _slug(identifier)
-        for name in _list_assessment_files(execute):
-            if slug and slug in name:
-                return False  # already assessed by the dispatching layer
         receipt = read_receipt(execute, identifier)
         if not isinstance(receipt, Mapping):
             return False
-        contract_id = str(receipt.get("contract_id") or "").strip()
-        if not contract_id:
-            return False
-        contract = read_frozen_contract(execute, contract_id)
+        contract = read_frozen_contract(execute, _text(receipt.get("contract_id")))
         if not isinstance(contract, Mapping):
             return False
-        assessment = assess_receipt(contract, receipt)
-        return write_assessment(execute, assessment)
-    except Exception as exc:  # a backstop must never break an observation
+        current = live_assessment_fingerprints(execute, receipt)
+        primary = assess_receipt(contract, receipt, current_fingerprints=current)
+        if primary.typed_code not in (
+            CONTRACT_BINDING_UNKNOWN,
+            STALE_FINGERPRINT,
+            DEVIATED_RECEIPT,
+        ):
+            complete = _bundle_completion(receipt).payload()
+            if receipt.get("output_content_hash") and any(
+                record == complete for record in read_assessments(execute)
+            ):
+                return True
+        if output is None and output_loader is not None:
+            output = output_loader()
+        return any(
+            item.typed_code == ASSESSMENT_BUNDLE_COMPLETE
+            for item in assess_dispatch(
+                execute,
+                contract=contract,
+                receipt=receipt,
+                current_fingerprints=current,
+                output=output,
+                evidence_ref=evidence_ref,
+                require_bound_output=True,
+            )
+        )
+    except Exception as exc:
         logger.debug(f"receipt {identifier} backstop assessment skipped: {exc}")
         return False
-
-
-def _list_assessment_files(
-    execute: Callable[..., Optional[Mapping[str, Any]]],
-) -> List[str]:
-    try:
-        result = execute(f"ls {ASSESSMENT_DIR} 2>/dev/null") or {}
-    except Exception:
-        return []
-    return [line.strip() for line in (result.get("output") or "").splitlines() if line.strip()]
 
 
 def read_live_assessment_ledger(orchestrator: Any) -> PublishedNamedJsonRecordStreamRead:
@@ -872,13 +956,52 @@ def _python_semantic_result(
         compile_observation = observations.get("compile") or {}
         return "met" if compile_observation.get("status") == "valid" else "unobserved"
 
-    if operation in {"test", "native"}:
-        # The current receipt records useful diagnostics, but it does not yet
-        # freeze the effective selector for tests or the full resolver /
-        # definitions / rebuild-trace tuple for native repair.  Promoting
-        # either shape would let a hidden scope rewrite or a loose feature
-        # probe masquerade as the contracted semantic operation.  A future
-        # typed schema may add those bindings explicitly; v1 stays fail-closed.
+    if operation == "test":
+        # The receipt freezes the actual pytest command. Only a literal match
+        # to the public selector can prove this semantic operation; survey
+        # hints/native smoke rewrites are not bound by this contract version.
+        requested = contract.get("requested_call") or {}
+        params = requested.get("params") or {}
+        try:
+            actual = shlex.split(_text(receipt.get("argv")))
+            selected = shlex.split(_text(params.get("args")))
+        except ValueError:
+            return "unobserved"
+        if (
+            len(actual) < 4
+            or re.fullmatch(r"python(?:[23](?:\.\d+)?)?", posixpath.basename(actual[0])) is None
+            or actual[1:3] != ["-m", "pytest"]
+            or actual[3:-1] != selected
+            or not actual[-1].startswith("--junitxml=")
+            or any(
+                token in {"--collect-only", "--co", "--version", "-V", "--help", "-h"}
+                or token.startswith("--junitxml")
+                for token in selected
+            )
+        ):
+            return "unobserved"
+        report = actual[-1].partition("=")[2]
+        claims = {
+            (_text(entry.get("path")), _text(entry.get("sha256")))
+            for bucket in ("new", "changed")
+            for entry in (receipt.get("report_delta") or {}).get(bucket, ())
+            if isinstance(entry, Mapping)
+        }
+        rows = (receipt.get("testcase_execution_rows") or {}).get("rows") or ()
+        if any(
+            row.get("framework") == "pytest"
+            and row.get("report_path") == report
+            and (report, row.get("report_sha256")) in claims
+            and row.get("qualifying_invocation") is True
+            and row.get("disposition") == "claimed"
+            for row in rows
+            if isinstance(row, Mapping)
+        ):
+            return "met"
+        return "unobserved"
+    if operation == "native":
+        # Native repair still lacks the full resolver/definitions/rebuild
+        # tuple; a loose capability probe cannot satisfy that operation.
         return "unobserved"
     return "unobserved"
 
@@ -1322,6 +1445,7 @@ def assess_dispatch(
     error_code: Optional[str] = None,
     output: Optional[str] = None,
     evidence_ref: Optional[str] = None,
+    require_bound_output: bool = False,
 ) -> List[ReceiptAssessment]:
     """Assess ONE dispatch and persist every verdict; return the ones that landed.
 
@@ -1335,24 +1459,334 @@ def assess_dispatch(
     stated in prose — a java version mismatch, say — is readable here and
     nowhere else. `evidence_ref`, when supplied, is the durable reference for
     that complete text; otherwise prerequisite riders cite their receipt.
+
+    Live producers set ``require_bound_output``. Unbound calls can retain pure
+    diagnostic compatibility, but can never publish a completion marker.
     """
     if not _text((receipt or {}).get("receipt_id")):
         return []
-    assessments = [
-        assess_receipt(
+    assert isinstance(receipt, Mapping)
+    bound = bool(receipt.get("output_content_hash")) and (
+        output is not None and output_content_hash(output) == receipt.get("output_content_hash")
+    )
+    if require_bound_output and not bound:
+        primary = ReceiptAssessment(
+            receipt_id=_text(receipt.get("receipt_id")),
+            typed_code=ASSESSMENT_OUTPUT_UNAVAILABLE,
+            detail="complete runner output is absent or does not match receipt output_content_hash",
+            fingerprints=_pinned_fingerprints(contract, receipt),
+            blocker_owner=BlockerOwner.HARNESS,
+        )
+        # Receipt-bound reasons remain usable; an unverified text payload does not.
+        output = None
+    else:
+        primary = assess_receipt(
             contract,
             receipt,
             current_fingerprints=current_fingerprints,
             dispatch_status=dispatch_status,
             error_code=error_code,
         )
-    ]
+    if bound or require_bound_output:
+        # The receipt's output hash is the common immutable reference for both
+        # facade and settlement, even if their display/storage references differ.
+        evidence_ref = _text(receipt.get("receipt_id"))
+    assessments = [primary]
     assessments.extend(prerequisite_assessments(receipt, output, evidence_ref=evidence_ref))
+    assessments.extend(execution_faults(receipt, output, evidence_ref=evidence_ref))
+    assessments.extend(test_failure_exits(receipt, output))
     assessments.extend(capability_absences(receipt))
     assessments.extend(dependency_incompatibilities(receipt))
     assessments.extend(java_version_mismatch(receipt, output))
     assessments.extend(maven_extension_incompatibility(receipt, output))
-    return [assessment for assessment in assessments if write_assessment(execute, assessment)]
+    landed = [assessment for assessment in assessments if write_assessment(execute, assessment)]
+    if (
+        bound
+        and len(landed) == len(assessments)
+        and assessments[0].typed_code
+        not in (CONTRACT_BINDING_UNKNOWN, STALE_FINGERPRINT, DEVIATED_RECEIPT)
+    ):
+        completion = _bundle_completion(receipt)
+        if write_assessment(execute, completion):
+            landed.append(completion)
+    return landed
+
+
+def test_outcome_diagnostics_complete(receipt: Mapping[str, Any]) -> bool:
+    """Whether every observed red can still carry its failure/setup diagnostic.
+
+    Counts and sealed execution rows locate red executions; only diagnostic
+    nodes carry their reasons. A complete count cannot replace missing reasons.
+    Each disclosure applies solely to the list its producer actually bounded.
+    """
+    from sag.agent.receipt_suite_totals import receipt_suite_totals
+
+    totals = receipt_suite_totals(receipt)
+    row_section = receipt.get("testcase_execution_rows")
+    rows = row_section.get("rows") if isinstance(row_section, Mapping) else None
+    row_disclosure = receipt.get("testcase_row_disclosure")
+    rows_complete = (
+        isinstance(row_section, Mapping)
+        and row_section.get("status") == "complete"
+        and isinstance(rows, list)
+        and not (
+            isinstance(row_disclosure, Mapping)
+            and row_disclosure.get("red_rows_complete") is not True
+        )
+    )
+    row_red = sum(
+        isinstance(row, Mapping) and row.get("outcome") in ("failed", "error") for row in rows or ()
+    )
+    expected_red: Optional[int] = None
+    expected_errors: Optional[int] = None
+    if totals is not None and totals.complete_claims:
+        expected_red = totals.failed + totals.errors
+        expected_errors = totals.errors
+    elif rows_complete:
+        expected_red = row_red
+        expected_errors = sum(
+            isinstance(row, Mapping) and row.get("outcome") == "error" for row in rows
+        )
+    elif "gradle_suite_summaries" in receipt or row_section is not None:
+        return False
+
+    outcomes = receipt.get("testcase_outcomes")
+    nodes = outcomes.get("nodes") if isinstance(outcomes, Mapping) else None
+    red_nodes = [
+        node
+        for node in nodes or ()
+        if isinstance(node, Mapping) and node.get("status") in ("failed", "error")
+    ]
+    if expected_red == 0:
+        return not red_nodes and not row_red
+    if not isinstance(nodes, list):
+        return False
+    node_disclosure = receipt.get("gradle_row_disclosure")
+    if node_disclosure is None and row_section is None:
+        node_disclosure = row_disclosure
+    if isinstance(node_disclosure, Mapping):
+        if node_disclosure.get("red_rows_complete") is not True:
+            return False
+    elif outcomes.get("truncated") is True:
+        # A truncated diagnostic list may have dropped only greens, but a
+        # matching count alone cannot bind its reasons to the red executions.
+        # Require complete red rows and match every retained red identity.
+        if not rows_complete or expected_red is None or len(red_nodes) != expected_red:
+            return False
+        from sag.testcases.results import canonical_test_identity
+
+        red_row_keys = []
+        for row in rows or ():
+            if not isinstance(row, Mapping) or row.get("outcome") not in {"failed", "error"}:
+                continue
+            owner, name = _text(row.get("owner")), _text(row.get("test_name"))
+            if not owner or not name:
+                return False
+            red_row_keys.append(
+                (owner.rsplit("::", 1)[-1], name, _text(row.get("parameter_id")), row["outcome"])
+            )
+        diagnostic_keys = []
+        for node in red_nodes:
+            owner, separator, name = _text(node.get("node_id")).partition("#")
+            identity = canonical_test_identity(owner, name) if separator else None
+            if identity is None:
+                return False
+            diagnostic_keys.append(
+                (
+                    owner.replace("$", ".").strip("."),
+                    identity.name,
+                    identity.param_id,
+                    node["status"],
+                )
+            )
+        if sorted(red_row_keys) != sorted(diagnostic_keys):
+            return False
+    if expected_red is not None and len(red_nodes) < expected_red:
+        return False
+    if (
+        expected_errors is not None
+        and sum(node.get("status") == "error" for node in red_nodes) < expected_errors
+    ):
+        return False
+    return all(bool(_text(node.get("reason"))) for node in red_nodes)
+
+
+def test_failure_exits(
+    receipt: Optional[Mapping[str, Any]], output: Optional[str]
+) -> List[ReceiptAssessment]:
+    """An explicit test-runner failure exit with receipt-bound assertion red.
+
+    This is a positive reason for nonzero exit, not permission to disregard
+    execution faults or incomplete scope from the same dispatch.
+    """
+    if _exit_code(receipt) == 0 or not _text((receipt or {}).get("receipt_id")):
+        return []
+    assert isinstance(receipt, Mapping)
+    from sag.agent.receipt_suite_totals import receipt_suite_totals
+
+    if not test_outcome_diagnostics_complete(receipt):
+        return []
+    totals = receipt_suite_totals(receipt)
+    if totals is not None and (not totals.complete_claims or totals.errors > 0):
+        return []
+    nodes = (receipt.get("testcase_outcomes") or {}).get("nodes") or ()
+    # JUnit <failure> is already typed as failed; the bounded reason often
+    # contains only "expected ... but was ...", without its exception class.
+    # An error outcome can be initialization failure and is not this proof.
+    has_assertion = any(
+        isinstance(node, Mapping) and node.get("status") == "failed" for node in nodes
+    )
+    has_error = any(isinstance(node, Mapping) and node.get("status") == "error" for node in nodes)
+    rows = (receipt.get("testcase_execution_rows") or {}).get("rows") or ()
+    has_error = has_error or any(
+        isinstance(row, Mapping) and row.get("outcome") == "error" for row in rows
+    )
+    if (
+        not has_assertion
+        or has_error
+        or execution_faults(receipt, output)
+        or prerequisite_assessments(receipt, output)
+    ):
+        return []
+    text = str(output or "")
+    failed_goals = re.findall(r"Failed to execute goal [^\n]+", text)
+    maven = bool(failed_goals) and all(
+        re.search(r"maven-(?:surefire|failsafe)-plugin:[^\n]*There are test failures", goal)
+        for goal in failed_goals
+    )
+    failures = list(re.finditer(r"Execution failed for task ['\"](?P<task>[^'\"]+)['\"]", text))
+    failed_tasks = re.findall(r"> Task (\S+) FAILED", text)
+    gradle = bool(failures)
+    explained_tasks = set()
+    for index, failure in enumerate(failures):
+        task = failure.group("task")
+        end = failures[index + 1].start() if index + 1 < len(failures) else len(text)
+        if (
+            not re.search(r"(?:^|:)test$|Test$", task)
+            or "There were failing tests" not in text[failure.end() : end]
+        ):
+            gradle = False
+            break
+        explained_tasks.add(task)
+    gradle = gradle and set(failed_tasks) <= explained_tasks
+    python_failure = False
+    if receipt.get("tool") == "python" and _exit_code(receipt) == 1:
+        clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).strip()
+        last_line = clean.splitlines()[-1] if clean else ""
+        summary = re.fullmatch(
+            r"=*\s*(?P<counts>\d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?)"
+            r"(?:, \d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?))*)"
+            r" in \d+(?:\.\d+)?s(?: \([0-9:]+\))?\s*=*",
+            last_line,
+        )
+        if summary:
+            stated = re.findall(r"(\d+) (\w+)", summary.group("counts"))
+            counts = {status: int(count) for count, status in stated}
+            bound_failures = (
+                sum(isinstance(row, Mapping) and row.get("outcome") == "failed" for row in rows)
+                if rows
+                else sum(node.get("status") == "failed" for node in nodes)
+            )
+            python_failure = (
+                len(counts) == len(stated)
+                and counts.get("failed", 0) > 0
+                and counts["failed"] == bound_failures
+                and not failed_goals
+                and not failures
+                and not failed_tasks
+            )
+    # Mixed runners / additional unknown terminal failures are not explained by
+    # finding one legitimate assertion failure elsewhere in the same output.
+    explained_failure = (
+        python_failure
+        if receipt.get("tool") == "python"
+        else (maven and not failures and not failed_tasks) or (gradle and not failed_goals)
+    )
+    if not explained_failure:
+        return []
+    return [
+        ReceiptAssessment(
+            receipt_id=_text(receipt.get("receipt_id")),
+            typed_code=TEST_FAILURE_EXIT,
+            detail="test runner attributed its failure exit to receipt-bound assertion failures",
+            blocker_owner=BlockerOwner.PROJECT,
+        )
+    ]
+
+
+# Explicit runner diagnostics only: ordinary test assertion failures are not
+# execution faults, and no project identity or presumed underlying cause is used.
+_EXECUTION_FAULT_PATTERNS = (
+    ("daemon_disappeared", re.compile(r"Gradle build daemon disappeared unexpectedly", re.I)),
+    (
+        "test_runtime_start_failed",
+        re.compile(
+            r"(?:The forked VM terminated without properly saying goodbye|"
+            r"Error occurred in starting fork, check output in log|"
+            r"Could not create the Java Virtual Machine)",
+            re.I,
+        ),
+    ),
+    (
+        "compilation_failed",
+        re.compile(
+            r"(?:Failed to execute goal [^\n]*maven-compiler-plugin:[^\n]*(?:Compilation failure|Fatal error compiling)|"
+            r"An exception has occurred in the compiler \(|"
+            r"Execution failed for task ['\"][^'\"]*:compile[^'\"]*['\"]|"
+            r"No compiler is provided in this environment)",
+            re.I,
+        ),
+    ),
+    (
+        "test_setup_service_unavailable",
+        re.compile(r"Could not find a valid Docker environment", re.I),
+    ),
+)
+
+
+def execution_faults(
+    receipt: Optional[Mapping[str, Any]],
+    output: Optional[str] = None,
+    *,
+    evidence_ref: Optional[str] = None,
+) -> List[ReceiptAssessment]:
+    """Bounded precise runner/failed-test setup facts, independent of exit code."""
+    identifier = _text((receipt or {}).get("receipt_id"))
+    if not identifier:
+        return []
+    found: Dict[str, ReceiptAssessment] = {}
+    # A successful test may print an exception string while exercising an
+    # error renderer. Exit-zero stdout alone cannot establish a runner fault;
+    # ignored setup failures must be grounded in the failed/error test reasons.
+    exit_code = (receipt or {}).get("exit_code")
+    runner_failed = type(exit_code) is int and exit_code != 0
+    fragments = itertools.chain(
+        ((reason, identifier, True) for _, reason in _failure_reasons(receipt)),
+        (
+            (line, _text(evidence_ref) or identifier, False)
+            for line in str(output or "").splitlines()
+            if runner_failed
+        ),
+    )
+    for fragment, source_ref, testcase_reason in fragments:
+        # Runner diagnostics start a line (possibly after its severity marker),
+        # unlike a test that happens to quote the same wording in ordinary prose.
+        normalized = re.sub(r"^\s*(?:\[(?:ERROR|WARN)\]\s*)?(?:>\s*)?", "", fragment)
+        for name, pattern in _EXECUTION_FAULT_PATTERNS:
+            match = pattern.search(fragment) if testcase_reason else pattern.match(normalized)
+            if name not in found and match:
+                found[name] = ReceiptAssessment(
+                    receipt_id=identifier,
+                    typed_code=EXECUTION_FAULT,
+                    name=name,
+                    scope=_prerequisite_scope(receipt),
+                    evidence_ref=source_ref,
+                    blocker_owner=BlockerOwner.UNKNOWN,
+                    detail=f"runner or failed testcase reported {name}",
+                )
+        if len(found) == len(_EXECUTION_FAULT_PATTERNS):
+            break
+    return list(found.values())
 
 
 def java_version_mismatch(

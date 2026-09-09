@@ -901,7 +901,7 @@ class PythonTool(BaseTool):
 
     @staticmethod
     def _producer_step_observation(step: _ProducerStep) -> Dict[str, Any]:
-        output = str(step.result.get("full_output") or step.result.get("output") or "")
+        output = str(step.result.get("full_output", step.result.get("output")) or "")
         observation: Dict[str, Any] = {
             "ordinal": step.ordinal,
             "role": step.role,
@@ -1970,13 +1970,57 @@ class PythonTool(BaseTool):
                     )
                 pytest_args = (hints.get("pytest_args") or "").strip()
 
-        # Bug #13 defect 5: pytest bootstrap — ensure pytest is importable in
-        # the venv first; live evidence: 5 test calls failed with 'No module
-        # named pytest' and still looked successful.
-        probe = self.orchestrator.execute_command(f"{python} -m pytest --version")
-        if not probe.get("success"):
-            self._run(f"{python} -m pip install pytest", working_directory, timeout)
-            preamble.append("[test] pytest not in venv — installed for the run")
+        # A failed interpreter or broken pytest plugin is not evidence that
+        # pytest is absent. Install only the explicitly missing module, and
+        # verify both the installer exit and the resulting import before tests.
+        probe_command = f"{python} -m pytest --version"
+        probe = self.orchestrator.execute_command(probe_command) or {}
+        bootstrap_failure = None
+        if not probe.get("success") or probe.get("exit_code") != 0:
+            missing_pytest = probe.get("exit_code") == 1 and re.search(
+                r"(?:^|:\s*)No module named ['\"]?pytest['\"]?(?:\s|$)",
+                probe.get("output") or "",
+            )
+            if not missing_pytest:
+                bootstrap_failure = ("probe", probe_command, probe)
+            else:
+                install_command = f"{python} -m pip install pytest"
+                installed = self._run(install_command, working_directory, timeout)
+                if installed.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
+                    pending = detached_handoff_tool_result("python", install_command, installed)
+                    pending.metadata.update(operation="test", bootstrap_stage="install")
+                    return pending
+                if installed.get("exit_code") != 0 or self._effective_install_failure(installed):
+                    bootstrap_failure = ("install", install_command, installed)
+                else:
+                    verified = self.orchestrator.execute_command(probe_command) or {}
+                    if not verified.get("success") or verified.get("exit_code") != 0:
+                        bootstrap_failure = ("verify", probe_command, verified)
+                    else:
+                        preamble.append("[test] pytest not in venv — installed for the run")
+        if bootstrap_failure is not None:
+            stage, command, failed = bootstrap_failure
+            detail = self._failure_tail_line(failed)
+            self._record_control_assessment("PYTEST_BOOTSTRAP_FAILED", detail)
+            return ToolResult.completed_failure(
+                output="\n".join(
+                    (
+                        *preamble,
+                        f"[test] pytest bootstrap {stage} failed",
+                        failed.get("output") or "",
+                    )
+                ),
+                error=detail,
+                error_code="PYTEST_BOOTSTRAP_FAILED",
+                metadata={
+                    "operation": "test",
+                    "runner_dispatched": False,
+                    "bootstrap_stage": stage,
+                    "command": command,
+                    "exit_code": failed.get("exit_code"),
+                    **gate_metadata,
+                },
+            )
 
         # Panel anchor source (Category-3 spec): the SELECTED count for THIS
         # invocation as a STRUCTURED field — never parsed from the run's
@@ -2150,7 +2194,7 @@ class PythonTool(BaseTool):
                     self.orchestrator.execute_command,
                     [working_directory, PYTEST_REPORT_DIR],
                 ),
-                output=result.get("full_output") or output,
+                output=result.get("full_output", output),
                 requirements=requirements,
                 # Bind this dispatch to the semantic contract the build facade
                 # froze. Python semantic receipts intentionally carry no argv

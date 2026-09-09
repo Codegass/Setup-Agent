@@ -33,6 +33,8 @@ import json
 import posixpath
 import re
 
+import pytest
+
 import sag.agent.evidence_assessments as assessments_module
 from sag.agent.control_ownership import BlockerOwner, blocker_owner_for_assessment
 from sag.agent.evidence_assessments import (
@@ -607,3 +609,25 @@ def test_the_dispatch_assessor_carries_the_finding(monkeypatch):
     )
 
     assert "maven_extension_incompatible" in [finding.typed_code for finding in landed]
+
+
+@pytest.mark.usefixtures("facade_contract_authority", "exact_internal_runner_authority")
+def test_final_runner_narration_matches_resolver_and_receipt():
+    from test_project_wrapper_preference import (
+        REGISTERED,
+        VersionPinnedToolchainManager,
+        WrapperOrchestrator,
+        _run,
+    )
+
+    orch = WrapperOrchestrator()
+    _, result = _run(
+        orch, manager=VersionPinnedToolchainManager(), maven_version_requirement="[3.9,)"
+    )
+    choice = result.metadata["maven_runner_choice"]
+    assert choice["runner"] == "registered"
+    assert choice["executable"] == REGISTERED
+    assert choice["executable"] == result.metadata["maven_runtime"]["executable"]
+    assert orch.runners == [REGISTERED]
+    assert "[toolchain] using registered Maven" in result.output
+    assert "using the project's own ./mvnw" not in result.output

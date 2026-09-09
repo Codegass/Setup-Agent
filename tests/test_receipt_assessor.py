@@ -42,7 +42,6 @@ from test_container_io import FakeContainer
 from test_invocation_receipts import receipts_written as atomic_receipts_written
 
 from sag.agent.action_intents import action_fingerprint
-from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.evidence_assessments import (
     ASSESSMENT_DIR,
     BLOCKED_CLASS_CODES,
@@ -70,6 +69,7 @@ from sag.agent.evidence_publications import (
     reset_evidence_publication_authority,
     unavailable_evidence_publication_authority,
 )
+from sag.agent.evidence_records import frame_named_json_record_stream
 from sag.agent.invocation_contracts import (
     ARGV_EXECUTION_BINDING,
     CONTRACT_DIR,
@@ -331,9 +331,7 @@ def test_assessment_replay_never_publishes_noncanonical_equal_semantics(
     )
     payload = assessment.payload()
     body = existing_body(payload)
-    execute = ContainerFS(
-        {f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json": body}
-    )
+    execute = ContainerFS({f"{ASSESSMENT_DIR}/{assessment.assessment_id}.json": body})
 
     assert write_assessment(execute, assessment) is False
     assert not bind_host_evidence_publication_authority.verify_bytes(
@@ -358,16 +356,22 @@ def test_persisted_assessment_union_recomputes_identity_shape_and_filename():
         evidence_refs=("control-gate-0001",),
     ).payload()
 
-    assert validate_assessment_v2(
-        receipt,
-        expected_id=receipt["assessment_id"],
-    ) == receipt
+    assert (
+        validate_assessment_v2(
+            receipt,
+            expected_id=receipt["assessment_id"],
+        )
+        == receipt
+    )
     # A gate may carry more precise ownership than the generic typed-code
     # fallback; reconstruction must preserve that closed-enum value exactly.
-    assert validate_assessment_v2(
-        control,
-        expected_id=control["assessment_id"],
-    ) == control
+    assert (
+        validate_assessment_v2(
+            control,
+            expected_id=control["assessment_id"],
+        )
+        == control
+    )
 
     invalid = []
     for mutation in (
@@ -495,9 +499,7 @@ class ContainerFS:
         if command.startswith("file=") and "SAG_NAMED_JSON_RECORD_V1" in command:
             target = shlex.split(command.partition(";")[0][len("file=") :])[0]
             records = (
-                [(target.rsplit("/", 1)[-1], self.files[target])]
-                if target in self.files
-                else []
+                [(target.rsplit("/", 1)[-1], self.files[target])] if target in self.files else []
             )
             return {
                 "success": True,
@@ -513,7 +515,11 @@ class ContainerFS:
                 for path, body in sorted(self.files.items())
                 if path.startswith(prefix) and path.endswith(".json")
             ]
-            return {"success": True, "exit_code": 0, "output": frame_named_json_record_stream(records)}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": frame_named_json_record_stream(records),
+            }
         if "__SAG_FILE_MISSING__" in command:
             return {"success": False, "exit_code": 44, "output": "__SAG_FILE_MISSING__"}
         row_parser = _row_parser_tokens(command)
@@ -903,10 +909,13 @@ def test_build_tool_projects_the_complete_current_authority_tuple():
         ],
     }
 
-    assert BuildTool._current_fingerprints(
-        requirements,
-        {"target_sha": SHA, "actual_cwd": "/workspace/proj/sub"},
-    ) == CURRENT
+    assert (
+        BuildTool._current_fingerprints(
+            requirements,
+            {"target_sha": SHA, "actual_cwd": "/workspace/proj/sub"},
+        )
+        == CURRENT
+    )
 
 
 def test_a_dispatch_that_left_the_frozen_vector_is_a_deviated_receipt():
@@ -1015,7 +1024,7 @@ def test_a_build_that_states_an_artifact_is_not_falsified():
         contract_for("compile"),
         receipt_for(
             action="compile",
-            artifact_delta={"new": [{"path": "/workspace/proj/target/a.jar"}], "changed": []}
+            artifact_delta={"new": [{"path": "/workspace/proj/target/a.jar"}], "changed": []},
         ),
         current_fingerprints=CURRENT,
     )
@@ -1291,6 +1300,7 @@ class ReceiptWritingMavenTool:
             before={},
             after=self.after,
             requirements=WIRED_REQUIREMENTS,
+            output="BUILD SUCCESS" if self.exit_code == 0 else "BUILD FAILURE",
             **contract_receipt_fields(argv),
         )
         result = (
@@ -1333,7 +1343,8 @@ def test_the_facade_assesses_the_receipt_its_own_dispatch_minted():
 
     (contract,) = contracts_written(orchestrator.commands)
     (receipt,) = receipts_written(orchestrator.commands)
-    (assessment,) = assessments_written(orchestrator.commands)
+    assessment, completion = assessments_written(orchestrator.commands)
+    assert completion["typed_code"] == "assessment_bundle_complete"
     assert result.succeeded
     assert contract["expected_observations"] == ["report_delta"]
     assert receipt["contract_id"] == contract["contract_id"]
@@ -1356,7 +1367,7 @@ def test_the_facade_records_a_capability_absence_the_receipt_carries():
         tool.execute(action="test", working_directory="/workspace/proj")
 
     codes = [payload["typed_code"] for payload in assessments_written(orchestrator.commands)]
-    assert codes == ["expectation_met", f"{CAPABILITY_PREFIX}llvm"]
+    assert codes == ["expectation_met", f"{CAPABILITY_PREFIX}llvm", "assessment_bundle_complete"]
 
 
 def test_a_dispatch_that_minted_no_receipt_is_assessed_as_nothing():
@@ -1543,12 +1554,12 @@ def test_backstop_assesses_a_facade_external_receipt_once(
         contract_hash=contract["contract_hash"],
     )
 
-    assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is True
+    assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is False
     assert len(written) == 1
     body = _json.loads(next(iter(written.values())))
     # A facade-external project receipt has no harness-current pin tuple at
     # this backstop seam. Preserve it as evidence, but never promote it green.
-    assert body["typed_code"] == "contract_binding_unknown"
+    assert body["typed_code"] == "assessment_output_unavailable"
 
     # second pass: already assessed => no-op
     assert ensure_receipt_assessed(execute, "inv-gradle-1-0004") is False
@@ -1592,3 +1603,186 @@ def test_a_failed_node_without_a_matching_reason_emits_nothing():
     }
 
     assert dependency_incompatibilities(receipt) == []
+
+
+@pytest.mark.parametrize("output", [None, "display summary", "yq: command not found"])
+def test_bound_dispatch_refuses_missing_or_mismatched_complete_output(output):
+    execute = ContainerFS()
+    observed = receipt_for(
+        report_delta=wrote_reports(),
+        output_content_hash=hashlib.sha256(b"complete runner output\n").hexdigest(),
+    )
+    landed = assess_dispatch(
+        execute,
+        contract=contract_for(),
+        receipt=observed,
+        current_fingerprints=CURRENT,
+        output=output,
+        require_bound_output=True,
+    )
+    assert [item.typed_code for item in landed] == ["assessment_output_unavailable"]
+
+
+def test_bound_dispatch_publishes_completion_only_after_all_riders(monkeypatch):
+    import sag.agent.evidence_assessments as module
+
+    output = "yq: command not found\n"
+    observed = receipt_for(
+        report_delta=wrote_reports(),
+        output_content_hash=hashlib.sha256(output.encode()).hexdigest(),
+    )
+    written = []
+
+    def persist(_execute, assessment):
+        written.append(assessment.typed_code)
+        return assessment.typed_code != "prerequisite_executable_missing"
+
+    monkeypatch.setattr(module, "write_assessment", persist)
+    module.assess_dispatch(
+        lambda *_a, **_k: {},
+        contract=contract_for(),
+        receipt=observed,
+        current_fingerprints=CURRENT,
+        output=output,
+        require_bound_output=True,
+    )
+    assert "prerequisite_executable_missing" in written
+    assert "assessment_bundle_complete" not in written
+
+
+def test_backstop_supplements_existing_primary_and_replays_exact_bundle(monkeypatch):
+    import sag.agent.evidence_assessments as module
+
+    execute = ContainerFS()
+    output = "yq: command not found\n"
+    observed = receipt_for(
+        report_delta=wrote_reports(),
+        output_content_hash=hashlib.sha256(output.encode()).hexdigest(),
+    )
+    monkeypatch.setattr(module, "read_receipt", lambda *_: observed)
+    monkeypatch.setattr(module, "read_frozen_contract", lambda *_: contract_for())
+    monkeypatch.setattr(module, "live_assessment_fingerprints", lambda *_: dict(CURRENT))
+    assert write_assessment(
+        execute, assess_receipt(contract_for(), observed, current_fingerprints=CURRENT)
+    )
+    assert module.ensure_receipt_assessed(execute, observed["receipt_id"], output=output)
+    first = dict(execute.files)
+    codes = {item["typed_code"] for item in read_assessments(execute)}
+    assert {
+        "expectation_met",
+        "prerequisite_executable_missing",
+        "assessment_bundle_complete",
+    } <= codes
+    assert module.ensure_receipt_assessed(execute, observed["receipt_id"], output=output)
+    assert execute.files == first
+    # A later observation without retained output may rely on the exact,
+    # published completion record; a primary assessment alone cannot do this.
+    assert module.ensure_receipt_assessed(execute, observed["receipt_id"])
+    assert execute.files == first
+
+
+def test_bound_dispatch_current_sha_mismatch_never_gets_completion():
+    output = "Tests run: 1, Failures: 0\n"
+    observed = receipt_for(
+        report_delta=wrote_reports(),
+        output_content_hash=hashlib.sha256(output.encode()).hexdigest(),
+    )
+    landed = assess_dispatch(
+        ContainerFS(),
+        contract=contract_for(),
+        receipt=observed,
+        current_fingerprints={**CURRENT, "target_sha": OTHER_SHA},
+        output=output,
+        require_bound_output=True,
+    )
+    assert "stale_fingerprint" in {item.typed_code for item in landed}
+    assert "assessment_bundle_complete" not in {item.typed_code for item in landed}
+
+
+def test_async_backstop_uses_the_same_current_host_context_as_the_facade(monkeypatch):
+    import sag.agent.evidence_assessments as module
+
+    tool, orchestrator = _wired_build_tool()
+    monkeypatch.setattr(tool, "_assess_receipts", lambda *_: None)
+    with build_action_context("envelope-async-context", action="test"):
+        tool.execute(action="test", working_directory="/workspace/proj")
+    (observed,) = receipts_written(orchestrator.commands)
+    (contract,) = contracts_written(orchestrator.commands)
+    assert module.ensure_receipt_assessed(
+        orchestrator.execute_command,
+        observed["receipt_id"],
+        output="BUILD SUCCESS",
+    )
+    actual = read_assessments(orchestrator)
+    expected = assess_receipt(
+        contract,
+        observed,
+        current_fingerprints=module.live_assessment_fingerprints(orchestrator, observed),
+    ).payload()
+    assert expected in actual
+    assert expected["typed_code"] != "contract_binding_unknown"
+    assert any(row["typed_code"] == "assessment_bundle_complete" for row in actual)
+
+
+def test_partial_bundle_publication_retries_missing_riders_without_rewriting_primary(monkeypatch):
+    import sag.agent.evidence_assessments as module
+
+    execute = ContainerFS()
+    output = "yq: command not found\n"
+    observed = receipt_for(
+        report_delta=wrote_reports(),
+        output_content_hash=hashlib.sha256(output.encode()).hexdigest(),
+    )
+    arguments = dict(
+        contract=contract_for(),
+        receipt=observed,
+        current_fingerprints=CURRENT,
+        output=output,
+        require_bound_output=True,
+    )
+    persist = module.write_assessment
+    monkeypatch.setattr(
+        module,
+        "write_assessment",
+        lambda source, item: (
+            False if item.typed_code == "prerequisite_executable_missing" else persist(source, item)
+        ),
+    )
+    first = assess_dispatch(execute, **arguments)
+    assert [item.typed_code for item in first] == ["expectation_met"]
+    primary_path = f"{ASSESSMENT_DIR}/{first[0].assessment_id}.json"
+    primary_bytes = execute.files[primary_path]
+    monkeypatch.setattr(module, "write_assessment", persist)
+    second = assess_dispatch(execute, **arguments)
+    assert {item.typed_code for item in second} == {
+        "expectation_met",
+        "prerequisite_executable_missing",
+        "assessment_bundle_complete",
+    }
+    assert execute.files[primary_path] == primary_bytes
+    assert len(read_assessments(execute)) == 3
+
+
+def test_multiple_execution_faults_have_distinct_immutable_ids():
+    execute = ContainerFS()
+    output = "An exception has occurred in the compiler (17.0.16).\nGradle build daemon disappeared unexpectedly\n"
+    observed = receipt_for(
+        exit_code=1, output_content_hash=hashlib.sha256(output.encode()).hexdigest()
+    )
+    arguments = dict(
+        contract=contract_for(),
+        receipt=observed,
+        current_fingerprints=CURRENT,
+        output=output,
+        require_bound_output=True,
+    )
+    first = assess_dispatch(execute, **arguments)
+    faults = [item for item in first if item.typed_code == "execution_fault"]
+    assert {item.name for item in faults} == {"compilation_failed", "daemon_disappeared"}
+    assert len({item.assessment_id for item in faults}) == 2
+    assert first[-1].typed_code == "assessment_bundle_complete"
+    original = dict(execute.files)
+    assert [item.payload() for item in assess_dispatch(execute, **arguments)] == [
+        item.payload() for item in first
+    ]
+    assert execute.files == original

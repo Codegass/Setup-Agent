@@ -451,3 +451,41 @@ jobs:
         ("job-root", "job_defaults"),
         ("step-root", "step"),
     ]
+
+
+def test_default_matrix_name_binds_only_the_exact_literal_cell():
+    text = """
+jobs:
+  build:
+    strategy:
+      matrix:
+        java: ['21']
+    steps:
+      - run: mvn verify -Pjdk${{ matrix.java }}
+"""
+    step = extract_build_commands(text, cell_id="build (21)")[0]
+    assert step.job_name_template == "build (21)"
+    assert step.text == "mvn verify -Pjdk21"
+    assert "${{ matrix.java }}" in extract_build_commands(text, cell_id="build (17)")[0].text
+
+
+@pytest.mark.parametrize(
+    "axes",
+    [
+        "java: [17]\n        directory: [one, two]",
+        "java: [17]\n        include: [{java: 21}]",
+        "java: ['${{ inputs.java }}']",
+    ],
+)
+def test_unproven_matrix_binding_keeps_expressions_unknown(axes):
+    text = f"""
+jobs:
+  build:
+    name: Build ${{{{ matrix.java }}}}
+    strategy:
+      matrix:
+        {axes}
+    steps:
+      - run: mvn verify -Pjdk${{{{ matrix.java }}}}
+"""
+    assert "${{ matrix.java }}" in extract_build_commands(text, cell_id="Build 17")[0].text

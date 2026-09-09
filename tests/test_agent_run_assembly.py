@@ -90,6 +90,7 @@ def test_setup_to_legacy_rebuilds_surface_and_discards_setup_state(assembled_age
     agent.pre_finalize_evidence_callback = lambda: {"old": True}
     agent._observed_target_repo_sha = "a" * 40
     agent._run_pin_template = {"run_id": "setup-run"}
+    agent._setup_ci_target = object()
     agent._bootstrap_continuation_overlay = lambda workflow_mode: None
     agent._initialize_context_and_tools(mode)
     assert agent.react_engine is not old_engine
@@ -105,6 +106,7 @@ def test_setup_to_legacy_rebuilds_surface_and_discards_setup_state(assembled_age
     assert agent.physical_validator.receipt_run_id == "next-command"
     assert agent._run_pin_template is None
     assert agent._observed_target_repo_sha is None
+    assert agent._setup_ci_target is None
 
 
 def test_two_public_setup_commands_bind_the_new_run(assembled_agent, monkeypatch):

@@ -1,0 +1,1587 @@
+{
+  "schema_version": 1,
+  "purpose": "Minimal immutable D3R1 evidence projections for offline execution-completion calibration; not production-authorized receipts or a new run.",
+  "baseline": {
+    "sag_sha": "79ae52aa2da7692eeaf63ab0b7b0a39c33ee20d4",
+    "report": {
+      "path": "docs/superpowers/reports/d3r1-20260907.md",
+      "sha256": "eaef36197aae7d6739f065a18c32138a1ca20ee3a53a0f8e8e850f922982a2f0"
+    },
+    "artifact_seal": {
+      "path": "logs/d3r1-20260907/artifact-seal.json",
+      "sha256": "d8f6b614091abc8e526a0e9ed09a1d9082ecdb2067a8714f9407f7414e9e482f"
+    }
+  },
+  "extraction": {
+    "version": 1,
+    "receipt_fields": "Exact original top-level fields, excluding module_outcomes/report_delta/testcase_execution_rows/testcase_outcomes; those collections are separately counted and sampled.",
+    "row_and_node_samples": "First original element for each present outcome, in error/failed/skipped/passed order; zero-based source_index. Samples never replace the original complete collection.",
+    "report_delta_samples": "Original entries matching sampled report paths, or first original new report when no identity rows exist.",
+    "assessments": "All original assessment files whose receipt_id equals the selected final test receipt_id; no synthetic prerequisites or authorization flags added.",
+    "output": "Selected exact lines from the identified JSONL record output; line numbers are one-based after str.splitlines(). Four complete record outputs hash to the original receipt output_content_hash; SeaTunnel has a disclosed truncated-output exception and separately verified XML.",
+    "reports": "Parse only the selected original tar member. Verify member SHA-256 against original receipt report_delta. Retain suite attributes and testcase outcome elements; omit system-out, properties, and other unrelated content.",
+    "privacy": "No environment dumps, credentials, tokens, host authority registry or whole large logs copied. Public project/source names, original receipt/run identifiers and /workspace paths are retained for provenance."
+  },
+  "cases": [
+    {
+      "id": "spark-kubernetes-operator",
+      "expected": {
+        "disallowed_state": "completed",
+        "preferred_state": "partial",
+        "reason": "225 test rows were produced, but the same requested invocation failed the non-test assertGeneratedCRDMatchesHelmChart task because yq was absent. No later test receipt repaired that invocation.",
+        "non_assertion_reason": "An external executable could not be started; the reported test rows are green. This is not a test assertion failure."
+      },
+      "source_receipt": {
+        "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/logs/session_20260907_232231_862180_57b47dc27a32_50517/.setup_agent/invocation_receipts/inv-gradle-1-017d5f0525fc-0002.json",
+        "sha256": "83fb28ee766855682680abd93a7142378dcc0717c8984af58aa6a6bd7b3b2999"
+      },
+      "receipt_fields": {
+        "actual_cwd": "/workspace/spark-kubernetes-operator",
+        "argv": "/workspace/spark-kubernetes-operator/gradlew --continue -Dtest.ignoreFailures=true test",
+        "compliance": "equivalent",
+        "config_fingerprint": "1672968411 6174 L0",
+        "contract_hash": "bfa58f17a2e8f0b4444de393c17a926bd49f2bc9cbaeaf74b42a1500db8ba0cd",
+        "contract_id": "ic-9e83c8b632dd",
+        "document_map_fingerprint": "f0906f4851896c4cdb199419c93a2d410e7e2a5a32551d425038afc9e12cbcdc",
+        "domain_id": "/workspace/spark-kubernetes-operator",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "26",
+          "provenance": {
+            "source": "unknown"
+          },
+          "requirement_authority": "static_survey",
+          "requirement_major": "26"
+        },
+        "execution_binding": "argv_v1",
+        "exit_code": 1,
+        "gradle_row_disclosure": {
+          "red_rows_complete": true,
+          "rows_source": "gradle_xml",
+          "rows_truncated": {
+            "dropped_files": 36,
+            "dropped_green": 175
+          }
+        },
+        "gradle_suite_summaries": {
+          "suites": [
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":spark-operator",
+              "skipped": 0,
+              "task": "test",
+              "tests": 140,
+              "xml_files": 29
+            },
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":spark-operator-api",
+              "skipped": 0,
+              "task": "test",
+              "tests": 48,
+              "xml_files": 9
+            },
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":spark-submission-worker",
+              "skipped": 0,
+              "task": "test",
+              "tests": 37,
+              "xml_files": 8
+            }
+          ]
+        },
+        "lifecycle_state": "finished",
+        "outcome": "failed",
+        "output_content_hash": "49c397e15f124ce7951ff60e6216f5953af8065a818f32a2ff403e9d826d727a",
+        "receipt_id": "inv-gradle-1-017d5f0525fc-0002",
+        "requested_action": "test",
+        "run_id": "20260907_232231_862180_57b47dc27a32_50517-7-974f22a19a2a",
+        "schema_version": 3,
+        "survey_fingerprint": "ee046d65955116e0a7e0d2dfa02f9be4b0528e23446d1969759bbb7917b9557d",
+        "target_sha": "5fe4436cbfba709987a094c1a8c4f1a65d72dbc7",
+        "tool": "gradle",
+        "toolchain_fingerprint": {
+          "executable": "/workspace/spark-kubernetes-operator/gradlew"
+        },
+        "working_directory": "/workspace/spark-kubernetes-operator"
+      },
+      "source_contract": {
+        "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/logs/session_20260907_232231_862180_57b47dc27a32_50517/.setup_agent/invocation_contracts/ic-9e83c8b632dd.json",
+        "sha256": "afa472f385ecbdb4baaea0dc201acb92a6614993a16511dc65567a91a5b5b3b3"
+      },
+      "contract": {
+        "action_fingerprint": "act-adffb5840ec6af7de2e166dba5e9ae76ec60b84deddec2c8ae6d9a76e5f6e5ad",
+        "config_fingerprint": "1672968411 6174 L0",
+        "contract_hash": "bfa58f17a2e8f0b4444de393c17a926bd49f2bc9cbaeaf74b42a1500db8ba0cd",
+        "contract_id": "ic-9e83c8b632dd",
+        "direct_falsifiers": [
+          {
+            "kind": "delta_empty_on_exit0",
+            "predicate_id": "empty_delta_despite_success"
+          }
+        ],
+        "document_map_fingerprint": "f0906f4851896c4cdb199419c93a2d410e7e2a5a32551d425038afc9e12cbcdc",
+        "domain_id": "/workspace/spark-kubernetes-operator",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "26",
+          "provenance": {
+            "source": "unknown"
+          },
+          "requirement_authority": "static_survey",
+          "requirement_major": "26"
+        },
+        "effective_tool": "gradle",
+        "envelope_id": "envelope-000201",
+        "execution_binding": "argv_v1",
+        "expected_argv": "--continue test",
+        "expected_cwd": "/workspace/spark-kubernetes-operator",
+        "expected_observations": [
+          "report_delta"
+        ],
+        "intent_domain_id": "test:/workspace/spark-kubernetes-operator",
+        "intent_id": "intent-76b2c5e99404",
+        "intent_source": "model",
+        "predecessor_contract_id": "ic-6d7857866308",
+        "requested_call": {
+          "params": {
+            "action": "test",
+            "timeout": 1200,
+            "working_directory": "/workspace/spark-kubernetes-operator"
+          },
+          "tool": "build"
+        },
+        "run_id": "20260907_232231_862180_57b47dc27a32_50517-7-974f22a19a2a",
+        "schema_version": 2,
+        "survey_fingerprint": "ee046d65955116e0a7e0d2dfa02f9be4b0528e23446d1969759bbb7917b9557d",
+        "target_sha": "5fe4436cbfba709987a094c1a8c4f1a65d72dbc7"
+      },
+      "testcase_execution_rows_metadata": {
+        "report_count": 46,
+        "schema_version": 2,
+        "status": "complete"
+      },
+      "source_row_count": 225,
+      "row_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/spark-kubernetes-operator",
+            "execution_id": "inv-gradle-1-017d5f0525fc-0002#execution-01f4700ff2a4570221ed9da7",
+            "execution_index": 2,
+            "execution_ordinal": 2,
+            "framework": "junit-xml",
+            "module_coordinate": ":spark-operator-api",
+            "outcome": "passed",
+            "owner": "org.apache.spark.k8s.operator.spec.ClusterSpecTest",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-gradle-1-017d5f0525fc-0002",
+            "report_path": "/workspace/spark-kubernetes-operator/spark-operator-api/build/test-results/test/TEST-org.apache.spark.k8s.operator.spec.ClusterSpecTest.xml",
+            "report_sha256": "78e63bdeee8f00d0a645c284411d9a609431f99ca1958ef6a2b7256d97bcb1b1",
+            "run_id": "20260907_232231_862180_57b47dc27a32_50517-7-974f22a19a2a",
+            "target_sha": "5fe4436cbfba709987a094c1a8c4f1a65d72dbc7",
+            "test_name": "testBuilder"
+          }
+        }
+      ],
+      "source_testcase_outcome_count": 50,
+      "testcase_outcome_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "node_id": "org.apache.spark.k8s.operator.SparkOperatorTest#testOperatorConstructionWithDynamicConfigConfigMapSource()",
+            "status": "passed"
+          }
+        }
+      ],
+      "report_delta_counts": {
+        "changed": 0,
+        "new": 46
+      },
+      "report_delta_samples": {
+        "changed": [],
+        "new": [
+          {
+            "path": "/workspace/spark-kubernetes-operator/spark-operator-api/build/test-results/test/TEST-org.apache.spark.k8s.operator.spec.ClusterSpecTest.xml",
+            "sha256": "78e63bdeee8f00d0a645c284411d9a609431f99ca1958ef6a2b7256d97bcb1b1"
+          }
+        ]
+      },
+      "source_module_outcome_count": 4,
+      "failed_module_samples": [
+        {
+          "module": "spark-operator-api",
+          "status": "failure",
+          "tests_reported": 48
+        }
+      ],
+      "assessments": [
+        {
+          "source": {
+            "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/logs/session_20260907_232231_862180_57b47dc27a32_50517/.setup_agent/evidence_assessments/asm-inv_gradle_1_017d5f0525fc_0002-expectation_unmet-b4dfc145.json",
+            "sha256": "0f9163f143e7fe6617fe411d3b5d6d194ab0bc80f72647c3c2d77775b46d6390"
+          },
+          "record": {
+            "assessment_id": "asm-inv_gradle_1_017d5f0525fc_0002-expectation_unmet-b4dfc145",
+            "blocker_owner": "project",
+            "detail": "exit 1 against the expected report_delta",
+            "fingerprints": {
+              "config_fingerprint": "1672968411 6174 L0",
+              "document_map_fingerprint": "f0906f4851896c4cdb199419c93a2d410e7e2a5a32551d425038afc9e12cbcdc",
+              "domain_id": "/workspace/spark-kubernetes-operator",
+              "survey_fingerprint": "ee046d65955116e0a7e0d2dfa02f9be4b0528e23446d1969759bbb7917b9557d",
+              "target_sha": "5fe4436cbfba709987a094c1a8c4f1a65d72dbc7"
+            },
+            "receipt_id": "inv-gradle-1-017d5f0525fc-0002",
+            "schema_version": 2,
+            "typed_code": "expectation_unmet"
+          }
+        },
+        {
+          "source": {
+            "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/logs/session_20260907_232231_862180_57b47dc27a32_50517/.setup_agent/evidence_assessments/asm-inv_gradle_1_017d5f0525fc_0002-prerequisite_executable_missing_yq__work-f67e5872.json",
+            "sha256": "0043da7a29ff2fc12b5988fa666aa4d5d50b4703069fdbadaa322946d3dba436"
+          },
+          "record": {
+            "assessment_id": "asm-inv_gradle_1_017d5f0525fc_0002-prerequisite_executable_missing_yq__work-f67e5872",
+            "blocker_owner": "unknown",
+            "detail": "runner output reported missing executable yq",
+            "evidence_ref": "output_59fe691e197c",
+            "name": "yq",
+            "receipt_id": "inv-gradle-1-017d5f0525fc-0002",
+            "schema_version": 2,
+            "scope": "/workspace/spark-kubernetes-operator",
+            "typed_code": "prerequisite_executable_missing"
+          }
+        }
+      ],
+      "output": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/container-evidence/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "b43cad08ae0314deabaaacffb93104e8c0de87f7036c76ac2f97418afe5459df"
+        },
+        "jsonl_record_line": 22,
+        "ref_id": "output_59fe691e197c",
+        "record_output_sha256": "49c397e15f124ce7951ff60e6216f5953af8065a818f32a2ff403e9d826d727a",
+        "record_output_bytes": 5492,
+        "record_metadata": {
+          "command": "/workspace/spark-kubernetes-operator/gradlew --continue -Dtest.ignoreFailures=true test",
+          "exit_code": 1
+        },
+        "record_output_matches_receipt_hash": true,
+        "excerpts_are_complete_output": false,
+        "excerpts": [
+          {
+            "start_line": 62,
+            "end_line": 62,
+            "text": "> Task :spark-operator-api:assertGeneratedCRDMatchesHelmChart FAILED"
+          },
+          {
+            "start_line": 78,
+            "end_line": 80,
+            "text": "* What went wrong:\nExecution failed for task ':spark-operator-api:assertGeneratedCRDMatchesHelmChart' (registered in build file 'spark-operator-api/build.gradle').\n> java.io.IOException: Cannot run program \"yq\": Exec failed, error: 2 (No such file or directory) "
+          },
+          {
+            "start_line": 94,
+            "end_line": 94,
+            "text": "BUILD FAILED in 1m 15s"
+          }
+        ]
+      },
+      "report_samples": [],
+      "historical_result": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/audit/result.json",
+          "sha256": "521c6da3a938c273a354478aa402577104f033210e385ca8824e2d6af56c85b5"
+        },
+        "outcome": {
+          "build_state": "success",
+          "terminal_reason": "test_terminated",
+          "test_state": "success",
+          "verdict": "success"
+        },
+        "receipt_executions": {
+          "availability": "available",
+          "basis": "gradle suite totals over every claimed report",
+          "errors": 0,
+          "executed": 225,
+          "failed": 0,
+          "passed": 225,
+          "skipped": 0
+        }
+      },
+      "source_review": {
+        "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/audit/execution-review.json",
+        "sha256": "ff84a3cd1eb3f7217ed9bb27dce813cf5b07901aac458b837a57db16b16ba0dc"
+      }
+    },
+    {
+      "id": "kafka",
+      "expected": {
+        "disallowed_state": "completed",
+        "preferred_state": "partial",
+        "reason": "The Gradle daemon disappeared during the test invocation. Suite totals prove prior test execution even though module-qualified identity rows are unavailable; completed reports do not prove the remaining invocation completed.",
+        "non_assertion_reason": "The independent runner failure is a vanished Gradle daemon. Four reported assertion failures coexist but do not explain away the unfinished runner. The daemon failure cause, including OOM, is unproved."
+      },
+      "source_receipt": {
+        "path": "logs/d3r1-20260907/runs/kafka/logs/session_20260908_004554_382784_eca4d5db5dcd_53903/.setup_agent/invocation_receipts/inv-gradle-1-80042183a8e5-0003.json",
+        "sha256": "7b6917f010379ddd1308afe66179e861a6f76a5c1846dcd4485a4a81e90e23ca"
+      },
+      "receipt_fields": {
+        "actual_cwd": "/workspace/kafka",
+        "argv": "/workspace/kafka/gradlew --continue -Dtest.ignoreFailures=true test",
+        "compliance": "equivalent",
+        "config_fingerprint": "1298829823 269653 L0",
+        "contract_hash": "6881aea1088d453f50497fc0842ff3c9940134d29f2aa0f96421a90954da6e40",
+        "contract_id": "ic-2a15312430d1",
+        "document_map_fingerprint": "55fc1cca61866db8b0a44ed804d1a9889a7a275426e0b1cc37f1246a10bd048e",
+        "domain_id": "/workspace/kafka",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "17",
+          "provenance": {
+            "source": "java_runtime_probe"
+          },
+          "runtime_authority": "dispatch_probe"
+        },
+        "execution_binding": "argv_v1",
+        "exit_code": 1,
+        "gradle_row_disclosure": {
+          "red_rows_complete": true,
+          "rows_source": "gradle_xml",
+          "rows_truncated": {
+            "dropped_files": 604,
+            "dropped_green": 791
+          }
+        },
+        "gradle_suite_summaries": {
+          "suites": [
+            {
+              "errors": 0,
+              "failures": 2,
+              "module": ":clients",
+              "skipped": 30,
+              "task": "test",
+              "tests": 13561,
+              "xml_files": 442
+            },
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":connect:basic-auth-extension",
+              "skipped": 0,
+              "task": "test",
+              "tests": 17,
+              "xml_files": 2
+            },
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":connect:file",
+              "skipped": 0,
+              "task": "test",
+              "tests": 38,
+              "xml_files": 6
+            },
+            {
+              "errors": 0,
+              "failures": 1,
+              "module": ":metadata",
+              "skipped": 1,
+              "task": "test",
+              "tests": 995,
+              "xml_files": 102
+            },
+            {
+              "errors": 0,
+              "failures": 1,
+              "module": ":server-common",
+              "skipped": 0,
+              "task": "test",
+              "tests": 932,
+              "xml_files": 50
+            },
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":shell",
+              "skipped": 0,
+              "task": "test",
+              "tests": 22,
+              "xml_files": 6
+            },
+            {
+              "errors": 0,
+              "failures": 0,
+              "module": ":transaction-coordinator",
+              "skipped": 0,
+              "task": "test",
+              "tests": 76,
+              "xml_files": 6
+            }
+          ]
+        },
+        "outcome": "failed",
+        "output_content_hash": "00fe815f398c135315fae3e87e0e86027c307f4e5cc15281bfbc5347111fb3cb",
+        "receipt_id": "inv-gradle-1-80042183a8e5-0003",
+        "requested_action": "test",
+        "run_id": "20260908_004554_382784_eca4d5db5dcd_53903-7-0dbc9e714da7",
+        "schema_version": 3,
+        "survey_fingerprint": "2d4e361ed409564a260cb57f1c2480ceab29cdf84e571926c43b93fb102a7610",
+        "target_sha": "f5e01c7b0a07878e79d310a021a7881c6ee52717",
+        "tool": "gradle",
+        "toolchain_fingerprint": {
+          "executable": "/workspace/kafka/gradlew"
+        },
+        "working_directory": "/workspace/kafka"
+      },
+      "source_contract": {
+        "path": "logs/d3r1-20260907/runs/kafka/logs/session_20260908_004554_382784_eca4d5db5dcd_53903/.setup_agent/invocation_contracts/ic-2a15312430d1.json",
+        "sha256": "1b4171b620004f6f5b54ecf5a0fa586dde75d46bf2cd3fab68a6bd7519a9c4fa"
+      },
+      "contract": {
+        "action_fingerprint": "act-543bbd6c7b4078b8f522466fa5b09535ddf5ee7879a6153c6e0e33cb92ab05da",
+        "config_fingerprint": "1298829823 269653 L0",
+        "contract_hash": "6881aea1088d453f50497fc0842ff3c9940134d29f2aa0f96421a90954da6e40",
+        "contract_id": "ic-2a15312430d1",
+        "direct_falsifiers": [
+          {
+            "kind": "delta_empty_on_exit0",
+            "predicate_id": "empty_delta_despite_success"
+          }
+        ],
+        "document_map_fingerprint": "55fc1cca61866db8b0a44ed804d1a9889a7a275426e0b1cc37f1246a10bd048e",
+        "domain_id": "/workspace/kafka",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "17",
+          "provenance": {
+            "source": "java_runtime_probe"
+          },
+          "runtime_authority": "dispatch_probe"
+        },
+        "effective_tool": "gradle",
+        "envelope_id": "envelope-000296",
+        "execution_binding": "argv_v1",
+        "expected_argv": "--continue test",
+        "expected_cwd": "/workspace/kafka",
+        "expected_observations": [
+          "report_delta"
+        ],
+        "intent_domain_id": "test:/workspace/kafka",
+        "intent_id": "intent-a46098fdb8d7",
+        "intent_source": "model",
+        "predecessor_contract_id": "ic-84b5da699fbe",
+        "requested_call": {
+          "params": {
+            "action": "test",
+            "args": "test",
+            "timeout": 7200,
+            "working_directory": "/workspace/kafka"
+          },
+          "tool": "build"
+        },
+        "run_id": "20260908_004554_382784_eca4d5db5dcd_53903-7-0dbc9e714da7",
+        "schema_version": 2,
+        "survey_fingerprint": "2d4e361ed409564a260cb57f1c2480ceab29cdf84e571926c43b93fb102a7610",
+        "target_sha": "f5e01c7b0a07878e79d310a021a7881c6ee52717"
+      },
+      "testcase_execution_rows_metadata": {
+        "reasons": [
+          "module_qualified_identity_unavailable"
+        ],
+        "report_count": 614,
+        "schema_version": 2,
+        "status": "unavailable"
+      },
+      "source_row_count": 0,
+      "row_samples": [],
+      "source_testcase_outcome_count": 49,
+      "testcase_outcome_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "node_id": "org.apache.kafka.common.network.SslTransportLayerTest#\"testListenerConfigOverride(Args).args=tlsProtocol=TLSv1.2, useInlinePem=true\"",
+            "reason": "org.opentest4j.AssertionFailedError: expected: <AUTHENTICATION_FAILED> but was: <AUTHENTICATE>",
+            "status": "failed"
+          }
+        },
+        {
+          "source_index": 4,
+          "record": {
+            "node_id": "org.apache.kafka.common.security.oauthbearer.internals.expiring.ExpiringCredentialRefreshConfigTest#fromGoodConfig()",
+            "status": "passed"
+          }
+        }
+      ],
+      "report_delta_counts": {
+        "changed": 0,
+        "new": 614
+      },
+      "report_delta_samples": {
+        "changed": [],
+        "new": [
+          {
+            "path": "/workspace/kafka/clients/build/test-results/test/TEST-o-A4PG2T174VORO.apache.kafka.common.security.oauthbearer.internals.expiring.ExpiringCredentialRefreshConfigTest.xml",
+            "sha256": "6dce3c6815944511fb2de9b6b00f6725eb58f6029b16286f4221c17ba6d75b8b"
+          }
+        ]
+      },
+      "source_module_outcome_count": 56,
+      "failed_module_samples": [
+        {
+          "module": "server-common",
+          "status": "failure",
+          "tests_reported": 932
+        },
+        {
+          "module": "clients",
+          "status": "failure",
+          "tests_reported": 13561
+        }
+      ],
+      "assessments": [
+        {
+          "source": {
+            "path": "logs/d3r1-20260907/runs/kafka/logs/session_20260908_004554_382784_eca4d5db5dcd_53903/.setup_agent/evidence_assessments/asm-inv_gradle_1_80042183a8e5_0003-contract_binding_unknown-6f69dcea.json",
+            "sha256": "7938e8b5b5da1afd688359c8ebe9a36a1dc31e633d512c0fd1d02877b6618373"
+          },
+          "record": {
+            "assessment_id": "asm-inv_gradle_1_80042183a8e5_0003-contract_binding_unknown-6f69dcea",
+            "blocker_owner": "harness",
+            "detail": "current target_sha pin is unavailable",
+            "fingerprints": {
+              "config_fingerprint": "1298829823 269653 L0",
+              "document_map_fingerprint": "55fc1cca61866db8b0a44ed804d1a9889a7a275426e0b1cc37f1246a10bd048e",
+              "domain_id": "/workspace/kafka",
+              "survey_fingerprint": "2d4e361ed409564a260cb57f1c2480ceab29cdf84e571926c43b93fb102a7610",
+              "target_sha": "f5e01c7b0a07878e79d310a021a7881c6ee52717"
+            },
+            "receipt_id": "inv-gradle-1-80042183a8e5-0003",
+            "schema_version": 2,
+            "typed_code": "contract_binding_unknown"
+          }
+        }
+      ],
+      "output": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/kafka/container-evidence/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "56c819a61b5b96432b6a24a2690ca5656efe3a9c3deba474ad29d07e22663663"
+        },
+        "jsonl_record_line": 26,
+        "ref_id": "output_f37199e5bc4c",
+        "record_output_sha256": "00fe815f398c135315fae3e87e0e86027c307f4e5cc15281bfbc5347111fb3cb",
+        "record_output_bytes": 7825288,
+        "record_metadata": {
+          "operation_outcome": "failed",
+          "error_code": "DETACHED_OPERATION_FAILED",
+          "failure_signature": "DETACHED_OPERATION_FAILED:e0eb359fac313024"
+        },
+        "record_output_matches_receipt_hash": true,
+        "excerpts_are_complete_output": false,
+        "excerpts": [
+          {
+            "start_line": 71376,
+            "end_line": 71376,
+            "text": "The message received from the daemon indicates that the daemon has disappeared."
+          },
+          {
+            "start_line": 71472,
+            "end_line": 71475,
+            "text": "FAILURE: Build failed with an exception.\n\n* What went wrong:\nGradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)"
+          }
+        ]
+      },
+      "report_samples": [],
+      "historical_result": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/kafka/audit/result.json",
+          "sha256": "206a19e2c145eb304674edf9bcfdbeb4aa446b9d741f7a6732f642e2b87aca4d"
+        },
+        "outcome": {
+          "build_state": "success",
+          "terminal_reason": "test_terminated",
+          "test_state": "success",
+          "verdict": "success"
+        },
+        "receipt_executions": {
+          "availability": "available",
+          "basis": "gradle suite totals over every claimed report",
+          "errors": 0,
+          "executed": 15641,
+          "failed": 4,
+          "passed": 15606,
+          "skipped": 31
+        }
+      },
+      "source_review": {
+        "path": "logs/d3r1-20260907/runs/kafka/audit/execution-review.json",
+        "sha256": "069b71164abfc31ca4acbbf3bf3e796b2a595741c6c0bcef9a532e2e5476aeb6"
+      }
+    },
+    {
+      "id": "zookeeper",
+      "expected": {
+        "disallowed_state": "completed",
+        "preferred_state": "partial",
+        "reason": "The full-build/verify invocation produced test reports but failed starting autoreconf in zookeeper-client-c and failed compiling zookeeper-it. The missing current target_sha assessment is a separate context defect.",
+        "non_assertion_reason": "Missing autoreconf and a compiler exception are non-testcase failures in the requested lifecycle. Existing testcase red is separate."
+      },
+      "source_receipt": {
+        "path": "logs/d3r1-20260907/runs/zookeeper/logs/session_20260907_233315_219870_d287a6ab0657_51166/.setup_agent/invocation_receipts/inv-maven-1-8e7119a2feee-0003.json",
+        "sha256": "c8116616095f18a50a6e0aae27fa4fee095be7f094ae20fd0f3f4c55c07a3a66"
+      },
+      "receipt_fields": {
+        "actual_cwd": "/workspace/zookeeper",
+        "argv": "/opt/apache-maven-3.9.9/bin/mvn --fail-at-end -Dmaven.test.failure.ignore=true test -Pfull-build verify -Dsurefire-forkcount=1 -DskipCppUnit -Dsurefire.rerunFailingTestsCount=5",
+        "compliance": "equivalent",
+        "config_fingerprint": "1587007751 50024 L0",
+        "contract_hash": "6bdc0873f04e94f22af8625399d90b84b4da8e1b486b23c94156b7854737a25c",
+        "contract_id": "ic-808b446d0214",
+        "document_map_fingerprint": "5c2d2e17e7a898108d8b5405cc8cb1c58783363f77a63c700e8d501e7dfc23c7",
+        "domain_id": "/workspace/zookeeper",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "17",
+          "provenance": {
+            "source": "maven-compiler"
+          },
+          "requirement_authority": "static_survey",
+          "requirement_major": "17"
+        },
+        "execution_binding": "argv_v1",
+        "exit_code": 1,
+        "outcome": "failed",
+        "output_content_hash": "98162346c8d83080a2da46a50d1cc8cf0227baac6622d2abad4235fc5dfb6a1f",
+        "receipt_id": "inv-maven-1-8e7119a2feee-0003",
+        "requested_action": "test",
+        "run_id": "20260907_233315_219870_d287a6ab0657_51166-7-d44c2c0f49e1",
+        "schema_version": 3,
+        "survey_fingerprint": "eed36f804b7e3726eccb8edad06bbdb695204ddde9ce33ab12e5af5099941430",
+        "target_sha": "100001f614a25ff24fb9435ad6209679d69c95bd",
+        "testcase_row_disclosure": {
+          "red_rows_complete": true,
+          "rows_source": "delta_xml",
+          "rows_truncated": {
+            "dropped_files": 185,
+            "dropped_green": 1278
+          }
+        },
+        "tool": "maven",
+        "toolchain_fingerprint": {
+          "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+          "version": "Apache Maven 3.9.9 (8e8579a9e76f7d015ee5ec7bfcdc97d260186937)"
+        },
+        "working_directory": "/workspace/zookeeper"
+      },
+      "source_contract": {
+        "path": "logs/d3r1-20260907/runs/zookeeper/logs/session_20260907_233315_219870_d287a6ab0657_51166/.setup_agent/invocation_contracts/ic-808b446d0214.json",
+        "sha256": "2379c7321648e8e5089adfe6af7954f2819fe33223037f35035310b2a13fc740"
+      },
+      "contract": {
+        "action_fingerprint": "act-b6275d3762af97bc40d822e7ac5167ff252eb40d113000cd2bb824cb59fe29c0",
+        "config_fingerprint": "1587007751 50024 L0",
+        "contract_hash": "6bdc0873f04e94f22af8625399d90b84b4da8e1b486b23c94156b7854737a25c",
+        "contract_id": "ic-808b446d0214",
+        "direct_falsifiers": [
+          {
+            "kind": "delta_empty_on_exit0",
+            "predicate_id": "empty_delta_despite_success"
+          }
+        ],
+        "document_map_fingerprint": "5c2d2e17e7a898108d8b5405cc8cb1c58783363f77a63c700e8d501e7dfc23c7",
+        "domain_id": "/workspace/zookeeper",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "17",
+          "provenance": {
+            "source": "maven-compiler"
+          },
+          "requirement_authority": "static_survey",
+          "requirement_major": "17"
+        },
+        "effective_tool": "maven",
+        "envelope_id": "envelope-000195",
+        "execution_binding": "argv_v1",
+        "expected_argv": "--fail-at-end test -Pfull-build verify -Dsurefire-forkcount=1 -DskipCppUnit -Dsurefire.rerunFailingTestsCount=5",
+        "expected_cwd": "/workspace/zookeeper",
+        "expected_observations": [
+          "report_delta"
+        ],
+        "intent_domain_id": "test:/workspace/zookeeper",
+        "intent_id": "intent-e1cb2c5cbd8b",
+        "intent_source": "model",
+        "predecessor_contract_id": "ic-6bd0184ffee6",
+        "requested_call": {
+          "params": {
+            "action": "test",
+            "args": "-Pfull-build verify -Dsurefire-forkcount=1 -DskipCppUnit -Dsurefire.rerunFailingTestsCount=5",
+            "timeout": 2400,
+            "working_directory": "/workspace/zookeeper"
+          },
+          "tool": "build"
+        },
+        "run_id": "20260907_233315_219870_d287a6ab0657_51166-7-d44c2c0f49e1",
+        "schema_version": 2,
+        "survey_fingerprint": "eed36f804b7e3726eccb8edad06bbdb695204ddde9ce33ab12e5af5099941430",
+        "target_sha": "100001f614a25ff24fb9435ad6209679d69c95bd"
+      },
+      "testcase_execution_rows_metadata": {
+        "report_count": 349,
+        "schema_version": 2,
+        "status": "complete"
+      },
+      "source_row_count": 2048,
+      "row_samples": [
+        {
+          "source_index": 1614,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/zookeeper",
+            "execution_id": "inv-maven-1-8e7119a2feee-0003#execution-ce39828e563751ba1b0b7604",
+            "execution_index": 3,
+            "execution_ordinal": 2,
+            "framework": "junit-xml",
+            "module_coordinate": "zookeeper-server",
+            "outcome": "error",
+            "owner": "org.apache.zookeeper.server.util.JvmPauseMonitorTest",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-maven-1-8e7119a2feee-0003",
+            "report_path": "/workspace/zookeeper/zookeeper-server/target/surefire-reports/TEST-org.apache.zookeeper.server.util.JvmPauseMonitorTest.xml",
+            "report_sha256": "1df3e72341f93303d5c130b7628fed68f4824e13ee371c2d47551d474ebf5c73",
+            "run_id": "20260907_233315_219870_d287a6ab0657_51166-7-d44c2c0f49e1",
+            "target_sha": "100001f614a25ff24fb9435ad6209679d69c95bd",
+            "test_name": "testJvmPauseMonitorExceedInfoThreshold"
+          }
+        },
+        {
+          "source_index": 303,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/zookeeper",
+            "execution_id": "inv-maven-1-8e7119a2feee-0003#execution-26eebbc01fddc096c344cf3f",
+            "execution_index": 3,
+            "execution_ordinal": 4,
+            "framework": "junit-xml",
+            "module_coordinate": "zookeeper-server",
+            "outcome": "failed",
+            "owner": "org.apache.zookeeper.server.ZooKeeperServerMainTest",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-maven-1-8e7119a2feee-0003",
+            "report_path": "/workspace/zookeeper/zookeeper-server/target/surefire-reports/TEST-org.apache.zookeeper.server.ZooKeeperServerMainTest.xml",
+            "report_sha256": "f6bcd53fd9b0ad428fe900c93f13a284f9de18e43984a130a4cc123ea80e0e39",
+            "run_id": "20260907_233315_219870_d287a6ab0657_51166-7-d44c2c0f49e1",
+            "target_sha": "100001f614a25ff24fb9435ad6209679d69c95bd",
+            "test_name": "testReadOnlySnapshotDir"
+          }
+        },
+        {
+          "source_index": 0,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/zookeeper",
+            "execution_id": "inv-maven-1-8e7119a2feee-0003#execution-00204aaa07552b5b690a39c8",
+            "execution_index": 3,
+            "execution_ordinal": 3,
+            "framework": "junit-xml",
+            "module_coordinate": "zookeeper-server",
+            "outcome": "passed",
+            "owner": "org.apache.zookeeper.server.ZooKeeperServerTest",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-maven-1-8e7119a2feee-0003",
+            "report_path": "/workspace/zookeeper/zookeeper-server/target/surefire-reports/TEST-org.apache.zookeeper.server.ZooKeeperServerTest.xml",
+            "report_sha256": "25ee2b762ae81e264955b6d61fa42522f60f5287346b9b6223673734217208d1",
+            "run_id": "20260907_233315_219870_d287a6ab0657_51166-7-d44c2c0f49e1",
+            "target_sha": "100001f614a25ff24fb9435ad6209679d69c95bd",
+            "test_name": "testInvalidSnapshot"
+          }
+        }
+      ],
+      "source_testcase_outcome_count": 50,
+      "testcase_outcome_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "node_id": "org.apache.zookeeper.server.util.JvmPauseMonitorTest#testJvmPauseMonitorExceedInfoThreshold",
+            "reason": "testJvmPauseMonitorExceedInfoThreshold() timed out after 5 seconds",
+            "status": "error"
+          }
+        },
+        {
+          "source_index": 1,
+          "record": {
+            "node_id": "org.apache.zookeeper.ZKUtilTest#testUnreadableFileInput",
+            "reason": "expected: not <null>",
+            "status": "failed"
+          }
+        },
+        {
+          "source_index": 6,
+          "record": {
+            "node_id": "org.apache.jute.BinaryInputArchiveTest#testBool",
+            "status": "passed"
+          }
+        }
+      ],
+      "report_delta_counts": {
+        "changed": 0,
+        "new": 349
+      },
+      "report_delta_samples": {
+        "changed": [],
+        "new": [
+          {
+            "path": "/workspace/zookeeper/zookeeper-server/target/surefire-reports/TEST-org.apache.zookeeper.server.ZooKeeperServerMainTest.xml",
+            "sha256": "f6bcd53fd9b0ad428fe900c93f13a284f9de18e43984a130a4cc123ea80e0e39"
+          },
+          {
+            "path": "/workspace/zookeeper/zookeeper-server/target/surefire-reports/TEST-org.apache.zookeeper.server.ZooKeeperServerTest.xml",
+            "sha256": "25ee2b762ae81e264955b6d61fa42522f60f5287346b9b6223673734217208d1"
+          },
+          {
+            "path": "/workspace/zookeeper/zookeeper-server/target/surefire-reports/TEST-org.apache.zookeeper.server.util.JvmPauseMonitorTest.xml",
+            "sha256": "1df3e72341f93303d5c130b7628fed68f4824e13ee371c2d47551d474ebf5c73"
+          }
+        ]
+      },
+      "source_module_outcome_count": 19,
+      "failed_module_samples": [
+        {
+          "module": "Apache ZooKeeper - Client - C",
+          "status": "failure"
+        },
+        {
+          "module": "Apache ZooKeeper - Tests",
+          "status": "failure"
+        }
+      ],
+      "assessments": [
+        {
+          "source": {
+            "path": "logs/d3r1-20260907/runs/zookeeper/logs/session_20260907_233315_219870_d287a6ab0657_51166/.setup_agent/evidence_assessments/asm-inv_maven_1_8e7119a2feee_0003-contract_binding_unknown-94776ce9.json",
+            "sha256": "7af4dde6814f7ff213f5c2ca183b5ebf635f8bcafd8025c51a826fe4959bc875"
+          },
+          "record": {
+            "assessment_id": "asm-inv_maven_1_8e7119a2feee_0003-contract_binding_unknown-94776ce9",
+            "blocker_owner": "harness",
+            "detail": "current target_sha pin is unavailable",
+            "fingerprints": {
+              "config_fingerprint": "1587007751 50024 L0",
+              "document_map_fingerprint": "5c2d2e17e7a898108d8b5405cc8cb1c58783363f77a63c700e8d501e7dfc23c7",
+              "domain_id": "/workspace/zookeeper",
+              "survey_fingerprint": "eed36f804b7e3726eccb8edad06bbdb695204ddde9ce33ab12e5af5099941430",
+              "target_sha": "100001f614a25ff24fb9435ad6209679d69c95bd"
+            },
+            "receipt_id": "inv-maven-1-8e7119a2feee-0003",
+            "schema_version": 2,
+            "typed_code": "contract_binding_unknown"
+          }
+        }
+      ],
+      "output": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/zookeeper/container-evidence/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "a0dd858deeadbb5b92cbd7dc27f0ff4bf0843ab32bc4c04f3cbd167dfdf8b28c"
+        },
+        "jsonl_record_line": 22,
+        "ref_id": "output_a06e345d8ad8",
+        "record_output_sha256": "98162346c8d83080a2da46a50d1cc8cf0227baac6622d2abad4235fc5dfb6a1f",
+        "record_output_bytes": 704038,
+        "record_metadata": {
+          "operation_outcome": "failed",
+          "error_code": "DETACHED_OPERATION_FAILED",
+          "failure_signature": "DETACHED_OPERATION_FAILED:8a44b12805ccd212"
+        },
+        "record_output_matches_receipt_hash": true,
+        "excerpts_are_complete_output": false,
+        "excerpts": [
+          {
+            "start_line": 10813,
+            "end_line": 10815,
+            "text": "[INFO] --- exec:1.6.0:exec (autoreconf) @ zookeeper-client-c ---\n[ERROR] Command execution failed.\njava.io.IOException: Cannot run program \"autoreconf\" (in directory \"/workspace/zookeeper/zookeeper-client/zookeeper-client-c\"): error=2, No such file or directory"
+          },
+          {
+            "start_line": 14089,
+            "end_line": 14090,
+            "text": "[ERROR] Failed to execute goal org.codehaus.mojo:exec-maven-plugin:1.6.0:exec (autoreconf) on project zookeeper-client-c: Command execution failed.: Cannot run program \"autoreconf\" (in directory \"/workspace/zookeeper/zookeeper-client/zookeeper-client-c\"): error=2, No such file or directory -> [Help 1]\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.8.1:compile (default-compile) on project zookeeper-it: Fatal error compiling: java.lang.NullPointerException: Cannot invoke \"javax.lang.model.element.Element.getKind()\" because \"elem\" is null -> [Help 1]"
+          }
+        ]
+      },
+      "report_samples": [],
+      "historical_result": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/zookeeper/audit/result.json",
+          "sha256": "83d83fa41ab5404d213310d5f58c5f26cee345fd35860f0384c3cc1708823a30"
+        },
+        "outcome": {
+          "build_state": "success",
+          "terminal_reason": "test_terminated",
+          "test_state": "success",
+          "verdict": "partial"
+        },
+        "receipt_executions": {
+          "availability": "partial",
+          "basis": "module-qualified receipt execution rows (bounded identity sample)",
+          "bound": "lower",
+          "errors": 1,
+          "executed": 2048,
+          "failed": 5,
+          "passed": 2042,
+          "reason": "a current receipt stated no suite totals and its identity rows were bounded",
+          "skipped": 0
+        }
+      },
+      "source_review": {
+        "path": "logs/d3r1-20260907/runs/zookeeper/audit/execution-review.json",
+        "sha256": "c1c5763dcaa35897e6a73e009adf0d366813c3facabde139899320b415d67104"
+      }
+    },
+    {
+      "id": "storm",
+      "expected": {
+        "disallowed_state": "completed",
+        "preferred_state": "failed",
+        "reason": "The requested invocation failed compiling storm-client. Its only claimed testcase was skipped, so there is no evidence a test body ran; the skipped receipt execution still remains counted.",
+        "non_assertion_reason": "The failure occurred in maven-compiler-plugin:compile with missing relocated classes, not an assertion. The unrelated skipped row is neither passed nor evidence that compilation completed."
+      },
+      "source_receipt": {
+        "path": "logs/d3r1-20260907/runs/storm/logs/session_20260908_020217_821325_2f88fd28162a_56524/.setup_agent/invocation_receipts/inv-maven-1-5fb9f0da96b2-0003.json",
+        "sha256": "864314bad99d27ac10a8aee5e33e57607e1f388e6843c4852eefb46e52993047"
+      },
+      "receipt_fields": {
+        "actual_cwd": "/workspace/storm",
+        "argv": "/opt/apache-maven-3.9.9/bin/mvn --fail-at-end -Dmaven.test.failure.ignore=true test -DskipITs -DskipTests=false",
+        "compliance": "equivalent",
+        "config_fingerprint": "2797085423 28968 L0",
+        "contract_hash": "535efef034bbb3015e69c33c4957f438239e418a570e5c574ae25ea4cda4211a",
+        "contract_id": "ic-81bfd82a6df2",
+        "document_map_fingerprint": "1055b135e1831bf763a589b459b3e3beb436653964dcb3d692bda6655a4fc784",
+        "domain_id": "/workspace/storm",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "25",
+          "provenance": {
+            "activated_at": "2026-09-08T06:05:30.817566+00:00",
+            "active_runtime": {
+              "executable": "/usr/lib/jvm/java-25-openjdk-arm64/bin/java",
+              "major": "25"
+            },
+            "domain_root": "/workspace/storm",
+            "observed_at": "2026-09-08T06:05:18.739716+00:00",
+            "observed_runtime": {
+              "executable": "/usr/lib/jvm/java-17-openjdk-arm64/bin/java",
+              "major": "17"
+            },
+            "observed_sequence": 1,
+            "required_major": "25",
+            "source_ref": "inv-maven-1-5fb9f0da96b2-0001",
+            "target_sha": "26ad76e7e8cc2eb53df032680e86bedd3e7addde"
+          },
+          "requirement_authority": "persisted_dynamic",
+          "requirement_major": "25"
+        },
+        "execution_binding": "argv_v1",
+        "exit_code": 1,
+        "lifecycle_state": "finished",
+        "outcome": "failed",
+        "output_content_hash": "6d488f951b3a8e33975cd16245ed4181a70e076df0561a9702499063dec6e6d3",
+        "receipt_id": "inv-maven-1-5fb9f0da96b2-0003",
+        "requested_action": "test",
+        "run_id": "20260908_020217_821325_2f88fd28162a_56524-7-15853b620d3e",
+        "schema_version": 3,
+        "survey_fingerprint": "cb29f9d379a69034ba8b8ab68f21624445e91f83c7a860c3bb8da4204de74a90",
+        "target_sha": "26ad76e7e8cc2eb53df032680e86bedd3e7addde",
+        "tool": "maven",
+        "toolchain_fingerprint": {
+          "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+          "version": "WARNING: A restricted method in java.lang.System has been called"
+        },
+        "working_directory": "/workspace/storm"
+      },
+      "source_contract": {
+        "path": "logs/d3r1-20260907/runs/storm/logs/session_20260908_020217_821325_2f88fd28162a_56524/.setup_agent/invocation_contracts/ic-81bfd82a6df2.json",
+        "sha256": "8e9a3a5f66805ff4d639e9acbe0336741ab622866dfd61b92c9ac519c1df2fed"
+      },
+      "contract": {
+        "action_fingerprint": "act-5fffc2f54a1a5e153ce6be0d8fbb34b37880d7ece92e39e90f64dde93fb470b4",
+        "config_fingerprint": "2797085423 28968 L0",
+        "contract_hash": "535efef034bbb3015e69c33c4957f438239e418a570e5c574ae25ea4cda4211a",
+        "contract_id": "ic-81bfd82a6df2",
+        "direct_falsifiers": [
+          {
+            "kind": "delta_empty_on_exit0",
+            "predicate_id": "empty_delta_despite_success"
+          }
+        ],
+        "document_map_fingerprint": "1055b135e1831bf763a589b459b3e3beb436653964dcb3d692bda6655a4fc784",
+        "domain_id": "/workspace/storm",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "25",
+          "provenance": {
+            "activated_at": "2026-09-08T06:05:30.817566+00:00",
+            "active_runtime": {
+              "executable": "/usr/lib/jvm/java-25-openjdk-arm64/bin/java",
+              "major": "25"
+            },
+            "domain_root": "/workspace/storm",
+            "observed_at": "2026-09-08T06:05:18.739716+00:00",
+            "observed_runtime": {
+              "executable": "/usr/lib/jvm/java-17-openjdk-arm64/bin/java",
+              "major": "17"
+            },
+            "observed_sequence": 1,
+            "required_major": "25",
+            "source_ref": "inv-maven-1-5fb9f0da96b2-0001",
+            "target_sha": "26ad76e7e8cc2eb53df032680e86bedd3e7addde"
+          },
+          "requirement_authority": "persisted_dynamic",
+          "requirement_major": "25"
+        },
+        "effective_tool": "maven",
+        "envelope_id": "envelope-000258",
+        "execution_binding": "argv_v1",
+        "expected_argv": "--fail-at-end test -DskipITs -DskipTests=false",
+        "expected_cwd": "/workspace/storm",
+        "expected_observations": [
+          "report_delta"
+        ],
+        "intent_domain_id": "test:/workspace/storm",
+        "intent_id": "intent-6c661fdf6a54",
+        "intent_source": "model",
+        "predecessor_contract_id": "ic-4adfc6613218",
+        "requested_call": {
+          "params": {
+            "action": "test",
+            "args": "-DskipITs -DskipTests=false",
+            "timeout": 7200,
+            "working_directory": "/workspace/storm"
+          },
+          "tool": "build"
+        },
+        "run_id": "20260908_020217_821325_2f88fd28162a_56524-7-15853b620d3e",
+        "schema_version": 2,
+        "survey_fingerprint": "cb29f9d379a69034ba8b8ab68f21624445e91f83c7a860c3bb8da4204de74a90",
+        "target_sha": "26ad76e7e8cc2eb53df032680e86bedd3e7addde"
+      },
+      "testcase_execution_rows_metadata": {
+        "report_count": 1,
+        "schema_version": 2,
+        "status": "complete"
+      },
+      "source_row_count": 1,
+      "row_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/storm",
+            "execution_id": "inv-maven-1-5fb9f0da96b2-0003#execution-5daf49e33f912a64c24ea0d4",
+            "execution_index": 3,
+            "execution_ordinal": 1,
+            "framework": "junit-xml",
+            "module_coordinate": "external/storm-kafka-monitor",
+            "outcome": "skipped",
+            "owner": "org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-maven-1-5fb9f0da96b2-0003",
+            "report_path": "/workspace/storm/external/storm-kafka-monitor/target/surefire-reports/TEST-org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest.xml",
+            "report_sha256": "71b1fa6581aabe07c0e843ab3922123adb03f5083e32b7e451bd7de11872cd2d",
+            "run_id": "20260908_020217_821325_2f88fd28162a_56524-7-15853b620d3e",
+            "target_sha": "26ad76e7e8cc2eb53df032680e86bedd3e7addde",
+            "test_name": "getOffsetLagsReportsCommittedOffsetForCommittedPartitionsAndMinusOneForUncommittedPartitions"
+          }
+        }
+      ],
+      "source_testcase_outcome_count": 1,
+      "testcase_outcome_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "node_id": "org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest#getOffsetLagsReportsCommittedOffsetForCommittedPartitionsAndMinusOneForUncommittedPartitions",
+            "reason": "disabledWithoutDocker is true and Docker is not available",
+            "status": "skipped"
+          }
+        }
+      ],
+      "report_delta_counts": {
+        "changed": 0,
+        "new": 1
+      },
+      "report_delta_samples": {
+        "changed": [],
+        "new": [
+          {
+            "path": "/workspace/storm/external/storm-kafka-monitor/target/surefire-reports/TEST-org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest.xml",
+            "sha256": "71b1fa6581aabe07c0e843ab3922123adb03f5083e32b7e451bd7de11872cd2d"
+          }
+        ]
+      },
+      "source_module_outcome_count": 42,
+      "failed_module_samples": [
+        {
+          "module": "Storm Client",
+          "status": "failure"
+        }
+      ],
+      "assessments": [
+        {
+          "source": {
+            "path": "logs/d3r1-20260907/runs/storm/logs/session_20260908_020217_821325_2f88fd28162a_56524/.setup_agent/evidence_assessments/asm-inv_maven_1_5fb9f0da96b2_0003-expectation_unmet-56bdf761.json",
+            "sha256": "0dcb653d9e8c5b6b50d5d282b0a5179dba8ed63a27f8ae23c1684a8683324fd3"
+          },
+          "record": {
+            "assessment_id": "asm-inv_maven_1_5fb9f0da96b2_0003-expectation_unmet-56bdf761",
+            "blocker_owner": "project",
+            "detail": "exit 1 against the expected report_delta",
+            "fingerprints": {
+              "config_fingerprint": "2797085423 28968 L0",
+              "document_map_fingerprint": "1055b135e1831bf763a589b459b3e3beb436653964dcb3d692bda6655a4fc784",
+              "domain_id": "/workspace/storm",
+              "survey_fingerprint": "cb29f9d379a69034ba8b8ab68f21624445e91f83c7a860c3bb8da4204de74a90",
+              "target_sha": "26ad76e7e8cc2eb53df032680e86bedd3e7addde"
+            },
+            "receipt_id": "inv-maven-1-5fb9f0da96b2-0003",
+            "schema_version": 2,
+            "typed_code": "expectation_unmet"
+          }
+        }
+      ],
+      "output": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/storm/container-evidence/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "185e313f28419c7e42129f0e44256e7c4cd8dd66d5290880d247879f8d6c50e7"
+        },
+        "jsonl_record_line": 28,
+        "ref_id": "output_a83d4a3407c1",
+        "record_output_sha256": "6d488f951b3a8e33975cd16245ed4181a70e076df0561a9702499063dec6e6d3",
+        "record_output_bytes": 2294526,
+        "record_metadata": {
+          "invocation_status": "completed",
+          "operation_outcome": "failed",
+          "evidence_status": "verified",
+          "error_code": "JAVA_VERSION_ERROR",
+          "failure_signature": "JAVA_VERSION_ERROR:f20fcae57551558f",
+          "action": "test"
+        },
+        "record_output_matches_receipt_hash": true,
+        "excerpts_are_complete_output": false,
+        "excerpts": [
+          {
+            "start_line": 14506,
+            "end_line": 14506,
+            "text": "[ERROR] /workspace/storm/storm-client/src/jvm/org/apache/storm/generated/StormTopology.java:[28,62] package org.apache.storm.thrift does not exist"
+          },
+          {
+            "start_line": 15171,
+            "end_line": 15173,
+            "text": "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.15.0:compile (default-compile) on project storm-client: Compilation failure: Compilation failure: \n[ERROR] /workspace/storm/storm-client/src/jvm/org/apache/storm/task/TopologyContext.java:[38,47] package org.apache.storm.shade.net.minidev.json does not exist\n[ERROR] /workspace/storm/storm-client/src/jvm/org/apache/storm/task/TopologyContext.java:[39,55] package org.apache.storm.shade.org.apache.commons.lang3 does not exist"
+          }
+        ]
+      },
+      "report_samples": [
+        {
+          "archive_source": {
+            "path": "logs/d3r1-20260907/runs/storm/physical-test-reports.tar.gz",
+            "sha256": "55ed3535dcb3730f67019346a63adac098716e31160950474025ab7adcb3ac06"
+          },
+          "member": "./storm/external/storm-kafka-monitor/target/surefire-reports/TEST-org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest.xml",
+          "member_sha256": "71b1fa6581aabe07c0e843ab3922123adb03f5083e32b7e451bd7de11872cd2d",
+          "receipt_report_delta": {
+            "path": "/workspace/storm/external/storm-kafka-monitor/target/surefire-reports/TEST-org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest.xml",
+            "sha256": "71b1fa6581aabe07c0e843ab3922123adb03f5083e32b7e451bd7de11872cd2d"
+          },
+          "xml_root_attributes": {
+            "{http://www.w3.org/2001/XMLSchema-instance}noNamespaceSchemaLocation": "https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd",
+            "version": "3.0.2",
+            "name": "org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest",
+            "time": "0.007",
+            "tests": "1",
+            "errors": "0",
+            "skipped": "1",
+            "failures": "0",
+            "flakes": "0"
+          },
+          "testcases": [
+            {
+              "attributes": {
+                "name": "getOffsetLagsReportsCommittedOffsetForCommittedPartitionsAndMinusOneForUncommittedPartitions",
+                "classname": "org.apache.storm.kafka.monitor.KafkaOffsetLagUtilTest",
+                "time": "0.0"
+              },
+              "outcome_elements": [
+                {
+                  "tag": "skipped",
+                  "attributes": {
+                    "message": "disabledWithoutDocker is true and Docker is not available"
+                  },
+                  "text": ""
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "historical_result": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/storm/audit/result.json",
+          "sha256": "b1a56a4fc0f836bf09669e7c6b414ceda0a00f309e655c2c06f1191a93099201"
+        },
+        "outcome": {
+          "build_state": "success",
+          "terminal_reason": "test_terminated",
+          "test_state": "success",
+          "verdict": "partial"
+        },
+        "receipt_executions": {
+          "availability": "available",
+          "basis": "module-qualified receipt execution rows",
+          "errors": 0,
+          "executed": 1,
+          "failed": 0,
+          "passed": 0,
+          "skipped": 1
+        }
+      },
+      "source_review": {
+        "path": "logs/d3r1-20260907/runs/storm/audit/execution-review.json",
+        "sha256": "bb3ebfc01084910b011c92ec2aa8c2036615d2063c41791223f509bb4f85fb8f"
+      }
+    },
+    {
+      "id": "seatunnel",
+      "expected": {
+        "disallowed_state": "completed",
+        "preferred_state": "partial",
+        "reason": "Six jar-content checks completed, but ActiveMQ class setup failed because Docker was unavailable. maven.test.failure.ignore=true allowed exit 0; this does not prove successful setup or completion of the requested ActiveMQ tests.",
+        "non_assertion_reason": "Receipt-bound XML identifies ActivemqIT.setup and java.lang.IllegalStateException for unavailable Docker. This is environment initialization, not project assertion red."
+      },
+      "source_receipt": {
+        "path": "logs/d3r1-20260907/runs/seatunnel/logs/session_20260908_022115_765269_3fef5998e870_57314/.setup_agent/invocation_receipts/inv-maven-1-7a4ecce7de19-0003.json",
+        "sha256": "cd88bd1ace351ac90681d4a7b80b6102cfdf20c5eeccc1ff0b439a9fd38dac32"
+      },
+      "receipt_fields": {
+        "actual_cwd": "/workspace/seatunnel",
+        "argv": "/opt/apache-maven-3.9.9/bin/mvn --fail-at-end -Dmaven.test.failure.ignore=true test -T 1 -B verify -DskipUT=true -DskipIT=false -Dlicense.skipAddThirdParty=true -Dskip.ui=true --no-snapshot-updates -pl seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e -am -Pci",
+        "compliance": "equivalent",
+        "config_fingerprint": "894225143 280470 L0",
+        "contract_hash": "563e0ab7af5d4c3998ab5777db94406fc21abe3df7a6aac75e67c62eea4f749b",
+        "contract_id": "ic-9a469f3319b9",
+        "document_map_fingerprint": "0e79d48cc76716aeec8a70f33fac286e35190c8006490e8abcebfb62e424ad0e",
+        "domain_id": "/workspace/seatunnel",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "8",
+          "provenance": {
+            "source": "maven-compiler"
+          },
+          "requirement_authority": "static_survey",
+          "requirement_major": "8"
+        },
+        "execution_binding": "argv_v1",
+        "exit_code": 0,
+        "lifecycle_state": "finished",
+        "outcome": "completed",
+        "output_content_hash": "075dbc31cceb400c526a3cda83351bf92f07d1ea3bdb296dfbc93652e851d30c",
+        "receipt_id": "inv-maven-1-7a4ecce7de19-0003",
+        "requested_action": "test",
+        "run_id": "20260908_022115_765269_3fef5998e870_57314-7-82f8801e58d3",
+        "schema_version": 3,
+        "survey_fingerprint": "0f0296ade0915fd4b8c3a89ba62bdc82b80828484fa2eb085bffca129c7de418",
+        "target_sha": "b03cf1f1697ed84d0f57f416673cec40a075ef5a",
+        "tool": "maven",
+        "toolchain_fingerprint": {
+          "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+          "version": "Apache Maven 3.9.9 (8e8579a9e76f7d015ee5ec7bfcdc97d260186937)"
+        },
+        "working_directory": "/workspace/seatunnel"
+      },
+      "source_contract": {
+        "path": "logs/d3r1-20260907/runs/seatunnel/logs/session_20260908_022115_765269_3fef5998e870_57314/.setup_agent/invocation_contracts/ic-9a469f3319b9.json",
+        "sha256": "77c7ad3f97b78b5a28d179feac7a222d793b716325d3aee4b06e96fd3f25ca30"
+      },
+      "contract": {
+        "action_fingerprint": "act-3d13b4de9e31442286f91d17b6e5e2ee23051af08b187eeed951aa44b09abdfa",
+        "config_fingerprint": "894225143 280470 L0",
+        "contract_hash": "563e0ab7af5d4c3998ab5777db94406fc21abe3df7a6aac75e67c62eea4f749b",
+        "contract_id": "ic-9a469f3319b9",
+        "direct_falsifiers": [
+          {
+            "kind": "delta_empty_on_exit0",
+            "predicate_id": "empty_delta_despite_success"
+          }
+        ],
+        "document_map_fingerprint": "0e79d48cc76716aeec8a70f33fac286e35190c8006490e8abcebfb62e424ad0e",
+        "domain_id": "/workspace/seatunnel",
+        "effective_action": "test",
+        "effective_jdk": {
+          "major": "8",
+          "provenance": {
+            "source": "maven-compiler"
+          },
+          "requirement_authority": "static_survey",
+          "requirement_major": "8"
+        },
+        "effective_tool": "maven",
+        "envelope_id": "envelope-000284",
+        "execution_binding": "argv_v1",
+        "expected_argv": "--fail-at-end test -T 1 -B verify -DskipUT=true -DskipIT=false -Dlicense.skipAddThirdParty=true -Dskip.ui=true --no-snapshot-updates -pl seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e -am -Pci",
+        "expected_cwd": "/workspace/seatunnel",
+        "expected_observations": [
+          "report_delta"
+        ],
+        "intent_domain_id": "test:/workspace/seatunnel",
+        "intent_id": "intent-ec0b570226aa",
+        "intent_source": "model",
+        "predecessor_contract_id": "ic-f58e9d9447ba",
+        "requested_call": {
+          "params": {
+            "action": "test",
+            "args": "-T 1 -B verify -DskipUT=true -DskipIT=false -Dlicense.skipAddThirdParty=true -Dskip.ui=true --no-snapshot-updates -pl seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e -am -Pci",
+            "maven_version_requirement": "[3.9,)",
+            "timeout": 7200,
+            "working_directory": "/workspace/seatunnel"
+          },
+          "tool": "build"
+        },
+        "run_id": "20260908_022115_765269_3fef5998e870_57314-7-82f8801e58d3",
+        "schema_version": 2,
+        "survey_fingerprint": "0f0296ade0915fd4b8c3a89ba62bdc82b80828484fa2eb085bffca129c7de418",
+        "target_sha": "b03cf1f1697ed84d0f57f416673cec40a075ef5a"
+      },
+      "testcase_execution_rows_metadata": {
+        "report_count": 66,
+        "schema_version": 2,
+        "status": "complete"
+      },
+      "source_row_count": 7,
+      "row_samples": [
+        {
+          "source_index": 2,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/seatunnel",
+            "execution_id": "inv-maven-1-7a4ecce7de19-0003#execution-205d2ed91359caa6cd730e02",
+            "execution_index": 3,
+            "execution_ordinal": 1,
+            "framework": "junit-xml",
+            "module_coordinate": "seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e",
+            "outcome": "error",
+            "owner": "org.apache.seatunnel.e2e.connector.activemq.ActivemqIT",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-maven-1-7a4ecce7de19-0003",
+            "report_path": "/workspace/seatunnel/seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e/target/failsafe-reports/TEST-org.apache.seatunnel.e2e.connector.activemq.ActivemqIT.xml",
+            "report_sha256": "11a8975eddd5becabc32f76a69adf626dbc3359b411f9002496d044ba8387e54",
+            "run_id": "20260908_022115_765269_3fef5998e870_57314-7-82f8801e58d3",
+            "target_sha": "b03cf1f1697ed84d0f57f416673cec40a075ef5a",
+            "test_name": "org.apache.seatunnel.e2e.connector.activemq.ActivemqIT"
+          }
+        },
+        {
+          "source_index": 0,
+          "record": {
+            "disposition": "claimed",
+            "domain_id": "/workspace/seatunnel",
+            "execution_id": "inv-maven-1-7a4ecce7de19-0003#execution-0025d214d64b912c2a787400",
+            "execution_index": 3,
+            "execution_ordinal": 3,
+            "framework": "junit-xml",
+            "module_coordinate": "seatunnel-core/seatunnel-spark-starter/seatunnel-spark-2-starter",
+            "outcome": "passed",
+            "owner": "org.apache.seatunnel.core.starter.spark.TestSparkStarterJarContentIT",
+            "parameter_id": null,
+            "qualifying_invocation": true,
+            "receipt_id": "inv-maven-1-7a4ecce7de19-0003",
+            "report_path": "/workspace/seatunnel/seatunnel-core/seatunnel-spark-starter/seatunnel-spark-2-starter/target/failsafe-reports/TEST-org.apache.seatunnel.core.starter.spark.TestSparkStarterJarContentIT.xml",
+            "report_sha256": "6bdf3ee283657bf15463dbadf6bd302cfefdcd035fd77f950c6b1a70712ba340",
+            "run_id": "20260908_022115_765269_3fef5998e870_57314-7-82f8801e58d3",
+            "target_sha": "b03cf1f1697ed84d0f57f416673cec40a075ef5a",
+            "test_name": "testStarterUsageRunsFromShadedJar"
+          }
+        }
+      ],
+      "source_testcase_outcome_count": 4,
+      "testcase_outcome_samples": [
+        {
+          "source_index": 0,
+          "record": {
+            "node_id": "org.apache.seatunnel.e2e.connector.activemq.ActivemqIT#org.apache.seatunnel.e2e.connector.activemq.ActivemqIT",
+            "reason": "Could not find a valid Docker environment. Please see logs and check configuration",
+            "status": "error"
+          }
+        },
+        {
+          "source_index": 1,
+          "record": {
+            "node_id": "org.apache.seatunnel.core.starter.spark.TestSparkStarterJarContentIT#testShadedJarDoesNotContainScalaClasses",
+            "status": "passed"
+          }
+        }
+      ],
+      "report_delta_counts": {
+        "changed": 0,
+        "new": 66
+      },
+      "report_delta_samples": {
+        "changed": [],
+        "new": [
+          {
+            "path": "/workspace/seatunnel/seatunnel-core/seatunnel-spark-starter/seatunnel-spark-2-starter/target/failsafe-reports/TEST-org.apache.seatunnel.core.starter.spark.TestSparkStarterJarContentIT.xml",
+            "sha256": "6bdf3ee283657bf15463dbadf6bd302cfefdcd035fd77f950c6b1a70712ba340"
+          },
+          {
+            "path": "/workspace/seatunnel/seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e/target/failsafe-reports/TEST-org.apache.seatunnel.e2e.connector.activemq.ActivemqIT.xml",
+            "sha256": "11a8975eddd5becabc32f76a69adf626dbc3359b411f9002496d044ba8387e54"
+          }
+        ]
+      },
+      "source_module_outcome_count": 50,
+      "failed_module_samples": [],
+      "assessments": [
+        {
+          "source": {
+            "path": "logs/d3r1-20260907/runs/seatunnel/logs/session_20260908_022115_765269_3fef5998e870_57314/.setup_agent/evidence_assessments/asm-inv_maven_1_7a4ecce7de19_0003-expectation_met-a2814c22.json",
+            "sha256": "a5751f65c0a93af5267d8f8470a326b642422a0c5050aedb17238f922e72cc54"
+          },
+          "record": {
+            "assessment_id": "asm-inv_maven_1_7a4ecce7de19_0003-expectation_met-a2814c22",
+            "blocker_owner": "none",
+            "detail": "typed evidence satisfied report_delta",
+            "fingerprints": {
+              "config_fingerprint": "894225143 280470 L0",
+              "document_map_fingerprint": "0e79d48cc76716aeec8a70f33fac286e35190c8006490e8abcebfb62e424ad0e",
+              "domain_id": "/workspace/seatunnel",
+              "survey_fingerprint": "0f0296ade0915fd4b8c3a89ba62bdc82b80828484fa2eb085bffca129c7de418",
+              "target_sha": "b03cf1f1697ed84d0f57f416673cec40a075ef5a"
+            },
+            "receipt_id": "inv-maven-1-7a4ecce7de19-0003",
+            "schema_version": 2,
+            "typed_code": "expectation_met"
+          }
+        }
+      ],
+      "output": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/seatunnel/container-evidence/.setup_agent/contexts/full_outputs.jsonl",
+          "sha256": "0a54ef519c6b4db09eef5035416e90c167a6b11ea61fab640fde3ae91860ca98"
+        },
+        "jsonl_record_line": 34,
+        "ref_id": "output_6d9f33df272a",
+        "record_output_sha256": "c5c3b06e3e20629b555221dd8365b062059734c92d524a9e9f0dc30051f988f1",
+        "record_output_bytes": 131072,
+        "record_metadata": {
+          "command": "/opt/apache-maven-3.9.9/bin/mvn --fail-at-end -Dmaven.test.failure.ignore=true test -T 1 -B verify -DskipUT=true -DskipIT=false -Dlicense.skipAddThirdParty=true -Dskip.ui=true --no-snapshot-updates -pl seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e -am -Pci",
+          "exit_code": 0,
+          "full_log_bytes": 1242464,
+          "full_log_sha256": "075dbc31cceb400c526a3cda83351bf92f07d1ea3bdb296dfbc93652e851d30c",
+          "output_storage_truncated": true,
+          "full_log_ref": "job:822ff7673d7b",
+          "full_log_path": "/tmp/sag_jobs/822ff7673d7b.log"
+        },
+        "record_output_matches_receipt_hash": false,
+        "excerpts_are_complete_output": false,
+        "excerpts": [
+          {
+            "start_line": 1371,
+            "end_line": 1371,
+            "text": "[] 2026-09-08 06:33:45,932 ERROR org.testcontainers.dockerclient.DockerClientProviderStrategy - Could not find a valid Docker environment. Please check configuration. Attempted configurations were:"
+          },
+          {
+            "start_line": 1376,
+            "end_line": 1377,
+            "text": "java.lang.IllegalStateException: Could not find a valid Docker environment. Please see logs and check configuration\n\tat org.apache.seatunnel.e2e.connector.activemq.ActivemqIT.setup(ActivemqIT.java:68)"
+          },
+          {
+            "start_line": 1383,
+            "end_line": 1383,
+            "text": "[ERROR]   ActivemqIT.setup:68 » IllegalState Could not find a valid Docker environment. ..."
+          },
+          {
+            "start_line": 1462,
+            "end_line": 1462,
+            "text": "[INFO] BUILD SUCCESS"
+          }
+        ],
+        "binding_limit": "The persisted output is truncated and does not hash to the complete receipt output. It is diagnostic context only; the independently archived XML below is checked against the receipt report_delta SHA-256 and establishes the setup error."
+      },
+      "report_samples": [
+        {
+          "archive_source": {
+            "path": "logs/d3r1-20260907/runs/seatunnel/physical-test-reports.tar.gz",
+            "sha256": "82bee153ba385a116d886f3239292d21a5b84b0288d4621e174389059c34a090"
+          },
+          "member": "./seatunnel/seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e/target/failsafe-reports/TEST-org.apache.seatunnel.e2e.connector.activemq.ActivemqIT.xml",
+          "member_sha256": "11a8975eddd5becabc32f76a69adf626dbc3359b411f9002496d044ba8387e54",
+          "receipt_report_delta": {
+            "path": "/workspace/seatunnel/seatunnel-e2e/seatunnel-connector-v2-e2e/connector-activemq-e2e/target/failsafe-reports/TEST-org.apache.seatunnel.e2e.connector.activemq.ActivemqIT.xml",
+            "sha256": "11a8975eddd5becabc32f76a69adf626dbc3359b411f9002496d044ba8387e54"
+          },
+          "xml_root_attributes": {
+            "{http://www.w3.org/2001/XMLSchema-instance}noNamespaceSchemaLocation": "https://maven.apache.org/surefire/maven-failsafe-plugin/xsd/failsafe-test-report.xsd",
+            "name": "org.apache.seatunnel.e2e.connector.activemq.ActivemqIT",
+            "time": "0.18",
+            "tests": "1",
+            "errors": "1",
+            "skipped": "0",
+            "failures": "0"
+          },
+          "testcases": [
+            {
+              "attributes": {
+                "name": "org.apache.seatunnel.e2e.connector.activemq.ActivemqIT",
+                "classname": "org.apache.seatunnel.e2e.connector.activemq.ActivemqIT",
+                "time": "0.18"
+              },
+              "outcome_elements": [
+                {
+                  "tag": "error",
+                  "attributes": {
+                    "message": "Could not find a valid Docker environment. Please see logs and check configuration",
+                    "type": "java.lang.IllegalStateException"
+                  },
+                  "text": "java.lang.IllegalStateException: Could not find a valid Docker environment. Please see logs and check configuration\n\tat org.apache.seatunnel.e2e.connector.activemq.ActivemqIT.setup(ActivemqIT.java:68)\n"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "historical_result": {
+        "source": {
+          "path": "logs/d3r1-20260907/runs/seatunnel/audit/result.json",
+          "sha256": "98294afde22848713b252ebddae4a7e8c2d22ed6b39122a837dc8df7c1808e54"
+        },
+        "outcome": {
+          "build_state": "success",
+          "terminal_reason": "test_terminated",
+          "test_state": "success",
+          "verdict": "partial"
+        },
+        "receipt_executions": {
+          "availability": "available",
+          "basis": "module-qualified receipt execution rows",
+          "errors": 1,
+          "executed": 7,
+          "failed": 0,
+          "passed": 6,
+          "skipped": 0
+        }
+      },
+      "source_review": {
+        "path": "logs/d3r1-20260907/runs/seatunnel/audit/execution-review.json",
+        "sha256": "59221fb4e57212a2529f0c69ad712901cf79ff4dac555b2edc00a020efe4e5d2"
+      }
+    }
+  ]
+}

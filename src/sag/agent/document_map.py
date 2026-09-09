@@ -61,7 +61,7 @@ from sag.agent.evidence_records import (
     decode_named_json_record_stream,
     execute_named_json_file_stream,
 )
-from sag.runtime.container_io import read_container_text
+from sag.runtime.container_io import read_container_prefix, read_container_text
 from sag.utils.container_io import (
     WRITE_COMPARE_CONFLICT,
     compare_publish_container_text_atomic,
@@ -224,6 +224,8 @@ class DocumentMapEntry:
     section_index: List[Dict[str, Any]] = field(default_factory=list)
     discovery_status: str = "indexed"
     target_sha: Optional[str] = None
+    indexed_bytes: Optional[int] = None
+    content_truncated: Optional[bool] = None
 
     def payload(self) -> Dict[str, Any]:
         """The persisted shape. Absent facts are absent keys, never nulls."""
@@ -240,6 +242,9 @@ class DocumentMapEntry:
         target_sha = str(self.target_sha or "").strip()
         if target_sha:
             body["target_sha"] = target_sha
+        if self.indexed_bytes is not None:
+            body["indexed_bytes"] = self.indexed_bytes
+            body["content_truncated"] = self.content_truncated
         return body
 
 
@@ -257,7 +262,7 @@ def discover_document_map(
     """Enumerate, contain, bound and index the documents under `checkout_root`.
 
     Three probe shapes, in this order: one `find`, one batched `realpath`, one
-    bounded `head -c` per file that survives to indexing. The order is the
+    bounded byte-prefix read per file that survives to indexing. The order is the
     budget law — containment is proved before any content is fetched, and the
     file cap stops the read loop rather than filtering its results.
 
@@ -317,20 +322,25 @@ def discover_document_map(
     entries: List[DocumentMapEntry] = []
     total_bytes = 0
     for position, (path, realpath) in enumerate(contained):
-        text = _read_head(execute, path)
-        if text is None:
+        remaining_bytes = MAX_TOTAL_BYTES - total_bytes
+        if remaining_bytes <= 0:
+            for remaining, _ in contained[position:]:
+                conflicts[remaining] = "over_budget"
+            break
+        source = _read_head(execute, path, max_bytes=min(MAX_FILE_BYTES, remaining_bytes))
+        if source is None:
             conflicts[path] = "unreadable"
             continue
-        raw = _raw_bytes(text)
+        text, raw, content_truncated = source
         if b"\x00" in raw[:BINARY_SNIFF_BYTES]:
             conflicts[path] = "binary"
             continue
-        if total_bytes + len(raw) > MAX_TOTAL_BYTES:
+        if content_truncated and remaining_bytes < MAX_FILE_BYTES:
             for remaining, _ in contained[position:]:
                 conflicts[remaining] = "over_budget"
             break
         total_bytes += len(raw)
-        entries.append(_build_entry(path, realpath, text, raw, sha))
+        entries.append(_build_entry(path, realpath, text, raw, sha, content_truncated))
 
     return _result(entries, conflicts)
 
@@ -350,10 +360,13 @@ def _build_entry(
     text: str,
     raw: bytes,
     target_sha: Optional[str],
+    content_truncated: bool,
 ) -> DocumentMapEntry:
     kind = detect_kind(path, text)
-    section_index, index_truncated = _build_section_index(kind, text)
-    truncated = index_truncated or len(raw) >= MAX_FILE_BYTES
+    section_index, index_truncated = _build_section_index(
+        kind, _complete_prefix_lines(text, content_truncated)
+    )
+    truncated = index_truncated or content_truncated
     return DocumentMapEntry(
         entry_id=entry_id(path),
         path=path,
@@ -363,6 +376,8 @@ def _build_entry(
         section_index=section_index,
         discovery_status="truncated" if truncated else "indexed",
         target_sha=target_sha,
+        indexed_bytes=len(raw),
+        content_truncated=content_truncated,
     )
 
 
@@ -517,21 +532,34 @@ def _resolve_paths(
 def _read_head(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     path: str,
-) -> Optional[str]:
-    """The first `MAX_FILE_BYTES` of `path`, or None when it is unreadable."""
+    *,
+    max_bytes: Optional[int] = None,
+) -> Optional[Tuple[str, bytes, bool]]:
+    """Read and index a bounded UTF-8 prefix, retaining its exact byte extent."""
     try:
-        result = execute(f"head -c {MAX_FILE_BYTES} -- {shlex.quote(path)} 2>/dev/null") or {}
+        raw, truncated = read_container_prefix(
+            execute, path, max_bytes=MAX_FILE_BYTES if max_bytes is None else max_bytes
+        )
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # A byte budget may end inside a valid UTF-8 character. Index only
+            # its complete prefix; never substitute bytes before hashing them.
+            if not truncated or exc.reason != "unexpected end of data" or exc.end != len(raw):
+                raise
+            raw = raw[: exc.start]
+            text = raw.decode("utf-8")
+        return text, raw, truncated
     except Exception as exc:
         logger.debug(f"document {path} unreadable: {exc}")
         return None
-    if not _succeeded(result):
-        return None
-    return str(result.get("output") or "")
 
 
 def read_entry_text(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     entry: Any,
+    *,
+    complete_lines_only: bool = False,
 ) -> Optional[str]:
     """The indexed text of one map entry, under the SAME budget discovery used.
 
@@ -547,21 +575,62 @@ def read_entry_text(
     so a claim extractor can record a typed survey conflict without treating
     the changed document as the bytes the published handle named.
 
+    ``complete_lines_only`` omits an unfinished final line of a budget prefix
+    after verifying its complete byte extent. Extractors must not turn, for
+    example, a cut ``Java 17`` into the different constraint ``Java 1``.
+
     None when the entry names no path or the read failed; an unreadable
     document states nothing, and nothing is guessed on its behalf.
     """
     path = _field(entry, "path")
     if not path:
         return None
-    text = _read_head(execute, path)
-    if text is None:
+    indexed_bytes = (
+        entry.get("indexed_bytes")
+        if isinstance(entry, Mapping)
+        else getattr(entry, "indexed_bytes", None)
+    )
+    content_truncated = (
+        entry.get("content_truncated")
+        if isinstance(entry, Mapping)
+        else getattr(entry, "content_truncated", None)
+    )
+    if indexed_bytes is not None and (
+        type(indexed_bytes) is not int
+        or not 0 <= indexed_bytes <= MAX_FILE_BYTES
+        or type(content_truncated) is not bool
+    ):
         return None
+    if indexed_bytes is None and content_truncated is not None:
+        return None
+    source = _read_head(execute, path, max_bytes=indexed_bytes)
+    if source is None:
+        return None
+    text, raw, truncated = source
     expected = _field(entry, "source_hash").strip().lower()
     if expected:
-        actual = hashlib.sha256(_raw_bytes(text)).hexdigest()
+        actual = hashlib.sha256(raw).hexdigest()
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or actual != expected:
             raise DocumentSourceChangedError(f"document bytes changed after mapping: {path}")
-    return text
+    if indexed_bytes is not None and (len(raw) != indexed_bytes or truncated != content_truncated):
+        raise DocumentSourceChangedError(f"document indexed extent changed after mapping: {path}")
+    return _complete_prefix_lines(text, truncated) if complete_lines_only else text
+
+
+def _complete_prefix_lines(text: str, truncated: bool) -> str:
+    if not truncated:
+        return text
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines.pop()
+    # A completed physical line may still be an unfinished shell command.
+    # Do not turn `mvn test \\` plus a cut selector into a broader `mvn test`.
+    while lines:
+        tail = lines[-1].rstrip("\r\n")
+        if (len(tail) - len(tail.rstrip("\\"))) % 2 == 0:
+            break
+        lines.pop()
+    return "".join(lines)
 
 
 def _probe_target_sha(
@@ -1047,6 +1116,7 @@ def validate_document_map_v1(
     entry_ids: set[str] = set()
     target_shas: List[str] = []
     target_presence: List[bool] = []
+    indexed_total = 0
     for position, candidate in enumerate(entries):
         if not isinstance(candidate, Mapping):
             raise ValueError(f"document map entry {position} is not an object")
@@ -1063,7 +1133,7 @@ def validate_document_map_v1(
                 "parser_version",
                 "discovery_status",
             },
-            optional={"target_sha"},
+            optional={"target_sha", "indexed_bytes", "content_truncated"},
             field=f"document map entry {position}",
         )
         path = _canonical_workspace_path(record["path"], f"entry {position} path")
@@ -1084,6 +1154,17 @@ def validate_document_map_v1(
             raise ValueError(f"document map entry {position} parser_version is invalid")
         if record["discovery_status"] not in DISCOVERY_STATUSES:
             raise ValueError(f"document map entry {position} discovery_status is invalid")
+        if {"indexed_bytes", "content_truncated"}.intersection(record):
+            if (
+                type(record.get("indexed_bytes")) is not int
+                or not 0 <= record["indexed_bytes"] <= MAX_FILE_BYTES
+                or type(record.get("content_truncated")) is not bool
+                or (record["content_truncated"] and record["discovery_status"] != "truncated")
+            ):
+                raise ValueError(f"document map entry {position} indexed byte extent is invalid")
+            indexed_total += record["indexed_bytes"]
+            if indexed_total > MAX_TOTAL_BYTES:
+                raise ValueError("document map indexed byte extents exceed the total budget")
         _validate_section_index(record["section_index"], position)
 
         has_target = "target_sha" in record
@@ -1403,14 +1484,6 @@ def _field(entry: Any, name: str) -> str:
 
 def _inside_workspace(path: str) -> bool:
     return path.startswith(f"{WORKSPACE_ROOT}/") and path != WORKSPACE_ROOT
-
-
-def _raw_bytes(text: str) -> bytes:
-    """The bytes of the fetched head, as fetched."""
-    try:
-        return text.encode("utf-8", "surrogateescape")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return text.encode("utf-8", "replace")
 
 
 def _is_blank_or_comment(line: str, comment: str = "#") -> bool:

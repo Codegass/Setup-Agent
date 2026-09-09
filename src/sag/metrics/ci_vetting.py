@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from itertools import product
 from typing import Any, Literal
 
 import yaml  # type: ignore[import-untyped]
@@ -218,7 +219,49 @@ def _step_directory(document: dict, job: dict, step: dict) -> tuple[str, str]:
     return ".", "repository_root"
 
 
-def extract_build_commands(yaml_text: str) -> tuple[BuildCommandStep, ...]:
+_MATRIX_VALUE_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
+
+
+def _fixed_matrix_binding(job: dict, template: str, cell_id: str | None) -> dict[str, str]:
+    """Bind only one exact, literal matrix cell; expressions remain unresolved."""
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if not cell_id or not isinstance(matrix, dict) or not matrix:
+        return {}
+    # Includes, exclusions and expression-valued axes require their own full
+    # evaluator. Keeping them unknown is safer than partially expanding them.
+    if any(key in matrix for key in ("include", "exclude")):
+        return {}
+    axes: dict[str, list[str]] = {}
+    combinations = 1
+    for key, values in matrix.items():
+        if not isinstance(key, str) or not isinstance(values, list) or not values:
+            return {}
+        if any(type(value) not in (str, int, bool) for value in values):
+            return {}
+        normalized = [
+            str(value).lower() if isinstance(value, bool) else str(value) for value in values
+        ]
+        if any("$" in value or "`" in value for value in normalized):
+            return {}
+        combinations *= len(normalized)
+        if combinations > 256:
+            return {}
+        axes[key] = normalized
+    matches = []
+    for values in product(*axes.values()):
+        binding = dict(zip(axes, values))
+        rendered = _MATRIX_VALUE_RE.sub(lambda match: binding.get(match[1], match[0]), template)
+        if "name" not in job:
+            rendered = f"{template} ({', '.join(values)})"
+        if rendered == cell_id:
+            matches.append(binding)
+    return matches[0] if len(matches) == 1 else {}
+
+
+def extract_build_commands(
+    yaml_text: str, *, cell_id: str | None = None
+) -> tuple[BuildCommandStep, ...]:
     """Every `run:` step that mentions a build or test, in document order."""
 
     try:
@@ -234,6 +277,11 @@ def extract_build_commands(yaml_text: str) -> tuple[BuildCommandStep, ...]:
             continue
         name = job.get("name")
         template = name if isinstance(name, str) else str(job_id)
+        binding = _fixed_matrix_binding(job, template, cell_id)
+
+        def resolve(text: str) -> str:
+            return _MATRIX_VALUE_RE.sub(lambda match: binding.get(match[1], match[0]), text)
+
         for step in job.get("steps") or []:
             if not isinstance(step, dict) or not isinstance(step.get("run"), str):
                 continue
@@ -242,9 +290,9 @@ def extract_build_commands(yaml_text: str) -> tuple[BuildCommandStep, ...]:
                 found.append(
                     BuildCommandStep(
                         job_id=str(job_id),
-                        job_name_template=template,
-                        text=step["run"].strip(),
-                        working_directory=working_directory,
+                        job_name_template=cell_id if binding and cell_id else resolve(template),
+                        text=resolve(step["run"].strip()),
+                        working_directory=resolve(working_directory),
                         working_directory_source=directory_source,
                     )
                 )

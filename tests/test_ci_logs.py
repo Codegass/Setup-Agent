@@ -9,6 +9,8 @@ SAG's own Maven receipts.
 
 import zipfile
 
+import pytest
+
 from sag.metrics.ci_logs import job_logs, modules_from_log
 
 GRADLE_LOG = """
@@ -110,3 +112,71 @@ def test_duplicate_job_names_are_ambiguous_instead_of_last_write_wins(tmp_path):
         archive.writestr("0_build.txt", "one")
         archive.writestr("1_build.txt", "two")
     assert job_logs(path) == {}
+
+
+@pytest.mark.parametrize("padding", ["", ". "])
+def test_maven_names_with_versions_and_short_padding(padding):
+    text = f"[INFO] Reactor Summary:\n[INFO] RocketMQ 5.5.1 {padding}SUCCESS\n[INFO] BUILD SUCCESS"
+    assert modules_from_log(text).modules == ("RocketMQ 5.5.1",)
+
+
+@pytest.mark.parametrize("second_status", ["SUCCESS", "FAILURE", "SKIPPED"])
+def test_duplicate_maven_labels_cannot_define_an_exact_universe(second_status):
+    text = (
+        "[INFO] Reactor Summary:\n[INFO] duplicate ... SUCCESS\n"
+        f"[INFO] duplicate ... {second_status}\n[INFO] BUILD SUCCESS"
+    )
+    result = modules_from_log(text)
+    assert result.modules == ()
+    assert result.ambiguous_labels == ("duplicate",)
+    assert result.notes
+
+
+def test_multiple_reactors_are_not_merged_by_display_name():
+    result = modules_from_log(MAVEN_REACTOR_LOG + MAVEN_REACTOR_LOG)
+    assert result.modules == ()
+    assert result.notes
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[INFO] BUILD SUCCESS\n[INFO] Building app 1.0\n[INFO] BUILD FAILURE",
+        "[INFO] BUILD SUCCESS\n[INFO] Building app 1.0",
+        MAVEN_SINGLE_LOG + "\n[INFO] BUILD FAILURE",
+        MAVEN_SINGLE_LOG + "\n[INFO] Scanning for projects...",
+        "[INFO] Reactor Summary:\n[INFO] only ... SUCCESS",
+        MAVEN_REACTOR_LOG + "\n[INFO] Building unfinished 1.0",
+        "[INFO] Scanning for projects...\n[INFO] Building unfinished\n"
+        "[INFO] Scanning for projects...\n" + MAVEN_REACTOR_LOG,
+        "##[group]Run mvn test\n[INFO] Building unfinished 1.0\n##[endgroup]\n"
+        "##[group]Run another script\n[INFO] BUILD SUCCESS\n##[endgroup]",
+    ],
+)
+def test_mixed_or_unfinished_maven_logs_do_not_prove_root_scope(text):
+    assert modules_from_log(text).modules == ()
+
+
+def test_frozen_camel_examples_block_proves_all_83_names_but_two_blocks_do_not():
+    from pathlib import Path
+
+    from sag.metrics.maven_reactor import parse_maven_reactor
+
+    text = (
+        Path(__file__).parent / "fixtures/d3r1_remediation/maven_reactor/camel-examples.txt"
+    ).read_text()
+    block = parse_maven_reactor(text)[0]
+    one_build = "\n".join(text.splitlines()[block.start_line - 1 : block.end_line])
+    assert len(modules_from_log(one_build).modules) == 83
+    assert modules_from_log(text).modules == ()
+
+
+def test_frozen_camel_duplicate_names_do_not_hide_failed_or_skipped_modules():
+    from pathlib import Path
+
+    text = (Path(__file__).parent / "fixtures/d3r1_remediation/maven_reactor/camel.txt").read_text()
+    result = modules_from_log(text)
+    assert result.modules == ()
+    assert len(result.ambiguous_labels) == 2
+    assert result.failed == 2
+    assert result.skipped == 36

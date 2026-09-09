@@ -16,7 +16,7 @@ def live_reads(monkeypatch):
         state["reads"] += 1
         return state["records"]
 
-    def parse(_project, *, primary_root, receipt_records):
+    def parse(_project, *, primary_root, receipt_records, owner_receipt_ids):
         return {
             "valid": True,
             "total_tests": state["executed"],
@@ -26,13 +26,19 @@ def live_reads(monkeypatch):
         }
 
     monkeypatch.setattr(validator, "_read_live_invocation_receipts", read)
+    # This suite measures read freshness with opaque receipt stubs; binding
+    # correctness is exercised by receipt-scoped rollup and report-scope tests.
+    monkeypatch.setattr(
+        validator, "_current_scoped_receipts", lambda _root, *, receipt_records: receipt_records
+    )
     monkeypatch.setattr(validator, "_parse_test_reports_compact_in_container", parse)
     monkeypatch.setattr(validator, "_check_modules_without_tests", lambda *_: [])
     monkeypatch.setattr(
-        "sag.agent.attempt_policy.resolve_survey_test_candidates",
-        lambda _: SimpleNamespace(
-            primary=SimpleNamespace(root=state["root"]),
-            candidates=(SimpleNamespace(root=state["root"]),),
+        "sag.agent.attempt_policy.resolve_test_report_scope",
+        lambda _, **kwargs: SimpleNamespace(
+            primary_root=state["root"],
+            roots=(state["root"],),
+            receipt_ids=tuple(r["receipt_id"] for r in state["records"]),
         ),
     )
     return validator, state
@@ -107,6 +113,10 @@ def test_test_status_rechecks_integrity_before_reusing_executed_counts(live_read
     validator, state = live_reads
     monkeypatch.setattr(validator, "parse_test_reports_with_catalog", validator.parse_test_reports)
     monkeypatch.setattr(validator, "_python_collected_count", lambda _: None)
+    # Independent execution proof must not override a newly unreadable report ledger.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
     assert validator.validate_test_status("demo")["status"] == "SUCCESS"
     state["records"] = None
     result = validator.validate_test_status("demo")

@@ -233,6 +233,7 @@ GRADLE_CLAIMS_UNIDENTIFIED = "gradle_claimed_reports_unidentified"
 GRADLE_TEST_ABSENCE_UNDECIDED = "gradle_test_absence_disposition_unknown"
 DECLARED_OMISSION_REASONS = frozenset(
     {
+        "maven_reactor_summary_boundaries_unavailable",
         GRADLE_NO_TEST_REPORTS,
         GRADLE_NO_CLAIMED_TEST_REPORTS,
         GRADLE_SUITE_TOTALS_UNREADABLE,
@@ -1592,7 +1593,7 @@ def report_tag_command(path: str, *, tag_cap: int = TESTCASE_TAG_CAP) -> str:
         f"{{ sag_report_tags=$(grep -oE {shlex.quote(TESTCASE_TAG_PATTERN)} {quoted} 2>/dev/null "
         f"| head -n {int(tag_cap)}); "
         f"printf %s {shlex.quote(REPORT_TAG_MARKER)}; sha256sum {quoted} 2>/dev/null; echo; "
-        f'printf \'%s\\n\' "$sag_report_tags"; }}'
+        f"printf '%s\\n' \"$sag_report_tags\"; }}"
     )
 
 
@@ -3634,10 +3635,7 @@ def record_invocation(
     # here erased that distinction at the receipt boundary.
     exact_sample_carried = isinstance(sealed_rows, Mapping) and (
         bool(sealed_rows.get("rows"))
-        or (
-            sealed_rows.get("status") == "complete"
-            and rows_were_bounded(parsed_rows)
-        )
+        or (sealed_rows.get("status") == "complete" and rows_were_bounded(parsed_rows))
     )
     carries_bounded_rows = exact_sample_carried or (
         gradle_row_disclosure is None and bool(diagnostic_rows)

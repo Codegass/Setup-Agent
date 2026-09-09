@@ -26,13 +26,13 @@ else about a dispatch was true when the dispatch happened and stays true.
 
 import json
 
+from container_evidence_fakes import ContainerFS, ScriptedOrchestrator
+
 from sag.agent.evidence_publications import (
     install_evidence_publication_authority,
     reset_evidence_publication_authority,
     unavailable_evidence_publication_authority,
 )
-from container_evidence_fakes import ContainerFS, ScriptedOrchestrator
-
 from sag.agent.invocation_receipts import next_sequence
 from sag.agent.job_obligations import (
     OBLIGATION_DIR,
@@ -925,3 +925,20 @@ def test_an_absent_ledger_directory_states_no_obligations():
 
     assert read_obligations(orchestrator) == []
     assert open_job_ids(orchestrator) == ()
+
+
+def test_unreadable_settlement_output_is_not_an_observed_empty_log():
+    from sag.agent.job_obligations import _read_complete_log
+
+    assert (
+        _read_complete_log(
+            lambda *_a, **_k: {"success": False, "exit_code": 1, "output": ""}, "/tmp/job.log"
+        )
+        is None
+    )
+    assert (
+        _read_complete_log(
+            lambda *_a, **_k: {"success": True, "exit_code": 0, "output": ""}, "/tmp/job.log"
+        )
+        == ""
+    )

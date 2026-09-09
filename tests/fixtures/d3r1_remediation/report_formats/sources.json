@@ -1,0 +1,42 @@
+[
+  {
+    "fixture": "testng-junit.xml",
+    "archive": "logs/d3r1-20260907/runs/struts/physical-test-reports.tar.gz",
+    "member": "./struts/plugins/testng/target/surefire-reports/junitreports/TEST-org.apache.struts2.testng.TestNGXWorkTestCaseTest$RunTest.xml",
+    "source_bytes": 490,
+    "source_sha256": "7fd0fd5d909493ea2ffe3bb80fc6cdfb89838065e8b2d53371d6c5bc0e12caf8",
+    "fixture_bytes": 490,
+    "fixture_sha256": "7fd0fd5d909493ea2ffe3bb80fc6cdfb89838065e8b2d53371d6c5bc0e12caf8",
+    "extraction": "verbatim"
+  },
+  {
+    "fixture": "testng-suite.xml",
+    "archive": "logs/d3r1-20260907/runs/struts/physical-test-supplement.tar.gz",
+    "member": "./struts/plugins/testng/target/surefire-reports/Command line suite/Command line test.xml",
+    "source_bytes": 405,
+    "source_sha256": "9cc7dfb1d96f99b6252d7b68dafbd3bc13982e6c885c2d71238a307e782ef304",
+    "fixture_bytes": 405,
+    "fixture_sha256": "9cc7dfb1d96f99b6252d7b68dafbd3bc13982e6c885c2d71238a307e782ef304",
+    "extraction": "verbatim"
+  },
+  {
+    "fixture": "testng-results.xml",
+    "archive": "logs/d3r1-20260907/runs/struts/physical-test-supplement.tar.gz",
+    "member": "./struts/plugins/testng/target/surefire-reports/testng-results.xml",
+    "source_bytes": 1760,
+    "source_sha256": "494449c88c269b7ae9801c34523dc36c04c1753f947aa79e3b3bc64595b64f4b",
+    "fixture_bytes": 1760,
+    "fixture_sha256": "494449c88c269b7ae9801c34523dc36c04c1753f947aa79e3b3bc64595b64f4b",
+    "extraction": "verbatim"
+  },
+  {
+    "fixture": "curator-mismatch.xml",
+    "archive": "logs/d3r1-20260907/runs/curator/physical-test-reports.tar.gz",
+    "member": "./curator/curator-recipes/target/surefire-reports/TEST-org.apache.curator.framework.recipes.leader.TestLeaderSelectorEdges.xml",
+    "source_bytes": 18889,
+    "source_sha256": "f84f3da670f1927579bcb60074a5a8dab1ed2faebd4934657c2b7a6c94681a5a",
+    "fixture_bytes": 883,
+    "fixture_sha256": "57a180d8305bdd7eae567faa50b4fb9824be38c446e80bbba16fca401505a2f1",
+    "extraction": "retain root declaration and all testcase attributes/outcome tags; remove properties, captured output, and stack traces"
+  }
+]

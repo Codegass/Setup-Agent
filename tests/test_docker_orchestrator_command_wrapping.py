@@ -70,12 +70,13 @@ class FakeContainers:
 class FakeClient:
     def __init__(self, container):
         self.containers = FakeContainers(container)
-        self.api = FakeDaemonAPI(container.id)
+        self.api = FakeDaemonAPI(container.id, container)
 
 
 class FakeDaemonAPI:
-    def __init__(self, container_id):
+    def __init__(self, container_id, container=None):
         self.container_id = container_id
+        self.container = container
         self.exec_id = "d" * 64
         self.create_calls = []
         self.start_calls = []
@@ -86,13 +87,16 @@ class FakeDaemonAPI:
 
     def exec_start(self, exec_id, **kwargs):
         self.start_calls.append({"exec_id": exec_id, "kwargs": kwargs})
+        if kwargs.get("stream"):
+            call = self.create_calls[-1]
+            return self.container.exec_run(call["cmd"], **call["kwargs"], **kwargs).output
 
     def exec_inspect(self, exec_id):
         return {
             "ID": exec_id,
             "ContainerID": self.container_id,
             "Running": False,
-            "ExitCode": 0,
+            "ExitCode": self.container.exec_result.exit_code if self.container else 0,
         }
 
 
@@ -210,7 +214,7 @@ def test_execute_command_exec_exception_is_not_a_runner_dispatch():
     assert result["runner_dispatched"] is False
 
 
-def test_monitored_exec_exception_is_not_a_runner_dispatch():
+def test_monitored_start_exception_retains_unknown_dispatch():
     orchestrator = build_orchestrator(FailingExecContainer())
 
     result = orchestrator.execute_command_with_monitoring(
@@ -220,8 +224,8 @@ def test_monitored_exec_exception_is_not_a_runner_dispatch():
     )
 
     assert result["success"] is False
-    assert result["dispatch_status"] == "dispatch_failed"
-    assert result["runner_dispatched"] is False
+    assert result["dispatch_status"] == "dispatch_unknown"
+    assert result["runner_dispatched"] is None
 
 
 def test_monitoring_failure_after_exec_preserves_runner_dispatch():
@@ -537,10 +541,10 @@ def test_execute_command_with_monitoring_treats_unknown_exit_build_failure_as_fa
     )
 
     assert result["success"] is False
-    assert result["exit_code"] == 1
+    assert result["exit_code"] is None
 
 
-def test_execute_command_with_monitoring_treats_unknown_exit_ordinary_output_as_success():
+def test_execute_command_with_monitoring_treats_unknown_exit_ordinary_output_as_unavailable():
     container = FakeContainer(
         FakeStreamingExecResult(exit_code=None, output=[(b"[INFO] BUILD SUCCESS\n", b"")])
     )
@@ -552,10 +556,10 @@ def test_execute_command_with_monitoring_treats_unknown_exit_ordinary_output_as_
         enable_cpu_monitoring=False,
     )
 
-    assert result["success"] is True
-    assert result["exit_code"] == 0
+    assert result["success"] is False
+    assert result["exit_code"] is None
     assert result["observed_exit_code"] is None
-    assert result["exit_code_inferred"] is True
+    assert result["exit_code_inferred"] is False
 
 
 def test_execute_command_with_monitoring_treats_unknown_exit_pip_terminal_failure_as_failure():
@@ -579,12 +583,12 @@ def test_execute_command_with_monitoring_treats_unknown_exit_pip_terminal_failur
     )
 
     assert result["success"] is False
-    assert result["exit_code"] == 1
+    assert result["exit_code"] is None
     assert result["observed_exit_code"] is None
-    assert result["exit_code_inferred"] is True
+    assert result["exit_code_inferred"] is False
 
 
-def test_execute_command_with_monitoring_keeps_unknown_exit_could_not_resolve_narrative_success():
+def test_execute_command_with_monitoring_keeps_unknown_exit_could_not_resolve_narrative_unavailable():
     container = FakeContainer(
         FakeStreamingExecResult(
             exit_code=None,
@@ -604,11 +608,11 @@ def test_execute_command_with_monitoring_keeps_unknown_exit_could_not_resolve_na
         enable_cpu_monitoring=False,
     )
 
-    assert result["success"] is True
-    assert result["exit_code"] == 0
+    assert result["success"] is False
+    assert result["exit_code"] is None
 
 
-def test_execute_command_with_monitoring_keeps_unknown_exit_allowed_range_narrative_success():
+def test_execute_command_with_monitoring_keeps_unknown_exit_allowed_range_narrative_unavailable():
     container = FakeContainer(
         FakeStreamingExecResult(
             exit_code=None,
@@ -628,8 +632,8 @@ def test_execute_command_with_monitoring_keeps_unknown_exit_allowed_range_narrat
         enable_cpu_monitoring=False,
     )
 
-    assert result["success"] is True
-    assert result["exit_code"] == 0
+    assert result["success"] is False
+    assert result["exit_code"] is None
 
 
 def test_execute_command_with_monitoring_preserves_quoted_workdir_in_timeout_wrapper():

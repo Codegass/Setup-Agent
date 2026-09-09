@@ -524,8 +524,8 @@ def test_absent_static_denominator_is_honest_partial_without_analyze_prescriptio
     assert "project(action='analyze')" not in result.reason
 
 
-def test_all_collection_errors_are_red_even_when_report_exists():
-    class CollectionFailure(FakeValidator):
+def test_completed_project_errors_remain_test_outcomes():
+    class CompletedProjectErrors(FakeValidator):
         def validate_test_status(self, project_name=None):
             return {
                 "has_test_reports": True,
@@ -534,20 +534,20 @@ def test_all_collection_errors_are_red_even_when_report_exists():
                 "error_tests": 328,
                 "test_stats": {"executed": 328, "discovered": 328},
                 "receipt_scoped": True,
-                "reason": "collection errors",
+                "test_execution_state": "completed",
+                "reason": "all project tests errored after execution",
                 "report_files": ["report://junit"],
             }
 
     result = check_phase_claim(
         "test",
         PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
-        validator=CollectionFailure(),
+        validator=CompletedProjectErrors(),
         orchestrator=_orch(),
         project_name="demo",
     )
 
-    # Premise updated 2026-08-10: terminal execution closes even when red;
-    # collection-error counts remain sealed content, not a gate rejection.
+    # Complete execution is an explicit premise, not inferred from error rows.
     assert result.accepted is True
     assert result.validator_state is ValidatorState.GREEN
     assert result.validated_outcome is PhaseOutcome.SUCCESS
@@ -580,6 +580,7 @@ def test_red_tests_never_reject_a_test_phase_close():
                 "unique_error_tests": 20,
                 "unique_skipped_tests": 0,
                 "receipt_scoped": True,
+                "test_execution_state": "completed",
             }
 
     gate = check_phase_claim(
@@ -593,6 +594,51 @@ def test_red_tests_never_reject_a_test_phase_close():
     assert gate.accepted is True
     assert gate.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
     assert "test_failures" not in gate.code
+
+
+@pytest.mark.parametrize("execution_state", [None, "unknown", "failed", "completed"])
+def test_report_counts_cannot_supply_missing_test_completion(execution_state):
+    class ReportCounts(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "status": "SUCCESS",
+                "evidence_status": "success",
+                "reason": "100 passing rows observed",
+                "report_files": ["report://current-run"],
+                "test_stats": {
+                    "executed": 100,
+                    "passed": 100,
+                    "failed": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                },
+                "receipt_scoped": True,
+                **({"test_execution_state": execution_state} if execution_state else {}),
+            }
+
+    gate = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=ReportCounts(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert gate.validated_facts["test.stats"]["unique"]["executed"] == 100
+    if execution_state == "completed":
+        assert gate.accepted is True
+        assert gate.validator_state is ValidatorState.GREEN
+        assert gate.validated_outcome is PhaseOutcome.SUCCESS
+    elif execution_state == "failed":
+        assert gate.accepted is False
+        assert gate.validator_state is ValidatorState.RED
+        assert gate.validated_outcome is PhaseOutcome.FAILED
+    else:
+        assert gate.accepted is False
+        assert gate.validator_state is ValidatorState.UNAVAILABLE
+        assert gate.validated_outcome is PhaseOutcome.UNKNOWN
+        assert gate.code == "test_execution_unavailable"
 
 
 def test_interrupted_test_with_sealed_rows_closes_only_as_partial():

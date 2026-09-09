@@ -5,6 +5,7 @@ underlying tool. Stage 1 delegates to the existing MavenTool/GradleTool;
 later ecosystems (python/node) add a module here, never a schema change.
 """
 
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -22,6 +23,77 @@ from sag.tools.internal.dispatch_argv import (
     gradle_task_tokens,
     maven_action_tokens,
 )
+
+
+def source_command_tokens(
+    source_command: str, system: str, verb: str, args: Optional[str]
+) -> List[str]:
+    """Validate a declared runner command against public params; never run shell syntax."""
+    if (
+        not isinstance(source_command, str)
+        or not source_command.strip()
+        or len(source_command) > 2048
+    ):
+        raise ValueError("source_command must be bounded non-empty text")
+    if any(char in source_command for char in ("\n", "\r", "$", "`")):
+        raise ValueError(
+            "source_command has unresolved shell syntax; use explicit ordered setup steps"
+        )
+    tokens = shlex.split(source_command)
+    if not tokens or any(token in {"&&", "||", "|", ";", "&", ">", "<", ">>"} for token in tokens):
+        raise ValueError(
+            "source_command must name one runner; separate initialization and cwd into steps"
+        )
+    head = posixpath.basename(tokens[0])
+    if head in {"make", "gmake"}:
+        raise ValueError(
+            "Make is not a build backend: review its recipe and encode supported setup/pytest steps, or mark the test blocked"
+        )
+    if head in {"mvn", "mvnw"}:
+        named, body = "maven", tokens[1:]
+    elif head in {"gradle", "gradlew"}:
+        named, body = "gradle", tokens[1:]
+    elif head == "pytest":
+        named, body = "python", tokens[1:]
+    elif re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", head) and tokens[1:3] == ["-m", "pytest"]:
+        named, body = "python", tokens[3:]
+    elif head == "uv" and tokens[1:3] == ["run", "pytest"]:
+        named, body = "python", tokens[3:]
+    elif head == "uv" and tokens[1:4] == ["run", "--active", "pytest"]:
+        named, body = "python", tokens[4:]
+    else:
+        raise ValueError(
+            "source_command executor is unsupported; use an existing explicit setup tool or mark the step blocked"
+        )
+    if named != system:
+        raise ValueError(f"source_command executor {named} disagrees with system={system}")
+    supplied = shlex.split(args or "")
+    if named == "python":
+        if verb != "test" or body != supplied:
+            raise ValueError("pytest source_command must match action=test and its exact args")
+        return body
+    if named == "maven":
+        goal = MavenBackend.VERBS.get(verb)
+        remaining = list(body)
+        if goal not in remaining:
+            raise ValueError(f"source_command does not execute Maven action={verb}")
+        remaining.remove(goal)
+        if remaining != supplied:
+            raise ValueError(
+                "Maven source_command differs from action/args; preserve every goal and option"
+            )
+    elif body != supplied:
+        # A default Gradle task may be stated in source_command while args
+        # holds just its options. A scoped task must remain explicit in args.
+        remaining = list(body)
+        default = GradleBackend.VERBS.get(verb)
+        if default not in remaining:
+            raise ValueError("Gradle source_command differs from action/args")
+        remaining.remove(default)
+        if remaining != supplied:
+            raise ValueError("Gradle source_command differs from action/args")
+    return body
+
 
 # Verbs that produce local artifacts. Packaging is NOT a test owner — the `test`
 # verb is the only one (live bigtop: a naked `mvn install` ran environment-
@@ -148,6 +220,7 @@ class MavenBackend:
         # verify/failsafe in its model-authored plan must request that lifecycle
         # explicitly; the facade must not silently widen `test` to `verify`.
         "test": "test",
+        "verify": "verify",
         "package": "package",
         # A reactor whose modules depend on siblings' produced artifacts (shaded
         # jars, code-gen, packaged deps) needs those installed to the local repo so
@@ -198,7 +271,9 @@ class MavenBackend:
         """
         tokens = ["--fail-at-end"] if params.get("fail_at_end") else []
         tokens.extend(
-            maven_action_tokens(params.get("command"), extra_args=params.get("extra_args"))
+            params["_source_argv"]
+            if "_source_argv" in params
+            else maven_action_tokens(params.get("command"), extra_args=params.get("extra_args"))
         )
         return " ".join(shlex.quote(token) for token in tokens) or None
 
@@ -230,7 +305,7 @@ class MavenBackend:
         # of aborting at the first error and making the agent rediscover failures
         # one module per iteration. Pairs with the coverage-based build verdict
         # (a partial compile -> PARTIAL listing the modules that failed).
-        if verb in ("compile", "package", "test", "install"):
+        if verb in ("compile", "package", "test", "verify", "install"):
             kwargs["fail_at_end"] = True
         extra_args = self._extra_args(verb, args)
         if extra_args:
@@ -522,9 +597,12 @@ class GradleBackend:
         """
         gradle_args = params.get("gradle_args")
         materialized = str(params.get("tasks") or verb)
-        tokens = gradle_task_tokens(materialized, gradle_args) or gradle_task_selections(
-            gradle_args
-        )
+        if "_source_argv" in params:
+            tokens = gradle_task_selections(params["_source_argv"])
+        else:
+            tokens = gradle_task_tokens(materialized, gradle_args) or gradle_task_selections(
+                gradle_args
+            )
         tasks = " ".join(tokens)
         added = (
             GRADLE_EXCLUDE_TEST_ARGS
@@ -550,6 +628,8 @@ class GradleBackend:
     @staticmethod
     def effective_action(params: Dict[str, Any]) -> str:
         """The Gradle task list these params hand the runner."""
+        if "_source_argv" in params:
+            return " ".join(gradle_task_selections(params["_source_argv"]))
         return str(params.get("tasks") or "")
 
     @staticmethod
@@ -564,6 +644,9 @@ class GradleBackend:
         part of the frozen vector (see `compliance_class`).
         """
         tokens = ["--continue"] if params.get("fail_at_end") else []
+        if "_source_argv" in params:
+            tokens.extend(params["_source_argv"])
+            return shlex.join(tokens)
         gradle_args = params.get("gradle_args")
         tokens.extend(shlex.split(str(gradle_args or "")))
         tokens.extend(gradle_task_tokens(params.get("tasks"), gradle_args))

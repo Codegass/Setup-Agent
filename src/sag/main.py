@@ -43,7 +43,7 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH
 from sag.trajectory.builder import build_trajectory, follow_trajectory
 from sag.trajectory.schema import DETAIL_TIERS
 from sag.utils.git_utils import extract_project_name_from_url
-from sag.verdict_rates import render_rate_lines
+from sag.verdict_rates import render_rate_lines, render_snapshot_metric_lines
 from sag.web.server import run_web_server
 
 console = Console()
@@ -72,12 +72,10 @@ def _render_setup_cli_result(
             conflicts=[*snapshot.conflicts],
         )
 
-    lines = render_rate_lines(snapshot.rates)
-    if snapshot.test_stats.failed or snapshot.test_stats.errors:
-        lines[1] += (
-            f" — {snapshot.test_stats.failed} failed, {snapshot.test_stats.errors} errors "
-            "(project-owned)"
-        )
+    lines = render_snapshot_metric_lines(snapshot.model_dump(mode="json"))
+    from sag.agent.ci_comparison import render_ci_comparison_lines
+
+    lines.extend(render_ci_comparison_lines(snapshot.ci_comparison))
     lines.extend(
         [
             f"Verdict (derived): {snapshot.verdict}",
@@ -537,11 +535,24 @@ def list():
     "project_ref",
     help="Git ref to set up, such as a branch, tag, release tag, short commit, or full commit.",
 )
+@click.option(
+    "--ci-target-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Frozen official-CI target JSON to compare after execution; never fetched at finalization.",
+)
 @click.pass_context
-def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
+def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref, ci_target_file):
     """Initial setup for a new project from repository URL."""
 
     config = ctx.obj["config"]
+    ci_target = None
+    if ci_target_file is not None:
+        from sag.agent.ci_comparison import load_ci_target
+
+        try:
+            ci_target = load_ci_target(ci_target_file)
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Invalid CI target: {exc}") from exc
 
     # Override ui_mode from command-line flag if provided
     if ui:
@@ -612,6 +623,7 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
             goal=goal,
             docker_label=docker_label,
             project_ref=project_ref,
+            **({"ci_target": ci_target} if ci_target is not None else {}),
             pre_finalize_evidence_callback=(
                 (
                     lambda: _run_coverage_evidence_pass(

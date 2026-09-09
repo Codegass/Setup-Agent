@@ -915,64 +915,18 @@ def analyze_maven_configuration(orch, project_path: str, config: Dict[str, Any])
                     logger.info(f"Found parent POM at: {parent_path}")
                 break
 
-    # Analyze all POM contents for Java version
-    java_version = None
-    java_version_source = None
-    java_version_enforced = False
+    # Keep runtime constraints separate from the compiler's target level.
+    from sag.tools.internal.java_versions import java_requirement_candidate, maven_java_requirements
 
-    for idx, pom_content in enumerate(all_pom_contents):
-        if java_version:
-            break  # Already found
-
-        # 1. First check Maven Enforcer plugin for RequireJavaVersion
-        enforcer_match = re.search(ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE)
-        if enforcer_match:
-            normalized = normalize_java_version(enforcer_match.group(1))
-            if normalized:
-                java_version = normalized
-                java_version_source = "maven-enforcer"
-                java_version_enforced = True
-                logger.info(
-                    f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                )
-                break
-
-        # 2. Check standard properties, then the maven-compiler-plugin
-        # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
-        # Java level only as <source>/<target>/<release> inside the compiler
-        # plugin config rather than as maven.compiler.* properties; without this
-        # the analyzer detects nothing and the wrong JDK gets provisioned.
-        java_version_patterns = [
-            r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
-            r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
-            r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
-            r"<java\.version>([^<]+)</java\.version>",
-            r"<release>\s*(1\.\d+|\d+)\s*</release>",  # compiler-plugin config
-            r"<target>\s*(1\.\d+|\d+)\s*</target>",
-            r"<source>\s*(1\.\d+|\d+)\s*</source>",
-        ]
-
-        for pattern in java_version_patterns:
-            match = re.search(pattern, pom_content)
-            if match:
-                normalized = normalize_java_version(match.group(1))
-                if not normalized:
-                    # Rejected capture (e.g. ${...} indirection): fall
-                    # through to the next pattern instead of accepting it.
-                    continue
-                java_version = normalized
-                java_version_source = "maven-compiler"
-                logger.info(
-                    f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
-                )
-                break
-
-    if java_version:
-        config["java_version"] = java_version
-        config["java_version_source"] = java_version_source
-        config["java_version_enforced"] = java_version_enforced
-    else:
-        logger.warning(f"No Java version found in Maven configuration for {project_path}")
+    java_requirements = maven_java_requirements(list(zip(all_pom_contents, pom_locations)))
+    config["java_requirements"] = java_requirements
+    config["java_version"] = java_requirement_candidate(java_requirements)
+    config["java_version_source"] = (
+        "maven-enforcer"
+        if java_requirements["runtime"]
+        else "maven-compiler" if java_requirements["compiler_release"] else None
+    )
+    config["java_version_enforced"] = bool(java_requirements["runtime"])
 
     # Check for multi-module project. The pom is read untruncated above, so the
     # <modules> block is intact even on large poms.

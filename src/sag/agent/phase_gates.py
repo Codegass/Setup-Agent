@@ -2557,12 +2557,10 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
                 ),
             )
         elif executed > 0 and receipt_scoped and not evidence_integrity_failure:
-            # Rate-banded verdict §4/§5: the phase grades execution. Project
-            # failures and errors remain exact sealed facts, but they never
-            # reject a terminal close; only evidence-integrity failures do.
-            # The upgrade brings its own sentence (spec §2.3): the validator's
-            # label described the pass rate, and keeping it here is exactly how
-            # ignite sealed "below the threshold" next to `green`.
+            # Counts prove observed results; receipt completion separately
+            # proves that the runner finished. Project assertion red remains
+            # compatible with a completed execution, while a missing or
+            # unknown completion cannot be supplied by a complete fraction.
             execution_state = str(rollup.get("execution_state") or "").strip().lower()
             if execution_state == "partial":
                 decision = _GradedDecision(
@@ -2576,14 +2574,23 @@ def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObser
             elif execution_state == "failed":
                 decision = _GradedDecision(
                     state=ValidatorState.RED,
-                    code="test_execution_interrupted",
+                    code="test_execution_failed",
                     reason=(
                         str(rollup.get("execution_reason") or "").strip()
-                        or "test execution was interrupted"
+                        or "test execution failed before completion"
                     ),
                 )
-            else:
+            elif execution_state == "completed":
                 decision = _test_execution_decision(rollup)
+            else:
+                decision = _GradedDecision(
+                    state=ValidatorState.UNAVAILABLE,
+                    code="test_execution_unavailable",
+                    reason=(
+                        str(rollup.get("execution_reason") or "").strip()
+                        or "test execution completion is unavailable for the observed results"
+                    ),
+                )
             state, code, reason = decision.state, decision.code, decision.reason
             suggestions = () if state is ValidatorState.GREEN else suggestions
     else:

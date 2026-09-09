@@ -1,0 +1,6 @@
+{
+  "path": "logs/d3r1-20260907/runs/polaris/audit/Makefile",
+  "sha256": "79bf237d49d9c3cc1ec675f419221e5eec957df328c59fb63139a5b745c7c750",
+  "bytes": 22437,
+  "scope": "read-only source fixture for document transport; not a build experiment"
+}

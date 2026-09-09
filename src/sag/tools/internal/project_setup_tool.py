@@ -10,9 +10,9 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
-from .build_preflight import PythonPreflight, read_live_build_requirements
+from .build_preflight import JdkPreflight, PythonPreflight, read_live_build_requirements
 from .maven_versions import MAVEN_PROVISION_VERSION
-from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
+from .project_analyzer import _normalize_java_version
 from .python_env import detect_installer, ensure_venv_pip, venv_repair_note
 
 # MAVEN_PROVISION_VERSION, imported above, is the standalone Maven this file
@@ -473,6 +473,9 @@ class ProjectSetupTool(BaseTool):
             "ref": requested_ref,
             "resolved_commit": resolved_commit,
         }
+        detected = getattr(self, "_detected_java_requirements", None)
+        if detected and detected[0] == clone_path:
+            metadata["java_requirements"] = detected[1]
         if legacy_branch:
             metadata["branch"] = legacy_branch
 
@@ -776,68 +779,13 @@ class ProjectSetupTool(BaseTool):
                     logger.info(f"Found parent POM at: {parent_path}")
                     break
 
-        # Analyze all POM contents for Java version
-        java_version = None
-        java_version_source = None
-        java_version_enforced = False
+        from .build_preflight import active_java_runtime
+        from .java_versions import java_requirement_candidate, maven_java_requirements
 
-        for idx, pom_content in enumerate(all_pom_contents):
-            if java_version:
-                break  # Already found
-
-            # 1. First check Maven Enforcer plugin for RequireJavaVersion (highest priority)
-            enforcer_match = re.search(
-                ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE
-            )
-            if enforcer_match:
-                normalized = _normalize_java_version(enforcer_match.group(1))
-                if normalized:
-                    java_version = normalized
-                    java_version_source = "maven-enforcer"
-                    java_version_enforced = True
-                    logger.info(
-                        f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                    )
-                    break
-
-            # 2. Check standard properties, then the maven-compiler-plugin
-            # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
-            # Java level only as <source>/<target>/<release> inside the compiler
-            # plugin config rather than as maven.compiler.* properties; without this
-            # the wrong JDK gets provisioned (cassandra core won't compile on 11).
-            java_version_patterns = [
-                r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
-                r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
-                r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
-                r"<java\.version>([^<]+)</java\.version>",
-                r"<release>\s*(1\.\d+|\d+)\s*</release>",  # compiler-plugin config
-                r"<target>\s*(1\.\d+|\d+)\s*</target>",
-                r"<source>\s*(1\.\d+|\d+)\s*</source>",
-            ]
-
-            for pattern in java_version_patterns:
-                match = re.search(pattern, pom_content)
-                if match:
-                    normalized = _normalize_java_version(match.group(1))
-                    if not normalized:
-                        # Rejected capture (e.g. ${...} indirection): fall
-                        # through to the next pattern instead of accepting it.
-                        continue
-                    java_version = normalized
-                    java_version_source = "maven-compiler"
-                    logger.info(
-                        f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
-                    )
-                    break
-
-        if java_version:
-            logger.info(
-                f"Detected Java version: {java_version} (source: {java_version_source}, enforced: {java_version_enforced})"
-            )
-        else:
-            logger.warning(f"No Java version found in Maven configuration for {project_path}")
-
-        return java_version
+        requirements = maven_java_requirements(list(zip(all_pom_contents, pom_locations)))
+        self._detected_java_requirements = (project_path, requirements)
+        active = active_java_runtime(self.orchestrator)
+        return java_requirement_candidate(requirements, active_version=active.get("version"))
 
     def _detect_gradle_java_version(self, project_path: str) -> Optional[str]:
         """Detect Java version from Gradle build files."""
@@ -891,6 +839,43 @@ class ProjectSetupTool(BaseTool):
         """Install dependencies based on project type and detected Java version."""
 
         if project_type["type"] == "maven":
+            detected = getattr(self, "_detected_java_requirements", None)
+            if detected and detected[0] == directory:
+                requirements = detected[1]
+                if any(
+                    requirements.get(key) for key in ("runtime", "compiler_release", "unresolved")
+                ):
+                    outcome = JdkPreflight(self.orchestrator).run(
+                        java_version, requirements=requirements
+                    )
+                    if outcome.mismatch or (outcome.unknown and not outcome.matched):
+                        return {
+                            "success": False,
+                            "error": outcome.narration,
+                            "java_requirements": requirements,
+                            "java_requirement_status": "unknown" if outcome.unknown else "mismatch",
+                        }
+                    # The preflight has already proved or activated the Maven
+                    # JVM. Installing default-jdk here could silently replace it.
+                    installed = self.orchestrator.execute_command(
+                        "DEBIAN_FRONTEND=noninteractive apt-get install -y maven", workdir=directory
+                    )
+                    if installed.get("success"):
+                        self._register_maven_runtime_overlay()
+                        self._provision_required_maven_if_needed(directory)
+                    return {
+                        "success": bool(installed.get("success")),
+                        "installed": "Maven; active Java preserved after constraint verification",
+                        "error": (
+                            None
+                            if installed.get("success")
+                            else installed.get("output", "Maven installation failed")
+                        ),
+                        "java_version": outcome.active_version,
+                        "java_requirements": requirements,
+                        "java_requirement_status": "unknown" if outcome.unknown else "satisfied",
+                        "output": outcome.narration + "\n" + installed.get("output", ""),
+                    }
             # Determine which Java package to install
             if java_version and java_version.isdigit():
                 java_package = f"openjdk-{java_version}-jdk"

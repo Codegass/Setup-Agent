@@ -14,13 +14,14 @@ survey output: this lane must hold the rollup shape even before lane c1's
 producer exists.
 """
 
+from build_requirements_fakes import complete_build_requirements_v1
 from container_evidence_fakes import add_published_mutable_json, strict_published_evidence
+
 from sag.agent.attempt_policy import (
     IncompatibleDomainEdge,
     UntriedIslandsRequirement,
     untried_islands_requirement,
 )
-from build_requirements_fakes import complete_build_requirements_v1
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.phase_gates import (
@@ -216,6 +217,7 @@ class GreenValidator:
             "evidence_status": "success",
             "reason": "test reports present",
             "receipt_scoped": True,
+            "test_execution_state": "completed",
             # Premise updated 2026-08-10: executed counts close the test gate
             # only when they are bound to the current receipt ledger.
             "test_stats": {

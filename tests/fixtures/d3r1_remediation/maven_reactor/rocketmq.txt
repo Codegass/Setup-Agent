@@ -1,0 +1,24 @@
+[INFO] Reactor Summary for Apache RocketMQ 5.5.1 5.5.1:
+[INFO] 
+[INFO] Apache RocketMQ 5.5.1 .............................. SUCCESS [ 54.405 s]
+[INFO] rocketmq-common 5.5.1 .............................. SUCCESS [ 24.936 s]
+[INFO] rocketmq-remoting 5.5.1 ............................ SUCCESS [  8.028 s]
+[INFO] rocketmq-client 5.5.1 .............................. SUCCESS [  9.116 s]
+[INFO] rocketmq-store 5.5.1 ............................... SUCCESS [ 11.958 s]
+[INFO] rocketmq-tiered-store 5.5.1 ........................ SUCCESS [  5.275 s]
+[INFO] rocketmq-srvutil 5.5.1 ............................. SUCCESS [  1.647 s]
+[INFO] rocketmq-filter 5.5.1 .............................. SUCCESS [  2.682 s]
+[INFO] rocketmq-auth 5.5.1 ................................ SUCCESS [  4.403 s]
+[INFO] rocketmq-broker 5.5.1 .............................. SUCCESS [ 14.073 s]
+[INFO] rocketmq-tools 5.5.1 ............................... SUCCESS [  6.912 s]
+[INFO] rocketmq-controller 5.5.1 .......................... SUCCESS [  5.140 s]
+[INFO] rocketmq-namesrv 5.5.1 ............................. SUCCESS [  3.603 s]
+[INFO] rocketmq-proxy 5.5.1 ............................... SUCCESS [  9.770 s]
+[INFO] rocketmq-container 5.5.1 ........................... SUCCESS [  4.395 s]
+[INFO] rocketmq-test 5.5.1 ................................ SUCCESS [  6.298 s]
+[INFO] rocketmq-distribution 5.5.1 ........................ SUCCESS [  0.040 s]
+[INFO] rocketmq-openmessaging 5.5.1 ....................... SUCCESS [  2.683 s]
+[INFO] rocketmq-example 5.5.1 ............................. SUCCESS [  4.643 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------

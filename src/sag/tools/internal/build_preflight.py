@@ -36,7 +36,13 @@ from sag.agent.evidence_records import (
 )
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.paths import BUILD_REQUIREMENTS_PATH
-from sag.tools.internal.java_versions import java_major
+from sag.tools.internal.java_versions import (
+    java_constraint_matches,
+    java_major,
+    java_requirement_candidate,
+    java_requirements_range,
+    parse_java_verification,
+)
 from sag.tools.internal.python_env import (
     _REPAIR_ACTION_PHRASE,
     ensure_venv_pip,
@@ -148,6 +154,7 @@ _OPTIONAL_KEYS = (
             "domain_edges",
             "domain_facts",
             "module_structure",
+            "java_requirements",
         }
     )
     | _PYTHON_KEYS
@@ -931,6 +938,31 @@ def validate_build_requirements_v1(
         choices=frozenset({"maven-compiler", "maven-enforcer"}),
     )
     _boolean(body["java_version_enforced"], "java_version_enforced")
+    if "java_requirements" in body:
+        java = _exact_keys(
+            body["java_requirements"],
+            required={"runtime", "compiler_release", "compiler_source", "compiler_toolchain"},
+            optional={"unresolved"},
+            field="java_requirements",
+        )
+        for index, raw in enumerate(
+            _sequence(java["runtime"], "java_requirements.runtime", cap=64)
+        ):
+            rule = _exact_keys(
+                raw, required={"constraint", "source"}, field=f"java_requirements.runtime[{index}]"
+            )
+            _text(rule["constraint"], "java constraint", max_bytes=256)
+            _text(rule["source"], "java constraint source", max_bytes=1024)
+        _text(
+            java["compiler_release"],
+            "compiler_release",
+            nullable=True,
+            pattern=re.compile(r"[1-9]\d{0,2}"),
+        )
+        _text(java["compiler_source"], "compiler_source", nullable=True, max_bytes=1024)
+        _boolean(java["compiler_toolchain"], "compiler_toolchain")
+        if "unresolved" in java:
+            _string_list(java["unresolved"], "java_requirements.unresolved", item_max_bytes=1024)
     _text(body["root_shape"], "root_shape", choices=_ROOT_SHAPES)
     build_root = _workspace_path(body["build_root"], "build_root", project_root=project_root)
     fail_at_end = _boolean(body["fail_at_end"], "fail_at_end")
@@ -1201,6 +1233,9 @@ def active_java_runtime(orchestrator) -> Dict[str, str]:
     match = _JAVA_VERSION_RE.search(output)
     if match:
         runtime["major"] = match.group(1)
+    version = parse_java_verification(output).get("java_version")
+    if version:
+        runtime["version"] = version
     return runtime
 
 
@@ -1300,6 +1335,7 @@ class PreflightOutcome:
     mismatch: bool = False
     narration: str = ""
     conflicts: Tuple[str, ...] = ()
+    unknown: bool = False
 
 
 class JdkPreflight:
@@ -1308,14 +1344,101 @@ class JdkPreflight:
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
 
-    def run(self, required_version: Optional[str], source: str = "unknown") -> PreflightOutcome:
+    def run(
+        self,
+        required_version: Optional[str],
+        source: str = "unknown",
+        *,
+        requirements: Optional[Dict[str, Any]] = None,
+    ) -> PreflightOutcome:
         try:
+            if requirements is not None:
+                return self._run_constraints(requirements, required_version, source)
+            if required_version and source == "maven-enforcer":
+                return self._run_constraints(
+                    {
+                        "runtime": [{"constraint": required_version, "source": source}],
+                        "compiler_release": None,
+                        "compiler_source": None,
+                        "compiler_toolchain": False,
+                    },
+                    required_version,
+                    source,
+                )
+            if required_version and not str(required_version).isdigit():
+                return PreflightOutcome(
+                    False,
+                    None,
+                    required_version,
+                    unknown=True,
+                    narration="[pre-flight] Java requirement is unresolved; no automatic JDK change",
+                )
             return self._run(required_version, source)
         except Exception as exc:  # never let the pre-flight kill a build
             logger.warning(f"JDK pre-flight error (continuing): {exc}")
-            return PreflightOutcome(True, None, required_version)
+            return PreflightOutcome(
+                False,
+                None,
+                required_version,
+                unknown=True,
+                narration="[pre-flight] Java requirements could not be checked; no automatic JDK change",
+            )
 
-    def _run(self, required: Optional[str], source: str) -> PreflightOutcome:
+    def _run_constraints(
+        self, requirements: Dict[str, Any], required: Optional[str], source: str
+    ) -> PreflightOutcome:
+        observed = required if source.startswith(("runner", "persisted_dynamic")) else None
+        bound = java_requirements_range(requirements, observed_major=observed)
+        active_runtime = active_java_runtime(self.orchestrator)
+        active = active_runtime.get("major")
+        if bound is None or requirements.get("unresolved"):
+            return PreflightOutcome(
+                False,
+                active,
+                required,
+                unknown=True,
+                narration="[pre-flight] Java constraint resolution is unknown; preserving the active JVM "
+                "until Maven resolves the declared profiles/properties or version range",
+            )
+        if bound.empty:
+            return PreflightOutcome(
+                False,
+                active,
+                required,
+                mismatch=True,
+                conflicts=("java_constraint_conflict",),
+                narration="[pre-flight] java_constraint_conflict: declared Maven JVM bounds and compiler "
+                "release have no common runtime; no automatic JDK change",
+            )
+        candidate = java_requirement_candidate(
+            requirements, active_version=active_runtime.get("version"), observed_major=observed
+        )
+        if candidate is None:
+            outcome = PreflightOutcome(
+                False,
+                active,
+                required,
+                unknown=True,
+                narration="[pre-flight] no proved installable JDK candidate for the declared constraints",
+            )
+        else:
+            outcome = self._run(candidate, source, constraint=bound, active_runtime=active_runtime)
+        if requirements.get("compiler_toolchain"):
+            outcome.unknown = True
+            outcome.narration += ("\n" if outcome.narration else "") + (
+                "[pre-flight] Maven JVM checked separately; independent compiler toolchain selection "
+                f"and release {requirements.get('compiler_release') or 'unknown'} remain unverified until execution"
+            )
+        return outcome
+
+    def _run(
+        self,
+        required: Optional[str],
+        source: str,
+        *,
+        constraint=None,
+        active_runtime: Optional[Dict[str, str]] = None,
+    ) -> PreflightOutcome:
         # The activation check needs something to compare AGAINST, so it reads
         # the overlay first and probes only when a runtime was registered. A
         # container with no registered java behaves exactly as before: no
@@ -1334,9 +1457,20 @@ class JdkPreflight:
                 conflicts=(JAVA_RUNTIME_CONFLICT,) if conflict else (),
             )
 
-        active_runtime = active_java_runtime(self.orchestrator)
+        active_runtime = active_runtime or active_java_runtime(self.orchestrator)
         active = active_runtime.get("major")
-        if active == required:
+
+        def matches(runtime):
+            if constraint is not None:
+                from sag.tools.internal.java_versions import _java_version_tuple
+
+                version = _java_version_tuple(runtime.get("version"))
+                return version is not None and constraint.contains(version)
+            if source == "maven-enforcer":
+                return java_constraint_matches(required, runtime.get("version")) is True
+            return runtime.get("major") == required
+
+        if matches(active_runtime):
             logger.debug(f"JDK pre-flight: active Java {active} matches requirement")
             # The version the manifest asked for is satisfied, which does not
             # by itself prove the build inherited the runtime that was
@@ -1382,7 +1516,7 @@ class JdkPreflight:
                 registered_runtime,
                 post_runtime,
             )
-            if post_major != required or activation_conflict:
+            if not matches(post_runtime) or activation_conflict:
                 observed = post_major or "unknown"
                 reason = activation_conflict or (
                     f"the dispatch environment still reports Java {observed}"

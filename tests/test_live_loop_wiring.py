@@ -30,6 +30,7 @@ import shlex
 
 import pytest
 from test_container_io import FakeContainer as AtomicFakeContainer
+from test_document_map import framed_source_prefix
 from test_forced_attempt_native import forced_engine  # noqa: F401  (shared fixture)
 
 from sag.agent.action_intents import action_fingerprint
@@ -154,6 +155,14 @@ class FakeContainer:
     # -- transport -------------------------------------------------------
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        if "SAG_FILE_PREFIX_V1" in command:
+            path, limit = shlex.split(command)[-2:]
+            body = self._read(path)
+            return (
+                fail("unreadable source")
+                if body is None
+                else ok(framed_source_prefix(body, int(limit)))
+            )
         # The absent-or-identical publisher is one multi-line python command.
         # Recognize it before the legacy newline guard discards tokenization.
         if "python3 -c" in command and "fcntl.flock" in command:
@@ -272,9 +281,8 @@ class FakeContainer:
         """The paths whose text was fetched, in order (discovery + extraction)."""
         paths = []
         for command in self.commands:
-            if command.startswith("head -c "):
-                arguments = shlex.split(command)
-                paths.append(arguments[arguments.index("--") + 1])
+            if "SAG_FILE_PREFIX_V1" in command:
+                paths.append(shlex.split(command)[-2])
         return paths
 
     def claims(self):
@@ -402,7 +410,65 @@ def test_entry_text_is_fetched_under_the_map_s_own_byte_budget():
     text = read_entry_text(container.execute_command, {"path": f"{ROOT}/README.md"})
 
     assert text == README
-    assert f"head -c {MAX_FILE_BYTES} -- " in container.commands[-1]
+    assert shlex.split(container.commands[-1])[-1] == str(MAX_FILE_BYTES)
+
+
+def test_a_prefix_ending_in_half_a_version_cannot_mint_a_constraint(monkeypatch):
+    from sag.agent import document_map
+
+    monkeypatch.setattr(document_map, "MAX_FILE_BYTES", len(b"Requires Java 1"))
+    container = FakeContainer({"README.md": "Requires Java 17\n"})
+    analysis = {}
+    mapped = analyzer(container)._survey_documents_and_claims(ROOT, analysis)
+    assert mapped is not None
+    assert mapped["entries"][0].content_truncated is True
+    assert container.claims() == {}
+
+
+@pytest.mark.parametrize("suffix", ["", " -pl co"])
+def test_prefix_cannot_drop_the_remainder_of_a_shell_continuation(monkeypatch, suffix):
+    from sag.agent import document_map
+
+    prefix = "#!/bin/sh\nmvn test \\\n" + suffix
+    monkeypatch.setattr(document_map, "MAX_FILE_BYTES", len(prefix.encode()))
+    container = FakeContainer({"build.sh": "#!/bin/sh\nmvn test \\\n -pl core\n"})
+    mapped = analyzer(container)._survey_documents_and_claims(ROOT, {})
+    assert mapped is not None
+    assert mapped["entries"][0].content_truncated is True
+    assert container.claims() == {}
+
+
+def test_document_read_failure_after_mapping_is_a_survey_conflict():
+    class UnreadableAfterMap(FakeContainer):
+        def __call__(self, command, **kwargs):
+            if "SAG_FILE_PREFIX_V1" in command and DOCUMENT_MAP_PATH in self.files:
+                self.commands.append(command)
+                return fail("source read failed")
+            return super().__call__(command, **kwargs)
+
+    container = UnreadableAfterMap({"README.md": README})
+    analysis = {}
+    mapped = analyzer(container)._survey_documents_and_claims(ROOT, analysis)
+    assert mapped is not None
+    assert conflict_kinds(analysis) == ["document_source_unreadable"]
+    assert container.claims() == {}
+
+
+def test_document_survey_uses_the_host_control_channel_through_claim_publication():
+    class ControlOnlyDocuments(FakeContainer):
+        def execute_command(self, command, **kwargs):
+            raise AssertionError("document survey used the project runtime executor")
+
+        def execute_control_command(self, command, **kwargs):
+            return self(command, **kwargs)
+
+    container = ControlOnlyDocuments(CHECKOUT)
+    analysis = {}
+    mapped = analyzer(container)._survey_documents_and_claims(ROOT, analysis)
+    assert mapped is not None
+    assert mapped["entries"]
+    assert container.claims()
+    assert conflict_kinds(analysis) == []
 
 
 def test_a_failed_discovery_records_a_named_conflict_and_analyze_continues():

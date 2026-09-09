@@ -547,14 +547,14 @@ def test_an_unsettled_row_after_the_close_is_impossible(tmp_path):
 def test_a_pre_plan_8_transcript_still_replays_byte_identically():
     """The frozen v3 projection and event digest remain byte-identical.
 
-    Premise updated 2026-08-10: replay returns today's v4 snapshot after it
+    Premise updated 2026-08-10: replay returns today's v5 snapshot after it
     internally verifies the comparison-only v3 projection.
     """
     result = ControlReplayRunner.offline().run(FIXTURES / "paramiko.jsonl")
 
     assert result.produced_event_digest == result.expected_event_digest
     assert result.expected_snapshot["schema_version"] == 3
-    assert result.snapshot.schema_version == 4
+    assert result.snapshot.schema_version == 5
     assert result.snapshot.rates
     assert not any(conflict.startswith("job_unsettled:") for conflict in result.snapshot.conflicts)
 

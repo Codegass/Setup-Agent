@@ -84,6 +84,7 @@ def _ignite_status():
         "evidence_status": "success",
         "reason": "executed 37 of 37 discovered · 29 passed, 8 failed, 0 skipped",
         "receipt_scoped": True,
+        "test_execution_state": "completed",  # Independent premise of this wording test.
         "total_tests": 37,
         "passed_tests": 29,
         "failed_tests": 8,
@@ -111,6 +112,7 @@ def _kafka_status():
         "evidence_status": "success",
         "reason": "Tests passed above the 80% threshold: 3568/3571 (99.9%)",
         "receipt_scoped": True,
+        "test_execution_state": "completed",  # Synthetic wording control, not D3R1 replay.
         "total_tests": 3571,
         "passed_tests": 3568,
         "failed_tests": 2,

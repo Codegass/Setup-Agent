@@ -802,6 +802,10 @@ def test_validate_test_status_grades_a_red_suite_that_ran_on_its_execution(monke
     """
     failing = [f"com.example.VfsTest::case{i}" for i in range(7)]
     validator = PhysicalValidator(project_path="/workspace")
+    # This test varies project outcomes after independently proven completion.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
     monkeypatch.setattr(
         validator,
         "parse_test_reports_with_catalog",
@@ -824,6 +828,10 @@ def test_validate_test_status_never_fails_a_suite_for_being_half_red(monkeypatch
     """50/100 passing used to be FAILED at the 80% cliff; it executed fully."""
     failing = [f"com.example.Bad::t{i}" for i in range(50)]
     validator = PhysicalValidator(project_path="/workspace")
+    # This test varies project outcomes after independently proven completion.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
     monkeypatch.setattr(
         validator,
         "parse_test_reports_with_catalog",
@@ -841,6 +849,10 @@ def test_validate_test_status_never_fails_a_suite_for_being_half_red(monkeypatch
 
 def test_validate_test_status_all_pass_success(monkeypatch):
     validator = PhysicalValidator(project_path="/workspace")
+    # This test varies project outcomes after independently proven completion.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
     monkeypatch.setattr(
         validator,
         "parse_test_reports_with_catalog",
@@ -1163,6 +1175,10 @@ def test_reconcile_without_physical_evidence_is_partial_whatever_the_pass_rate()
 def test_report_and_validator_verdicts_agree_on_a_red_suite_that_ran(monkeypatch):
     """Single source of truth: report verdict and run/test verdict don't diverge."""
     validator = PhysicalValidator(project_path="/workspace")
+    # This test varies project outcomes after independently proven completion.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
     monkeypatch.setattr(
         validator,
         "parse_test_reports_with_catalog",
@@ -1189,6 +1205,10 @@ def test_no_configured_pass_rate_can_relabel_the_same_execution(monkeypatch):
     accomplishments = _accomplishments(100, 85)
 
     validator = PhysicalValidator(project_path="/workspace")
+    # This test varies project outcomes after independently proven completion.
+    monkeypatch.setattr(
+        validator, "_test_execution_receipt_summary", lambda _root: {"state": "completed"}
+    )
     assert not hasattr(validator, "test_pass_threshold")
     assert not hasattr(validator, "test_execution_threshold")
     with pytest.raises(TypeError):

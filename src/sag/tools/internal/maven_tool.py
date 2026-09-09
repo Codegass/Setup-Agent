@@ -21,6 +21,7 @@ from sag.agent.invocation_receipts import record_invocation, snapshot_reports
 from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
+from sag.metrics.maven_reactor import parse_maven_reactor, reactor_scope_issues
 from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.utils.container_io import write_container_text_atomic
@@ -46,27 +47,36 @@ from .dispatch_argv import maven_action_tokens
 from .maven_versions import floor_from_requirement, nearest_installable_floor
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
-# The reactor summary Maven prints at the end of every multi-module build:
-#   [INFO] camel-core ......................... SUCCESS [ 12.345 s]
-#   [INFO] camel-jms .......................... FAILURE [  3.210 s]
-#   [INFO] camel-ftp .......................... SKIPPED
-# It is the build system's own record of what THIS invocation attempted. A
-# single-module build prints none, which is the honest absence: there is one
-# module and the exit code already speaks for it.
-_REACTOR_ROW = re.compile(r"\[INFO\]\s+([^\.\[]+?)\s+\.{2,}\s+(SUCCESS|FAILURE|SKIPPED)\b")
-
 
 def _reactor_module_outcomes(output: Optional[str]) -> List[Dict[str, str]]:
-    """`[{module, status}]` from the reactor summary, or [] when it printed none."""
-    rows: List[Dict[str, str]] = []
-    seen = set()
-    for label, status in _REACTOR_ROW.findall(str(output or "")):
-        module = label.strip()
-        if not module or module in seen:
-            continue
-        seen.add(module)
-        rows.append({"module": module, "status": status.lower()})
-    return rows
+    """Receipt observations, including repeated labels; no identity is guessed."""
+    return [
+        {"module": row.module, "status": row.status.lower()}
+        for block in parse_maven_reactor(str(output or ""))
+        for row in block.rows
+    ]
+
+
+def _reactor_receipt_fields(output: Optional[str]) -> Dict[str, Any]:
+    """Only a bounded summary can supply receipt scope; keep refusals explicit.
+
+    The full rows and block boundaries remain in the bound output and analysis.
+    Reuse the receipt's existing omission contract instead of adding a second
+    representation of module identity to its schema.
+    """
+    blocks = parse_maven_reactor(str(output or ""))
+    if reactor_scope_issues(str(output or ""), blocks):
+        return {
+            "module_outcomes": [],
+            "declared_omissions": [
+                {
+                    "field": "module_outcomes",
+                    "status": "unavailable",
+                    "reasons": ["maven_reactor_summary_boundaries_unavailable"],
+                }
+            ],
+        }
+    return {"module_outcomes": _reactor_module_outcomes(output)}
 
 
 class MavenTool(BaseTool):
@@ -121,6 +131,7 @@ class MavenTool(BaseTool):
         *,
         _env_preflight: bool = True,
         _requirements: Optional[Mapping[str, Any]] = None,
+        _source_argv: Optional[List[str]] = None,
     ) -> ToolResult:
         """
         Execute Maven commands with comprehensive error handling.
@@ -226,7 +237,15 @@ class MavenTool(BaseTool):
             outcome = JdkPreflight(self.orchestrator).run(
                 requirements.get("java_version"),
                 source=requirements.get("java_version_source") or "unknown",
+                requirements=requirements.get("java_requirements"),
             )
+            if "java_constraint_conflict" in outcome.conflicts:
+                return ToolResult.completed_failure(
+                    output=outcome.narration,
+                    error="conflicting Java requirements",
+                    error_code="JAVA_CONSTRAINT_CONFLICT",
+                    metadata={"runner_dispatched": False},
+                )
             if outcome.narration:
                 preamble_lines.append(outcome.narration)
 
@@ -263,8 +282,6 @@ class MavenTool(BaseTool):
             requirements,
         )
         self._pending_runner_choice = runner_choice
-        if runner_narration:
-            preamble_lines.append(runner_narration)
 
         requested_version = ToolVersionRequirement.from_raw(
             maven_version_requirement, source="tool_parameter"
@@ -327,7 +344,6 @@ class MavenTool(BaseTool):
                 "fallback_reason": fallback_reason,
             }
             self._pending_runner_choice = runner_choice
-            preamble_lines.append(f"[toolchain] {fallback_reason}; using registered Maven")
 
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
@@ -390,6 +406,32 @@ class MavenTool(BaseTool):
                 ),
             }
             self._pending_runner_choice = runner_choice
+        runner_choice = {
+            **runner_choice,
+            "executable": maven_executable,
+            "version": maven_runtime.get("version"),
+        }
+        self._pending_runner_choice = runner_choice
+        if not raw_output and not self._normalize_maven_version_command(command):
+            if runner_choice["runner"] == "wrapper":
+                pin = runner_choice.get("pinned_version")
+                preamble_lines.append(
+                    "[toolchain] using the project's own ./mvnw"
+                    + (f" (pins Maven {pin})" if pin else "")
+                )
+            else:
+                reason = runner_choice["reason"].replace("no ./mvnw in", "no project wrapper in")
+                prefix = (
+                    "[toolchain] ./mvnw is present but not executable; "
+                    if runner_choice["reason"].endswith(" is not executable")
+                    else "[toolchain] "
+                )
+                preamble_lines.append(
+                    f"{prefix}using registered Maven {maven_executable}"
+                    + (f" ({maven_runtime['version']})" if maven_runtime.get("version") else "")
+                    + f"; {reason}"
+                )
+        preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
         requested_requirement_metadata = self._maven_version_requirement_metadata(
             contract_requirement
         )
@@ -440,7 +482,11 @@ class MavenTool(BaseTool):
         # Maven's --fail-at-end doesn't continue after test failures, only compilation failures
         # For test commands with fail_at_end, automatically add maven.test.failure.ignore=true
         auto_ignore_test_failures = False
-        if fail_at_end and command in ["test", "verify", "integration-test"]:
+        if (
+            fail_at_end
+            and command in ["test", "verify", "integration-test"]
+            and _source_argv is None
+        ):
             logger.info("📝 Enabling test failure ignore for fail_at_end with test command")
             logger.info("   (Maven's --fail-at-end doesn't continue after test failures)")
             caller_supplied_ignore = any(
@@ -479,6 +525,7 @@ class MavenTool(BaseTool):
             use_wrapper=prefer_wrapper,
             extra_args=extra_args,
             maven_executable=maven_executable,
+            _source_argv=_source_argv,
         )
         # The lifecycle actually handed to Maven (the caller's command plus any
         # extra goals) versus what this tool was asked for. Both go into the
@@ -633,7 +680,9 @@ class MavenTool(BaseTool):
                 active = outcome.active_version or active_java_major(self.orchestrator)
                 if needed and needed != active:
                     retry_outcome = JdkPreflight(self.orchestrator).run(
-                        needed, source="build-error"
+                        needed,
+                        source="runner-observed:build-error",
+                        requirements=requirements.get("java_requirements"),
                     )
                     if retry_outcome.provisioned:
                         preamble += (
@@ -732,6 +781,7 @@ class MavenTool(BaseTool):
                     ),
                     terminal_observation=True,
                 )
+                detached_result.raw_output = full_output
                 if not detached_result.succeeded:
                     # A normally terminated Maven process with a recorded
                     # non-zero exit is a Maven-domain failure, even though it
@@ -857,8 +907,8 @@ class MavenTool(BaseTool):
                 if analysis["build_success"]:
                     return self._finalize_main_result(
                         ToolResult.completed_success(
-                            output=result["output"],
-                            raw_output=result["output"],
+                            output=full_output,
+                            raw_output=full_output,
                             **evidence_fields,
                             metadata={
                                 "command": maven_cmd,
@@ -881,7 +931,7 @@ class MavenTool(BaseTool):
                     )
 
                 error_result = self._handle_maven_error(
-                    result["output"],
+                    full_output,
                     result["exit_code"],
                     maven_cmd,
                     analysis,
@@ -891,8 +941,8 @@ class MavenTool(BaseTool):
                     output_ref_id=ref_id,
                     working_directory=working_directory,
                 )
-                error_result.output = result["output"]
-                error_result.raw_output = result["output"]
+                error_result.output = full_output
+                error_result.raw_output = full_output
                 if ref_id:
                     error_result.metadata["output_ref_id"] = ref_id
                 if result.get("dispatch_status"):
@@ -940,7 +990,7 @@ class MavenTool(BaseTool):
                             )
                             return self._finalize_main_result(
                                 self._handle_maven_error(
-                                    result["output"],
+                                    full_output,
                                     result["exit_code"],
                                     maven_cmd,
                                     analysis,
@@ -961,7 +1011,7 @@ class MavenTool(BaseTool):
                 return self._finalize_main_result(
                     ToolResult.completed_success(
                         output=self._format_success_output_enhanced(analysis, ref_id),
-                        raw_output=result["output"],
+                        raw_output=full_output,
                         **evidence_fields,
                         metadata={
                             "command": maven_cmd,
@@ -993,7 +1043,7 @@ class MavenTool(BaseTool):
                     )
                 # Build failed - use error handler even if exit code was 0
                 error_result = self._handle_maven_error(
-                    result["output"],
+                    full_output,
                     result["exit_code"],
                     maven_cmd,
                     analysis,
@@ -1039,7 +1089,6 @@ class MavenTool(BaseTool):
         """
         if preamble:
             tool_result.output = preamble + (tool_result.output or "")
-            tool_result.raw_output = preamble + (tool_result.raw_output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
         tool_result.metadata.update(getattr(self, "_pending_log_storage_metadata", {}) or {})
@@ -1114,9 +1163,7 @@ class MavenTool(BaseTool):
             # coverage denominator is built from this instead of from every
             # source tree on disk, so a scoped build (`-pl`) or a reactor that
             # stopped early is measured against what it tried.
-            module_outcomes=_reactor_module_outcomes(
-                result.get("full_output") or result.get("output")
-            ),
+            **_reactor_receipt_fields(result.get("full_output") or result.get("output")),
             # Plan 6 Stage B: bind this dispatch back to the contract the build
             # facade froze for it. Absent when the runner was called outside
             # the facade, and `compliance` is the argv comparison's verdict.
@@ -1208,6 +1255,7 @@ class MavenTool(BaseTool):
         use_wrapper: bool = False,
         extra_args: str = None,
         maven_executable: str = "mvn",
+        _source_argv: Optional[List[str]] = None,
     ) -> str:
         """Build the complete Maven command."""
         cmd_parts = []
@@ -1260,7 +1308,11 @@ class MavenTool(BaseTool):
         # the single producer, shared with MavenBackend.expected_argv): the
         # lifecycle first, then goals, then the extra args — nothing appended,
         # nothing reordered.
-        cmd_parts.extend(maven_action_tokens(command, goals, extra_args))
+        cmd_parts.extend(
+            _source_argv
+            if _source_argv is not None
+            else maven_action_tokens(command, goals, extra_args)
+        )
 
         # Quote every token at the single shell boundary: the detached runner
         # embeds this string in bash -c. Raw joins let internally generated
@@ -2357,6 +2409,24 @@ class MavenTool(BaseTool):
             "reactor_summary": [],
         }
 
+        reactor_blocks = parse_maven_reactor(output)
+        analysis["reactor_scope_issues"] = list(reactor_scope_issues(output, reactor_blocks))
+        reactor_rows = {row.line_number: row for block in reactor_blocks for row in block.rows}
+        analysis["reactor_summary_blocks"] = [
+            {
+                "start_line": block.start_line,
+                "end_line": block.end_line,
+                "row_count": len(block.rows),
+                "result": block.result,
+                "duplicate_labels": list(block.duplicate_labels),
+                "unparsed_lines": list(block.unparsed_lines),
+            }
+            for block in reactor_blocks
+        ]
+        analysis["reactor_ambiguous_labels"] = list(
+            dict.fromkeys(name for block in reactor_blocks for name in block.duplicate_labels)
+        )
+
         maven_version_requirement = self.extract_version_requirement_from_output(output)
         if maven_version_requirement:
             analysis["maven_version_requirement"] = {
@@ -2419,7 +2489,7 @@ class MavenTool(BaseTool):
 
         # Also check for simpler Java version error messages
         if not analysis["java_version_error"]:
-            for line in lines:
+            for line_number, line in enumerate(lines, 1):
                 if "Java" in line and "required" in line.lower():
                     # Try to extract version numbers
                     version_match = re.search(r"Java (\d+).*required", line, re.IGNORECASE)
@@ -2468,7 +2538,7 @@ class MavenTool(BaseTool):
             current_execution_has_final_summary = False
             expecting_final_test_summary = False
 
-        for line in lines:
+        for line_number, line in enumerate(lines, 1):
             line = line.strip()
 
             # Extract executed phases
@@ -2549,14 +2619,12 @@ class MavenTool(BaseTool):
                     }
                 )
 
-            summary_match = re.search(
-                r"\[INFO\]\s+([^\.\[]+?)\s+\.+\s+(SUCCESS|FAILURE|SKIPPED)", line
-            )
-            if summary_match:
-                module_label = summary_match.group(1).strip()
-                status = summary_match.group(2).upper()
+            summary_row = reactor_rows.get(line_number)
+            if summary_row:
+                module_label = summary_row.module
+                status = summary_row.status
                 analysis["reactor_summary"].append(
-                    {"module": module_label, "status": status, "raw": line}
+                    {"module": module_label, "status": status, "raw": summary_row.raw}
                 )
                 last_summary_module = module_label
                 if status == "SKIPPED":
@@ -3240,6 +3308,9 @@ class MavenTool(BaseTool):
             "failed_modules": failed_modules,
             "skipped_modules": analysis.get("skipped_modules", []),
             "reactor_summary": analysis.get("reactor_summary", []),
+            "reactor_summary_blocks": analysis.get("reactor_summary_blocks", []),
+            "reactor_ambiguous_labels": analysis.get("reactor_ambiguous_labels", []),
+            "reactor_scope_issues": analysis.get("reactor_scope_issues", []),
         }
 
         metrics_dir = "/workspace/.setup_agent/metrics"

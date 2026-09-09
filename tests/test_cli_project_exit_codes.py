@@ -40,6 +40,9 @@ def snapshot_for(verdict):
         verdict=verdict,
         build_evidence=BuildEvidenceSnapshot(judgment=verdict, source="physical", observed=True),
         test_stats=SnapshotTestStats(
+            # This CLI fixture starts after an independently completed test run;
+            # report delivery and command options must not reclassify that run.
+            judgment="success",
             discovered=10,
             executed=10,
             passed=10 if verdict == "success" else 8,

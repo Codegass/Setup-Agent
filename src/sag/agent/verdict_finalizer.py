@@ -27,6 +27,7 @@ from sag.verdict_rates import (
     unbounded_conflicts,
 )
 
+from .ci_comparison import CIComparisonSnapshot, PinnedCITarget, build_ci_comparison
 from .evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
     VERDICT_LOGICAL_ARTIFACT_ID,
@@ -39,7 +40,7 @@ from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
 LEGACY_VERDICT_SCHEMA_VERSION = 3
-VERDICT_SCHEMA_VERSION = 4
+VERDICT_SCHEMA_VERSION = 5
 _VERDICT_FILENAME = "verdict.json"
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _UTC_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
@@ -323,13 +324,21 @@ class RunVerdictSnapshot(BaseModel):
     rates: dict[str, Any] = Field(default_factory=dict)
     conflicts: tuple[str, ...] = ()
     phase_records: tuple[PhaseRecordSnapshot, ...] = ()
+    ci_comparison: CIComparisonSnapshot | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_historical_comparison(self, handler):
+        data = handler(self)
+        if self.ci_comparison is None:
+            data.pop("ci_comparison", None)
+        return data
 
     @model_validator(mode="before")
     @classmethod
     def _load_historical_rates_additively(cls, value: Any) -> Any:
-        """Historical v3 artifacts remain readable without becoming v4.
+        """Historical artifacts retain their recorded version.
 
-        The writer stamps v4 through the field default.  A v3 reader merely
+        The writer stamps v5 through the field default.  A v3 reader merely
         supplies the additive empty projection; it never rewrites history.
         """
         if not isinstance(value, dict):
@@ -910,8 +919,12 @@ def _fold_test_stats(
             conflicts = _dedupe([*conflicts, "test_execution_interrupted"])
         elif execution_state == "failed":
             validated_judgment = "failed"
-        else:
+        elif execution_state == "completed":
             validated_judgment = "success" if validated_unique.executed > 0 else "unknown"
+        else:
+            # A complete report fraction can be only a prefix of an
+            # unfinished run. Absent legacy completion is unknown too.
+            validated_judgment = "unknown"
         return (
             SnapshotTestStats(
                 discovered=_nonnegative_int(validated_rollup.get("discovered")),
@@ -1436,6 +1449,21 @@ def _snapshot_verdict(
     )
 
 
+def _execution_verdict_word(
+    build: BuildEvidenceSnapshot,
+    tests: SnapshotTestStats,
+    test_cases: GrainRate,
+) -> str:
+    """Require completion beside the observed-results rate on write and read."""
+
+    execution = tests.judgment if tests.judgment != "unknown" else "partial"
+    return run_verdict(
+        execution,
+        derived_verdict_word(_build_execution_judgment(build), test_cases),
+        (),
+    )
+
+
 _OUTCOME_RANK = {"failed": 0, "partial": 1, "success": 2}
 
 
@@ -1646,10 +1674,10 @@ def _validated_rates_block(
 
 
 def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapshot:
-    """Validate one decoded v3/v4 verdict payload without granting authority.
+    """Validate one decoded v3/v4/v5 verdict payload without granting authority.
 
     The historical function name is retained for offline callers.  V3 is
-    display/forensic only; the live reader separately requires current v4.
+    and v4 are display/forensic only; the live reader requires current v5.
     """
 
     if not isinstance(payload, Mapping):
@@ -1657,7 +1685,7 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     if type(payload.get("schema_version")) is not int:
         raise ValueError("verdict schema version must be a strict integer")
     schema_version = payload.get("schema_version")
-    if schema_version not in (LEGACY_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION):
+    if schema_version not in (LEGACY_VERDICT_SCHEMA_VERSION, 4, VERDICT_SCHEMA_VERSION):
         raise ValueError("verdict schema version is not supported")
 
     raw_test_stats = payload.get("test_stats", {})
@@ -1709,6 +1737,9 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
         validate_raw_count(source_files, label="source file")
 
     snapshot = RunVerdictSnapshot.model_validate(payload)
+    if snapshot.ci_comparison is not None:
+        if schema_version < 5 or snapshot.ci_comparison.run_id != snapshot.run_id:
+            raise ValueError("CI comparison does not bind the verdict schema and run")
     if type(snapshot.run_id) is not str or _RUN_ID_RE.fullmatch(snapshot.run_id) is None:
         raise ValueError("verdict run id is invalid")
     finalized_at = snapshot.finalized_at
@@ -1764,7 +1795,7 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     )
     expected_verdict = run_verdict(
         _phase_machine_verdict(snapshot.phase_records),
-        derived_verdict_word(_build_execution_judgment(snapshot.build_evidence), test_cases),
+        _execution_verdict_word(snapshot.build_evidence, snapshot.test_stats, test_cases),
         snapshot.conflicts,
     )
     if snapshot.verdict != expected_verdict:
@@ -1847,6 +1878,8 @@ class VerdictFinalizer:
         *,
         validator=None,
         project_name: str | None = None,
+        repository: str | None = None,
+        ci_target: PinnedCITarget | None = None,
     ):
         self.orchestrator = orchestrator
         # The physical validator is the build oracle at evidence-close (same
@@ -1854,6 +1887,8 @@ class VerdictFinalizer:
         # the observation aggregate.
         self.validator = validator
         self.project_name = project_name
+        self.repository = repository
+        self.ci_target = ci_target
         self._snapshots: dict[int, RunVerdictSnapshot] = {}
         self._expected_snapshots: dict[int, RunVerdictSnapshot] = {}
 
@@ -1902,7 +1937,7 @@ class VerdictFinalizer:
             input_refs=input_refs,
             verdict=run_verdict(
                 _phase_machine_verdict(state.phase_records),
-                derived_verdict_word(_build_execution_judgment(build), test_cases_rate),
+                _execution_verdict_word(build, tests, test_cases_rate),
                 conflicts,
             ),
             build_evidence=build,
@@ -1910,6 +1945,14 @@ class VerdictFinalizer:
             rates=rates,
             conflicts=conflicts,
             phase_records=tuple(_phase_record_snapshot(record) for record in state.phase_records),
+            ci_comparison=build_ci_comparison(
+                self.orchestrator,
+                state,
+                validator=self.validator,
+                project_root=(f"/workspace/{self.project_name}" if self.project_name else None),
+                repository=self.repository,
+                target=self.ci_target,
+            ),
         )
         self._expected_snapshots[cache_key] = snapshot
         return snapshot

@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 import sag.agent.evidence_assessments as assessments_module
 import sag.tools.build.build_tool as build_tool_module
 from sag.agent.action_intents import action_fingerprint
@@ -333,3 +335,226 @@ def test_findings_are_bounded_and_never_contain_an_action_prescription():
     for finding in findings:
         payload = finding.payload()
         assert not ({"command", "args", "suggestions", "install", "start"} & payload.keys())
+
+
+@pytest.mark.parametrize(
+    ("output", "name"),
+    [
+        (
+            "Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)",
+            "daemon_disappeared",
+        ),
+        (
+            "The forked VM terminated without properly saying goodbye. VM crash or System.exit called?",
+            "test_runtime_start_failed",
+        ),
+        (
+            "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile (default-compile) on project core: Compilation failure",
+            "compilation_failed",
+        ),
+        (
+            "An exception has occurred in the compiler (17.0.16). Please file a bug against the Java compiler",
+            "compilation_failed",
+        ),
+    ],
+)
+def test_precise_runner_faults_are_typed(output, name):
+    findings = assessments_module.execution_faults(receipt(), output)
+    assert [(item.typed_code, item.name) for item in findings] == [("execution_fault", name)]
+    assert assessments_module.validate_assessment_v2(findings[0].payload()) == findings[0].payload()
+
+
+def test_failed_setup_docker_reason_is_preserved_even_when_exit_zero():
+    observed = receipt(
+        exit_code=0,
+        **failed(
+            "Could not find a valid Docker environment. Please see logs and check configuration"
+        ),
+    )
+    findings = assessments_module.execution_faults(observed)
+    assert [(item.typed_code, item.name) for item in findings] == [
+        ("execution_fault", "test_setup_service_unavailable")
+    ]
+
+
+def test_assertion_red_and_skipped_environment_do_not_invent_execution_fault():
+    assert (
+        assessments_module.execution_faults(
+            receipt(**failed("AssertionError: expected 2 but got 3")),
+            "[ERROR] Tests run: 3, Failures: 1",
+        )
+        == []
+    )
+    observed = receipt(
+        testcase_outcomes={
+            "nodes": [{"status": "skipped", "reason": "Could not find a valid Docker environment"}]
+        }
+    )
+    assert assessments_module.execution_faults(observed) == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.0:test (default-test) on project sample: There are test failures.",
+        "Execution failed for task ':test'.\n> There were failing tests. See the report at: file:///workspace/project/build/reports/tests/test/index.html",
+    ],
+)
+def test_project_assertion_failure_has_explicit_test_failure_exit(output):
+    observed = receipt(exit_code=1, **failed("expected:<2> but was:<3>"))
+    findings = assessments_module.test_failure_exits(observed, output)
+    assert [item.typed_code for item in findings] == ["test_failure_exit"]
+    assert findings[0].owner.value == "project"
+
+
+def test_generic_failed_task_or_setup_error_does_not_prove_assertion_only_exit():
+    assertion = receipt(exit_code=1, **failed("AssertionError: expected 2 but got 3"))
+    assert assessments_module.test_failure_exits(assertion, "BUILD FAILED") == []
+    setup = receipt(exit_code=1, **failed("Could not find a valid Docker environment"))
+    assert assessments_module.test_failure_exits(setup, "There were failing tests.") == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.0:test on project one: There are test failures.\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-enforcer-plugin:3.5.0:enforce on project two: RequireFilesExist failed: missing catalog",
+        "Execution failed for task ':test'.\n> There were failing tests.\nExecution failed for task ':generateCatalog'.\n> Missing catalog",
+        "> Task :generateCatalog FAILED\nExecution failed for task ':test'.\n> There were failing tests.",
+    ],
+)
+def test_test_failure_exit_does_not_hide_another_failed_goal_or_task(output):
+    observed = receipt(exit_code=1, **failed("expected:<2> but was:<3>"))
+    assert assessments_module.test_failure_exits(observed, output) == []
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_green_test_printing_a_docker_diagnostic_does_not_become_setup_failure(exit_code):
+    observed = receipt(
+        exit_code=exit_code,
+        testcase_outcomes={
+            "nodes": [{"node_id": "RuntimeErrorRenderingTest#renders", "status": "passed"}]
+        },
+    )
+    output = "expected diagnostic rendered correctly: Could not find a valid Docker environment\nBUILD SUCCESSFUL"
+    assert assessments_module.execution_faults(observed, output) == []
+
+
+def _bounded_gradle_assertions(*, failures=100, errors=1, complete_red=False):
+    return receipt(
+        schema_version=3,
+        exit_code=1,
+        gradle_suite_summaries={
+            "suites": [
+                {
+                    "module": ":root",
+                    "task_dir": "test",
+                    "tests": failures + errors,
+                    "failures": failures,
+                    "errors": errors,
+                    "skipped": 0,
+                }
+            ]
+        },
+        testcase_outcomes={
+            "nodes": [
+                {"node_id": "suite#one", "status": "failed", "reason": "expected:<2> but was:<3>"}
+            ],
+            "truncated": True,
+        },
+        gradle_row_disclosure={"rows_source": "gradle_xml", "red_rows_complete": complete_red},
+    )
+
+
+def test_hidden_gradle_error_cannot_be_an_assertion_only_failure_exit():
+    observed = _bounded_gradle_assertions()
+    output = "Execution failed for task ':test'.\n> There were failing tests."
+    assert assessments_module.test_failure_exits(observed, output) == []
+
+
+@pytest.mark.parametrize("tool", ["maven", "gradle"])
+def test_truncated_red_diagnostics_do_not_prove_assertion_only_exit(tool):
+    observed = receipt(tool=tool, **failed("expected:<2> but was:<3>"))
+    observed["testcase_outcomes"]["truncated"] = True
+    output = "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.0:test on project sample: There are test failures."
+    assert assessments_module.test_failure_exits(observed, output) == []
+
+
+def test_counts_of_assertions_do_not_replace_missing_diagnostic_reasons():
+    observed = _bounded_gradle_assertions(failures=100, errors=0)
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is False
+    observed = _bounded_gradle_assertions(failures=1, errors=0, complete_red=True)
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is True
+    del observed["testcase_outcomes"]["nodes"][0]["reason"]
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is False
+
+
+def test_complete_green_totals_do_not_require_a_diagnostic_sample():
+    observed = _bounded_gradle_assertions(failures=0, errors=0)
+    observed["gradle_suite_summaries"]["suites"][0]["tests"] = 10
+    del observed["testcase_outcomes"]
+    del observed["gradle_row_disclosure"]
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is True
+
+
+def test_execution_row_disclosure_cannot_certify_a_truncated_node_sample():
+    observed = receipt(**failed("expected:<2> but was:<3>"))
+    observed["testcase_outcomes"]["truncated"] = True
+    observed["testcase_execution_rows"] = {"status": "complete", "rows": [{"outcome": "failed"}]}
+    observed["testcase_row_disclosure"] = {"red_rows_complete": True}
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is False
+
+
+def test_failed_node_cannot_stand_in_for_a_declared_error_diagnostic():
+    observed = _bounded_gradle_assertions(failures=0, errors=1, complete_red=True)
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is False
+
+
+def test_incomplete_totals_cannot_certify_the_absence_of_hidden_errors():
+    observed = _bounded_gradle_assertions(failures=1, errors=0, complete_red=True)
+    observed["gradle_suite_summaries"]["unsummarized_files"] = 1
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is False
+
+
+def test_complete_maven_rows_still_require_every_red_diagnostic():
+    observed = receipt(tool="maven", **failed("expected:<2> but was:<3>"))
+    observed["testcase_execution_rows"] = {
+        "status": "complete",
+        "rows": [{"outcome": "failed"}, {"outcome": "error"}],
+    }
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is False
+    observed["testcase_outcomes"]["nodes"].append(
+        {
+            "node_id": "suite#two",
+            "status": "error",
+            "reason": "Could not find a valid Docker environment",
+        }
+    )
+    assert assessments_module.test_outcome_diagnostics_complete(observed) is True
+
+
+def test_pytest_assertion_failure_exit_requires_its_final_summary():
+    observed = receipt(tool="python", exit_code=1, **failed("assert 2 == 3"))
+    output = "FAILED tests/test_sample.py::test_one - assert 2 == 3\n=================== 1 failed, 2 passed in 0.12s ===================\n"
+    assert [
+        item.typed_code for item in assessments_module.test_failure_exits(observed, output)
+    ] == ["test_failure_exit"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 2, 3, 4, 5])
+def test_non_test_failure_pytest_exit_is_not_an_assertion_exit(exit_code):
+    observed = receipt(tool="python", exit_code=exit_code, **failed("assert 2 == 3"))
+    assert assessments_module.test_failure_exits(observed, "1 failed in 0.12s") == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "1 failed, 1 error in 0.12s",
+        "1 failed in 0.12s\nINTERNALERROR: pytest could not finish",
+        "FAILED tests/test_sample.py::test_one - assert 2 == 3",
+        "2 failed in 0.12s",
+    ],
+)
+def test_pytest_summary_must_be_terminal_and_agree_with_bound_red(output):
+    observed = receipt(tool="python", exit_code=1, **failed("assert 2 == 3"))
+    assert assessments_module.test_failure_exits(observed, output) == []

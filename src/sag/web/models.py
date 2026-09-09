@@ -6,6 +6,8 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
+from sag.agent.ci_comparison import CIComparisonSnapshot
+
 
 class WebModel(BaseModel):
     __test__: ClassVar[bool] = False
@@ -834,6 +836,12 @@ class ExecutionSessionDetail(WebModel):
     )
     canonical_verdict: str = Field(default="unknown", serialization_alias="canonicalVerdict")
     rates: dict[str, Any] | None = None
+    ci_comparison: CIComparisonSnapshot | None = Field(
+        default=None, serialization_alias="ciComparison"
+    )
+    ci_comparison_lines: list[str] = Field(
+        default_factory=list, serialization_alias="ciComparisonLines"
+    )
     snapshot_status: str = Field(default="unavailable", serialization_alias="snapshotStatus")
     legacy: bool = False
     report_delivery_status: str | None = Field(

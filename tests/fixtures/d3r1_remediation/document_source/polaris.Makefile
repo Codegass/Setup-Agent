@@ -1,0 +1,511 @@
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing,
+#  software distributed under the License is distributed on an
+#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+#  KIND, either express or implied.  See the License for the
+#  specific language governing permissions and limitations
+#  under the License.
+
+# Configures the shell for recipes to use bash, enabling bash commands and ensuring
+# that recipes exit on any command failure (including within pipes).
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
+
+## Variables
+PYTHON ?= python3
+BUILD_IMAGE ?= true
+DOCKER ?= docker
+MINIKUBE_PROFILE ?= minikube
+DEPENDENCIES ?= ct helm helm-docs java21 git yamllint
+OPTIONAL_DEPENDENCIES := jq kubectl minikube
+VENV_DIR := .venv
+PYTHON_CLIENT_DIR := client/python
+ACTIVATE_AND_CD = source $(VENV_DIR)/bin/activate && cd $(PYTHON_CLIENT_DIR)
+
+## Version information
+BUILD_VERSION := $(shell cat version.txt)
+GIT_COMMIT := $(shell git rev-parse HEAD)
+UV_VERSION := $(shell cat client/python/pyproject.toml | grep -A1 tool.uv | grep -v tool.uv | grep required-version | sed 's/required-version *= *"\([^"]*\)".*/\1/')
+
+##@ General
+
+.PHONY: help
+help: ## Display this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9\.-]+:.*?##/ { printf "  \033[36m%-40s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+.PHONY: version
+version: ## Display version information
+	@echo "Build version: ${BUILD_VERSION}"
+	@echo "Git commit: ${GIT_COMMIT}"
+	@echo "UV version: ${UV_VERSION}"
+
+##@ Polaris Build
+
+.PHONY: build
+build: build-server build-admin ## Build Polaris server, admin, and container images
+
+build-admin: DEPENDENCIES := java21 $(DOCKER)
+.PHONY: build-admin
+build-admin: check-dependencies ## Build Polaris admin and container image
+	@echo "--- Building Polaris admin ---"
+	@./gradlew \
+		:polaris-admin:assemble \
+		:polaris-admin:quarkusAppPartsBuild --rerun \
+		-Dquarkus.container-image.build=$(BUILD_IMAGE) \
+		-Dquarkus.docker.executable-name=$(DOCKER)
+	@echo "--- Polaris admin build complete ---"
+
+build-cleanup: DEPENDENCIES := java21
+.PHONY: build-cleanup
+build-cleanup: check-dependencies ## Clean build artifacts
+	@echo "--- Cleaning up build artifacts ---"
+	@./gradlew clean
+	@echo "--- Build artifacts cleaned ---"
+
+build-server: DEPENDENCIES := java21 $(DOCKER)
+.PHONY: build-server
+build-server: check-dependencies ## Build Polaris server and container image
+	@echo "--- Building Polaris server ---"
+	@./gradlew \
+		:polaris-server:assemble \
+		:polaris-server:quarkusAppPartsBuild --rerun \
+		-Dquarkus.container-image.build=$(BUILD_IMAGE) \
+		-Dquarkus.docker.executable-name=$(DOCKER)
+	@echo "--- Polaris server build complete ---"
+
+build-spark-plugin-3.5-2.12: DEPENDENCIES := java21
+.PHONY: build-spark-plugin-3.5-2.12
+build-spark-plugin-3.5-2.12: check-dependencies ## Build Spark plugin v3.5 with Scala v2.12
+	@echo "--- Building Spark plugin v3.5 with Scala v2.12 ---"
+	@./gradlew \
+		:polaris-spark-3.5_2.12:assemble
+	@echo "--- Spark plugin v3.5 with Scala v2.12 build complete ---"
+
+build-spark-plugin-3.5-2.13: DEPENDENCIES := java21
+.PHONY: build-spark-plugin-3.5-2.13
+build-spark-plugin-3.5-2.13: check-dependencies ## Build Spark plugin v3.5 with Scala v2.13
+	@echo "--- Building Spark plugin v3.5 with Scala v2.13 ---"
+	@./gradlew \
+		:polaris-spark-3.5_2.13:assemble
+	@echo "--- Spark plugin v3.5 with Scala v2.13 build complete ---"
+
+build-spark-plugin-4.0-2.13: DEPENDENCIES := java21
+.PHONY: build-spark-plugin-4.0-2.13
+build-spark-plugin-4.0-2.13: check-dependencies ## Build Spark plugin v4.0 with Scala v2.13
+	@echo "--- Building Spark plugin v4.0 with Scala v2.13 ---"
+	@./gradlew \
+		:polaris-spark-4.0_2.13:assemble
+	@echo "--- Spark plugin v4.0 with Scala v2.13 build complete ---"
+
+config-doc-generate: DEPENDENCIES := java21
+.PHONY: config-doc-generate
+config-doc-generate: check-dependencies ## Generate configuration reference documentation
+	@echo "--- Generating configuration reference documentation ---"
+	@./gradlew :polaris-config-docs-site:copyConfigSectionsToSite
+	@echo "--- Configuration reference documentation generated ---"
+
+config-doc-verify: DEPENDENCIES := java21 git
+.PHONY: config-doc-verify
+config-doc-verify: config-doc-generate ## Verify configuration reference documentation is up to date
+	@echo "--- Verifying configuration reference documentation is up to date ---"
+	@if ! git diff --exit-code site/content/in-dev/unreleased/configuration/config-sections/ || \
+		[ -n "$$(git ls-files --others --exclude-standard site/content/in-dev/unreleased/configuration/config-sections/)" ]; then \
+		echo "ERROR: Configuration reference is out of date. Please run 'make config-doc-generate' and commit the changes."; \
+		exit 1; \
+	fi
+	@echo "--- Configuration reference documentation is up to date ---"
+
+spotless-apply: DEPENDENCIES := java21
+.PHONY: spotless-apply
+spotless-apply: check-dependencies ## Apply code formatting using Spotless Gradle plugin.
+	@echo "--- Applying Spotless formatting ---"
+	@./gradlew spotlessApply
+	@echo "--- Spotless formatting applied ---"
+
+##@ Polaris Client
+
+# Target to create the virtual environment directory
+$(VENV_DIR):
+	@echo "Setting up Python virtual environment at $(VENV_DIR)..."
+	@$(PYTHON) -m venv $(VENV_DIR)
+	@echo "Virtual environment created."
+
+.PHONY: client-build
+client-build: client-setup-env ## Build client distribution. Pass FORMAT=sdist or FORMAT=wheel to build a specific format, and VERSION to stamp the version before building.
+	@echo "--- Building client distribution ---"
+	@if [ -n "$(VERSION)" ]; then \
+		$(ACTIVATE_AND_CD) && uv version "$(VERSION)"; \
+	fi
+	@if [ -n "$(FORMAT)" ]; then \
+		if [ "$(FORMAT)" != "sdist" ] && [ "$(FORMAT)" != "wheel" ]; then \
+			echo "Error: Invalid format '$(FORMAT)'. Supported formats are 'sdist' and 'wheel'." >&2; \
+			exit 1; \
+		fi; \
+		echo "Building with format: $(FORMAT)"; \
+		$(ACTIVATE_AND_CD) && uv build --$(FORMAT); \
+	else \
+		echo "Building default distribution (sdist and wheel)"; \
+		$(ACTIVATE_AND_CD) && uv build --clear; \
+	fi
+	@echo "--- Client distribution build complete ---"
+
+.PHONY: client-cleanup
+client-cleanup: ## Cleanup virtual environment, build artifacts, and generated files
+	@echo "--- Cleaning up client environment and generated files ---"
+	@echo "Removing virtual environment..."
+	@rm -rf "$(VENV_DIR)"
+	@echo "Removing build artifacts..."
+	@rm -rf $(PYTHON_CLIENT_DIR)/dist
+	@echo "Removing copied spec files..."
+	@rm -rf $(PYTHON_CLIENT_DIR)/spec
+	@echo "Removing pytest cache..."
+	@rm -rf $(PYTHON_CLIENT_DIR)/.pytest_cache
+	@echo "Removing OpenAPI generator cache..."
+	@rm -rf $(PYTHON_CLIENT_DIR)/.openapi-generator
+	@echo "Removing Python cache files..."
+	@find $(PYTHON_CLIENT_DIR) -type d -name "__pycache__" -delete
+	@echo "--- Client cleanup complete ---"
+
+.PHONY: client-setup-env
+client-setup-env: $(VENV_DIR) ## Set up Python client environment (venv + dependencies)
+	@echo "--- Setting up Python client environment ---"
+	@$(VENV_DIR)/bin/pip install --upgrade pip
+	@if [ ! -f "$(VENV_DIR)/bin/uv" ]; then \
+		$(VENV_DIR)/bin/pip install --upgrade "uv$(UV_VERSION)"; \
+	fi
+	@$(ACTIVATE_AND_CD) && uv lock && uv sync --active --all-extras
+	@echo "--- Python client environment setup complete ---"
+
+run-client-integration-test: client-setup-env
+	@echo "--- Starting client integration tests ---"
+	@echo "Ensuring Docker Compose services are stopped and removed..."
+	@$(DOCKER) compose -f $(PYTHON_CLIENT_DIR)/docker-compose.yml kill || true # `|| true` prevents make from failing if containers don't exist
+	@$(DOCKER) compose -f $(PYTHON_CLIENT_DIR)/docker-compose.yml rm -f || true # `|| true` prevents make from failing if containers don't exist
+	@echo "Bringing up Docker Compose services in detached mode..."
+	@$(DOCKER) compose -f $(PYTHON_CLIENT_DIR)/docker-compose.yml up -d
+	@echo "Waiting for Polaris HTTP health check to pass..."
+	@until curl -s -f http://localhost:8182/q/health > /dev/null; do \
+		echo "Still waiting for HTTP 200 from /q/health (sleeping 2s)..."; \
+		sleep 2; \
+	done
+	@echo "Polaris is healthy. Starting integration tests..."
+	@$(ACTIVATE_AND_CD) && uv run --active pytest integration_tests/
+	@echo "--- Client integration tests complete ---"
+	@echo "Tearing down Docker Compose services..."
+	@$(DOCKER) compose -f $(PYTHON_CLIENT_DIR)/docker-compose.yml down || true # Ensure teardown even if tests fail
+
+.PHONY: client-integration-test
+client-integration-test: build-server run-client-integration-test ## Run client integration tests
+
+.PHONY: client-license-check
+client-license-check: client-setup-env ## Run license compliance check
+	@echo "--- Starting license compliance check ---"
+	@$(ACTIVATE_AND_CD) && pip-licenses
+	@echo "--- License compliance check complete ---"
+
+.PHONY: client-lint
+client-lint: client-setup-env ## Run linting checks for Polaris client
+	@echo "--- Running client linting checks ---"
+	@$(ACTIVATE_AND_CD) && uv run --active pre-commit run --files integration_tests/* generate_clients.py apache_polaris/cli/* apache_polaris/cli/command/* apache_polaris/cli/options/* test/*
+	@echo "--- Client linting checks complete ---"
+
+.PHONY: client-nightly-build
+client-nightly-build: client-setup-env ## Build nightly version for publishing to Test PyPI
+	@$(MAKE) client-build \
+		VERSION="$$($(VENV_DIR)/bin/uv --directory $(PYTHON_CLIENT_DIR) version --short).dev$$(date -u +%Y%m%d%H%M%S)" \
+		FORMAT=wheel
+
+.PHONY: client-rc-build
+client-rc-build: client-setup-env ## Build RC wheel for staging to Apache dist dev (requires RC_VERSION and RC_NUMBER)
+	@if [ -z "$(RC_VERSION)" ]; then echo "ERROR: RC_VERSION is not set"; exit 1; fi
+	@if [ -z "$(RC_NUMBER)" ]; then echo "ERROR: RC_NUMBER is not set"; exit 1; fi
+	@echo "--- Building RC wheel for version $(RC_VERSION) RC$(RC_NUMBER) ---"
+	@$(ACTIVATE_AND_CD) && uv version "$(RC_VERSION)" && uv build --wheel
+	@echo "--- RC wheel build complete ---"
+
+.PHONY: client-rc-testpypi-build
+client-rc-testpypi-build: client-setup-env ## Build RC wheel with rc suffix for Test PyPI (requires RC_VERSION and RC_NUMBER)
+	@if [ -z "$(RC_VERSION)" ]; then echo "ERROR: RC_VERSION is not set"; exit 1; fi
+	@if [ -z "$(RC_NUMBER)" ]; then echo "ERROR: RC_NUMBER is not set"; exit 1; fi
+	@echo "--- Building RC wheel for Test PyPI: $(RC_VERSION)rc$(RC_NUMBER) ---"
+	@$(ACTIVATE_AND_CD) && uv version "$(RC_VERSION)rc$(RC_NUMBER)" && uv build --wheel
+	@echo "--- RC wheel build for Test PyPI complete ---"
+
+.PHONY: client-regenerate
+client-regenerate: client-setup-env ## Regenerate the client code
+	@echo "--- Regenerating client code ---"
+	@$(ACTIVATE_AND_CD) && $(PYTHON) -B generate_clients.py
+	@echo "--- Client code regeneration complete ---"
+
+.PHONY: client-unit-test
+client-unit-test: client-setup-env ## Run client unit tests
+	@echo "--- Running client unit tests ---"
+	@$(ACTIVATE_AND_CD) && uv run --active pytest tests/
+	@echo "--- Client unit tests complete ---"
+
+##@ Helm
+
+.PHONY: helm
+helm: helm-schema-generate helm-doc-generate helm-lint helm-unittest ## Run most Helm targets (schema, docs, unittest, lint) excluding integration tests
+
+helm-doc-generate: DEPENDENCIES := helm-docs
+.PHONY: helm-doc-generate
+helm-doc-generate: check-dependencies ## Generate Helm chart documentation
+	@echo "--- Generating Helm documentation ---"
+	@helm-docs --chart-search-root=helm \
+       --template-files site/content/in-dev/unreleased/helm-chart/reference.md.gotmpl \
+       --output-file ../../site/content/in-dev/unreleased/helm-chart/reference.md \
+       --sort-values-order=file
+	@echo "--- Helm documentation generated and copied ---"
+
+helm-doc-verify: DEPENDENCIES := helm-docs git
+.PHONY: helm-doc-verify
+helm-doc-verify: helm-doc-generate ## Verify Helm chart documentation is up to date
+	@echo "--- Verifying Helm documentation is up to date ---"
+	@if ! git diff --exit-code site/content/in-dev/unreleased/helm-chart/reference.md; then \
+		echo "ERROR: Helm documentation is out of date. Please run 'make helm-doc-generate' and commit the changes."; \
+		exit 1; \
+	fi
+	@echo "--- Helm documentation is up to date ---"
+
+helm-install-plugins: DEPENDENCIES := helm
+.PHONY: helm-install-plugins
+helm-install-plugins: check-dependencies ## Install required Helm plugins (unittest, schema)
+	@echo "--- Installing Helm plugins ---"
+	@HELM_MAJOR_VERSION=$$(helm version --short | sed 's/^v//' | cut -d. -f1); \
+	if [ "$$HELM_MAJOR_VERSION" -ge 4 ] 2>/dev/null; then \
+		HELM_PLUGIN_FLAGS="--verify=false"; \
+	else \
+		HELM_PLUGIN_FLAGS=""; \
+	fi; \
+	if helm plugin list | grep -q "^unittest"; then \
+		echo "Plugin 'unittest' is already installed."; \
+	else \
+		echo "Installing 'unittest' plugin..."; \
+		helm plugin install $$HELM_PLUGIN_FLAGS https://github.com/helm-unittest/helm-unittest.git; \
+	fi; \
+	if helm plugin list | grep -q "^schema"; then \
+		echo "Plugin 'schema' is already installed."; \
+	else \
+		echo "Installing 'schema' plugin..."; \
+		helm plugin install $$HELM_PLUGIN_FLAGS https://github.com/losisin/helm-values-schema-json.git; \
+	fi
+	@echo "--- Helm plugins installed ---"
+
+helm-lint: DEPENDENCIES := ct yamllint
+.PHONY: helm-lint
+helm-lint: check-dependencies ## Run Helm chart lint check
+	@echo "--- Running Helm chart linting ---"
+	@ct lint --charts helm/polaris --validate-maintainers=false
+	@echo "--- Helm chart linting complete ---"
+
+helm-schema-generate: DEPENDENCIES := helm
+.PHONY: helm-schema-generate
+helm-schema-generate: helm-install-plugins ## Generate Helm chart JSON schema from values.yaml
+	@echo "--- Generating Helm values schema ---"
+	@helm schema -f helm/polaris/values.yaml -o helm/polaris/values.schema.json --use-helm-docs --draft 7
+	@echo "--- Helm values schema generated ---"
+
+helm-schema-verify: DEPENDENCIES := helm git
+.PHONY: helm-schema-verify
+helm-schema-verify: helm-schema-generate ## Verify Helm chart JSON schema is up to date
+	@echo "--- Verifying Helm values schema is up to date ---"
+	@if ! git diff --exit-code helm/polaris/values.schema.json; then \
+		echo "ERROR: Helm schema is out of date. Please run 'make helm-schema-generate' and commit the changes."; \
+		exit 1; \
+	fi
+	@echo "--- Helm values schema is up to date ---"
+
+helm-unittest: DEPENDENCIES := helm
+.PHONY: helm-unittest
+helm-unittest: helm-install-plugins ## Run Helm chart unittest
+	@echo "--- Running Helm chart unittest ---"
+	@helm unittest helm/polaris
+	@echo "--- Helm chart unittest complete ---"
+
+helm-fixtures: DEPENDENCIES := kubectl
+.PHONY: helm-fixtures
+helm-fixtures: check-dependencies ## Create namespace and deploy fixtures for Helm chart testing
+	@echo "--- Creating namespace and deploying fixtures ---"
+	@kubectl create namespace polaris --dry-run=client -o yaml | kubectl apply -f -
+	@kubectl apply --namespace polaris -f helm/polaris/ci/fixtures/
+	@echo "--- Waiting for database pods to be ready ---"
+	@kubectl wait --namespace polaris --for=condition=ready pod --selector=app.kubernetes.io/name=postgres --timeout=120s
+	@kubectl wait --namespace polaris --for=condition=ready pod --selector=app.kubernetes.io/name=mongodb --timeout=120s
+	@echo "--- Fixtures deployed and ready ---"
+
+helm-fixtures-cleanup: DEPENDENCIES := kubectl
+.PHONY: helm-fixtures-cleanup
+helm-fixtures-cleanup: check-dependencies ## Remove fixtures and namespace for Helm chart testing
+	@echo "--- Removing fixtures and namespace ---"
+	@kubectl delete namespace polaris --wait=true --ignore-not-found
+	@echo "--- Fixtures and namespace removed ---"
+
+helm-integration-test: DEPENDENCIES := ct
+.PHONY: helm-integration-test
+helm-integration-test: build minikube-load-images helm-fixtures check-dependencies ## Run Helm chart integration tests
+	@echo "--- Running Helm chart integration tests ---"
+	@ct install --namespace polaris --charts ./helm/polaris
+	@echo "--- Helm chart integration tests complete ---"
+
+##@ Minikube
+
+minikube-cleanup: DEPENDENCIES := minikube $(DOCKER)
+.PHONY: minikube-cleanup
+minikube-cleanup: check-dependencies ## Cleanup the Minikube cluster
+	@echo "--- Checking Minikube cluster status ---"
+	@if minikube status -p $(MINIKUBE_PROFILE) >/dev/null 2>&1; then \
+		echo "--- Cleanup Minikube cluster ---"; \
+		minikube delete -p $(MINIKUBE_PROFILE); \
+		echo "--- Minikube cluster removed ---"; \
+	else \
+		echo "--- Minikube cluster does not exist. Skipping cleanup ---"; \
+	fi
+
+minikube-load-images: DEPENDENCIES := minikube $(DOCKER)
+.PHONY: minikube-load-images
+minikube-load-images: minikube-start-cluster check-dependencies ## Load local Docker images into the Minikube cluster
+	@echo "--- Loading images into Minikube cluster ---"
+	@minikube image load -p $(MINIKUBE_PROFILE) docker.io/apache/polaris:latest
+	@minikube image tag -p $(MINIKUBE_PROFILE) docker.io/apache/polaris:latest docker.io/apache/polaris:$(BUILD_VERSION)
+	@minikube image load -p $(MINIKUBE_PROFILE) docker.io/apache/polaris-admin-tool:latest
+	@minikube image tag -p $(MINIKUBE_PROFILE) docker.io/apache/polaris-admin-tool:latest docker.io/apache/polaris-admin-tool:$(BUILD_VERSION)
+	@echo "--- Images loaded into Minikube cluster ---"
+
+minikube-start-cluster: DEPENDENCIES := minikube $(DOCKER)
+.PHONY: minikube-start-cluster
+minikube-start-cluster: check-dependencies ## Start the Minikube cluster
+	@echo "--- Checking Minikube cluster status ---"
+	@if minikube status -p $(MINIKUBE_PROFILE) --format "{{.Host}}" | grep -q "Running"; then \
+		echo "--- Minikube cluster is already running. Skipping start ---"; \
+	else \
+		echo "--- Starting Minikube cluster ---"; \
+		if [ "$(DOCKER)" = "podman" ]; then \
+			minikube start -p $(MINIKUBE_PROFILE) --driver=$(DOCKER) --container-runtime=cri-o; \
+		else \
+			minikube start -p $(MINIKUBE_PROFILE) --driver=$(DOCKER); \
+		fi; \
+		echo "--- Minikube cluster started ---"; \
+	fi
+
+minikube-stop-cluster: DEPENDENCIES := minikube $(DOCKER)
+.PHONY: minikube-stop-cluster
+minikube-stop-cluster: check-dependencies ## Stop the Minikube cluster
+	@echo "--- Checking Minikube cluster status ---"
+	@if minikube status -p $(MINIKUBE_PROFILE) --format "{{.Host}}" | grep -q "Running"; then \
+		echo "--- Stopping Minikube cluster ---"; \
+		minikube stop -p $(MINIKUBE_PROFILE); \
+		echo "--- Minikube cluster stopped ---"; \
+	else \
+		echo "--- Minikube cluster is already stopped or does not exist. Skipping stop ---"; \
+	fi
+
+##@ Regression Tests
+
+regtest-rustfs: DEPENDENCIES := $(DOCKER)
+.PHONY: regtest-rustfs
+regtest-rustfs: check-dependencies ## Run regression tests with RustFS
+	@echo "--- Running regression tests with RustFS ---"
+	@S3_TEST_BACKEND=rustfs $(DOCKER) compose --profile rustfs -f ./regtests/docker-compose.yml up --build --exit-code-from regtest
+	@echo "--- Regression tests with RustFS completed ---"
+
+regtest-cleanup: DEPENDENCIES := $(DOCKER)
+.PHONY: regtest-cleanup
+regtest-cleanup: check-dependencies ## Stop and remove regression test containers, networks, and volumes
+	@echo "--- Cleaning up all regression tests resources ---"
+	@$(DOCKER) compose --profile rustfs -f ./regtests/docker-compose.yml down --volumes --remove-orphans
+	@echo "--- All regression resources cleanup completed ---"
+
+##@ Pre-commit
+
+.PHONY: pre-commit
+pre-commit: spotless-apply helm-doc-generate config-doc-generate client-lint ## Run tasks for pre-commit
+
+##@ Dependencies
+
+.PHONY: check-dependencies
+check-dependencies: ## Check if all requested dependencies are present
+	@echo "--- Checking for requested dependencies ---"
+	@for dependency in $(DEPENDENCIES); do \
+		echo "Checking for $$dependency..."; \
+		if [ "$$dependency" = "java21" ]; then \
+			if java --version | head -n1 | cut -d' ' -f2 | grep -q '^21\.'; then \
+			echo "Java 21 is installed."; \
+			else \
+				echo "Java 21 is NOT installed."; \
+				echo "--- ERROR: Dependency 'Java 21' is missing. Please install it to proceed. Exiting. ---"; \
+				exit 1; \
+			fi ; \
+		elif command -v $$dependency >/dev/null 2>&1; then \
+			echo "$$dependency is installed."; \
+		else \
+			echo "$$dependency is NOT installed."; \
+			echo "--- ERROR: Dependency '$$dependency' is missing. Please install it to proceed. Exiting. ---"; \
+			exit 1; \
+		fi; \
+	done
+	@echo "--- All checks complete. ---"
+
+.PHONY: check-brew
+check-brew:
+	@echo "--- Checking Homebrew installation ---"
+	@if command -v brew >/dev/null 2>&1; then \
+		echo "--- Homebrew is installed ---"; \
+	else \
+		echo "--- Homebrew is not installed. Aborting ---"; \
+		exit 1; \
+	fi
+
+.PHONY: install-dependencies-brew
+install-dependencies-brew: check-brew ## Install dependencies if not present via Brew
+	@echo "--- Checking and installing dependencies for this target ---"
+	@for dependency in $(DEPENDENCIES); do \
+		case $$dependency in \
+			java21) \
+				if java -version 2>&1 | grep -q '21'; then \
+					:; \
+				else \
+					echo "Java 21 is not installed. Installing openjdk@21 and jenv..."; \
+					brew install openjdk@21 jenv; \
+					$(shell brew --prefix jenv)/bin/jenv add $(shell brew --prefix openjdk@21); \
+					jenv local 21; \
+					echo "Java 21 installed."; \
+				fi ;; \
+			docker|podman) \
+				if command -v $$dependency >/dev/null 2>&1; then \
+					:; \
+				else \
+					echo "$$dependency is not installed. Manual installation required"; \
+				fi ;; \
+			ct) \
+				if command -v ct >/dev/null 2>&1; then \
+					:; \
+				else \
+					echo "ct is not installed. Installing with Homebrew..."; \
+					brew install chart-testing; \
+					echo "ct installed."; \
+				fi ;; \
+			*) \
+				if command -v $$dependency >/dev/null 2>&1; then \
+					:; \
+				else \
+					echo "$$dependency is not installed. Installing with Homebrew..."; \
+					brew install $$dependency; \
+					echo "$$dependency installed."; \
+				fi ;; \
+		esac; \
+	done
+	@echo "--- All requested dependencies checked/installed ---"
+
+install-optional-dependencies-brew: DEPENDENCIES := $(OPTIONAL_DEPENDENCIES)
+.PHONY: install-optional-dependencies-brew
+install-optional-dependencies-brew: install-dependencies-brew ## Install optional dependencies if not present via Brew

@@ -35,7 +35,7 @@ TARGET_RECORD_SCHEMA_VERSION: Literal[2] = 2
 ModulesBasis = Literal["log", "declared", "test_bearing"]
 
 BuildOutcome = Literal["ok", "failed", "unknown"]
-# Grade A: the cell's test identities come from parsed JUnit XML.
+# Grade A: parsed JUnit XML or a validated, complete Jenkins JUnit API pool.
 # Grade B: only the cell's aggregate conclusion is known.
 CellGrade = Literal["A", "B"]
 

@@ -21,6 +21,7 @@ import pytest
 from sag.metrics.target_record import target_record_sha256
 from scripts.d3_harvest_target import (
     HarvestError,
+    apply_job_logs,
     assemble_target_record,
     harvest_from_dir,
     main,
@@ -28,6 +29,37 @@ from scripts.d3_harvest_target import (
     pool_covers_check,
     pool_jdk_annotation,
 )
+
+
+@pytest.mark.parametrize("ambiguous_first", [True, False])
+def test_ambiguous_maven_log_cannot_be_hidden_by_another_log(tmp_path, ambiguous_first):
+    from sag.metrics.target_record import CellTarget
+
+    original = CellTarget(
+        cell_id="build",
+        build="ok",
+        executed_count=1,
+        red_count=0,
+        grade="A",
+        modules=("observed-test-module",),
+        modules_basis="test_bearing",
+    )
+    cells = [original]
+    good = "[INFO] Reactor Summary:\n[INFO] core ... SUCCESS\n[INFO] BUILD SUCCESS"
+    ambiguous = good.replace(
+        "[INFO] BUILD SUCCESS", "[INFO] core ... FAILURE\n[INFO] BUILD FAILURE"
+    )
+    logs = [ambiguous, good] if ambiguous_first else [good, ambiguous]
+    for number, text in enumerate(logs):
+        with zipfile.ZipFile(tmp_path / f"run-{number}-logs.zip", "w") as archive:
+            archive.writestr("0_build.txt", text)
+
+    notes = apply_job_logs(tmp_path, cells, [])
+
+    assert cells == [original]
+    assert any("identity ambiguous" in note for note in notes)
+    assert any("multiple job logs" in note for note in notes)
+
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "target_attainment"
@@ -660,6 +692,104 @@ def test_a_job_log_outranks_the_pool_lower_bound(tmp_path):
     assert cell.modules == ("clients", "core", "generator")
     assert cell.modules_basis == "log"
     assert _has_note(record, "job log")
+
+
+def test_nested_gradle_output_cannot_claim_maven_repository_root(tmp_path):
+    snapshot = build_snapshot(tmp_path / "snap", jobs=(("JDK 21, DB derby", "success"),))
+    with zipfile.ZipFile(snapshot / "run-1-logs.zip", "w") as archive:
+        archive.writestr(
+            "0_JDK 21, DB derby.txt",
+            "##[group]Run mvn verify -q -DcayenneTestConnection=derby\n"
+            "mvn verify -q -DcayenneTestConnection=derby\n##[endgroup]\n"
+            "> Task :compileJava\n> Task :classes\n> Task :jar\nBUILD SUCCESSFUL\n",
+        )
+    record = _record(snapshot)
+    cell = _cell(record, "JDK 21, DB derby")
+    assert cell.modules == ()
+    assert cell.modules_basis is None
+    assert _has_note(record, "no proven project root")
+
+
+def test_ci_command_preserves_separate_build_steps(tmp_path):
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: Build JDK 17\n    steps:\n"
+        "      - run: mvn install -DskipTests\n"
+        "      - run: mvn verify -Pcoverage\n"
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap", jobs=(("Build JDK 17", "success"),), workflow=workflow
+    )
+    cell = _cell(_record(snapshot), "Build JDK 17")
+    assert cell.command == "mvn install -DskipTests\nmvn verify -Pcoverage"
+    assert cell.modules == ()
+    assert cell.executed_count == 0
+
+
+def test_literal_matrix_cell_resolves_command_and_cwd_without_cross_cell_merge(tmp_path):
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(
+        "jobs:\n  build:\n    name: Build ${{ matrix.java }} in ${{ matrix.directory }}\n"
+        "    strategy:\n      matrix:\n        java: [17, 21]\n        directory: [core, tools]\n"
+        "    steps:\n      - run: mvn verify -Pjdk${{ matrix.java }}\n"
+        "        working-directory: ${{ matrix.directory }}\n"
+    )
+    snapshot = build_snapshot(
+        tmp_path / "snap",
+        jobs=(("Build 17 in core", "success"), ("Build 21 in tools", "success")),
+        workflow=workflow,
+    )
+    record = _record(snapshot)
+    first = _cell(record, "Build 17 in core")
+    other = _cell(record, "Build 21 in tools")
+    assert "cd core" in first.command and "-Pjdk17" in first.command
+    assert "cd tools" in other.command and "-Pjdk21" in other.command
+    assert first.executed_count == other.executed_count == 0
+
+
+def test_controlled_target_scores_then_loses_scope_and_detects_new_red(tmp_path):
+    from sag.metrics.attainment import CertificateView, evaluate_attainment
+
+    snapshot = build_snapshot(
+        tmp_path / "controlled",
+        pools={
+            "junit-xml-17-control": {
+                "core/17-control/TEST-a.xml": _suite("a.A", (("one", False), ("two", False)))
+            }
+        },
+    )
+    record = _record(snapshot)
+    cell = record.cells[0]
+    record = type(record)(**(record.model_dump() | {"matched_cell": cell.cell_id}))
+    assert cell.grade == "A" and cell.modules == ("core",)
+    view = CertificateView(
+        authority_ok=True,
+        counts_receipt_bound=True,
+        build_ok=True,
+        repo=REPO,
+        target_sha=SHA,
+        modules=cell.modules,
+        executed_count=cell.executed_count,
+        executed_ids=cell.executed_ids,
+        red_count=0,
+    )
+    result = evaluate_attainment(view, record)
+    assert result.verdict == "met" and result.alpha is not None
+
+    payload = cell.model_dump(mode="json")
+    payload.update(modules=(), modules_basis=None)
+    without_scope = type(cell)(**payload)
+    ablated = evaluate_attainment(
+        view, type(record)(**(record.model_dump() | {"cells": (without_scope,)}))
+    )
+    assert ablated.alpha is None and ablated.verdict not in {"met", "exceeded"}
+
+    red_view = CertificateView(
+        **(view.model_dump() | {"red_count": 1, "red_ids": (cell.executed_ids[0],)})
+    )
+    negative = evaluate_attainment(red_view, record)
+    assert negative.verdict == "not_met"
+    assert negative.unexpected_red_ids == (cell.executed_ids[0],)
 
 
 def test_declared_sources_fill_modules_when_no_log_exists(tmp_path, monkeypatch):

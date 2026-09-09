@@ -11,17 +11,18 @@ from sag.agent.control_events import (
     CONTROL_EVENT_KINDS,
     CONTROL_EVENT_SCHEMA_VERSION,
     ControlEvent,
-    job_stall_transition,
     ControlEventSink,
     EvidencePublicationPayload,
     RunPin,
     canonical_sha256,
     forced_action_sha256,
+    job_stall_transition,
     sanitize_config,
 )
 from sag.agent.react_engine import ReActEngine
 from sag.agent.replay import (
     ControlReplayRunner,
+    ReplayMismatchError,
     ReplayValidationError,
     _validate_analysis_recovery_audit,
 )
@@ -53,7 +54,7 @@ def test_live_run_id_is_a_unique_command_epoch_under_the_log_session(monkeypatch
     ["tvm.jsonl", "bigtop.jsonl", "paramiko.jsonl", "cassandra-java-driver.jsonl"],
 )
 def test_fixture_replays_to_declared_snapshot_without_external_calls(fixture_name):
-    """Frozen v3 bytes verify while replay returns today's v4 projection.
+    """Frozen v3 bytes verify while replay returns today's v5 projection.
 
     Premise updated 2026-08-10: archived expectations remain immutable; the
     comparison-only v3 view is checked inside the runner.
@@ -68,8 +69,10 @@ def test_fixture_replays_to_declared_snapshot_without_external_calls(fixture_nam
     assert result.header.fixture_kind == "recorded_tool_transcript"
     assert result.header.source_manifest
     assert result.expected_snapshot["schema_version"] == 3
-    assert result.snapshot.schema_version == 4
+    assert result.snapshot.schema_version == 5
     assert result.snapshot.rates
+    assert result.snapshot.ci_comparison.status == "no_target"
+    assert result.snapshot.ci_comparison.certificate is None
     assert result.unconsumed_events == ()
     assert result.produced_event_digest == result.expected_event_digest
 
@@ -245,9 +248,7 @@ def test_a_record_about_a_run_never_makes_that_run_unreplayable(tmp_path, record
 
     assert result.snapshot is not None
     assert result.unconsumed_events == ()
-    assert kind in {
-        json.loads(line).get("kind") for line in transcript.read_text().splitlines()
-    }
+    assert kind in {json.loads(line).get("kind") for line in transcript.read_text().splitlines()}
     # Carried by a branch of its own, not filed away as machinery this walk
     # stopped modelling: these kinds are current, and the notice is for the old.
     assert kind not in result.skipped_event_kinds
@@ -357,7 +358,7 @@ def test_evidence_publication_is_strict_but_inert_inside_pending_action_pair(tmp
 
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
-    assert result.snapshot.schema_version == 4
+    assert result.snapshot.schema_version == 5
     assert result.snapshot.verdict == "partial"
     assert result.executed_envelope_count == result.paired_envelope_count == 6
 
@@ -432,7 +433,7 @@ def test_mutable_publication_revision_chain_is_inert_and_strict(tmp_path):
         _paramiko_rows_with_publications([first, second]),
     )
     result = ControlReplayRunner.offline(verify_expected=False).run(valid)
-    assert result.snapshot.schema_version == 4
+    assert result.snapshot.schema_version == 5
     assert result.snapshot.verdict == "partial"
 
     forged = tmp_path / "publication-revision-forged.jsonl"
@@ -1906,6 +1907,31 @@ def test_the_pin_mirror_writes_the_exact_published_bytes():
     mirror(payload)
 
     stored = orch._fs.files["/workspace/.setup_agent/run-pin.json"]
-    assert hashlib.sha256(stored.encode("utf-8")).hexdigest() == hashlib.sha256(
-        payload.encode("utf-8")
-    ).hexdigest(), "mirror bytes must hash exactly like the published payload"
+    assert (
+        hashlib.sha256(stored.encode("utf-8")).hexdigest()
+        == hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    ), "mirror bytes must hash exactly like the published payload"
+
+
+def test_v4_expectation_projects_only_additive_ci_field_and_still_detects_drift(tmp_path):
+    frozen = FIXTURES / "paramiko.jsonl"
+    original_bytes = frozen.read_bytes()
+    rows = [json.loads(line) for line in original_bytes.decode().splitlines()]
+    current = ControlReplayRunner.offline(verify_expected=False).run(frozen)
+    historical = current.snapshot.model_dump(mode="json")
+    historical["schema_version"] = 4
+    historical.pop("ci_comparison")
+    rows[0]["expected_snapshot"] = historical
+    transcript = tmp_path / "v4-expectation.jsonl"
+    _write_replay_rows(transcript, rows)
+    result = ControlReplayRunner.offline().run(transcript)
+    assert result.snapshot.schema_version == 5
+    assert result.expected_snapshot == historical
+    assert result.snapshot.rates == historical["rates"]
+    assert result.snapshot.verdict == historical["verdict"]
+    assert result.snapshot.ci_comparison.certificate is None
+    rows[0]["expected_snapshot"]["verdict"] = "success"
+    _write_replay_rows(transcript, rows)
+    with pytest.raises(ReplayMismatchError, match="snapshot"):
+        ControlReplayRunner.offline().run(transcript)
+    assert frozen.read_bytes() == original_bytes

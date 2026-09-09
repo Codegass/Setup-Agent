@@ -7,13 +7,12 @@ primary coordinate's runner invocation actually write?".  Fifty of those
 reports came from ``bigtop-data-generators``; the other four came from the
 test-framework build and silently joined the primary numerator.
 
-These tests drive the partition from hand-written schema-v1 invocation
-receipts (the cross-lane contract in
-``docs/superpowers/plans/2026-07-26-sagv2-plan5-p0-ground-truth.md``):
+These tests drive the partition from published current-run invocation
+receipts bound to a published checkout pin:
 
-* PRIMARY  — scanned reports claimed by ``report_delta`` of a receipt whose
-  ``working_directory`` is at/under the primary test coordinate root AND whose
-  recorded ``sha256`` still matches the file's current content.
+* PRIMARY  — scanned reports claimed by ``report_delta`` of a receipt bound
+  to the primary root and backend AND whose recorded ``sha256`` still matches
+  the file's current content.
 * STALE    — claimed but superseded (no receipt hash matches the current
   content): excluded from primary and flagged, never re-attributed.
 * AUXILIARY— every other scanned report: visible as ``auxiliary_test_stats``,
@@ -30,27 +29,28 @@ import io
 import json
 import os
 import shlex
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from container_evidence_fakes import add_published_mutable_json, complete_run_pin
 from test_container_io import FakeContainer
 
-from sag.agent.attempt_policy import TestAttemptRequirement as AttemptRequirement
-from sag.agent.attempt_policy import TestCandidateResolution as CandidateResolution
+from sag.agent.attempt_policy import TestReportScope as ReportScope
 from sag.agent.evidence_assessments import ReceiptAssessment, validate_assessment_v2
-from sag.agent.evidence_publications import publish_evidence_bytes
+from sag.agent.evidence_publications import RUN_PIN_LOGICAL_ARTIFACT_ID, publish_evidence_bytes
 from sag.agent.evidence_records import (
     frame_json_record_stream,
     frame_named_json_record_stream,
 )
-from sag.agent.invocation_receipts import build_receipt, validate_receipt_v2
+from sag.agent.invocation_receipts import active_receipt_run_id, build_receipt, validate_receipt_v2
 from sag.agent.phase_gates import check_phase_claim, check_phase_done
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 from sag.agent.physical_validator import PhysicalValidator
 
 
 # ---------------------------------------------------------------------------
-# Fixtures: real files on disk, hand-written schema-v1 receipts
+# Fixtures: real files on disk, published current-run receipts
 # ---------------------------------------------------------------------------
 def _surefire_xml(classname: str, names) -> str:
     cases = "".join(
@@ -74,7 +74,7 @@ def _sha256(path: Path) -> str:
 
 
 def _receipt(receipt_id: str, working_directory: Path, new=(), changed=(), cached=()) -> dict:
-    """One strict current v2 invocation receipt."""
+    """One strict current invocation receipt."""
     report_delta = {}
     if new:
         report_delta["new"] = [{"path": str(p), "sha256": _sha256(Path(p))} for p in new]
@@ -89,6 +89,7 @@ def _receipt(receipt_id: str, working_directory: Path, new=(), changed=(), cache
         effective_action="test",
         argv="mvn -B test",
         working_directory=str(working_directory),
+        target_sha="a" * 40,
         exit_code=0,
         before={},
         after={},
@@ -149,6 +150,16 @@ class ReceiptOrchestrator:
         self.workspace = workspace
         self.commands: list[str] = []
         self.atomic = FakeContainer()
+        self.pin_path = workspace.workspace / ".setup_agent/run-pin.json"
+        self.pin_raw = add_published_mutable_json(
+            self,
+            self.atomic,
+            path=str(self.pin_path),
+            record_kind="run_pin",
+            record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            payload=complete_run_pin(active_receipt_run_id(), "a" * 40),
+        )
         if workspace.receipts_dir.is_dir():
             for path in sorted(workspace.receipts_dir.glob("*.json")):
                 try:
@@ -187,6 +198,12 @@ class ReceiptOrchestrator:
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
         text = command.strip()
+        if str(self.pin_path) in text and "SAG_NAMED_JSON_RECORD_V1" in text:
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream([("run-pin.json", self.pin_raw.encode())]),
+            }
         if text.startswith(
             (
                 "mkdir -p -- ",
@@ -281,24 +298,29 @@ def _validator(workspace: ReceiptWorkspace) -> tuple[PhysicalValidator, ReceiptO
 
 
 def _bind_primary_coordinate(monkeypatch, workspace: ReceiptWorkspace, root=None) -> None:
-    """Bind attempt_policy's primary test coordinate (Plan 4) without probing."""
+    """Bind report ownership while exercising the real scoped receipt/parser chain."""
     import sag.agent.attempt_policy as attempt_policy
 
     resolved = str(root if root is not None else workspace.primary_root)
-    requirement = AttemptRequirement(
-        root=resolved,
-        system="maven",
-        required_action={"tool": "build", "params": {"working_directory": resolved}},
-    )
-    resolution = CandidateResolution(
+    resolution = ReportScope(
         status="available",
-        candidates=(requirement,),
+        roots=(resolved,),
         project_root=str(workspace.project),
         workspace_root=str(workspace.workspace),
-        primary=requirement,
+        primary_root=resolved,
     )
     monkeypatch.setattr(
-        attempt_policy, "resolve_survey_test_candidates", lambda orchestrator: resolution
+        attempt_policy,
+        "resolve_test_report_scope",
+        lambda orchestrator, **kwargs: replace(
+            resolution,
+            receipt_ids=tuple(
+                r["receipt_id"]
+                for r in kwargs["receipts"]
+                if r["working_directory"] == resolved
+                or r["working_directory"].startswith(resolved + "/")
+            ),
+        ),
     )
 
 
@@ -307,14 +329,76 @@ def _unbound_primary_coordinate(monkeypatch) -> None:
 
     monkeypatch.setattr(
         attempt_policy,
-        "resolve_survey_test_candidates",
-        lambda orchestrator: CandidateResolution(status="manifest_unreadable"),
+        "resolve_test_report_scope",
+        lambda orchestrator, **kwargs: ReportScope(status="manifest_unreadable"),
     )
 
 
 # ---------------------------------------------------------------------------
 # Bigtop's acceptance row: primary exactly 50, auxiliary exactly 4
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("wrong", ["sha", "backend", "actual_cwd", "domain"])
+def test_primary_owner_cannot_lend_authority_to_another_report(bigtop, monkeypatch, wrong):
+    from sag.agent import attempt_policy
+
+    primary = str(bigtop.primary_root)
+    coordinate = attempt_policy._candidate_requirement(primary, "maven")
+    monkeypatch.setattr(
+        attempt_policy,
+        "_read_survey_test_coordinates",
+        lambda _orch: attempt_policy.TestCandidateResolution(
+            "available", (coordinate,), str(bigtop.project), str(bigtop.workspace), coordinate
+        ),
+    )
+    monkeypatch.setattr(
+        attempt_policy, "_resolved_realpath", lambda _orch, path: str(Path(path).resolve())
+    )
+    monkeypatch.setattr(
+        attempt_policy,
+        "verify_forced_candidate_build_graph",
+        lambda *args, **kwargs: pytest.fail(
+            "Observed report ownership must not ask to authorize a new build"
+        ),
+    )
+    good_reports = sorted((bigtop.primary_root / "target/surefire-reports").glob("*.xml"))
+    bigtop.write_receipt(_receipt("inv-test-1-0001", bigtop.primary_root, new=good_reports))
+    wrong_report = bigtop.primary_report("TEST-wrong.xml", "wrong.Tests", ["one", "two", "three"])
+    bad = _receipt("inv-test-1-0002", bigtop.primary_root, new=[wrong_report])
+    if wrong == "sha":
+        bad["target_sha"] = "b" * 40
+    elif wrong == "backend":
+        bad["tool"] = "gradle"
+        bad["argv"] = "gradle test"
+    elif wrong == "actual_cwd":
+        bad["actual_cwd"] = str(bigtop.project / "other")
+    else:
+        bad["domain_id"] = str(bigtop.project / "other")
+    bigtop.write_receipt(bad)
+    validator, _ = _validator(bigtop)
+
+    result = validator.parse_test_reports(str(bigtop.project))
+
+    assert result["total_tests"] == 50
+    assert result["auxiliary_test_stats"]["executed"] == 7
+    assert str(wrong_report) not in result["report_files"]
+    assert "test_primary_coordinate_unresolved" not in result["metrics_conflicts"]
+
+
+def test_old_checkout_receipts_cannot_restore_an_unscoped_scan(bigtop, monkeypatch):
+    _bind_primary_coordinate(monkeypatch, bigtop)
+    files = sorted((bigtop.primary_root / "target/surefire-reports").glob("*.xml"))
+    old = _receipt("inv-test-1-0001", bigtop.primary_root, new=files)
+    old["target_sha"] = "b" * 40
+    bigtop.write_receipt(old)
+    validator, orch = _validator(bigtop)
+
+    result = validator.parse_test_reports(str(bigtop.project))
+
+    assert result["total_tests"] == 0
+    assert result["auxiliary_test_stats"]["executed"] == 54
+    assert not any("find " in command and "*.xml" in command for command in orch.commands)
+
+
 def test_primary_and_auxiliary_reports_coexist_at_fifty_and_four(bigtop, monkeypatch):
     """Auxiliary reports stay visible but never enter the primary numerator."""
     _bind_primary_coordinate(monkeypatch, bigtop)

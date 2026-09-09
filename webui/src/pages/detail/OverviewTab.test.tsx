@@ -113,6 +113,27 @@ function unavailableSubjectLayers() {
 }
 
 describe("OverviewTab", () => {
+  it.each([
+    ["evaluated", "Official CI: met; scope score 1/1; cell maven-17"],
+    ["evaluated", "Official CI: partial; scope score unavailable; cell maven-17"],
+    ["unavailable", "Official CI: unavailable (authorization missing)"],
+  ] as const)("shows sealed CI comparison %s independently of local execution", (status, line) => {
+    render(<OverviewTab detail={makeDetail({
+      canonicalVerdict: "success",
+      ciComparison: { status },
+      ciComparisonLines: [line, "CI lifecycle parity: unavailable"],
+    })} onOpenFlow={() => {}} />)
+    const comparison = screen.getByRole("region", { name: "Official CI comparison" })
+    expect(within(comparison).getByText(line)).toBeInTheDocument()
+    expect(within(comparison).getByText("CI lifecycle parity: unavailable")).toBeInTheDocument()
+    expect(comparison).not.toHaveClass("text-status-success")
+  })
+
+  it("does not invent a CI result for a historical session", () => {
+    render(<OverviewTab detail={makeDetail()} onOpenFlow={() => {}} />)
+    expect(screen.getByText("Official CI: unavailable (no sealed comparison)")).toBeInTheDocument()
+  })
+
   it("invokes onOpenFlow when the goal button is clicked", () => {
     const onOpenFlow = vi.fn()
     render(<OverviewTab detail={makeDetail()} onOpenFlow={onOpenFlow} />)

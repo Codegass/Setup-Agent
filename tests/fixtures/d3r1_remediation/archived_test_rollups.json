@@ -1,0 +1,171 @@
+{
+  "purpose": "Read-only archived count projection for downstream completion tests; not a new authorized run. Counts are copied from local.test_stats, never recalculated from sampled receipt rows.",
+  "cases": {
+    "spark-kubernetes-operator": {
+      "source": {
+        "path": "logs/d3r1-20260907/runs/spark-kubernetes-operator/audit/result.json",
+        "sha256": "521c6da3a938c273a354478aa402577104f033210e385ca8824e2d6af56c85b5"
+      },
+      "source_pointer": "local.test_stats",
+      "test_stats": {
+        "discovered": 226,
+        "denominator_basis": "complete",
+        "unique": {
+          "executed": 221,
+          "passed": 221,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "raw": {
+          "executed": 225,
+          "passed": 225,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "flaky_count": 0,
+        "collection_errors": 0,
+        "collection_errors_skipped": 0,
+        "receipt_scoped": true
+      },
+      "build": {
+        "judgment": "success",
+        "compiled_classes": 209
+      }
+    },
+    "kafka": {
+      "source": {
+        "path": "logs/d3r1-20260907/runs/kafka/audit/result.json",
+        "sha256": "206a19e2c145eb304674edf9bcfdbeb4aa446b9d741f7a6732f642e2b87aca4d"
+      },
+      "source_pointer": "local.test_stats",
+      "test_stats": {
+        "discovered": 23096,
+        "denominator_basis": "complete",
+        "unique": {
+          "executed": 7159,
+          "passed": 7124,
+          "failed": 4,
+          "errors": 0,
+          "skipped": 31
+        },
+        "raw": {
+          "executed": 15641,
+          "passed": 15606,
+          "failed": 4,
+          "errors": 0,
+          "skipped": 31
+        },
+        "flaky_count": 0,
+        "collection_errors": 0,
+        "collection_errors_skipped": 0,
+        "receipt_scoped": true
+      },
+      "build": {
+        "judgment": "success",
+        "compiled_classes": 13267
+      }
+    },
+    "zookeeper": {
+      "source": {
+        "path": "logs/d3r1-20260907/runs/zookeeper/audit/result.json",
+        "sha256": "83d83fa41ab5404d213310d5f58c5f26cee345fd35860f0384c3cc1708823a30"
+      },
+      "source_pointer": "local.test_stats",
+      "test_stats": {
+        "discovered": 1957,
+        "denominator_basis": "complete",
+        "unique": {
+          "executed": 3326,
+          "passed": 3316,
+          "failed": 5,
+          "errors": 1,
+          "skipped": 4
+        },
+        "raw": {
+          "executed": 3326,
+          "passed": 3316,
+          "failed": 5,
+          "errors": 1,
+          "skipped": 4
+        },
+        "flaky_count": 0,
+        "collection_errors": 0,
+        "collection_errors_skipped": 0,
+        "receipt_scoped": true
+      },
+      "build": {
+        "judgment": "success",
+        "compiled_classes": 1808
+      }
+    },
+    "storm": {
+      "source": {
+        "path": "logs/d3r1-20260907/runs/storm/audit/result.json",
+        "sha256": "b1a56a4fc0f836bf09669e7c6b414ceda0a00f309e655c2c06f1191a93099201"
+      },
+      "source_pointer": "local.test_stats",
+      "test_stats": {
+        "discovered": 947,
+        "denominator_basis": "complete",
+        "unique": {
+          "executed": 1,
+          "passed": 0,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 1
+        },
+        "raw": {
+          "executed": 1,
+          "passed": 0,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 1
+        },
+        "flaky_count": 0,
+        "collection_errors": 0,
+        "collection_errors_skipped": 0,
+        "receipt_scoped": true
+      },
+      "build": {
+        "judgment": "success",
+        "compiled_classes": 5
+      }
+    },
+    "seatunnel": {
+      "source": {
+        "path": "logs/d3r1-20260907/runs/seatunnel/audit/result.json",
+        "sha256": "98294afde22848713b252ebddae4a7e8c2d22ed6b39122a837dc8df7c1808e54"
+      },
+      "source_pointer": "local.test_stats",
+      "test_stats": {
+        "discovered": 7481,
+        "denominator_basis": "complete",
+        "denominator_bare_total": 7477,
+        "unique": {
+          "executed": 4,
+          "passed": 3,
+          "failed": 0,
+          "errors": 1,
+          "skipped": 0
+        },
+        "raw": {
+          "executed": 7,
+          "passed": 6,
+          "failed": 0,
+          "errors": 1,
+          "skipped": 0
+        },
+        "flaky_count": 0,
+        "collection_errors": 0,
+        "collection_errors_skipped": 0,
+        "receipt_scoped": true
+      },
+      "build": {
+        "judgment": "success",
+        "compiled_classes": 2956
+      }
+    }
+  }
+}

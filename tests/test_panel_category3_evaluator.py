@@ -768,7 +768,9 @@ def test_evaluate_probe_pyyaml_needs_floor_kwarg():
 # --------------------------------------------------------------------------
 # loader (structured artifacts on disk)
 # --------------------------------------------------------------------------
-def _write_session(tmp_path, *, verdict, build_evidence, unique, events, manifest):
+def _write_session(
+    tmp_path, *, verdict, build_evidence, unique, events, manifest, test_judgment="unknown"
+):
     setup = tmp_path / ".setup_agent"
     setup.mkdir(parents=True)
     run_id = "category3-loader-run"
@@ -792,7 +794,7 @@ def _write_session(tmp_path, *, verdict, build_evidence, unique, events, manifes
         finalized_at="2026-08-09T06:00:00Z",
         verdict=verdict,
         build_evidence=build_evidence,
-        test_stats={"unique": unique_counts, "raw": unique_counts},
+        test_stats={"unique": unique_counts, "raw": unique_counts, "judgment": test_judgment},
         rates=complete_verdict_rates(verdict),
     )
     verdict_raw = snapshot.model_dump_json().encode("utf-8")
@@ -977,6 +979,9 @@ def test_loader_rejects_a_published_stampless_manifest(tmp_path):
         unique={"executed": 100, "failed": 0},
         events=[],
         manifest={"python_packages": ["yaml"]},  # no survey stamp
+        # The manifest is the invalid artifact under test; the sealed execution
+        # result is independently complete and internally consistent.
+        test_judgment="success",
     )
     with pytest.raises(EvaluationError, match="valid v1 manifest"):
         load_run_artifacts(session)
@@ -1007,6 +1012,8 @@ def test_loader_absent_manifest_is_not_present(tmp_path):
         unique={"executed": 1856, "failed": 0},
         events=[],
         manifest=None,
+        # A missing optional manifest does not undo completed test execution.
+        test_judgment="success",
     )
     art = load_run_artifacts(session)
     assert art.manifest_present is False

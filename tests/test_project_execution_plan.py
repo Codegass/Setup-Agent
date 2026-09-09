@@ -6,8 +6,8 @@ import json
 import pytest
 from test_container_io import FakeContainer
 
-from sag.agent.document_map import DocumentMapEntry, document_map_fingerprint, entry_id
 from sag.agent.control_events import canonical_sha256
+from sag.agent.document_map import DocumentMapEntry, document_map_fingerprint, entry_id
 from sag.agent.project_execution_plan import (
     MAX_INVENTORY_PROMPT_CHARS,
     MAX_SYSTEM_PROMPT_CHARS,
@@ -115,6 +115,10 @@ def candidate():
 
 def planned_candidate():
     value = candidate()
+    for step in value["build_steps"] + value["test_steps"]:
+        params = step["params"]
+        params["system"] = "maven"
+        params["source_command"] = f"./mvnw {params['action']} {params['args']}"
     value["test_disposition"] = {
         "status": "planned",
         "reason": "DEVNOTES defines IgniteBasicTestSuite as an unattended product test lane.",
@@ -128,7 +132,7 @@ def planned_candidate():
 
 
 def blocked_candidate():
-    value = candidate()
+    value = planned_candidate()
     value["test_steps"] = []
     value["test_disposition"] = {
         "status": "blocked",
@@ -754,3 +758,53 @@ def test_invalid_artifact_mapping_returns_a_typed_write_failure():
 
     assert not result.persisted
     assert result.code == "invalid_arguments"
+
+
+def test_new_analyze_plan_rejects_make_target_encoded_as_gradle_args():
+    plan = planned_candidate()
+    plan["test_disposition"]["execution_mechanism"] = "make client-unit-test"
+    plan["test_steps"][0]["params"].update(
+        system="gradle", source_command="make client-unit-test", args="client-unit-test"
+    )
+    with pytest.raises(ProjectExecutionPlanValidationError, match="Make|make|executor"):
+        validate_authored_plan(plan, require_test_disposition=True)
+
+
+def test_new_analyze_plan_requires_explicit_runner_and_source_command():
+    plan = planned_candidate()
+    for step in plan["build_steps"] + plan["test_steps"]:
+        step["params"].pop("system", None)
+        step["params"].pop("source_command", None)
+    with pytest.raises(ProjectExecutionPlanValidationError, match="system|source_command"):
+        validate_authored_plan(plan, require_test_disposition=True)
+
+
+def test_new_plan_preserves_ordered_initialization_producer_and_verify_steps():
+    plan = planned_candidate()
+    plan["build_steps"].insert(
+        0,
+        {
+            "tool": "bash",
+            "params": {"command": "sh bootstrap-wrapper.sh", "working_directory": ROOT},
+            "purpose": "Initialize the documented wrapper before building.",
+            "evidence_refs": [DEVNOTES.entry_id],
+        },
+    )
+    plan["build_steps"][1]["params"].update(
+        source_command="./mvnw clean install -pl shaded-deps -am -DskipTests",
+        args="clean -pl shaded-deps -am -DskipTests",
+    )
+    plan["test_steps"][0]["params"].update(
+        action="verify", source_command="./mvnw verify -Dit.test=SmokeIT", args="-Dit.test=SmokeIT"
+    )
+    value = validate_authored_plan(plan, require_test_disposition=True)
+    assert [step.params.get("action", "initialize") for step in value.build_steps] == [
+        "initialize",
+        "install",
+    ]
+    assert value.test_steps[0].params["action"] == "verify"
+    assert (
+        value.build_steps[1].params["source_command"]
+        == plan["build_steps"][1]["params"]["source_command"]
+    )
+    assert value.test_success_criteria == tuple(plan["test_success_criteria"])

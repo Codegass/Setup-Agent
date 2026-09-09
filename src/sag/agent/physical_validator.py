@@ -33,7 +33,7 @@ import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
@@ -71,7 +71,7 @@ from sag.utils.container_io import write_container_text_atomic
 from sag.verdict_rates import STALE_CONFLICT, execution_sentence, no_execution_sentence
 
 if TYPE_CHECKING:
-    from sag.agent.attempt_policy import TestCandidateResolution
+    from sag.agent.attempt_policy import TestReportScope
 
 
 def _census_facts(census: TestCensus) -> Dict[str, Any]:
@@ -293,6 +293,12 @@ _DENOMINATOR_REFUSALS = {
     ),
     "build_receipt_not_terminal": (
         "a dispatch that did not end on its own stated the modules it had reached"
+    ),
+    "build_receipt_module_identity_ambiguous": (
+        "a receipt contains repeated or colliding Maven module display names"
+    ),
+    "build_receipt_module_scope_unavailable": (
+        "a Maven receipt discloses unavailable module scope"
     ),
     "build_receipt_scope_unavailable": (
         "the current run, target checkout, and project root pins could not be bound"
@@ -1761,20 +1767,30 @@ class PhysicalValidator:
                 [],
             )
         receipts_present = bool(receipt_records)
-        resolution = self._resolve_test_candidates() if receipts_present else None
-        primary_root = getattr(getattr(resolution, "primary", None), "root", None) or None
-        test_modules = {
-            str(candidate.root)
-            for candidate in getattr(resolution, "candidates", ())
-            if str(getattr(candidate, "root", "")).strip()
-        }
+        if receipts_present:
+            receipt_records = self._current_scoped_receipts(
+                project_dir, receipt_records=receipt_records
+            )
+            if receipt_records is None:
+                return self._receipt_evidence_failure(
+                    test_result, "current run/checkout receipt scope is unavailable", []
+                )
+        resolution = (
+            self._resolve_test_report_scope(project_dir, receipt_records)
+            if receipts_present
+            else None
+        )
+        primary_root = getattr(resolution, "primary_root", None)
+        test_modules = set(getattr(resolution, "roots", ()))
         coordinate_unresolved = receipts_present and not primary_root
+        owner_ids = resolution.receipt_ids if primary_root else None
 
         try:
             compact_result = self._parse_test_reports_compact_in_container(
                 project_dir,
                 primary_root=primary_root,
                 receipt_records=receipt_records,
+                owner_receipt_ids=owner_ids,
             )
             if compact_result and compact_result.get("receipt_error"):
                 return self._receipt_evidence_failure(
@@ -2210,10 +2226,14 @@ class PhysicalValidator:
     def _current_scoped_receipts(
         self,
         project_dir: str,
+        *,
+        receipt_records: Optional[List[Mapping[str, Any]]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Current-run receipts bound to this checkout and project root."""
 
-        records = self._read_live_invocation_receipts()
+        records = (
+            self._read_live_invocation_receipts() if receipt_records is None else receipt_records
+        )
         if records is None:
             return None
         if not records:
@@ -2256,6 +2276,8 @@ class PhysicalValidator:
         partial module summary cannot satisfy it.
         """
 
+        from sag.agent.receipt_structure import maven_module_identity_ambiguous
+
         receipts = self._current_scoped_receipts(project_dir)
         if not receipts:
             return None
@@ -2281,6 +2303,7 @@ class PhysicalValidator:
             or str(latest.get("compliance") or "").strip().lower() != "exact"
             or not isinstance(outcomes, list)
             or not outcomes
+            or maven_module_identity_ambiguous(latest)
             or any(
                 str((entry or {}).get("status") or "").strip().lower() != "success"
                 for entry in outcomes
@@ -2294,96 +2317,219 @@ class PhysicalValidator:
             "requested_action": str(latest.get("requested_action") or ""),
         }
 
+    @staticmethod
+    def _test_argv_scope(tool: str, argv: str) -> Optional[tuple[str, ...]]:
+        """Discard only a known launcher and the backend's outcome-reporting flag."""
+        launchers = {"maven": {"mvn", "mvnw", "mvn.cmd"}, "gradle": {"gradle", "gradlew"}}
+        reporting_flags = {
+            "maven": {"-Dmaven.test.failure.ignore=true"},
+            "gradle": {"-Dtest.ignoreFailures=true"},
+        }
+        try:
+            tokens = shlex.split(argv)
+        except ValueError:
+            return None
+        if tokens and posixpath.basename(tokens[0]) in launchers.get(tool, set()):
+            tokens = tokens[1:]
+        return tuple(token for token in tokens if token not in reporting_flags.get(tool, set()))
+
+    def _test_execution_contract(self, receipt: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+        """Only a published, receipt-bound call can identify a recoverable task."""
+        from sag.agent.evidence_assessments import (
+            _python_semantic_result,
+            contract_receipt_binding_problem,
+        )
+        from sag.agent.invocation_contracts import read_frozen_contract
+        from sag.runtime.container_io import resolve_control_execute
+
+        execute = resolve_control_execute(self.docker_orchestrator)
+        if not callable(execute):
+            return None
+        contract = read_frozen_contract(execute, receipt.get("contract_id"))
+        if not isinstance(contract, Mapping) or contract_receipt_binding_problem(contract, receipt):
+            return None
+        if contract.get("execution_binding") == "argv_v1":
+            expected = self._test_argv_scope(receipt["tool"], contract.get("expected_argv", ""))
+            actual = self._test_argv_scope(receipt["tool"], receipt.get("argv", ""))
+            if not expected or actual != expected:
+                return None
+        elif (
+            contract.get("execution_binding") == "python_facade_v1"
+            and contract.get("effective_action") == "test"
+            and _python_semantic_result(contract, receipt, None) != "met"
+        ):
+            return None
+        return contract
+
+    @staticmethod
+    def _test_receipt_observations(receipt: Mapping[str, Any]) -> tuple[int, int, int, int]:
+        """Reported, non-skipped, assertion-red and sampled row counts; never a census."""
+        from sag.agent.receipt_suite_totals import receipt_suite_totals
+
+        envelope = receipt.get("testcase_execution_rows")
+        rows = envelope.get("rows") if isinstance(envelope, Mapping) else None
+        rows = rows if isinstance(rows, list) else []
+        totals = receipt_suite_totals(receipt)
+        if totals is not None:
+            return totals.tests, totals.tests - totals.skipped, totals.failed, len(rows)
+        non_skipped = sum(row.get("outcome") != "skipped" for row in rows)
+        red = sum(row.get("outcome") == "failed" for row in rows)
+        return len(rows), non_skipped, red, len(rows)
+
     def _test_execution_receipt_summary(self, project_dir: str) -> Dict[str, Any]:
-        """Separate runner completion from the outcomes in emitted test rows."""
+        """Execution completion is independent of the outcome of project assertions."""
+        from sag.agent.evidence_assessments import (
+            ASSESSMENT_BUNDLE_COMPLETE,
+            BLOCKED_CLASS_CODES,
+            DEVIATED_RECEIPT,
+            EXECUTION_FAULT,
+            EXPECTATION_MET,
+            EXPECTATION_UNMET,
+            FINGERPRINT_KEYS,
+            PREREQUISITE_EXECUTABLE_MISSING,
+            PREREQUISITE_SERVICE_UNAVAILABLE,
+            STALE_FINGERPRINT,
+            test_outcome_diagnostics_complete,
+        )
 
         receipts = self._current_scoped_receipts(project_dir)
         if receipts is None:
             return {"state": "unknown", "reason": "test receipt scope unavailable"}
-        test_actions = {"test", "verify", "integration-test"}
-        candidates = []
-        for receipt in receipts:
+        test_actions = {"test", "verify", "integration-test", "run_tests"}
+        latest: Dict[tuple, tuple[Mapping[str, Any], bool]] = {}
+        for receipt in sorted(receipts, key=self._receipt_sequence):
             requested = str(receipt.get("requested_action") or "").strip().lower()
             effective = str(receipt.get("effective_action") or "").strip().lower()
-            if (
-                requested not in test_actions
-                and effective not in test_actions
-                and not isinstance(receipt.get("testcase_execution_rows"), Mapping)
-            ):
+            reported, _, _, _ = self._test_receipt_observations(receipt)
+            if requested not in test_actions and effective not in test_actions and not reported:
                 continue
-            candidates.append(receipt)
-        if not candidates:
+            receipt_id = str(receipt.get("receipt_id") or "")
+            contract = self._test_execution_contract(receipt)
+            # The exact public call permits a repaired runtime/launcher while
+            # keeping cwd, args, profiles and selections fixed. A repair link
+            # alone cannot discharge a differently scoped task. Unbound records
+            # each remain visible and can never supersede a bound failure.
+            key = ("unbound", receipt_id)
+            if contract is not None:
+                key = (
+                    contract["run_id"],
+                    contract.get("target_sha"),
+                    contract["intent_domain_id"],
+                    json.dumps(
+                        {
+                            "tool": contract["requested_call"]["tool"],
+                            "params": {
+                                key: value
+                                for key, value in contract["requested_call"]["params"].items()
+                                if key != "timeout"
+                            },
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    contract["effective_tool"],
+                    contract["effective_action"],
+                    contract["expected_cwd"],
+                )
+                if contract.get("execution_binding") == "argv_v1":
+                    key += (self._test_argv_scope(receipt["tool"], receipt.get("argv", "")),)
+            latest[key] = (receipt, contract is not None)
+        if not latest:
             return {"state": "unknown", "reason": "no current test receipt"}
 
-        latest_by_action: Dict[tuple[str, str, str], Mapping[str, Any]] = {}
-        for receipt in sorted(candidates, key=self._receipt_sequence):
-            key = (
-                str(receipt.get("tool") or "").strip().lower(),
-                str(receipt.get("requested_action") or receipt.get("effective_action") or "")
-                .strip()
-                .lower(),
-                posixpath.normpath(
-                    str(
-                        receipt.get("actual_cwd") or receipt.get("working_directory") or project_dir
-                    )
-                ),
-            )
-            latest_by_action[key] = receipt
-
-        interrupted: List[str] = []
+        assessments = self._read_live_evidence_assessments()
+        by_receipt: Dict[str, List[Mapping[str, Any]]] = {}
+        for assessment in assessments or ():
+            by_receipt.setdefault(str(assessment.get("receipt_id") or ""), []).append(assessment)
+        failures: List[str] = []
+        unknown: List[str] = []
         completed: List[str] = []
-        observed_rows = 0
-        for receipt in latest_by_action.values():
-            receipt_id = str(receipt.get("receipt_id") or "").strip()
-            envelope = receipt.get("testcase_execution_rows")
-            rows = envelope.get("rows") if isinstance(envelope, Mapping) else None
-            if isinstance(rows, list):
-                observed_rows += len(rows)
+        observed_rows = reported_executions = non_skipped = 0
+        fault_codes = {
+            *BLOCKED_CLASS_CODES,
+            EXECUTION_FAULT,
+            "java_version_mismatch",
+            "maven_extension_incompatible",
+        }
+        for receipt, bound in latest.values():
+            receipt_id = str(receipt.get("receipt_id") or "")
+            count, attempted, red, sampled = self._test_receipt_observations(receipt)
+            observed_rows += sampled
+            reported_executions += count
+            non_skipped += attempted
+            records = by_receipt.get(receipt_id, [])
+            codes = {record.get("typed_code") for record in records}
             exit_code = receipt.get("exit_code")
-            lifecycle = str(receipt.get("lifecycle_state") or "").strip().lower()
-            was_interrupted = bool(
+            interrupted = bool(
                 str(receipt.get("termination_reason") or "").strip()
-                or lifecycle == "vanished"
-                or (
-                    isinstance(exit_code, int)
-                    and not isinstance(exit_code, bool)
-                    and exit_code >= 128
-                )
+                or receipt.get("lifecycle_state") == "vanished"
+                or (type(exit_code) is int and exit_code >= 128)
             )
-            if was_interrupted:
-                interrupted.append(receipt_id)
-            elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            outcomes = receipt.get("testcase_outcomes") or {}
+            has_test_error = any(
+                node.get("status") in {"failed", "error"} for node in outcomes.get("nodes", ())
+            )
+            prerequisite_failure = codes.intersection(
+                {PREREQUISITE_EXECUTABLE_MISSING, PREREQUISITE_SERVICE_UNAVAILABLE}
+            ) and (exit_code != 0 or red or has_test_error)
+            if interrupted or codes.intersection(fault_codes) or prerequisite_failure:
+                failures.append(receipt_id)
+                continue
+            bundle_complete = any(
+                record.get("typed_code") == ASSESSMENT_BUNDLE_COMPLETE
+                and receipt.get("output_content_hash")
+                and record.get("scope") == receipt["output_content_hash"]
+                and record.get("fingerprints")
+                == {
+                    key: str(receipt[key]).strip()
+                    for key in FINGERPRINT_KEYS
+                    if receipt.get(key) is not None and str(receipt[key]).strip()
+                }
+                for record in records
+            )
+            if (
+                not bound
+                or assessments is None
+                or not bundle_complete
+                or codes.intersection({STALE_FINGERPRINT, DEVIATED_RECEIPT})
+                or not _dispatch_terminated(receipt)
+                or not test_outcome_diagnostics_complete(receipt)
+            ):
+                unknown.append(receipt_id)
+            elif count and (
+                (exit_code == 0 and EXPECTATION_MET in codes)
+                or (red and EXPECTATION_UNMET in codes and "test_failure_exit" in codes)
+            ):
                 completed.append(receipt_id)
+            else:
+                unknown.append(receipt_id)
 
-        if interrupted:
-            state = "partial" if observed_rows else "failed"
+        result = {
+            "receipt_ids": [str(receipt.get("receipt_id") or "") for receipt, _ in latest.values()],
+            "interrupted_receipt_ids": failures,
+            "unresolved_receipt_ids": unknown,
+            "observed_rows": observed_rows,
+            "reported_executions": reported_executions,
+        }
+        if failures:
             return {
-                "state": state,
+                **result,
+                "state": "partial" if non_skipped else "failed",
                 "reason": (
-                    f"test execution was interrupted after {observed_rows:,} sealed row(s)"
-                    if observed_rows
-                    else "test execution was interrupted before any sealed test row"
+                    "test execution did not complete: runner or prerequisite failure; "
+                    f"{reported_executions:,} reported result(s) retained"
                 ),
-                "receipt_ids": [
-                    str(receipt.get("receipt_id") or "") for receipt in latest_by_action.values()
-                ],
-                "interrupted_receipt_ids": interrupted,
-                "observed_rows": observed_rows,
             }
-        if completed and len(completed) == len(latest_by_action):
+        if unknown:
             return {
-                "state": "completed",
-                "reason": "test runner receipts reached terminal process outcomes",
-                "receipt_ids": completed,
-                "observed_rows": observed_rows,
+                **result,
+                "state": "unknown",
+                "reason": "test execution completion lacks bound task, assessment or outcome evidence",
             }
         return {
-            "state": "unknown",
-            "reason": "test receipt completion is unavailable",
-            "receipt_ids": [
-                str(receipt.get("receipt_id") or "") for receipt in latest_by_action.values()
-            ],
-            "observed_rows": observed_rows,
+            **result,
+            "state": "completed",
+            "reason": "bound test tasks completed with assessed runtime outcomes",
         }
 
     def _read_live_evidence_assessments(self) -> Optional[List[Dict[str, Any]]]:
@@ -2414,16 +2560,25 @@ class PhysicalValidator:
     def _verified_report_claims(
         receipt_records: List[Mapping[str, Any]],
         primary_root: Optional[str],
+        *,
+        owner_receipt_ids: Optional[Sequence[str]] = None,
     ) -> Dict[str, List[str]]:
         """Project a verified receipt snapshot to report path/hash claims."""
 
         claims: Dict[str, set[str]] = {}
         primary_prefix = str(primary_root or "").rstrip("/")
+        owners = set(owner_receipt_ids) if owner_receipt_ids is not None else None
         for payload in receipt_records:
+            if owners is not None and payload.get("receipt_id") not in owners:
+                continue
             working_directory = str(payload.get("working_directory") or "").rstrip("/") or "/"
-            if primary_prefix and (
-                working_directory != primary_prefix
-                and not working_directory.startswith(primary_prefix + "/")
+            if (
+                owners is None
+                and primary_prefix
+                and (
+                    working_directory != primary_prefix
+                    and not working_directory.startswith(primary_prefix + "/")
+                )
             ):
                 continue
             delta = payload.get("report_delta") or {}
@@ -2485,6 +2640,7 @@ class PhysicalValidator:
             resolve_current_build_receipt_scope,
         )
         from sag.agent.invocation_receipts import active_receipt_run_id
+        from sag.agent.receipt_structure import maven_module_identity_ambiguous
 
         current_run_id = self.receipt_run_id or active_receipt_run_id()
         project_scope = project_dir or self.project_path
@@ -2499,6 +2655,8 @@ class PhysicalValidator:
             return _AttemptedModules((), False, "build_receipt_scope_unavailable")
         modules: List[str] = []
         unproven = False
+        ambiguous = False
+        scope_omitted = False
         for payload in receipt_records:
             receipt_id = str(payload.get("receipt_id") or "").strip()
             if not current_run_production_build_receipt(
@@ -2511,6 +2669,14 @@ class PhysicalValidator:
                 # A durable receipt from another run, checkout, or domain is
                 # historical evidence.  It cannot narrow THIS run's coverage.
                 continue
+            if maven_module_identity_ambiguous(payload):
+                ambiguous = True
+            if str(payload.get("tool") or "").lower() == "maven" and any(
+                omission.get("field") == "module_outcomes"
+                for omission in payload.get("evidence_omissions") or ()
+                if isinstance(omission, Mapping)
+            ):
+                scope_omitted = True
             stated = False
             for entry in payload.get("module_outcomes") or ():
                 name = str((entry or {}).get("module") or "").strip()
@@ -2525,7 +2691,15 @@ class PhysicalValidator:
             # denominator's.
             if stated and not _dispatch_terminated(payload):
                 unproven = True
-        cap = "build_receipt_not_terminal" if unproven else None
+        cap = (
+            "build_receipt_module_identity_ambiguous"
+            if ambiguous
+            else (
+                "build_receipt_module_scope_unavailable"
+                if scope_omitted
+                else "build_receipt_not_terminal" if unproven else None
+            )
+        )
         return _AttemptedModules(tuple(modules), cap is None, cap)
 
     def _receipt_structure(self) -> Dict[str, Any]:
@@ -2662,8 +2836,10 @@ class PhysicalValidator:
         directory is presence, and a probe that failed is not."""
         return self._invocation_receipts_state() == _RECEIPTS_PRESENT
 
-    def _resolve_test_candidates(self) -> Optional["TestCandidateResolution"]:
-        """Read this call's survey coordinate and its candidate roots together.
+    def _resolve_test_report_scope(
+        self, project_dir: str, receipts: List[Mapping[str, Any]]
+    ) -> Optional["TestReportScope"]:
+        """Read this call's observed roots without authorizing a forced build.
 
         The returned resolution is local to the test-evidence read. Missing
         coordinates do not authorize an unscoped corpus: the compact parser
@@ -2673,7 +2849,9 @@ class PhysicalValidator:
         try:
             from sag.agent import attempt_policy
 
-            return attempt_policy.resolve_survey_test_candidates(self.docker_orchestrator)
+            return attempt_policy.resolve_test_report_scope(
+                self.docker_orchestrator, receipts=receipts, project_root=project_dir
+            )
         except Exception as exc:
             logger.debug(f"Primary test coordinate unresolved: {exc}")
             return None
@@ -2706,6 +2884,7 @@ class PhysicalValidator:
         project_dir: str,
         primary_root: Optional[str] = None,
         receipt_records: Optional[List[Mapping[str, Any]]] = None,
+        owner_receipt_ids: Optional[Sequence[str]] = None,
     ) -> Optional[Dict[str, any]]:
         """Parse Maven/Gradle test XML inside the container and return compact JSON.
 
@@ -2714,10 +2893,11 @@ class PhysicalValidator:
         validator does ``find`` followed by ``cat``. This parser keeps all XML
         reading local to the container and only returns aggregate metrics.
 
-        ``primary_root`` is attempt_policy's primary test coordinate; with it
-        the claim set is narrowed to that coordinate's receipts. ``None`` (no
-        resolvable coordinate) narrows nothing — every claim of every current
-        receipt counts — but it never widens the rollup past the claims.
+        ``owner_receipt_ids`` identifies receipts independently bound to the
+        primary root and backend. Without those IDs, ``primary_root`` retains
+        the legacy cwd filter. With neither, every current receipt claim is
+        diagnostic evidence; the caller marks the primary coordinate unresolved.
+        No mode widens the rollup past the supplied path/hash claims.
 
         Returns ``None`` only when the parser did not run or produced no
         readable JSON — a run that found nothing still returns its dict, so
@@ -2743,7 +2923,9 @@ class PhysicalValidator:
                 "receipt_error": "evidence assessment ledger is not host-authorized and complete",
                 "receipt_error_files": [],
             }
-        receipt_claims = self._verified_report_claims(records, primary_root)
+        receipt_claims = self._verified_report_claims(
+            records, primary_root, owner_receipt_ids=owner_receipt_ids
+        )
         parser_input = json.dumps(
             {
                 "project_dir": project_dir,
@@ -5621,13 +5803,18 @@ class PhysicalValidator:
             status = "PARTIAL"
             evidence_status = "partial"
             reason = str(execution_summary.get("reason") or "test execution was interrupted")
-        elif execution_summary.get("state") == "failed" and not test_metrics.get("total_tests", 0):
+        elif execution_summary.get("state") == "failed":
             status = "FAILED"
             evidence_status = "blocked"
             reason = str(
                 execution_summary.get("reason")
                 or "test execution was interrupted before producing results"
             )
+
+        if execution_summary.get("state") == "unknown" and status == "SUCCESS":
+            status = "WARNING"
+            evidence_status = "unknown"
+            reason = str(execution_summary.get("reason") or "test execution completion is unknown")
 
         has_test_count_evidence = test_metrics.get("valid", False) or any(
             key in test_metrics and test_metrics.get(key) is not None

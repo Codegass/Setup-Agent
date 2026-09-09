@@ -15,7 +15,7 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from sag.tools.internal.build_preflight import read_live_build_requirements
 
@@ -68,10 +68,7 @@ class TestAttemptRequirement:
             return "project(action='analyze')"
         args = str(params.get("args") or "").strip()
         suffix = f", args={args!r}" if args else ""
-        return (
-            "build(action='test', "
-            f"working_directory={params['working_directory']!r}{suffix})"
-        )
+        return "build(action='test', " f"working_directory={params['working_directory']!r}{suffix})"
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -295,8 +292,8 @@ def _resolved_realpath(orchestrator: Any, path: str) -> str | None:
     return _normalized_absolute_path(lines[0])
 
 
-def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution:
-    """Read test coordinates without collapsing I/O/schema failure into absence."""
+def _read_survey_test_coordinates(orchestrator: Any) -> TestCandidateResolution:
+    """Read published coordinates and physical containment; authorize no dispatch."""
     if orchestrator is None:
         return TestCandidateResolution(status="manifest_unreadable")
     workspace_root = _resolved_realpath(orchestrator, "/workspace")
@@ -386,24 +383,6 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
                 project_root=project_root,
                 workspace_root=workspace_root,
             )
-        if probe_forced_build_backend(orchestrator, root) != system:
-            return TestCandidateResolution(
-                status="unsafe_coordinates",
-                project_root=project_root,
-                workspace_root=workspace_root,
-            )
-        graph_boundary = verify_forced_candidate_build_graph(
-            orchestrator,
-            project_root=project_root,
-            candidate_root=root,
-            system=system,
-        )
-        if not graph_boundary.verified:
-            return TestCandidateResolution(
-                status="unsafe_coordinates",
-                project_root=project_root,
-                workspace_root=workspace_root,
-            )
         requirement = _candidate_requirement(root, system)
         if (root, system) in seen:
             if is_primary and primary is None:
@@ -428,6 +407,108 @@ def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution
         project_root=project_root,
         workspace_root=workspace_root,
         primary=primary,
+    )
+
+
+def resolve_survey_test_candidates(orchestrator: Any) -> TestCandidateResolution:
+    """Coordinates eligible for a new harness-forced test action."""
+    resolution = _read_survey_test_coordinates(orchestrator)
+    if resolution.status != "available":
+        return resolution
+    for candidate in resolution.candidates:
+        if (
+            probe_forced_build_backend(orchestrator, candidate.root) != candidate.system
+            or not verify_forced_candidate_build_graph(
+                orchestrator,
+                project_root=resolution.project_root,
+                candidate_root=candidate.root,
+                system=candidate.system,
+            ).verified
+        ):
+            return TestCandidateResolution(
+                status="unsafe_coordinates",
+                project_root=resolution.project_root,
+                workspace_root=resolution.workspace_root,
+            )
+    return resolution
+
+
+@dataclass(frozen=True, slots=True)
+class TestReportScope:
+    """Observed report roots, deliberately carrying no executable action."""
+
+    status: CandidateResolutionStatus | Literal["receipt_unbound"]
+    project_root: str | None = None
+    workspace_root: str | None = None
+    primary_root: str | None = None
+    roots: tuple[str, ...] = ()
+    receipt_ids: tuple[str, ...] = ()
+
+
+def resolve_test_report_scope(
+    orchestrator: Any,
+    *,
+    receipts: Sequence[Mapping[str, Any]],
+    project_root: str,
+) -> TestReportScope:
+    """Bind survey coordinates to already executed, current scoped receipts.
+
+    The caller supplies the single host-verified run/SHA/project receipt
+    snapshot. This only proves root ownership; report hashes and module/test
+    identities retain their independent validators. It authorizes no new work.
+    """
+    coordinates = _read_survey_test_coordinates(orchestrator)
+    if coordinates.status != "available":
+        return TestReportScope(
+            coordinates.status, coordinates.project_root, coordinates.workspace_root
+        )
+    current_root = _resolved_realpath(orchestrator, project_root)
+    if current_root != coordinates.project_root:
+        return TestReportScope("unsafe_coordinates", current_root, coordinates.workspace_root)
+    roots: list[str] = []
+    owner_receipts: list[tuple[str, str, str]] = []
+    for candidate in coordinates.candidates:
+        for receipt in receipts:
+            receipt_id = str(receipt.get("receipt_id") or "").strip()
+            if not receipt_id:
+                continue
+            if _normalized_system(receipt.get("tool")) != candidate.system:
+                continue
+            requested_cwd = _normalized_absolute_path(receipt.get("working_directory"))
+            actual_cwd = _normalized_absolute_path(receipt.get("actual_cwd") or requested_cwd)
+            if not requested_cwd or not actual_cwd:
+                continue
+            requested = _resolved_realpath(orchestrator, requested_cwd)
+            actual = _resolved_realpath(orchestrator, actual_cwd)
+            if requested != candidate.root or actual != candidate.root:
+                continue
+            domain = str(receipt.get("domain_id") or "").strip()
+            if domain:
+                resolved_domain = _resolved_realpath(orchestrator, domain)
+                if (
+                    not resolved_domain
+                    or not _is_contained(candidate.root, resolved_domain)
+                    or not _is_contained(resolved_domain, current_root)
+                ):
+                    continue
+            roots.append(candidate.root)
+            owner_receipts.append((candidate.root, candidate.system, receipt_id))
+    primary = coordinates.primary
+    primary_receipt_ids = tuple(
+        dict.fromkeys(
+            receipt_id
+            for root, system, receipt_id in owner_receipts
+            if primary and (root, system) == (primary.root, primary.system)
+        )
+    )
+    primary_root = primary.root if primary and primary_receipt_ids else None
+    return TestReportScope(
+        "available" if primary_root else "receipt_unbound",
+        coordinates.project_root,
+        coordinates.workspace_root,
+        primary_root,
+        tuple(dict.fromkeys(roots)),
+        primary_receipt_ids,
     )
 
 

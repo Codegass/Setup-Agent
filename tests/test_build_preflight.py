@@ -9,6 +9,7 @@ overlay (/workspace/.setup_agent/).
 import json
 import re
 
+import pytest
 from test_container_io import FakeContainer
 
 from sag.agent.evidence_records import frame_named_json_record_stream
@@ -22,6 +23,7 @@ from sag.tools.internal.build_preflight import (
     validate_build_requirements_v1,
     write_build_requirements,
 )
+from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION
 
 
 class FakeOrch:
@@ -52,7 +54,7 @@ def current_manifest(**overrides):
         "schema_version": BUILD_REQUIREMENTS_SCHEMA_VERSION,
         "survey": {
             "project_path": "/workspace/p",
-            "analyzer_version": 12,
+            "analyzer_version": SURVEY_FACTS_VERSION,
             "config_fingerprint": None,
             "target_sha": None,
             "document_map_fingerprint": None,
@@ -102,9 +104,7 @@ def test_live_read_requires_the_exact_current_host_revision():
     current = read_live_build_requirements(orch)
     # The tampered body is schema-valid (restamped), so the PUBLICATION check
     # is what refuses it — not a fingerprint recompute masking this test.
-    orch.files[REQUIREMENTS_PATH] = json.dumps(
-        current_manifest(java_version="11"), sort_keys=True
-    )
+    orch.files[REQUIREMENTS_PATH] = json.dumps(current_manifest(java_version="11"), sort_keys=True)
     tampered = read_live_build_requirements(orch)
     del orch.files[REQUIREMENTS_PATH]
     deleted = read_live_build_requirements(orch)
@@ -186,9 +186,7 @@ def test_current_schema_is_closed_strict_and_bounded():
         current_manifest(future_authority="yes"),
         current_manifest(fail_at_end=1),
         current_manifest(build_root="/workspace/p/../escape"),
-        current_manifest(
-            build_islands=[{"root": "/workspace/p/m", "system": "maven"}] * 2
-        ),
+        current_manifest(build_islands=[{"root": "/workspace/p/m", "system": "maven"}] * 2),
     ]
     for payload in invalid:
         try:
@@ -407,6 +405,80 @@ def test_no_requirement_is_a_noop():
     assert outcome.matched is True and outcome.narration == ""
 
 
+def test_enforcer_bare_lower_bound_does_not_downgrade_current_java():
+    orch = ProvisionOrch('openjdk version "17.0.9"')
+    outcome = JdkPreflight(orch).run("11", source="maven-enforcer")
+    assert outcome.matched is True
+    assert not any("apt-get" in command for command in orch.commands)
+
+
+def test_maven_java_constraints_preserve_enforcer_and_compiler_separately():
+    from sag.tools.internal import java_versions
+
+    pom = """<project><properties><maven.compiler.release>17</maven.compiler.release>
+    </properties><build><plugins><plugin><artifactId>maven-enforcer-plugin</artifactId>
+    <configuration><rules><requireJavaVersion><version>11</version></requireJavaVersion>
+    </rules></configuration></plugin></plugins></build></project>"""
+    requirements = java_versions.maven_java_requirements([(pom, "/workspace/demo/pom.xml")])
+    assert requirements["runtime"] == [
+        {"constraint": "11", "source": "/workspace/demo/pom.xml:requireJavaVersion"}
+    ]
+    assert requirements["compiler_release"] == "17"
+    orch = ProvisionOrch('openjdk version "17.0.9"')
+    outcome = JdkPreflight(orch).run("11", requirements=requirements)
+    assert outcome.matched is True
+    assert not any("apt-get" in command for command in orch.commands)
+
+
+@pytest.mark.parametrize(
+    "constraint, version, expected",
+    [
+        ("11", "17.0.9", True),
+        ("[11]", "17", False),
+        ("[11]", "11", True),
+        ("[11]", "11.0.9", False),
+        ("[11,)", "17.0.9", True),
+        ("[11,17)", "17", False),
+        ("(,17]", "11", True),
+        ("(,17]", "21", False),
+        ("[1.8,)", "1.8.0_392", True),
+        ("[11,17),[21,)", "17", None),
+        ("${jdk.version}", "17", None),
+    ],
+)
+def test_enforcer_constraints_do_not_relax_exact_or_upper_bounds(constraint, version, expected):
+    from sag.tools.internal import java_versions
+
+    assert java_versions.java_constraint_matches(constraint, version) is expected
+
+
+def test_independent_compiler_toolchain_does_not_change_maven_jvm():
+    requirements = {
+        "runtime": [{"constraint": "[11]", "source": "pom.xml:requireJavaVersion"}],
+        "compiler_release": "17",
+        "compiler_source": "pom.xml:maven.compiler.release",
+        "compiler_toolchain": True,
+    }
+    orch = ProvisionOrch('openjdk version "11"')
+    outcome = JdkPreflight(orch).run("11", requirements=requirements)
+    assert outcome.active_version == "11"
+    assert "independent compiler toolchain" in outcome.narration
+    assert not any("apt-get" in command for command in orch.commands)
+
+
+def test_exact_runtime_and_same_jvm_compiler_conflict_without_provisioning():
+    requirements = {
+        "runtime": [{"constraint": "[11]", "source": "pom.xml:requireJavaVersion"}],
+        "compiler_release": "17",
+        "compiler_source": "pom.xml:maven.compiler.release",
+        "compiler_toolchain": False,
+    }
+    orch = ProvisionOrch('openjdk version "17.0.9"')
+    outcome = JdkPreflight(orch).run("11", requirements=requirements)
+    assert "java_constraint_conflict" in outcome.conflicts
+    assert not any("apt-get" in command for command in orch.commands)
+
+
 from sag.tools.internal.build_preflight import classify_version_error
 
 
@@ -537,3 +609,75 @@ def test_the_provisioning_set_keeps_its_deliberate_downgrade():
     # guard is about the looser wordings only; it must not veto that set.
     out = "Groovy:A transform used a generics containing ClassNode List <String>"
     assert classify_runner_java_requirement(out, active_version="11") == "8"
+
+
+def test_setup_preserves_existing_satisfying_java_instead_of_reinstalling(monkeypatch):
+    from sag.tools.internal.project_setup_tool import ProjectSetupTool
+
+    orch = ProvisionOrch('openjdk version "17.0.9"')
+    tool = ProjectSetupTool(orch)
+    tool._detected_java_requirements = (
+        "/workspace/demo",
+        {
+            "runtime": [{"constraint": "11", "source": "pom.xml:requireJavaVersion"}],
+            "compiler_release": "17",
+            "compiler_source": "pom.xml:maven.compiler.release",
+            "compiler_toolchain": False,
+        },
+    )
+    monkeypatch.setattr(tool, "_register_maven_runtime_overlay", lambda: None)
+    monkeypatch.setattr(tool, "_provision_required_maven_if_needed", lambda directory: None)
+    monkeypatch.setattr(
+        orch, "_execute_command", lambda *args: {"success": True, "exit_code": 0, "output": ""}
+    )
+    result = tool._install_dependencies_for_project_type({"type": "maven"}, "/workspace/demo", "17")
+    assert result["success"]
+    assert result["java_version"] == "17"
+    assert result["java_requirement_status"] == "satisfied"
+    assert not any("openjdk" in command or "default-jdk" in command for command in orch.commands)
+
+
+def test_runner_observation_cannot_relax_declared_upper_bound():
+    requirements = {
+        "runtime": [{"constraint": "[11,17)", "source": "pom.xml:requireJavaVersion"}],
+        "compiler_release": None,
+        "compiler_source": None,
+        "compiler_toolchain": False,
+    }
+    orch = ProvisionOrch('openjdk version "11.0.9"')
+    outcome = JdkPreflight(orch).run(
+        "17", source="runner_observed:receipt", requirements=requirements
+    )
+    assert "java_constraint_conflict" in outcome.conflicts
+    assert not any("apt-get" in command for command in orch.commands)
+
+
+def test_plain_fork_does_not_claim_an_independent_compiler():
+    from sag.tools.internal.java_versions import maven_java_requirements
+
+    pom = """<project><properties><maven.compiler.release>17</maven.compiler.release></properties>
+    <build><plugins><plugin><artifactId>maven-compiler-plugin</artifactId><configuration>
+    <fork>true</fork></configuration></plugin></plugins></build></project>"""
+    requirements = maven_java_requirements([(pom, "/workspace/p/pom.xml")])
+    assert requirements["compiler_toolchain"] is False
+    assert requirements["compiler_release"] == "17"
+
+
+@pytest.mark.parametrize("constraint", ["[11]", "(,11]"])
+def test_installing_the_right_major_does_not_prove_a_narrow_constraint(monkeypatch, constraint):
+    import sag.tools.internal.build_preflight as bp
+
+    orch = ProvisionOrch('openjdk version "17.0.9"')
+    preflight = JdkPreflight(orch)
+
+    def provision(version):
+        assert version == "11"
+        orch.java_output = 'openjdk version "11.0.9"'
+        return "/usr/lib/jvm/java-11"
+
+    monkeypatch.setattr(preflight, "_provision", provision)
+    monkeypatch.setattr(bp, "_register_overlay", lambda *args: True)
+    outcome = preflight.run(constraint, source="maven-enforcer")
+    assert outcome.mismatch
+    assert not outcome.provisioned
+    assert "postcondition failed" in outcome.narration

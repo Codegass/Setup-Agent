@@ -10,9 +10,12 @@ import hashlib
 import json
 import re
 import shlex
+import subprocess
+import sys
 
 import pytest
 
+from sag.runtime.container_io import ContainerFileReadError, read_container_prefix
 from sag.utils.container_io import (
     DEFAULT_MAX_CMD_CHARS,
     ContainerWriteResult,
@@ -479,3 +482,183 @@ def test_bound_normal_callback_without_a_clean_owner_fails_closed():
     assert result.persisted is False
     assert result.code == "invalid_arguments"
     assert owner.normal_commands == []
+
+
+def _local_prefix_executor(command, **kwargs):
+    """Run only the generated Python read, with production whitespace stripping."""
+    argv = shlex.split(command)
+    assert argv[:2] == ["python3", "-c"]
+    assert kwargs == {"truncate_output": False}
+    completed = subprocess.run(
+        [sys.executable, *argv[1:]], capture_output=True, check=False, timeout=10
+    )
+    return {
+        "success": completed.returncode == 0,
+        "exit_code": completed.returncode,
+        "output": completed.stdout.decode("utf-8").strip(),
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "budget"),
+    [
+        pytest.param(b"", 0, id="empty-zero-budget"),
+        pytest.param(b"", 8, id="empty-file"),
+        pytest.param(b"abc", 0, id="nonempty-zero-budget"),
+        pytest.param(b"abc", 3, id="exact-budget"),
+        pytest.param(b"abcd", 3, id="over-budget"),
+        pytest.param(" \n中文 café\n\n".encode("utf-8"), 100, id="utf8-and-whitespace"),
+        pytest.param("a中\n".encode("utf-8"), 2, id="partial-utf8-codepoint"),
+        pytest.param(b"a\x00\xff\n", 8, id="raw-binary-bytes"),
+    ],
+)
+def test_prefix_transport_preserves_exact_bounded_bytes(tmp_path, raw, budget):
+    path = tmp_path / "odd name ' ; $(touch forbidden)"
+    path.write_bytes(raw)
+
+    assert read_container_prefix(_local_prefix_executor, str(path), max_bytes=budget) == (
+        raw[:budget],
+        len(raw) > budget,
+    )
+    assert sorted(child.name for child in tmp_path.iterdir()) == [path.name]
+
+
+def test_prefix_transport_reads_only_budget_plus_one_from_the_file(tmp_path, monkeypatch):
+    import builtins
+    import io
+    from contextlib import redirect_stdout
+
+    path = tmp_path / "large-document.txt"
+    body = b"recipe\n" * 10_000
+    path.write_bytes(body)
+    read_sizes = []
+    actual_open = builtins.open
+
+    class BoundedReader:
+        def __enter__(self):
+            self.file = actual_open(path, "rb")
+            return self
+
+        def read(self, size=-1):
+            assert size >= 0
+            read_sizes.append(size)
+            assert sum(read_sizes) <= 18
+            return self.file.read(size)
+
+        def __exit__(self, *_args):
+            self.file.close()
+
+    def guarded_open(requested_path, mode):
+        assert requested_path == str(path)
+        assert mode == "rb"
+        return BoundedReader()
+
+    def bounded_execute(command, **kwargs):
+        argv = shlex.split(command)
+        assert argv[:2] == ["python3", "-c"]
+        assert kwargs == {"truncate_output": False}
+        captured = io.StringIO()
+        with monkeypatch.context() as scoped, redirect_stdout(captured):
+            scoped.setattr(builtins, "open", guarded_open)
+            scoped.setattr(sys, "argv", ["-c", *argv[3:]])
+            exec(compile(argv[2], "<container-prefix-command>", "exec"), {})
+        return {"success": True, "exit_code": 0, "output": captured.getvalue().strip()}
+
+    assert read_container_prefix(bounded_execute, str(path), max_bytes=17) == (
+        body[:17],
+        True,
+    )
+    assert read_sizes == [18]
+
+
+@pytest.mark.parametrize("budget", [-1, True, False, 1.5, "4", None])
+def test_prefix_transport_rejects_noninteger_or_negative_budget_before_execution(budget):
+    def forbidden_execute(*args, **kwargs):
+        pytest.fail("an invalid budget must not execute")
+
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        read_container_prefix(forbidden_execute, "/irrelevant", max_bytes=budget)
+
+
+def _prefix_frame(raw=b"data\n", *, has_more=False):
+    return (
+        "SAG_FILE_PREFIX_V1\t"
+        f"{len(raw)}\t{hashlib.sha256(raw).hexdigest()}\t{int(has_more)}\t"
+        f"{base64.b64encode(raw).decode('ascii')}\nSAG_FILE_PREFIX_END_V1\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda frame: frame.split("\n")[0], id="missing-footer"),
+        pytest.param(lambda frame: frame + "extra", id="extra-suffix"),
+        pytest.param(lambda frame: "noise\n" + frame, id="extra-prefix"),
+        pytest.param(lambda frame: frame.replace("V1", "V2", 1), id="wrong-marker"),
+        pytest.param(lambda frame: frame.replace("\t5\t", "\t4\t", 1), id="wrong-length"),
+        pytest.param(lambda frame: frame.replace("\t5\t", "\t05\t", 1), id="padded-length"),
+        pytest.param(lambda frame: frame.replace("\t5\t", "\t99999\t", 1), id="large-length"),
+        pytest.param(
+            lambda frame: frame.replace(hashlib.sha256(b"data\n").hexdigest(), "0" * 64),
+            id="wrong-digest",
+        ),
+        pytest.param(lambda frame: frame.replace("ZGF0YQo=", "!GF0YQo="), id="invalid-base64"),
+        pytest.param(lambda frame: frame.replace("ZGF0YQo=", "ZGF0YQo=="), id="excess-padding"),
+        pytest.param(lambda frame: frame.replace("ZGF0YQo=", "ZGF0YQp="), id="noncanonical-bits"),
+        pytest.param(lambda frame: frame.replace("\t0\t", "\ttrue\t", 1), id="invalid-eof"),
+        pytest.param(lambda frame: frame.replace("\t0\t", "\t1\t", 1), id="short-truncated"),
+        pytest.param(lambda frame: None, id="non-text"),
+    ],
+)
+def test_prefix_transport_rejects_incomplete_or_corrupt_frames(mutate):
+    def execute(command, **kwargs):
+        return {"success": True, "exit_code": 0, "output": mutate(_prefix_frame())}
+
+    with pytest.raises(ContainerFileReadError):
+        read_container_prefix(execute, "/workspace/README", max_bytes=8)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"success": False, "exit_code": 0},
+        {"success": True, "exit_code": 1},
+        {"success": True, "exit_code": 0, "dispatch_status": "container_unavailable"},
+        {"success": True, "exit_code": False},
+        {"success": True},
+    ],
+)
+def test_prefix_transport_does_not_accept_valid_frame_from_failed_read(status):
+    def execute(command, **kwargs):
+        return {**status, "output": _prefix_frame()}
+
+    with pytest.raises(ContainerFileReadError, match="did not succeed"):
+        read_container_prefix(execute, "/workspace/README", max_bytes=8)
+
+
+def test_prefix_transport_missing_file_is_a_failed_read(tmp_path):
+    with pytest.raises(ContainerFileReadError, match="did not succeed"):
+        read_container_prefix(_local_prefix_executor, str(tmp_path / "absent"), max_bytes=8)
+
+
+def test_prefix_transport_prefers_clean_control_and_has_no_direct_file_shortcut(tmp_path):
+    path = tmp_path / "document"
+    path.write_bytes(b"actual\n")
+
+    class ControlSource:
+        files = {str(path): "unverified shortcut"}
+
+        def read_file(self, path):
+            pytest.fail("prefix reads must exercise the bounded transport")
+
+        def execute_command(self, command, **kwargs):
+            pytest.fail("prefix reads must use the clean control executor")
+
+        def execute_control_command(self, command, **kwargs):
+            return _local_prefix_executor(command, **kwargs)
+
+    source = ControlSource()
+    assert read_container_prefix(source.execute_command, str(path), max_bytes=8) == (
+        b"actual\n",
+        False,
+    )

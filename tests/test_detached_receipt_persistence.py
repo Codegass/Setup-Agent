@@ -25,10 +25,10 @@ and why.
 import pytest
 from test_container_io import FakeContainer
 from test_invocation_receipts import (
-    FakeExecute,
     HASH_A,
-    ReceiptOrchestrator,
     SUREFIRE,
+    FakeExecute,
+    ReceiptOrchestrator,
     argv_contract_authority,
     maven_tool,
     minimal_valid_receipt,
@@ -42,9 +42,9 @@ from sag.agent.invocation_receipts import (
     validate_receipt_v2,
     write_receipt_result,
 )
+from sag.agent.output_storage import OutputStorageManager
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.receipt_test_rows import diagnostic_testcase_outcomes
-from sag.agent.output_storage import OutputStorageManager
 
 # camel's own reactor, measured on the stored detached log `output_3dff08155101`:
 # 652 rows through the full-output parser, 31 through the truncated one.
@@ -269,12 +269,12 @@ class DetachedReceiptOrchestrator(ReceiptOrchestrator):
 
 def _camel_detached_log(rows):
     lines = [
+        "[INFO] Tests run: 11492, Failures: 0, Errors: 0, Skipped: 0",
         "[INFO] Reactor Summary:",
         *(
             f"[INFO] camel-{index:04d} ......................... SUCCESS [  0.1 s]"
             for index in range(rows)
         ),
-        "[INFO] Tests run: 11492, Failures: 0, Errors: 0, Skipped: 0",
         "[INFO] BUILD SUCCESS",
     ]
     return "\n".join(lines)
@@ -299,10 +299,14 @@ def test_a_completed_detached_maven_dispatch_persists_a_countable_receipt(tmp_pa
 
     assert orchestrator.soft_timeout_calls, "the fence must exercise the dispatch path"
     assert result.succeeded is True
+    assert result.raw_output == orchestrator.full_output
 
     (receipt,) = receipts_written(orchestrator.receipt_commands)
     assert receipt["exit_code"] == 0
     assert receipt["outcome"] == "completed"
+    from sag.agent.invocation_receipts import output_content_hash
+
+    assert receipt["output_content_hash"] == output_content_hash(result.raw_output)
     assert receipt["report_delta"]["new"] == [{"path": SUREFIRE, "sha256": HASH_A}]
     assert len(receipt["module_outcomes"]) == CAMEL_REACTOR_ROWS
     assert "evidence_omissions" not in receipt
@@ -339,3 +343,17 @@ def test_a_completed_detached_dispatch_keeps_its_receipt_when_evidence_is_unclea
     assert omission["field"] == "module_outcomes"
     assert omission["status"] == "unavailable"
     assert omission["reasons"]
+
+
+@pytest.mark.parametrize("runner", ["maven", "gradle"])
+def test_runtime_narration_does_not_change_bound_raw_output(runner):
+    from sag.tools.base import ToolResult
+    from sag.tools.internal.gradle_tool import GradleTool
+    from sag.tools.internal.maven_tool import MavenTool
+
+    tool = object.__new__(MavenTool if runner == "maven" else GradleTool)
+    raw = "first line\nmiddle log\nlast line\n"
+    result = ToolResult.completed_success(output="summary", raw_output=raw)
+    finalized = tool._finalize_main_result(result, "[pre-flight] selected registered runner\n")
+    assert finalized.output.startswith("[pre-flight]")
+    assert finalized.raw_output == raw

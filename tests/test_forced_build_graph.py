@@ -2,6 +2,7 @@ import shlex
 
 import pytest
 from build_requirements_fakes import complete_build_requirements_v1
+from test_test_attempt_policy import ManifestOrchestrator, _ready_state
 
 from sag.agent.attempt_policy import (
     required_test_attempt,
@@ -10,7 +11,6 @@ from sag.agent.attempt_policy import (
 from sag.agent.evidence_state import StateScope
 from sag.agent.forced_build_graph import verify_forced_candidate_build_graph
 from sag.tools.base import ToolResult
-from test_test_attempt_policy import ManifestOrchestrator, _ready_state
 
 _NO_PARENT = object()
 _DEFAULT_PARENT = object()
@@ -141,6 +141,8 @@ def test_large_valid_maven_graph_uses_untruncated_machine_poms():
     assert len(root_pom) > 10_000
     assert result.status == "verified"
     assert result.visited_roots == (root, f"{root}/child")
+
+
 def test_maven_reactor_rejects_parent_relative_module_outside_project():
     root = "/workspace/reactor"
     orch = GraphOrchestrator(
@@ -194,6 +196,131 @@ def test_maven_reactor_rejects_self_cycle_by_realpath():
 
     assert result.status == "unavailable"
     assert result.reason_code == "maven_module_cycle"
+
+
+@pytest.mark.parametrize("parent_relative", [_DEFAULT_PARENT, "../pom.xml"])
+def test_maven_aggregated_child_can_inherit_its_aggregator(parent_relative):
+    root = "/workspace/reactor"
+    orch = GraphOrchestrator(
+        {
+            f"{root}/pom.xml": _pom("child"),
+            f"{root}/child/pom.xml": _pom(parent_relative=parent_relative),
+        }
+    )
+
+    result = verify_forced_candidate_build_graph(
+        orch, project_root=root, candidate_root=root, system="maven"
+    )
+
+    assert result.status == "verified"
+    assert result.visited_roots == (root, f"{root}/child")
+
+
+def test_maven_nested_aggregation_and_shared_parent_are_not_cycles():
+    root = "/workspace/reactor"
+    orch = GraphOrchestrator(
+        {
+            f"{root}/pom.xml": _pom("child", "sibling"),
+            f"{root}/child/pom.xml": _pom("nested", parent_relative="../pom.xml"),
+            f"{root}/child/nested/pom.xml": _pom(parent_relative="../../pom.xml"),
+            f"{root}/sibling/pom.xml": _pom(parent_relative="../pom.xml"),
+        }
+    )
+
+    result = verify_forced_candidate_build_graph(
+        orch, project_root=root, candidate_root=root, system="maven"
+    )
+
+    assert result.status == "verified"
+    assert result.visited_roots == (
+        root,
+        f"{root}/child",
+        f"{root}/child/nested",
+        f"{root}/sibling",
+    )
+
+
+def test_maven_inherited_parent_does_not_expand_its_unselected_modules():
+    root = "/workspace/reactor"
+    child = f"{root}/child"
+    orch = GraphOrchestrator(
+        {
+            f"{root}/pom.xml": _pom("child", "../unselected-outside"),
+            f"{child}/pom.xml": _pom(parent_relative="../pom.xml"),
+        }
+    )
+
+    result = verify_forced_candidate_build_graph(
+        orch, project_root=root, candidate_root=child, system="maven"
+    )
+
+    assert result.status == "verified"
+    assert result.visited_roots == (child, root)
+
+
+def test_maven_aggregation_cycle_remains_unavailable_with_inheritance():
+    root = "/workspace/reactor"
+    orch = GraphOrchestrator(
+        {
+            f"{root}/pom.xml": _pom("child"),
+            f"{root}/child/pom.xml": _pom("..", parent_relative="../pom.xml"),
+        }
+    )
+
+    result = verify_forced_candidate_build_graph(
+        orch, project_root=root, candidate_root=root, system="maven"
+    )
+
+    assert result.status == "unavailable"
+    assert result.reason_code == "maven_module_cycle"
+
+
+@pytest.mark.parametrize("relation", ["aggregation", "inheritance"])
+@pytest.mark.parametrize("last_depth", [32, 33])
+def test_maven_default_depth_limit_is_preserved(relation, last_depth):
+    root = "/workspace/reactor"
+    paths = [root] + [f"{root}/level-{index}" for index in range(1, last_depth + 1)]
+    files = {}
+    for index, path in enumerate(paths):
+        if index == last_depth:
+            pom = _pom()
+        elif relation == "aggregation":
+            pom = _pom(paths[index + 1])
+        else:
+            pom = _pom(parent_relative=f"{paths[index + 1]}/pom.xml")
+        files[f"{path}/pom.xml"] = pom
+
+    result = verify_forced_candidate_build_graph(
+        GraphOrchestrator(files), project_root=root, candidate_root=root, system="maven"
+    )
+
+    if last_depth == 32:
+        assert result.status == "verified"
+        assert result.visited_roots == tuple(paths)
+    else:
+        assert result.status == "unavailable"
+        assert result.reason_code == "maven_module_depth_exceeded"
+
+
+@pytest.mark.parametrize("node_count", [256, 257])
+def test_maven_default_node_limit_counts_shared_parent_once(node_count):
+    root = "/workspace/reactor"
+    modules = [f"child-{index}" for index in range(node_count - 1)]
+    files = {f"{root}/pom.xml": _pom(*modules)}
+    files.update(
+        {f"{root}/{module}/pom.xml": _pom(parent_relative="../pom.xml") for module in modules}
+    )
+
+    result = verify_forced_candidate_build_graph(
+        GraphOrchestrator(files), project_root=root, candidate_root=root, system="maven"
+    )
+
+    if node_count == 256:
+        assert result.status == "verified"
+        assert len(result.visited_roots) == 256
+    else:
+        assert result.status == "unavailable"
+        assert result.reason_code == "maven_module_cap_exceeded"
 
 
 def test_maven_recursive_and_default_profile_modules_stay_forceable():

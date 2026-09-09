@@ -1,0 +1,134 @@
+{
+  "purpose": "Frozen source and receipt summaries for R5 report ownership versus forced-attempt eligibility. These snippets do not authorize a new build, reconstruct unknown module identities, or claim a new experiment result.",
+  "fixtures": [
+    {
+      "project": "httpcomponents-client",
+      "fixture": "httpcomponents-client.pom.xml",
+      "fixture_sha256": "a767fee5da52ef784941c288c08bbe77cc1a69f25a672b47652730b4703ab1c6",
+      "fixture_bytes": 572,
+      "source": {
+        "path": "logs/d3-freeze-20260830/httpcomponents-client/sources/pom.xml",
+        "sha256": "81c391aa269c8aab36e20162493aaba8192f802dad296b8985e3908eb89163b0",
+        "bytes": 24707,
+        "lines": [
+          464,
+          479
+        ],
+        "repo": "apache/httpcomponents-client",
+        "target_sha": "be07c77297576b08bc01bb93789eca6f5f9bf850",
+        "repo_path": "pom.xml"
+      },
+      "extraction": "Exact contiguous source lines, one-based and inclusive; original bytes and line endings retained. The Maven fixture is a profile element, not a standalone project POM.",
+      "receipts": {
+        "path": "logs/d3r1-20260907/runs/httpcomponents-client/audit/receipts.json",
+        "sha256": "28fb11f83ab4e6dec791af1bf0a911fd716b5cc6400f15f20d3365b14068cb06",
+        "bytes": 2356657,
+        "summaries": [
+          {
+            "receipt_id": "inv-maven-1-5053a1327177-0001",
+            "tool": "maven",
+            "effective_action": "compile",
+            "working_directory": "/workspace/httpcomponents-client",
+            "actual_cwd": "/workspace/httpcomponents-client",
+            "target_sha": "be07c77297576b08bc01bb93789eca6f5f9bf850",
+            "run_id": "20260907_222120_333421_b5a26d8a59a8_46479-7-a03006e24e27",
+            "module_outcome_count": 9,
+            "module_identity_status": "absent",
+            "module_identity_reasons": [],
+            "module_identity_retained_rows": 0,
+            "claimed_report_counts": {
+              "changed": 0,
+              "new": 0
+            },
+            "claimed_report_count": 0
+          },
+          {
+            "receipt_id": "inv-maven-1-5053a1327177-0002",
+            "tool": "maven",
+            "effective_action": "test",
+            "working_directory": "/workspace/httpcomponents-client",
+            "actual_cwd": "/workspace/httpcomponents-client",
+            "target_sha": "be07c77297576b08bc01bb93789eca6f5f9bf850",
+            "run_id": "20260907_222120_333421_b5a26d8a59a8_46479-7-a03006e24e27",
+            "module_outcome_count": 9,
+            "module_identity_status": "complete",
+            "module_identity_reasons": [],
+            "module_identity_retained_rows": 2048,
+            "claimed_report_counts": {
+              "changed": 0,
+              "new": 368
+            },
+            "claimed_report_count": 368
+          }
+        ]
+      }
+    },
+    {
+      "project": "freemarker",
+      "fixture": "freemarker.settings.gradle.kts",
+      "fixture_sha256": "633133b63b2db947b381c73e5152a1ee5b647aeb65344b6b4c33c960f6c8addc",
+      "fixture_bytes": 455,
+      "source": {
+        "path": "logs/d3-freeze-20260830/freemarker/sources/settings.gradle.kts",
+        "sha256": "9841e107e3162ff9f61127af9b20321c38edfb058ff9034d6ded84dbe6fe58af",
+        "bytes": 1264,
+        "lines": [
+          20,
+          38
+        ],
+        "repo": "apache/freemarker",
+        "target_sha": "bea5c3577781b118d3e799adf18d7459794ca951",
+        "repo_path": "settings.gradle.kts"
+      },
+      "extraction": "Exact contiguous source lines, one-based and inclusive; original bytes and line endings retained. The Maven fixture is a profile element, not a standalone project POM.",
+      "receipts": {
+        "path": "logs/d3r1-20260907/runs/freemarker/audit/receipts.json",
+        "sha256": "5bcd885653fb9753aa39265a7c5c85ae8dc75e609890672b5ce5c4d2f1a589cb",
+        "bytes": 112143,
+        "summaries": [
+          {
+            "receipt_id": "inv-gradle-1-c29d1f7c9f57-0001",
+            "tool": "gradle",
+            "effective_action": "compileJava",
+            "working_directory": "/workspace/freemarker",
+            "actual_cwd": "/workspace/freemarker",
+            "target_sha": "bea5c3577781b118d3e799adf18d7459794ca951",
+            "run_id": "20260907_221942_228284_b307c4226b4c_46398-7-92cbecf8d5bf",
+            "module_outcome_count": 3,
+            "module_identity_status": "unavailable",
+            "module_identity_reasons": [
+              "module_qualified_identity_unavailable"
+            ],
+            "module_identity_retained_rows": 0,
+            "claimed_report_counts": {
+              "changed": 0,
+              "new": 194
+            },
+            "claimed_report_count": 194
+          },
+          {
+            "receipt_id": "inv-gradle-1-c29d1f7c9f57-0002",
+            "tool": "gradle",
+            "effective_action": "test",
+            "working_directory": "/workspace/freemarker",
+            "actual_cwd": "/workspace/freemarker",
+            "target_sha": "bea5c3577781b118d3e799adf18d7459794ca951",
+            "run_id": "20260907_221942_228284_b307c4226b4c_46398-7-92cbecf8d5bf",
+            "module_outcome_count": 3,
+            "module_identity_status": "unavailable",
+            "module_identity_reasons": [
+              "module_qualified_identity_unavailable"
+            ],
+            "module_identity_retained_rows": 0,
+            "claimed_report_counts": {
+              "cached": 188,
+              "changed": 6,
+              "new": 0
+            },
+            "claimed_report_count": 194
+          }
+        ]
+      }
+    }
+  ]
+}

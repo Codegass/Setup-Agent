@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from sag.metrics.maven_reactor import parse_maven_reactor, reactor_scope_issues
 from sag.metrics.module_keys import module_key, module_keys
 
 # Successful build tasks identify projects participating in the CI build.
@@ -26,16 +27,13 @@ _GRADLE_TASK_RE = re.compile(
     r"> Task (?P<path>(?::[A-Za-z0-9_.\-]+)*):"
     r"(?P<task>compileJava|compileKotlin|compileScala|compileGroovy|classes|jar)\b(?P<suffix>[^\r\n]*)"
 )
-_MAVEN_SUMMARY_RE = re.compile(
-    r"\[INFO\][ \t]+(?P<name>\S[^\r\n]*?)[ \t]+\.{2,}[ \t]+(?P<status>SUCCESS|FAILURE|SKIPPED)\b"
-)
 # Packaging plugins also print unindented `Building jar: <path>` lines.
 # They name artifacts, not additional projects.
 _MAVEN_BUILDING_RE = re.compile(
     r"\[INFO\] Building (?!(?:jar|war|ear|zip|tar)(?: archive)?:)"
-    r"(?P<name>\S.*?)(?: \[\d+/\d+\])?\s*$"
+    r"(?P<name>\S.*?)(?: \[(?P<index>\d+)/(?P<total>\d+)\])?\s*$"
 )
-_MAVEN_RESULT_RE = re.compile(r"\[INFO\] BUILD (?P<result>SUCCESS|FAILURE)\b")
+_MAVEN_RESULT_RE = re.compile(r"\[INFO\] BUILD (?P<result>SUCCESS|FAILURE)[ \t]*$")
 _JOB_FILE_RE = re.compile(r"^\d+_(?P<job>.+)\.txt$")
 
 
@@ -48,6 +46,8 @@ class LogModules(BaseModel):
     modules: tuple[str, ...] = ()
     skipped: int = 0
     failed: int = 0
+    ambiguous_labels: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 def modules_from_log(text: str) -> LogModules:
@@ -72,25 +72,70 @@ def modules_from_log(text: str) -> LogModules:
             tool="gradle", modules=module_keys(built - failed), failed=len(failed), skipped=skipped
         )
 
-    rows = list(_MAVEN_SUMMARY_RE.finditer(text))
-    if rows:
-        maven_built = [match.group("name") for match in rows if match.group("status") == "SUCCESS"]
+    blocks = parse_maven_reactor(text)
+    lines = text.splitlines()
+    results = [
+        (i, match) for i, line in enumerate(lines) if (match := _MAVEN_RESULT_RE.search(line))
+    ]
+    summary_lines = {row.line_number - 1 for block in blocks for row in block.rows}
+    building = [
+        (i, match)
+        for i, line in enumerate(lines)
+        if i not in summary_lines and (match := _MAVEN_BUILDING_RE.search(line))
+    ]
+    scans = [
+        i
+        for i, line in enumerate(lines)
+        if i not in summary_lines and "[INFO] Scanning for projects" in line
+    ]
+    step_boundaries = [
+        i for i, line in enumerate(lines) if "##[group]" in line or "##[endgroup]" in line
+    ]
+    if blocks:
+        rows = [row for block in blocks for row in block.rows]
+        notes: list[str] = []
+        ambiguous = tuple(dict.fromkeys(name for b in blocks for name in b.duplicate_labels))
+        # module_keys is a coordinate normalizer, not a display-name resolver.
+        # Even distinct labels must not collapse through it into one coordinate.
+        keys: dict[str, list[str]] = {}
+        for row in rows:
+            keys.setdefault(module_key(row.module), []).append(row.module)
+        collisions = tuple(name for names in keys.values() if len(set(names)) > 1 for name in names)
+        ambiguous = tuple(dict.fromkeys((*ambiguous, *collisions)))
+        if ambiguous:
+            notes.append("Maven module identity ambiguous: " + ", ".join(ambiguous))
+        notes.extend(
+            f"Maven build scope unavailable: {issue}"
+            for issue in reactor_scope_issues(text, blocks)
+        )
+        maven_built = [row.module for row in rows if row.status == "SUCCESS"]
         return LogModules(
             tool="maven",
-            modules=module_keys(maven_built) if maven_built else (),
-            skipped=sum(1 for match in rows if match.group("status") == "SKIPPED"),
-            failed=sum(1 for match in rows if match.group("status") == "FAILURE"),
+            modules=module_keys(maven_built) if not notes else (),
+            skipped=sum(row.status == "SKIPPED" for row in rows),
+            failed=sum(row.status == "FAILURE" for row in rows),
+            ambiguous_labels=ambiguous,
+            notes=tuple(notes),
         )
 
-    result = _MAVEN_RESULT_RE.search(text)
-    building = [
-        match for match in (_MAVEN_BUILDING_RE.search(line) for line in text.splitlines()) if match
-    ]
-    if result is not None and len(building) == 1:
-        # One project, no reactor: the root is the whole universe.
-        succeeded = result.group("result") == "SUCCESS"
+    if (
+        len(results) == len(building) == 1
+        and building[0][0] < results[0][0]
+        and (not scans or (len(scans) == 1 and scans[0] < building[0][0]))
+        and building[0][1].group("total") in (None, "1")
+        and building[0][1].group("index") in (None, "1")
+        and not any(building[0][0] < i < results[0][0] for i in step_boundaries)
+    ):
+        # One bounded build, one project, one terminal result. A marker in a
+        # different invocation cannot turn the whole mixed job into root scope.
+        succeeded = results[0][1].group("result") == "SUCCESS"
         return LogModules(
             tool="maven", modules=(".",) if succeeded else (), failed=0 if succeeded else 1
+        )
+    if results or building:
+        return LogModules(
+            tool="maven",
+            notes=("Maven single-module build scope unavailable: ambiguous invocation boundaries",),
         )
     return LogModules()
 

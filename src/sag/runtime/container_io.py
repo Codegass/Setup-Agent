@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import re
 import shlex
 from collections.abc import Callable
 from typing import Any, Mapping, Optional, cast
 
 _PAYLOAD_MARKER = "__SAG_FILE_BASE64__"
 _MISSING_MARKER = "__SAG_FILE_MISSING__"
+_PREFIX_MARKER = "SAG_FILE_PREFIX_V1"
+_PREFIX_END_MARKER = "SAG_FILE_PREFIX_END_V1"
 
 
 class ContainerFileReadError(RuntimeError):
@@ -88,6 +92,75 @@ def _execute_untruncated(orchestrator: Any, command: str) -> Mapping[str, Any]:
     if not isinstance(result, Mapping):
         raise ContainerFileReadError("container read returned a non-mapping result")
     return result
+
+
+def read_container_prefix(source: Any, path: str, *, max_bytes: int) -> tuple[bytes, bool]:
+    """Read an exact byte prefix and whether the file extends beyond it.
+
+    Only ``max_bytes + 1`` bytes are read in the container. The extra byte
+    distinguishes an exactly full budget from a truncated file; it is never
+    returned or hashed. Framing survives presentation whitespace stripping,
+    while its length and digest reject clipped or changed transport data.
+    Missing files and unverified reads raise ``ContainerFileReadError``.
+    """
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("max_bytes must be a nonnegative integer")
+    script = (
+        "import base64,hashlib,sys\n"
+        "limit=int(sys.argv[2])\n"
+        "with open(sys.argv[1], 'rb') as source:\n"
+        " data=source.read(limit+1)\n"
+        "raw=data[:limit]\n"
+        f"print('{_PREFIX_MARKER}\\t'+str(len(raw))+'\\t'+"
+        "hashlib.sha256(raw).hexdigest()+'\\t'+str(int(len(data)>limit))+'\\t'+"
+        "base64.b64encode(raw).decode('ascii'))\n"
+        f"print('{_PREFIX_END_MARKER}')\n"
+    )
+    command = f"python3 -c {shlex.quote(script)} {shlex.quote(path)} {max_bytes}"
+    result = _execute_untruncated(source, command)
+    if (
+        result.get("success") is False
+        or type(result.get("exit_code")) is not int
+        or result["exit_code"] != 0
+        or result.get("dispatch_status")
+    ):
+        raise ContainerFileReadError(f"bounded container read did not succeed for {path}")
+    output = result.get("output")
+    # Bound the encoded reply before decoding. This is a single prefix frame,
+    # not an arbitrary successful command whose text may be accepted as data.
+    max_output_bytes = ((max_bytes + 2) // 3 * 4) + len(str(max_bytes)) + 128
+    if not isinstance(output, str) or len(output) > max_output_bytes:
+        raise ContainerFileReadError(f"bounded container read returned invalid frame for {path}")
+    lines = output.removesuffix("\n").split("\n")
+    if len(lines) != 2 or lines[1] != _PREFIX_END_MARKER:
+        raise ContainerFileReadError(f"bounded container read returned invalid frame for {path}")
+    fields = lines[0].split("\t")
+    if (
+        len(fields) != 5
+        or fields[0] != _PREFIX_MARKER
+        or re.fullmatch(r"0|[1-9][0-9]*", fields[1]) is None
+        or len(fields[1]) > len(str(max_bytes))
+        or re.fullmatch(r"[0-9a-f]{64}", fields[2]) is None
+        or fields[3] not in ("0", "1")
+    ):
+        raise ContainerFileReadError(f"bounded container read returned invalid frame for {path}")
+    byte_count = int(fields[1])
+    has_more = fields[3] == "1"
+    if byte_count > max_bytes or (has_more and byte_count != max_bytes):
+        raise ContainerFileReadError(f"bounded container read exceeded its budget for {path}")
+    try:
+        raw = base64.b64decode(fields[4], validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ContainerFileReadError(
+            f"bounded container read returned invalid payload for {path}"
+        ) from exc
+    if (
+        len(raw) != byte_count
+        or hashlib.sha256(raw).hexdigest() != fields[2]
+        or base64.b64encode(raw).decode("ascii") != fields[4]
+    ):
+        raise ContainerFileReadError(f"bounded container read returned invalid payload for {path}")
+    return raw, has_more
 
 
 def _direct_read(

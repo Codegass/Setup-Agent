@@ -1706,17 +1706,19 @@ def test_maven_retry_dispatch_failure_preserves_first_real_dispatch(
             self.soft_timeout_calls.append(command)
             return self.results.pop(0)
 
-    def preflight(_self, required, source):
-        if source == "build-error":
+    def preflight(_self, required, source, *, requirements=None):
+        if source == "runner-observed:build-error":
             return SimpleNamespace(
                 provisioned=True,
                 active_version="17",
                 narration="",
+                conflicts=(),
             )
         return SimpleNamespace(
             provisioned=False,
             active_version="11",
             narration="",
+            conflicts=(),
         )
 
     monkeypatch.setattr(

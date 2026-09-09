@@ -233,9 +233,7 @@ class TestDisposition(_FrozenPlanModel):
         if self.status == "planned" and self.readiness != "ready":
             raise ValueError("planned test disposition requires readiness=ready")
         if self.status == "planned" and self.verdict_scope != "product_test_cases":
-            raise ValueError(
-                "planned test disposition requires verdict_scope=product_test_cases"
-            )
+            raise ValueError("planned test disposition requires verdict_scope=product_test_cases")
         return self
 
 
@@ -309,9 +307,7 @@ class ProjectExecutionPlan(_FrozenPlanModel):
                     "test disposition evidence must cite a reviewed-document output ref"
                 )
             if not set(self.test_disposition.definition_evidence_refs).issubset(document_refs):
-                raise ValueError(
-                    "test entry definition must cite a reviewed-document output ref"
-                )
+                raise ValueError("test entry definition must cite a reviewed-document output ref")
         size = len(canonical_json(self.model_dump(mode="json")).encode("utf-8"))
         if size > MAX_AUTHORED_PLAN_BYTES:
             raise ValueError("authored project execution plan exceeds the canonical byte bound")
@@ -484,6 +480,44 @@ def validate_authored_plan(
             raise TypeError("authored plan candidate must be a mapping or JSON object")
         if require_test_disposition and plan.test_disposition is None:
             raise ValueError("test_disposition is required for a new Analyze plan")
+        if require_test_disposition:
+            # New submissions must state the executable interpretation. Keep
+            # this out of the model validators so archived payloads and seals
+            # remain byte-for-byte readable.
+            from sag.tools.build.backends import source_command_tokens
+
+            for step in (*plan.build_steps, *plan.test_steps):
+                cwd = step.params.get("working_directory")
+                if (
+                    not isinstance(cwd, str)
+                    or not (cwd == "/workspace" or cwd.startswith("/workspace/"))
+                    or posixpath.normpath(cwd) != cwd
+                ):
+                    raise ValueError(
+                        "new execution steps require an explicit canonical workspace working_directory"
+                    )
+                if step.tool != "build" or step.params.get("action") in {"deps", "native"}:
+                    continue
+                system = step.params.get("system")
+                source = step.params.get("source_command")
+                if system not in {"maven", "gradle", "python"} or not source:
+                    raise ValueError(
+                        "new build execution steps require explicit system and source_command"
+                    )
+                source_command_tokens(
+                    source, system, step.params.get("action"), step.params.get("args")
+                )
+            disposition = plan.test_disposition
+            if disposition is not None and disposition.execution_mechanism.lower().startswith(
+                "make "
+            ):
+                if any(
+                    step.tool == "build" and step.params.get("system") != "python"
+                    for step in plan.test_steps
+                ):
+                    raise ValueError(
+                        "Make test mechanism cannot be encoded as a different build executor; review its recipe or mark it blocked"
+                    )
         # The after-validator checks the canonical bound; this copy also makes
         # the return value independent from caller-owned mutable structures.
         return plan.model_copy(deep=True)
@@ -887,9 +921,7 @@ def write_sealed_project_execution_plan(
             validated = SealedProjectExecutionPlan.model_validate(dict(artifact))
         else:
             raise TypeError("artifact must be a SealedProjectExecutionPlan or mapping")
-        body = canonical_json(
-            _sealed_plan_payload(validated, include_artifact_sha256=True)
-        )
+        body = canonical_json(_sealed_plan_payload(validated, include_artifact_sha256=True))
         if len(body.encode("utf-8")) > MAX_SEALED_PLAN_BYTES:
             raise ValueError("sealed artifact exceeds the byte bound")
     except (TypeError, ValueError, ValidationError):

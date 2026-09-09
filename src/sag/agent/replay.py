@@ -127,7 +127,7 @@ _V4_RATE_CONFLICTS = frozenset({UNBOUNDED_CONFLICT})
 def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
     """Project today's replay into the immutable verdict-v3 comparison shape.
 
-    The replay still executes and returns the v4 finalizer result. This view is
+    The replay still executes and returns the current finalizer result. This view is
     comparison-only: it preserves old transcript bytes without granting live
     authority to v3 or rewriting the recorded expectation.
     """
@@ -150,6 +150,7 @@ def _legacy_v3_snapshot_projection(snapshot: RunVerdictSnapshot) -> dict[str, An
         conflicts,
     )
     payload.pop("rates", None)
+    payload.pop("ci_comparison", None)
     return payload
 
 
@@ -2422,6 +2423,11 @@ class ControlReplayRunner:
         if self.verify_expected:
             if header.expected_snapshot.get("schema_version") == 3:
                 actual_snapshot = _legacy_v3_snapshot_projection(snapshot)
+            elif header.expected_snapshot.get("schema_version") == 4:
+                # Compare historical rates and verdict verbatim. Only the
+                # additive v5 CI field is outside this archived shape.
+                actual_snapshot["schema_version"] = 4
+                actual_snapshot.pop("ci_comparison", None)
             if actual_snapshot != header.expected_snapshot:
                 raise ReplayMismatchError("replayed snapshot differs from frozen expectation")
             if digest != header.expected_event_digest:

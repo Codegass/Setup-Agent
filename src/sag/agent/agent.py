@@ -22,6 +22,7 @@ from sag.docker_orch.orch import DockerOrchestrator
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
 from sag.verdict_rates import execution_sentence
 
+from .ci_comparison import PinnedCITarget
 from .context_manager import ContextManager
 from .control_events import (
     ControlEventSink,
@@ -202,6 +203,7 @@ class SetupAgent:
         self._run_pin_template = None
         self._observed_target_repo_sha = None
         if workflow_mode != "setup":
+            self._setup_ci_target = None
             self.phase_machine = None
             self.context_journal = None
             self.run_evidence_state = None
@@ -422,13 +424,22 @@ class SetupAgent:
             "canonical_payload",
             self.react_engine.prompts,
         )
+        frozen_config = sanitize_config(self.config)
+        target = getattr(self, "_setup_ci_target", None)
+        if target is not None:
+            frozen_config["ci_target"] = {
+                "record_sha256": target.raw_sha256,
+                "repo": target.record.repo,
+                "sha": target.record.sha,
+                "matched_cell": target.record.matched_cell,
+            }
         self._run_pin_template = {
             "run_id": self.run_id,
             "container_image_digest": image_digest,
             "sag_git_sha": sag_git_sha,
             "thinking_model": self.config.thinking_model,
             "action_model": self.config.action_model,
-            "sanitized_config": sanitize_config(self.config),
+            "sanitized_config": frozen_config,
             # Hash the complete prompt bundle. Event projections are bounded,
             # but a reproducibility pin must notice suffix-only prompt edits.
             "prompt_bundle_sha256": canonical_sha256(prompt_bundle),
@@ -804,6 +815,7 @@ class SetupAgent:
         docker_label: Optional[str] = None,
         project_ref: Optional[str] = None,
         pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
+        ci_target: PinnedCITarget | None = None,
     ) -> RunTermination:
         """Setup a project from scratch.
 
@@ -873,7 +885,10 @@ class SetupAgent:
 
             self.phase_machine = PhaseMachine()
             self.run_evidence_state = RunEvidenceState(run_id=run_id)
-            self.verdict_finalizer = VerdictFinalizer(self.orchestrator)
+            self._setup_ci_target = ci_target
+            self.verdict_finalizer = VerdictFinalizer(
+                self.orchestrator, repository=project_url, ci_target=ci_target
+            )
             self.context_journal = ContextJournal(self.orchestrator)
             # Actual repo directory name (from URL); the phase gates probe
             # /workspace/<project_name> with it.

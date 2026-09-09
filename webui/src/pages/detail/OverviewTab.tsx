@@ -115,6 +115,13 @@ export function OverviewTab({
         />
       </div>
 
+      <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3" aria-label="Official CI comparison">
+        <h2 className="text-[13px] font-semibold text-foreground">Official CI comparison</h2>
+        {(detail.ciComparisonLines?.length ? detail.ciComparisonLines : ["Official CI: unavailable (no sealed comparison)"]).map((line, index) => (
+          <p key={`${index}-${line}`} className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{line}</p>
+        ))}
+      </section>
+
       {ms?.lineRate != null || ms?.branchRate != null ? (
         <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
           {ms?.lineRate != null ? (

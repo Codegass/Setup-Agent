@@ -1905,7 +1905,7 @@ def test_test_bootstraps_pytest_into_the_venv_when_missing():
     orch = Orch(
         manifest=dict(MANIFEST),
         rules=[
-            ("-m pytest --version", fail("No module named pytest")),
+            ("-m pytest --version", FailThenOk("No module named pytest")),
             ("--collect-only", ok("3 tests collected in 0.01s")),
         ],
     )
@@ -2707,3 +2707,200 @@ def test_native_unready_real_pytest_collection_accepts_owned_concrete_path(tmp_p
     assert result.succeeded is True
     assert result.metadata["selection_mode"] == "explicit"
     assert result.metadata["collected_after_deselection"] == 1
+
+
+@pytest.mark.usefixtures("exact_build_facade_authority")
+def test_make_pytest_recipe_keeps_real_failure_and_repaired_receipts(tmp_path, monkeypatch):
+    """Real pytest/XML, with only container transport and environment activation doubled."""
+    from sag.tools.build.build_tool import BuildTool
+
+    monkeypatch.setattr(PythonTool, "execute", _ORIGINAL_PYTHON_EXECUTE)
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_ready.py").write_text(
+        "import os\ndef test_ready():\n    assert os.environ.get('SAG_FIXTURE_READY') == '1'\n"
+    )
+    (tmp_path / "Makefile").write_text("unit: prepare\n\tpython -m pytest tests/\n")
+    state = {"ready": False, "reports": {}, "runs": []}
+
+    def snapshot(command):
+        return ok("".join(f"{digest}  {path}\n" for path, digest in state["reports"].items()))
+
+    def run_pytest(command):
+        import os
+
+        argv = shlex.split(command)
+        collect = "--collect-only" in argv
+        virtual_report = next(
+            (token.split("=", 1)[1] for token in argv if token.startswith("--junitxml=")), None
+        )
+        report = tmp_path / f"result-{len(state['runs'])}.xml"
+        flags = (
+            ["--collect-only", "-q", "tests/"]
+            if collect
+            else ["-q", "tests/", f"--junitxml={report}"]
+        )
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", *flags],
+            cwd=tmp_path,
+            env={**os.environ, "SAG_FIXTURE_READY": "1" if state["ready"] else "0"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if not collect:
+            raw = report.read_bytes()
+            state["reports"][virtual_report] = hashlib.sha256(raw).hexdigest()
+            state["runs"].append(
+                {
+                    "argv": command,
+                    "exit": completed.returncode,
+                    "xml": raw,
+                    "sha256": state["reports"][virtual_report],
+                }
+            )
+        return {
+            "success": completed.returncode == 0,
+            "exit_code": completed.returncode,
+            "output": completed.stdout + completed.stderr,
+        }
+
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -f /workspace/proj/pyproject.toml && echo exists", ok("exists")),
+            ("test -e /workspace/proj/tests", ok("EXISTS")),
+            (
+                "realpath -m -- /workspace /workspace/proj",
+                ok("/workspace\n/workspace/proj\n/workspace/proj/tests\n"),
+            ),
+            ("--collect-only", run_pytest),
+            ("sha256sum", snapshot),
+            ("--junitxml", run_pytest),
+        ],
+    )
+    facade = BuildTool(orch, python_tool=PythonTool(orch))
+    params = {
+        "action": "test",
+        "system": "python",
+        "source_command": "python -m pytest tests/",
+        "args": "tests/",
+        "working_directory": "/workspace/proj",
+    }
+    failed = facade.execute(**params)
+    state["ready"] = True
+    repaired = facade.execute(**params)
+    assert failed.metadata["exit_code"] == 1
+    assert repaired.succeeded
+    assert [run["exit"] for run in state["runs"]] == [1, 0]
+    receipts = written_python_receipts(orch.commands)
+    assert len(receipts) == 2
+    assert {receipt["exit_code"] for receipt in receipts} == {0, 1}
+    assert len({receipt["receipt_id"] for receipt in receipts}) == 2
+    assert len({receipt["output_content_hash"] for receipt in receipts}) == 2
+    assert all(receipt["tool"] == "python" for receipt in receipts)
+    assert all(receipt["working_directory"] == "/workspace/proj" for receipt in receipts)
+    assert all(
+        receipt["report_delta"]["new"] or receipt["report_delta"]["changed"] for receipt in receipts
+    )
+    assert all("--junitxml=" in run["argv"] and "tests/" in run["argv"] for run in state["runs"])
+    assert len(list(ET.fromstring(state["runs"][0]["xml"]).iter("failure"))) == 1
+    assert len(list(ET.fromstring(state["runs"][1]["xml"]).iter("failure"))) == 0
+
+
+@pytest.mark.parametrize("environment", ["missing_interpreter", "interpreter_without_pip"])
+def test_pytest_bootstrap_preserves_real_missing_executable_and_pip_failure(tmp_path, environment):
+    """Run the actual venv executable/probe/installer commands, without a network."""
+    venv = tmp_path / ".venv"
+    if environment == "interpreter_without_pip":
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert created.returncode == 0, created.stderr
+    physical_results = []
+
+    def physical(command):
+        process = subprocess.run(
+            command, shell=True, cwd=tmp_path, capture_output=True, text=True, timeout=30
+        )
+        result = {
+            "success": process.returncode == 0,
+            "exit_code": process.returncode,
+            "output": process.stdout + process.stderr,
+        }
+        physical_results.append(result)
+        return result
+
+    orch = Orch(rules=[(str(venv / "bin/python"), physical)])
+    result = PythonTool(orch)._run_tests(str(tmp_path), None, 30, {}, str(venv))
+    assert not result.succeeded
+    assert result.error_code == "PYTEST_BOOTSTRAP_FAILED"
+    assert result.metadata["runner_dispatched"] is False
+    assert result.metadata["exit_code"] == physical_results[-1]["exit_code"]
+    assert physical_results[-1]["output"].strip() in result.output
+    assert "installed for the run" not in result.output
+    assert not any(
+        "--collect-only" in command or "--junitxml" in command for command in orch.commands
+    )
+    assert written_python_receipts(orch.commands) == []
+    if environment == "missing_interpreter":
+        assert result.metadata["exit_code"] == 127
+        assert result.metadata["bootstrap_stage"] == "probe"
+        assert len(physical_results) == 1
+        assert not any("pip install" in command for command in orch.commands)
+    else:
+        assert result.metadata["exit_code"] == 1
+        assert result.metadata["bootstrap_stage"] == "install"
+        assert len(physical_results) == 2
+        assert "No module named pip" in result.output
+
+
+def test_pytest_bootstrap_does_not_treat_arbitrary_probe_failure_as_missing_pytest():
+    orch = Orch(rules=[("-m pytest --version", fail("pytest plugin initialization failed", 2))])
+    result = PythonTool(orch)._run_tests("/workspace/proj", None, 30, {}, "/workspace/proj/.venv")
+    assert not result.succeeded
+    assert result.metadata["exit_code"] == 2
+    assert result.metadata["bootstrap_stage"] == "probe"
+    assert not any("pip install" in command for command in orch.commands)
+    assert written_python_receipts(orch.commands) == []
+
+
+def test_successful_installer_exit_does_not_replace_a_working_pytest_probe():
+    orch = Orch(rules=[("-m pytest --version", fail("No module named pytest"))])
+    result = PythonTool(orch)._run_tests("/workspace/proj", None, 30, {}, "/workspace/proj/.venv")
+    assert not result.succeeded
+    assert result.metadata["bootstrap_stage"] == "verify"
+    assert "installed for the run" not in result.output
+    assert not any(
+        "--collect-only" in command or "--junitxml" in command for command in orch.commands
+    )
+    assert written_python_receipts(orch.commands) == []
+
+
+def test_detached_pytest_install_remains_pending_without_starting_tests():
+    pending = {
+        "success": False,
+        "exit_code": None,
+        "output": "installation still running",
+        "dispatch_status": "running_detached",
+        "runner_dispatched": True,
+        "dispatch": {"job_id": "pytest-bootstrap", "log_path": "/tmp/pytest-bootstrap.log"},
+    }
+    orch = Orch(
+        rules=[
+            ("-m pytest --version", fail("No module named pytest")),
+            ("-m pip install pytest", pending),
+        ]
+    )
+    result = PythonTool(orch)._run_tests("/workspace/proj", None, 30, {}, "/workspace/proj/.venv")
+    assert not result.is_terminal
+    assert result.poll_ref == "job:pytest-bootstrap"
+    assert result.metadata["bootstrap_stage"] == "install"
+    assert "installed for the run" not in result.output
+    assert not any(
+        "--collect-only" in command or "--junitxml" in command for command in orch.commands
+    )
+    assert written_python_receipts(orch.commands) == []

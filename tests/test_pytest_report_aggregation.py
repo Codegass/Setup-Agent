@@ -31,9 +31,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from container_evidence_fakes import add_published_mutable_json, complete_run_pin
 from test_container_io import FakeContainer
 
+from sag.agent.evidence_publications import RUN_PIN_LOGICAL_ARTIFACT_ID
 from sag.agent.evidence_records import frame_named_json_record_stream
+from sag.agent.invocation_receipts import active_receipt_run_id, build_receipt
 from sag.agent.physical_validator import PhysicalValidator
 from sag.tools.internal.python_tool import COLLECTED_JSON, PYTEST_REPORT_DIR
 from sag.tools.report_tool import ReportTool
@@ -47,13 +50,29 @@ class LocalExecOrch:
     """Executes every validator command via bash so the compact in-container
     parser runs exactly as it would inside the container."""
 
-    def __init__(self):
+    def __init__(self, project):
         self.commands = []
         self.atomic = FakeContainer()
+        self.pin_path = project.parent / ".setup_agent/run-pin.json"
+        self.pin_raw = add_published_mutable_json(
+            self,
+            self.atomic,
+            path=str(self.pin_path),
+            record_kind="run_pin",
+            record_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            logical_artifact_id=RUN_PIN_LOGICAL_ARTIFACT_ID,
+            payload=complete_run_pin(active_receipt_run_id(), "a" * 40),
+        )
 
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
         text = cmd.strip()
+        if str(self.pin_path) in text and "SAG_NAMED_JSON_RECORD_V1" in text:
+            return {
+                "exit_code": 0,
+                "success": True,
+                "output": frame_named_json_record_stream([("run-pin.json", self.pin_raw)]),
+            }
         if text.startswith(
             (
                 "mkdir -p -- ",
@@ -203,24 +222,36 @@ def _claiming_receipt(project):
 
     roots = [Path(project), Path(python_tool.PYTEST_REPORT_DIR)]
     claimed = sorted({str(path) for root in roots if root.is_dir() for path in root.rglob("*.xml")})
-    return {
-        "working_directory": str(project),
-        "report_delta": {
-            "new": [
-                {"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
-                for path in claimed
-            ],
-            "changed": [],
-        },
+    receipt = build_receipt(
+        receipt_id="inv-python-1-0001",
+        tool="python",
+        requested_action="test",
+        effective_action="test",
+        argv="python -m pytest",
+        working_directory=str(project),
+        target_sha="a" * 40,
+        exit_code=0,
+        before={},
+        after={},
+    )
+    receipt["report_delta"] = {
+        "new": [
+            {"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+            for path in claimed
+        ],
+        "changed": [],
     }
+    return receipt
 
 
 def _parse(project):
     validator = PhysicalValidator(
-        docker_orchestrator=LocalExecOrch(), project_path=str(project.parent)
+        docker_orchestrator=LocalExecOrch(project), project_path=str(project.parent)
     )
     # The published-ledger seam: these fixtures write reports directly rather
     # than through a runner, so the ledger states what that runner would have.
+    # The current run/SHA scope is still checked against a real published pin;
+    # ledger publication and report ownership have their separate fence tests.
     validator._read_live_invocation_receipts = lambda: [_claiming_receipt(project)]
     return validator.parse_test_reports(str(project))
 
@@ -414,7 +445,7 @@ class CompactParserDownOrch(LocalExecOrch):
 
 def _parse_fallback(project):
     validator = PhysicalValidator(
-        docker_orchestrator=CompactParserDownOrch(), project_path=str(project.parent)
+        docker_orchestrator=CompactParserDownOrch(project), project_path=str(project.parent)
     )
     return validator.parse_test_reports(str(project))
 

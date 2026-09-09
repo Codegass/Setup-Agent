@@ -925,7 +925,19 @@ class PhaseTool(BaseTool):
                                     "additionalProperties": False,
                                     "properties": {
                                         "tool": {"type": "string", "maxLength": 64},
-                                        "params": {"type": "object"},
+                                        "params": {
+                                            "type": "object",
+                                            "description": (
+                                                "Exact public tool parameters with explicit working_directory. "
+                                                "Build execution steps require system and source_command matching action/args, "
+                                                "e.g. action=install, system=maven, args='clean -DskipTests', "
+                                                "source_command='./mvnw clean install -DskipTests'. "
+                                                "Keep wrapper setup and producer package/install as preceding steps. "
+                                                "For Make targets inspect the recipe, then use explicit setup plus the actual "
+                                                "pytest command/cwd; do not pass the Make target name to Gradle or pytest. "
+                                                "deps/native describe project-declared setup and do not require source_command."
+                                            ),
+                                        },
                                         "purpose": {"type": "string", "maxLength": 1000},
                                         "evidence_refs": {
                                             "type": "array",

@@ -172,6 +172,7 @@ EXPECTED_OBSERVATIONS = {
     "install": ("artifact_or_report_delta",),
     "package": ("artifact_or_report_delta",),
     "test": ("report_delta",),
+    "verify": ("report_delta",),
 }
 PYTHON_EXPECTED_OBSERVATIONS = {
     "deps": ("python_setup_observation",),
@@ -1432,7 +1433,9 @@ def _validate_v2_contract_shape(
             "requested_call.params.action",
             lowercase=True,
         )
-        if action not in PYTHON_PUBLIC_ACTION_TO_OPERATION:
+        if action not in PYTHON_PUBLIC_ACTION_TO_OPERATION and not (
+            action == "verify" and contract.get("effective_tool") == "maven"
+        ):
             raise ValueError("invocation contract public build action is not recognized")
         public_cwd = params.get("working_directory")
         if public_cwd is not None:
