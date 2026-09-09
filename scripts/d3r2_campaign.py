@@ -28,6 +28,7 @@ SMALL = (
 )
 LOCK = threading.Lock()
 STOP = threading.Event()
+MAX_SOURCE_PATCH_BYTES = 16 * 1024 * 1024
 ENV_ALIASES = {
     "thinking_max_tokens": "SAG_MAX_THINKING_TOKENS",
     "action_max_tokens": "SAG_MAX_ACTION_TOKENS",
@@ -420,6 +421,56 @@ def archive_container(project: dict, directory: Path, identity: str) -> dict:
                     "output": probe.stdout,
                     "error": probe.stderr,
                 }
+            patch_path = directory / "source.patch"
+            patch = {
+                "path": patch_path.name,
+                "scope": "tracked changes against HEAD; untracked paths remain in source_status",
+                "exit_code": None,
+                "max_retained_bytes": MAX_SOURCE_PATCH_BYTES,
+            }
+            try:
+                # Stream directly to a separate file, preserving binary patches
+                # and legitimate empty output without a text/display projection.
+                with patch_path.open("wb") as stream:
+                    diff = subprocess.run(
+                        [
+                            "docker",
+                            "exec",
+                            identity,
+                            "git",
+                            "-C",
+                            project_path,
+                            "diff",
+                            "HEAD",
+                            "--binary",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                        ],
+                        stdout=stream,
+                        stderr=subprocess.PIPE,
+                        timeout=60,
+                    )
+                patch.update(exit_code=diff.returncode, error=diff.stderr.decode(errors="replace"))
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                patch["error"] = f"{type(exc).__name__}: {exc}"
+                patch["timeout"] = isinstance(exc, subprocess.TimeoutExpired)
+            finally:
+                if patch_path.is_file():
+                    observed_size = patch_path.stat().st_size
+                    truncated = observed_size > MAX_SOURCE_PATCH_BYTES
+                    if truncated:
+                        with patch_path.open("r+b") as stream:
+                            stream.truncate(MAX_SOURCE_PATCH_BYTES)
+                    patch.update(
+                        collected_bytes=observed_size,
+                        retained_bytes=patch_path.stat().st_size,
+                        sha256=digest(patch_path),
+                        truncated=truncated,
+                        complete=patch["exit_code"] == 0 and not truncated,
+                    )
+                else:
+                    patch.update(retained_bytes=0, sha256=None, truncated=False, complete=False)
+                diagnostics["source_patch"] = patch
             paths = set()
             # Keep diagnostic reports as well as claimed ones. Attribution needs
             # to distinguish a missing receipt from an actually absent report.

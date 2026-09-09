@@ -1,6 +1,8 @@
 """Campaign preparation and resume boundaries do not launch Docker or models."""
 
+import hashlib
 import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -229,3 +231,128 @@ def test_collector_authority_cannot_substitute_a_different_prepared_subject(
         assert "verdict" not in result
     # Keep the authorized-but-wrong observation available for attribution.
     assert json.loads((tmp_path / "runs/subject-candidate/collected.json").read_text()) == payload
+
+
+def _archive_with_patch(tmp_path, monkeypatch, produce_patch):
+    calls = []
+    monkeypatch.setattr(
+        campaign,
+        "inspect_container",
+        lambda _identity: {"Id": "owned", "State": {"Running": True}, "Mounts": []},
+    )
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "--binary" in argv:
+            assert argv == [
+                "docker",
+                "exec",
+                "owned",
+                "git",
+                "-C",
+                "/workspace/demo",
+                "diff",
+                "HEAD",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+            ]
+            assert kwargs["stdout"].name.endswith("source.patch")
+            assert not kwargs.get("capture_output") and not kwargs.get("text")
+            return produce_patch(argv, kwargs)
+        text = kwargs.get("text")
+        output = " M tracked.bin\n?? generated/\n" if "status" in argv else ""
+        return SimpleNamespace(
+            returncode=0, stdout=output if text else b"", stderr="" if text else b""
+        )
+
+    monkeypatch.setattr(campaign.subprocess, "run", run)
+    directory = tmp_path / "archive"
+    directory.mkdir()
+    result = campaign.archive_container(
+        {"repo": "apache/demo", "seat": "alias"}, directory, "owned"
+    )
+    assert calls[-1] == ["docker", "stop", "--time", "20", "owned"]
+    assert result["raw_reports"]["exit_code"] == 0  # Patch failure must not skip report recovery.
+    assert result["source_status"]["output"].endswith("?? generated/\n")
+    assert (
+        json.loads((directory / "diagnostics.json").read_text())["source_patch"]
+        == result["source_patch"]
+    )
+    return directory / "source.patch", result["source_patch"]
+
+
+@pytest.mark.parametrize(
+    "body,exit_code,timed_out,expected_complete,expected_truncated",
+    [
+        (b"", 0, False, True, False),
+        (b"binary\x00\xff\xfe\n", 0, False, True, False),
+        (b"partial diff", 128, False, False, False),
+        (b"x" * 32, 0, False, True, False),
+        (b"x" * 33, 0, False, False, True),
+        (b"unfinished diff", None, True, False, False),
+    ],
+    ids=["empty", "binary", "failed", "at-limit", "truncated", "timeout"],
+)
+def test_source_patch_archive_never_promotes_incomplete_bytes(
+    tmp_path, monkeypatch, body, exit_code, timed_out, expected_complete, expected_truncated
+):
+    monkeypatch.setattr(campaign, "MAX_SOURCE_PATCH_BYTES", 32)
+
+    def produce(argv, kwargs):
+        kwargs["stdout"].write(body)
+        if timed_out:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return SimpleNamespace(returncode=exit_code, stderr=b"git failure" if exit_code else b"")
+
+    path, facts = _archive_with_patch(tmp_path, monkeypatch, produce)
+    retained = body[:32]
+    assert path.read_bytes() == retained
+    assert facts["sha256"] == hashlib.sha256(retained).hexdigest()
+    assert facts["collected_bytes"] == len(body)
+    assert facts["retained_bytes"] == len(retained)
+    assert facts["complete"] is expected_complete
+    assert facts["truncated"] is expected_truncated
+    assert facts["exit_code"] == exit_code
+    if timed_out:
+        assert facts["timeout"] is True
+
+
+def test_source_patch_preserves_real_staged_binary_and_unstaged_changes(tmp_path, monkeypatch):
+    git = subprocess.run
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def command(*args):
+        return git(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    command("init", "-q")
+    (repo / "tracked.bin").write_bytes(b"original\x00binary")
+    (repo / "pom.xml").write_text("<project>original</project>\n")
+    command("add", ".")
+    command(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-qm",
+        "fixture",
+    )
+    (repo / "tracked.bin").write_bytes(b"replacement\x00binary")
+    command("add", "tracked.bin")
+    (repo / "pom.xml").write_text("<project>changed</project>\n")
+    expected = command("diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv").stdout
+    assert b"GIT binary patch" in expected and b"+<project>changed</project>" in expected
+
+    def produce(_argv, kwargs):
+        # Only Docker transport is replaced; actual git emits the archived bytes.
+        return git(
+            ["git", "-C", str(repo), "diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"],
+            **kwargs,
+        )
+
+    path, facts = _archive_with_patch(tmp_path, monkeypatch, produce)
+    assert path.read_bytes() == expected
+    assert facts["complete"] is True and facts["truncated"] is False
+    assert facts["sha256"] == hashlib.sha256(expected).hexdigest()
