@@ -20,9 +20,9 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}")
 _FLOOR_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
 
-# The last release of each Maven 3 line, which is what an `apache-maven-X-bin`
-# archive is published as. A floor names a LINE ("3.9"); this table names the
-# one distribution that answers it. Maven publishes every one of these under
+# The established default release for each supported Maven 3 line. A broad
+# floor ("3.9") keeps its existing resolution when an explicit CI patch is
+# added below. Maven publishes these distributions under
 # https://archive.apache.org/dist/maven/maven-3/<version>/binaries/.
 MAVEN_DISTRIBUTIONS: Dict[str, str] = {
     "3.3": "3.3.9",
@@ -31,6 +31,10 @@ MAVEN_DISTRIBUTIONS: Dict[str, str] = {
     "3.8": "3.8.8",
     "3.9": "3.9.9",
 }
+# Official CI may pin a newer patch than the established line default. Only
+# verified published releases are admitted; arbitrary patch strings must not
+# become invented Apache archive URLs (for example the nonexistent 3.7.1).
+MAVEN_EXPLICIT_PATCHES = frozenset({"3.9.11", "3.9.16"})
 # The default standalone distribution: the newest line this harness installs.
 MAVEN_PROVISION_VERSION = MAVEN_DISTRIBUTIONS["3.9"]
 
@@ -71,7 +75,7 @@ def satisfies_maven_floor(version: Any, floor: Any) -> bool:
 def maven_distribution_for_floor(floor: Any) -> Optional[str]:
     """The exact distribution version that answers this floor, or None.
 
-    Every floor resolves through the table above, because the table is what
+    Every floor resolves through the catalog above, because it is what
     this harness can actually download. A floor naming a line takes that line's
     last release; a floor naming a patch takes the same release when it
     satisfies the patch, and NONE when it does not — `3.7.1` used to be handed
@@ -83,6 +87,8 @@ def maven_distribution_for_floor(floor: Any) -> Optional[str]:
     normalized = normalize_maven_floor(floor)
     if normalized is None:
         return None
+    if normalized in MAVEN_EXPLICIT_PATCHES:
+        return normalized
     parts = normalized.split(".")
     if len(parts) >= 3:
         release = MAVEN_DISTRIBUTIONS.get(".".join(parts[:2]))
@@ -117,6 +123,9 @@ def nearest_installable_floor(floor: Any) -> Optional[str]:
         for line, version in MAVEN_DISTRIBUTIONS.items()
         if satisfies_maven_floor(version, normalized)
     ]
+    satisfying.extend(
+        version for version in MAVEN_EXPLICIT_PATCHES if satisfies_maven_floor(version, normalized)
+    )
     return min(satisfying, key=maven_version_tuple) if satisfying else None
 
 
@@ -132,5 +141,5 @@ def floor_from_requirement(requirement: Any) -> Optional[str]:
 
 
 def maven_installable_floors() -> str:
-    """The lines this harness can install, for a refusal to name."""
-    return ", ".join(sorted(MAVEN_DISTRIBUTIONS, key=maven_version_tuple))
+    """Supported line defaults and exact patches, for actionable refusals."""
+    return ", ".join(sorted(set(MAVEN_DISTRIBUTIONS) | MAVEN_EXPLICIT_PATCHES, key=maven_version_tuple))

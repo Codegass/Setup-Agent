@@ -212,6 +212,16 @@ def test_a_maven_provision_installs_activates_and_verifies_the_floor():
     assert APT_VERSION not in result.output
 
 
+@pytest.mark.parametrize("version", ["3.9.11", "3.9.16"])
+def test_official_ci_patch_is_installed_and_activated_as_requested(version):
+    container = FakeMavenContainer()
+    result = _provision(container, floor=version)
+    assert result.succeeded is True
+    assert container.downloads == [version]
+    assert container.resolved_version() == version
+    assert result.metadata["verified_maven_version"] == version
+
+
 def test_a_subsequent_dispatch_resolves_the_provisioned_maven():
     container = FakeMavenContainer()
 

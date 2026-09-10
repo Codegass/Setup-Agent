@@ -802,7 +802,9 @@ def test_the_provision_exit_carries_the_floor_of_an_exact_requirement():
         ("3.4", "3.5"),
         ("3", "3"),  # a bare major resolves to the newest line of it
         ("4.0", None),  # nothing this harness installs satisfies it
-        ("3.9.10", None),  # a patch past the newest release this harness has
+        ("3.9.10", "3.9.11"),  # nearest explicitly supported published patch
+        ("3.9.12", "3.9.16"),
+        ("3.9.17", None),  # no known supported distribution satisfies this floor
         ("", None),
     ],
 )
@@ -815,6 +817,9 @@ def test_the_installable_floor_is_the_nearest_line_that_satisfies_the_ask(floor,
     [
         ("3.9", "3.9.9"),
         ("3.9.6", "3.9.9"),  # the line's release, which satisfies the patch
+        ("3.9.11", "3.9.11"),  # preserve the official CI patch when known
+        ("3.9.16", "3.9.16"),
+        ("3.9.17", None),
         ("3.6.3", "3.6.3"),  # the line's release IS the patch asked for
         ("3.7.1", None),  # no 3.7 line, so no archive answers this patch
         ("3.8.9", None),  # the 3.8 line ended at 3.8.8
