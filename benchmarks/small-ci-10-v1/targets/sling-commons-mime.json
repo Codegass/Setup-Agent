@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "repo": "apache/sling-org-apache-sling-commons-mime",
+  "sha": "1da9c00081102f3eeef5b2053ea23cec31a42878",
+  "harvested_at": "2026-09-10T01:46:39.000065+00:00",
+  "cells": [
+    {
+      "cell_id": "Apache Jenkins sling-commons-mime Linux JDK 17 #349 Build",
+      "build": "ok",
+      "executed_count": 8,
+      "executed_ids": [
+        "org.apache.sling.commons.mime.internal.MimeTypeServiceImplTest#testFileLoading",
+        "org.apache.sling.commons.mime.internal.MimeTypeServiceImplTest#testNoMapping",
+        "org.apache.sling.commons.mime.internal.MimeTypeServiceImplTest#testProvider",
+        "org.apache.sling.commons.mime.internal.MimeTypeServiceImplTest#testProvider2",
+        "org.apache.sling.commons.mime.internal.MimeTypeServiceImplTest#testTxtMapping",
+        "org.apache.sling.commons.mime.internal.MimeTypeWebConsolePluginTest#testDoGet",
+        "org.apache.sling.commons.mime.internal.TikaMimeTypeProviderTest#testGetExtension",
+        "org.apache.sling.commons.mime.internal.TikaMimeTypeProviderTest#testGetMimeType"
+      ],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 0,
+      "modules": [
+        "."
+      ],
+      "modules_basis": "log",
+      "command": "mvn --show-version -U -B -e clean deploy javadoc:javadoc  -DaltDeploymentRepository=snapshot-repo::default::file:/home/jenkins/jenkins-agent/workspace/apache-sling-commons-mime_master/jdk_17_latest/.local-snapshots-dir -Pjacoco-report -Dci",
+      "grade": "A",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-mime/job/master/349/api/json",
+        "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-mime/job/master/349/consoleText",
+        "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-mime/job/master/349/testReport/api/json"
+      ]
+    }
+  ],
+  "matched_cell": "Apache Jenkins sling-commons-mime Linux JDK 17 #349 Build",
+  "notes": [
+    "Frozen small CI benchmark. Counts include skipped final testcase rows, as in SAG-MS-1's current adapter; non-skipped counts are also reported separately.",
+    "Full original testcase rows and byte hashes are archived; no count is inferred from a success badge.",
+    "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference."
+  ]
+}

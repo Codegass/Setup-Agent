@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "repo": "apache/httpcomponents-core",
+  "sha": "6e0fd205cfa52e59ad66e63d2e2eef8f49844697",
+  "harvested_at": "2026-09-10T01:46:55.687722+00:00",
+  "cells": [
+    {
+      "cell_id": "Apache Jenkins httpcomponents-core Linux JDK 17 #210",
+      "build": "ok",
+      "executed_count": 2232,
+      "executed_ids": [],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 4,
+      "modules": [
+        "Apache HttpComponents Core",
+        "Apache HttpComponents Core HTTP/1.1",
+        "Apache HttpComponents Core HTTP/2",
+        "Apache HttpComponents Core Integration Tests",
+        "Apache HttpComponents Core Reactive Extensions",
+        "Jackson 3 bindings for Apache HttpComponents Core"
+      ],
+      "modules_basis": "log",
+      "command": "mvn -B -f pom.xml clean verify install -Djunit.jupiter.execution.parallel.enabled=false -P-use-toolchains,nodoclint",
+      "grade": "A",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Core%205.5.x%20Java17/210/api/json",
+        "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Core%205.5.x%20Java17/210/consoleText",
+        "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Core%205.5.x%20Java17/210/testReport/api/json"
+      ]
+    }
+  ],
+  "matched_cell": "Apache Jenkins httpcomponents-core Linux JDK 17 #210",
+  "notes": [
+    "Frozen small CI benchmark. Counts include skipped final testcase rows, as in SAG-MS-1's current adapter; non-skipped counts are also reported separately.",
+    "Full original testcase rows and byte hashes are archived; no count is inferred from a success badge.",
+    "Full selected official Maven build/test invocation; no project/module/test exclusion added."
+  ]
+}

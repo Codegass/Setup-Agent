@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "repo": "apache/creadur-tentacles",
+  "sha": "6dee268ae4a15651fb6b014fa0baedc686d07aad",
+  "harvested_at": "2026-09-10T01:46:44.159726+00:00",
+  "cells": [
+    {
+      "cell_id": "Apache Jenkins creadur-tentacles Linux JDK 17 #2430 Build",
+      "build": "ok",
+      "executed_count": 2,
+      "executed_ids": [
+        "org.apache.creadur.tentacles.ArchivesJsonTest#test",
+        "org.apache.creadur.tentacles.filter.ListOfFilesFilterTest#testCreationAndToString"
+      ],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 0,
+      "modules": [
+        "."
+      ],
+      "modules_basis": "log",
+      "command": "./mvnw -B -U -V clean deploy",
+      "grade": "A",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://ci-builds.apache.org/job/Creadur/job/Creadur-Tentacles/2430/api/json",
+        "https://ci-builds.apache.org/job/Creadur/job/Creadur-Tentacles/2430/consoleText",
+        "https://ci-builds.apache.org/job/Creadur/job/Creadur-Tentacles/2430/testReport/api/json"
+      ]
+    }
+  ],
+  "matched_cell": "Apache Jenkins creadur-tentacles Linux JDK 17 #2430 Build",
+  "notes": [
+    "Frozen small CI benchmark. Counts include skipped final testcase rows, as in SAG-MS-1's current adapter; non-skipped counts are also reported separately.",
+    "Full original testcase rows and byte hashes are archived; no count is inferred from a success badge.",
+    "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference."
+  ]
+}

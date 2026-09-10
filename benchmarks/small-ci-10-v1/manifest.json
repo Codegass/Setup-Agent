@@ -1,0 +1,451 @@
+{
+  "benchmark": "small-ci-10-v1",
+  "frozen_at": "2026-09-10T01:54:09.542457+00:00",
+  "projects": [
+    {
+      "seat": "commons-dbutils",
+      "repo": "apache/commons-dbutils",
+      "sha": "e1e2d9edfab8f237aab9e733c6d61e23b35d2079",
+      "build_url": "https://ci-builds.apache.org/job/Commons/job/commons-dbutils/455/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "official_command": "mvn -B -f pom.xml -V clean test --batch-mode",
+      "scope_note": "Full selected official Maven build/test invocation; no project/module/test exclusion added.",
+      "local_command": "mvn -B -f pom.xml -V clean test --batch-mode",
+      "cell_id": "Apache Jenkins commons-dbutils Linux JDK 17 #455",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/commons-dbutils.json",
+      "target_sha256": "2abd4e565aee7bfda6f82d0b8aa632d834113589c760ee09830e1df588189ae6",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/commons-dbutils",
+      "official": {
+        "stage": null,
+        "counts_basis": "complete Jenkins final testcase rows",
+        "jdk_versions": [
+          "17.0.12"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "1.9.0-SNAPSHOT",
+        "reported": 523,
+        "passed": 523,
+        "red": 0,
+        "skipped": 0,
+        "executed_non_skipped": 523,
+        "build_modules": 1,
+        "modules": [
+          "."
+        ],
+        "ci_job_seconds": 133.661
+      }
+    },
+    {
+      "seat": "commons-net",
+      "repo": "apache/commons-net",
+      "sha": "ac1ca59667b945ec95b54e503c7b4415fd5e0276",
+      "build_url": "https://ci-builds.apache.org/job/Commons/job/commons-net/826/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.11",
+      "official_command": "mvn -B -f pom.xml -V clean install --no-transfer-progress --batch-mode",
+      "scope_note": "Full selected official Maven build/test invocation; no project/module/test exclusion added.",
+      "local_command": "mvn -B -f pom.xml -V clean install --no-transfer-progress --batch-mode",
+      "cell_id": "Apache Jenkins commons-net Linux JDK 17 #826",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/commons-net.json",
+      "target_sha256": "f900c3656dbf1d1a8ff565b0ca45e51c7a15d6717a5aad23fa6a0c60c2a2e979",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/commons-net",
+      "official": {
+        "stage": null,
+        "counts_basis": "complete Jenkins final testcase rows",
+        "jdk_versions": [
+          "17.0.12"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "3.12.1-SNAPSHOT",
+        "reported": 557,
+        "passed": 555,
+        "red": 0,
+        "skipped": 2,
+        "executed_non_skipped": 555,
+        "build_modules": 1,
+        "modules": [
+          "."
+        ],
+        "ci_job_seconds": 218.724
+      }
+    },
+    {
+      "seat": "sling-commons-mime",
+      "repo": "apache/sling-org-apache-sling-commons-mime",
+      "sha": "1da9c00081102f3eeef5b2053ea23cec31a42878",
+      "build_url": "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-mime/job/master/349/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "stage": "Maven Build (Java 17, deploy)",
+      "stage_node": "85",
+      "shell_node": "101",
+      "stage_context": [
+        "Maven Build (Java 17, deploy)",
+        "Build (Java 17 on linux)"
+      ],
+      "official_command": "mvn --show-version -U -B -e clean deploy javadoc:javadoc  -DaltDeploymentRepository=snapshot-repo::default::file:/home/jenkins/jenkins-agent/workspace/apache-sling-commons-mime_master/jdk_17_latest/.local-snapshots-dir -Pjacoco-report -Dci",
+      "scope_note": "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference.",
+      "local_command": "mvn --show-version -U -B -e clean install javadoc:javadoc -Pjacoco-report -Dci",
+      "cell_id": "Apache Jenkins sling-commons-mime Linux JDK 17 #349 Build",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/sling-commons-mime.json",
+      "target_sha256": "2b4f530513dde676598bcb6a48cba7eab20041622b88e7bfbea72ef8952ec222",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/sling-commons-mime",
+      "official": {
+        "stage": "Maven Build (Java 17, deploy)",
+        "counts_basis": "complete Jenkins final testcase rows",
+        "ci_shell_seconds": 46.819,
+        "stage_node": "85",
+        "shell_node": "101",
+        "jdk_versions": [
+          "17.0.12"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "3.0.1-SNAPSHOT",
+        "reported": 8,
+        "passed": 8,
+        "red": 0,
+        "skipped": 0,
+        "executed_non_skipped": 8,
+        "build_modules": 1,
+        "modules": [
+          "."
+        ],
+        "ci_job_seconds": 345.066
+      }
+    },
+    {
+      "seat": "sling-commons-osgi",
+      "repo": "apache/sling-org-apache-sling-commons-osgi",
+      "sha": "8635856737280369a865cb4f2a9dda6839a29715",
+      "build_url": "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-osgi/job/master/335/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "stage": "Maven Build (Java 17, deploy)",
+      "stage_node": "81",
+      "shell_node": "98",
+      "stage_context": [
+        "Maven Build (Java 17, deploy)",
+        "Build (Java 17 on linux)"
+      ],
+      "official_command": "mvn --show-version -U -B -e clean deploy javadoc:javadoc  -DaltDeploymentRepository=snapshot-repo::default::file:/home/jenkins/jenkins-agent/workspace/apache-sling-commons-osgi_master/jdk_17_latest/.local-snapshots-dir -Pjacoco-report -Dci",
+      "scope_note": "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference.",
+      "local_command": "mvn --show-version -U -B -e clean install javadoc:javadoc -Pjacoco-report -Dci",
+      "cell_id": "Apache Jenkins sling-commons-osgi Linux JDK 17 #335 Build",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/sling-commons-osgi.json",
+      "target_sha256": "8e19274a339e1bd8040f8e51161339b235ba729e46ffcde658f8bb88072820cb",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/sling-commons-osgi",
+      "official": {
+        "stage": "Maven Build (Java 17, deploy)",
+        "counts_basis": "complete Jenkins final testcase rows",
+        "ci_shell_seconds": 42.951,
+        "stage_node": "81",
+        "shell_node": "98",
+        "jdk_versions": [
+          "17.0.12"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "2.4.3-SNAPSHOT",
+        "reported": 28,
+        "passed": 28,
+        "red": 0,
+        "skipped": 0,
+        "executed_non_skipped": 28,
+        "build_modules": 1,
+        "modules": [
+          "."
+        ],
+        "ci_job_seconds": 401.793
+      }
+    },
+    {
+      "seat": "creadur-tentacles",
+      "repo": "apache/creadur-tentacles",
+      "sha": "6dee268ae4a15651fb6b014fa0baedc686d07aad",
+      "build_url": "https://ci-builds.apache.org/job/Creadur/job/Creadur-Tentacles/2430/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "stage": "Build",
+      "official_command": "./mvnw -B -U -V clean deploy",
+      "scope_note": "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference.",
+      "local_command": "./mvnw -B -U -V clean install",
+      "cell_id": "Apache Jenkins creadur-tentacles Linux JDK 17 #2430 Build",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/creadur-tentacles.json",
+      "target_sha256": "e3bf50217537a8d4b48e7fd642b24f5c315125bc5478dc23ec62f4243412bfe6",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/creadur-tentacles",
+      "official": {
+        "stage": "Build",
+        "counts_basis": "complete Jenkins final testcase rows",
+        "console_lines": {
+          "first": 139,
+          "last": 276
+        },
+        "jdk_versions": [
+          "17.0.12"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "0.2-SNAPSHOT",
+        "reported": 2,
+        "passed": 2,
+        "red": 0,
+        "skipped": 0,
+        "executed_non_skipped": 2,
+        "build_modules": 1,
+        "modules": [
+          "."
+        ],
+        "ci_job_seconds": 117.204
+      }
+    },
+    {
+      "seat": "creadur-whisker",
+      "repo": "apache/creadur-whisker",
+      "sha": "7900f83dca7f43f7ff9074f37977703b645db472",
+      "build_url": "https://ci-builds.apache.org/job/Creadur/job/Creadur-Whisker/2453/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "stage": "Build",
+      "official_command": "./mvnw -B -U -V clean deploy",
+      "scope_note": "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference.",
+      "local_command": "./mvnw -B -U -V clean install",
+      "cell_id": "Apache Jenkins creadur-whisker Linux JDK 17 #2453 Build",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/creadur-whisker.json",
+      "target_sha256": "4b6b33b17df8844d687069837256581a9eee37e23ab27c9e3f1988b1100377b8",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/creadur-whisker",
+      "official": {
+        "stage": "Build",
+        "counts_basis": "complete Jenkins final testcase rows",
+        "console_lines": {
+          "first": 141,
+          "last": 967
+        },
+        "jdk_versions": [
+          "17.0.12"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "0.2-SNAPSHOT",
+        "reported": 155,
+        "passed": 155,
+        "red": 0,
+        "skipped": 0,
+        "executed_non_skipped": 155,
+        "build_modules": 8,
+        "modules": [
+          "Apache Whisker",
+          "Apache Whisker::App",
+          "Apache Whisker::Command Line Interface",
+          "Apache Whisker::Maven Plugin",
+          "Apache Whisker::Model",
+          "Apache Whisker::Output(velocity)",
+          "Apache Whisker::Scan",
+          "Apache Whisker::XML"
+        ],
+        "ci_job_seconds": 386.567
+      }
+    },
+    {
+      "seat": "commons-jcs",
+      "repo": "apache/commons-jcs",
+      "sha": "404fd99deb8dfbf4336ce194256cf83ec354d722",
+      "build_url": "https://ci-builds.apache.org/job/Commons/job/commons-jcs/726/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "official_command": "mvn -B -f pom.xml clean install",
+      "scope_note": "Full selected official Maven build/test invocation; no project/module/test exclusion added.",
+      "local_command": "mvn -B -f pom.xml clean install",
+      "cell_id": "Apache Jenkins commons-jcs Linux JDK 17 #726",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/commons-jcs.json",
+      "target_sha256": "1354d9ea578196a9b27f894ea509520e59246096954cdb16c42571623764b3ad",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/commons-jcs",
+      "official": {
+        "stage": null,
+        "counts_basis": "complete Jenkins final testcase rows",
+        "jdk_versions": null,
+        "jdk_patch_known": false,
+        "source_pom_version": "4.0.0-SNAPSHOT",
+        "reported": 443,
+        "passed": 443,
+        "red": 0,
+        "skipped": 0,
+        "executed_non_skipped": 443,
+        "build_modules": 7,
+        "modules": [
+          "Apache Commons JCS",
+          "Apache Commons JCS :: Core",
+          "Apache Commons JCS :: Distribution",
+          "Apache Commons JCS :: JCache",
+          "Apache Commons JCS :: JCache Extras",
+          "Apache Commons JCS :: JCache OpenJPA",
+          "Apache Commons JCS :: JCache TCK"
+        ],
+        "ci_job_seconds": 612.489
+      }
+    },
+    {
+      "seat": "httpcomponents-client",
+      "repo": "apache/httpcomponents-client",
+      "sha": "be07c77297576b08bc01bb93789eca6f5f9bf850",
+      "build_url": "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Client%205.7.x%20Java17/225/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "official_command": "mvn -B -f pom.xml clean verify install -P-use-toolchains,nodoclint",
+      "scope_note": "Full selected official Maven build/test invocation; no project/module/test exclusion added.",
+      "local_command": "mvn -B -f pom.xml clean verify install -P-use-toolchains,nodoclint",
+      "cell_id": "Apache Jenkins httpcomponents-client Linux JDK 17 #225",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/httpcomponents-client.json",
+      "target_sha256": "a65b32c4eab74593ac1aee83f7ac5f9ecbdd9577add4db45b1cdb451997b3b24",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/httpcomponents-client",
+      "official": {
+        "stage": null,
+        "counts_basis": "complete Jenkins final testcase rows",
+        "jdk_versions": null,
+        "jdk_patch_known": false,
+        "source_pom_version": "5.7-alpha2-SNAPSHOT",
+        "reported": 2775,
+        "passed": 2762,
+        "red": 0,
+        "skipped": 13,
+        "executed_non_skipped": 2762,
+        "build_modules": 9,
+        "modules": [
+          "Apache HttpClient",
+          "Apache HttpClient Cache",
+          "Apache HttpClient Fluent",
+          "Apache HttpClient Integration Tests",
+          "Apache HttpClient Observation",
+          "Apache HttpClient WebSocket",
+          "Apache HttpClient sse",
+          "Apache HttpComponents Client",
+          "Jakarta REST Client for Apache HttpClient"
+        ],
+        "ci_job_seconds": 429.327
+      }
+    },
+    {
+      "seat": "httpcomponents-core",
+      "repo": "apache/httpcomponents-core",
+      "sha": "6e0fd205cfa52e59ad66e63d2e2eef8f49844697",
+      "build_url": "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Core%205.5.x%20Java17/210/",
+      "heavy": false,
+      "jdk_major": 17,
+      "maven_version": "3.9.16",
+      "official_command": "mvn -B -f pom.xml clean verify install -Djunit.jupiter.execution.parallel.enabled=false -P-use-toolchains,nodoclint",
+      "scope_note": "Full selected official Maven build/test invocation; no project/module/test exclusion added.",
+      "local_command": "mvn -B -f pom.xml clean verify install -Djunit.jupiter.execution.parallel.enabled=false -P-use-toolchains,nodoclint",
+      "cell_id": "Apache Jenkins httpcomponents-core Linux JDK 17 #210",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/httpcomponents-core.json",
+      "target_sha256": "3a96cc3f19e6184e0741b180f27645b606672f2596883934af2a30ea10346b74",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/httpcomponents-core",
+      "official": {
+        "stage": null,
+        "counts_basis": "complete Jenkins final testcase rows",
+        "jdk_versions": null,
+        "jdk_patch_known": false,
+        "source_pom_version": "5.5-beta3-SNAPSHOT",
+        "reported": 2232,
+        "passed": 2228,
+        "red": 0,
+        "skipped": 4,
+        "executed_non_skipped": 2228,
+        "build_modules": 6,
+        "modules": [
+          "Apache HttpComponents Core",
+          "Apache HttpComponents Core HTTP/1.1",
+          "Apache HttpComponents Core HTTP/2",
+          "Apache HttpComponents Core Integration Tests",
+          "Apache HttpComponents Core Reactive Extensions",
+          "Jackson 3 bindings for Apache HttpComponents Core"
+        ],
+        "ci_job_seconds": 724.186
+      }
+    },
+    {
+      "seat": "creadur-rat",
+      "repo": "apache/creadur-rat",
+      "sha": "bd42e2fe6847336515c94410a811b8a9cf39b094",
+      "build_url": "https://ci-builds.apache.org/job/Creadur/job/Creadur-Rat/2697/",
+      "heavy": false,
+      "jdk_major": 21,
+      "maven_version": "3.9.16",
+      "stage": "Build",
+      "official_command": "./mvnw -B -U -V clean deploy",
+      "scope_note": "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference.",
+      "local_command": "./mvnw -B -U -V clean install",
+      "cell_id": "Apache Jenkins creadur-rat Linux JDK 21 #2697 Build",
+      "target_file": "/Users/chenhao/Documents/github/Setup-Agent/benchmarks/small-ci-10-v1/targets/creadur-rat.json",
+      "target_sha256": "0164e64fcb0f7ec3169acb483532f7b2f81bcaaa73c56a7c1a1a3cf0e9d6365f",
+      "evidence_dir": "/Users/chenhao/Documents/github/Setup-Agent/logs/small-ci-bench-10-v1-20260909/official/creadur-rat",
+      "official": {
+        "stage": "Build",
+        "counts_basis": "complete Jenkins final testcase rows",
+        "console_lines": {
+          "first": 747,
+          "last": 6477
+        },
+        "jdk_versions": [
+          "21.0.4"
+        ],
+        "jdk_patch_known": true,
+        "source_pom_version": "1.0.0-SNAPSHOT",
+        "reported": 1149,
+        "passed": 1146,
+        "red": 0,
+        "skipped": 3,
+        "executed_non_skipped": 1146,
+        "build_modules": 7,
+        "modules": [
+          "Apache Creadur RAT",
+          "Apache Creadur RAT::Core",
+          "Apache Creadur RAT::Packaging",
+          "Apache Creadur RAT::Plugin4Maven",
+          "Apache Creadur RAT::Tasks4Ant",
+          "Apache Creadur RAT::Testdata",
+          "Apache Creadur RAT::Tools"
+        ],
+        "ci_job_seconds": 884.179
+      }
+    }
+  ],
+  "selection": {
+    "size": 10,
+    "chosen_before_sag_outcomes": true,
+    "requirements": [
+      "official repository and full commit SHA",
+      "completed official successful build/test cell",
+      "complete JUnit case pool, not badge or log aggregate",
+      "bounded exact successful module scope",
+      "at most 12 CI modules and 10000 final test records",
+      "no known OOM project; small libraries; serial SAG attempts"
+    ]
+  },
+  "excluded": {
+    "kafka": "observed OOM/resource exhaustion in R11",
+    "rocketmq": "prior outer timeout and large logs; excluded from small scope",
+    "large_prior_projects": "all prior 23 projects outside this newly frozen ten are not scheduled",
+    "commons-cli": "legacy official Jenkins has no retained builds; no complete official JUnit pool found during admission",
+    "gson": "official JDK17 log is available but no JUnit artifacts; kept as discovery only, not silently promoted to count/id Grade A",
+    "commons-numbers": "46159 CI testcase rows exceed small scope",
+    "commons-geometry": "official run about 24 minutes; not selected",
+    "commons-compress/validator": "complete console but testcase API missing in inspected jobs"
+  },
+  "measurement": {
+    "standard": "SAG-MS-1 Part IV, refined by 2026-09-07 CI-defined-build-scope owner clarification",
+    "alpha_build": "matched successful SAG modules / official successful CI modules",
+    "alpha_test": "min(SAG final reported testcase rows, CI final reported testcase rows) / CI final reported testcase rows",
+    "alpha": "min(alpha_build, alpha_test), only from the production authority-gated attainment result",
+    "missing": "missing scope/authority is unscored, not success and not synthetic 1/1",
+    "raw_counts": "CI and SAG reported, passed, red, skipped and non-skipped counts are shown separately",
+    "lifecycle": "separate parity field; publication-only deploy/site is outside the build/test goal where explicitly listed",
+    "headlines": "met or exceeded / all 10 frozen tasks; scorable / 10; completed build/test / 10",
+    "comparison": "new CI-anchored task baseline, not a paired improvement claim against R11's different 23 tasks"
+  },
+  "collector_sha256": "cce43d305cdcd5ed7a9e18744a6c95c0b8965abca04e6128e1a44a6962c78741"
+}

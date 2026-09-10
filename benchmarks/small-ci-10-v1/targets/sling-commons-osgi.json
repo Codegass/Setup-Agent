@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "repo": "apache/sling-org-apache-sling-commons-osgi",
+  "sha": "8635856737280369a865cb4f2a9dda6839a29715",
+  "harvested_at": "2026-09-10T01:46:42.063716+00:00",
+  "cells": [
+    {
+      "cell_id": "Apache Jenkins sling-commons-osgi Linux JDK 17 #335 Build",
+      "build": "ok",
+      "executed_count": 28,
+      "executed_ids": [
+        "org.apache.sling.commons.osgi.BundleFileProcessorTest#testBSNRenaming",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testAttributes",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testDirectives",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testMultipleEntries",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testNonExisting",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testQuoting",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testQuoting2",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testSeveralPaths",
+        "org.apache.sling.commons.osgi.ManifestHeaderTest#testSinglePath",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testRanking",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToBoolean",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToDouble",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToInteger",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToLong",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToObject",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToString",
+        "org.apache.sling.commons.osgi.OsgiUtilTest#testToStringArray",
+        "org.apache.sling.commons.osgi.PropertiesUtilTest#testToMap",
+        "org.apache.sling.commons.osgi.RankedServicesTest#testChangeListener",
+        "org.apache.sling.commons.osgi.RankedServicesTest#testSortedServicesAscending",
+        "org.apache.sling.commons.osgi.RankedServicesTest#testSortedServicesDescending",
+        "org.apache.sling.commons.osgi.bundleversion.BundleBundleVersionInfoTest#testSnapshot",
+        "org.apache.sling.commons.osgi.bundleversion.BundleBundleVersionInfoTest#testVersionInfo",
+        "org.apache.sling.commons.osgi.bundleversion.BundleVersionComparisonTest#testEqual",
+        "org.apache.sling.commons.osgi.bundleversion.BundleVersionComparisonTest#testSimpleCompare",
+        "org.apache.sling.commons.osgi.bundleversion.BundleVersionComparisonTest#testSortBundles",
+        "org.apache.sling.commons.osgi.bundleversion.FileBundleVersionInfoTest#testSlf4jJar",
+        "org.apache.sling.commons.osgi.bundleversion.FileBundleVersionInfoTest#testSlingApiJar"
+      ],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 0,
+      "modules": [
+        "."
+      ],
+      "modules_basis": "log",
+      "command": "mvn --show-version -U -B -e clean deploy javadoc:javadoc  -DaltDeploymentRepository=snapshot-repo::default::file:/home/jenkins/jenkins-agent/workspace/apache-sling-commons-osgi_master/jdk_17_latest/.local-snapshots-dir -Pjacoco-report -Dci",
+      "grade": "A",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-osgi/job/master/335/api/json",
+        "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-osgi/job/master/335/consoleText",
+        "https://ci-builds.apache.org/job/Sling/job/modules/job/sling-org-apache-sling-commons-osgi/job/master/335/testReport/api/json"
+      ]
+    }
+  ],
+  "matched_cell": "Apache Jenkins sling-commons-osgi Linux JDK 17 #335 Build",
+  "notes": [
+    "Frozen small CI benchmark. Counts include skipped final testcase rows, as in SAG-MS-1's current adapter; non-skipped counts are also reported separately.",
+    "Full original testcase rows and byte hashes are archived; no count is inferred from a success badge.",
+    "Selected official build/test cell only. SAG executes the same compile/test/package/install scope and profiles; publication-only deploy is replaced by local install before the run. External Nexus upload and separate site/Sonar/other-JDK jobs are outside this benchmark. Lifecycle parity must disclose this difference."
+  ]
+}

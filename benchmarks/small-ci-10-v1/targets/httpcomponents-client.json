@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "repo": "apache/httpcomponents-client",
+  "sha": "be07c77297576b08bc01bb93789eca6f5f9bf850",
+  "harvested_at": "2026-09-10T01:46:52.576278+00:00",
+  "cells": [
+    {
+      "cell_id": "Apache Jenkins httpcomponents-client Linux JDK 17 #225",
+      "build": "ok",
+      "executed_count": 2775,
+      "executed_ids": [],
+      "red_count": 0,
+      "red_ids": [],
+      "flaky_count": 0,
+      "flaky_ids": [],
+      "skipped": 13,
+      "modules": [
+        "Apache HttpClient",
+        "Apache HttpClient Cache",
+        "Apache HttpClient Fluent",
+        "Apache HttpClient Integration Tests",
+        "Apache HttpClient Observation",
+        "Apache HttpClient WebSocket",
+        "Apache HttpClient sse",
+        "Apache HttpComponents Client",
+        "Jakarta REST Client for Apache HttpClient"
+      ],
+      "modules_basis": "log",
+      "command": "mvn -B -f pom.xml clean verify install -P-use-toolchains,nodoclint",
+      "grade": "A",
+      "laundered_conclusion": false,
+      "evidence_refs": [
+        "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Client%205.7.x%20Java17/225/api/json",
+        "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Client%205.7.x%20Java17/225/consoleText",
+        "https://ci-builds.apache.org/job/HttpComponents/job/HttpComponents%20Client%205.7.x%20Java17/225/testReport/api/json"
+      ]
+    }
+  ],
+  "matched_cell": "Apache Jenkins httpcomponents-client Linux JDK 17 #225",
+  "notes": [
+    "Frozen small CI benchmark. Counts include skipped final testcase rows, as in SAG-MS-1's current adapter; non-skipped counts are also reported separately.",
+    "Full original testcase rows and byte hashes are archived; no count is inferred from a success badge.",
+    "Full selected official Maven build/test invocation; no project/module/test exclusion added."
+  ]
+}
