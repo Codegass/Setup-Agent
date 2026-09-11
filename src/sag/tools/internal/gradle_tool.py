@@ -1322,6 +1322,7 @@ class GradleTool(BaseTool):
                 result["exit_code"],
                 compile_source_languages=_compile_source_languages,
             )
+            self._prefer_current_report_counts(analysis)
             compile_mismatch = analysis.get("compile_source_mismatch")
             if compile_mismatch is None and _compile_source_languages is None:
                 # P0-C follow-up (live p5v-bigtop-r1): the recovery path re-ran
@@ -1639,12 +1640,44 @@ class GradleTool(BaseTool):
             ReceiptAssessment(receipt_id=receipt_id, typed_code=typed_code, detail=detail),
         )
 
+    def _prefer_current_report_counts(self, analysis: Dict[str, Any]) -> None:
+        """Keep the current invocation's XML counts separate from log summaries."""
+        metadata = getattr(self, "_pending_invocation_receipt", None) or {}
+        counts = metadata.get("report_test_counts")
+        analysis["test_stats_basis"] = "stdout_summary"
+        if not metadata.get("receipt_id") or not isinstance(counts, dict):
+            return
+        analysis["log_test_results"] = analysis.get("test_results")
+        analysis["test_results"] = {
+            "total": counts["reported"],
+            "failed": counts["failed"],
+            "errors": counts["errors"],
+            "skipped": counts["skipped"],
+        }
+        analysis["test_stats_basis"] = "invocation_report_xml"
+
     def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:
-        """Byte-compat: `receipt_id` on success, `receipt_persisted` only on
-        failure — nothing at all on paths that dispatched no runner."""
+        """Return saved report observations without changing the runner outcome."""
         receipt_metadata = getattr(self, "_pending_invocation_receipt", None)
         if receipt_metadata:
             tool_result.metadata.update(receipt_metadata)
+            from_reports = bool(receipt_metadata.get("receipt_id")) and isinstance(
+                receipt_metadata.get("report_test_counts"), dict
+            )
+            if from_reports:
+                report_analysis: Dict[str, Any] = {}
+                self._prefer_current_report_counts(report_analysis)
+                tool_result.test_stats = self._gradle_test_stats(report_analysis)
+            if from_reports or tool_result.test_stats is not None:
+                tool_result.metadata["test_stats_basis"] = (
+                    "invocation_report_xml" if from_reports else "stdout_summary"
+                )
+                basis = (
+                    "Test counts come from hash-verified XML claimed by this invocation."
+                    if from_reports
+                    else "Test counts below are console summaries; complete current XML counts are unavailable."
+                )
+                tool_result.output = f"[tests] {basis}\n" + (tool_result.output or "")
         return tool_result
 
     def _resolve_gradle_executable(self, working_directory: str, prefer_wrapper: bool = True):
@@ -2051,50 +2084,29 @@ class GradleTool(BaseTool):
         self, analysis: Dict[str, Any], ref_id: Optional[str] = None
     ) -> str:
         """Format with essential validation data always visible."""
-        output = "✅ Gradle build completed\n\n"
+        output = "✅ Gradle command completed\n\n"
 
-        # ALWAYS show what tasks executed (critical for validation)
-        output += "📍 Tasks executed: "
+        # Task labels describe the log; they do not certify compilation or tests.
         if analysis.get("tasks_executed"):
+            output += "📍 Gradle tasks in the log: "
             tasks = analysis["tasks_executed"]
             output += ", ".join(tasks[:5])
             if len(tasks) > 5:
                 output += f" (+{len(tasks)-5} more)"
+
+        if analysis.get("test_results"):
+            results = analysis["test_results"]
+            from_reports = analysis.get("test_stats_basis") == "invocation_report_xml"
+            label = "Invocation XML test records" if from_reports else "Console test summary"
+            output += (
+                f"\n📊 {label}: {results.get('total', 0)} reported, "
+                f"{results.get('failed', 0)} failures"
+            )
+            if from_reports:
+                output += f", {results['errors']} errors"
+            output += f", {results.get('skipped', 0)} skipped"
         else:
-            output += "⚠️ NONE DETECTED (possible parsing issue)"
-
-        # ALWAYS show test execution status if test task ran
-        test_tasks = ["test", "check", "Test", "Check"]
-        tasks_executed = analysis.get("tasks_executed", [])
-        if any(any(test_task in task for test_task in test_tasks) for task in tasks_executed):
-            output += "\n📊 Test Execution: "
-            if analysis.get("test_results"):
-                results = analysis["test_results"]
-                total = results.get("total", 0)
-                failed = results.get("failed", 0)
-                output += f"{total} tests run"
-                if failed > 0:
-                    output += f", {failed} failed ❌"
-                else:
-                    output += " ✅"
-            else:
-                output += "⚠️ Test task ran but no results captured (check build/reports/tests/)"
-
-        # Show compilation status if compile tasks ran
-        compile_tasks = ["compileJava", "compileKotlin", "compile"]
-        if any(
-            any(compile_task in task for compile_task in compile_tasks) for task in tasks_executed
-        ):
-            if analysis.get("compilation_errors"):
-                output += f"\n❌ Compilation: {len(analysis['compilation_errors'])} errors"
-            else:
-                output += "\n✅ Compilation: successful"
-
-        # Show build status
-        if analysis.get("build_successful"):
-            output += "\n✅ Build: SUCCESS"
-        else:
-            output += "\n❌ Build: FAILED"
+            output += "\nTest counts: unavailable in this result."
 
         # Reference to full output
         if ref_id:
@@ -2143,12 +2155,14 @@ class GradleTool(BaseTool):
             return None
 
         failed = int(results.get("failed") or 0)
+        errors = int(results.get("errors") or 0)
         skipped = int(results.get("skipped") or 0)
-        passed = max(executed - failed - skipped, 0)
+        passed = max(executed - failed - errors - skipped, 0)
         return TestStats(
             executed=executed,
             passed=passed,
             failed=failed,
+            errors=errors,
             skipped=skipped,
         )
 
@@ -2160,7 +2174,7 @@ class GradleTool(BaseTool):
         if test_stats:
             fields["test_stats"] = test_stats
 
-        has_test_failures = bool(test_stats and test_stats.failed > 0)
+        has_test_failures = bool(test_stats and test_stats.failed + test_stats.errors > 0)
         build_claimed_success = bool(
             analysis.get("build_successful") or analysis.get("exit_code") == 0
         )

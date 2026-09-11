@@ -18,7 +18,6 @@ from loguru import logger as default_logger
 from sag.agent.tool_orchestration import ParameterFix, ParameterFixSource
 from sag.tools.base import BaseTool
 
-
 _MAVEN_COMMAND_TO_BUILD_ACTION = {
     "deps": "deps",
     "dependency:resolve": "deps",
@@ -111,7 +110,6 @@ def _map_output_search_params(params: Dict[str, Any]) -> Dict[str, Any]:
     if action and action not in {"retrieve", "grep"}:
         raise ValueError(f"legacy output_search action {action!r} has no exact search equivalent")
     unsupported = {
-        "context_lines",
         "head_lines",
         "tail_lines",
         "task_id",

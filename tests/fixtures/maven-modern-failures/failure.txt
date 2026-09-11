@@ -1,0 +1,15 @@
+[INFO] 
+[INFO] Results:
+[INFO] 
+[ERROR] Failures: 
+[ERROR]   MoveTest>AbstractJCRTest.run:475->testMoveVisibilityAcrossSessions:47
+[INFO] 
+[ERROR] Tests run: 1696, Failures: 1, Errors: 0, Skipped: 0
+[INFO] 
+[ERROR] There are test failures.
+
+See /workspace/jackrabbit/jackrabbit-core/target/surefire-reports for the individual test results.
+See dump files (if any exist) [date].dump, [date]-jvmRun[N].dump and [date].dumpstream.
+[INFO] 
+[INFO] --------------< org.apache.jackrabbit:jackrabbit-vfs-ext >--------------
+[INFO] Building Jackrabbit VFS Extension 2.23.6-beta-SNAPSHOT            [9/23]

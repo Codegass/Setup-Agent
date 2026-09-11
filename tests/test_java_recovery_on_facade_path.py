@@ -70,7 +70,7 @@ def test_the_facade_classifies_the_complete_detached_log():
 
     from sag.tools.build.build_tool import BuildTool
 
-    source = inspect.getsource(BuildTool.execute)
+    source = inspect.getsource(BuildTool._execute)
     retry = source.split("Bounded retry (spec §1c)", 1)[1][:900]
 
     assert "inner.raw_output" in retry

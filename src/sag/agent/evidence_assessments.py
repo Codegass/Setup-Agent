@@ -705,6 +705,24 @@ def live_assessment_fingerprints(source: Any, receipt: Mapping[str, Any]) -> Dic
     )
 
 
+def receipt_assessment_bundle_complete(
+    receipt: Mapping[str, Any], assessments: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Whether published assessments bind this exact receipt output and inputs."""
+    fingerprints = {
+        key: str(receipt[key]).strip()
+        for key in FINGERPRINT_KEYS
+        if receipt.get(key) is not None and str(receipt[key]).strip()
+    }
+    return bool(receipt.get("output_content_hash")) and any(
+        item.get("receipt_id") == receipt.get("receipt_id")
+        and item.get("typed_code") == ASSESSMENT_BUNDLE_COMPLETE
+        and item.get("scope") == receipt["output_content_hash"]
+        and item.get("fingerprints") == fingerprints
+        for item in assessments
+    )
+
+
 def _bundle_completion(receipt: Mapping[str, Any]) -> ReceiptAssessment:
     return ReceiptAssessment(
         receipt_id=_text(receipt.get("receipt_id")),
@@ -885,7 +903,13 @@ def _current_contract_binding_problem(
     ):
         return ""
     requested = contract.get("requested_call")
-    if not isinstance(requested, Mapping) or _text(requested.get("tool")) != "build":
+    if not isinstance(requested, Mapping) or not (
+        _text(requested.get("tool")) == "build"
+        or (
+            _text(requested.get("tool")) == "bash"
+            and _text(contract.get("effective_tool")) in {"maven", "gradle"}
+        )
+    ):
         return ""
     for key in FINGERPRINT_KEYS:
         contract_states = key in contract

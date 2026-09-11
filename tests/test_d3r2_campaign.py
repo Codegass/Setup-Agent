@@ -70,6 +70,164 @@ def test_baseline_never_receives_new_comparison_cli_flag():
     )
 
 
+@pytest.mark.parametrize("change", ["bytes", "repo", "sha", "file_removed", "baseline"])
+def test_required_task_drift_is_rejected_before_container_inspection(tmp_path, monkeypatch, change):
+    task_path = tmp_path / "task.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "repo": "apache/demo",
+                "sha": "a" * 40,
+                "steps": [{"id": "test", "runner": "maven", "argv": ["mvn", "test"]}],
+            }
+        )
+    )
+    project = dict(
+        repo="apache/demo",
+        sha="a" * 40,
+        variant="candidate",
+        run_key="demo",
+        acceptance_task_file=str(task_path),
+        acceptance_task_sha256=campaign.digest(task_path),
+    )
+    if change == "bytes":
+        task_path.write_text(task_path.read_text() + "\n")
+    elif change in {"repo", "sha"}:
+        project[change] = "apache/another" if change == "repo" else "b" * 40
+    elif change == "file_removed":
+        project.pop("acceptance_task_file")
+    else:
+        project["variant"] = "baseline"
+    monkeypatch.setattr(campaign, "inspect_container", lambda *_a: pytest.fail("no Docker call"))
+    with pytest.raises((ValueError, RuntimeError), match="[Tt]ask|baseline"):
+        campaign.run_one(tmp_path, {}, project)
+
+
+def test_resuming_without_the_required_task_cannot_reuse_its_result(tmp_path):
+    directory = tmp_path / "runs/demo"
+    directory.mkdir(parents=True)
+    manifest = {"sources": {"candidate": {"sha": "c" * 40}}}
+    project = dict(
+        run_key="demo", repo="apache/demo", sha="a" * 40, variant="candidate", target_sha256="t"
+    )
+    (directory / "result.json").write_text(
+        json.dumps(
+            {
+                **project,
+                "target_sha": project["sha"],
+                "sag_sha": "c" * 40,
+                "target_record_file_sha256": "t",
+                "acceptance_task_file_sha256": "f" * 64,
+            }
+        )
+    )
+    with pytest.raises(RuntimeError, match="Existing result"):
+        campaign.run_one(tmp_path, manifest, project)
+
+
+def test_candidate_cli_keeps_task_and_ci_inputs_separate():
+    manifest = {"sources": {"candidate": {"path": "/candidate"}, "baseline": {"path": "/baseline"}}}
+    project = dict(
+        repo="apache/demo",
+        sha="a" * 40,
+        container="sag-demo",
+        variant="candidate",
+        target_file="/ci.json",
+        acceptance_command="mvn test",
+        acceptance_task_file="/task.json",
+    )
+    argv = campaign.cli_command(manifest, project)
+    for flag, value in [
+        ("--ci-target-file", "/ci.json"),
+        ("--acceptance-command", "mvn test"),
+        ("--acceptance-task-file", "/task.json"),
+    ]:
+        assert argv[argv.index(flag) + 1] == value
+    assert "--acceptance-task-file" not in campaign.cli_command(
+        manifest, project | {"variant": "baseline"}
+    )
+
+
+@pytest.mark.parametrize("task_pin_status", ["valid", "missing", "different"])
+def test_attempt_archives_task_bytes_and_checks_the_actual_run_pin(
+    tmp_path, monkeypatch, task_pin_status
+):
+    from pathlib import Path
+    from sag.agent.acceptance_task import load_acceptance_task
+
+    task_path = tmp_path / "task.json"
+    raw = json.dumps(
+        {
+            "repo": "apache/demo",
+            "sha": "a" * 40,
+            "steps": [{"id": "test", "runner": "maven", "argv": ["mvn", "test"]}],
+        }
+    )
+    task_path.write_text(raw)
+    task = load_acceptance_task(task_path)
+    target_file = tmp_path / "ci.json"
+    target_file.write_text("{}")
+    manifest = {
+        "sources": {"candidate": {"path": str(tmp_path), "sha": "b" * 40, "files": {}}},
+        "config": {"max_wall_clock_seconds": 1},
+        "docker_image_id": "sha256:" + "f" * 64,
+    }
+    project = dict(
+        run_key="demo",
+        seat="demo",
+        variant="candidate",
+        repo=task.repo,
+        sha=task.sha,
+        target_file=str(target_file),
+        target_sha256=campaign.digest(target_file),
+        container="sag-demo",
+        acceptance_task_file=str(task_path),
+        acceptance_task_sha256=campaign.digest(task_path),
+    )
+    task_pin = {"sha256": task.sha256, "definition": task.model_dump(mode="json")}
+    if task_pin_status == "different":
+        task_pin["sha256"] = "c" * 64
+    config = {} if task_pin_status == "missing" else {"acceptance_task": task_pin}
+    pin = {
+        "target_repo_sha": task.sha,
+        "sag_git_sha": "b" * 40,
+        "container_image_digest": manifest["docker_image_id"],
+        "sanitized_config": config,
+    }
+    payload = {"run_id": "task-run", "metrics": {"verdict": "success"}, "pin": pin}
+
+    class FinishedProcess:
+        returncode, pid = 0, 123456789
+
+        def __init__(self, argv, **kwargs):
+            copied = Path(argv[argv.index("--acceptance-task-file") + 1])
+            assert copied == kwargs["cwd"] / "acceptance-task.json"
+            # Changing the caller's original file after dispatch cannot alter
+            # the bytes the child receives or its archived provenance.
+            task_path.write_text("changed after dispatch")
+            assert copied.read_text() == raw
+            (kwargs["cwd"] / "logs/session_fake").mkdir(parents=True)
+
+        def poll(self):
+            return self.returncode
+
+    for name in ["verify_source", "runtime_environment", "effective_config"]:
+        monkeypatch.setattr(campaign, name, lambda *_a: {})
+    monkeypatch.setattr(campaign, "inspect_container", lambda *_a: None)
+    monkeypatch.setattr(campaign.subprocess, "Popen", FinishedProcess)
+    monkeypatch.setattr(
+        campaign.subprocess,
+        "run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
+    )
+    result = campaign.run_one(tmp_path, manifest, project)
+    assert result["authority_ok"] is (task_pin_status == "valid")
+    assert result["acceptance_task_file_sha256"] == project["acceptance_task_sha256"]
+    if task_pin_status != "valid":
+        assert "acceptance_task" in result["runner_error"]
+        assert "verdict" not in result
+
+
 def test_container_name_alone_is_not_ownership():
     project = {"container": "sag-new-project"}
     started = "2026-09-09T01:00:00+00:00"

@@ -396,6 +396,7 @@ def _repair_assessment_id_for_gate(
     payload: Mapping[str, Any],
     *,
     phase_attempt_id: str,
+    decision_linked: bool = True,
 ) -> str:
     """Re-derive the live gate ControlAssessment identity from event facts."""
 
@@ -415,6 +416,8 @@ def _repair_assessment_id_for_gate(
             {str(ref).strip() for ref in payload.get("evidence_refs") or () if str(ref).strip()}
         ),
     }
+    if decision_linked:
+        subject_material["decision_id"] = str(payload.get("decision_id") or "")
     subject_id = GATE_ASSESSMENT_SUBJECT_PREFIX + canonical_sha256(subject_material)[:16]
     return assessment_id(subject_id, code)
 
@@ -597,6 +600,9 @@ def _validated_opened_repair_context(
     expected_trigger = _repair_assessment_id_for_gate(
         source_gate,
         phase_attempt_id=attempt_id,
+        decision_linked=bool(
+            source_gate.get("decision_id") in context.observed_fact_refs
+        ),
     )
     if context.trigger_assessment_id != expected_trigger:
         raise ReplayValidationError("repair context trigger is not derived from its source gate")
@@ -608,7 +614,13 @@ def _validated_opened_repair_context(
         expected_trigger,
         *(str(ref).strip() for ref in source_gate.get("evidence_refs") or () if str(ref).strip()),
     }
-    if set(context.observed_fact_refs) != expected_refs:
+    # Current writers link to the gate that owns the complete evidence set.
+    # Historical contexts copied the refs directly; both forms must identify
+    # this exact recorded gate, never an arbitrary subset of its evidence.
+    linked_refs = {expected_trigger, str(source_gate.get("decision_id") or "")}
+    if set(context.observed_fact_refs) != expected_refs and (
+        not source_gate.get("decision_id") or set(context.observed_fact_refs) != linked_refs
+    ):
         raise ReplayValidationError("repair context observed refs differ from its source gate")
     return context
 

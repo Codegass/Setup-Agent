@@ -26,6 +26,67 @@ from sag.tools.internal.dispatch_argv import (
 )
 
 
+def parse_runner_command(command: str) -> tuple[str, str, list[str]]:
+    """Parse one argv without guessing which work it will successfully perform.
+
+    The verb is routing metadata only. Unknown Maven goals/defaultGoal and
+    custom Gradle tasks stay executable; receipts and reports prove their work.
+    Shell programs require the separate shell tool, not implicit evaluation.
+    """
+    if not isinstance(command, str) or not command.strip() or len(command) > 2048:
+        raise ValueError("command must be bounded non-empty text")
+    if any(c in command for c in ("\n", "\r", "\x00", "$", "`")):
+        raise ValueError("command must be one literal runner invocation, without shell expansion")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    tokens = list(lexer)
+    if not tokens or any(t and set(t) <= set(";&|<>") for t in tokens):
+        raise ValueError("command must be one runner; use separate tools for shell operations")
+    head, body = posixpath.basename(tokens[0]), tokens[1:]
+    if head in {"mvn", "mvnw"}:
+        # Parsing is not lifecycle verification. Maven interprets plugin goals,
+        # profiles and defaults; preserving their argv is the contract.
+        verb = next(
+            (
+                v
+                for v in ("install", "verify", "package", "test", "compile", "deps")
+                if MavenBackend.VERBS[v] in body
+            ),
+            "run",
+        )
+        return "maven", verb, body
+    if head in {"gradle", "gradlew"}:
+        return "gradle", "run", body
+    if head == "pytest":
+        return "python", "test", body
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", head) and body[:2] == ["-m", "pytest"]:
+        return "python", "test", body[2:]
+    if head == "uv" and body[:2] == ["run", "pytest"]:
+        return "python", "test", body[2:]
+    if head == "uv" and body[:3] == ["run", "--active", "pytest"]:
+        return "python", "test", body[3:]
+    raise ValueError(
+        "unrecognized runner; use the appropriate explicit tool, with bounded execution"
+    )
+
+
+def parse_complete_command(params: Mapping[str, Any]) -> tuple[str, str, list[str]]:
+    """One interpretation for the facade and its immutable public contract."""
+    if any(params.get(key) is not None for key in ("action", "args")):
+        raise ValueError("command is the complete invocation; omit action and args")
+    command = params.get("command")
+    system, verb, argv = parse_runner_command(command)
+    if params.get("system") is not None and params["system"] != system:
+        raise ValueError("system contradicts the complete command's runner")
+    source = params.get("source_command")
+    if source is not None and (
+        not isinstance(source, str) or shlex.split(source) != shlex.split(command)
+    ):
+        raise ValueError("source_command contradicts the complete command's argv")
+    return system, verb, argv
+
+
 def source_command_tokens(
     source_command: str, system: str, verb: str, args: Optional[str]
 ) -> List[str]:
@@ -121,29 +182,6 @@ def source_command_tokens(
     return body
 
 
-# Verbs that produce local artifacts. Packaging is NOT a test owner — the `test`
-# verb is the only one (live bigtop: a naked `mvn install` ran environment-
-# dependent tests during the BUILD phase and manufactured a failure that belongs
-# to another environment). The contract rides on the VERB, never on a phase name.
-PACKAGING_VERBS = ("package", "install")
-
-MAVEN_SKIP_TESTS_ARG = "-DskipTests"
-GRADLE_EXCLUDE_TEST_ARGS = "-x test"
-
-_TEST_OWNERSHIP_REASON = "packaging must not run tests — the 'test' verb owns test execution"
-
-# Caller-owned test policy: an explicit skip or an explicit test selection in the
-# caller's argv means the caller already decided, and the backend adds nothing.
-# Surveyed lifecycle flags (bigtop's skipTests/skipITs) must survive verbatim
-# into execution instead of being doubled or overridden.
-_MAVEN_CALLER_TEST_FLAGS = re.compile(
-    r"(?:^|\s)-D(?:skipTests|skipITs|maven\.test\.skip|test|it\.test)\b"
-)
-_GRADLE_CALLER_TEST_FLAGS = re.compile(
-    r"(?:^|\s)(?:-x[\s=]|--exclude-task[\s=]|--tests[\s=]|-[DP]skipTests\b)"
-)
-
-
 @dataclass(frozen=True)
 class ExecutedAction:
     """What a backend actually ran, and why that differs from the verb.
@@ -156,15 +194,6 @@ class ExecutedAction:
 
     argv_fragment: str
     reasons: Tuple[str, ...] = ()
-
-
-def _appended(args: Optional[str], addition: str) -> str:
-    return " ".join(part for part in ((args or "").strip(), addition) if part)
-
-
-def _backend_added(recorded: Any, caller_args: Optional[str], flag: str) -> bool:
-    """True when `flag` is in the executed argv because the BACKEND put it there."""
-    return flag in str(recorded or "") and flag not in (caller_args or "")
 
 
 # Marker files probed (in priority order) to select a backend.
@@ -240,6 +269,7 @@ def native_cmake_args(definitions: Mapping[str, str]) -> str:
 class MavenBackend:
     EXECUTION_BINDING = ARGV_EXECUTION_BINDING
     VERBS = {
+        "run": "run",
         "deps": "dependency:resolve",
         "compile": "compile",
         # Preserve the public action's Maven lifecycle. A project that declares
@@ -260,24 +290,13 @@ class MavenBackend:
 
     @staticmethod
     def _extra_args(verb: str, args: Optional[str]) -> Optional[str]:
-        """The caller's args plus the packaging test-skip contract."""
-        if verb not in PACKAGING_VERBS or _MAVEN_CALLER_TEST_FLAGS.search(args or ""):
-            return args
-        return _appended(args, MAVEN_SKIP_TESTS_ARG)
+        """Test selection belongs to the caller, including lifecycle defaults."""
+        return args
 
     @staticmethod
     def executed_action(verb: str, params: Dict[str, Any], args: Optional[str]) -> ExecutedAction:
         """The Maven lifecycle actually dispatched, and its semantic delta."""
-        goal = str(params.get("command") or verb)
-        added = [
-            flag
-            for flag in (MAVEN_SKIP_TESTS_ARG,)
-            if _backend_added(params.get("extra_args"), args, flag)
-        ]
-        return ExecutedAction(
-            argv_fragment=" ".join([goal] + added),
-            reasons=(_TEST_OWNERSHIP_REASON,) if added else (),
-        )
+        return ExecutedAction(argv_fragment=str(params.get("command") or verb))
 
     @staticmethod
     def effective_action(params: Dict[str, Any]) -> str:
@@ -301,7 +320,8 @@ class MavenBackend:
             if "_source_argv" in params
             else maven_action_tokens(params.get("command"), extra_args=params.get("extra_args"))
         )
-        return " ".join(shlex.quote(token) for token in tokens) or None
+        vector = shlex.join(tokens)
+        return vector if "_source_argv" in params else vector or None
 
     def materialize(
         self,
@@ -484,6 +504,7 @@ class GradleBackend:
     # stays for callers that translate a verb without a container probe, such
     # as schema/introspection tests.
     VERBS = {
+        "run": "run",
         "deps": "dependencies",
         "compile": "compileJava",
         "test": "test",
@@ -605,9 +626,7 @@ class GradleBackend:
     @staticmethod
     def _gradle_args(verb: str, args: Optional[str]) -> Optional[str]:
         """The caller's args plus the packaging test-skip contract."""
-        if verb not in PACKAGING_VERBS or _GRADLE_CALLER_TEST_FLAGS.search(args or ""):
-            return args
-        return _appended(args, GRADLE_EXCLUDE_TEST_ARGS)
+        return args
 
     @staticmethod
     def executed_action(verb: str, params: Dict[str, Any], args: Optional[str]) -> ExecutedAction:
@@ -630,14 +649,7 @@ class GradleBackend:
                 gradle_args
             )
         tasks = " ".join(tokens)
-        added = (
-            GRADLE_EXCLUDE_TEST_ARGS
-            if _backend_added(gradle_args, args, GRADLE_EXCLUDE_TEST_ARGS)
-            else ""
-        )
         reasons: List[str] = []
-        if added:
-            reasons.append(_TEST_OWNERSHIP_REASON)
         # The substitution is a fact about the task this backend MATERIALIZED —
         # `_install_task` found no maven-publish plugin — and stays true however
         # the caller then narrowed it.
@@ -647,7 +659,7 @@ class GradleBackend:
                 "nothing to the local maven repo"
             )
         return ExecutedAction(
-            argv_fragment=" ".join(part for part in (tasks, added) if part),
+            argv_fragment=tasks,
             reasons=tuple(reasons),
         )
 

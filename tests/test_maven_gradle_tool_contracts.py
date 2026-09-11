@@ -739,6 +739,83 @@ def test_an_unsatisfied_model_asserted_requirement_names_the_registered_maven():
     assert "3.8.7" in stated and "/usr/share/maven/bin/mvn" in stated
 
 
+@pytest.mark.parametrize("registered", [False, True])
+def test_maven_resolution_operations_reach_the_model_without_a_selected_fix(registered):
+    from sag.agent.tool_orchestration import format_tool_result
+
+    manager = RequirementFreeToolchainManager() if registered else EmptyToolchainManager()
+    result = _requirement_refusal(manager)
+    before = result.model_dump(mode="json")
+
+    visible = format_tool_result("build", result)
+
+    assert "project(action='provision', maven_version='<version floor>')" in visible
+    assert "project(action='env', tool='maven'" in visible
+    assert "does not install missing files" in visible
+    assert "source: tool_parameter" in visible
+    assert "parameter itself does not establish a project requirement" in visible
+    assert "maven_version='3.9" not in visible
+    assert "re-dispatch the same build" not in visible
+    assert "Suggestions:" not in visible
+    if registered:
+        assert "3.8.7 at /usr/share/maven/bin/mvn (source: env_overlay)" in visible
+    else:
+        assert "Registered Maven without" not in visible
+    assert result.model_dump(mode="json") == before
+
+
+def test_project_requirement_remains_visible_in_resolution_failure():
+    from sag.agent.tool_orchestration import format_tool_result
+
+    class ObservedRequirementManager(RequirementFreeToolchainManager):
+        def observed_requirements(self, name, working_directory=None):
+            return [ToolVersionRequirement(raw="[3.9,)", source="build_error", kind="range")]
+
+    result = _requirement_refusal(ObservedRequirementManager(), requirement=None)
+    visible = format_tool_result("build", result)
+
+    assert "[3.9,) (source: build_error)" in visible
+    assert "must still satisfy the required range" in visible
+    assert "this call's maven_version_requirement parameter" not in visible
+    assert "omitted" not in visible
+
+
+def test_maven_syntax_for_provision_and_registration_is_reachable():
+    from sag.tools.project_tool import ProjectTool
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, **kwargs):
+            self.calls.append(kwargs)
+            return ToolResult.completed_success(output="operation accepted")
+
+    installer, registrar = Recorder(), Recorder()
+    project = ProjectTool(system_tool=installer, env_tool=registrar)
+    # Values are chosen by this caller, not filled by the failure renderer.
+    provision = project.safe_execute(action="provision", maven_version="3.9")
+    register = project.safe_execute(
+        action="env",
+        tool="maven",
+        executable="/opt/apache-maven/bin/mvn",
+        requirement="[3.9,)",
+        activate=True,
+    )
+
+    assert provision.succeeded and register.succeeded
+    assert installer.calls == [{"action": "install_maven", "maven_version": "3.9"}]
+    assert registrar.calls == [
+        {
+            "action": "register",
+            "tool": "maven",
+            "executable": "/opt/apache-maven/bin/mvn",
+            "requirement": "[3.9,)",
+            "activate": True,
+        }
+    ]
+
+
 def test_an_unsatisfied_model_asserted_requirement_names_both_exits():
     manager = RequirementFreeToolchainManager()
 

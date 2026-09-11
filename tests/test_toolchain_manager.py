@@ -520,6 +520,65 @@ def test_env_overlay_candidate_wins_over_system_path():
     assert resolved.candidate.source == "env_overlay"
 
 
+@pytest.mark.parametrize(
+    "tool, executable, wrapper_name, versions",
+    [
+        ("maven", "mvn", "mvnw", ("3.9.4", "3.9.9")),
+        ("gradle", "gradle", "gradlew", ("8.7", "8.8")),
+    ],
+)
+@pytest.mark.parametrize("selection", ["default", "compatible", "disabled", "exact", "preferred"])
+def test_usable_project_wrapper_preference_survives_an_active_overlay(
+    tool, executable, wrapper_name, versions, selection
+):
+    root = "/workspace/project"
+    wrapper = f"{root}/{wrapper_name}"
+    active = f"/opt/{tool}-{versions[1]}/bin/{executable}"
+    prefix = "Apache Maven" if tool == "maven" else "Gradle"
+    orchestrator = FakeToolchainOrchestrator(
+        {wrapper: f"{prefix} {versions[0]}", active: f"{prefix} {versions[1]}"},
+        path_executable=active,
+        realpaths={root: root, wrapper: wrapper},
+        regular_files={wrapper},
+    )
+    orchestrator.publish_manifest(
+        complete_build_requirements_v1(project_root=root, build_system=tool)
+    )
+    orchestrator.publish_overlay(
+        {
+            "version": 1,
+            "tools": {
+                tool: {
+                    "active": active,
+                    "candidates": {active: {"version": versions[1], "source": "agent_registered"}},
+                    "blocked": [],
+                }
+            },
+        }
+    )
+    requirement = None
+    if selection in {"exact", "preferred", "compatible"}:
+        requirement = ToolVersionRequirement(
+            raw=f">={versions[0]}" if selection == "compatible" else versions[1],
+            source="tool_parameter",
+            kind="minimum" if selection == "compatible" else selection,
+        )
+    resolved = ToolchainManager(orchestrator).resolve(
+        ToolchainSpec(
+            name=tool,
+            executable=executable,
+            prefer_wrapper=selection != "disabled",
+            version_requirement=requirement,
+        ),
+        working_directory=root,
+    )
+    assert resolved is not None
+    prefer_project = selection in {"default", "compatible"}
+    assert resolved.candidate.path == (wrapper if prefer_project else active)
+    assert resolved.candidate.version == (versions[0] if prefer_project else versions[1])
+    assert resolved.candidate.source == ("wrapper" if prefer_project else "env_overlay")
+
+
 def test_env_overlay_blocker_excludes_exact_path_only():
     orchestrator = FakeToolchainOrchestrator(
         {
@@ -617,9 +676,7 @@ def test_env_overlay_resolution_reads_overlay_json_once_for_multiple_candidates(
 
 
 def test_registered_candidate_persists_but_is_not_live_resolution_authority():
-    orchestrator = FakeToolchainOrchestrator(
-        {"/private/toolchains/mvn": "Apache Maven 3.9.6"}
-    )
+    orchestrator = FakeToolchainOrchestrator({"/private/toolchains/mvn": "Apache Maven 3.9.6"})
     manager = ToolchainManager(orchestrator)
     manager.register(
         ToolExecutableCandidate(

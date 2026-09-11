@@ -124,8 +124,15 @@ class PythonReceiptFS(ContainerFS):
     [("normal", False), ("truncated", False), ("empty", False), ("normal", True)],
 )
 def test_python_raw_bytes_close_facade_assessments_and_round_trip_output_ref(
-    mode, assertion_failed, durable_tool_result_storage
+    mode, assertion_failed, durable_tool_result_storage, tmp_path, monkeypatch
 ):
+    from sag.agent import receipt_test_rows
+
+    # The fixture executes the real row parser on the host; its retained XML
+    # belongs in this test's writable directory, not Docker's /workspace.
+    monkeypatch.setattr(
+        receipt_test_rows, "REPORT_SNAPSHOT_DIR", str(tmp_path.resolve() / "report-snapshots")
+    )
     raw = {
         "normal": "1 passed in 0.01s\n",
         "truncated": ("runner diagnostic line\n" * 10000) + "1 passed in 0.01s\n",

@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
+import re
 import shlex
+import xml.etree.ElementTree as ET
 from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Literal, Mapping
@@ -32,6 +35,8 @@ from sag.agent.java_success_certificates import (
     scope_subject_sha256,
 )
 from sag.metrics.attainment import AttainmentResult, evaluate_attainment, view_from_certificate
+from sag.agent.evidence_assessments import receipt_assessment_bundle_complete as _assessed
+from sag.agent.receipt_structure import single_maven_module_proven as _single_maven_module
 from sag.metrics.module_keys import module_key
 from sag.metrics.target_record import TargetRecord
 
@@ -56,9 +61,11 @@ class PinnedCITarget(BaseModel):
 
     record: TargetRecord
     raw_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Host-supplied task, never a model-authored plan or a rewritten CI record.
+    execution_command: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
-def load_ci_target(path: str | Path) -> PinnedCITarget:
+def load_ci_target(path: str | Path, *, execution_command: str | None = None) -> PinnedCITarget:
     source = Path(path)
     if source.stat().st_size > 4 * 1024 * 1024:
         raise ValueError("CI target exceeds the 4 MiB input bound")
@@ -66,6 +73,7 @@ def load_ci_target(path: str | Path) -> PinnedCITarget:
     return PinnedCITarget(
         record=TargetRecord.model_validate_json(raw),
         raw_sha256=hashlib.sha256(raw).hexdigest(),
+        execution_command=execution_command,
     )
 
 
@@ -85,6 +93,8 @@ class CIComparisonSnapshot(BaseModel):
     attainment: AttainmentResult | None = None
     receipt_ids: tuple[str, ...] = ()
     commands: tuple[str, ...] = ()
+    acceptance_command: str | None = None
+    test_identity_basis: str | None = None
     reasons: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -134,23 +144,6 @@ def _call_key(tool, params):
     )
 
 
-def _assessed(receipt, assessments):
-    from sag.agent.evidence_assessments import ASSESSMENT_BUNDLE_COMPLETE, FINGERPRINT_KEYS
-
-    fingerprints = {
-        key: str(receipt[key]).strip()
-        for key in FINGERPRINT_KEYS
-        if receipt.get(key) is not None and str(receipt[key]).strip()
-    }
-    return any(
-        item.get("receipt_id") == receipt["receipt_id"]
-        and item.get("typed_code") == ASSESSMENT_BUNDLE_COMPLETE
-        and item.get("scope") == receipt.get("output_content_hash")
-        and item.get("fingerprints") == fingerprints
-        for item in assessments
-    )
-
-
 def _current_test_counts(receipt, parsed, *, run_id, target_sha):
     """Read an existing totals tier, or complete current Maven XML rows.
 
@@ -194,41 +187,13 @@ def _current_test_counts(receipt, parsed, *, run_id, target_sha):
     )
 
 
-def _single_maven_module(orchestrator, receipt, project_root):
-    """A root-only current POM graph can name '.', independently of a CI cell.
+def _certificate_input(orchestrator, state, validator, project_root, repo, target=None):
+    """Bind actual receipts to a fixed host task, or read the archived plan path.
 
-    This is used only when a successful single-project Maven invocation has no
-    Reactor Summary. Existing receipt module rows do not depend on this probe.
+    A fixed command supplies obligations, never observations or test counts.
+    Matching its recipe does not discharge those obligations without terminal,
+    assessed current-checkout receipts and complete hash-verified reports.
     """
-    from sag.agent.forced_build_graph import verify_forced_candidate_build_graph
-    from sag.agent.invocation_receipts import _succeeded
-    from sag.runtime.container_io import resolve_control_execute
-
-    if (
-        receipt.get("tool") != "maven"
-        or receipt.get("actual_cwd", receipt.get("working_directory")) != project_root
-    ):
-        return False
-    execute = resolve_control_execute(orchestrator)
-    if not callable(execute):
-        return False
-    unchanged = (
-        execute(
-            f"git -C {shlex.quote(project_root)} diff --quiet HEAD -- "
-            "pom.xml .mvn/maven.config .mvn/extensions.xml"
-        )
-        or {}
-    )
-    if not _succeeded(unchanged) or unchanged.get("dispatch_status"):
-        return False
-    graph = verify_forced_candidate_build_graph(
-        orchestrator, project_root=project_root, candidate_root=project_root, system="maven"
-    )
-    return graph.status == "verified" and graph.visited_roots == (project_root,)
-
-
-def _certificate_input(orchestrator, state, validator, project_root, repo):
-    """Adapt one accepted finite plan and the receipts proving its exact calls."""
     from sag.agent.attempt_policy import resolve_current_build_receipt_scope
     from sag.agent.receipt_structure import dispatch_terminated, maven_module_identity_ambiguous
     from sag.agent.receipt_test_rows import read_delta_testcase_rows
@@ -247,9 +212,42 @@ def _certificate_input(orchestrator, state, validator, project_root, repo):
     execute = resolve_control_execute(orchestrator)
     if not callable(execute) or read_target_sha(execute, project_root) != scope_pin.target_sha:
         raise ValueError("current_checkout_differs_from_run_pin")
-    artifact = _accepted_plan(orchestrator, state)
-    if artifact is None:
-        raise ValueError("accepted_execution_plan_unavailable")
+    fixed_command = target.execution_command if target else None
+    if fixed_command:
+        from sag.agent.project_execution_plan import ExecutionStep
+        from sag.tools.build.backends import parse_runner_command
+
+        if target.record.repo != repo or target.record.sha != scope_pin.target_sha:
+            raise ValueError("fixed_task_repository_or_revision_mismatch")
+        executor, _, argv = parse_runner_command(fixed_command)
+        if executor not in {"maven", "gradle"}:
+            raise ValueError("fixed_task_certificate_requires_jvm_runner")
+        plan_digest = canonical_sha256(
+            {
+                "target_sha256": target.raw_sha256,
+                "command": fixed_command,
+                "project_root": project_root,
+            }
+        )
+        basis_ref = plan_digest
+        step = ExecutionStep(
+            tool="build",
+            params={
+                "command": fixed_command,
+                "working_directory": project_root,
+            },
+            purpose="Complete the host-pinned build and test task",
+        )
+        groups = (("build", (step,)), ("test", (step,)))
+        fixed_key = (executor, project_root, tuple(argv))
+    else:
+        artifact = _accepted_plan(orchestrator, state)
+        if artifact is None:
+            raise ValueError("accepted_execution_plan_unavailable")
+        plan_digest, basis_ref = artifact.authored_plan_sha256, artifact.artifact_sha256
+        groups = (("build", artifact.plan.build_steps), ("test", artifact.plan.test_steps))
+        fixed_key = None
+
     receipts = validator._current_scoped_receipts(project_root)
     assessments = validator._read_live_evidence_assessments()
     if receipts is None or assessments is None:
@@ -265,22 +263,22 @@ def _certificate_input(orchestrator, state, validator, project_root, repo):
         project_id=repo or project_root,
         run_id=state.run_id,
         target_sha=scope_pin.target_sha,
-        plan_sha256=artifact.authored_plan_sha256,
+        plan_sha256=plan_digest,
     )
     scope = ScopeClaim(
-        scope_id="plan:" + artifact.authored_plan_sha256[:32],
+        scope_id=("task:" if fixed_command else "plan:") + plan_digest[:32],
         revision=1,
         evidence_epoch=state.run_id,
         subject=subject,
         kind="declared_entrypoint",
         closure="closed",
-        basis_refs=(artifact.artifact_sha256,),
+        basis_refs=(basis_ref,),
     )
 
     def obligations(unit, required, satisfied=(), failed=(), *, applicability="required", red=()):
         return TypedObligationSet(
             unit=unit,
-            basis_ref=artifact.artifact_sha256,
+            basis_ref=basis_ref,
             subject_sha256=scope_subject_sha256(subject),
             scope_id=scope.scope_id,
             scope_revision=scope.revision,
@@ -297,20 +295,31 @@ def _certificate_input(orchestrator, state, validator, project_root, repo):
     # execution-completion validator. A later different/narrower call has a
     # different key and cannot discharge the original plan step.
     planned_calls = Counter(
-        _call_key(step.tool, step.params)
-        for step in (*artifact.plan.build_steps, *artifact.plan.test_steps)
+        fixed_key or _call_key(step.tool, step.params) for _, steps in groups for step in steps
     )
     matched = {}
     for receipt in sorted(receipts, key=validator._receipt_sequence):
         contract = validator._test_execution_contract(receipt)
         if contract is None or not _assessed(receipt, assessments):
             continue
+        if fixed_command and shlex.split(receipt.get("argv") or "")[1:] != list(fixed_key[2]):
+            # A runner-added selection/skip is not equivalent to the fixed task,
+            # even when the legacy contract's ordered-subsequence check permits it.
+            continue
         call = contract["requested_call"]
-        key = _call_key(call["tool"], call["params"])
+        key = (
+            (
+                contract["effective_tool"],
+                contract["expected_cwd"],
+                tuple(shlex.split(contract.get("expected_argv") or "")),
+            )
+            if fixed_command
+            else _call_key(call["tool"], call["params"])
+        )
         matched.setdefault(key, deque(maxlen=planned_calls.get(key, 0))).append(receipt)
 
-    evidence = {artifact.artifact_sha256}
-    required_evidence = {artifact.artifact_sha256}
+    evidence = {basis_ref}
+    required_evidence = {basis_ref}
     build_required, build_done, build_failed = [], [], []
     test_required, test_done, test_red = [], [], []
     modules, succeeded_modules, failed_modules = set(), set(), set()
@@ -322,16 +331,16 @@ def _certificate_input(orchestrator, state, validator, project_root, repo):
             CertificateBlocker(code=code, affects=affects, owner="harness", reason=detail)
         )
 
-    for lane, steps in (("build", artifact.plan.build_steps), ("test", artifact.plan.test_steps)):
+    for lane, steps in groups:
         for index, step in enumerate(steps):
             step_id = f"{lane}:{index + 1}"
             required_evidence.add(step_id)
             required = build_required if lane == "build" else test_required
             required.append(step_id)
-            candidates = matched.get(_call_key(step.tool, step.params))
+            candidates = matched.get(fixed_key or _call_key(step.tool, step.params))
             if not candidates:
                 continue
-            receipt = candidates.popleft()
+            receipt = candidates[-1] if fixed_command else candidates.popleft()
             evidence.add(step_id)
             evidence.add(receipt["receipt_id"])
             required_evidence.add(receipt["receipt_id"])
@@ -505,11 +514,94 @@ def _certificate_input(orchestrator, state, validator, project_root, repo):
     )
 
 
-def _same_pool_identities(parsed_reads, counts, cell):
-    """Map complete fresh raw JUnit identities only by exact target membership.
+def _jenkins_report_namespaces(orchestrator, parsed_reads, project_root, cell):
+    """Bind each raw report to the literal GAV of its unchanged source POM.
 
-    Identity evidence never invents aliases or deduplicates executions. Once a
-    target names its universe, an incomplete or different local pool cannot
+    No namespace stripping or artifact/directory-name guessing. A parent group
+    may be inherited literally; property expressions and duplicate coordinates
+    remain unavailable. The caller already proved the current target SHA.
+    """
+    from sag.agent.invocation_receipts import _succeeded
+    from sag.agent.receipt_test_rows import _report_module_root
+    from sag.runtime.container_io import read_container_text, resolve_control_execute
+
+    qualified = [identity.partition("::") for identity in cell.executed_ids]
+    if not qualified or not all(
+        sep and prefix.count("$") == 1 and suffix for prefix, sep, suffix in qualified
+    ):
+        return {}
+    expected = {prefix for prefix, _, _ in qualified}
+    reports = {}
+    for parsed in parsed_reads:
+        for row in parsed.get("rows", ()):
+            path = str(row.get("report_path") or "")
+            root = _report_module_root("maven", path)
+            if (
+                not root
+                or posixpath.normpath(path) != path
+                or not (root == project_root or root.startswith(project_root.rstrip("/") + "/"))
+            ):
+                return {}
+            reports[path] = root
+    roots = set(reports.values())
+    if not roots or len(roots) > 256:
+        return {}
+    execute = resolve_control_execute(orchestrator)
+    if not callable(execute):
+        return {}
+    namespaces = {}
+    try:
+        for root in sorted(roots):
+            path = posixpath.join(root, "pom.xml")
+            relative = posixpath.relpath(path, project_root)
+            tracked = (
+                execute(
+                    f"git -C {shlex.quote(project_root)} ls-files --error-unmatch -- {shlex.quote(relative)}"
+                )
+                or {}
+            )
+            clean = (
+                execute(
+                    f"git -C {shlex.quote(project_root)} diff --quiet HEAD -- {shlex.quote(relative)}"
+                )
+                or {}
+            )
+            if (
+                not _succeeded(tracked)
+                or tracked.get("dispatch_status")
+                or str(tracked.get("output") or "").strip() != relative
+                or not _succeeded(clean)
+                or clean.get("dispatch_status")
+            ):
+                return {}
+            content = read_container_text(orchestrator, path, exact_bytes=True)
+            if content is None or len(content.encode("utf-8")) > 1024 * 1024:
+                return {}
+            pom = ET.fromstring(content)
+            for element in pom.iter():
+                element.tag = element.tag.rsplit("}", 1)[-1]
+            if len(pom.findall("artifactId")) != 1 or len(pom.findall("groupId")) > 1:
+                return {}
+            group = (pom.findtext("groupId") or pom.findtext("parent/groupId") or "").strip()
+            artifact = (pom.findtext("artifactId") or "").strip()
+            if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", value) for value in (group, artifact)):
+                return {}
+            namespace = group + "$" + artifact
+            if namespace not in expected or namespace in namespaces.values():
+                return {}
+            namespaces[root] = namespace
+    except Exception:
+        return {}
+    return {path: namespaces[root] for path, root in reports.items()}
+
+
+def _same_pool_identities(
+    parsed_reads, counts, cell, *, single_module=False, report_namespaces=None
+):
+    """Map complete raw JUnit identities to the same fixed target universe.
+
+    A sole module or unchanged module POM can prove a Jenkins namespace. Once
+    a target names its universe, an incomplete or different local pool cannot
     fall back to a more flattering count-only comparison.
     """
     from sag.agent.receipt_test_rows import rows_were_bounded
@@ -518,15 +610,44 @@ def _same_pool_identities(parsed_reads, counts, cell):
         counts is not None and counts.red > 0 and (cell.red_count > 0 or cell.flaky_count > 0)
     )
     if not cell.executed_ids:
-        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE" if identity_needed_for_red else None
+        return (
+            (),
+            (),
+            "CI_TEST_IDENTITIES_NOT_COMPARABLE" if identity_needed_for_red else None,
+            None,
+        )
     if identity_needed_for_red and (
         len(cell.red_ids) != cell.red_count or len(cell.flaky_ids) != cell.flaky_count
     ):
-        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE"
+        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+    # Jenkins Maven reports qualify raw JUnit IDs as group$artifact::class#name.
+    # One independently proven module on BOTH sides makes that sole namespace
+    # unambiguous. Never strip namespaces across multiple/unknown modules or
+    # collapse duplicate testcase identities into a more flattering set.
+    qualified = [identity.partition("::") for identity in cell.executed_ids]
+    namespaces = {prefix for prefix, separator, _ in qualified if separator}
+    aliases = {}
+    namespace = None
+    if (
+        single_module
+        and cell.modules == (".",)
+        and len(namespaces) == 1
+        and all(
+            separator and prefix.count("$") == 1 and suffix
+            for prefix, separator, suffix in qualified
+        )
+    ):
+        aliases = {
+            suffix: original for original, (_, _, suffix) in zip(cell.executed_ids, qualified)
+        }
+        if len(aliases) != len(cell.executed_ids):
+            return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+        namespace = next(iter(namespaces))
     executed, red = [], []
+    mapped = False
     for parsed in parsed_reads:
         if parsed.get("status") != "complete" or parsed.get("reasons") or rows_were_bounded(parsed):
-            return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE"
+            return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
         for row in parsed.get("rows", ()):
             classname, name = row.get("classname"), row.get("name")
             if (
@@ -535,10 +656,18 @@ def _same_pool_identities(parsed_reads, counts, cell):
                 or not classname
                 or not name
             ):
-                return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE"
+                return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
             identity = classname + "#" + name
+            if identity not in cell.executed_ids and identity in aliases:
+                identity = aliases[identity]
+                mapped = True
+            elif identity not in cell.executed_ids and report_namespaces:
+                prefix = report_namespaces.get(row.get("report_path"))
+                if prefix:
+                    identity = prefix + "::" + identity
+                    mapped = True
             if identity not in cell.executed_ids or identity in executed:
-                return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE"
+                return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
             executed.append(identity)
             if row.get("outcome") in {"failed", "error"}:
                 red.append(identity)
@@ -548,8 +677,17 @@ def _same_pool_identities(parsed_reads, counts, cell):
         or len(red) != counts.red
         or set(executed) != set(cell.executed_ids)
     ):
-        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE"
-    return tuple(executed), tuple(red), None
+        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+    return (
+        tuple(executed),
+        tuple(red),
+        None,
+        (
+            "jenkins_module_pom_coordinates"
+            if mapped and report_namespaces
+            else "jenkins_single_module:" + namespace if mapped else "exact_raw_junit_ids"
+        ),
+    )
 
 
 def build_ci_comparison(orchestrator, state, *, validator, project_root, repository, target=None):
@@ -558,6 +696,7 @@ def build_ci_comparison(orchestrator, state, *, validator, project_root, reposit
         "run_id": state.run_id,
         "repo": repo,
         "target_record_sha256": target.raw_sha256 if target else None,
+        "acceptance_command": target.execution_command if target else None,
     }
     if validator is None or not project_root:
         return CIComparisonSnapshot(
@@ -567,7 +706,7 @@ def build_ci_comparison(orchestrator, state, *, validator, project_root, reposit
         )
     try:
         payload, receipt_ids, commands, parsed_reads = _certificate_input(
-            orchestrator, state, validator, project_root, repo
+            orchestrator, state, validator, project_root, repo, target
         )
         certificate = evaluate_java_success_certificate(payload)
     except Exception as exc:
@@ -592,8 +731,18 @@ def build_ci_comparison(orchestrator, state, *, validator, project_root, reposit
             **base, status="no_matched_cell", reasons=("official_ci_cell_not_matched",)
         )
     cell = next(cell for cell in target.record.cells if cell.cell_id == target.record.matched_cell)
-    executed_ids, red_ids, identity_reason = _same_pool_identities(
-        parsed_reads, certificate.test_counts, cell
+    single_module = certificate.build_units.required_ids == (".",)
+    namespaces = (
+        _jenkins_report_namespaces(orchestrator, parsed_reads, project_root, cell)
+        if not single_module
+        else {}
+    )
+    executed_ids, red_ids, identity_reason, identity_basis = _same_pool_identities(
+        parsed_reads,
+        certificate.test_counts,
+        cell,
+        single_module=single_module,
+        report_namespaces=namespaces,
     )
     view = view_from_certificate(certificate, repo=repo)
     view_fields = view.model_dump()
@@ -618,6 +767,7 @@ def build_ci_comparison(orchestrator, state, *, validator, project_root, reposit
         **base,
         status="evaluated",
         attainment=result,
+        test_identity_basis=identity_basis,
         reasons=tuple(
             dict.fromkeys(
                 (

@@ -111,7 +111,7 @@ def test_successful_build_still_requires_test_entry_prerequisite():
     assert decision.reason_code == "build_not_ready"
 
 
-def test_analyze_requires_both_survey_readiness_and_a_sealed_model_plan():
+def test_historical_strict_policy_requires_both_survey_readiness_and_a_sealed_model_plan():
     state = _state()
     plan_sha256 = "a" * 64
     state.set_fact(
@@ -120,7 +120,7 @@ def test_analyze_requires_both_survey_readiness_and_a_sealed_model_plan():
         evidence_ref="validator://analysis",
     )
 
-    missing = PhaseTransitionPolicy().decide(
+    missing = PhaseTransitionPolicy(require_analysis_plan=True).decide(
         _analysis_record(plan_sha256=plan_sha256),
         state=state,
         budgets=RepairBudgets.available(),
@@ -146,7 +146,7 @@ def test_analyze_requires_both_survey_readiness_and_a_sealed_model_plan():
         evidence_ref="/workspace/.setup_agent/project_execution_plan.json",
     )
 
-    ready = PhaseTransitionPolicy().decide(
+    ready = PhaseTransitionPolicy(require_analysis_plan=True).decide(
         _analysis_record(plan_sha256=plan_sha256),
         state=state,
         budgets=RepairBudgets.available(),
@@ -167,7 +167,7 @@ def test_analyze_one_plan_cannot_license_analyze_two():
     ):
         state.set_fact(key, value, evidence_ref="artifact://analyze-1-plan")
 
-    decision = PhaseTransitionPolicy().decide(
+    decision = PhaseTransitionPolicy(require_analysis_plan=True).decide(
         _analysis_record(attempt_id="analyze-2", plan_sha256=plan_sha256),
         state=state,
         budgets=RepairBudgets.available(),
@@ -188,7 +188,7 @@ def test_blocked_analyze_without_a_plan_claim_cannot_borrow_a_sealed_artifact():
     ):
         state.set_fact(key, value, evidence_ref="artifact://analyze-2-plan")
 
-    decision = PhaseTransitionPolicy().decide(
+    decision = PhaseTransitionPolicy(require_analysis_plan=True).decide(
         _analysis_record(
             attempt_id="analyze-2",
             signal="blocked",

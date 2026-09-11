@@ -326,6 +326,7 @@ _RECEIPT_V2_OPTIONAL_FIELDS = frozenset(
         "producer_observations_sha256",
         "testcase_outcomes",
         "testcase_execution_rows",
+        "testcase_execution_totals",
         "testcase_row_disclosure",
         "gradle_suite_summaries",
         "gradle_row_disclosure",
@@ -345,6 +346,7 @@ _RECEIPT_OMITTABLE_EVIDENCE_FIELDS = frozenset(
     {
         "testcase_outcomes",
         "testcase_execution_rows",
+        "testcase_execution_totals",
         "testcase_row_disclosure",
         "gradle_suite_summaries",
         "gradle_row_disclosure",
@@ -1452,13 +1454,15 @@ def toolchain_fingerprint(
     executable: Optional[str],
     version_flag: str,
     working_directory: Optional[str] = None,
+    tool: Optional[str] = None,
 ) -> Optional[Dict[str, str]]:
     """Which runner binary this invocation actually launched, and its version.
 
-    ONE round trip: the resolved path (`command -v`) and the FIRST line of the
-    runner's own version output, separated by a marker so an unresolved path
-    can never shift into the version slot. A wrapper (`./gradlew`, `./mvnw`) is
-    resolved from the invocation's own cwd, which is where it ran.
+    One round trip resolves the path and reads the runner's version output.
+    Gradle starts with blank/separator lines, so read up to 64 lines for its
+    explicit version banner. Other runners keep their first-line convention.
+    The marker keeps an unresolved path out of the version slot; wrappers
+    resolve from the invocation's own cwd.
     """
     runner = str(executable or "").strip()
     if not runner:
@@ -1468,7 +1472,7 @@ def toolchain_fingerprint(
     command = (
         f"{prefix}command -v {shlex.quote(runner)} 2>/dev/null; "
         f"echo {shlex.quote(TOOLCHAIN_MARKER)}; "
-        f"{shlex.quote(runner)} {version_flag} 2>&1 | head -n 1"
+        f"{shlex.quote(runner)} {version_flag} 2>&1 | head -n {64 if tool == 'gradle' else 1}"
     )
     try:
         result = execute(command) or {}
@@ -1480,7 +1484,16 @@ def toolchain_fingerprint(
     path = _first_line(resolved)
     if path:
         fingerprint["executable"] = path
-    line = _first_line(version)[:VERSION_LINE_MAX_CHARS]
+    if tool == "gradle":
+        versions = {
+            line.strip()
+            for line in version.splitlines()[:64]
+            if re.fullmatch(r"Gradle [0-9][0-9A-Za-z.+-]*", line.strip())
+            and len(line.strip()) <= VERSION_LINE_MAX_CHARS
+        }
+        line = versions.pop() if len(versions) == 1 else ""
+    else:
+        line = _first_line(version)[:VERSION_LINE_MAX_CHARS]
     if line:
         fingerprint["version"] = line
     return fingerprint or None
@@ -2161,6 +2174,54 @@ def _validate_testcase_row_disclosure(value: Any) -> None:
     _validate_row_disclosure(value, field="testcase_row_disclosure", source_id=TESTCASE_ROWS_SOURCE)
 
 
+def _validate_testcase_execution_totals(value: Any, *, receipt: Mapping[str, Any]) -> None:
+    """The complete Maven XML census, independent of its identity sample.
+
+    These are the counts the exact delta parser already returns to the agent.
+    They claim all report bytes on this receipt, never a module/test universe.
+    A contradictory total is withdrawn before it can hide retained red rows.
+    """
+    field = "testcase_execution_totals"
+    counts = {"reported", "passed", "failed", "errors", "skipped"}
+    if (
+        receipt.get("tool") != "maven"
+        or not isinstance(value, Mapping)
+        or set(value) != counts | {"report_count"}
+    ):
+        raise ValueError(f"receipt {field} shape or runner is invalid")
+    for key in counts | {"report_count"}:
+        _receipt_count(value[key], f"{field}.{key}")
+    claims = _validate_report_delta(receipt.get("report_delta"))
+    if not claims or value["report_count"] != len(claims):
+        raise ValueError(f"receipt {field} does not cover its report_delta")
+    if value["reported"] != sum(value[key] for key in counts - {"reported"}):
+        raise ValueError(f"receipt {field} counts do not conserve results")
+    for envelope_name, list_key, outcome_key in (
+        ("testcase_execution_rows", "rows", "outcome"),
+        ("testcase_outcomes", "nodes", "status"),
+    ):
+        entries = (receipt.get(envelope_name) or {}).get(list_key) or ()
+        if len(entries) > value["reported"]:
+            raise ValueError(f"receipt {field} is smaller than retained observations")
+        for outcome, key in (
+            ("passed", "passed"),
+            ("failed", "failed"),
+            ("error", "errors"),
+            ("skipped", "skipped"),
+        ):
+            if sum(row.get(outcome_key) == outcome for row in entries) > value[key]:
+                raise ValueError(f"receipt {field} contradicts retained {outcome} observations")
+    envelope = receipt.get("testcase_execution_rows") or {}
+    if envelope.get("status") == "complete":
+        rows = envelope.get("rows") or ()
+        truncation = (receipt.get("testcase_row_disclosure") or {}).get("rows_truncated") or {}
+        accounted = len(rows) + sum(
+            truncation.get(key, 0) for key in ("dropped_green", "dropped_red", "unread_rows")
+        )
+        if accounted > value["reported"] or (not truncation and accounted != value["reported"]):
+            raise ValueError(f"receipt {field} contradicts its identity sample bounds")
+
+
 # --- receipt-level reconciliation (plan r2 T3; principle P-C) ---------------
 #
 # Every rule below reads two fields AGAINST each other. None of them is a shape
@@ -2177,7 +2238,7 @@ def _validate_testcase_row_disclosure(value: Any) -> None:
 
 
 def _suite_totals(receipt: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """This receipt's own Gradle totals, folded per module, with their reach.
+    """This receipt's own totals, with their reach.
 
     Three reaches, because a bounded section is bounded in three different
     ways. `complete_pairs`: the section still names every (module, task) pair
@@ -2191,6 +2252,22 @@ def _suite_totals(receipt: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     witness and reconciles nothing rather than reconciling against zero.
     """
 
+    census = receipt.get("testcase_execution_totals")
+    if census is not None:
+        _validate_testcase_execution_totals(census, receipt=receipt)
+        return {
+            "modules": {},  # A complete global count proves no module map.
+            "totals": {
+                "tests": census["reported"],
+                "failures": census["failed"],
+                "errors": census["errors"],
+                "skipped": census["skipped"],
+                "xml_files": census["report_count"],
+            },
+            "complete_pairs": False,
+            "read_every_report": True,
+            "complete_claims": True,
+        }
     section = receipt.get("gradle_suite_summaries")
     if not isinstance(section, Mapping):
         return None
@@ -3038,6 +3115,10 @@ def validate_receipt_v2(
         )
     if "testcase_row_disclosure" in receipt:
         _validate_testcase_row_disclosure(receipt.get("testcase_row_disclosure"))
+    if "testcase_execution_totals" in receipt:
+        _validate_testcase_execution_totals(
+            receipt.get("testcase_execution_totals"), receipt=receipt
+        )
     if "gradle_suite_summaries" in receipt:
         _validate_gradle_suite_summaries(receipt.get("gradle_suite_summaries"), receipt=receipt)
     if "gradle_row_disclosure" in receipt:
@@ -3140,6 +3221,7 @@ def build_receipt(
     output_content_hash: Optional[str] = None,
     testcase_outcomes: Optional[Mapping[str, Any]] = None,
     testcase_execution_rows: Optional[Mapping[str, Any]] = None,
+    testcase_execution_totals: Optional[Mapping[str, Any]] = None,
     testcase_row_disclosure: Optional[Mapping[str, Any]] = None,
     gradle_suite_summaries: Optional[Mapping[str, Any]] = None,
     gradle_row_disclosure: Optional[Mapping[str, Any]] = None,
@@ -3295,6 +3377,17 @@ def build_receipt(
         or ("testcase_outcomes" in receipt and not gradle_row_disclosure)
     ):
         _attach("testcase_row_disclosure", row_bounds, _validate_testcase_row_disclosure)
+    if testcase_execution_totals is not None:
+        totals = (
+            dict(testcase_execution_totals)
+            if isinstance(testcase_execution_totals, Mapping)
+            else testcase_execution_totals
+        )
+        _attach(
+            "testcase_execution_totals",
+            totals,
+            lambda value: _validate_testcase_execution_totals(value, receipt=receipt),
+        )
     # Gradle test evidence (evidence study 2026-08-30): the complete per
     # (project, task-dir) totals, and what the bounded identity harvest beside
     # them had to drop. Both are attached through the same gate as every other
@@ -3604,6 +3697,7 @@ def record_invocation(
         execute,
         receipt_id=resolved_receipt_id,
         delta=resolved_delta,
+        capture_reports=True,
     )
     gradle_project_map = (
         read_gradle_project_map(execute, resolved_domain_id) if tool == "gradle" else None
@@ -3663,6 +3757,7 @@ def record_invocation(
             executable=runner_executable(argv, tool),
             version_flag=VERSION_FLAGS.get(tool, "--version"),
             working_directory=working_directory,
+            tool=tool,
         ),
         output_content_hash=output_content_hash(output),
         # Precedence, weakest transport last. A harvest that ran states BOTH
@@ -3683,6 +3778,16 @@ def record_invocation(
             else (diagnostic_rows or read_testcase_outcomes(execute, resolved_delta))
         ),
         testcase_execution_rows=sealed_rows,
+        testcase_execution_totals=(
+            {**parsed_rows["execution_totals"], "report_count": parsed_rows["report_count"]}
+            if tool == "maven"
+            and parsed_rows
+            and parsed_rows.get("status") == "complete"
+            and not parsed_rows.get("reasons")
+            and parsed_rows.get("report_count", 0) > 0
+            and parsed_rows.get("execution_totals") is not None
+            else None
+        ),
         testcase_row_disclosure=row_bound_disclosure,
         contract_id=contract_id,
         contract_hash=contract_hash,
@@ -3712,7 +3817,24 @@ def record_invocation(
         # system to keep in step. A receipt that named no modules writes
         # nothing at all.
         promote_structure(execute, receipt)
-        return {"receipt_id": receipt["receipt_id"]}
+        return {
+            "receipt_id": receipt["receipt_id"],
+            **(
+                {"report_test_counts": dict(parsed_rows["execution_totals"])}
+                if tool in {"maven", "gradle"}
+                and parsed_rows
+                and parsed_rows.get("status") == "complete"
+                and not parsed_rows.get("reasons")
+                and parsed_rows.get("report_count", 0) > 0
+                and parsed_rows.get("execution_totals") is not None
+                else {}
+            ),
+            **(
+                {"report_snapshot_errors": parsed_rows["report_snapshot_errors"]}
+                if parsed_rows and parsed_rows.get("report_snapshot_errors")
+                else {}
+            ),
+        }
     return {
         "receipt_persisted": False,
         "receipt_persistence_code": persistence.code,

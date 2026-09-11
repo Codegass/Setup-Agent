@@ -635,9 +635,9 @@ def test_zero_execution_reads_as_zero_execution_not_as_a_failed_percentage():
 
     assert "pass threshold" not in status["reason"]
     assert "0.0%" not in status["reason"]
-    assert status["reason"] == "no tests executed of 9,754 discovered"
-    assert status["status"] == "FAILED"
-    assert status["evidence_status"] == "blocked"
+    assert status["reason"] == "no current test receipt"
+    assert status["status"] == "WARNING"
+    assert status["evidence_status"] == "unknown"
 
 
 # --------------------------------------------------------------------------- #

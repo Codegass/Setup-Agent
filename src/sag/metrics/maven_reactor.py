@@ -19,7 +19,7 @@ _ROW = re.compile(
 )
 _RESULT = re.compile(r"BUILD (SUCCESS|FAILURE)$")
 _PROJECT = re.compile(
-    r"Building (?!(?:jar|war|ear|zip|tar)(?: archive)?:)"
+    r"Building (?!(?:jar|bundle|war|ear|zip|tar)(?: archive)?:)"
     r"(?P<name>\S.*?)(?: \[(?P<index>\d+)/(?P<total>\d+)\])?$"
 )
 

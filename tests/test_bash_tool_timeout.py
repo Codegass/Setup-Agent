@@ -19,6 +19,7 @@ class FakeBashOrchestrator:
         capture_stderr=True,
         environment=None,
         timeout=None,
+        truncate_output=True,
     ):
         self.command_calls.append(
             {

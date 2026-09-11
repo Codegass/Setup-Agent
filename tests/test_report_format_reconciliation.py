@@ -156,11 +156,12 @@ def test_archived_struts_testng_projections_contribute_one_execution(tmp_path):
     assert result["rows"][0]["name"] == "testRun"
 
 
-def test_archived_curator_one_declared_three_actual_stays_conflict(tmp_path):
+def test_archived_curator_retry_header_preserves_all_three_cases(tmp_path):
     result = parse(tmp_path, {"TEST-case.xml": (FIXTURES / "curator-mismatch.xml").read_text()})
-    assert result["status"] == "unavailable"
-    assert result["reasons"] == ["declared_testcase_count_mismatch"]
-    assert result["rows"] == []
+    assert result["status"] == "complete"
+    assert result["execution_totals"]["reported"] == 3
+    assert len(result["rows"]) == 3
+    assert sum(row.get("runner_reruns", 0) for row in result["rows"]) == 1
 
 
 @pytest.mark.parametrize(

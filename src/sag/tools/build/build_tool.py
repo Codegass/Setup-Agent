@@ -59,6 +59,7 @@ from .backends import (
     native_definition_feature,
     native_feature_definition,
     source_command_tokens,
+    parse_complete_command,
 )
 
 _ACTIONS = ("deps", "compile", "test", "verify", "package", "install", "native")
@@ -66,14 +67,14 @@ _ACTIONS = ("deps", "compile", "test", "verify", "package", "install", "native")
 # Verbs that actually invoke the JDK; `deps` resolution is not gated on a
 # matching toolchain, so it skips the pre-flight (spec §1b: no-op when moot).
 # `native` is python-system machinery and never reaches a JVM toolchain.
-_PREFLIGHT_VERBS = ("compile", "test", "verify", "package", "install")
+_PREFLIGHT_VERBS = ("run", "compile", "test", "verify", "package", "install")
 
 # Verbs the domain-edge execution law governs (spec §C2). They are the verbs
 # that PRODUCE something; `deps` resolves coordinates and env/probe verbs only
 # inspect, and refusing those would hide the very mismatch the edge records.
 # `native` repairs the ENVIRONMENT a consumer builds in rather than consuming a
 # producer's artifact, so a locked edge is not a reason to refuse it.
-_EDGE_GATED_VERBS = ("compile", "test", "verify", "package", "install")
+_EDGE_GATED_VERBS = ("run", "compile", "test", "verify", "package", "install")
 
 # --- the typed native affordance (spec §C8, plan §Stage E) ------------------
 # The refusal the plan names verbatim: provenance is necessary for a repair and
@@ -210,7 +211,7 @@ class BuildTool(BaseTool):
         super().__init__(
             name="build",
             description=(
-                "Project build runner facade: action = compile | test | package | deps. "
+                "Project build runner facade: pass command and working_directory once. "
                 "It detects maven, gradle, or python project markers, resolves the registered "
                 "toolchain, and records each dispatched runner in a durable invocation receipt. "
                 "For Maven and Gradle, compile/test/package already resolve declared dependencies; "
@@ -286,7 +287,7 @@ class BuildTool(BaseTool):
 
     def execute(
         self,
-        action: str,
+        action: Optional[str] = None,
         args: Optional[str] = None,
         working_directory: str = "/workspace",
         timeout: Optional[int] = None,
@@ -295,9 +296,55 @@ class BuildTool(BaseTool):
         definitions: Optional[Mapping[str, str]] = None,
         system: Optional[str] = None,
         source_command: Optional[str] = None,
+        command: Optional[str] = None,
+    ) -> ToolResult:
+        return self._execute(
+            action=action,
+            args=args,
+            working_directory=working_directory,
+            timeout=timeout,
+            maven_version_requirement=maven_version_requirement,
+            features=features,
+            definitions=definitions,
+            system=system,
+            source_command=source_command,
+            command=command,
+        )
+
+    def execute_bash_command(
+        self,
+        *,
+        command: str,
+        timeout: int,
+        working_directory: str,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> ToolResult:
+        """Same runner/evidence path, preserving the engine's original Bash call."""
+        return self._execute(
+            command=command,
+            timeout=timeout,
+            working_directory=working_directory,
+            _requested_tool="bash",
+            _request_environment=environment,
+        )
+
+    def _execute(
+        self,
+        action: Optional[str] = None,
+        args: Optional[str] = None,
+        working_directory: str = "/workspace",
+        timeout: Optional[int] = None,
+        maven_version_requirement: Optional[str] = None,
+        features: Optional[Sequence[str]] = None,
+        definitions: Optional[Mapping[str, str]] = None,
+        system: Optional[str] = None,
+        source_command: Optional[str] = None,
+        command: Optional[str] = None,
+        _requested_tool: str = "build",
+        _request_environment: Optional[Dict[str, str]] = None,
     ) -> ToolResult:
         verb = (action or "").strip().lower()
-        if verb not in _ACTIONS:
+        if command is None and verb not in _ACTIONS:
             return ToolResult.completed_failure(
                 output=f"Unknown build action: {action!r}",
                 error="invalid action",
@@ -333,10 +380,11 @@ class BuildTool(BaseTool):
         # the engine-owned scope before even probing a build marker. The facade
         # cannot silently add seven optional nulls or freeze a nearby call.
         actual_public_params: Dict[str, Any] = {
-            "action": action,
             "working_directory": working_directory,
         }
         for key, value in (
+            ("action", action),
+            ("command", command),
             ("args", args),
             ("timeout", timeout),
             ("maven_version_requirement", maven_version_requirement),
@@ -350,6 +398,10 @@ class BuildTool(BaseTool):
             # absent. Non-null runtime values can never be omitted.
             if value is not None or key in (scope.intent_exact_params or {}):
                 actual_public_params[key] = value
+        if _requested_tool == "bash" and (
+            _request_environment is not None or "environment" in (scope.intent_exact_params or {})
+        ):
+            actual_public_params["environment"] = _request_environment
         try:
             actual_public_params = bounded_exact_params(actual_public_params)
         except (TypeError, ValueError):
@@ -366,6 +418,26 @@ class BuildTool(BaseTool):
                 metadata={"runner_dispatched": False},
             )
 
+        source_argv = None
+        if _requested_tool == "bash" and _request_environment:
+            return self._parameter_refusal(
+                detail="the structured runner cannot discard a shell environment override",
+                verb=verb,
+                working_directory=working_directory,
+            )
+        if command is not None:
+            try:
+                system, verb, source_argv = parse_complete_command(actual_public_params)
+                # Exact duplicate declarations do not need a model retry.
+                # The original public params remain bound above; execute only
+                # the single complete command without merging any arguments.
+                source_command = None
+                args = shlex.join(source_argv) or None
+            except ValueError as exc:
+                return self._parameter_refusal(
+                    detail=str(exc), verb=verb, working_directory=working_directory
+                )
+
         parameter_problem = self._public_parameter_problem(
             verb=verb,
             args=args,
@@ -381,7 +453,6 @@ class BuildTool(BaseTool):
                 working_directory=working_directory,
             )
         requested_system = system
-        source_argv = None
         try:
             if system is not None and system not in {"maven", "gradle", "python"}:
                 raise ValueError("system must be maven, gradle, or python")
@@ -826,25 +897,13 @@ class BuildTool(BaseTool):
             # Keep the semantic action separately so a clean/test sequence is
             # still assessed as a test invocation.
             materialized["_source_argv"] = list(source_argv)
-            if verb in {"package", "install"}:
-                if (
-                    system == "maven"
-                    and "-DskipTests" in str(materialized.get("extra_args") or "")
-                    and "-DskipTests" not in source_argv
-                ):
-                    materialized["_source_argv"].append("-DskipTests")
-                if (
-                    system == "gradle"
-                    and "-x test" in str(materialized.get("gradle_args") or "")
-                    and not any(
-                        source_argv[i : i + 2] == ["-x", "test"] for i in range(len(source_argv))
-                    )
-                ):
-                    materialized["_source_argv"].extend(["-x", "test"])
+            materialized["fail_at_end"] = False
         effective_action = backend.effective_action(materialized)
         if source_argv is not None and system == "gradle":
             materialized["tasks"] = effective_action
         expected_argv = backend.expected_argv(materialized)
+        if command is not None:
+            preamble_lines.append(f"[build] requested command: {command}; cwd: {working_directory}")
         if system == "maven" and verb == "test" and "-Dit.test" in (args or ""):
             preamble_lines.append(
                 "[scope] action=test stops before Failsafe integration-test/verify; -Dit.test does not prove integration tests ran"
@@ -854,7 +913,7 @@ class BuildTool(BaseTool):
             self.docker_orchestrator.execute_command,
             run_id=active_receipt_run_id(),
             envelope_id=envelope_id,
-            tool=self.name,
+            tool=_requested_tool,
             params=requested_call_params,
             effective_tool=system,
             effective_action=effective_action,
@@ -1116,7 +1175,7 @@ class BuildTool(BaseTool):
                                 self.docker_orchestrator.execute_command,
                                 run_id=active_receipt_run_id(),
                                 envelope_id=envelope_id,
-                                tool=self.name,
+                                tool=_requested_tool,
                                 params=requested_call_params,
                                 effective_tool=system,
                                 effective_action=effective_action,
@@ -1906,6 +1965,13 @@ class BuildTool(BaseTool):
         # The narration is the feature (transparency-by-construction, spec
         # §§1b-1c, 3): whatever the pre-flight did — or could not do — must be
         # visible in the agent's observation, not just in host logs.
+        if inner.metadata.get("report_snapshot_errors"):
+            preamble_lines = [
+                *preamble_lines,
+                "[evidence] Some report XML could not be retained: "
+                + ", ".join(inner.metadata["report_snapshot_errors"])
+                + ". A later rerun may overwrite the remaining evidence.",
+            ]
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
         output = inner.output
         raw_output = inner.raw_output
@@ -1969,10 +2035,15 @@ class BuildTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "command": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "description": "Preferred: the complete project runner command, e.g. mvn -B clean install. Supply command and working_directory (plus optional timeout/version constraint); omit action and args. Redundant system or source_command must agree exactly with this command. Preserves all goals and flags, including explicit test skips. One completed invocation can prove both build and test; actual reports determine what ran.",
+                },
                 "action": {
                     "type": "string",
                     "enum": list(_ACTIONS),
-                    "description": "What to do; the build system is auto-selected. "
+                    "description": "Legacy verb interface; omit when using command. The build system is auto-selected. "
                     "Use install for a multi-module reactor whose modules depend on "
                     "siblings' built artifacts (shaded jars, code-gen). native "
                     "re-installs a python project with a native capability enabled, "
@@ -2032,5 +2103,6 @@ class BuildTool(BaseTool):
                     ),
                 },
             },
-            "required": ["action"],
+            # Provider function schemas prohibit top-level anyOf. execute()
+            # enforces command-or-action and rejects competing representations.
         }

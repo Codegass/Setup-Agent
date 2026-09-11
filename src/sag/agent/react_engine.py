@@ -262,61 +262,15 @@ PHASE_OBJECTIVES = {
         "remains an explicit blocker or unknown fact."
     ),
     "analyze": (
-        "Actively inspect the project and its document inventory, including project-specific "
-        "files beyond familiar README/BUILDING names. Treat harness-extracted claims as hints, "
-        "not as the project strategy. Before closing this phase, author a structured execution "
-        "plan that names the documents and evidence you relied on, the intended build and test "
-        "actions, success criteria, constraints, risks, and unresolved questions. Submit that "
-        "plan in execution_plan on the terminal phase call; Build cannot start until it is "
-        "validated and sealed. Each build execution step must state params.system and "
-        "params.source_command matching its action/args and explicit working_directory. "
-        "Example: build(action='install', system='maven', args='clean -DskipTests', "
-        "source_command='./mvnw clean install -DskipTests', working_directory='/workspace/project'). "
-        "For Maven, args is source_command minus the runner and exactly one action goal: "
-        "preserve ALL other tokens in their original order, including every flag and other goal. "
-        "Example: source_command='mvn --errors --batch-mode clean verify', action='verify', "
-        "args='--errors --batch-mode clean'. test_steps may use action='verify'; do not use "
-        "action='test' when the source declares only verify. When docs invoke bare Maven, "
-        "inspect the effective POM defaultGoal and record its reviewed origin. Explicitly "
-        "preserve its COMPLETE resolved goal sequence and original flags: with 'mvn --batch-mode' "
-        "and defaultGoal='clean verify checkstyle:check', explicitly use source_command="
-        "'mvn --batch-mode clean verify checkstyle:check', action='verify', "
-        "args='--batch-mode clean checkstyle:check'. Never drop the quality/plugin goals "
-        "or invent unresolved parent/profile/property defaults. "
-        "Keep wrapper initialization and upstream artifact installation in preceding ordered steps. "
-        "For a Make-wrapped pytest target, read its recipe and prerequisite definitions, then "
-        "represent setup and the actual pytest command at its own cwd; never pass a Make target "
-        "to Gradle or pytest. If it cannot be represented, record a concrete blocker. "
-        "Use Maven action='verify' for documented Failsafe/verify tasks; test plus -Dit.test "
-        "does not prove integration tests executed. Project-declared deps/native setup needs "
-        "no source_command. Classify whether the project's declared test entry is suitable "
-        "for unattended execution from its docs, CI, profiles, and suite definitions. Prefer the "
-        "project-declared suite/profile/target; do not use a broad root run merely to discover "
-        "whether it stalls. Record test_disposition as planned with at least one evidence-backed "
-        "test step, or blocked with empty test_steps and a concrete reason plus reviewed-document "
-        "evidence refs. In test_disposition, keep the exact execution mechanism, verdict_scope, "
-        "and unattended readiness separate. Classify verdict_scope from the definition before "
-        "choosing status: product_test_cases executes product behavior cases; test_metadata only "
-        "checks their inventory or suite membership; quality_only is not a test verdict; "
-        "benchmark_or_manual needs coordination; unknown stays unresolved. Only "
-        "product_test_cases with readiness ready may be planned. For a custom profile, "
-        "task, script, wrapper, or suite, read its actual definition and cite that output in "
-        "definition_evidence_refs; never infer its behavior from its name or invocation alone. "
-        "Before selecting one, prioritize project testing, developer, or contributor "
-        "documentation over a generic README or generic test-plugin configuration. Refine or read "
-        "a relevant capped search before treating its question as settled. In the plan reason, "
-        "explicitly reconcile the exact entry with the project's own label or stated purpose and "
-        "cite evidence binding it to automated product test cases. Each planned step's tool, "
-        "working directory, and arguments must faithfully implement the cited project command; "
-        "do not substitute a similarly named build lifecycle or a mechanical fact-sheet runner. "
-        "Resolve required services, external checkouts, manual coordination, and runner/report "
-        "support before sealing. Prefer a bounded self-contained documented suite; if the real "
-        "entry cannot run unattended here, keep test_steps empty and use blocked."
+        "Inspect relevant project documentation, configuration and CI; treat the survey as "
+        "evidence hints. Record a short strategy and unresolved prerequisites in key_results. "
+        "A structured execution_plan is optional. The user task and pinned CI scope remain "
+        "the acceptance requirements. Unknown runner semantics may be explored through "
+        "bounded execution; neither a plan nor a command name establishes success."
     ),
     "build": (
-        "Execute the exact lifecycle and scope in the sealed Analyze execution plan, adapting "
-        "only when new observed evidence "
-        "requires it and recording the reason for any deviation. Establish terminal build evidence "
+        "Execute the task's project command with its original lifecycle, profiles and scope. "
+        "Revise strategy from observed evidence, explaining changes. Establish terminal build evidence "
         "for every required surveyed build coordinate. "
         "An aggregator root with no sources is not compile evidence for source-bearing "
         "islands; each required island needs a current receipt and artifact/coverage evidence, "
@@ -326,9 +280,10 @@ PHASE_OBJECTIVES = {
         "are automatic and no unrelated work may start."
     ),
     "test": (
-        "Execute the exact lifecycle and scope in the sealed Analyze test strategy; do not "
-        "broaden it to a larger lifecycle or repository scope. Adapt only when current "
-        "evidence requires it and recording the reason for any deviation. Establish terminal "
+        "Inspect existing current-run build receipts and test reports first: a completed "
+        "build lifecycle may already satisfy the required tests. Reuse that evidence without "
+        "repeating a command solely because the phase changed. Execute missing task scope "
+        "and explain evidence-driven changes to strategy. Establish terminal "
         "runner evidence for the required surveyed test coordinates. "
         "Test coordinates can live in a different module or build system from build "
         "coordinates. Persist executed, passed, failed, error, and skipped counts with their "
@@ -337,7 +292,7 @@ PHASE_OBJECTIVES = {
         "absence of a runner receipt cannot support test success."
     ),
     "report": (
-        "Persist the final setup report grounded in the sealed Analyze execution plan, the sealed "
+        "Persist the final setup report grounded in fixed task requirements, the sealed "
         "verdict, current receipts, "
         "artifacts, test counts, and unresolved conflicts. Completion requires a durable report "
         "artifact reference; report delivery status does not rewrite the verdict."
@@ -696,6 +651,8 @@ class ReActEngine(UIEventEmitter):
         # physical validator, or the sealed snapshot can carry a gate-validated
         # SUCCESS next to observation-derived FAILED (live ws7-final7 bigtop).
         finalizer = getattr(self, "verdict_finalizer", None)
+        if finalizer is not None:
+            finalizer.output_storage = self.output_storage
         if finalizer is not None and getattr(finalizer, "validator", None) is None:
             finalizer.validator = self.physical_validator
             if getattr(finalizer, "project_name", None) is None:
@@ -1236,6 +1193,14 @@ class ReActEngine(UIEventEmitter):
     _JOB_INTEGRITY_RETRIES = 2
     _JOB_MARKER_RECONCILE_ATTEMPTS = 30
 
+    def _report_reserve_seconds(self, cap=None) -> float:
+        """Reserve at most ten percent of a bounded run for sealing/reporting."""
+        if cap is None:
+            cap = getattr(self, "_wall_clock_cap", None) or getattr(
+                getattr(self, "config", None), "max_wall_clock_seconds", 7200
+            )
+        return min(float(self._REPORT_RESERVE_SECONDS), max(0.0, float(cap) * 0.10))
+
     def _hold_deadline(self) -> Optional[float]:
         """When must any hold stop — ONE computation (P3, spec §4.2).
 
@@ -1251,7 +1216,7 @@ class ReActEngine(UIEventEmitter):
         cap = getattr(self, "_wall_clock_cap", None) or getattr(
             getattr(self, "config", None), "max_wall_clock_seconds", 7200
         )
-        return float(started_at) + float(cap) - self._REPORT_RESERVE_SECONDS
+        return float(started_at) + float(cap) - self._report_reserve_seconds(cap)
 
     def _install_hold_deadline_provider(self) -> None:
         orchestrator = getattr(self, "orchestrator", None)
@@ -1689,7 +1654,25 @@ class ReActEngine(UIEventEmitter):
         failures: List[str] = []
         state = getattr(self, "run_evidence_state", None)
         announced = self._assessment_guard("_announced_ephemeral_job_terminals")
-        for job_id, handle in list(self._ephemeral_job_handles().items()):
+        handles = self._ephemeral_job_handles()
+        records = read_obligations(orchestrator) if handles else ()
+        durable = {record["job_id"]: record for record in records or ()}
+        for job_id, handle in list(handles.items()):
+            # Cancellation also recovers remembered handles whose complete
+            # obligation already landed. Their published ledger owns normal
+            # reconciliation; the memory copy does not prove a failed write.
+            record = durable.get(job_id)
+            if record is not None and all(
+                handle.get(key) and handle[key] == record.get(key)
+                for key in (
+                    "terminal_authority",
+                    "docker_exec_id",
+                    "container_id",
+                    "process_identity_token",
+                )
+            ):
+                handles.pop(job_id, None)
+                continue
             observation = observe_detached_terminal(orchestrator, handle)
             if observation.state == "running":
                 if observation.start_accepted:
@@ -2569,6 +2552,7 @@ class ReActEngine(UIEventEmitter):
             phase=machine.current_phase,
             attempt_id=machine.current_attempt_id,
             resolution=resolution,
+            validator=getattr(self, "physical_validator", None),
         )
 
     def _unresolved_test_coordinates_after_refresh(
@@ -3207,10 +3191,6 @@ class ReActEngine(UIEventEmitter):
             return base_system_prompt
         artifact = self._read_sealed_execution_plan()
         if artifact is None:
-            if phase in {"build", "test"}:
-                raise RuntimeError(
-                    f"{phase} cannot dispatch without a sealed Analyze execution plan"
-                )
             return base_system_prompt
         from .project_execution_plan import render_plan_system_prompt
 
@@ -3218,7 +3198,7 @@ class ReActEngine(UIEventEmitter):
         authority = (
             "MODEL-AUTHORED IN ANALYZE. The Harness verified bounded structure, "
             "source bindings, and persistence; it did not choose or semantically "
-            "approve the project commands. Treat this as the execution baseline. "
+            "approve the project commands. This is revisable strategy, not task acceptance. "
             "If current tool evidence requires a deviation, state the evidence and "
             "reason explicitly."
         )
@@ -3851,7 +3831,7 @@ class ReActEngine(UIEventEmitter):
         )
         validated_facts = dict(probe.get("validated_facts") or {})
         refs = tuple(probe.get("evidence_refs") or ())
-        reserve = self._REPORT_RESERVE_SECONDS
+        reserve = self._report_reserve_seconds()
         sentence = (
             f"job {named} was still live at the report reserve; the controller "
             f"stopped waiting with {reserve}s reserved for the report and no "
@@ -4858,22 +4838,6 @@ class ReActEngine(UIEventEmitter):
     ) -> str | None:
         """Mint intent, persist its envelope, and open the contract scope."""
 
-        machine = getattr(self, "phase_machine", None)
-        current_phase = str(getattr(machine, "current_phase", "") or "").strip().lower()
-        tool_name = str(call.name or "").strip().lower()
-        action = str(params.get("action") or "").strip().lower()
-        if current_phase == "build" and tool_name == "build" and action == "test":
-            raise PreDispatchControlError(
-                "build(action='test') belongs to the Test phase; finish the current "
-                "Build phase with its build steps first",
-                error_code="PHASE_ACTION_MISMATCH",
-                metadata={
-                    "runner_dispatched": False,
-                    "current_phase": current_phase,
-                    "requested_action": action,
-                },
-            )
-
         if call.action_intent is None:
             call.action_intent = self._mint_model_action_intent(call, params)
         else:
@@ -5807,6 +5771,7 @@ class ReActEngine(UIEventEmitter):
     ) -> ControlAssessment:
         machine = getattr(self, "phase_machine", None)
         subject_material = {
+            "decision_id": gate.decision_id,
             "phase_attempt_id": str(getattr(machine, "current_attempt_id", "") or ""),
             "phase": claim.phase,
             "validator_state": gate.validator_state.value,
@@ -5829,7 +5794,10 @@ class ReActEngine(UIEventEmitter):
             ),
             blocker_owner=gate.blocker_owner,
             observed_facts=compact_control_value(dict(gate.validated_facts or {})),
-            evidence_refs=tuple(gate.evidence_refs),
+            # The gate event retains the complete report/path set. Refer to
+            # that decision instead of copying an unbounded set into a
+            # 64-reference assessment and then a 64-reference repair context.
+            evidence_refs=(gate.decision_id,),
         )
 
     def _install_repair_context(
@@ -5874,7 +5842,7 @@ class ReActEngine(UIEventEmitter):
                 blocker_owner=gate.blocker_owner.value,
                 domain_id=self._action_domain_id(),
                 fingerprints=self._repair_fingerprints(gate),
-                observed_fact_refs=(assessment.assessment_id, *gate.evidence_refs),
+                observed_fact_refs=(assessment.assessment_id, gate.decision_id),
                 constraint_set=ConstraintSet(
                     constraints=(constraint,),
                     source_refs=(assessment.assessment_id,),
@@ -7936,13 +7904,68 @@ class ReActEngine(UIEventEmitter):
         return "unknown" if value is None else str(value)
 
     def _last_test_attempt_line(self) -> str:
-        """The newest pytest attempt's collection facts, verbatim from its
-        metadata (Plan 4 Tasks 1-2 keys).
+        """Render the latest observed JVM reports or pytest collection facts.
 
-        The reviewer's whole job in the test phase is judging whether a suite
-        actually RAN. Before this line, a run whose every attempt died in
-        collection looked to the advisor exactly like a run that executed
-        tests and failed them (live TVM: 28 collection errors, 0 executed)."""
+        A Build-phase JVM invocation may already have executed tests. Keep its
+        reported counts and receipt reference visible after the phase switch;
+        this prompt projection does not certify completion or compare CI scope.
+        """
+        state = getattr(self, "run_evidence_state", None)
+        for observation in reversed(tuple(getattr(state, "tool_observations", ()) or ())):
+            result = getattr(observation, "result", None)
+            metadata = dict(getattr(result, "metadata", None) or {})
+            if "collection_scope" in metadata:
+                break  # The newest relevant attempt is pytest; use its vocabulary below.
+            if metadata.get("system") not in {"maven", "gradle"} or not (
+                metadata.get("receipt_id") or metadata.get("runner_dispatched")
+            ):
+                continue
+            job_id = metadata.get("job_id")
+            orchestrator = getattr(self, "orchestrator", None)
+            if job_id and orchestrator is not None:
+                records = read_obligations(orchestrator)
+                matching = [
+                    record
+                    for record in records or ()
+                    if record.get("job_id") == job_id
+                    and record.get("run_id") == getattr(state, "run_id", None)
+                    and record.get("tool") == metadata.get("system")
+                    and record.get("working_directory") == metadata.get("working_directory")
+                ]
+                settlement = (
+                    settlement_from_ledger(orchestrator, matching[0])
+                    if len(matching) == 1
+                    else None
+                )
+                if settlement is not None:
+                    return (
+                        f"Last JVM runner observation: {str(metadata.get('command') or 'unknown')[:2048]} — "
+                        f"{settlement.notice()}; output=job:{job_id}. "
+                        "This host-authorized settlement supersedes the initiating call's "
+                        "pending outcome. Report paths are not case counts and an exit code "
+                        "is not a completion or CI verdict. Inspect this receipt and log "
+                        "before declaring tests missing or rerunning them."
+                    )
+            counts = metadata.get("report_test_counts")
+            if metadata.get("test_stats_basis") != "invocation_report_xml" or not isinstance(
+                counts, dict
+            ):
+                counts = {}
+            values = ", ".join(
+                f"{key}={self._advisor_count(counts.get(key))}"
+                for key in ("reported", "passed", "failed", "errors", "skipped")
+            )
+            outcome = getattr(result, "operation_outcome", "unknown")
+            return (
+                f"Last JVM runner observation: {str(metadata.get('command') or 'unknown')[:2048]} — "
+                f"cwd={str(metadata.get('working_directory') or 'unknown')[:512]}, "
+                f"receipt={str(metadata.get('receipt_id') or 'unknown')[:160]}, "
+                f"output={str(metadata.get('output_ref_id') or 'unknown')[:160]}, "
+                f"tool_outcome={getattr(outcome, 'value', outcome)}, "
+                f"invocation XML counts: {values}. "
+                "These are tool observations, not a completion verdict. Inspect the linked "
+                "receipt and required scope before declaring tests missing or rerunning them."
+            )
         metadata = self._last_pytest_metadata()
         if not metadata:
             return ""

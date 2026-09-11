@@ -319,8 +319,8 @@ class ProjectExecutionPlan(_FrozenPlanModel):
         body = canonical_json(self.model_dump(mode="json"))
         prompt = (
             "=== PROJECT EXECUTION PLAN ===\n"
-            "This plan was authored during project analysis. Build and test "
-            "actions should follow it; unresolved items remain explicit.\n"
+            "This strategy was authored during analysis and may be revised using phase note. "
+            "User task requirements remain fixed; actual receipts determine completion.\n"
             f"{body}"
         )
         if len(prompt) > MAX_SYSTEM_PROMPT_CHARS:
@@ -507,6 +507,10 @@ def validate_authored_plan(
                                 "new execution steps require an explicit canonical workspace working_directory"
                             )
                         if step.tool != "build" or step.params.get("action") in {"deps", "native"}:
+                            continue
+                        if step.params.get("command"):
+                            from sag.tools.build.backends import parse_runner_command
+                            parse_runner_command(step.params["command"])
                             continue
                         system = step.params.get("system")
                         source = step.params.get("source_command")

@@ -35,6 +35,7 @@ be the same kind of untrue sentence the plan is about.
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from loguru import logger
@@ -474,3 +475,36 @@ class _ExecuteOnly:
 
     def execute_command(self, command: str, **kwargs: Any) -> Optional[Mapping[str, Any]]:
         return self._execute(command, **kwargs)
+
+
+def single_maven_module_proven(orchestrator, receipt, project_root):
+    """A root-only current POM graph can name '.', independently of a CI cell.
+
+    This is used only when a successful single-project Maven invocation has no
+    Reactor Summary. Existing receipt module rows do not depend on this probe.
+    """
+    from sag.agent.forced_build_graph import verify_forced_candidate_build_graph
+    from sag.agent.invocation_receipts import _succeeded
+    from sag.runtime.container_io import resolve_control_execute
+
+    if (
+        receipt.get("tool") != "maven"
+        or receipt.get("actual_cwd", receipt.get("working_directory")) != project_root
+    ):
+        return False
+    execute = resolve_control_execute(orchestrator)
+    if not callable(execute):
+        return False
+    unchanged = (
+        execute(
+            f"git -C {shlex.quote(project_root)} diff --quiet HEAD -- "
+            "pom.xml .mvn/maven.config .mvn/extensions.xml"
+        )
+        or {}
+    )
+    if not _succeeded(unchanged) or unchanged.get("dispatch_status"):
+        return False
+    graph = verify_forced_candidate_build_graph(
+        orchestrator, project_root=project_root, candidate_root=project_root, system="maven"
+    )
+    return graph.status == "verified" and graph.visited_roots == (project_root,)

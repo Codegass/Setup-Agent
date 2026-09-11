@@ -1,0 +1,33 @@
+[INFO] Building Apache Curator 5.9.1-SNAPSHOT                             [1/9]
+[INFO] Building Curator Testing 5.9.1-SNAPSHOT                            [2/9]
+[INFO] Building jar: /workspace/curator/curator-test/target/curator-test-5.9.1-SNAPSHOT.jar
+[INFO] Building Curator Client 5.9.1-SNAPSHOT                             [3/9]
+[INFO] Building bundle: /workspace/curator/curator-client/target/curator-client-5.9.1-SNAPSHOT.jar
+[INFO] Building jar: /workspace/curator/curator-client/target/curator-client-5.9.1-SNAPSHOT-tests.jar
+[INFO] Building Curator Framework 5.9.1-SNAPSHOT                          [4/9]
+[INFO] Building bundle: /workspace/curator/curator-framework/target/curator-framework-5.9.1-SNAPSHOT.jar
+[INFO] Building jar: /workspace/curator/curator-framework/target/curator-framework-5.9.1-SNAPSHOT-tests.jar
+[INFO] Building Curator Recipes 5.9.1-SNAPSHOT                            [5/9]
+[INFO] Building bundle: /workspace/curator/curator-recipes/target/curator-recipes-5.9.1-SNAPSHOT.jar
+[INFO] Building jar: /workspace/curator/curator-recipes/target/curator-recipes-5.9.1-SNAPSHOT-tests.jar
+[INFO] Building Curator Service Discovery 5.9.1-SNAPSHOT                  [6/9]
+[INFO] Building bundle: /workspace/curator/curator-x-discovery/target/curator-x-discovery-5.9.1-SNAPSHOT.jar
+[INFO] Building Curator Async 5.9.1-SNAPSHOT                              [7/9]
+[INFO] Building jar: /workspace/curator/curator-x-async/target/curator-x-async-5.9.1-SNAPSHOT.jar
+[INFO] Building Curator Examples 5.9.1-SNAPSHOT                           [8/9]
+[INFO] Building jar: /workspace/curator/curator-examples/target/curator-examples-5.9.1-SNAPSHOT.jar
+[INFO] Building Curator Service Discovery Server 5.9.1-SNAPSHOT           [9/9]
+[INFO] Building bundle: /workspace/curator/curator-x-discovery-server/target/curator-x-discovery-server-5.9.1-SNAPSHOT.jar
+[INFO] Reactor Summary for Apache Curator 5.9.1-SNAPSHOT:
+[INFO] 
+[INFO] Apache Curator ..................................... SUCCESS [  2.919 s]
+[INFO] Curator Testing .................................... SUCCESS [ 11.004 s]
+[INFO] Curator Client ..................................... SUCCESS [ 31.049 s]
+[INFO] Curator Framework .................................. SUCCESS [13:30 min]
+[INFO] Curator Recipes .................................... SUCCESS [34:31 min]
+[INFO] Curator Service Discovery .......................... SUCCESS [01:23 min]
+[INFO] Curator Async ...................................... SUCCESS [02:43 min]
+[INFO] Curator Examples ................................... SUCCESS [  0.952 s]
+[INFO] Curator Service Discovery Server ................... SUCCESS [ 10.961 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS

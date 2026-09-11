@@ -1,0 +1,95 @@
+{
+  "kind": "tool-output-repair-validation",
+  "recorded_at": "2026-09-11T06:01:14.560521+00:00",
+  "base_commit": "fe7eacb137b47201c7836e7a5e864ead4f614850",
+  "source_files": [
+    {
+      "path": "src/sag/agent/output_storage.py",
+      "sha256": "d5b5f68e0d6b9c331067a9373126fa9714d840f460f280e256d0501934d0ed94"
+    },
+    {
+      "path": "src/sag/agent/tool_orchestration.py",
+      "sha256": "12ab87461c490935386ae2861c700581e216a4b1b7a7b6a871d94496a43785ec"
+    },
+    {
+      "path": "src/sag/agent/tool_parameters.py",
+      "sha256": "afb5bcd603744aa918b17b5aa8d01f685c0532f8df88612a8b59a40edd517597"
+    },
+    {
+      "path": "src/sag/docker_orch/orch.py",
+      "sha256": "4f19c5fc59db5ba7e12cc5869a479e2c7c67f5e9f10510d2503f4ffb94f4d613"
+    },
+    {
+      "path": "src/sag/tools/base.py",
+      "sha256": "dc14a412ebe49671a9c99b45646761c22d9a51da930f09ef9a01119e21a77294"
+    },
+    {
+      "path": "src/sag/tools/bash.py",
+      "sha256": "5bca559f453b394c7af23a0b1ccaf8a279d54c49d6b36085fec8aaf013547ad8"
+    },
+    {
+      "path": "src/sag/tools/file_io.py",
+      "sha256": "76980d40bf7dbbc1fbd27f14bfd0628185cd6a55de993b983fac35ec7a7105b0"
+    },
+    {
+      "path": "src/sag/tools/internal/output_search_tool.py",
+      "sha256": "b3db3c3d124733a6fa707e7c54c36aa6c37bf06f191ef27c67e415d8a7152b9d"
+    },
+    {
+      "path": "src/sag/tools/output_paging.py",
+      "sha256": "36c45ab223a80b19c26caba733fce828263c1575405207c2c1f2e1878e260a45"
+    },
+    {
+      "path": "src/sag/tools/search_tool.py",
+      "sha256": "ea6702877f344ff436e041ce688c54838f5983e9099fd6bea5f56aa38cb20479"
+    },
+    {
+      "path": "tests/test_bash_tool_timeout.py",
+      "sha256": "4f5b0a6c2fb6de79dac95497af536a02243b01d62c9e863c8a4bcc7aa662201f"
+    },
+    {
+      "path": "tests/test_output_storage.py",
+      "sha256": "16f01a1c0afff163dd1a746407717eaf0fecef7499d16af2b5065f8652d5d048"
+    },
+    {
+      "path": "tests/test_result_hint_vocabulary.py",
+      "sha256": "433efb33b93611f647f07d87f645f23661ea530f92395314ced4196ba7aff7a2"
+    },
+    {
+      "path": "tests/test_runner_evidence_return.py",
+      "sha256": "0eba485c80f808b4442a8ff5dc152c205de506d2160760f46c9207ac7b46deb8"
+    },
+    {
+      "path": "tests/test_tool_output_access.py",
+      "sha256": "2b0699a8b30613b99af2c859d0aba7c1ede3b56e9b6a5f2b41d759eba695a988"
+    }
+  ],
+  "checks": {
+    "regression": {
+      "command": "UV_CACHE_DIR=/private/tmp/setup-agent-uv-cache PYTHONPATH=. uv run --no-sync pytest -q --ignore=tests/test_packaging_smoke.py",
+      "summary": "7454 passed, 22 skipped, 44 warnings in 121.12s (0:02:01)",
+      "log": "logs/tool-output-repair-20260911/regression.log",
+      "sha256": "4b80564ba025275d2120cf411b96590f71bc2aa167b3de98cd5992732bcf5246"
+    },
+    "packaging": {
+      "command": "UV_CACHE_DIR=/private/tmp/setup-agent-uv-cache PYTHONPATH=. uv run --no-sync pytest -q tests/test_packaging_smoke.py",
+      "summary": "1 passed in 9.72s",
+      "log": "logs/tool-output-repair-20260911/packaging.log",
+      "sha256": "3c6f7de8bb02256fc6cecdd9d891f867fbfa432cb9cba6fecd9a84ae79a87219",
+      "environment": "Network-enabled isolated build and temporary virtual environment"
+    }
+  },
+  "native_log_pagination": {
+    "source": "logs/verification-23-20260910/rocketmq-full-first-package.log",
+    "bytes": 5659714,
+    "page_chars": 20000,
+    "pages": 283,
+    "source_sha256": "3238b25867e426617808d7ad66798bf21e4aad543ef94aa393481d5f337cf293",
+    "reassembled_sha256": "3238b25867e426617808d7ad66798bf21e4aad543ef94aa393481d5f337cf293",
+    "reassembled_equal": true,
+    "verification": "Offline replay through read_text_page; no native process or model run"
+  },
+  "new_sag_runs": 0,
+  "phase_handoff_changed": false,
+  "verdict_rules_changed": false
+}

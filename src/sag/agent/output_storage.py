@@ -8,6 +8,7 @@ in the main context files. It provides indexing and search capabilities.
 import hashlib
 import json
 import re
+import shlex
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.project_fact_sheet import project_fact_sheet_identity
+from sag.runtime.container_io import _execute_untruncated
 from sag.tools.base import (
     OutputPersistenceError,
     ToolResult,
@@ -28,6 +30,9 @@ from sag.utils.container_io import write_container_text
 
 class OutputDurabilityError(OutputPersistenceError):
     """Raised when no validated durable home can be established for output."""
+
+
+OUTPUT_FILE_THRESHOLD = 10_000
 
 
 _SEARCH_METADATA_KEYS = (
@@ -132,7 +137,35 @@ def _with_validated_output_ref(
         task_id=task_id,
         tool_name=tool_name,
     ):
-        return ToolResult.model_validate(payload)
+        attached = ToolResult.model_validate(payload)
+    return attached.with_execution_trace(result.execution_trace)
+
+
+def _attach_output_file(result: ToolResult, storage: Any, output: str) -> ToolResult:
+    """Expose a readable copy without changing the canonical evidence reference."""
+    materialize = getattr(storage, "materialize_output", None)
+    if len(output) <= OUTPUT_FILE_THRESHOLD or not callable(materialize):
+        return result
+    path = materialize(result.output_ref)
+    metadata = dict(result.metadata)
+    if path:
+        metadata.pop("output_file_unavailable", None)
+        metadata.update(
+            output_path=path,
+            output_path_ref=result.output_ref,
+            output_path_scope="container" if storage.orchestrator else "host",
+            stored_chars=len(output),
+            stored_bytes=len(output.encode("utf-8")),
+        )
+    else:
+        metadata.pop("output_path", None)
+        metadata.pop("output_path_ref", None)
+        metadata["output_file_unavailable"] = True
+    # The engine re-renders an observation when its result is replaced. Do not
+    # mutate metadata in place and leave the already-rendered message stale.
+    return (
+        result if metadata == result.metadata else result.model_copy(update={"metadata": metadata})
+    )
 
 
 def attach_durable_output_ref(
@@ -149,9 +182,14 @@ def attach_durable_output_ref(
         output=result.output,
         error=result.error,
     )
+    for candidate in (result.output_ref, result.metadata.get("output_ref_id")):
+        if is_output_storage_ref(candidate) and _output_round_trips(storage, candidate, output):
+            if candidate != result.output_ref:
+                result = _with_validated_output_ref(
+                    result, storage, ref=candidate, task_id=task_id, tool_name=tool_name
+                )
+            return _attach_output_file(result, storage, output)
     if result.output_ref:
-        if _output_round_trips(storage, result.output_ref, output):
-            return result
         logger.warning(
             f"Re-persisting inaccessible output reference {result.output_ref} for {tool_name}"
         )
@@ -190,13 +228,14 @@ def attach_durable_output_ref(
             failures.append(f"{label} tool output reference is not immediately retrievable")
             continue
         try:
-            return _with_validated_output_ref(
+            attached = _with_validated_output_ref(
                 result,
                 storage,
                 ref=ref,
                 task_id=task_id,
                 tool_name=tool_name,
             )
+            return _attach_output_file(attached, storage, output)
         except (TypeError, ValueError) as exc:
             failures.append(f"{label} result validation raised {type(exc).__name__}")
 
@@ -223,6 +262,47 @@ def atomic_write_container_text(orchestrator, path: str, content: str) -> None:
 
 class OutputStorageManager:
     """Manages storage of full outputs with indexing for efficient retrieval."""
+
+    def materialize_output(self, ref_id: str) -> Optional[str]:
+        """Make a ref readable by ordinary file tools, including for old stores.
+
+        JSONL remains the canonical store so existing receipt/replay readers
+        keep working. Only requested or long outputs get a plain-text copy.
+        Never return a path when the write failed.
+        """
+        if not is_output_storage_ref(ref_id):
+            return None
+        output = self.retrieve_output(ref_id)
+        if output is None:
+            return None
+        try:
+            data = output.encode("utf-8")
+            if self.orchestrator:
+                path = f"{self.container_storage_dir}/{ref_id}.log"
+                digest = hashlib.sha256(data).hexdigest()
+                command = f"sha256sum -- {shlex.quote(path)}"
+                existing = _execute_untruncated(self.orchestrator, command)
+                if existing.get("exit_code") != 0 or str(existing.get("output", "")).split()[
+                    :1
+                ] != [digest]:
+                    atomic_write_container_text(self.orchestrator, path, output)
+                    existing = _execute_untruncated(self.orchestrator, command)
+                return (
+                    path
+                    if existing.get("exit_code") == 0
+                    and str(existing.get("output", "")).split()[:1] == [digest]
+                    else None
+                )
+            path = (self.storage_dir / f"{ref_id}.log").resolve()
+            if path.is_file() and path.read_bytes() == data:
+                return str(path)
+            temporary = path.with_suffix(".log.tmp")
+            temporary.write_bytes(data)
+            temporary.replace(path)
+            return str(path)
+        except Exception as exc:
+            logger.warning(f"Could not materialize output {ref_id}: {exc}")
+            return None
 
     def __init__(self, storage_dir: Path, orchestrator=None):
         """
@@ -310,7 +390,7 @@ class OutputStorageManager:
         if self.orchestrator:
             # Check if index exists in container using container path
             check_cmd = f"test -f {self.container_index_file} && cat {self.container_index_file}"
-            check_result = self.orchestrator.execute_command(check_cmd)
+            check_result = _execute_untruncated(self.orchestrator, check_cmd)
 
             if check_result.get("exit_code") == 0 and check_result.get("output"):
                 try:
@@ -416,8 +496,8 @@ class OutputStorageManager:
     def _read_storage_line(self, line_number: int) -> Optional[Dict[str, Any]]:
         try:
             if self.orchestrator:
-                result = self.orchestrator.execute_command(
-                    f"sed -n '{line_number}p' {self.container_storage_file}"
+                result = _execute_untruncated(
+                    self.orchestrator, f"sed -n '{line_number}p' {self.container_storage_file}"
                 )
                 if result.get("exit_code") != 0 or not result.get("output"):
                     return None
@@ -578,7 +658,7 @@ class OutputStorageManager:
         try:
             if self.orchestrator:
                 path = self._container_emergency_path(ref_id)
-                result = self.orchestrator.execute_command(f"test -f {path} && cat {path}")
+                result = _execute_untruncated(self.orchestrator, f"test -f {path} && cat {path}")
                 if result.get("exit_code") != 0 or not result.get("output"):
                     return None
                 record = json.loads(result["output"])

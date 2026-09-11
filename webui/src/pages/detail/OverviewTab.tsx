@@ -115,6 +115,15 @@ export function OverviewTab({
         />
       </div>
 
+      {!!detail.taskCompletionLines?.length && (
+        <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3" aria-label="Required task completion">
+          <h2 className="text-[13px] font-semibold text-foreground">Required task completion</h2>
+          {detail.taskCompletionLines.map((line, index) => (
+            <p key={`${index}-${line}`} className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{line}</p>
+          ))}
+        </section>
+      )}
+
       <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3" aria-label="Official CI comparison">
         <h2 className="text-[13px] font-semibold text-foreground">Official CI comparison</h2>
         {(detail.ciComparisonLines?.length ? detail.ciComparisonLines : ["Official CI: unavailable (no sealed comparison)"]).map((line, index) => (

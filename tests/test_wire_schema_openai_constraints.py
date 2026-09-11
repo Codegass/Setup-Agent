@@ -25,6 +25,20 @@ def test_project_facade_schema_is_wire_clean():
     assert_wire_clean(ProjectTool().get_parameter_schema(), "project")
 
 
+def test_build_facade_schema_is_wire_clean():
+    from sag.tools.build.build_tool import BuildTool
+
+    assert_wire_clean(BuildTool(None).get_parameter_schema(), "build")
+
+
+def test_build_without_command_or_action_is_rejected_before_execution():
+    from sag.tools.build.build_tool import BuildTool
+
+    result = BuildTool(None).execute()
+    assert not result.succeeded
+    assert result.error == "invalid action"
+
+
 def test_project_env_branch_still_activates_without_a_schema_default():
     """The default the allOf used to state lives in execute: absent activate
     is forced True, explicit False is refused with the registered guidance."""

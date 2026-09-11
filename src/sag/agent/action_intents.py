@@ -158,7 +158,7 @@ def validate_repair_action_affordance(
     if len(matches) != 1:
         raise ValueError("repair action tool has no unique active affordance")
     affordance = matches[0]
-    if affordance.action_parameter is None:
+    if affordance.action_parameter is None or (tool_name == "build" and "command" in params):
         canonical_kind = tool_name
     else:
         if "action" not in params:

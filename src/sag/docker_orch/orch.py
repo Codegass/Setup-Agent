@@ -2901,6 +2901,8 @@ class DockerOrchestrator:
                 "npm",
                 "build-essential",
                 "grep",
+                "ripgrep",
+                "sed",
                 "findutils",
                 "less",
                 "unzip",

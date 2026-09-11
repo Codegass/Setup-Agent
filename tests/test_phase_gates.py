@@ -437,7 +437,7 @@ def test_analyze_readiness_rejects_a_sealed_plan_from_another_attempt(monkeypatc
 
     assert stale["validated_facts"]["analysis.execution_plan_artifact_present"] is True
     assert stale["validated_facts"]["analysis.execution_plan_sealed"] is False
-    assert stale["validated_facts"]["analysis.build_entry_ready"] is False
+    assert stale["validated_facts"]["analysis.build_entry_ready"] is True
     assert stale["validated_facts"]["analysis.execution_plan_source_attempt_id"] == "analyze-1"
     assert stale["validated_facts"]["analysis.execution_plan_expected_attempt_id"] == "analyze-2"
     assert current["validated_facts"]["analysis.execution_plan_sealed"] is True

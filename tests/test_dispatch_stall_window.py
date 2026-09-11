@@ -229,6 +229,7 @@ from sag.agent.react_engine import ReActEngine
 
 class _EngineStub:
     _REPORT_RESERVE_SECONDS = ReActEngine._REPORT_RESERVE_SECONDS
+    _report_reserve_seconds = ReActEngine._report_reserve_seconds
     _hold_deadline = ReActEngine._hold_deadline
     _install_hold_deadline_provider = ReActEngine._install_hold_deadline_provider
 

@@ -1122,7 +1122,7 @@ def test_maven_contract_pins_the_materialized_lifecycle_and_cwd():
 
     (contract,) = contracts_written(orchestrator.commands)
     assert contract["effective_action"] == "package"
-    assert contract["expected_argv"] == "--fail-at-end package -DskipTests"
+    assert contract["expected_argv"] == "--fail-at-end package"
     assert contract["expected_cwd"] == "/workspace/proj"
     assert contract["requested_call"] == {
         "tool": "build",
@@ -1140,7 +1140,7 @@ def test_gradle_contract_pins_the_materialized_tasks():
 
     (contract,) = contracts_written(orchestrator.commands)
     assert contract["effective_action"] == "assemble"
-    assert contract["expected_argv"] == "--continue -x test assemble"
+    assert contract["expected_argv"] == "--continue assemble"
 
 
 def test_python_contract_states_the_action_and_no_argv_it_cannot_know():
@@ -1426,7 +1426,7 @@ def test_the_gradle_vector_the_facade_freezes_is_the_one_the_runner_builds():
         params.get("fail_at_end", False),
     )
 
-    assert params["gradle_args"] == "--info -x test"
+    assert params["gradle_args"] == "--info"
     assert compliance_class(backend.expected_argv(params), physical) == "exact"
 
 

@@ -66,6 +66,7 @@ from .invocation_receipts import (
     nearest_domain_root,
     next_receipt_id,
     next_sequence,
+    output_content_hash,
     receipt_record_scope,
     record_invocation,
     report_delta,
@@ -2057,6 +2058,38 @@ def _read_complete_log(orchestrator: Any, log_path: Any) -> Optional[str]:
         logger.debug(f"job log {path} unreadable: {exc}")
         return None
     return str(result.get("output") or "") if _succeeded(result) else None
+
+
+def read_settled_job_output(orchestrator: Any, receipt: Mapping[str, Any]) -> Optional[str]:
+    """Read a settled invocation's bound bytes without inventing a ToolResult.
+
+    Both ledgers must still be host-authorized. A log path alone, a process
+    exit alone, or another receipt's output cannot discharge the current task.
+    """
+    execute = resolve_control_execute(orchestrator)
+    if not callable(execute) or not receipt.get("output_content_hash"):
+        return None
+    obligations = read_obligations(orchestrator)
+    if obligations is None:
+        return None
+    matches = [
+        record
+        for record in obligations
+        if _lifecycle_state(record) == (PROCESS_TERMINAL, SETTLEMENT_SETTLED)
+        and record.get("settled_receipt_id") == receipt.get("receipt_id")
+    ]
+    if len(matches) != 1:
+        return None
+    record = matches[0]
+    ledger = _read_live_receipt_ledger(execute)
+    if ledger is None or ledger.get(receipt.get("receipt_id")) != dict(receipt):
+        return None
+    if not _receipt_matches_obligation(receipt, record, record["terminal_exit_code"]):
+        return None
+    if any(receipt.get(key) != record.get(key) for key in ("contract_id", "contract_hash")):
+        return None
+    output = _read_complete_log(orchestrator, record.get("log_path"))
+    return output if output_content_hash(output) == receipt["output_content_hash"] else None
 
 
 def _receipt_claims(

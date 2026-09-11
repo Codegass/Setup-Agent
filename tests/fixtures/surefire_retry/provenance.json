@@ -1,0 +1,92 @@
+[
+  {
+    "fixture": "v1-m5-green.xml",
+    "sha256": "034523f9f6f308b03d568201d46edf37b418bf615e55ba879ca820ef7c2d35a7",
+    "surefire": "3.0.0-M5",
+    "retries": 1,
+    "native_exit": 0,
+    "logical_cases": 3,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v1/m5-green/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v1-m5-failure-no-retry.xml",
+    "sha256": "214a4d5efe6a4dda333863bbae6df4dbf9b49a25a1165ae617ac01e8a651f045",
+    "surefire": "3.0.0-M5",
+    "retries": 0,
+    "native_exit": 1,
+    "logical_cases": 3,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v1/m5-failure-no-retry/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v1-m5-failure-with-retry.xml",
+    "sha256": "fe22785a30437143dbdaddff136852091fd6a914adb9f627e9a7100495fe5929",
+    "surefire": "3.0.0-M5",
+    "retries": 1,
+    "native_exit": 0,
+    "logical_cases": 3,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v1/m5-failure-with-retry/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v1-newer-failure-with-retry.xml",
+    "sha256": "981d7685d58bc4f7ecda96f6e7479602f0ee82cac698de5e58d2dc13fd81a3df",
+    "surefire": "3.5.3",
+    "retries": 1,
+    "native_exit": 0,
+    "logical_cases": 3,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v1/newer-failure-with-retry/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v2-m5-no-retry-red.xml",
+    "sha256": "0d8be419e2ce1b984cdf3249bd8accd384bbed8490e87fbc4521748eed9d2db6",
+    "surefire": "3.0.0-M5",
+    "retries": 0,
+    "native_exit": 1,
+    "logical_cases": 5,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v2/m5-no-retry-red/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v2-m5-split-retry-pass.xml",
+    "sha256": "226582c9c1f2da5330eb4a12b08219feab41733ff7b312bd58c4e67d03c3f45e",
+    "surefire": "3.0.0-M5",
+    "retries": 2,
+    "native_exit": 0,
+    "logical_cases": 5,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v2/m5-split-retry-pass/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v2-m5-split-retry-red.xml",
+    "sha256": "007fd940233677beac299ff6a87b66e33bd1bd93a10cd2e92ca2c8e7c5e87179",
+    "surefire": "3.0.0-M5",
+    "retries": 2,
+    "native_exit": 1,
+    "logical_cases": 5,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v2/m5-split-retry-red/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v2-newer-no-retry-red.xml",
+    "sha256": "bfc9b45b82969f8989b47ee1bbd29bfffd71a53789b69373ab0e3423a7e705eb",
+    "surefire": "3.5.3",
+    "retries": 0,
+    "native_exit": 1,
+    "logical_cases": 5,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v2/newer-no-retry-red/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v2-newer-split-retry-pass.xml",
+    "sha256": "8567e43da6b3be51952017cd9cbeb7461543a25a17317df0d2211c2dce905be1",
+    "surefire": "3.5.3",
+    "retries": 2,
+    "native_exit": 0,
+    "logical_cases": 5,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v2/newer-split-retry-pass/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  },
+  {
+    "fixture": "v2-newer-split-retry-red.xml",
+    "sha256": "8cc86d20c1ed72eb54fec48d2c63d666311e19bc0524b3558a2642f363b0abc1",
+    "surefire": "3.5.3",
+    "retries": 2,
+    "native_exit": 1,
+    "logical_cases": 5,
+    "origin": "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/curator-surefire-repro-v2/newer-split-retry-red/target/surefire-reports/TEST-org.example.CounterProbeTest.xml"
+  }
+]

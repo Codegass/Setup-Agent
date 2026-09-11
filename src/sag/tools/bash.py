@@ -73,16 +73,19 @@ class BashTool(BaseTool):
     Use bash for: file operations, package installation, git operations, system tasks, and ESPECIALLY grep-based code investigation.
     """
 
-    def __init__(self, docker_orchestrator=None, config: Optional[BashToolConfig] = None):
+    def __init__(
+        self, docker_orchestrator=None, config: Optional[BashToolConfig] = None, *, build_tool=None
+    ):
         super().__init__(
             name="bash",
-            description="Execute shell commands in the container. SPECIALIZES in grep-based code investigation. "
+            description="Execute shell commands in the container. Use rg -n -C 3 to search files and sed -n to read line ranges. "
             "grep is your PRIMARY tool for understanding codebases, finding patterns, and investigating issues. "
             "Use for file operations, package installation, git operations, and comprehensive code analysis. "
             "Supports background processes with & and command validation.",
         )
         self.docker_orchestrator = docker_orchestrator
         self.config = config or BashToolConfig()
+        self.build_tool = build_tool
         self.background_processes: Dict[str, List[int]] = {}  # Track background PIDs per container
 
     @staticmethod
@@ -328,172 +331,7 @@ class BashTool(BaseTool):
         return self._extract_bash_key_info(output, command)
 
     def _extract_bash_key_info(self, output: str, command: str = "") -> str:
-        """Extract key information from bash output with aggressive truncation for verbose commands."""
-        if not output:
-            return output
-
-        lines = output.split("\n")
-        total_lines = len(lines)
-
-        # CRITICAL: Detect verbose package management commands by COMMAND, not output
-        command_lower = command.lower()
-        is_verbose_package_cmd = any(
-            pattern in command_lower
-            for pattern in [
-                "apt-get install",
-                "apt install",
-                "yum install",
-                "dnf install",
-                "npm install",
-                "pip install",
-                "cargo install",
-                "go get",
-            ]
-        )
-
-        if is_verbose_package_cmd and total_lines > 50:
-            # For verbose package commands, use AGGRESSIVE truncation
-            logger.info(
-                f"🔧 Detected verbose package command with {total_lines} lines, applying aggressive truncation"
-            )
-
-            # Keep only: head (25 lines) + tail (25 lines) = 50 lines total
-            key_start = lines[:25]
-            key_end = lines[-25:]
-
-            # Extract critical status lines from the middle if any
-            critical_lines = []
-            for line in lines[10:-10]:  # Skip already included start/end
-                line_lower = line.lower()
-                if any(
-                    critical in line_lower
-                    for critical in [
-                        "error:",
-                        "failed:",
-                        "could not",
-                        "unable to",
-                        "permission denied",
-                        "build success",
-                        "build failure",
-                        "completed successfully",
-                        "warning:",
-                        "critical:",
-                    ]
-                ):
-                    critical_lines.append(line)
-                    if len(critical_lines) >= 5:  # Limit critical lines to prevent spam
-                        break
-
-            result_parts = []
-            result_parts.extend(key_start)
-            if critical_lines:
-                result_parts.append(f"\n... [Key status messages from {total_lines} lines] ...")
-                result_parts.extend(critical_lines)
-            result_parts.append(
-                f"\n... [Skipped {total_lines - 50 - len(critical_lines)} lines of verbose output] ..."
-            )
-            result_parts.extend(key_end)
-
-            return "\n".join(result_parts)
-
-        # If this looks like grep output, preserve more context
-        if any(line.strip() and ":" in line for line in lines[:10]):
-            # This might be grep output with file:line:content format
-            key_lines = []
-            for line in lines:
-                if line.strip():
-                    # Preserve grep results with context
-                    key_lines.append(line)
-                    if len(key_lines) >= 50:  # Keep more grep results
-                        break
-
-            if key_lines:
-                result = "\n".join(key_lines)
-                if len(lines) > len(key_lines):
-                    result += f"\n... [Showing first {len(key_lines)} matches out of {len(lines)} total lines]"
-                return result
-
-        # For regular commands, extract key information
-        key_lines = []
-        error_lines = []
-        line_count = 0
-
-        for line in lines:
-            line_lower = line.lower()
-            line_count += 1
-
-            # Stop processing if we've seen too many lines (prevent context pollution)
-            if line_count > 100:
-                key_lines.append(f"... [Stopped processing after 100 lines, total: {total_lines}]")
-                break
-
-            # Capture errors and important status (high priority)
-            if any(
-                keyword in line_lower
-                for keyword in [
-                    "error:",
-                    "exception:",
-                    "failed:",
-                    "warning:",
-                    "critical:",
-                    "build success",
-                    "build failure",
-                    "success:",
-                    "completed:",
-                ]
-            ):
-                if "error" in line_lower or "exception" in line_lower or "failed" in line_lower:
-                    error_lines.append(f"🚨 {line.strip()}")
-                else:
-                    key_lines.append(f"✅ {line.strip()}")
-
-            # File operations (medium priority)
-            elif any(
-                keyword in line_lower
-                for keyword in ["created:", "copied:", "moved:", "deleted:", "modified:"]
-            ):
-                key_lines.append(f"📁 {line.strip()}")
-
-            # Package management (low priority - be selective)
-            elif any(
-                keyword in line_lower
-                for keyword in [
-                    "installed successfully",
-                    "removed successfully",
-                    "updated successfully",
-                    "package not found",
-                    "dependency error",
-                ]
-            ):
-                key_lines.append(f"📦 {line.strip()}")
-
-            # Git operations (medium priority)
-            elif any(
-                keyword in line_lower for keyword in ["commit", "push", "pull", "branch", "merge"]
-            ):
-                key_lines.append(f"🔄 {line.strip()}")
-
-        # Combine results with strict limits
-        result_lines = error_lines[:10] + key_lines[:30]  # Limit to prevent bloat
-        if result_lines:
-            if total_lines > len(result_lines) + 10:
-                result_lines.append(
-                    f"... [Extracted {len(result_lines)} key lines from {total_lines} total]"
-                )
-            return "\n".join(result_lines)
-
-        # If no key patterns found, apply strict truncation
-        if len(output) > 1500:  # Reduced from 2000
-            truncated = (
-                output[:800]
-                + "\n... [Output truncated to prevent context pollution] ..."
-                + output[-400:]
-            )
-            logger.info(
-                f"🔧 Applied fallback truncation: {len(output)} chars → {len(truncated)} chars"
-            )
-            return truncated
-
+        """Preserve selected lines; BaseTool supplies one bounded preview and ref."""
         return output
 
     def execute(
@@ -639,6 +477,28 @@ class BashTool(BaseTool):
             )
         workdir = working_directory
 
+        # A literal JVM command has the same meaning through either public
+        # entrypoint. Reuse its runner instead of producing an unreceipted shell
+        # job. Shell expressions, explicit environments and version probes keep
+        # their existing shell semantics; no argument is silently discarded.
+        if self.build_tool is not None and environment in (None, {}):
+            from .build.backends import parse_runner_command
+
+            try:
+                system, verb, argv = parse_runner_command(command)
+            except ValueError:
+                system, verb, argv = None, None, []
+            informational = verb == "run" and any(
+                token in {"-v", "-version", "--version", "-h", "-help", "--help"} for token in argv
+            )
+            if system in {"maven", "gradle"} and not informational:
+                return self.build_tool.execute_bash_command(
+                    command=command,
+                    timeout=timeout,
+                    working_directory=working_directory,
+                    environment=environment,
+                )
+
         # Check if this is a background command
         is_background = self._is_background_command(command)
         if is_background and self.config.enable_background_processes:
@@ -647,12 +507,32 @@ class BashTool(BaseTool):
             logger.info(f"🚀 Detected background command: {command}")
 
         # Prepare environment variables
-        env_vars = environment or {}
+        env_vars = dict(environment or {})
         if self.config.add_sag_cli_marker:
             env_vars["SAG_CLI"] = "1"
 
         # Detect if this is a long-running command that needs enhanced monitoring
         is_long_running_command = self._is_long_running_command(command) and not is_background
+
+        from sag.agent.native_task_receipt import (
+            prepare_native_task_receipt,
+            finish_native_task_receipt,
+        )
+
+        native_dispatch = None
+        if not is_background:
+            try:
+                native_dispatch = prepare_native_task_receipt(
+                    self.docker_orchestrator,
+                    command=command,
+                    cwd=workdir,
+                    environment=environment,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Native task evidence preparation unavailable: {type(exc).__name__}"
+                )
 
         try:
             logger.info(f"Executing bash command: {command}")
@@ -707,12 +587,22 @@ class BashTool(BaseTool):
                     capture_stderr=True,
                     environment=env_vars,
                     timeout=timeout,
+                    truncate_output=False,
                 )
 
             # Handle a nonterminal dispatch-and-poll handoff; tell the agent how
             # to poll the same job even when the latest liveness probe was inconclusive.
             if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("bash", command, result)
+
+            # Monitored and detached runners return a preview plus a complete
+            # stream. Let the tool boundary persist the latter before previewing.
+            if result.get("full_output") is not None:
+                result = {**result, "output": result["full_output"]}
+
+            native_metadata = finish_native_task_receipt(
+                self.docker_orchestrator, native_dispatch, result
+            )
 
             if result.get("dispatch_status") == "completed_detached":
                 detached_result = classify_detached_completion(
@@ -730,6 +620,7 @@ class BashTool(BaseTool):
                         self._with_execution_metadata(
                             {
                                 "dispatch_status": "completed_detached",
+                                **native_metadata,
                                 "exit_code": result.get("exit_code"),
                                 "execution_directory": workdir,
                                 "environment_vars": env_vars,
@@ -801,6 +692,7 @@ class BashTool(BaseTool):
                     metadata=self._with_execution_metadata(
                         {
                             "termination_reason": termination_reason,
+                            **native_metadata,
                             "timeout": timeout,
                             "monitoring_info": monitoring_info,
                         },
@@ -849,6 +741,7 @@ class BashTool(BaseTool):
                             "monitoring_info": result.get("monitoring_info"),
                             "is_long_running": is_long_running_command,
                             "completion_signals": completion_signals,
+                            **native_metadata,
                             "command_type": self._get_command_type(command),
                             "extracted_values": self._extract_values(result["output"], command),
                             "background_pids": [],
@@ -889,6 +782,7 @@ class BashTool(BaseTool):
                             "monitoring_info": result.get("monitoring_info"),
                             "error_analysis": error_analysis,
                             "recovery_commands": self._get_recovery_commands(error_analysis),
+                            **native_metadata,
                             "background_pids": [],
                         },
                         command=command,

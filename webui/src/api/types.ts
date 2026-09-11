@@ -286,6 +286,8 @@ export interface ExecutionSessionDetail {
     attainment?: { verdict: string } | null
   } | null
   ciComparisonLines?: string[]
+  taskCompletion?: { status: "complete" | "incomplete" | "unavailable" } | null
+  taskCompletionLines?: string[]
   snapshotStatus?: SnapshotStatus
   legacy?: boolean
   reportDeliveryStatus?: ReportDeliveryStatus | null

@@ -7,6 +7,7 @@ internals (stage-1 consolidates the surface, not the implementations).
 """
 
 import subprocess
+import pytest
 from types import SimpleNamespace
 
 from container_evidence_fakes import ContainerFS
@@ -92,6 +93,29 @@ def test_job_target_polls_original_operation():
     # ledger through the bounded record stream — now the filename-bound
     # (named) variant the strict live reader requires — and nothing else.
     assert orch.commands == [named_json_record_stream_command(OBLIGATION_DIR)]
+
+
+@pytest.mark.parametrize("job_id", ["output_a93bbaebcf50", "unknown_job"])
+def test_unknown_job_lookup_is_recoverable_without_starting_controller_recovery(job_id):
+    class UnknownDispatch(FakeOrchestrator):
+        def detached_handle(self, job_id):
+            return {"job_id": job_id, "runner_dispatch_state": "unknown", "start_accepted": False}
+
+        def poll_detached_command(self, *args, **kwargs):
+            raise AssertionError("a lookup miss is not an execution to poll")
+
+        def collect_detached_result(self, *args, **kwargs):
+            raise AssertionError("a lookup miss has no result to settle")
+
+    orch = UnknownDispatch()
+    result = SearchTool(orch).execute(target="job:" + job_id)
+    assert not result.succeeded
+    assert result.error_code == "UNKNOWN_DETACHED_JOB_REF"
+    assert result.poll_ref is None
+    assert not result.metadata
+    assert not orch.commands
+    if job_id.startswith("output_"):
+        assert "target='" + job_id + "'" in result.output
 
 
 class PublishedLedgerOrchestrator(FakeOrchestrator):

@@ -1,4 +1,8 @@
-"""The live reading of a receipt's Gradle suite totals (plan r2 T5; principle P-A).
+"""One live reading of receipt totals (plan r2 T5; principle P-A).
+
+Maven now seals the exact delta parser's complete result totals here too.
+That global census does not prove a module map. Existing Gradle per-suite
+summaries and historical receipts retain their original interpretation.
 
 r2 changed what a Gradle receipt MEANS. `gradle_suite_summaries` states, per
 (project, task-dir), what every claimed report's own `<testsuite>` root
@@ -55,7 +59,7 @@ SUITE_TOTALS_BOUND_FIELDS = (
 
 @dataclass(frozen=True)
 class SuiteExecutionTotals:
-    """One receipt's Gradle executions, as the reports themselves declared them.
+    """One receipt's complete counts, apart from its bounded identity sample.
 
     `complete_claims` is the strong reading: the section still names every
     (module, task) pair it summed AND no claimed report went unsummed, so these
@@ -93,10 +97,10 @@ class SuiteExecutionTotals:
 def receipt_suite_totals(receipt: Mapping[str, Any]) -> Optional[SuiteExecutionTotals]:
     """This receipt's own suite totals, or ``None`` when it states none.
 
-    Gated on the live schema version and on the Gradle runner, because those
-    are the conditions under which the field means what this reads it to mean:
-    a receipt written under an older schema is not a live receipt (T6), and a
-    (project, task-dir) total is a statement only the Gradle layout makes.
+    Gradle carries per-(project, task) summaries. Maven carries the exact
+    delta parser's global totals, including logical cases in retry reports.
+    Both use the existing count tier; neither lends identity to a missing
+    module map. Historical Maven receipts with no totals still return None.
 
     Nothing here interprets a receipt's other fields — whether the totals may
     be attributed to a run, a target or a certificate is the caller's binding
@@ -105,11 +109,14 @@ def receipt_suite_totals(receipt: Mapping[str, Any]) -> Optional[SuiteExecutionT
 
     if not isinstance(receipt, Mapping):
         return None
-    if str(receipt.get("tool") or "").strip().lower() != "gradle":
+    if str(receipt.get("tool") or "").strip().lower() not in {"maven", "gradle"}:
         return None
     if receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION:
         return None
-    summed = _suite_totals(receipt)
+    try:
+        summed = _suite_totals(receipt)
+    except (TypeError, ValueError):
+        return None
     if summed is None:
         return None
     totals = summed["totals"]
@@ -119,9 +126,7 @@ def receipt_suite_totals(receipt: Mapping[str, Any]) -> Optional[SuiteExecutionT
         # refusal rather than a clamp: a reader that repaired an impossible
         # receipt into a plausible one would be inventing the run's evidence.
         return None
-    section = receipt.get("gradle_suite_summaries")
-    if not isinstance(section, Mapping):
-        return None
+    section = receipt.get("gradle_suite_summaries") or {}
     bounds = tuple(field for field in SUITE_TOTALS_BOUND_FIELDS if field in section)
     return SuiteExecutionTotals(
         tests=totals["tests"],

@@ -172,7 +172,7 @@ def test_done_passes_gate_and_signals_engine():
     assert gate.calls == ["build"]
 
 
-def test_analyze_done_requires_a_model_authored_execution_plan_after_gate_acceptance():
+def test_analyze_done_records_strategy_without_requiring_a_structured_plan():
     gate = GateRecorder(ok=True)
 
     result = _tool(gate, phase="analyze").execute(
@@ -181,13 +181,9 @@ def test_analyze_done_requires_a_model_authored_execution_plan_after_gate_accept
         key_results="survey and document review complete",
     )
 
-    assert result.succeeded is False
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_REQUIRED"
-    assert "phase_signal" not in result.metadata
-    assert (
-        result.metadata["gate_result"]["validated_facts"]["analysis.execution_plan_required"]
-        is True
-    )
+    assert result.succeeded is True
+    assert result.metadata["phase_signal"] == "done"
+    assert "execution_plan_candidate" not in result.metadata
     assert gate.calls == ["analyze"]
 
 
@@ -277,10 +273,10 @@ def test_analyze_plan_rejects_output_like_text_without_a_current_document_read(t
         execution_plan=_authored_execution_plan(),
     )
 
-    assert result.succeeded is False
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
-    assert "current Analyze attempt" in result.error
-    assert gate.calls == []
+    assert result.succeeded is True
+    assert "current Analyze attempt" in result.metadata["plan_warning"]
+    assert "execution_plan_candidate" not in result.metadata
+    assert gate.calls == ["analyze"]
 
 
 def test_analyze_plan_rejection_returns_the_exact_valid_ref_for_the_path(tmp_path):
@@ -315,10 +311,10 @@ def test_analyze_plan_rejection_returns_the_exact_valid_ref_for_the_path(tmp_pat
         execution_plan=plan,
     )
 
-    assert result.succeeded is False
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
-    assert valid_ref in result.error
-    assert "output_guessed" in result.error
+    assert result.succeeded is True
+    assert valid_ref in result.metadata["plan_warning"]
+    assert "output_guessed" in result.metadata["plan_warning"]
+    assert "execution_plan_candidate" not in result.metadata
 
 
 def test_analyze_plan_may_honestly_defer_tests_when_no_safe_entry_was_established(tmp_path):
@@ -640,8 +636,7 @@ def test_analysis_facts_recovery_still_runs_before_explicit_no_plan_termination(
 
     assert result.succeeded is True
     assert result.metadata["phase_signal"] == "done"
-    assert result.metadata["gate_result"]["validated_outcome"] == "unknown"
-    assert result.metadata["gate_result"]["validated_facts"]["analysis.build_entry_ready"] is False
+    assert result.metadata["gate_result"]["validated_outcome"] == "success"
     assert "execution_plan_candidate" not in result.metadata
     assert gate.calls == 2
     assert surveys == ["survey"]

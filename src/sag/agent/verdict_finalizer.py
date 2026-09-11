@@ -28,6 +28,7 @@ from sag.verdict_rates import (
 )
 
 from .ci_comparison import CIComparisonSnapshot, PinnedCITarget, build_ci_comparison
+from .acceptance_task import AcceptanceTask, TaskCompletionSnapshot, build_task_completion
 from .evidence_publications import (
     EVIDENCE_PUBLICATION_GENESIS_SHA256,
     VERDICT_LOGICAL_ARTIFACT_ID,
@@ -325,12 +326,24 @@ class RunVerdictSnapshot(BaseModel):
     conflicts: tuple[str, ...] = ()
     phase_records: tuple[PhaseRecordSnapshot, ...] = ()
     ci_comparison: CIComparisonSnapshot | None = None
+    task_completion: TaskCompletionSnapshot | None = None
+
+    @model_validator(mode="after")
+    def _task_completion_consistent(self):
+        if self.task_completion is not None:
+            if self.task_completion.run_id != self.run_id:
+                raise ValueError("task completion belongs to another run")
+            if self.verdict == "success" and self.task_completion.status != "complete":
+                raise ValueError("incomplete required task cannot carry a success verdict")
+        return self
 
     @model_serializer(mode="wrap")
     def _omit_historical_comparison(self, handler):
         data = handler(self)
         if self.ci_comparison is None:
             data.pop("ci_comparison", None)
+        if self.task_completion is None:
+            data.pop("task_completion", None)
         return data
 
     @model_validator(mode="before")
@@ -1740,6 +1753,11 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     if snapshot.ci_comparison is not None:
         if schema_version < 5 or snapshot.ci_comparison.run_id != snapshot.run_id:
             raise ValueError("CI comparison does not bind the verdict schema and run")
+    if snapshot.task_completion is not None:
+        if schema_version < 5 or snapshot.task_completion.run_id != snapshot.run_id:
+            raise ValueError("task completion does not bind the verdict schema and run")
+        if snapshot.verdict == "success" and snapshot.task_completion.status != "complete":
+            raise ValueError("incomplete required task cannot carry a success verdict")
     if type(snapshot.run_id) is not str or _RUN_ID_RE.fullmatch(snapshot.run_id) is None:
         raise ValueError("verdict run id is invalid")
     finalized_at = snapshot.finalized_at
@@ -1796,7 +1814,15 @@ def validate_verdict_snapshot_v3(payload: Mapping[str, Any]) -> RunVerdictSnapsh
     expected_verdict = run_verdict(
         _phase_machine_verdict(snapshot.phase_records),
         _execution_verdict_word(snapshot.build_evidence, snapshot.test_stats, test_cases),
-        snapshot.conflicts,
+        (
+            *snapshot.conflicts,
+            *(
+                [f"acceptance_task_{snapshot.task_completion.status}"]
+                if snapshot.task_completion is not None
+                and snapshot.task_completion.status != "complete"
+                else []
+            ),
+        ),
     )
     if snapshot.verdict != expected_verdict:
         raise ValueError("verdict word does not reconcile with build execution and test outcomes")
@@ -1880,6 +1906,8 @@ class VerdictFinalizer:
         project_name: str | None = None,
         repository: str | None = None,
         ci_target: PinnedCITarget | None = None,
+        acceptance_task: AcceptanceTask | None = None,
+        output_storage=None,
     ):
         self.orchestrator = orchestrator
         # The physical validator is the build oracle at evidence-close (same
@@ -1889,6 +1917,8 @@ class VerdictFinalizer:
         self.project_name = project_name
         self.repository = repository
         self.ci_target = ci_target
+        self.acceptance_task = acceptance_task
+        self.output_storage = output_storage
         self._snapshots: dict[int, RunVerdictSnapshot] = {}
         self._expected_snapshots: dict[int, RunVerdictSnapshot] = {}
 
@@ -1911,6 +1941,15 @@ class VerdictFinalizer:
             validator=self.validator,
             project_name=self.project_name,
         )
+        completion = build_task_completion(
+            self.orchestrator,
+            state,
+            validator=self.validator,
+            project_root=(f"/workspace/{self.project_name}" if self.project_name else None),
+            repository=self.repository,
+            task=self.acceptance_task,
+            output_storage=self.output_storage,
+        )
         conflicts = _dedupe(
             [
                 *state.conflicts,
@@ -1918,6 +1957,11 @@ class VerdictFinalizer:
                 *test_conflicts,
                 *rate_conflicts,
                 *_oracle_divergence_conflicts(state, build),
+                *(
+                    [f"acceptance_task_{completion.status}"]
+                    if completion is not None and completion.status != "complete"
+                    else []
+                ),
             ]
         )
         input_refs = _dedupe(
@@ -1945,6 +1989,7 @@ class VerdictFinalizer:
             rates=rates,
             conflicts=conflicts,
             phase_records=tuple(_phase_record_snapshot(record) for record in state.phase_records),
+            task_completion=completion,
             ci_comparison=build_ci_comparison(
                 self.orchestrator,
                 state,

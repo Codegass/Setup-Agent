@@ -713,8 +713,12 @@ class ToolchainManager:
 
     def _source_priority(self, source: CandidateSource) -> int:
         priorities = {
-            "env_overlay": 0,
-            "wrapper": 1,
+            # Wrappers are discovered only when requested by the spec. An
+            # activated installation must not erase that project preference;
+            # version compatibility and explicit preferred versions still
+            # take precedence in resolve/_rank_candidate.
+            "wrapper": 0,
+            "env_overlay": 1,
             "registered": 2,
             "path": 3,
             "standalone": 4,

@@ -368,7 +368,7 @@ def checked_benchmark_projects(benchmark: Path, bench: dict) -> list[tuple[dict,
     return checked
 
 
-def prepare(benchmark: Path, out: Path, source: Path, sha: str, image: str) -> dict:
+def prepare(benchmark: Path, out: Path, source: Path, sha: str, image: str, only: list[str] | None = None) -> dict:
     """Pin the existing SAG binary/configuration and all ten goals before running."""
     out = runner.safe_output(out)
     if out.exists():
@@ -392,6 +392,8 @@ def prepare(benchmark: Path, out: Path, source: Path, sha: str, image: str) -> d
     config.update(docker_base_image=image, max_iterations=75, max_wall_clock_seconds=1200)
     projects = []
     for i, (p, record) in enumerate(checked_benchmark_projects(benchmark, bench)):
+        if only is not None and p["seat"] not in only:
+            continue
         target = Path(p["target_file"])
         container = f"sag-{out.name}-{p['seat']}"
         if runner.inspect_container(container) is not None:
@@ -400,9 +402,13 @@ def prepare(benchmark: Path, out: Path, source: Path, sha: str, image: str) -> d
         projects.append(p | dict(
             variant="candidate", run_key=p["seat"], order=i, container=container, goal=goal,
             matched_cell=record.matched_cell, target_source=str(target),
+            acceptance_command=p["local_command"],
             target_file=str(out / "targets" / target.name),
         ))
+    if only is not None and {p["seat"] for p in projects} != set(only):
+        raise ValueError("Unknown or missing project in selected cohort")
     manifest = dict(
+        cohort=[p["seat"] for p in projects],
         campaign=out.name, created_at=runner.now(), phase="small-ci-10",
         reference_manifest=str(reference), reference_sha256=runner.digest(reference),
         benchmark_manifest=str(bench_file.resolve()), benchmark_sha256=runner.digest(bench_file),
@@ -412,7 +418,7 @@ def prepare(benchmark: Path, out: Path, source: Path, sha: str, image: str) -> d
         docker_resources={k: resources.get(k) for k in ("NCPU", "MemTotal", "Architecture", "OperatingSystem", "ServerVersion")},
         image={k: image_info.get(k) for k in ("Id", "Architecture", "Os", "RepoDigests")},
         cache_policy="One fresh container per project, no host dependency/project cache; official CI cache differs and time is descriptive only",
-        schedule="All ten tasks run serially; one attempt each; no retries or project replacements based on SAG outcomes",
+        schedule="Selected frozen tasks run serially; one attempt each; no retries or project replacements based on SAG outcomes",
         python_environment=str(ROOT / ".venv"), projects=projects,
         runner_path=str(Path(runner.__file__).resolve()), runner_sha256=runner.digest(Path(runner.__file__)),
         small_runner_sha256=runner.digest(Path(__file__)),
@@ -469,7 +475,7 @@ def main() -> None:
     elif args.action == "prepare":
         if not all((args.benchmark, args.source, args.sha, args.image)):
             parser.error("prepare requires --benchmark, --source, --sha, --image")
-        result = prepare(args.benchmark, args.out, args.source, args.sha, args.image)
+        result = prepare(args.benchmark, args.out, args.source, args.sha, args.image, only=args.only)
         print(json.dumps({"prepared": result["campaign"], "attempts": len(result["projects"])}))
     else:
         run(args.out.resolve(), args.only)

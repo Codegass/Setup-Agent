@@ -1014,7 +1014,26 @@ def validate_phase_claim(
             owner = BlockerOwner.PROJECT
         else:
             owner = BlockerOwner.UNKNOWN
-        if not accepted:
+        # A host-pinned task may simply have later commands left to run.
+        # Reject an unsupported success claim, but keep ordinary execution
+        # available; requiring a repair hypothesis here obstructs that work.
+        # Use the same typed facts for live grading and replay.
+        unfinished_task = False
+        if (
+            phase_claim.phase == "test"
+            and state is ValidatorState.PARTIAL
+            and code in {"required_task_incomplete", "required_task_unavailable"}
+        ):
+            from .acceptance_task import TaskCompletionSnapshot
+
+            try:
+                task = TaskCompletionSnapshot.model_validate(facts.get("task_completion"))
+                unfinished_task = (
+                    task.status != "complete" and code == f"required_task_{task.status}"
+                )
+            except (TypeError, ValueError):
+                pass
+        if not accepted and not unfinished_task:
             control = GateControlDisposition.REPAIR_REQUIRED
 
     return GateResult(
@@ -2269,7 +2288,7 @@ def _inspect_analyze(
         suggestions=projected_suggestions,
         code=analysis_code or f"analysis_{state.value}",
         validated_facts={
-            "analysis.build_entry_ready": survey_ready and plan_ready,
+            "analysis.build_entry_ready": survey_ready,
             "analysis.status_code": analysis_code or None,
             "analysis.status_facts": dict(analysis_status_facts),
             "analysis.execution_plan_sealed": plan_ready,

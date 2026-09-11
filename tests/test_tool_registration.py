@@ -174,6 +174,14 @@ def test_setup_mode_tool_surface():
     assert "manage_context" not in names
 
 
+def test_bash_and_build_share_the_same_registered_runner():
+    from sag.agent.phase_machine import PhaseMachine
+
+    agent = _agent_for_registration(phase_machine=PhaseMachine())
+    tools = {tool.name: tool for tool in agent._initialize_tools(workflow_mode="setup")}
+    assert tools["bash"].build_tool is tools["build"]
+
+
 def test_run_task_mode_tool_surface():
     agent = _agent_for_registration(phase_machine=None)
     names = {tool.name for tool in agent._initialize_tools(workflow_mode="run_task")}

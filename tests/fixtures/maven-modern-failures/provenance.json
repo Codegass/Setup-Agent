@@ -1,0 +1,20 @@
+[
+  {
+    "fixture": "failure.txt",
+    "fixture_sha256": "8c4be97e9f6c0e50360699beda096bc8870d609c9bf029a6818914e13bf30b8e",
+    "source": "logs/verification-23-20260910/jackrabbit-full-forced-test.log",
+    "source_sha256": "3b9b094fc056af549bb087afc8635f3d800abad8a249929c6fbb0f0d7cc20f4e",
+    "first_lf_line": 625,
+    "last_lf_line": 639,
+    "note": "Exact contiguous native console excerpt; not a synthetic or new SAG run."
+  },
+  {
+    "fixture": "error.txt",
+    "fixture_sha256": "9328c85202f42ae5d402c21107e0cac58fabae7ec37619e542bb2f92985c00aa",
+    "source": "logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/error-last/console.log",
+    "source_sha256": "29961cd21add12d4ef5a60ca18f57ffdeb07b8b85abd50aa9ff56d66b968d329",
+    "first_lf_line": 59,
+    "last_lf_line": 75,
+    "note": "Exact contiguous native console excerpt; not a synthetic or new SAG run."
+  }
+]

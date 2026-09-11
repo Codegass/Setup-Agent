@@ -55,8 +55,7 @@ class ConflictOrch:
                 ),
             }
         if "java -version" in cmd:
-            return {"success": True, "exit_code": 0,
-                    "output": f'openjdk version "{self.java}.0.1"'}
+            return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": canonical_json(self.manifest)}
@@ -91,18 +90,62 @@ def test_no_conflict_when_matching_or_unknown(java, required_java):
     assert validator._collect_env_conflicts() == []
 
 
+@pytest.mark.parametrize(
+    ("runtime_constraints", "release", "unresolved", "expected"),
+    [
+        ([], "11", [], []),
+        (["[11,)"], "11", [], []),
+        (["[11,17)"], "11", [], ["jdk_mismatch"]),
+        (["[17.0.2,)"], "11", [], ["jdk_mismatch"]),
+        ([], "21", [], ["jdk_mismatch"]),
+        ([], "11", ["unresolved profile JVM constraint"], ["build_requirements_unavailable"]),
+    ],
+)
+def test_final_verdict_uses_preflight_java_constraint_semantics(
+    runtime_constraints, release, unresolved, expected
+):
+    requirements = {
+        "runtime": [
+            {"constraint": value, "source": "pom.xml:requireJavaVersion"}
+            for value in runtime_constraints
+        ],
+        "compiler_release": release,
+        "compiler_source": "pom.xml:maven.compiler.release",
+        "compiler_toolchain": False,
+        "unresolved": unresolved,
+    }
+    validator = PhysicalValidator.__new__(PhysicalValidator)
+    validator.docker_orchestrator = ConflictOrch(
+        java="17",
+        manifest=complete_build_requirements_v1(
+            java_version=release,
+            java_version_source="maven-compiler",
+            java_version_enforced=False,
+            java_requirements=requirements,
+        ),
+    )
+    assert validator._collect_env_conflicts() == expected
+
+
 def _metrics(tested_pairs):
     """tested_pairs: list of (path, has_test_sources, tests_total)."""
     return assemble_module_metrics(
         modules=[
-            {"path": p, "name": p, "class_count": 5, "jar_count": 1,
-             "report_dirs": [], "has_test_sources": bearing}
+            {
+                "path": p,
+                "name": p,
+                "class_count": 5,
+                "jar_count": 1,
+                "report_dirs": [],
+                "has_test_sources": bearing,
+            }
             for p, bearing, _ in tested_pairs
         ],
         reactor_status={p: "success" for p, _, _ in tested_pairs},
         tests={
             p: {"tests_total": total, "tests_passed": total, "failing_count": 0}
-            for p, _, total in tested_pairs if total
+            for p, _, total in tested_pairs
+            if total
         },
         build_systems=["maven"],
         build_error_samples={},

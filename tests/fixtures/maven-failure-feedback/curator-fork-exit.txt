@@ -1,0 +1,23 @@
+[INFO] 
+[INFO] Apache Curator ..................................... SUCCESS [  2.961 s]
+[INFO] Curator Testing .................................... SUCCESS [ 11.395 s]
+[INFO] Curator Client ..................................... SUCCESS [ 31.079 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] 68 goals, 62 executed, 6 from cache, saving at least 4s
+[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] Process Exit Code: 2
+[ERROR] Crashed tests:
+[ERROR] org.apache.curator.framework.imps.TestReconfiguration
+[ERROR] org.apache.maven.surefire.booter.SurefireBooterForkException: ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] 	at org.apache.maven.plugin.surefire.booterclient.ForkStarter.awaitResultsDone(ForkStarter.java:532)
+[ERROR] 	at org.apache.maven.plugin.surefire.booterclient.ForkStarter.runSuitesForkPerTestSet(ForkStarter.java:479)
+[ERROR] Caused by: org.apache.maven.surefire.booter.SurefireBooterForkException: The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] 	at org.apache.maven.plugin.surefire.booterclient.ForkStarter.fork(ForkStarter.java:748)
+[ERROR] 	at org.apache.maven.plugin.surefire.booterclient.ForkStarter.access$700(ForkStarter.java:121)
+[ERROR] 	at org.apache.maven.plugin.surefire.booterclient.ForkStarter$2.call(ForkStarter.java:465)
+[ERROR] 	at org.apache.maven.plugin.surefire.booterclient.ForkStarter$2.call(ForkStarter.java:442)
+[ERROR] 	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+[ERROR] 	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+[ERROR] 	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+[ERROR] 	at java.base/java.lang.Thread.run(Thread.java:840)

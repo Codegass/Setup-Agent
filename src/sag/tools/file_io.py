@@ -1,12 +1,17 @@
 """File I/O tool for the agent."""
 
+import inspect
+import json
+import shlex
 from typing import Any, Dict, Optional
 
 from loguru import logger
 
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.runtime.container_io import _execute_untruncated
 
 from .base import BaseTool, ToolError, ToolResult
+from .output_paging import read_text_page, render_text_page
 
 
 class FileIOTool(BaseTool):
@@ -14,7 +19,11 @@ class FileIOTool(BaseTool):
 
     def __init__(self, orchestrator: DockerOrchestrator):
         super().__init__(
-            "file_io", "A tool for reading, writing, and listing files in the workspace."
+            "file_io",
+            "Read, write, or list files in the container. For reads, start_line is zero-based "
+            "and end_line is exclusive. max_chars defaults to 20000 (capped at 100000). "
+            "Follow the returned Next read arguments, including column_offset for long lines, "
+            "to continue without losing text.",
         )
         self.orchestrator = orchestrator
 
@@ -25,6 +34,8 @@ class FileIOTool(BaseTool):
         content: Optional[str] = None,
         start_line: int = 0,
         end_line: Optional[int] = None,
+        column_offset: int = 0,
+        max_chars: int = 20_000,
     ) -> ToolResult:
         """
         Execute a file operation.
@@ -33,14 +44,16 @@ class FileIOTool(BaseTool):
             action: The action to perform ('read', 'write', 'list').
             path: The path to the file or directory.
             content: The content to write to the file (for 'write' action).
-            start_line: The starting line number for reading (for 'read' action).
-            end_line: The ending line number for reading (for 'read' action).
+            start_line: Zero-based starting line for reading.
+            end_line: Exclusive ending line for reading.
+            column_offset: Character offset within the starting line; use Next read to continue.
+            max_chars: Page size, capped at 100000 characters; follow Next read for more.
         """
         # The base class now handles parameter validation automatically
         # via _validate_parameters() which checks the schema
 
         if action == "read":
-            return self._read(path, start_line, end_line)
+            return self._read(path, start_line, end_line, column_offset, max_chars)
         elif action == "write":
             return self._write(path, content)
         elif action == "list":
@@ -59,7 +72,14 @@ class FileIOTool(BaseTool):
                 retryable=True,
             )
 
-    def _read(self, path: str, start_line: int, end_line: Optional[int]) -> ToolResult:
+    def _read(
+        self,
+        path: str,
+        start_line: int,
+        end_line: Optional[int],
+        column_offset: int = 0,
+        max_chars: int = 20_000,
+    ) -> ToolResult:
         """Read a file."""
         if not path:
             raise ToolError(
@@ -69,9 +89,18 @@ class FileIOTool(BaseTool):
                 retryable=True,
             )
 
-        # Command to read the file content
-        command = f"cat '{path}'"
-        result = self.orchestrator.execute_command(command)
+        # Page next to the file, before crossing Docker's output transport.
+        script = "from __future__ import annotations\nimport json\n" + inspect.getsource(
+            read_text_page
+        )
+        script += (
+            f"\nwith open({path!r}, encoding='utf-8', errors='replace', newline='\\n') as source:\n"
+            f"    page = read_text_page(source, {start_line!r}, {end_line!r}, "
+            f"{column_offset!r}, {max_chars!r})\n"
+            "print(json.dumps(page, ensure_ascii=True))\n"
+        )
+        command = "python3 -c " + shlex.quote(script)
+        result = _execute_untruncated(self.orchestrator, command)
 
         if not result["success"]:
             raise ToolError(
@@ -87,24 +116,15 @@ class FileIOTool(BaseTool):
                 retryable=True,
             )
 
-        file_content = result["output"]
-        lines = file_content.splitlines()
-
-        # Handle line slicing
-        if end_line is None:
-            end_line = len(lines)
-
-        selected_lines = lines[start_line:end_line]
-        output = "\n".join(selected_lines)
+        page = json.loads(result["output"])
 
         return ToolResult.completed_success(
-            output=output,
+            output=render_text_page(page, {"action": "read", "path": path}),
+            raw_output=page["text"],
             metadata={
                 "path": path,
-                "total_lines": len(lines),
-                "read_lines": len(selected_lines),
-                "start_line": start_line,
-                "end_line": end_line,
+                "output_page": True,
+                **{key: value for key, value in page.items() if key != "text"},
             },
         )
 

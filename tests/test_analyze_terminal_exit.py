@@ -86,7 +86,7 @@ def _deliver(engine, result):
 
 @pytest.mark.parametrize("outcome", ["unknown", "failed"])
 @pytest.mark.parametrize("old_plan", [False, True])
-def test_explicit_no_plan_close_skips_execution_without_granting_authority(outcome, old_plan):
+def test_no_plan_close_advances_a_surveyed_project_without_granting_completion(outcome, old_plan):
     engine, tool, container = _analyze(old_plan=old_plan)
     original_plan = container.files.get(PROJECT_EXECUTION_PLAN_PATH)
 
@@ -97,9 +97,9 @@ def test_explicit_no_plan_close_skips_execution_without_granting_authority(outco
     )
 
     assert result.succeeded is True  # The terminal call, not the project, succeeded.
-    assert result.metadata["gate_result"]["validated_outcome"] == "unknown"
+    assert result.metadata["gate_result"]["validated_outcome"] == "success"
     facts = result.metadata["gate_result"]["validated_facts"]
-    assert facts["analysis.survey_validator_state"] == "green"
+    assert facts["analysis.build_entry_ready"] is True
     assert facts["analysis.execution_plan_sealed"] is False
     assert facts["analysis.execution_plan_artifact_present"] is old_plan
     if old_plan:
@@ -109,14 +109,12 @@ def test_explicit_no_plan_close_skips_execution_without_granting_authority(outco
     assert "execution_plan_candidate" not in result.metadata
     assert engine.phase_machine.current_phase == "analyze"
     assert _deliver(engine, result) == "done"
-    assert engine.phase_machine.current_phase == "report"
+    assert engine.phase_machine.current_phase == "build"
     assert [(record.phase, record.outcome.value) for record in engine.phase_machine.records] == [
-        ("analyze", "unknown"),
-        ("build", "skipped"),
-        ("test", "skipped"),
+        ("analyze", "success"),
     ]
-    assert engine.finalized_reasons == [EvidenceCloseReason.DEPENDENTS_SKIPPED]
-    assert engine.run_evidence_state.fact_value("analysis.build_entry_ready") is False
+    assert engine.finalized_reasons == []
+    assert engine.run_evidence_state.fact_value("analysis.build_entry_ready") is True
     assert container.files.get(PROJECT_EXECUTION_PLAN_PATH) == original_plan
     assert engine._read_sealed_execution_plan() is None
     assert engine._system_prompt_for_current_phase("BASE") == "BASE"
@@ -131,11 +129,11 @@ def test_no_plan_optimistic_close_cannot_use_old_authority(outcome, old_plan):
     engine, tool, container = _analyze(old_plan=old_plan)
     original_plan = container.files.get(PROJECT_EXECUTION_PLAN_PATH)
     result = tool.execute(action="done", outcome=outcome, key_results="Survey complete.")
-    assert result.succeeded is False
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_REQUIRED"
-    assert _deliver(engine, result) is None
-    assert engine.phase_machine.current_phase == "analyze"
-    assert engine.phase_machine.records == ()
+    assert result.succeeded is True
+    assert "execution_plan_candidate" not in result.metadata
+    assert not result.metadata["phase_claim"].get("execution_plan_sha256")
+    assert _deliver(engine, result) == "done"
+    assert engine.phase_machine.current_phase == "build"
     assert container.files.get(PROJECT_EXECUTION_PLAN_PATH) == original_plan
 
 
@@ -143,10 +141,11 @@ def test_no_plan_optimistic_close_cannot_use_old_authority(outcome, old_plan):
 def test_supplied_invalid_plan_is_not_a_no_plan_exit(outcome):
     engine, tool, _ = _analyze()
     result = tool.execute(action="done", outcome=outcome, execution_plan={})
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
-    assert _deliver(engine, result) is None
-    assert engine.phase_machine.current_phase == "analyze"
-    assert engine.phase_machine.records == ()
+    assert result.succeeded
+    assert result.metadata["plan_warning"]
+    assert "execution_plan_candidate" not in result.metadata
+    assert _deliver(engine, result) == "done"
+    assert engine.phase_machine.current_phase == "build"
 
 
 @pytest.mark.parametrize("outcome", ["unknown", "failed"])
@@ -205,7 +204,8 @@ def test_other_attempt_document_read_cannot_supply_plan_authority(tmp_path, outc
     )
     tool.bind_execution_plan_evidence(storage)
     result = tool.execute(action="done", outcome=outcome, execution_plan=plan)
-    assert result.error_code == "ANALYSIS_EXECUTION_PLAN_INVALID"
-    assert "current Analyze attempt" in result.error
-    assert _deliver(engine, result) is None
-    assert engine.phase_machine.records == ()
+    assert result.succeeded
+    assert "current Analyze attempt" in result.metadata["plan_warning"]
+    assert "execution_plan_candidate" not in result.metadata
+    assert _deliver(engine, result) == "done"
+    assert engine.phase_machine.current_phase == "build"

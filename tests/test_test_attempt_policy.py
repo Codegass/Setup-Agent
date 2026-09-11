@@ -1239,9 +1239,9 @@ def _sealed_test_resolution(monkeypatch, *, system, params):
         "read_sealed_project_execution_plan",
         lambda _orchestrator: SimpleNamespace(
             plan=SimpleNamespace(
-                test_steps=(SimpleNamespace(tool="build", params=params),)
-                if params is not None
-                else ()
+                test_steps=(
+                    (SimpleNamespace(tool="build", params=params),) if params is not None else ()
+                )
             )
         ),
     )
@@ -1252,6 +1252,42 @@ def _sealed_test_resolution(monkeypatch, *, system, params):
 
 def test_empty_sealed_plan_does_not_restore_the_survey_invented_root_test(monkeypatch):
     assert _sealed_test_resolution(monkeypatch, system="gradle", params=None) is None
+
+
+@pytest.mark.parametrize("params", [None, {"command": "mvn clean install"}, {"action": "wrong"}])
+def test_live_attempt_floor_cannot_be_narrowed_or_invalidated_by_a_plan(monkeypatch, params):
+    # Install a legacy plan reader, including an empty or incorrectly encoded
+    # strategy. Live policy must use physical coordinates regardless of it.
+    _sealed_test_resolution(monkeypatch, system="gradle", params=params)
+    orchestrator = ManifestOrchestrator()
+    requirement = required_test_attempt(
+        _ready_state(), orchestrator, phase="test", attempt_id="test-1"
+    )
+    assert requirement is not None
+    assert requirement.root == "/workspace/bigtop/bigtop-data-generators"
+    assert requirement.system == "gradle"
+    assert requirement.reason_code != "sealed_plan_test_step"
+
+
+def test_completed_receipt_discharges_floor_when_new_dispatch_coordinates_are_unavailable():
+    calls = []
+    validator = SimpleNamespace(
+        _test_execution_receipt_summary=lambda root: calls.append(root) or {"state": "completed"}
+    )
+    assert (
+        required_test_attempt(
+            _ready_state(),
+            None,
+            phase="test",
+            attempt_id="test-1",
+            resolution=CandidateResolution(
+                status="unsafe_coordinates", project_root="/workspace/demo"
+            ),
+            validator=validator,
+        )
+        is None
+    )
+    assert calls == ["/workspace/demo"]
 
 
 @pytest.mark.parametrize(
@@ -1303,7 +1339,9 @@ def test_sealed_plan_floor_accepts_only_the_exact_backend_receipt(
     )
     assert resolution is not None
     requirement = resolution.primary
-    result = ToolResult.completed_success(output="terminal backend receipt", facts={"system": system})
+    result = ToolResult.completed_success(
+        output="terminal backend receipt", facts={"system": system}
+    )
 
     assert execution_matches_candidate(system, backend_params, result, requirement)
     assert not execution_matches_candidate(system, different_params, result, requirement)

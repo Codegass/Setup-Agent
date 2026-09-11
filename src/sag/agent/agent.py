@@ -23,6 +23,7 @@ from sag.ui import EventType, PhaseType, UIEvent, UIManager
 from sag.verdict_rates import execution_sentence
 
 from .ci_comparison import PinnedCITarget
+from .acceptance_task import AcceptanceTask, render_task_completion_lines
 from .context_manager import ContextManager
 from .control_events import (
     ControlEventSink,
@@ -204,6 +205,11 @@ class SetupAgent:
         self._observed_target_repo_sha = None
         if workflow_mode != "setup":
             self._setup_ci_target = None
+            self._setup_acceptance_task = None
+            if getattr(self, "orchestrator", None) is not None:
+                self.orchestrator.acceptance_task = None
+                self.orchestrator.acceptance_task_root = None
+                self.orchestrator.acceptance_task_repository = None
             self.phase_machine = None
             self.context_journal = None
             self.run_evidence_state = None
@@ -429,9 +435,20 @@ class SetupAgent:
         if target is not None:
             frozen_config["ci_target"] = {
                 "record_sha256": target.raw_sha256,
+                **(
+                    {"execution_command": target.execution_command}
+                    if target.execution_command
+                    else {}
+                ),
                 "repo": target.record.repo,
                 "sha": target.record.sha,
                 "matched_cell": target.record.matched_cell,
+            }
+        task = getattr(self, "_setup_acceptance_task", None)
+        if task is not None:
+            frozen_config["acceptance_task"] = {
+                "sha256": task.sha256,
+                "definition": task.model_dump(mode="json"),
             }
         self._run_pin_template = {
             "run_id": self.run_id,
@@ -690,16 +707,17 @@ class SetupAgent:
             control_event_sink=self.control_event_sink,
         )
         self.report_tool = report_tool
+        build_tool = BuildTool(
+            self.orchestrator,
+            maven_tool=maven_tool,
+            gradle_tool=gradle_tool,
+            python_tool=python_tool,
+        )
         tools = [
-            BashTool(self.orchestrator, config=bash_config),
+            BashTool(self.orchestrator, config=bash_config, build_tool=build_tool),
             FileIOTool(self.orchestrator),
             lifecycle_tool,
-            BuildTool(
-                self.orchestrator,
-                maven_tool=maven_tool,
-                gradle_tool=gradle_tool,
-                python_tool=python_tool,
-            ),
+            build_tool,
             ProjectTool(
                 setup_tool=setup_tool,
                 analyzer_tool=analyzer_tool,
@@ -816,6 +834,7 @@ class SetupAgent:
         project_ref: Optional[str] = None,
         pre_finalize_evidence_callback: Callable[[], Mapping[str, Any] | None] | None = None,
         ci_target: PinnedCITarget | None = None,
+        acceptance_task: AcceptanceTask | None = None,
     ) -> RunTermination:
         """Setup a project from scratch.
 
@@ -886,8 +905,17 @@ class SetupAgent:
             self.phase_machine = PhaseMachine()
             self.run_evidence_state = RunEvidenceState(run_id=run_id)
             self._setup_ci_target = ci_target
+            self._setup_acceptance_task = acceptance_task
+            self.orchestrator.acceptance_task = acceptance_task
+            self.orchestrator.acceptance_task_root = f"/workspace/{project_name}"
+            self.orchestrator.acceptance_task_repository = project_url
+            if acceptance_task is not None:
+                goal += "\n\n" + acceptance_task.prompt(f"/workspace/{project_name}")
             self.verdict_finalizer = VerdictFinalizer(
-                self.orchestrator, repository=project_url, ci_target=ci_target
+                self.orchestrator,
+                repository=project_url,
+                ci_target=ci_target,
+                acceptance_task=acceptance_task,
             )
             self.context_journal = ContextJournal(self.orchestrator)
             # Actual repo directory name (from URL); the phase gates probe
@@ -1895,6 +1923,7 @@ START by working toward the current phase objective shown in my context.
             "[bold]Canonical Result:[/bold]",
             f"• Verdict: {snapshot.verdict}",
             *[f"• {line}" for line in format_evidence_layer_lines(metrics_v2)],
+            *render_task_completion_lines(snapshot.task_completion),
         ]
         summary_lines.extend(
             [

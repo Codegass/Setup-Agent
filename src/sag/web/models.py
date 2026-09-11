@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Literal
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from sag.agent.ci_comparison import CIComparisonSnapshot
+from sag.agent.acceptance_task import TaskCompletionSnapshot
 
 
 class WebModel(BaseModel):
@@ -841,6 +842,12 @@ class ExecutionSessionDetail(WebModel):
     )
     ci_comparison_lines: list[str] = Field(
         default_factory=list, serialization_alias="ciComparisonLines"
+    )
+    task_completion: TaskCompletionSnapshot | None = Field(
+        default=None, serialization_alias="taskCompletion"
+    )
+    task_completion_lines: list[str] = Field(
+        default_factory=list, serialization_alias="taskCompletionLines"
     )
     snapshot_status: str = Field(default="unavailable", serialization_alias="snapshotStatus")
     legacy: bool = False

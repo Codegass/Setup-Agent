@@ -15,7 +15,6 @@ tests/test_maven_gradle_tool_contracts.py).
 """
 
 import pytest
-
 from test_invocation_receipts import receipts_written
 from test_maven_gradle_tool_contracts import FakeBuildToolOrchestrator, FakeToolchainManager
 
@@ -25,9 +24,7 @@ from sag.tools.base import BaseTool, ToolResult
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
 
-pytestmark = pytest.mark.usefixtures(
-    "facade_contract_authority", "exact_internal_runner_authority"
-)
+pytestmark = pytest.mark.usefixtures("facade_contract_authority", "exact_internal_runner_authority")
 
 WORKDIR = "/workspace/project"
 
@@ -190,20 +187,26 @@ def _truncated(result):
 LONG = "[INFO] Tests run: 982, Failures: 0, Errors: 0, Skipped: 61\n" * 400
 
 
-def test_the_notice_states_the_stored_reference_and_the_call_that_reads_it():
+def test_the_notice_states_the_stored_reference_and_the_call_that_reads_it(
+    durable_tool_result_storage,
+):
     # Premise updated for #30: the notice must teach the REGISTERED surface.
     # output_search left the tool list at stage 1, so the old wording proposed
     # a call the model cannot route to (the #19 defect class).
-    output = _truncated(ToolResult.completed_success(output=LONG, metadata={"output_ref_id": REF}))
+    ref = durable_tool_result_storage.store_output("test", "stub", LONG)
+    output = _truncated(ToolResult.completed_success(output=LONG, metadata={"output_ref_id": ref}))
 
     assert "OUTPUT TRUNCATED" in output
-    assert f"search(target='{REF}', pattern='Tests run')" in output
+    assert f"search(target='{ref}', pattern='Tests run')" in output
 
 
-def test_the_notice_reads_the_reference_off_the_canonical_output_ref_field_too():
-    result = ToolResult.completed_success(output=LONG, output_ref=REF)
+def test_the_notice_reads_the_reference_off_the_canonical_output_ref_field_too(
+    durable_tool_result_storage,
+):
+    ref = durable_tool_result_storage.store_output("test", "stub", LONG)
+    result = ToolResult.completed_success(output=LONG, output_ref=ref)
 
-    assert f"target='{REF}'" in _truncated(result)
+    assert f"target='{ref}'" in _truncated(result)
 
 
 def test_the_notice_no_longer_points_at_bash_and_grep():
@@ -213,9 +216,12 @@ def test_the_notice_no_longer_points_at_bash_and_grep():
     assert "file_io" not in output
 
 
-def test_without_a_stored_reference_the_notice_says_there_is_none():
-    output = _truncated(ToolResult.completed_success(output=LONG))
+def test_missing_reference_is_created_before_the_preview(durable_tool_result_storage):
+    result = StubTool(ToolResult.completed_success(output=LONG)).safe_execute()
+    output = result.output
 
     assert "OUTPUT TRUNCATED" in output
-    assert "no stored output reference" in output
+    assert durable_tool_result_storage.retrieve_output(result.output_ref) == LONG
+    assert f"target='{result.output_ref}'" in output
+    assert "no stored output reference" not in output
     assert "output_search" not in output

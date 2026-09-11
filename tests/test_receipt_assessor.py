@@ -235,8 +235,10 @@ def receipt_for(*, action="test", **overrides):
     return receipt
 
 
-def build_action_context(envelope_id, *, action):
-    params = {"action": action, "working_directory": "/workspace/proj"}
+def build_action_context(envelope_id, *, action, params=None):
+    params = (
+        params if params is not None else {"action": action, "working_directory": "/workspace/proj"}
+    )
     domain_id = "test:/workspace/proj"
     return action_context(
         envelope_id=envelope_id,

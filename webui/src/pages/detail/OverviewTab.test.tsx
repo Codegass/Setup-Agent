@@ -113,6 +113,17 @@ function unavailableSubjectLayers() {
 }
 
 describe("OverviewTab", () => {
+  it("shows incomplete required steps alongside successful physical build evidence", () => {
+    render(<OverviewTab detail={makeDetail({
+      canonicalVerdict: "partial",
+      taskCompletion: { status: "incomplete" },
+      taskCompletionLines: ["Required task: incomplete (1/2 steps)", "Task native: missing — ./app"],
+    })} onOpenFlow={() => {}} />)
+    const task = screen.getByRole("region", { name: "Required task completion" })
+    expect(within(task).getByText("Required task: incomplete (1/2 steps)")).toBeInTheDocument()
+    expect(within(task).getByText("Task native: missing — ./app")).toBeInTheDocument()
+  })
+
   it.each([
     ["evaluated", "Official CI: met; scope score 1/1; cell maven-17"],
     ["evaluated", "Official CI: partial; scope score unavailable; cell maven-17"],

@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import re
 from pathlib import Path
 
@@ -29,6 +30,13 @@ class FakeOutputStorageOrchestrator:
 
         if command.startswith("mkdir -p "):
             return {"success": True, "output": "", "exit_code": 0}
+
+        if command.startswith("sha256sum -- "):
+            path = command.split()[-1]
+            if path not in self.files:
+                return {"success": False, "output": "missing", "exit_code": 1}
+            digest = hashlib.sha256(self.files[path].encode()).hexdigest()
+            return {"success": True, "output": f"{digest}  {path}", "exit_code": 0}
 
         # `test -f <path> && cat <path>` supports both the primary index and
         # content-addressed emergency records.

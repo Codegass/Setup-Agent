@@ -1466,7 +1466,7 @@ def test_official_maven_multiphase_source_matches_real_runner_and_contract():
     assert result.succeeded
     actual = next(command for command in orch.commands if command.startswith("mvn"))
     assert shlex.split(actual)[1:] == shlex.split(captured[0]["expected_argv"])
-    assert shlex.split(actual)[2:] == shlex.split(source)[1:]
+    assert shlex.split(actual)[1:] == shlex.split(source)[1:]
     assert captured[0]["effective_action"] == "verify"
     assert captured[0]["requested_call"]["params"]["source_command"] == source
 
@@ -1498,7 +1498,7 @@ def test_explicit_full_default_goal_and_flags_reach_maven_runner_and_contract_un
     assert result.succeeded
     actual = next(command for command in orch.commands if command.startswith("mvn"))
     assert shlex.split(actual)[1:] == shlex.split(captured[0]["expected_argv"])
-    assert shlex.split(actual)[2:] == shlex.split(source)[1:]
+    assert shlex.split(actual)[1:] == shlex.split(source)[1:]
     assert captured[0]["effective_action"] == "verify"
     assert captured[0]["requested_call"]["params"]["source_command"] == source
     assert captured[0]["requested_call"]["params"]["args"] == args
@@ -1519,7 +1519,7 @@ def test_explicit_gradle_scoped_source_records_the_actual_task():
     assert result.succeeded
     assert backend.contracts[0]["effective_action"] == ":client:test"
     assert backend.calls[0]["tasks"] == ":client:test"
-    assert shlex.split(backend.contracts[0]["expected_argv"])[1:] == [
+    assert shlex.split(backend.contracts[0]["expected_argv"]) == [
         ":client:test",
         "--tests",
         "SmokeTest",

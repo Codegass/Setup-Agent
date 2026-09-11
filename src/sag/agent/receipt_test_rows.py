@@ -28,6 +28,16 @@ from sag.utils.container_io import write_container_text_atomic
 
 ROW_ENVELOPE_VERSION = 2
 ROW_INPUT_DIR = "/workspace/.setup_agent/.testcase-row-input"
+REPORT_SNAPSHOT_DIR = "/workspace/.setup_agent/test-report-snapshots"
+REPORT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+_REPORT_SNAPSHOT_ERRORS = frozenset(
+    {
+        "report_snapshot_conflict",
+        "report_snapshot_budget_exceeded",
+        "report_snapshot_write_failed",
+        "report_snapshot_directory_invalid",
+    }
+)
 _REPORT_BUCKETS = ("new", "changed", "cached")
 _OUTCOME_SEVERITY = {"skipped": 0, "passed": 1, "failed": 2, "error": 3}
 _DIAGNOSTIC_ORDER = {"error": 0, "failed": 1, "skipped": 2, "passed": 3}
@@ -99,6 +109,43 @@ class TestcaseRowContractError(ValueError):
     """A row cannot enter the module-qualified metrics-v2 claim set."""
 
 
+_SUREFIRE_RETRIES_SOURCE = r"""
+def surefire_retries(root):
+    # Surefire retains all logical cases but can overwrite the suite header
+    # with the final retry subset (SUREFIRE-1903). Its documented child tags
+    # prove those retries; a low header by itself is never enough.
+    from collections import Counter
+
+    def local_name(element):
+        return element.tag.rsplit("}", 1)[-1]
+
+    schemas = {
+        "https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report-3.0.xsd",
+        "https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd",
+    }
+    histories = {}
+    for suite in root.iter():
+        schema = suite.get("{http://www.w3.org/2001/XMLSchema-instance}noNamespaceSchemaLocation")
+        if local_name(suite) != "testsuite" or schema not in schemas:
+            continue
+        cases = [child for child in suite if local_name(child) == "testcase"]
+        if any(local_name(child) in ("testsuite", "testsuites") for child in suite):
+            continue
+        for case in cases:
+            tags = Counter(local_name(child) for child in case)
+            flaky = tags["flakyFailure"] + tags["flakyError"]
+            red_retries = tags["rerunFailure"] + tags["rerunError"]
+            red = tags["failure"] + tags["error"]
+            skipped = tags["skipped"] or case.get("status") == "skipped"
+            if ((flaky and (red or skipped or red_retries))
+                or (red_retries and (not red or skipped))):
+                raise ValueError("surefire_retry_history_invalid")
+            histories[id(case)] = flaky + red_retries
+    return histories
+
+"""
+
+
 # The input path is the sole argv value.  Report paths therefore never enter a
 # shell command, and a reactor with thousands of reports cannot hit ARG_MAX.
 #
@@ -107,7 +154,9 @@ class TestcaseRowContractError(ValueError):
 # container is the program whose bounds this module states.
 _CONTAINER_REPORT_ROW_PARSER = r"""
 import json
+import os
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 from hashlib import sha256
@@ -119,7 +168,11 @@ ROW_MAX_JSON_BYTES = ROW_CAP_JSON_BYTES
 REPORT_MAX_BYTES = ROW_CAP_REPORT_BYTES
 REASON_MAX_CHARS = ROW_CAP_REASON_CHARS
 READ_CHUNK_BYTES = ROW_CAP_CHUNK_BYTES
+SNAPSHOT_DIR = REPORT_SNAPSHOT_DIRECTORY
+SNAPSHOT_MAX_BYTES = REPORT_SNAPSHOT_BUDGET
+CAPTURE_REPORTS = REPORT_SNAPSHOT_CAPTURE
 RED = ("failed", "error")
+snapshot_errors = set()
 
 
 def local_name(element):
@@ -163,7 +216,9 @@ def collection_node(testcase):
     return False
 
 
-def declarations_agree(root):
+SUREFIRE_RETRIES_HELPER
+
+def declarations_agree(root, retries):
     # Every explicit nested declaration must agree, not just the outer total.
     for suite in root.iter():
         if local_name(suite) not in ("testsuite", "testsuites"):
@@ -175,8 +230,24 @@ def declarations_agree(root):
             count = int(value)
         except (TypeError, ValueError):
             return False
-        actual = sum(local_name(child) == "testcase" for child in suite.iter())
-        if count < 0 or count != actual:
+        cases = [child for child in suite.iter() if local_name(child) == "testcase"]
+        if count == len(cases) and count >= 0:
+            continue
+        # Only a leaf Surefire suite has these native header conventions.
+        # An outer testsuites total must still cover the full child reports.
+        if (local_name(suite) != "testsuite" or not cases
+            or any(id(case) not in retries for case in cases)
+            or len(cases) != sum(local_name(child) == "testcase" for child in suite)):
+            return False
+        # JUnit suites can execute the same case more than once. Surefire
+        # retains every testcase but counts distinct class/name pairs in the
+        # header. Keep all physical rows (and their red outcomes) below.
+        identities = [(case.get("classname", ""), case.get("name", "")) for case in cases]
+        if (all(classname.strip() and name.strip() for classname, name in identities)
+            and count == len(set(identities))):
+            continue
+        last_retry = max(retries[id(case)] for case in cases)
+        if last_retry < 1 or count != sum(retries[id(case)] == last_retry for case in cases):
             return False
     return True
 
@@ -245,6 +316,71 @@ def digest_and_body(path):
     return hasher.hexdigest(), b"".join(chunks)
 
 
+def retain_report(expected, body):
+    # The receipt already binds this content hash. Keep exactly those bytes,
+    # with bounded memory/disk and atomic publication; never retain a count as
+    # a substitute for the original XML. A reader never creates this backup.
+    temporary = None
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        if os.path.realpath(SNAPSHOT_DIR) != SNAPSHOT_DIR:
+            raise ValueError("report_snapshot_directory_invalid")
+        destination = os.path.join(SNAPSHOT_DIR, expected + ".xml")
+        if os.path.lexists(destination):
+            if os.path.islink(destination) or digest_and_body(destination)[0] != expected:
+                raise ValueError("report_snapshot_conflict")
+            return
+        used = sum(entry.stat(follow_symlinks=False).st_size for entry in os.scandir(SNAPSHOT_DIR))
+        if used + len(body) > SNAPSHOT_MAX_BYTES:
+            raise ValueError("report_snapshot_budget_exceeded")
+        with tempfile.NamedTemporaryFile(dir=SNAPSHOT_DIR, delete=False) as handle:
+            temporary = handle.name
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Link, rather than replace, so an existing different object is never
+        # silently overwritten. Hash verification remains mandatory on reads.
+        os.link(temporary, destination)
+    except Exception as exc:
+        snapshot_errors.add(str(exc) if isinstance(exc, ValueError) else "report_snapshot_write_failed")
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def claimed_report(report):
+    expected = str(report.get("sha256") or "").lower()
+    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+        raise ValueError("report_hash_invalid")
+    path = report.get("path")
+    try:
+        digest, body = digest_and_body(path)
+    except OSError:
+        digest, body = None, None
+    if digest == expected:
+        if CAPTURE_REPORTS and body is not None:
+            retain_report(expected, body)
+        return digest, body
+    # Capture only the live bytes produced by this invocation. Historical
+    # consumers may recover its retained bytes after another invocation writes
+    # the same report path; logical paths and receipt identities stay intact.
+    if not CAPTURE_REPORTS:
+        archived = os.path.join(SNAPSHOT_DIR, expected + ".xml")
+        if os.path.realpath(SNAPSHOT_DIR) == SNAPSHOT_DIR and not os.path.islink(archived):
+            try:
+                saved_digest, saved_body = digest_and_body(archived)
+                if saved_digest == expected:
+                    return saved_digest, saved_body
+            except OSError:
+                pass
+    if digest is None:
+        raise OSError("report_unreadable")
+    return digest, body
+
+
 bounds = {
     "observed_rows": 0,
     "kept_rows": 0,
@@ -299,7 +435,7 @@ for report in reports:
     if PurePosixPath(path).name not in ("testng-results.xml", "failsafe-summary.xml"):
         continue
     try:
-        digest, body = digest_and_body(path)
+        digest, body = claimed_report(report)
         if digest != report.get("sha256") or body is None:
             continue  # the normal read below reports the exact failure/bound
         root = ET.fromstring(body)
@@ -339,7 +475,7 @@ for report in reports:
     path = report.get("path")
     expected = str(report.get("sha256") or "").lower()
     try:
-        digest, body = digest_and_body(path)
+        digest, body = claimed_report(report)
     except Exception:
         result["status"] = "unavailable"
         result["reasons"].append("report_unreadable")
@@ -374,7 +510,13 @@ for report in reports:
         result["reasons"].append("unsupported_report_format")
         continue
     testcases = [element for element in root.iter() if local_name(element) == "testcase"]
-    if not declarations_agree(root):
+    try:
+        retries = surefire_retries(root)
+    except ValueError as exc:
+        result["status"] = "unavailable"
+        result["reasons"].append(str(exc))
+        continue
+    if not declarations_agree(root, retries):
         result["status"] = "unavailable"
         result["reasons"].append("declared_testcase_count_mismatch")
         continue
@@ -423,6 +565,8 @@ for report in reports:
             "reason": reason(testcase, status),
             "execution_ordinal": testcase_ordinal,
         }
+        if retries.get(id(testcase)):
+            row["runner_reruns"] = retries[id(testcase)]
         if row_bytes(row) > ROW_MAX_JSON_BYTES:
             drop(status, "oversize_row_drops")
             continue
@@ -487,6 +631,8 @@ if result["status"] == "complete" and not bounds["unparsed_reports"] and result[
         "skipped": complete_counts["skipped"],
     }
 result["reasons"] = sorted(set(result["reasons"]))
+if snapshot_errors:
+    result["report_snapshot_errors"] = sorted(snapshot_errors)
 print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 """
 
@@ -512,7 +658,7 @@ def _delta_reports(delta: Mapping[str, Any]) -> tuple[list[dict[str, str]], bool
     return selected, bool(conflicts)
 
 
-def _row_parser_program() -> str:
+def _row_parser_program(*, capture_reports: bool = False) -> str:
     """The container program with this module's bounds compiled into it."""
 
     return (
@@ -522,6 +668,10 @@ def _row_parser_program() -> str:
         .replace("ROW_CAP_REPORT_BYTES", str(DELTA_REPORT_MAX_BYTES))
         .replace("ROW_CAP_REASON_CHARS", str(_REASON_CAP))
         .replace("ROW_CAP_CHUNK_BYTES", str(_REPORT_READ_CHUNK_BYTES))
+        .replace("REPORT_SNAPSHOT_DIRECTORY", json.dumps(REPORT_SNAPSHOT_DIR))
+        .replace("REPORT_SNAPSHOT_BUDGET", str(REPORT_SNAPSHOT_MAX_BYTES))
+        .replace("REPORT_SNAPSHOT_CAPTURE", repr(capture_reports))
+        .replace("SUREFIRE_RETRIES_HELPER", _SUREFIRE_RETRIES_SOURCE)
     )
 
 
@@ -624,6 +774,7 @@ def read_delta_testcase_rows(
     *,
     receipt_id: str,
     delta: Mapping[str, Any],
+    capture_reports: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Read a BOUNDED identity sample from this receipt's hash-bound reports.
 
@@ -660,7 +811,7 @@ def read_delta_testcase_rows(
             "rows": [],
             "reasons": ["row_input_persistence_failed"],
         }
-    command = f"python3 -c {shlex.quote(_row_parser_program())} {shlex.quote(input_path)}"
+    command = f"python3 -c {shlex.quote(_row_parser_program(capture_reports=capture_reports))} {shlex.quote(input_path)}"
     try:
         try:
             result = execute(command, truncate_output=False) or {}
@@ -678,6 +829,16 @@ def read_delta_testcase_rows(
         payload = json.loads(str(result.get("output") or ""))
         if not isinstance(payload, Mapping):
             raise ValueError("row parser did not return an object")
+        snapshot_errors = payload.get("report_snapshot_errors", [])
+        if (
+            not isinstance(snapshot_errors, list)
+            or len(snapshot_errors) > len(_REPORT_SNAPSHOT_ERRORS)
+            or any(
+                not isinstance(code, str) or code not in _REPORT_SNAPSHOT_ERRORS
+                for code in snapshot_errors
+            )
+        ):
+            raise ValueError("report snapshot diagnostics are invalid")
         rows = payload.get("rows")
         if not isinstance(rows, list):
             raise ValueError("row parser did not return a row list")
@@ -733,6 +894,11 @@ def read_delta_testcase_rows(
                     "reasons": ["execution_totals_inconsistent"],
                 }
         return {
+            **(
+                {"report_snapshot_errors": snapshot_errors}
+                if capture_reports and snapshot_errors
+                else {}
+            ),
             **({"execution_totals": dict(totals)} if totals is not None else {}),
             "schema_version": ROW_ENVELOPE_VERSION,
             "status": (
@@ -1123,6 +1289,17 @@ def validate_testcase_execution_row(
         raise TestcaseRowContractError("testcase execution parameter_id must be a string or null")
     row["parameter_id"] = parameter
     row["qualifying_invocation"] = True
+    if "runner_reruns" in raw:
+        reruns = raw["runner_reruns"]
+        if type(reruns) is not int or reruns < 1 or row["framework"] != "junit-xml":
+            raise TestcaseRowContractError(
+                "testcase execution runner_reruns must be a positive JUnit count"
+            )
+        if row["outcome"] == "skipped":
+            raise TestcaseRowContractError(
+                "testcase execution runner_reruns cannot describe a skipped case"
+            )
+        row["runner_reruns"] = reruns
 
     expected = {
         "receipt_id": receipt_id,
@@ -1214,10 +1391,11 @@ def aggregate_testcase_execution_rows(rows: Sequence[Mapping[str, Any]]) -> dict
             attempts.append(worst)
         latest = attempts[-1]
         latest_cases.append(latest)
-        if len(attempts) > 1:
+        if len(attempts) > 1 or any(row.get("runner_reruns", 0) for row in history):
             retried_cases += 1
-        if latest["outcome"] == "passed" and any(
-            row["outcome"] in {"failed", "error"} for row in attempts[:-1]
+        if latest["outcome"] == "passed" and (
+            any(row["outcome"] in {"failed", "error"} for row in attempts[:-1])
+            or any(row.get("runner_reruns", 0) for row in history)
         ):
             flaky_cases += 1
 
@@ -1363,6 +1541,17 @@ def seal_testcase_execution_rows(
             "disposition": "claimed",
             "qualifying_invocation": True,
         }
+        if "runner_reruns" in raw:
+            reruns = raw["runner_reruns"]
+            if (
+                type(reruns) is not int
+                or reruns < 1
+                or normalized_tool not in {"maven", "gradle"}
+                or outcome == "skipped"
+            ):
+                reasons.add("surefire_retry_history_invalid")
+                continue
+            row["runner_reruns"] = reruns
         ordinal = row["execution_ordinal"]
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
             reasons.add("execution_ordinal_unavailable")

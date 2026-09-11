@@ -74,8 +74,10 @@ def _render_setup_cli_result(
 
     lines = render_snapshot_metric_lines(snapshot.model_dump(mode="json"))
     from sag.agent.ci_comparison import render_ci_comparison_lines
+    from sag.agent.acceptance_task import render_task_completion_lines
 
     lines.extend(render_ci_comparison_lines(snapshot.ci_comparison))
+    lines.extend(render_task_completion_lines(snapshot.task_completion))
     lines.extend(
         [
             f"Verdict (derived): {snapshot.verdict}",
@@ -540,17 +542,58 @@ def list():
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Frozen official-CI target JSON to compare after execution; never fetched at finalization.",
 )
+@click.option(
+    "--acceptance-command",
+    help="Fixed build/test command from the repository root; binds receipts independently of the agent plan. Requires --ci-target-file.",
+)
+@click.option(
+    "--acceptance-task-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Fixed ordered task JSON, independent of the agent plan and CI test-count availability.",
+)
 @click.pass_context
-def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref, ci_target_file):
+def project(
+    ctx,
+    repo_url,
+    name,
+    goal,
+    record,
+    coverage,
+    ui,
+    project_ref,
+    ci_target_file,
+    acceptance_command,
+    acceptance_task_file,
+):
     """Initial setup for a new project from repository URL."""
 
     config = ctx.obj["config"]
+    acceptance_task = None
+    if acceptance_task_file is not None:
+        from sag.agent.acceptance_task import load_acceptance_task
+        from sag.agent.ci_comparison import repository_identity
+
+        try:
+            acceptance_task = load_acceptance_task(acceptance_task_file)
+            if acceptance_task.repo != repository_identity(repo_url):
+                raise ValueError("task repository differs from project URL")
+            if project_ref is not None and project_ref != acceptance_task.sha:
+                raise ValueError("--ref must equal the task's frozen commit SHA")
+            project_ref = acceptance_task.sha
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Invalid acceptance task: {exc}") from exc
     ci_target = None
+    if acceptance_command and ci_target_file is None:
+        raise click.ClickException("--acceptance-command requires --ci-target-file")
     if ci_target_file is not None:
         from sag.agent.ci_comparison import load_ci_target
 
         try:
-            ci_target = load_ci_target(ci_target_file)
+            if acceptance_command:
+                from sag.tools.build.backends import parse_runner_command
+
+                parse_runner_command(acceptance_command)
+            ci_target = load_ci_target(ci_target_file, execution_command=acceptance_command)
         except (OSError, ValueError) as exc:
             raise click.ClickException(f"Invalid CI target: {exc}") from exc
 
@@ -624,6 +667,7 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref, ci_tar
             docker_label=docker_label,
             project_ref=project_ref,
             **({"ci_target": ci_target} if ci_target is not None else {}),
+            **({"acceptance_task": acceptance_task} if acceptance_task is not None else {}),
             pre_finalize_evidence_callback=(
                 (
                     lambda: _run_coverage_evidence_pass(

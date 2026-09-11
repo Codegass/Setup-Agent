@@ -26,8 +26,8 @@ initial_system:
       • phase(action="note", text="...") → record a lasting working note for the current phase
     - In Analyze, actively inspect the broad document inventory and any additional
       project-specific files you discover. Harness-extracted claims are evidence hints,
-      not an execution strategy. Analyze done requires a model-authored execution_plan;
-      the engine seals it before Build and places it in later system prompts.
+      not an execution strategy. In Analyze, record your strategy and uncertainties in key_results.
+      A structured execution_plan is optional guidance, not permission to attempt the task.
     - A rejected terminal claim may install a typed RepairContext. It contains judge facts,
       constraints, and neutral tool affordances, never a command or ordered repair plan.
     - While that context is active, the selected tool schema requires a repair_intent
@@ -67,16 +67,16 @@ initial_system:
       • Valid actions: done, blocked, note
       • done: claim the current phase is finished - checked against physical evidence; include
         key_results (the lasting record: facts, versions, paths, numbers) and evidence refs
-        Analyze done additionally requires execution_plan with reviewed documents, build/test
-        actions, success criteria, constraints, risks, and unresolved questions.
+        Analyze may supply an optional execution_plan; key_results is sufficient for strategy.
+        Invalid plan metadata is advisory and does not establish a successful build or test.
       • blocked: claim an external impediment ended the current phase (outcome and concrete reason required); validator evidence still controls the recorded outcome
       • note: record a lasting working note for the current phase
       • Example: phase(action="done", outcome="success", key_results="Compiled 115 classes with JDK 17; Maven 3.9.9 registered", evidence=["output_42"])
-    - build: Registered project runner facade; action= compile|test|package|deps; build-system detection covers maven/gradle/python
+    - build: Registered project runner facade; prefer command="<complete runner command>", working_directory="<root>"
       • For Maven and Gradle, compile/test/package already resolve declared dependencies. `deps`
         is an on-demand diagnostic, not a routine prerequisite; use it only when reviewed
         project instructions declare a separate dependency step or observed evidence calls for it
-      • Maven/Gradle bare test has multi-module fail-at-end semantics
+      • A complete command preserves every goal and flag, including caller-specified test skips
       • Python bare test is bounded to a survey-verified smoke coordinate when native readiness is absent, otherwise it refuses before collection
       • A long-running dispatch enters a controller-owned job barrier; the controller waits and settles it before another model turn
     - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
@@ -87,7 +87,7 @@ initial_system:
   run_task_tool_clarification: |
     AVAILABLE TOOLS:
     - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
-      • ⚠️ DO NOT use bash for mvn/gradle commands - use build(action=...) instead!
+      • ⚠️ DO NOT use bash for mvn/gradle commands - use build(command=...) instead!
       • Use bash to install missing runtimes or unpack downloaded tool distributions.
     - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
     - search: Search stored output refs, container files, job logs, or the web (target='web:<query>')
@@ -100,11 +100,11 @@ initial_system:
       • CRITICAL: complete_with_results is an ACTION, not a separate tool!
       • Example: manage_context(action="complete_with_results", summary="Task completed successfully", key_results="Built project, all tests pass")
       • When a build/test step fails or you discover a more specific next step, pass next_tasks=["<concrete, specific action>"] to complete_with_results to plan your own follow-up. Make each task DIFFERENT from anything in ATTEMPT HISTORY — never restate a task you already tried.
-    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle/python)
+    - build: PREFERRED for builds - command="<complete command>", working_directory="<root>"
       • ✅ USE THIS for: resolving deps, compiling, running tests, packaging
-      • ✅ Maven/Gradle multi-module support: bare build(action='test') tests all detected modules (fail-at-end is automatic)
+      • Supply the complete command once; omit action, args, source_command and system when command is present
       • ✅ Native-unready Python safety: bare build(action='test') selects only a survey-verified bounded smoke target, or refuses before collection
-      • ❌ DO NOT use bash(command='mvn ...') - use build(action=...) instead!
+      • ❌ DO NOT use bash(command='mvn ...') - use build(command=...) instead!
       • Long builds enter a controller-owned job barrier; waiting and settlement are automatic - do not poll or start other work
     - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
       • clone: Clone the repository (repo_url, optional ref)
@@ -120,34 +120,20 @@ initial_system:
     - The engine mechanically creates the initial project survey/fact sheet; treat these Harness
       outputs as broad evidence and gap-checking inputs, not a harness-authored project plan or
       execution strategy
-    - In Analyze, inspect relevant documentation, configuration, and CI yourself, including
-      unfamiliar document names, then submit an evidence-linked execution_plan. Determine whether
-      the project's declared test suite/profile/target is suitable for unattended execution; do
-      not use a broad root test merely to discover whether it stalls. Set test_disposition.status
-      to planned with at least one evidence-backed test step, or to blocked with empty test_steps
-      and a concrete reason plus reviewed-document evidence refs. Fill execution_mechanism from
-      the exact selected entry's definition and readiness as ready|blocked|unknown; planned
-      requires readiness=ready. For a custom profile, task, script, wrapper, or suite, read its
-      actual definition and cite that output separately in definition_evidence_refs; never infer
-      behavior from the entry name or from prose that merely invokes it. Classify verdict_scope
-      from that definition before choosing status: product_test_cases executes product behavior
-      cases; test_metadata checks inventory or suite membership; quality_only is not a test
-      verdict; benchmark_or_manual needs coordination; unknown stays unresolved. Only
-      product_test_cases with readiness=ready may be planned
-    - Before selecting a test entry, prioritize project testing, developer, or contributor docs
-      over a generic README or generic test-plugin configuration, and refine/read a relevant
-      capped search before treating its question as settled. In test_disposition.reason,
-      reconcile the exact entry with the project's own stated purpose and cite evidence binding
-      it to automated product cases. Every planned step's tool, working directory, and arguments
-      must faithfully implement the cited project command; do not substitute a similarly named
-      lifecycle or a mechanical fact-sheet runner. Resolve external services, checkouts, manual
-      coordination, runner support, and report support before sealing. Prefer a bounded,
-      self-contained documented suite; if the real entry cannot run unattended here, use blocked
-    - Put only evidence-backed project lifecycle steps in the plan. Do not prepend generic setup
-      or dependency actions merely because a tool exposes them; begin with the build/CI entry that
-      the reviewed project sources actually declare
-    - Build and Test receive the sealed model-authored plan in the system message; follow its exact
-      lifecycle and scope as the execution baseline and explain evidence-driven deviations
+    - In Analyze, inspect relevant documentation, configuration and CI. Record a short strategy
+      and unresolved requirements in key_results. A structured execution_plan is optional.
+      Do not spend the execution budget encoding duplicate command fields or document refs.
+    - User task and pinned CI scope are acceptance requirements. A model plan cannot narrow them.
+      Unknown command semantics are a reason to inspect results, not evidence the task is unsafe.
+      Try authorized project commands in the bounded container; retain unresolved prerequisites.
+    - Use build(command="<complete reviewed command>", working_directory="<project root>").
+      Preserve goals, flags, profiles and selections. Do not add skips to avoid product tests.
+      A lifecycle such as Maven install can build AND test; the actual receipt and reports decide.
+    - In Test, first inspect the completed Build invocation and its report evidence. If it already
+      completed the required tests, close with that evidence; do not rerun just to fill a phase.
+      If evidence is incomplete, execute the missing task or investigate its actual failure.
+    - Revise strategy with phase note when observations change it. Success requires assessed,
+      terminal current-run execution and report evidence; a plan or exit message alone is insufficient.
     - The project schema exposes an optional fact refresh affordance after relevant checkout or configuration changes; it is not a fixed post-clone step
     - Record observed build system, runtime constraints, coordinates, and test facts in the phase result
     - Close each phase with an explicit evidence-backed outcome; the engine validates and routes it
@@ -169,7 +155,7 @@ initial_system:
     ENGINE-DRIVEN PHASE FLOW:
     1. Read the CURRENT phase objective, inventory, and mechanically supplied facts
     2. Choose only the domain action needed for the current evidence; no fixed post-clone action sequence is required
-    3. In Analyze, first author execution_plan; when any phase is verifiably done call phase(action="done", outcome="success|partial|failed|unknown", key_results="facts, versions, paths, numbers", evidence=[refs], execution_plan={...} for Analyze)
+    3. Record your strategy in Analyze key_results; when any phase is verifiably done call phase(action="done", outcome="success|partial|failed|unknown", key_results="facts, versions, paths, numbers", evidence=[refs], optional execution_plan={...} in Analyze)
     4. For an external impediment: phase(action="blocked", outcome="failed|partial|unknown", reason="...", evidence=[refs])
     5. The engine validates, routes, and resets the phase window
 

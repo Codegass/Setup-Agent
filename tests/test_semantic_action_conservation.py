@@ -364,18 +364,18 @@ def test_no_source_on_a_non_compile_task_is_not_a_compile_mismatch():
 
 
 # --------------------------------------------------------------------------- #
-# 3) install/package never run tests — the `test` verb is the only test owner.
+# 3) Caller commands own test selection; packaging never injects skips.
 # --------------------------------------------------------------------------- #
-def test_maven_install_argv_skips_tests():
-    assert _maven_call("install")["extra_args"] == "-DskipTests"
+def test_maven_install_argv_preserves_lifecycle_tests():
+    assert not _maven_call("install").get("extra_args")
 
 
-def test_maven_package_argv_skips_tests():
-    assert _maven_call("package")["extra_args"] == "-DskipTests"
+def test_maven_package_argv_preserves_lifecycle_tests():
+    assert not _maven_call("package").get("extra_args")
 
 
-def test_maven_install_keeps_the_callers_args_and_appends_the_skip():
-    assert _maven_call("install", "-Pdist")["extra_args"] == "-Pdist -DskipTests"
+def test_maven_install_keeps_the_callers_args():
+    assert _maven_call("install", "-Pdist")["extra_args"] == "-Pdist"
 
 
 def test_maven_install_never_doubles_an_explicit_caller_skip():
@@ -401,25 +401,25 @@ def test_maven_compile_and_test_verbs_carry_no_skip():
         assert "skipTests" not in str(_maven_call(verb).get("extra_args") or ""), verb
 
 
-def test_gradle_publish_argv_excludes_the_test_task():
+def test_gradle_publish_argv_keeps_the_selected_lifecycle():
     call = _gradle_call(
         "install",
         files={f"{ISLAND}/build.gradle": "apply plugin: 'maven-publish'\n"},
     )
     assert call["tasks"] == "publishToMavenLocal"
-    assert call["gradle_args"] == "-x test"
+    assert not call.get("gradle_args")
 
 
-def test_gradle_assemble_paths_exclude_the_test_task():
+def test_gradle_assemble_paths_preserve_caller_selection():
     for verb in ("package", "install"):
         call = _gradle_call(verb, files={f"{ISLAND}/build.gradle": "apply plugin: 'java'\n"})
         assert call["tasks"] == "assemble", verb
-        assert call["gradle_args"] == "-x test", verb
+        assert not call.get("gradle_args"), verb
 
 
-def test_gradle_packaging_keeps_the_callers_args_and_appends_the_exclude():
+def test_gradle_packaging_keeps_the_callers_args():
     call = _gradle_call("package", args="--info")
-    assert call["gradle_args"] == "--info -x test"
+    assert call["gradle_args"] == "--info"
 
 
 def test_gradle_never_doubles_an_explicit_caller_exclude():
@@ -466,13 +466,14 @@ def test_delta_line_leads_the_output_on_a_compile_to_install_promotion():
 
     first = (result.output or "").splitlines()[0]
     assert first.startswith("[build] requested 'compile' -> executing ")
-    assert "publishToMavenLocal -x test" in first
+    assert "publishToMavenLocal" in first
+    assert "-x test" not in first
     assert "install" in first
     # The island provenance line survives underneath it.
     assert "[island]" in result.output
 
 
-def test_delta_line_leads_the_output_when_a_skip_flag_is_added():
+def test_unchanged_maven_install_does_not_claim_a_skip_was_added():
     orchestrator = ProbeOrchestrator(markers=["/workspace/p/pom.xml"])
     maven = RecordingBackendTool(orchestrator=orchestrator)
 
@@ -481,8 +482,8 @@ def test_delta_line_leads_the_output_when_a_skip_flag_is_added():
     )
 
     first = (result.output or "").splitlines()[0]
-    assert first.startswith("[build] requested 'install' -> executing 'install -DskipTests' (")
-    assert first.endswith(")")
+    assert "skipTests" not in result.output
+    assert not first.startswith("[build] requested")
 
 
 def test_gradle_install_that_cannot_publish_narrates_the_substitution():
@@ -497,7 +498,7 @@ def test_gradle_install_that_cannot_publish_narrates_the_substitution():
     )
 
     first = (result.output or "").splitlines()[0]
-    assert first.startswith("[build] requested 'install' -> executing 'assemble -x test' (")
+    assert first.startswith("[build] requested 'install' -> executing 'assemble' (")
     assert "maven-publish" in first
 
 
@@ -514,7 +515,7 @@ def test_gradle_narration_names_the_task_selection_the_argv_actually_carries():
 
     executed = GradleBackend.executed_action("install", params, ":spark:assemble")
 
-    assert executed.argv_fragment == ":spark:assemble -x test"
+    assert executed.argv_fragment == ":spark:assemble"
     assert GradleBackend.expected_argv(params) == ":spark:assemble -x test"
 
 
@@ -523,7 +524,7 @@ def test_gradle_narration_is_unchanged_when_the_caller_narrowed_nothing():
 
     executed = GradleBackend.executed_action("install", params, None)
 
-    assert executed.argv_fragment == "assemble -x test"
+    assert executed.argv_fragment == "assemble"
     assert "maven-publish" in " ".join(executed.reasons)
 
 

@@ -207,6 +207,8 @@ class CurrentBuildReceiptScope:
     run_id: str
     target_sha: str | None = None
     project_root: str | None = None
+    acceptance_task_declared: bool = False
+    acceptance_task_sha256: str | None = None
 
     @property
     def available(self) -> bool:
@@ -617,7 +619,7 @@ def _sealed_plan_test_resolution(
     orchestrator: Any,
     survey: TestCandidateResolution,
 ) -> tuple[bool, TestCandidateResolution | None]:
-    """Bind the Test floor to the accepted model plan when one is sealed."""
+    """Legacy plan resolution retained for archived policy replay."""
 
     try:
         from .project_execution_plan import read_sealed_project_execution_plan
@@ -1017,9 +1019,10 @@ def test_closure_survey(
         return None
     if state.fact_value("build.test_entry_ready") is not True:
         return None
-    surveyed = resolution or resolve_survey_test_candidates(orchestrator)
-    sealed, planned = _sealed_plan_test_resolution(orchestrator, surveyed)
-    return planned if sealed else surveyed
+    # Strategy cannot suppress the attempt floor by omitting test steps, or
+    # invalidate a physical coordinate through command-encoding mistakes.
+    # Completion and CI scope are still judged separately from this floor.
+    return resolution or resolve_survey_test_candidates(orchestrator)
 
 
 def required_test_attempt(
@@ -1029,6 +1032,7 @@ def required_test_attempt(
     phase: str | None,
     attempt_id: str | None,
     resolution: TestCandidateResolution | None = None,
+    validator: Any = None,
 ) -> TestAttemptRequirement | None:
     """Return the exact missing harness action, or ``None`` when closure is legal."""
     resolved = test_closure_survey(
@@ -1039,6 +1043,17 @@ def required_test_attempt(
     )
     if resolved is None or state is None:
         return None
+    # Current terminal evidence can discharge an attempt even if a subsequent
+    # survey cannot resolve a new dispatch. This does not authorize another run.
+    summary_reader = getattr(validator, "_test_execution_receipt_summary", None)
+    receipt_root = resolved.primary.root if resolved.primary else resolved.project_root
+    if callable(summary_reader) and receipt_root:
+        summary = summary_reader(receipt_root)
+        if summary.get("state") == "completed" or summary.get("terminal_attempt_receipt_ids"):
+            # Evidence that cannot grade a completed call must not erase the
+            # call itself and force a fresh, survey-default test command.
+            # The phase gate still checks completion and the fixed task.
+            return None
     if resolved.status != "available":
         # An unresolvable coordinate cannot un-run a test that already ran.
         # Without candidates there is nothing to bind a receipt to, so the
@@ -1471,11 +1486,18 @@ def resolve_current_build_receipt_scope(
             run_id=expected_run,
             project_root=normalized_project,
         )
+    task_declared = "acceptance_task" in (pin.get("sanitized_config") or {})
+    task_pin = (pin.get("sanitized_config") or {}).get("acceptance_task")
+    task_digest = task_pin.get("sha256") if isinstance(task_pin, Mapping) else None
+    if not isinstance(task_digest, str) or re.fullmatch(r"[0-9a-f]{64}", task_digest) is None:
+        task_digest = None
     return CurrentBuildReceiptScope(
         status="available",
         run_id=expected_run,
         target_sha=target_sha,
         project_root=normalized_project,
+        acceptance_task_declared=task_declared,
+        acceptance_task_sha256=task_digest,
     )
 
 

@@ -430,6 +430,54 @@ def test_maven_java_constraints_preserve_enforcer_and_compiler_separately():
     assert not any("apt-get" in command for command in orch.commands)
 
 
+def test_literal_local_java_property_is_resolved_before_preflight():
+    from sag.tools.internal.java_versions import maven_java_requirements
+
+    pom = """<project><properties><javaVersion>17</javaVersion>
+    <maven.compiler.release>${javaVersion}</maven.compiler.release>
+    <runtimeRange>[11,18)</runtimeRange></properties><build><plugins><plugin>
+    <artifactId>maven-enforcer-plugin</artifactId><configuration><rules>
+    <requireJavaVersion><version>${runtimeRange}</version></requireJavaVersion>
+    </rules></configuration></plugin></plugins></build></project>"""
+    requirements = maven_java_requirements([(pom, "pom.xml")])
+    assert requirements["compiler_release"] == "17"
+    assert requirements["runtime"][0]["constraint"] == "[11,18)"
+    assert requirements["unresolved"] == []
+    assert (
+        JdkPreflight(ProvisionOrch('openjdk version "17.0.9"'))
+        .run("17", requirements=requirements)
+        .matched
+    )
+
+
+@pytest.mark.parametrize(
+    "properties, profiles",
+    [
+        ("", ""),
+        ("<javaVersion>${parentVersion}</javaVersion>", ""),
+        ("<javaVersion>${javaVersion}</javaVersion>", ""),
+        ("<javaVersion>17</javaVersion><javaVersion>21</javaVersion>", ""),
+        (
+            "<javaVersion>17</javaVersion>",
+            "<profiles><profile><id>other</id><properties><javaVersion>21</javaVersion></properties></profile></profiles>",
+        ),
+    ],
+)
+def test_nonliteral_or_conditional_java_property_stays_unknown(properties, profiles):
+    from sag.tools.internal.java_versions import maven_java_requirements
+
+    pom = (
+        "<project><properties>"
+        + properties
+        + "<maven.compiler.release>${javaVersion}</maven.compiler.release></properties>"
+        + profiles
+        + "</project>"
+    )
+    requirements = maven_java_requirements([(pom, "pom.xml")])
+    assert requirements["compiler_release"] is None
+    assert requirements["unresolved"]
+
+
 @pytest.mark.parametrize(
     "constraint, version, expected",
     [

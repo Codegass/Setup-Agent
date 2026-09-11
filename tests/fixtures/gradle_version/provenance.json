@@ -1,0 +1,42 @@
+{
+  "jdk": {
+    "url": "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20%2B8/OpenJDK17U-jdk_aarch64_mac_hotspot_17.0.20_8.tar.gz",
+    "digest": "sha256:524850138c742324fb21fca4ff6ef68ea25f25bf59366a864e45b4a0c45ed0df",
+    "bytes": 185860079
+  },
+  "gradle": {
+    "url": "https://services.gradle.org/distributions/gradle-8.5-bin.zip",
+    "sha256": "9d926787066a081739e8200858338b4a69e837c3a821a33aca9db09dd4a41026",
+    "bytes": 132519731
+  },
+  "observations": [
+    {
+      "name": "first-use",
+      "argv": [
+        "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/gradle-version-probe-v1/runtime/gradle-8.5/bin/gradle",
+        "-v"
+      ],
+      "exit_code": 0,
+      "output": "first-use.txt",
+      "bytes": 678,
+      "sha256": "5df212bd95b65810c7b507a73f13e83857a34fb94b4253d861ddaa93bce68030",
+      "first_line": ""
+    },
+    {
+      "name": "subsequent-use",
+      "argv": [
+        "/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/gradle-version-probe-v1/runtime/gradle-8.5/bin/gradle",
+        "-v"
+      ],
+      "exit_code": 0,
+      "output": "subsequent-use.txt",
+      "bytes": 433,
+      "sha256": "26427eeac9960bd4a0bd989aef039cac2ef168778004569cc400f33f7b26d7e7",
+      "first_line": ""
+    }
+  ],
+  "is_sag_attempt": false,
+  "is_build_or_test_attempt": false,
+  "platform": "host macOS aarch64, JDK17; not a FreeMarker invocation",
+  "scope": "Only the already used Gradle -v option; no project task is executed."
+}

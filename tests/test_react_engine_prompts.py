@@ -120,7 +120,7 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "engine mechanically inventories checkout files and creates a fact sheet" in prompt
     assert "broad evidence and gap-checking inputs" in prompt
     assert "not a harness-authored project plan" in prompt
-    assert "submit an evidence-linked execution_plan" in prompt
+    assert "structured execution_plan is optional" in prompt
     assert "no fixed post-clone action sequence is required" in prompt
     assert "Handling Maven POM Parsing Errors" not in prompt
     assert "Handling Multi-Module Maven Test Execution" not in prompt
@@ -197,7 +197,7 @@ def test_real_setup_tool_bundle_has_no_pre_evidence_routing_or_usage_examples():
         "Usage:",
     )
     assert [text for text in forbidden if text in prompt] == []
-    assert "action= compile|test|package|deps" in prompt
+    assert 'command="<complete runner command>"' in prompt
     assert "on-demand diagnostic, not a routine prerequisite" in prompt
     assert "Valid actions: done, blocked, note" in prompt
     assert "Project build runner dispatches are recorded only by the build facade" in prompt
@@ -208,7 +208,7 @@ def test_build_schema_description_is_a_factual_boundary_not_a_router():
 
     description = BuildTool(None).description
 
-    assert "action = compile | test | package | deps" in description
+    assert "pass command and working_directory once" in description
     assert "deps is an on-demand diagnostic, not a routine prerequisite" in description
     assert "durable invocation receipt" in description
     assert "bash mvn/gradle" not in description

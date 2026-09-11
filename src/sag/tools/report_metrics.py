@@ -113,8 +113,6 @@ _COUNT_FIELDS_SET = frozenset(COUNT_FIELDS)
 # the same executions — and a surface that named neither left a reader unable
 # to tell 27,219 executions from the 2,048 rows that were kept of them.
 _ROW_EXECUTIONS_BASIS = "module-qualified receipt execution rows"
-_SUITE_TOTALS_BASIS = "gradle suite totals over every claimed report"
-_SUITE_TOTALS_PARTIAL_BASIS = "gradle suite totals over the claimed reports the read reached"
 # Said of a grain counted from identities the receipt itself disclosed as
 # capped. It qualifies the population, never the count: the sample is exact and
 # holds every red, and what it dropped is on the receipt.
@@ -630,6 +628,7 @@ def _suite_total_executions(
     rows: Sequence[Mapping[str, Any]],
     complete: bool,
     rows_bounded: bool = False,
+    count_source: str = "gradle suite totals",
 ) -> dict[str, Any]:
     """The claimed-execution counts a run's suite TOTALS state (plan r2 T5).
 
@@ -665,12 +664,16 @@ def _suite_total_executions(
         "errors": totals.errors,
         "skipped": totals.skipped,
     }
-    basis = _SUITE_TOTALS_BASIS if totals.complete_claims else _SUITE_TOTALS_PARTIAL_BASIS
+    basis = (
+        f"{count_source} over every claimed report"
+        if totals.complete_claims
+        else f"{count_source} over the claimed reports the read reached"
+    )
     reasons: list[str] = []
     if not totals.complete_claims:
         disclosed = ", ".join(totals.disclosed_bounds) or "not recorded"
         reasons.append(
-            "gradle suite totals were incomplete "
+            f"{count_source} were incomplete "
             f"(disclosed bounds: {disclosed}); counts cover only the claimed reports "
             "the read reached"
         )
@@ -727,6 +730,7 @@ def _receipt_row_projection(
     stale_files: set[str] = set()
     # The TOTALS tier, which no failure of the identity tier can take away.
     suite_totals: SuiteExecutionTotals | None = None
+    count_source = "gradle suite totals"
     suite_receipts: set[str] = set()
     executions_complete = True
     # Which current receipts disclosed a cap on their sealed identity sample.
@@ -794,6 +798,8 @@ def _receipt_row_projection(
             else None
         )
         if totals is not None:
+            if "testcase_execution_totals" in receipt:
+                count_source = "report XML totals"
             suite_totals = totals if suite_totals is None else suite_totals + totals
             suite_receipts.add(receipt_id)
         if not entries:
@@ -917,6 +923,7 @@ def _receipt_row_projection(
             rows=row_tier_rows,
             complete=executions_complete,
             rows_bounded=row_tier_bounded,
+            count_source=count_source,
         )
         if suite_totals is not None
         else (

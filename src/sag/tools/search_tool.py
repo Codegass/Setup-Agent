@@ -6,7 +6,7 @@ WebSearchTool internals; file/job targets grep inside the container.
 """
 
 import shlex
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.runtime.container_io import command_did_not_run
@@ -61,13 +61,17 @@ class SearchTool(BaseTool):
                 f"{NAME_SEARCH_MAX_DEPTH}, and never reads file content: this is the "
                 "form that establishes whether a path such as gradlew or pom.xml is "
                 "on disk. "
-                "pattern: for 'file:' and ref ids an extended regular expression "
-                "(grep -E). Set ignore_case=true for case-insensitive file-content "
+                "pattern: for 'file:' an extended regular expression (grep -E); "
+                "for ref ids a Python regular expression. Set ignore_case=true for case-insensitive "
                 "searches instead of using PCRE-only inline flags such as (?i); "
                 "for 'name:' one or more shell globs separated by "
                 f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew'), "
                 "matched against the name alone; ignored for web; "
                 "for a ref id, omit pattern to read the stored output itself."
+                " Ref reads support zero-based start_line, exclusive end_line, column_offset "
+                "and max_chars; follow Next read to continue. Ref searches support "
+                "offset (matching lines to skip) and context_lines. "
+                "Use bash rg -n -C 3 or sed -n with returned container log paths."
             ),
         )
         self.docker_orchestrator = docker_orchestrator
@@ -81,12 +85,16 @@ class SearchTool(BaseTool):
         pattern: str = "",
         max_results: int = 50,
         ignore_case: bool = False,
+        start_line: int = 0,
+        end_line: Optional[int] = None,
+        column_offset: int = 0,
+        max_chars: int = 20_000,
+        offset: int = 0,
+        context_lines: int = 2,
     ) -> ToolResult:
         target = (target or "").strip()
         if target.startswith("file:"):
-            return self._grep_container(
-                target[5:], pattern, max_results, ignore_case=ignore_case
-            )
+            return self._grep_container(target[5:], pattern, max_results, ignore_case=ignore_case)
         if target.startswith("name:"):
             return self._find_by_name(target[5:], pattern, max_results)
         if target.startswith("job:"):
@@ -99,9 +107,23 @@ class SearchTool(BaseTool):
                 # delegate). Grep-with-a-guessed-pattern must not be the only
                 # reachable action: guessing what to look for in a log it has
                 # never seen is exactly what a weak model cannot do (#30).
-                return self.output_search.execute(action="retrieve", ref_id=target)
+                return self.output_search.execute(
+                    action="retrieve",
+                    ref_id=target,
+                    start_line=start_line,
+                    end_line=end_line,
+                    column_offset=column_offset,
+                    max_chars=max_chars,
+                )
             return self.output_search.execute(
-                action="grep", ref_id=target, grep_pattern=pattern, limit=max_results
+                action="grep",
+                ref_id=target,
+                grep_pattern=pattern,
+                limit=max_results,
+                offset=offset,
+                context_lines=context_lines,
+                ignore_case=ignore_case,
+                show_line_numbers=True,
             )
         return ToolResult.completed_failure(
             output=f"Unrecognized search target: {target!r}",
@@ -124,6 +146,25 @@ class SearchTool(BaseTool):
                 output=f"Invalid background job reference: {poll_ref}",
                 error=str(exc),
                 error_code="INVALID_DETACHED_JOB_REF",
+            )
+
+        if (
+            handle.get("runner_dispatch_state") == "unknown"
+            or handle.get("start_accepted") is False
+        ):
+            # A misspelled lookup is not a pending execution. In particular an
+            # output_<id> passed as a job id must not enter controller recovery
+            # with a fabricated, incomplete handle.
+            hint = (
+                f"Use target='{job_id}' to read this stored output reference."
+                if job_id.startswith("output_")
+                else "Use a job reference returned by an actual dispatch."
+            )
+            return ToolResult.completed_failure(
+                output=f"No current host dispatch is known for {poll_ref}. {hint}",
+                error="background job reference has no host dispatch identity",
+                error_code="UNKNOWN_DETACHED_JOB_REF",
+                suggestions=[hint],
             )
 
         poll = self.docker_orchestrator.poll_detached_command(handle, tail_lines=50)
@@ -247,7 +288,9 @@ class SearchTool(BaseTool):
             f"grep -rn{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{limit}; "
             f"else grep -n{grep_flags} -e {quoted_pattern} -- {quoted_path} | head -{limit}; fi"
         )
-        result = self.docker_orchestrator.execute_command(command, workdir=None, timeout=60)
+        result = self.docker_orchestrator.execute_command(
+            command, workdir=None, timeout=60, truncate_output=False
+        )
 
         exit_code = result.get("exit_code")
         stdout = self._stream(result, "stdout")
@@ -449,8 +492,10 @@ class SearchTool(BaseTool):
                 "pattern": {
                     "type": "string",
                     "description": (
-                        "file:/ref id -> extended regular expression, grep -E; "
-                        "use ignore_case=true instead of inline PCRE flags such as (?i); "
+                        "file: -> extended regular expression, grep -E; "
+                        "ref id -> Python regular expression; omit pattern for a paged read. "
+                        "Use ignore_case=true for case-insensitive matching; "
+                        "file: does not support inline PCRE flags such as (?i). "
                         "name: -> shell globs separated by "
                         f"'{_NAME_GLOB_SEPARATOR}' (e.g. 'pom.xml|build.gradle|gradlew') "
                         "matched against the name alone; ignored for web"
@@ -460,11 +505,40 @@ class SearchTool(BaseTool):
                     "type": "boolean",
                     "default": False,
                     "description": (
-                        "Case-insensitive matching for file: content searches; use this "
+                        "Case-insensitive matching for file: and ref content searches; use this "
                         "instead of PCRE-only inline flags."
                     ),
                 },
                 "max_results": {"type": "integer", "default": 50},
+                "start_line": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "For ref reads: zero-based starting line. Copy Next read to continue.",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "For ref reads: exclusive ending line; omit to read toward EOF.",
+                },
+                "column_offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "For ref reads: character offset within start_line, for long-line continuation.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "default": 20_000,
+                    "description": "For ref reads: content characters per page, capped at 100000.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "For ref searches with pattern: number of matching lines to skip.",
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "For ref searches with pattern: lines of context before and after each match.",
+                },
             },
             "required": ["target"],
         }

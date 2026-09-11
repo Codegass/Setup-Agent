@@ -558,7 +558,7 @@ class MavenTool(BaseTool):
         try:
             # Use extended timeout for Maven commands which often download dependencies
             # Check if this is a potentially long-running command
-            is_long_running = any(
+            is_long_running = _source_argv is not None or any(
                 cmd in maven_cmd
                 for cmd in [
                     "clean",
@@ -737,6 +737,7 @@ class MavenTool(BaseTool):
 
             # Analyze the output
             analysis = self._analyze_maven_output(full_output, result["exit_code"])
+            self._prefer_current_report_counts(analysis)
             if auto_ignore_test_failures and analysis.get("test_failure_count", 0) > 0:
                 analysis["build_success"] = False
                 analysis["error_type"] = analysis.get("error_type") or "TEST_FAILURE"
@@ -801,6 +802,7 @@ class MavenTool(BaseTool):
                             str(full_output),
                             result["exit_code"],
                         )
+                        self._prefer_current_report_counts(detached_analysis)
                         if (
                             auto_ignore_test_failures
                             and detached_analysis.get("test_failure_count", 0) > 0
@@ -1089,6 +1091,13 @@ class MavenTool(BaseTool):
         """
         if preamble:
             tool_result.output = preamble + (tool_result.output or "")
+        failed_tests = (tool_result.metadata.get("analysis") or {}).get("failed_tests") or []
+        if failed_tests:
+            names = [name[:500] + ("…" if len(name) > 500 else "") for name in failed_tests[:5]]
+            detail = "[tests] Maven console failure summaries:\n" + "\n".join(names) + "\n"
+            if len(failed_tests) > 5:
+                detail += f"Showing 5 of {len(failed_tests)} summaries; see the full output for the rest.\n"
+            tool_result.output = detail + (tool_result.output or "")
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
         tool_result.metadata.update(getattr(self, "_pending_log_storage_metadata", {}) or {})
@@ -1170,9 +1179,31 @@ class MavenTool(BaseTool):
             **contract_receipt_fields(argv),
         )
 
+    def _prefer_current_report_counts(self, analysis: Dict[str, Any]) -> None:
+        """Present the same invocation's verified XML totals to the model.
+
+        Console summaries may name only the last module, or count repeated
+        plugin executions. Keep them as diagnostics instead of asking the model
+        to reconcile another set of numbers with the final report pool.
+        """
+        metadata = getattr(self, "_pending_invocation_receipt", None) or {}
+        counts = metadata.get("report_test_counts")
+        analysis["test_stats_basis"] = "stdout_summary"
+        if not metadata.get("receipt_id") or not isinstance(counts, dict):
+            return
+        analysis["log_tests_run"] = analysis.get("tests_run")
+        analysis["tests_run"] = {
+            "total": counts["reported"],
+            "failures": counts["failed"],
+            "errors": counts["errors"],
+            "skipped": counts["skipped"],
+        }
+        analysis["test_failure_count"] = counts["failed"]
+        analysis["test_error_count"] = counts["errors"]
+        analysis["test_stats_basis"] = "invocation_report_xml"
+
     def _apply_invocation_receipt(self, tool_result: ToolResult) -> ToolResult:
-        """Byte-compat: `receipt_id` on success, `receipt_persisted` only on
-        failure — nothing at all on paths that dispatched no runner.
+        """Attach the receipt and its current report-count provenance.
 
         The runner choice (spec Plan 7 §A1) rides the same merge: whichever
         Maven ran, and why, is a fact of every result a dispatch produced.
@@ -1180,6 +1211,25 @@ class MavenTool(BaseTool):
         receipt_metadata = getattr(self, "_pending_invocation_receipt", None)
         if receipt_metadata:
             tool_result.metadata.update(receipt_metadata)
+            from_reports = bool(receipt_metadata.get("receipt_id")) and isinstance(
+                receipt_metadata.get("report_test_counts"), dict
+            )
+            if from_reports:
+                # Early timeout/crash paths also carry observed report counts;
+                # their invocation/operation status must remain unchanged.
+                report_analysis: Dict[str, Any] = {}
+                self._prefer_current_report_counts(report_analysis)
+                tool_result.test_stats = self._maven_test_stats(report_analysis)
+            if tool_result.test_stats is not None:
+                tool_result.metadata["test_stats_basis"] = (
+                    "invocation_report_xml" if from_reports else "stdout_summary"
+                )
+                basis = (
+                    "Test counts come from hash-verified XML written by this invocation."
+                    if from_reports
+                    else "Test counts below are console summaries; complete current XML counts are unavailable."
+                )
+                tool_result.output = f"[tests] {basis}\n" + (tool_result.output or "")
         runner_choice = getattr(self, "_pending_runner_choice", None)
         if runner_choice:
             tool_result.metadata["maven_runner_choice"] = runner_choice
@@ -2392,6 +2442,7 @@ class MavenTool(BaseTool):
             "phases_executed": [],
             "tests_run": None,
             "compilation_errors": [],
+            "test_runtime_error": None,
             "dependency_issues": [],
             "warnings": [],
             "build_time": None,
@@ -2512,7 +2563,7 @@ class MavenTool(BaseTool):
             r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)"
         )
         test_execution_boundary_re = re.compile(
-            r"--- maven-(?:surefire|failsafe)-plugin:.* @ .+ ---"
+            r"--- (?:maven-)?(?:surefire|failsafe)(?:-plugin)?:.* @ .+ ---"
         )
         current_test_execution: Optional[Dict[str, int]] = None
         current_execution_has_final_summary = False
@@ -2546,8 +2597,10 @@ class MavenTool(BaseTool):
                 phase_match = re.search(r"--- maven-(\w+)-plugin:", line)
                 if phase_match:
                     analysis["phases_executed"].append(phase_match.group(1))
-                if test_execution_boundary_re.search(line):
-                    flush_test_execution()
+            # New Maven releases shorten maven-surefire-plugin to surefire.
+            # This is an execution boundary in either spelling.
+            if test_execution_boundary_re.search(line):
+                flush_test_execution()
 
             if re.search(r"\bResults:\s*$", line):
                 expecting_final_test_summary = True
@@ -2581,9 +2634,28 @@ class MavenTool(BaseTool):
                         for key, value in summary.items():
                             current_test_execution[key] += value
 
-            # Extract compilation errors
-            if "[ERROR]" in line and (".java:" in line or "compilation error" in line.lower()):
+            # Java stack frames also contain .java:line; they are runtime
+            # context, not javac diagnostics (Curator's Surefire fork crash).
+            is_java_frame = re.match(r"\[ERROR\]\s+at\s+\S+\s*\([^()]*\.java:\d+\)", line)
+            if (
+                "[ERROR]" in line
+                and not is_java_frame
+                and (".java:" in line or "compilation error" in line.lower())
+            ):
                 analysis["compilation_errors"].append(line)
+
+            if (
+                exit_code != 0
+                and line.startswith("[ERROR]")
+                and any(
+                    diagnostic in line
+                    for diagnostic in (
+                        "The forked VM terminated without properly saying goodbye",
+                        "Error occurred in starting fork, check output in log",
+                    )
+                )
+            ):
+                analysis["test_runtime_error"] = analysis["test_runtime_error"] or line
 
             # Extract dependency issues
             if "Could not resolve dependencies" in line or "Dependency resolution failed" in line:
@@ -2632,20 +2704,27 @@ class MavenTool(BaseTool):
                 elif status == "FAILURE" and not analysis.get("error_type"):
                     analysis["error_type"] = "MODULE_FAILURE"
 
-            if any(
-                marker in line
-                for marker in ["Tests in error:", "Tests in failure:", "Failed tests:"]
+            summary_text = re.sub(r"^\[(?:ERROR|INFO|WARNING)\]\s*", "", line).strip()
+            if summary_text in {"Tests in error:", "Tests in failure:", "Failed tests:"} or (
+                expecting_final_test_summary and summary_text in {"Failures:", "Errors:"}
             ):
                 collecting_failed_tests = True
                 continue
 
             if collecting_failed_tests:
-                if not line:
-                    collecting_failed_tests = False
+                # Surefire 3 reports retry details below the case name. Those
+                # lines can include PASS and must not become failing names.
+                if re.match(r"Run \d+:", summary_text):
                     continue
-                cleaned = re.sub(r"^\[ERROR\]\s*", "", line).strip()
-                if cleaned:
-                    failed_tests.append(cleaned)
+                if (
+                    not summary_text
+                    or test_summary_re.match(summary_text)
+                    or summary_text.startswith(("---", "BUILD ", "Results:"))
+                    or line.startswith(("[INFO]", "[WARNING]"))
+                ):
+                    collecting_failed_tests = False
+                else:
+                    failed_tests.append(summary_text)
 
             report_match = re.search(r"refer to (.+?surefire-reports)", line)
             if report_match:
@@ -2725,7 +2804,7 @@ class MavenTool(BaseTool):
         self, analysis: Dict[str, Any], ref_id: Optional[str] = None
     ) -> str:
         """Format with essential validation data always visible."""
-        output = "✅ Maven build completed\n\n"
+        output = "✅ Maven command completed\n\n"
 
         # Add multi-module warning if applicable
         if hasattr(self, "_multi_module_warning"):
@@ -2733,43 +2812,26 @@ class MavenTool(BaseTool):
             # Clear the warning after use
             delattr(self, "_multi_module_warning")
 
-        # ALWAYS show what phases executed (critical for validation)
-        output += "📍 Phases executed: "
-        if analysis["phases_executed"]:
-            phases = list(set(analysis["phases_executed"]))  # Remove duplicates
-            output += ", ".join(phases[:5])
-            if len(phases) > 5:
-                output += f" (+{len(phases)-5} more)"
+        # Console plugin labels are incomplete and are not lifecycle evidence.
+        # In particular, current XML may exist without a recognized log banner.
+        if analysis.get("tests_run"):
+            tests = analysis["tests_run"]
+            label = (
+                "Invocation XML test records"
+                if analysis.get("test_stats_basis") == "invocation_report_xml"
+                else "Console test summary"
+            )
+            output += (
+                f"📊 {label}: {tests['total']} reported, "
+                f"{tests['failures']} failures, {tests['errors']} errors, "
+                f"{tests['skipped']} skipped"
+            )
         else:
-            output += "⚠️ NONE DETECTED (possible parsing issue)"
-
-        # ALWAYS show test execution status if test/verify phase ran
-        test_phases = ["test", "verify", "surefire", "failsafe"]
-        phases_lower = [p.lower() for p in analysis.get("phases_executed", [])]
-        if any(phase in phases_lower for phase in test_phases):
-            output += "\n📊 Test Execution: "
-            if analysis["tests_run"]:
-                tests = analysis["tests_run"]
-                output += f"{tests['total']} tests run, {tests['failures']} failures, {tests['errors']} errors"
-                if tests["failures"] > 0 or tests["errors"] > 0:
-                    output += " ❌"
-                else:
-                    output += " ✅"
-            else:
-                output += (
-                    "⚠️ Test phase ran but no results captured (check target/surefire-reports/)"
-                )
+            output += "Test counts: unavailable in this result."
 
         # Show artifacts if created
         if analysis["artifacts_created"]:
             output += f"\n📦 Artifacts: {len(analysis['artifacts_created'])} created"
-
-        # Show compilation status for compile phase
-        if "compile" in phases_lower:
-            if analysis.get("compilation_errors"):
-                output += f"\n❌ Compilation: {len(analysis['compilation_errors'])} errors"
-            else:
-                output += "\n✅ Compilation: successful"
 
         # Reference to full output
         if ref_id:
@@ -2947,6 +3009,16 @@ class MavenTool(BaseTool):
             )
             documentation_links.append("https://maven.apache.org/guides/getting-started/test.html")
 
+        if analysis.get("test_runtime_error"):
+            error_code = "MAVEN_EXECUTION_ERROR"
+            error_suggestions.extend(
+                [
+                    "Test JVM did not complete normally; the stored fork diagnostic describes the observed failure",
+                    "Existing test summary counts cover reported tests and do not prove completion of the required test scope",
+                    "A fork exit alone does not establish an out-of-memory cause",
+                ]
+            )
+
         if "mvn: command not found" in output:
             error_code = "MAVEN_NOT_FOUND"
             error_suggestions.extend(
@@ -2992,7 +3064,9 @@ class MavenTool(BaseTool):
 
         # Check for Java version issues (including Maven Enforcer plugin)
         runtime_contract_persisted = None
-        if analysis.get("maven_version_requirement"):
+        # A caller's requirement may already be satisfied. Only a failed
+        # runtime observation can invalidate the selected Maven executable.
+        if (analysis.get("maven_version_requirement") or {}).get("source") == "build_error":
             requirement = analysis["maven_version_requirement"]
             raw_requirement = requirement.get("raw", "the required range")
             runtime_executable = (maven_runtime or {}).get("executable", "the current mvn")
@@ -3024,7 +3098,7 @@ class MavenTool(BaseTool):
         if (
             "Unsupported major.minor version" in output
             or "java.lang.UnsupportedClassVersionError" in output
-            or "RequireJavaVersion" in output
+            or re.search(r"RequireJavaVersion[^\n]*\bfailed\b", output, re.IGNORECASE)
             or "Detected JDK" in output
             and "not in the allowed range" in output
         ):
@@ -3124,6 +3198,9 @@ class MavenTool(BaseTool):
 
         if analysis.get("compilation_errors"):
             error_message += f"\nCompilation errors found: {len(analysis['compilation_errors'])}"
+
+        if analysis.get("test_runtime_error"):
+            error_message += "\nTest JVM did not complete normally"
 
         if analysis.get("test_failure_count", 0) > 0 or analysis.get("test_error_count", 0) > 0:
             error_message += (

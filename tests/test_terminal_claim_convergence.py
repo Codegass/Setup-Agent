@@ -1,5 +1,6 @@
 """Integration law for judge-owned facts and model-owned repair actions."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -147,17 +148,33 @@ def _rejected(signal="done"):
     )
 
 
-def test_build_phase_rejects_a_test_action_before_runner_dispatch():
+@pytest.mark.parametrize("has_identity", [True, False])
+def test_build_phase_preserves_a_legacy_test_command_without_requiring_install(has_identity):
     engine = _engine()
-    params = {"action": "test", "working_directory": "/workspace/demo"}
+    if has_identity:
+        engine._active_native_tool_call_id = "call-ci-test"
+    params = {
+        "action": "test",
+        "system": "maven",
+        "working_directory": "/workspace/demo",
+        "args": "-V --file pom.xml --no-transfer-progress",
+        "source_command": "mvn -V test --file pom.xml --no-transfer-progress",
+    }
     call = ToolCall(name="build", raw_params=params)
 
-    with pytest.raises(PreDispatchControlError) as exc:
-        engine._prepare_control_action(call, params)
+    if not has_identity:
+        with pytest.raises(PreDispatchControlError) as exc:
+            engine._prepare_control_action(call, params)
+        assert exc.value.error_code == "ACTION_ENVELOPE_IDENTITY_MISSING"
+        assert engine.control_event_sink.events == []
+        return
+    envelope = engine._prepare_control_action(call, params)
 
-    assert exc.value.error_code == "PHASE_ACTION_MISMATCH"
-    assert exc.value.metadata["runner_dispatched"] is False
-    assert engine.control_event_sink.events == []
+    assert envelope
+    assert current_action_context().intent_exact_params == params
+    assert engine.control_event_sink.events[-1].payload["exact_params"] == params
+    assert engine.phase_machine.current_phase == "build"
+    assert not engine.run_evidence_state.sealed
 
 
 def test_rejected_gate_persists_facts_only_context_and_requires_model_fields():
@@ -192,7 +209,9 @@ def test_rejected_gate_persists_facts_only_context_and_requires_model_fields():
     )
     assessment = engine.orchestrator.files[assessment_path]
     assert '"observed_facts": {"compiled_classes": 0, "fact_epoch": 7}' in assessment
-    assert '"evidence_refs": ["output_compile"]' in assessment
+    source_gate = engine.control_event_sink.events[1].payload
+    assert json.loads(assessment)["evidence_refs"] == [source_gate["decision_id"]]
+    assert source_gate["evidence_refs"] == ["output_compile"]
 
     with pytest.raises(PreDispatchControlError) as exc:
         engine._mint_model_action_intent(

@@ -68,33 +68,9 @@ class PhaseTool(BaseTool):
                 "external impediment; both are checked against physical evidence. "
                 "action='note' records a working note. A rejected terminal claim returns "
                 "typed judge facts; the model chooses its next ordinary project action. "
-                "Analyze action='done' requires execution_plan to establish the model's "
-                "evidence-linked build/test strategy. Explicit unknown/failed without a plan "
-                "may end Analyze with unresolved strategy; Build and Test remain unauthorized. "
-                "Any supplied plan must still pass validation. test_disposition must be planned with "
-                "at least one test step, or blocked with empty test_steps and a concrete reason "
-                "plus reviewed-document evidence refs. Separately record execution_mechanism, "
-                "verdict_scope, and readiness. Classify verdict_scope from the actual definition "
-                "before choosing status: product_test_cases executes product behavior cases; "
-                "test_metadata checks their inventory or suite membership; quality_only is not a "
-                "test verdict; benchmark_or_manual needs coordination; unknown stays unresolved. "
-                "Only product_test_cases with readiness=ready may be planned. For a custom profile, "
-                "task, script, wrapper, or suite, read its actual definition and cite that direct "
-                "definition in definition_evidence_refs; do not infer behavior from its name or "
-                "from prose that merely invokes it. Reconcile the exact entry with the project's "
-                "own stated purpose and cite evidence that it executes automated product cases. "
-                "Its tool, directory, and arguments must faithfully implement that cited command, "
-                "not a similarly named lifecycle or mechanical fact-sheet runner. Refine relevant "
-                "capped searches and resolve external services, checkouts, manual coordination, "
-                "runner support, and report support before sealing. Prefer a bounded self-contained "
-                "documented suite; keep looking or use blocked when the real entry cannot run "
-                "unattended here. Each reviewed "
-                "document needs a readable "
-                "output_* from a successful current-Analyze call that names that exact path. "
-                "Inventory entry_id/source_hash values are optional hints; "
-                "the Harness derives authoritative bindings and the engine "
-                "seals it, but neither authors its commands. The engine alone routes or "
-                "skips phases."
+                "Analyze may state strategy in key_results. execution_plan is optional guidance; "
+                "its validation warnings do not prevent bounded project execution or prove completion. "
+                "Revise strategy using note. The engine alone routes phases and verifies actual results."
             ),
         )
         self.machine = machine
@@ -164,6 +140,48 @@ class PhaseTool(BaseTool):
             disclosed_job_ids=disclosed_live_job_ids(self.run_evidence_state),
         )
         gate = gate if gate.claim is not None else gate.with_claim(claim)
+        if (
+            phase == "test"
+            and not sealed
+            and self.run_evidence_state is not None
+            and gate.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
+            and gate.validator_state in {ValidatorState.GREEN, ValidatorState.PARTIAL}
+        ):
+            from sag.agent.acceptance_task import build_task_completion
+
+            completion = build_task_completion(
+                self.orchestrator,
+                self.run_evidence_state,
+                validator=self.validator,
+                project_root=f"/workspace/{self.project_name}" if self.project_name else None,
+                repository=getattr(self.orchestrator, "acceptance_task_repository", None),
+                task=getattr(self.orchestrator, "acceptance_task", None),
+                output_storage=self._execution_plan_output_storage,
+            )
+            if completion is not None and completion.status != "complete":
+                # This bounds the completion claim, not the next executable
+                # action. A truthful partial claim can still terminate.
+                remaining = ", ".join(
+                    f"{step.id}={step.status}"
+                    for step in completion.steps
+                    if step.status != "complete"
+                ) or ", ".join(completion.reasons)
+                return validate_phase_claim(
+                    claim,
+                    ValidatorState.PARTIAL,
+                    reason=(
+                        f"The required task has unfinished or unverified steps: {remaining}. "
+                        "Ordinary tools remain available to continue the task; "
+                        "an honest partial claim can also close this phase."
+                    ),
+                    evidence_refs=gate.evidence_refs,
+                    code=f"required_task_{completion.status}",
+                    validated_facts={
+                        **dict(gate.validated_facts),
+                        "physical_test_validator_state": gate.validator_state.value,
+                        "task_completion": completion.model_dump(mode="json"),
+                    },
+                )
         callback = self._analysis_facts_recovery
         if (
             phase != "analyze"
@@ -450,31 +468,25 @@ class PhaseTool(BaseTool):
                 error_code="phase_blocker_reason_required",
             )
 
-        normalized_plan: ProjectExecutionPlan | None = None
-        plan_seal_candidate: ProjectExecutionPlan | None = None
-        plan_document_map: Any = None
-        plan_binding_error: ProjectExecutionPlanValidationError | None = None
+        # Strategy is advisory. Invalid guidance cannot authorize an action or
+        # certify a result, but must not prevent a surveyed project being tried.
+        normalized_plan = None
+        plan_seal_candidate = None
+        plan_candidate = None
+        plan_warning = None
         plan_sha256 = ""
+        plan_document_map = None
         if execution_plan is not None:
             if phase != "analyze" or verb != "done":
                 return ToolResult.completed_failure(
-                    output="execution_plan is accepted only by Analyze action='done'",
+                    output="Structured execution_plan is accepted only by Analyze done; use phase note to revise strategy later.",
                     error="execution_plan is not valid for this phase action",
                     error_code="ANALYSIS_EXECUTION_PLAN_FORBIDDEN",
                 )
             try:
                 normalized_plan = validate_authored_plan(
-                    execution_plan,
-                    require_test_disposition=True,
+                    execution_plan, require_test_disposition=True
                 )
-            except ProjectExecutionPlanValidationError as exc:
-                return ToolResult.completed_failure(
-                    output=f"Analyze execution plan is incomplete or invalid: {exc}",
-                    error=str(exc),
-                    error_code="ANALYSIS_EXECUTION_PLAN_INVALID",
-                    facts={"analysis.execution_plan_valid": False},
-                )
-            try:
                 normalized_plan = self.validate_execution_plan_evidence(normalized_plan)
                 plan_seal_candidate = normalized_plan
                 plan_document_map = self._execution_plan_document_map()
@@ -483,8 +495,8 @@ class PhaseTool(BaseTool):
                 )
                 plan_sha256 = canonical_authored_plan_sha256(normalized_plan)
             except ProjectExecutionPlanValidationError as exc:
-                plan_binding_error = exc
-                plan_sha256 = canonical_authored_plan_sha256(normalized_plan)
+                plan_warning = str(exc)[:1000]
+                normalized_plan = None
 
         claim = PhaseClaim(
             phase=phase,
@@ -496,41 +508,15 @@ class PhaseTool(BaseTool):
             execution_plan_sha256=plan_sha256,
             execution_plan_ref=(PROJECT_EXECUTION_PLAN_PATH if plan_sha256 else ""),
         )
-
-        plan_candidate: Dict[str, Any] | None = None
-        if plan_binding_error is not None:
-            return self._rejected_claim_result(
-                claim,
-                code="ANALYSIS_EXECUTION_PLAN_INVALID",
-                reason=(
-                    "Analyze execution plan evidence binding is invalid: " f"{plan_binding_error}"
-                ),
-                control_disposition=GateControlDisposition.REPAIR_REQUIRED,
-                blocker_owner="project",
-                validated_facts={
-                    "analysis.execution_plan_valid": False,
-                    "analysis.execution_plan_error": str(plan_binding_error)[:1000],
-                },
-            )
         if normalized_plan is not None:
             try:
                 plan_candidate = self._prepare_execution_plan(
-                    plan_seal_candidate or normalized_plan,
-                    claim,
-                    plan_document_map,
+                    plan_seal_candidate, claim, plan_document_map
                 )
             except ProjectExecutionPlanValidationError as exc:
-                return self._rejected_claim_result(
-                    claim,
-                    code="ANALYSIS_EXECUTION_PLAN_INVALID",
-                    reason=f"Analyze execution plan evidence binding is invalid: {exc}",
-                    control_disposition=GateControlDisposition.REPAIR_REQUIRED,
-                    blocker_owner="project",
-                    validated_facts={
-                        "analysis.execution_plan_valid": False,
-                        "analysis.execution_plan_error": str(exc)[:1000],
-                    },
-                )
+                plan_warning = str(exc)[:1000]
+                plan_sha256 = ""
+                claim = replace(claim, execution_plan_sha256="", execution_plan_ref="")
 
         sealed = bool(getattr(self.run_evidence_state, "sealed", False))
         gate = None
@@ -588,6 +574,7 @@ class PhaseTool(BaseTool):
             phase=phase,
             attempt_id=getattr(self.machine, "current_attempt_id", None),
             resolution=survey,
+            validator=self.validator,
         )
         if required_attempt is not None:
             return self._rejected_claim_result(
@@ -695,42 +682,6 @@ class PhaseTool(BaseTool):
                 blocker_owner=gate.blocker_owner,
             )
 
-        no_plan_terminal = (
-            phase == "analyze"
-            and verb == "done"
-            and execution_plan is None
-            and plan_candidate is None
-            and claimed_outcome in {PhaseOutcome.UNKNOWN, PhaseOutcome.FAILED}
-            and gate.accepted
-            and gate.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
-        )
-        if no_plan_terminal:
-            # A green survey alone does not establish an execution strategy.
-            # Close through the existing transition policy without upgrading a
-            # no-plan claim or discarding a physically observed analysis failure.
-            gate = validate_phase_claim(
-                claim,
-                (
-                    ValidatorState.RED
-                    if gate.validated_outcome is PhaseOutcome.FAILED
-                    else ValidatorState.UNAVAILABLE
-                ),
-                reason=(
-                    "Analyze ended without an established execution plan; "
-                    "Build and Test were not authorized."
-                ),
-                evidence_refs=gate.evidence_refs,
-                code="analysis_plan_not_established",
-                validated_facts={
-                    **dict(gate.validated_facts),
-                    "analysis.survey_validator_state": gate.validator_state.value,
-                    "analysis.survey_reason": gate.reason,
-                    "analysis.build_entry_ready": False,
-                    "analysis.execution_plan_valid": False,
-                    "analysis.execution_plan_required": True,
-                },
-            )
-
         if not gate.accepted:
             control_disposition = GateControlDisposition(gate.control_disposition).value
             # A project/unknown repair belongs to the model.  The judge exposes
@@ -756,30 +707,6 @@ class PhaseTool(BaseTool):
                 },
             )
 
-        if (
-            phase == "analyze"
-            and verb == "done"
-            and plan_candidate is None
-            and not no_plan_terminal
-        ):
-            return self._rejected_claim_result(
-                claim,
-                code="ANALYSIS_EXECUTION_PLAN_REQUIRED",
-                reason=(
-                    "Analyze cannot close without a model-authored execution_plan. "
-                    "Review the broad document inventory and submit the documents, "
-                    "build/test actions, success criteria, constraints, risks, and "
-                    "unresolved questions with the next done claim."
-                ),
-                control_disposition=GateControlDisposition.REPAIR_REQUIRED,
-                blocker_owner="project",
-                validated_facts={
-                    **dict(gate.validated_facts),
-                    "analysis.execution_plan_valid": False,
-                    "analysis.execution_plan_required": True,
-                },
-            )
-
         if plan_candidate is not None:
             gate = replace(
                 gate,
@@ -794,12 +721,20 @@ class PhaseTool(BaseTool):
         return ToolResult.completed_success(
             # The word the model reads and the word the record seals come out of
             # one renderer reading one object (spec §3.1).
-            output=gate_observation_text(gate, phase=phase, origin="terminal_claim"),
+            output=gate_observation_text(gate, phase=phase, origin="terminal_claim")
+            + (
+                "\n[plan advisory] Structured plan was not sealed: "
+                + plan_warning
+                + ". Continue from task requirements; revise strategy with phase note. Completion still requires physical evidence."
+                if plan_warning
+                else ""
+            ),
             facts={"phase": phase},
             metadata={
                 "control_disposition": control_disposition,
                 "blocker_owner": gate.blocker_owner.value,
                 "phase_signal": verb,
+                "plan_warning": plan_warning,
                 "phase_claim": claim.to_metadata(),
                 "gate_result": gate.to_metadata(),
                 **(
@@ -837,9 +772,8 @@ class PhaseTool(BaseTool):
                 "execution_plan": {
                     "type": "object",
                     "description": (
-                        "Analyze action='done': required to establish an execution strategy. "
-                        "May be omitted only for explicit unknown/failed termination, which "
-                        "does not authorize Build or Test. Any supplied plan is validated. "
+                        "Optional structured guidance for Analyze done. key_results may state the strategy instead. "
+                        "Validation problems are advisory; use phase note to revise strategy later. "
                         "Your model-authored, "
                         "evidence-linked project build/test strategy. Harness inventory "
                         "and extracted claims are hints, not commands."

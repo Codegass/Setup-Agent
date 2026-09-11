@@ -907,6 +907,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         canonical = snapshot.get("canonical_snapshot")
         if snapshot.get("mode") == "setup" and isinstance(canonical, dict):
             from sag.agent.ci_comparison import render_ci_comparison_lines
+            from sag.agent.acceptance_task import render_task_completion_lines
 
             lines = render_snapshot_metric_lines(canonical)
             test_stats = canonical.get("test_stats")
@@ -915,6 +916,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 if type(flaky) is int and flaky > 0:
                     lines[1] += f" · {flaky} flaky"
             lines.extend(render_ci_comparison_lines(canonical.get("ci_comparison")))
+            lines.extend(render_task_completion_lines(canonical.get("task_completion")))
             return lines
         if "rates" in snapshot:
             rates = snapshot.get("rates")

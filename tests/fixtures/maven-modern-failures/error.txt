@@ -1,0 +1,17 @@
+[INFO] 
+[INFO] Results:
+[INFO] 
+[ERROR] Errors: 
+[ERROR] org.example.DuplicateSuiteTest$Probe.testRepeated
+[INFO]   Run 1: PASS
+[ERROR]   Run 2: DuplicateSuiteTest$Probe.testRepeated:20 IllegalState deliberate error
+[INFO] 
+[INFO] 
+[ERROR] Tests run: 2, Failures: 0, Errors: 1, Skipped: 0
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  0.477 s
+[INFO] Finished at: 2026-09-10T20:15:34-04:00
+[INFO] ------------------------------------------------------------------------

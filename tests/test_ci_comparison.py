@@ -72,23 +72,31 @@ class ComparisonFS(ContainerFS):
 class Runner:
     """A deterministic backend emits real immutable facade receipts and bound output."""
 
-    def __init__(self, fs, *, exit_code=0, xml=XML, modules=True, termination_reason=None):
+    def __init__(
+        self, fs, *, exit_code=0, xml=XML, modules=True, termination_reason=None, report_files=None
+    ):
         self.fs, self.exit_code, self.xml, self.modules = fs, exit_code, xml, modules
         self.sequence = 0
         self.termination_reason = termination_reason
+        self.report_files = report_files
 
     def execute(self, **params):
         self.sequence += 1
         action = params["command"]
         contract = current_contract()
         argv = "mvn " + contract["expected_argv"]
-        testing = action in {"test", "verify"}
+        testing = action in {"test", "verify", "install", "package"} and not any(
+            flag in argv for flag in ("-DskipTests", "-Dmaven.test.skip=true")
+        )
         output = "BUILD SUCCESS"
         if testing and self.exit_code:
             output = "Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.1:test (default-test) on project p: There are test failures.\nBUILD FAILURE"
         if testing:
-            self.fs.files[REPORT] = self.xml
-            before, after = {}, {REPORT: hashlib.sha256(self.xml.encode()).hexdigest()}
+            reports = self.report_files or {REPORT: self.xml}
+            self.fs.files.update(reports)
+            before, after = {}, {
+                path: hashlib.sha256(xml.encode()).hexdigest() for path, xml in reports.items()
+            }
         else:
             before, after = {}, {ROOT + "/target/classes/a/T.class": "a" * 64}
         metadata = record_invocation(
@@ -106,13 +114,17 @@ class Runner:
             output=output,
             lifecycle_state="finished",
             termination_reason=self.termination_reason if testing else None,
-            module_outcomes=[{"module": ".", "status": "success"}] if self.modules else None,
+            module_outcomes=(
+                self.modules
+                if isinstance(self.modules, list)
+                else [{"module": ".", "status": "success"}] if self.modules else None
+            ),
             **contract_receipt_fields(argv),
         )
         result = (
-            ToolResult.completed_success(output=output)
+            ToolResult.completed_success(output=output, raw_output=output)
             if not testing or not self.exit_code
-            else ToolResult.completed_failure(output=output, error="test red")
+            else ToolResult.completed_failure(output=output, raw_output=output, error="test red")
         )
         result.metadata.update(metadata)
         return result
@@ -127,6 +139,8 @@ def setup_run(
     modules=True,
     test_action="test",
     plan_test_args=None,
+    execute_test_args=None,
+    report_files=None,
     termination_reason=None,
 ):
     fs = ComparisonFS()
@@ -196,15 +210,30 @@ def setup_run(
         )
     )
     runner = Runner(
-        fs, xml=xml, exit_code=exit_code, modules=modules, termination_reason=termination_reason
+        fs,
+        xml=xml,
+        exit_code=exit_code,
+        modules=modules,
+        termination_reason=termination_reason,
+        report_files=report_files,
     )
     tool = BuildTool(fs, maven_tool=runner)
     for index, action in enumerate(
         ["compile"] + [test_action] * (repeat if execute_tests is None else execute_tests)
     ):
-        with build_action_context(f"envelope-ci-{index+1}", action=action):
-            result = tool.execute(action=action, working_directory=ROOT)
+        params = {
+            "working_directory": ROOT,
+            **(
+                {"command": "mvn " + action + " " + execute_test_args}
+                if index and execute_test_args
+                else {"action": action}
+            ),
+        }
+        with build_action_context(f"envelope-ci-{index+1}", action=action, params=params):
+            result = tool.execute(**params)
         assert result.completed, result
+        if index and execute_test_args:
+            assert result.metadata.get("receipt_id"), result
     validator = PhysicalValidator(fs, project_path="/workspace")
     validator.receipt_run_id = state.run_id
     cell = CellTarget(
@@ -293,6 +322,31 @@ def test_single_maven_project_requires_independent_graph_evidence():
     del run.fs.files[ROOT + "/pom.xml"]
     changed = compare(run)
     assert changed.attainment is None or changed.attainment.alpha is None
+
+
+def test_terminal_single_module_test_receipt_proves_compile_without_a_jar():
+    run = setup_run(modules=False)
+    proof = run.validator._terminal_root_maven_reactor_receipt(ROOT)
+    assert proof is not None
+    assert proof["requested_action"] == "test"
+    assert proof["modules_succeeded"] == proof["modules_total"] == 1
+    assert not any(path.endswith(".jar") for path in run.fs.files)
+
+
+@pytest.mark.parametrize("missing", ["pom", "receipt", "assessment", "contract"])
+def test_single_module_compile_proof_requires_current_bound_evidence(missing):
+    run = setup_run(modules=False)
+    assert run.validator._terminal_root_maven_reactor_receipt(ROOT)
+    marker = {
+        "pom": ROOT + "/pom.xml",
+        "receipt": "/invocation_receipts/",
+        "assessment": "/evidence_assessments/",
+        "contract": "/invocation_contracts/",
+    }[missing]
+    for path in list(run.fs.files):
+        if marker in path:
+            del run.fs.files[path]
+    assert run.validator._terminal_root_maven_reactor_receipt(ROOT) is None
 
 
 def test_project_assertion_red_is_closed_but_not_ci_green():
@@ -451,6 +505,33 @@ def target_with(run, **fields):
     return PinnedCITarget(
         record=record, raw_sha256=hashlib.sha256(record.model_dump_json().encode()).hexdigest()
     )
+
+
+def test_jenkins_sole_module_namespace_maps_to_exact_junit_identity():
+    run = setup_run(modules=False)
+    target = target_with(run, executed_ids=["group$artifact::a.T#one"])
+    result = compare(run, target=target)
+    assert result.attainment.verdict == "met", result
+    assert result.test_identity_basis == "jenkins_single_module:group$artifact"
+
+
+@pytest.mark.parametrize(
+    "change", ["different_test", "different_class", "unknown_scope", "multiple_modules"]
+)
+def test_jenkins_namespace_mapping_does_not_erase_missing_identity_or_scope(change):
+    run = setup_run(modules=False)
+    fields = {"executed_ids": ["group$artifact::a.T#one"]}
+    if change == "different_test":
+        fields["executed_ids"] = ["group$artifact::a.T#other"]
+    elif change == "different_class":
+        fields["executed_ids"] = ["group$artifact::other.T#one"]
+    else:
+        fields["modules"] = [] if change == "unknown_scope" else [".", "extra"]
+        if change == "unknown_scope":
+            fields["modules_basis"] = None
+    result = compare(run, target=target_with(run, **fields))
+    assert result.attainment.alpha is None
+    assert "CI_TEST_IDENTITIES_NOT_COMPARABLE" in result.reasons
 
 
 def test_same_pool_replacement_red_is_detected_by_identity_not_just_equal_counts():

@@ -432,8 +432,7 @@ def test_build_prompt_rejects_plan_bound_to_an_older_analyze_record(monkeypatch)
         lambda _orchestrator: artifact,
     )
 
-    with pytest.raises(RuntimeError, match="sealed Analyze execution plan"):
-        engine._system_prompt_for_current_phase("BASE")
+    assert engine._system_prompt_for_current_phase("BASE") == "BASE"
     assert engine._sealed_execution_plan_cache is None
 
 

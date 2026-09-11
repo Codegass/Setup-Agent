@@ -157,6 +157,37 @@ def test_runner_failure_suggestions_do_not_bypass_model_owned_repair_intent():
     assert "-pl core" not in formatted
 
 
+@pytest.mark.parametrize("tool_name", ["maven", "build", "bash"])
+def test_missing_maven_exposes_syntax_even_without_a_version_requirement(tool_name):
+    result = ToolResult.completed_failure(
+        output="",
+        error="Maven not resolved",
+        error_code="MAVEN_EXECUTABLE_NOT_RESOLVED",
+        metadata={"system": "maven"},
+        suggestions=["Run build(command='mvn test -DskipTests')"],
+    )
+
+    visible = format_tool_result(tool_name, result)
+
+    assert "maven_version='<version floor>'" in visible
+    assert "executable='<existing distribution>/bin/mvn'" in visible
+    assert "-DskipTests" not in visible
+
+
+def test_unobserved_compatible_maven_candidate_is_not_reported_as_none():
+    result = ToolResult.completed_failure(
+        output="compile error",
+        error="build failed",
+        error_code="COMPILATION_ERROR",
+        metadata={"maven_version_requirement": {"raw": "[3.9,)", "source": "build_error"}},
+    )
+
+    visible = format_tool_result("build", result)
+
+    assert "Compatible Maven candidate: none" not in visible
+    assert "Available Maven tool operations" not in visible
+
+
 def test_failed_observation_and_lifecycle_event_preserve_failure_provenance():
     events = []
     orchestrator = ToolOrchestrator(

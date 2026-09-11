@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd" version="3.0.2" name="org.example.DuplicateSuiteTest" time="0.007" tests="2" errors="0" skipped="0" failures="0" flakes="0">
+  <properties>
+    <property name="java.specification.version" value="17"/>
+    <property name="sun.jnu.encoding" value="UTF-8"/>
+    <property name="java.class.path" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/test-classes:/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/classes:/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/repository/junit/junit/4.13.2/junit-4.13.2.jar:/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/repository/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar:"/>
+    <property name="probeMode" value="unique"/>
+    <property name="java.vm.vendor" value="Eclipse Adoptium"/>
+    <property name="sun.arch.data.model" value="64"/>
+    <property name="java.vendor.url" value="https://adoptium.net/"/>
+    <property name="os.name" value="Mac OS X"/>
+    <property name="java.vm.specification.version" value="17"/>
+    <property name="sun.java.launcher" value="SUN_STANDARD"/>
+    <property name="user.country" value="US"/>
+    <property name="sun.boot.library.path" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/runtime/jdk-17.0.20+8/Contents/Home/lib"/>
+    <property name="sun.java.command" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/surefire/surefirebooter-20260910201531258_3.jar /Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/surefire 2026-09-10T20-15-30_598-jvmRun1 surefire-20260910201531258_1tmp surefire_0-20260910201531258_2tmp"/>
+    <property name="http.nonProxyHosts" value="local|*.local|169.254/16|*.169.254/16"/>
+    <property name="jdk.debug" value="release"/>
+    <property name="surefire.test.class.path" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/test-classes:/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/classes:/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/repository/junit/junit/4.13.2/junit-4.13.2.jar:/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/repository/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar:"/>
+    <property name="sun.cpu.endian" value="little"/>
+    <property name="user.home" value="/Users/chenhao"/>
+    <property name="user.language" value="en"/>
+    <property name="java.specification.vendor" value="Oracle Corporation"/>
+    <property name="java.version.date" value="2026-07-21"/>
+    <property name="java.home" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/runtime/jdk-17.0.20+8/Contents/Home"/>
+    <property name="file.separator" value="/"/>
+    <property name="basedir" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique"/>
+    <property name="java.vm.compressedOopsMode" value="Zero based"/>
+    <property name="line.separator" value="&#10;"/>
+    <property name="java.vm.specification.vendor" value="Oracle Corporation"/>
+    <property name="java.specification.name" value="Java Platform API Specification"/>
+    <property name="surefire.real.class.path" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique/target/surefire/surefirebooter-20260910201531258_3.jar"/>
+    <property name="sun.management.compiler" value="HotSpot 64-Bit Tiered Compilers"/>
+    <property name="ftp.nonProxyHosts" value="local|*.local|169.254/16|*.169.254/16"/>
+    <property name="java.runtime.version" value="17.0.20+8"/>
+    <property name="user.name" value="chenhao"/>
+    <property name="path.separator" value=":"/>
+    <property name="os.version" value="26.6.2"/>
+    <property name="java.runtime.name" value="OpenJDK Runtime Environment"/>
+    <property name="file.encoding" value="UTF-8"/>
+    <property name="probe.mode" value="unique"/>
+    <property name="java.vm.name" value="OpenJDK 64-Bit Server VM"/>
+    <property name="java.vendor.version" value="Temurin-17.0.20+8"/>
+    <property name="localRepository" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/repository"/>
+    <property name="java.vendor.url.bug" value="https://github.com/adoptium/adoptium-support/issues"/>
+    <property name="java.io.tmpdir" value="/var/folders/nv/k82x0xgj2c37d22byhlx2fb00000gn/T/"/>
+    <property name="java.version" value="17.0.20"/>
+    <property name="user.dir" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/unique"/>
+    <property name="os.arch" value="aarch64"/>
+    <property name="java.vm.specification.name" value="Java Virtual Machine Specification"/>
+    <property name="native.encoding" value="UTF-8"/>
+    <property name="java.library.path" value="/Users/chenhao/Library/Java/Extensions:/Library/Java/Extensions:/Network/Library/Java/Extensions:/System/Library/Java/Extensions:/usr/lib/java:."/>
+    <property name="java.vm.info" value="mixed mode, sharing"/>
+    <property name="java.vendor" value="Eclipse Adoptium"/>
+    <property name="java.vm.version" value="17.0.20+8"/>
+    <property name="java.specification.maintenance.version" value="1"/>
+    <property name="sun.io.unicode.encoding" value="UnicodeBig"/>
+    <property name="maven.repo.local" value="/Users/chenhao/Documents/github/Setup-Agent/logs/verification-23-20260910/jackrabbit-surefire-duplicate-repro-v1/repository"/>
+    <property name="socksNonProxyHosts" value="local|*.local|169.254/16|*.169.254/16"/>
+    <property name="java.class.version" value="61.0"/>
+  </properties>
+  <testcase name="testRepeated" classname="org.example.DuplicateSuiteTest$Probe" time="0.002">
+    <system-out><![CDATA[DUPLICATE_PROBE_EXECUTION 1 unique
+]]></system-out>
+  </testcase>
+  <testcase name="testStable" classname="org.example.DuplicateSuiteTest$Probe" time="0.0"/>
+</testsuite>

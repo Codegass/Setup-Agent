@@ -53,9 +53,7 @@ _TARGET_FACT_PRIORITIES = {
 def _dedupe(values) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
-            str(value).strip()
-            for value in values
-            if value is not None and str(value).strip()
+            str(value).strip() for value in values if value is not None and str(value).strip()
         )
     )
 
@@ -69,6 +67,45 @@ def _short_json(value: Any, limit: int = 240) -> str:
     if len(rendered) <= limit:
         return rendered
     return rendered[: limit - 1] + "…"
+
+
+def _fact_json(key: str, value: Any) -> tuple[str, bool]:
+    """Keep test counts and their qualification together in the prompt.
+
+    The full fact remains in the handoff file. Only bulky diagnostic details
+    are summarized here; a JSON prefix must never stand in for a test rollup.
+    """
+    projected = value
+    abbreviated = False
+    if key == "test.stats" and isinstance(value, dict):
+        projected = {}
+        for name, detail in value.items():
+            rendered = json.dumps(detail, ensure_ascii=False, default=str)
+            if len(rendered) > 240 and isinstance(detail, (list, tuple, dict)):
+                # Count groups are small and must remain exact, including
+                # unknown values and separately disclosed excluded reports.
+                if name in {
+                    "raw",
+                    "unique",
+                    "auxiliary_test_stats",
+                    "stale_test_stats",
+                    "unmeasured_test_stats",
+                }:
+                    projected[name] = detail
+                    continue
+                projected[name] = {"detail_count": len(detail), "details": "full handoff"}
+                abbreviated = True
+            elif len(rendered) > 240 and isinstance(detail, str):
+                projected[name] = {"preview": detail[:239] + "…", "truncated": True}
+                abbreviated = True
+            else:
+                projected[name] = detail
+    else:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+        if len(rendered) > 240:
+            projected = {"preview": rendered[:239] + "…", "truncated": True}
+            abbreviated = True
+    return json.dumps(projected, ensure_ascii=False, default=str), abbreviated
 
 
 def _phase_from_attempt(attempt_id: str | None) -> str | None:
@@ -218,15 +255,21 @@ class HandoffProjection(BaseModel):
             f"Target phase: {self.target_phase}",
             "[BEGIN UNTRUSTED TOOL/PROJECT EVIDENCE]",
         ]
+        abbreviated_facts = False
         if self.facts:
             lines.append("FACTS:")
             for fact in self.facts:
                 source = fact.evidence_ref or "unverified-claim"
                 phase = f" phase={fact.source_phase}" if fact.source_phase else ""
-                lines.append(
-                    f"- {fact.key} [{fact.status}]={_short_json(fact.value)}"
-                    f"{phase} ref={source}"
-                )
+                value, abbreviated = _fact_json(fact.key, fact.value)
+                abbreviated_facts = abbreviated_facts or abbreviated
+                lines.append(f"- {fact.key} [{fact.status}]={value}" f"{phase} ref={source}")
+                if fact.key == "test.stats":
+                    lines.append(
+                        "  discovered is inventory, not executed or passed. "
+                        "raw and unique are separate count bases; preserve execution_state, "
+                        "receipt_scoped, denominator_basis and conflicts when reporting."
+                    )
 
         active_blockers = [blocker for blocker in self.blockers if blocker.status == "active"]
         if active_blockers:
@@ -254,8 +297,7 @@ class HandoffProjection(BaseModel):
                 identity = attempt.phase or attempt.action or attempt.attempt_id
                 refs = ",".join(attempt.evidence_refs) or "none"
                 lines.append(
-                    f"- {attempt.attempt_id} {identity} "
-                    f"outcome={attempt.outcome} refs={refs}"
+                    f"- {attempt.attempt_id} {identity} " f"outcome={attempt.outcome} refs={refs}"
                 )
 
         if self.repair_routes:
@@ -284,6 +326,8 @@ class HandoffProjection(BaseModel):
                 f"repairs={self.omitted_repair_count}; "
                 f"full handoff: {self.full_state_ref}"
             )
+        elif abbreviated_facts:
+            lines.append(f"Abbreviated fact details; full handoff: {self.full_state_ref}")
         return "\n".join(lines)
 
 
@@ -362,9 +406,7 @@ class PhaseHandoff:
             active = [item for _, item in occurrences if item.status == "active"]
             status = "active" if active else "resolved"
             representative = active[-1] if active else last
-            refs = _dedupe(
-                ref for _, item in occurrences for ref in item.evidence_refs
-            )
+            refs = _dedupe(ref for _, item in occurrences for ref in item.evidence_refs)
             attempt_ids = []
             for _, item in occurrences:
                 attempt_id = getattr(item, "source_attempt_id", None)
@@ -408,9 +450,11 @@ class PhaseHandoff:
                 continue
             fact = max(claims, key=lambda claim: claim.last_updated_epoch)
             next_epoch += 1
-            refs = (fact.evidence_ref,) if fact.evidence_ref and not fact.evidence_ref.startswith(
-                "claim://"
-            ) else ()
+            refs = (
+                (fact.evidence_ref,)
+                if fact.evidence_ref and not fact.evidence_ref.startswith("claim://")
+                else ()
+            )
             projected.append(
                 HandoffBlocker(
                     blocker_id=signature,
@@ -562,8 +606,7 @@ class PhaseHandoff:
                 "omitted_fact_count": totals["facts"] - len(projection.facts),
                 "omitted_blocker_count": totals["blockers"] - len(projection.blockers),
                 "omitted_attempt_count": totals["attempts"] - len(projection.attempts),
-                "omitted_failure_count": totals["failures"]
-                - len(projection.last_failures),
+                "omitted_failure_count": totals["failures"] - len(projection.last_failures),
                 "omitted_repair_count": totals["repairs"] - len(projection.repair_routes),
             }
         )
@@ -589,6 +632,16 @@ class PhaseHandoff:
         )
         selected = self._with_omission_counts(selected, totals=totals)
 
+        # Reporting needs the latest complete count basis before historical
+        # failures or large build facts spend the shared prompt budget.
+        if str(target_phase) == "report":
+            latest_stats = next((fact for fact in complete.facts if fact.key == "test.stats"), None)
+            if latest_stats is not None:
+                candidate = selected.model_copy(update={"facts": (latest_stats,)})
+                candidate = self._with_omission_counts(candidate, totals=totals)
+                if len(candidate.to_prompt_text()) <= char_budget:
+                    selected = candidate
+
         categories = (
             ("blockers", active_blockers, "blockers"),
             ("last_failures", complete.last_failures, "failures"),
@@ -596,19 +649,16 @@ class PhaseHandoff:
             ("attempts", complete.attempts, "attempts"),
             ("repair_routes", complete.repair_routes, "repairs"),
         )
-        budget_exhausted = False
         for field_name, entries, cap_name in categories:
             for entry in entries[: _INLINE_CAPS[cap_name]]:
                 current = tuple(getattr(selected, field_name))
+                if entry in current:
+                    continue
                 candidate = selected.model_copy(update={field_name: (*current, entry)})
                 candidate = self._with_omission_counts(candidate, totals=totals)
                 if len(candidate.to_prompt_text()) <= char_budget:
                     selected = candidate
                     continue
-                budget_exhausted = True
-                break
-            if budget_exhausted:
-                break
         return selected
 
     def materialize(self) -> HandoffProjection:

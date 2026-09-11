@@ -5,6 +5,7 @@ This tool allows agents to search and retrieve full outputs that were truncated
 in the context files.
 """
 
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,7 @@ from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
 from sag.tools.base import BaseTool, ToolError, ToolResult
+from sag.tools.output_paging import read_text_page, render_text_page
 
 
 class OutputSearchTool(BaseTool):
@@ -49,6 +51,12 @@ class OutputSearchTool(BaseTool):
         limit: int = 10,
         show_line_numbers: bool = False,
         extreme: bool = False,
+        start_line: int = 0,
+        end_line: Optional[int] = None,
+        column_offset: int = 0,
+        max_chars: int = 20_000,
+        offset: int = 0,
+        ignore_case: bool = False,
     ) -> ToolResult:
         """
         Execute intelligent output search operations.
@@ -58,7 +66,7 @@ class OutputSearchTool(BaseTool):
                 - 'search': Search for outputs and show preview (first/last 100 chars)
                 - 'preview': Show first N and last M lines of an output
                 - 'grep': Search within output using pattern with context lines
-                - 'retrieve': Get output (auto-truncates to 8000 chars, or 12000 with extreme=True)
+                - 'retrieve': Read an output page with explicit continuation parameters.
                 - 'list': List available outputs with metadata
             ref_id: Reference ID for specific output operations
             pattern: Regex pattern to search across all outputs (for 'search' action)
@@ -70,7 +78,13 @@ class OutputSearchTool(BaseTool):
             tool_name: Filter by tool name
             limit: Maximum number of search results or grep matches
             show_line_numbers: Whether to show line numbers in output
-            extreme: For 'retrieve' action, allow up to 12000 chars instead of 8000 (use cautiously)
+            extreme: Legacy compatibility parameter; use max_chars to set page size.
+            start_line: Zero-based starting line for retrieve.
+            end_line: Exclusive ending line for retrieve.
+            column_offset: Character offset within the starting line for retrieve.
+            max_chars: Read page size, capped at 100000 characters.
+            offset: Number of matching lines to skip for grep.
+            ignore_case: Whether grep ignores case.
 
         Returns:
             ToolResult with search results or retrieved output
@@ -79,14 +93,27 @@ class OutputSearchTool(BaseTool):
 
         try:
             if action == "retrieve":
-                return self._retrieve_output(ref_id, extreme=extreme)
+                return self._retrieve_output(
+                    ref_id,
+                    extreme=extreme,
+                    start_line=start_line,
+                    end_line=end_line,
+                    column_offset=column_offset,
+                    max_chars=max_chars,
+                )
             elif action == "search":
                 return self._search_outputs(pattern, task_id, tool_name, limit)
             elif action == "preview":
                 return self._preview_output(ref_id, head_lines, tail_lines, show_line_numbers)
             elif action == "grep":
                 return self._grep_output(
-                    ref_id, grep_pattern, context_lines, limit, show_line_numbers
+                    ref_id,
+                    grep_pattern,
+                    context_lines,
+                    limit,
+                    show_line_numbers,
+                    offset=offset,
+                    ignore_case=ignore_case,
                 )
             elif action == "list":
                 return self._list_outputs(task_id, tool_name, limit)
@@ -121,8 +148,17 @@ class OutputSearchTool(BaseTool):
                 retryable=False,
             )
 
-    def _retrieve_output(self, ref_id: Optional[str], extreme: bool = False) -> ToolResult:
-        """Retrieve a specific output by reference ID with smart truncation."""
+    def _retrieve_output(
+        self,
+        ref_id: Optional[str],
+        extreme: bool = False,
+        *,
+        start_line: int = 0,
+        end_line: Optional[int] = None,
+        column_offset: int = 0,
+        max_chars: int = 20_000,
+    ) -> ToolResult:
+        """Return a lossless page, including continuation within a long line."""
         if not ref_id:
             raise ToolError(
                 message="Reference ID is required for retrieve action",
@@ -133,38 +169,36 @@ class OutputSearchTool(BaseTool):
             )
 
         output = self.storage_manager.retrieve_output(ref_id)
-        if output:
-            original_length = len(output)
-            # Apply smart truncation
-            max_chars = 12000 if extreme else 8000
-            if len(output) > max_chars:
-                # Truncate intelligently at line boundaries
-                lines = output.split("\n")
-                truncated = []
-                current_length = 0
-
-                # Try to include complete lines
-                for line in lines:
-                    if current_length + len(line) + 1 > max_chars:
-                        break
-                    truncated.append(line)
-                    current_length += len(line) + 1
-
-                output = "\n".join(truncated)
-                truncation_note = f"\n\n[Output truncated to {max_chars} chars. Original: {original_length} chars]"
-                output += truncation_note
-
-            return ToolResult.completed_success(
-                output=f"📄 Full output for {ref_id}:\n\n{output}",
-                metadata={
-                    "original_length": original_length,
-                    "truncated": original_length > max_chars,
-                },
-            )
-        else:
+        if output is None:
             return ToolResult.completed_failure(
                 output=f"No output found with reference ID: {ref_id}"
             )
+        try:
+            page = read_text_page(StringIO(output), start_line, end_line, column_offset, max_chars)
+        except ValueError as exc:
+            raise ToolError(
+                str(exc), category="validation", error_code="INVALID_READ_RANGE"
+            ) from exc
+        path = self.storage_manager.materialize_output(ref_id)
+        metadata = {
+            "output_page": True,
+            "source_ref": ref_id,
+            **{key: value for key, value in page.items() if key != "text"},
+        }
+        if path:
+            metadata.update(
+                output_path=path,
+                output_path_ref=ref_id,
+                output_path_scope="container" if self.orchestrator else "host",
+                stored_chars=len(output),
+                stored_bytes=len(output.encode("utf-8")),
+            )
+        return ToolResult.completed_success(
+            output=f"Output page for {ref_id}:\n\n" + render_text_page(page, {"target": ref_id}),
+            raw_output=output,
+            output_ref=ref_id,
+            metadata=metadata,
+        )
 
     def _search_outputs(
         self, pattern: Optional[str], task_id: Optional[str], tool_name: Optional[str], limit: int
@@ -284,6 +318,9 @@ class OutputSearchTool(BaseTool):
         context_lines: int = 2,
         limit: int = 10,
         show_line_numbers: bool = True,
+        *,
+        offset: int = 0,
+        ignore_case: bool = False,
     ) -> ToolResult:
         """Search within a specific output with grep-like functionality."""
         if not ref_id:
@@ -305,7 +342,7 @@ class OutputSearchTool(BaseTool):
             )
 
         output = self.storage_manager.retrieve_output(ref_id)
-        if not output:
+        if output is None:
             return ToolResult.completed_failure(
                 output=f"No output found with reference ID: {ref_id}"
             )
@@ -313,7 +350,7 @@ class OutputSearchTool(BaseTool):
         try:
             import re
 
-            regex = re.compile(grep_pattern, re.IGNORECASE | re.MULTILINE)
+            regex = re.compile(grep_pattern, re.MULTILINE | (re.IGNORECASE if ignore_case else 0))
         except re.error as e:
             raise ToolError(
                 message=f"Invalid regex pattern: {e}",
@@ -325,22 +362,39 @@ class OutputSearchTool(BaseTool):
 
         lines = output.split("\n")
         matches = []
+        total_matches = 0
+        if offset < 0 or limit < 1 or context_lines < 0:
+            raise ToolError(
+                "offset/context_lines must be nonnegative and limit positive",
+                category="validation",
+                error_code="INVALID_SEARCH_RANGE",
+            )
 
         # Find all matching lines with their line numbers
         for i, line in enumerate(lines):
             if regex.search(line):
-                matches.append(i)
-                if len(matches) >= limit:
-                    break
+                if offset <= total_matches < offset + limit:
+                    matches.append(i)
+                total_matches += 1
 
         if not matches:
             return ToolResult.completed_success(
-                output=f"No matches found for pattern '{grep_pattern}' in {ref_id}"
+                output=f"No matches at offset {offset} for '{grep_pattern}' in {ref_id}; total matches: {total_matches}",
+                raw_output=output,
+                output_ref=ref_id,
+                metadata={
+                    "source_ref": ref_id,
+                    "total_matches": total_matches,
+                    "matches_shown": 0,
+                    "next_offset": None,
+                },
             )
 
         # Build result with context lines
         result_lines = [f"🔍 Grep results for '{grep_pattern}' in {ref_id}:"]
-        result_lines.append(f"Found {len(matches)} matches (showing up to {limit}):\n")
+        result_lines.append(
+            f"Found {total_matches} matches; showing {offset + 1}-{offset + len(matches)}:\n"
+        )
 
         shown_lines = set()
         for match_idx in matches:
@@ -363,76 +417,27 @@ class OutputSearchTool(BaseTool):
                         result_lines.append(f"{line_marker} {lines[i]}")
 
         # Add summary
-        if len(matches) > limit:
-            result_lines.append(f"\n... ({len(matches) - limit} more matches not shown)")
+        next_offset = offset + len(matches)
+        if next_offset < total_matches:
+            result_lines.append(
+                f"\nNext search: search(target={ref_id!r}, pattern={grep_pattern!r}, "
+                f"offset={next_offset}, max_results={limit}, ignore_case={ignore_case!r}, "
+                f"context_lines={context_lines})"
+            )
 
         return ToolResult.completed_success(
             output="\n".join(result_lines),
+            raw_output=output,
+            output_ref=ref_id,
             metadata={
-                "total_matches": len(matches),
-                "matches_shown": min(len(matches), limit),
+                "source_ref": ref_id,
+                "total_matches": total_matches,
+                "matches_shown": len(matches),
                 "context_lines": context_lines,
+                "next_offset": next_offset if next_offset < total_matches else None,
             },
         )
 
     def get_parameter_schema(self) -> Dict[str, Any]:
-        """Return the parameter schema for function calling."""
-        return {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["search", "retrieve", "preview", "grep", "list"],
-                    "description": "The action to perform: search (find outputs), retrieve (get full), preview (head/tail), grep (search within), list (show all)",
-                    "default": "search",
-                },
-                "ref_id": {
-                    "type": "string",
-                    "description": "Reference ID for specific output operations (required for retrieve/preview/grep)",
-                },
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex pattern to search across all outputs (for 'search' action)",
-                },
-                "grep_pattern": {
-                    "type": "string",
-                    "description": "Regex pattern to search within a specific output (for 'grep' action)",
-                },
-                "context_lines": {
-                    "type": "integer",
-                    "description": "Number of lines before and after matches to show (like grep -C)",
-                    "default": 2,
-                },
-                "head_lines": {
-                    "type": "integer",
-                    "description": "Number of lines from beginning to show (for 'preview' action)",
-                    "default": 50,
-                },
-                "tail_lines": {
-                    "type": "integer",
-                    "description": "Number of lines from end to show (for 'preview' action)",
-                    "default": 50,
-                },
-                "task_id": {"type": "string", "description": "Filter by task ID"},
-                "tool_name": {
-                    "type": "string",
-                    "description": "Filter by tool name (e.g., 'maven', 'gradle', 'bash')",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of search results or grep matches",
-                    "default": 10,
-                },
-                "show_line_numbers": {
-                    "type": "boolean",
-                    "description": "Whether to show line numbers in output",
-                    "default": False,
-                },
-                "extreme": {
-                    "type": "boolean",
-                    "description": "For 'retrieve' action, allow up to 12000 chars instead of 8000 (use cautiously)",
-                    "default": False,
-                },
-            },
-            "required": [],
-        }
+        """Expose the same arguments the implementation accepts."""
+        return self._parameter_schema

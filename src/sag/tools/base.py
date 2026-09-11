@@ -1035,24 +1035,17 @@ class BaseTool(ABC):
 
     @staticmethod
     def _truncation_guidance(output_ref: Optional[str]) -> str:
-        """How to read the part of the output the window omitted.
-
-        The complete text is persisted as an OutputStorage `output_<id>`
-        reference, which lives outside the container filesystem: `grep` and
-        `bash` cannot reach it, and the `search` tool is the only surface that
-        can. Naming a tool with nothing to read is what cost the 2026-07-27
-        commons-cli run seven actions of hand-reconstruction; naming a tool
-        the model cannot route to is the #19 defect class (#30).
-        """
+        """How to read the part of the output the window omitted."""
         if output_ref:
             return (
                 f"💡 The complete output is stored as '{output_ref}'. Read the omitted "
                 f"middle with search(target='{output_ref}', pattern='Tests run') — "
-                "substitute the pattern you need, or omit pattern for the whole log.\n\n"
+                "substitute the pattern you need, or omit pattern for a page of the log. "
+                "Use the returned continuation parameters to read further.\n\n"
             )
         return (
-            "💡 This result carries no stored output reference, so the omitted middle "
-            "cannot be retrieved — rerun the command with a narrower scope if you need it.\n\n"
+            "💡 The preview omits part of the output; use the full output reference "
+            "in the result envelope when available.\n\n"
         )
 
     def _truncate_output(
@@ -1317,6 +1310,7 @@ class BaseTool(ABC):
         import time
 
         start_time = time.time()
+        result = None
 
         try:
             logger.info(f"Executing tool: {self.name}")
@@ -1326,9 +1320,28 @@ class BaseTool(ABC):
 
             result = self.execute(**kwargs)
 
+            # Preserve the tool's complete response before any presentation
+            # transform. Successful readers often have no raw_output of their
+            # own; otherwise the engine would persist only this layer's preview.
+            if result.raw_output is None:
+                result.raw_output = canonical_full_output_source(
+                    output=result.output, error=result.error
+                )
+
             # Apply output truncation if needed
-            if result.succeeded and result.output:
+            if result.output and not result.metadata.get("output_page"):
                 original_length = len(result.output)
+                binding = _DURABLE_OUTPUT_BINDING.get()
+                if original_length > self.max_output_length and binding is not None:
+                    from sag.agent.output_storage import attach_durable_output_ref
+
+                    result = attach_durable_output_ref(
+                        result,
+                        binding.storage,
+                        task_id=binding.task_id,
+                        tool_name=binding.tool_name,
+                        action=kwargs.get("action"),
+                    )
                 result.output = self._truncate_output(
                     result.output,
                     self.name,
@@ -1349,6 +1362,18 @@ class BaseTool(ABC):
             return result
 
         except OutputPersistenceError as exc:
+            if isinstance(result, ToolResult):
+                # Persistence failed after execute returned. Keep that execution
+                # distinguishable from a command which never ran.
+                exc.attach_draft(
+                    UnpersistedToolResult.from_failed_construction(
+                        invocation_status=result.invocation_status,
+                        operation_outcome=result.operation_outcome,
+                        evidence_status=result.evidence_status,
+                        payload=result.model_dump(mode="python"),
+                    )
+                )
+                exc.attach_actual_executions(result.execution_trace)
             raise exc.attach_invocation(self.name, kwargs)
 
         except ToolError as e:

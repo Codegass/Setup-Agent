@@ -339,6 +339,10 @@ def cli_command(manifest: dict, project: dict) -> list[str]:
         argv.extend(["--goal", project["goal"]])
     if project["variant"] == "candidate":
         argv.extend(["--ci-target-file", project["target_file"]])
+        if project.get("acceptance_command"):
+            argv.extend(["--acceptance-command", project["acceptance_command"]])
+        if project.get("acceptance_task_file"):
+            argv.extend(["--acceptance-task-file", project["acceptance_task_file"]])
     return argv
 
 
@@ -753,6 +757,23 @@ def stop_process(process: subprocess.Popen) -> None:
 
 
 def run_one(out: Path, manifest: dict, project: dict) -> dict:
+    task_hash = None
+    task_pin = None
+    if project.get("acceptance_task_file"):
+        from sag.agent.acceptance_task import load_acceptance_task
+
+        if project["variant"] != "candidate":
+            raise ValueError("The baseline does not support a required task file")
+        task_path = Path(project["acceptance_task_file"])
+        task_hash = digest(task_path)
+        if task_hash != project.get("acceptance_task_sha256"):
+            raise RuntimeError("Prepared acceptance task bytes changed")
+        task = load_acceptance_task(task_path)
+        if (task.repo, task.sha) != (project["repo"], project["sha"]):
+            raise RuntimeError("Prepared acceptance task subject differs")
+        task_pin = {"sha256": task.sha256, "definition": task.model_dump(mode="json")}
+    elif project.get("acceptance_task_sha256"):
+        raise RuntimeError("Prepared acceptance task file is missing")
     directory = out / "runs" / project["run_key"]
     result_path = directory / "result.json"
     if result_path.exists():
@@ -764,6 +785,7 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
             "variant": project["variant"],
             "sag_sha": manifest["sources"][project["variant"]]["sha"],
             "target_record_file_sha256": project["target_sha256"],
+            "acceptance_task_file_sha256": task_hash,
         }
         if any(previous.get(key) != value for key, value in expected.items()):
             raise RuntimeError("Existing result does not belong to this prepared attempt")
@@ -795,6 +817,15 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
         "production_ci_result_supported": project["variant"] == "candidate",
         "authority_ok": False,
     }
+    if task_hash is not None:
+        result["acceptance_task_file_sha256"] = task_hash
+        shutil.copyfile(project["acceptance_task_file"], directory / "acceptance-task.json")
+        # The child reads the archived bytes checked above, not a mutable
+        # external path. The run pin records the parsed definition as well.
+        if digest(directory / "acceptance-task.json") != task_hash:
+            raise RuntimeError("Acceptance task changed during archival")
+        flag = result["command"].index("--acceptance-task-file")
+        result["command"][flag + 1] = str(directory / "acceptance-task.json")
     save(directory / "started.json", result)
     event(out, "started", run_key=project["run_key"], container=project["container"])
     container_id = None
@@ -880,6 +911,11 @@ def run_one(out: Path, manifest: dict, project: dict) -> dict:
                     for key, value in expected_pin.items()
                     if not isinstance(pin, dict) or pin.get(key) != value
                 ]
+                if task_pin is not None and (
+                    not isinstance(pin, dict)
+                    or (pin.get("sanitized_config") or {}).get("acceptance_task") != task_pin
+                ):
+                    mismatches.append("acceptance_task")
                 if mismatches:
                     raise RuntimeError(
                         "Collected run pin differs from prepared values: " + ", ".join(mismatches)

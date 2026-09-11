@@ -630,6 +630,8 @@ def _session_detail(
         rates=item.get("rates") if isinstance(item.get("rates"), dict) else None,
         ci_comparison=item.get("ci_comparison"),
         ci_comparison_lines=item.get("ci_comparison_lines") or [],
+        task_completion=item.get("task_completion"),
+        task_completion_lines=item.get("task_completion_lines") or [],
         snapshot_status=summary.snapshot_status,
         legacy=summary.legacy,
         report_delivery_status=summary.report_delivery_status,
@@ -972,8 +974,10 @@ def _setup_artifact_item(
         rates = None
 
     from sag.agent.ci_comparison import render_ci_comparison_lines
+    from sag.agent.acceptance_task import render_task_completion_lines
 
     comparison = snapshot.ci_comparison if snapshot is not None else None
+    task_completion = snapshot.task_completion if snapshot is not None else None
     return {
         "id": session_id,
         "workspace": workspace_id,
@@ -984,6 +988,8 @@ def _setup_artifact_item(
         "rates": rates,
         "ci_comparison": comparison.model_dump(mode="json") if comparison else None,
         "ci_comparison_lines": render_ci_comparison_lines(comparison),
+        "task_completion": task_completion.model_dump(mode="json") if task_completion else None,
+        "task_completion_lines": render_task_completion_lines(task_completion),
         "snapshot_status": snapshot_status,
         "legacy": legacy,
         "verdict_source": verdict_source,

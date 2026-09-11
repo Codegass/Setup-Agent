@@ -1,0 +1,43 @@
+{
+  "source_audit": "logs/verification-23-20260910/rocketmq-report-handoff-audit-v1.json",
+  "source_sha256": "f3c8d064d2bf2ccc2d8eebe9e5bf3bf793c7f1cd3ab6c088c18f8a967e290aff",
+  "request_window_turn_sequence": 388,
+  "source_component_refs": [
+    "output_8e7dee8de904",
+    "output_08edc95af86a"
+  ],
+  "test_stats": {
+    "collection_errors": 0,
+    "collection_errors_skipped": 0,
+    "conflicts": [],
+    "denominator_basis": "complete",
+    "discovered": 3487,
+    "driven_modules": [
+      "/workspace/rocketmq"
+    ],
+    "execution_reason": "bound test tasks completed with assessed runtime outcomes",
+    "execution_receipt_ids": [
+      "inv-maven-1-9097f88d48ba-0002"
+    ],
+    "execution_state": "completed",
+    "flaky_count": 0,
+    "raw": {
+      "errors": 0,
+      "executed": 3220,
+      "failed": 0,
+      "passed": 3201,
+      "skipped": 19
+    },
+    "receipt_scoped": true,
+    "test_modules": [
+      "/workspace/rocketmq"
+    ],
+    "unique": {
+      "errors": 0,
+      "executed": 3220,
+      "failed": 0,
+      "passed": 3201,
+      "skipped": 19
+    }
+  }
+}

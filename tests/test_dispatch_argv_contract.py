@@ -102,9 +102,9 @@ def test_a_scoped_selection_of_one_default_task_leaves_the_others_alone():
 
 def test_an_excluded_task_is_not_read_as_a_selection():
     """`-x test` is the option's value, not the caller naming work to run —
-    the packaging contract's own exclusion must not eat the verb's task."""
+    the caller's explicit exclusion must not eat the verb's task."""
     backend = _gradle_backend()
-    params = backend.materialize("package", "--info", "/workspace/proj", None)
+    params = backend.materialize("package", "--info -x test", "/workspace/proj", None)
 
     assert params["gradle_args"] == "--info -x test"
     assert shlex.split(_physical_gradle(params)) == [

@@ -59,7 +59,16 @@ def test_ref_target_without_pattern_retrieves_the_stored_output():
     result = tool.execute(target="output_5b9a")
 
     assert result.succeeded and "stored output body" in result.output
-    assert recorder.calls == [{"action": "retrieve", "ref_id": "output_5b9a"}]
+    assert recorder.calls == [
+        {
+            "action": "retrieve",
+            "ref_id": "output_5b9a",
+            "start_line": 0,
+            "end_line": None,
+            "column_offset": 0,
+            "max_chars": 20_000,
+        }
+    ]
 
 
 def test_ref_target_with_pattern_still_greps():
@@ -82,17 +91,15 @@ def test_legacy_alias_preserves_retrieve_intent():
     land on the retrieve path, not on a silent grep-all-lines downgrade."""
     from sag.agent.tool_parameters import ToolParameterNormalizer
 
-    normalizer = ToolParameterNormalizer(
-        tools={}, successful_states={}, repository_url=""
-    )
+    normalizer = ToolParameterNormalizer(tools={}, successful_states={}, repository_url="")
     name, params = normalizer.resolve_legacy_alias(
         "output_search", {"action": "retrieve", "ref_id": "output_5b9a"}
     )
     assert name == "search"
     assert params["target"] == "output_5b9a"
-    assert not params.get("pattern"), (
-        "retrieve intent must map to the no-pattern retrieve, not pattern='.'"
-    )
+    assert not params.get(
+        "pattern"
+    ), "retrieve intent must map to the no-pattern retrieve, not pattern='.'"
 
     name, params = normalizer.resolve_legacy_alias(
         "output_search",

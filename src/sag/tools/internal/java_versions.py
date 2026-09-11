@@ -231,11 +231,53 @@ def java_requirement_candidate(
     return str(candidate)
 
 
-def maven_java_requirements(poms: list[tuple[str, str]]) -> Dict[str, Any]:
+def _profile_declares_java_requirement(profile: ET.Element) -> bool:
+    """Track conditional Java declarations, not merely a compiler plugin name.
+
+    A profile that only changes testIncludes does not declare another Java
+    version. Conversely Maven compiler properties can override a version even
+    when the profile contains no plugin element. Plugin execution and plugin
+    dependency compatibility remain the native runner's responsibility.
+    """
+    compiler_options = {
+        "release",
+        "source",
+        "target",
+        "testRelease",
+        "testSource",
+        "testTarget",
+        "jdkToolchain",
+        "executable",
+        "fork",
+        "compilerId",
+        "compilerVersion",
+        "compilerArgs",
+        "compilerArgument",
+        "compilerArguments",
+    }
+    properties = {"java.version"} | {"maven.compiler." + key for key in compiler_options}
+    if any(element.tag in properties for element in profile.findall("./properties/*")):
+        return True
+    if any(True for _ in profile.iter("requireJavaVersion")):
+        return True
+    return any(
+        plugin.findtext("artifactId") == "maven-toolchains-plugin"
+        or (
+            plugin.findtext("artifactId") == "maven-compiler-plugin"
+            and any(element.tag in compiler_options for element in plugin.iter())
+        )
+        for plugin in profile.iter("plugin")
+    )
+
+
+def maven_java_requirements(
+    poms: list[tuple[str, str]], *, disabled_profiles: frozenset[str] = frozenset()
+) -> Dict[str, Any]:
     """Preserve declared runtime bounds and compiler requirements with their source.
 
-    This does not evaluate Maven profiles, remote parents, toolchain selection,
-    or arbitrary interpolation. Such inputs remain explicit unresolved facts.
+    Only explicit profile deactivation supplied by the caller is resolved.
+    Other activation, remote parents, toolchain selection and arbitrary
+    interpolation remain explicit unresolved facts.
     """
     result: Dict[str, Any] = {
         "runtime": [],
@@ -252,18 +294,38 @@ def maven_java_requirements(poms: list[tuple[str, str]]) -> Dict[str, Any]:
             continue
         for element in root.iter():
             element.tag = element.tag.rsplit("}", 1)[-1]
+        profiles = root.find("./profiles")
+        if profiles is not None:
+            for profile in list(profiles):
+                if (profile.findtext("id") or "").strip() in disabled_profiles:
+                    profiles.remove(profile)
+        # Resolve only one local, unconditional literal property. This covers
+        # <release>${javaVersion}</release> without implementing Maven's model
+        # interpolation or guessing which profile/parent supplies a value.
+        properties = {}
+        ambiguous = set()
+        for element in root.findall("./properties/*"):
+            if element.tag in properties:
+                ambiguous.add(element.tag)
+            properties[element.tag] = (element.text or "").strip()
+        ambiguous.update(element.tag for element in root.findall("./profiles/profile/properties/*"))
+
+        def local_literal(value):
+            match = re.fullmatch(r"\$\{([^{}]+)\}", value)
+            if match and match[1] not in ambiguous:
+                literal = properties.get(match[1], "")
+                if literal and "${" not in literal:
+                    return literal
+            return value
+
         for rule in root.iter("requireJavaVersion"):
             raw = (rule.findtext("version") or "").strip()
             if raw:
                 result["runtime"].append(
-                    {"constraint": raw, "source": f"{location}:requireJavaVersion"}
+                    {"constraint": local_literal(raw), "source": f"{location}:requireJavaVersion"}
                 )
         for profile in root.findall("./profiles/profile"):
-            if any(True for _ in profile.iter("requireJavaVersion")) or any(
-                plugin.findtext("artifactId")
-                in {"maven-compiler-plugin", "maven-toolchains-plugin"}
-                for plugin in profile.iter("plugin")
-            ):
+            if _profile_declares_java_requirement(profile):
                 result["unresolved"].append(
                     f"{location}:profile_activation:{profile.findtext('id') or 'unknown'}"
                 )
@@ -288,7 +350,7 @@ def maven_java_requirements(poms: list[tuple[str, str]]) -> Dict[str, Any]:
                     if "." in tag
                     else [element for plugin in compiler_plugins for element in plugin.iter(tag)]
                 )
-                values = [(element.text or "").strip() for element in elements]
+                values = [local_literal((element.text or "").strip()) for element in elements]
                 value = next((value for value in values if names_bare_java_major(value)), None)
                 if value:
                     result["compiler_release"] = java_major(value)

@@ -192,12 +192,11 @@ class PhaseTransitionPolicy:
         self,
         repair_guard: RepairRecurrenceGuard | None = None,
         *,
-        require_analysis_plan: bool = True,
+        require_analysis_plan: bool = False,
     ):
         self.repair_guard = repair_guard
-        # Historical control streams predate model-authored Analyze plans.
-        # Live runs default to the new invariant; replay opts out explicitly
-        # and still verifies the transition facts recorded by those streams.
+        # Plans are guidance, not permission to attempt a surveyed project.
+        # The explicit strict option remains for historical transition replay.
         self.require_analysis_plan = bool(require_analysis_plan)
         self._default_repair_guards: dict[int, tuple[RunEvidenceState, LoopMemory]] = {}
 

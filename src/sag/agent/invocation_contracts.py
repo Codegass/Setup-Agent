@@ -395,7 +395,19 @@ def validate_execution_binding(
         if executor == "python":
             raise ValueError("Python requires the python_facade_v1 semantic binding")
         if not _text(expected_argv):
-            raise ValueError("argv_v1 requires a non-empty expected_argv")
+            # Empty argv is a known vector only for an explicit zero-argument
+            # command. Absent legacy predictions still carry no authority.
+            from sag.tools.build.backends import parse_runner_command
+
+            params = requested_call.get("params") or {}
+            command = params.get("command")
+            if executor == "bash" and isinstance(command, str):
+                tokens = shlex.split(command)
+                zero_arguments = len(tokens) == 1 and shlex.join(tokens) == command
+            else:
+                zero_arguments = bool(command) and not parse_runner_command(command)[2]
+            if expected_argv != "" or not zero_arguments:
+                raise ValueError("argv_v1 requires an explicit expected_argv")
         return binding
 
     if _text(expected_argv):
@@ -407,7 +419,7 @@ def validate_execution_binding(
     params = requested_call.get("params")
     if not isinstance(params, Mapping):
         raise ValueError("python_facade_v1 requested params are invalid")
-    operation = python_operation_for_public_action(params.get("action"))
+    operation = python_operation_for_public_action(_public_build_action(params))
     if operation is None or operation != _text(effective_action):
         raise ValueError("python_facade_v1 action does not map to its effective operation")
     # Maven-only state cannot be silently ignored by a Python dispatch.
@@ -503,25 +515,40 @@ def _canonical_contract_text_list(value: Any, field: str) -> List[str]:
     return canonical
 
 
+def _public_build_action(params: Mapping[str, Any]) -> Any:
+    """Derive routing metadata without altering the frozen public invocation."""
+    if params.get("command") is not None:
+        from sag.tools.build.backends import parse_complete_command
+
+        return parse_complete_command(params)[1]
+    return params.get("action")
+
+
 def _derived_contract_observations(
     requested_call: Mapping[str, Any],
     execution_binding: str,
+    effective_tool: Optional[str] = None,
 ) -> List[str]:
-    if requested_call.get("tool") != "build":
+    if requested_call.get("tool") != "build" and not (
+        requested_call.get("tool") == "bash" and effective_tool in {"maven", "gradle"}
+    ):
         return []
     params = requested_call.get("params")
-    action = params.get("action") if isinstance(params, Mapping) else None
+    action = _public_build_action(params) if isinstance(params, Mapping) else None
     return expected_observations(action, execution_binding)
 
 
 def _derived_contract_falsifiers(
     requested_call: Mapping[str, Any],
     execution_binding: str,
+    effective_tool: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    if requested_call.get("tool") != "build":
+    if requested_call.get("tool") != "build" and not (
+        requested_call.get("tool") == "bash" and effective_tool in {"maven", "gradle"}
+    ):
         return []
     params = requested_call.get("params")
-    action = params.get("action") if isinstance(params, Mapping) else None
+    action = _public_build_action(params) if isinstance(params, Mapping) else None
     return direct_falsifiers(action, execution_binding)
 
 
@@ -589,7 +616,7 @@ def build_contract(
 
     argv = (
         _canonical_contract_text(expected_argv, "expected_argv")
-        if expected_argv is not None
+        if expected_argv is not None and expected_argv != ""
         else ""
     )
     runtime_binding = _effective_jdk(effective_jdk)
@@ -671,11 +698,12 @@ def build_contract(
         expected_argv=argv,
         supporting_claim_ids=supporting,
     )
-    if argv:
+    if argv or (execution_binding == ARGV_EXECUTION_BINDING and exact_params.get("command")):
         contract["expected_argv"] = argv
     derived_observations = _derived_contract_observations(
         requested_call,
         contract["execution_binding"],
+        contract["effective_tool"],
     )
     if expected_observations is None:
         observations = derived_observations
@@ -690,6 +718,7 @@ def build_contract(
     derived_predicates = _derived_contract_falsifiers(
         requested_call,
         contract["execution_binding"],
+        contract["effective_tool"],
     )
     if direct_falsifiers is None:
         predicates = derived_predicates
@@ -990,7 +1019,11 @@ def freeze_contract(
     assessor compares against the promise.
     """
     fact = _domain_fact(requirements, expected_cwd)
-    action = (params or {}).get("action")
+    action = (
+        _public_build_action(params or {})
+        if tool == "build" or (tool == "bash" and effective_tool in {"maven", "gradle"})
+        else None
+    )
     try:
         contract = build_contract(
             run_id=run_id,
@@ -1067,6 +1100,8 @@ def compliance_class(
     """
     expected = _tokens(expected_argv)
     dispatched = _tokens(actual_argv)
+    if expected_argv == "" and dispatched and len(dispatched) == 1:
+        return "exact"
     if not expected or not dispatched:
         return None
     actual = dispatched[1:]
@@ -1261,7 +1296,7 @@ def python_facade_dispatch_matches(
     params = requested.get("params") if isinstance(requested, Mapping) else None
     if not isinstance(params, Mapping) or not isinstance(internal_params, Mapping):
         return False
-    expected_operation = python_operation_for_public_action(params.get("action"))
+    expected_operation = python_operation_for_public_action(_public_build_action(params))
     actual_operation = _text(operation).lower()
     if (
         expected_operation != actual_operation
@@ -1283,6 +1318,10 @@ def python_facade_dispatch_matches(
     if _normalized_root(actual.get("working_directory")) != actual_cwd:
         return False
     public_args = params.get("args")
+    if params.get("command"):
+        from sag.tools.build.backends import parse_runner_command
+
+        public_args = shlex.join(parse_runner_command(params["command"])[2]) or None
     if actual.get("args") != public_args:
         return False
     # The public schema's optional timeout may arrive as an explicit JSON null
@@ -1424,19 +1463,40 @@ def _validate_v2_contract_shape(
     cwd = _canonical_contract_text(contract.get("expected_cwd"), "expected_cwd")
     if not cwd.startswith("/") or posixpath.normpath(cwd) != cwd:
         raise ValueError("invocation contract expected_cwd must be an absolute canonical path")
-    if "expected_argv" in contract:
+    if "expected_argv" in contract and not (
+        contract["expected_argv"] == "" and params.get("command")
+    ):
         _canonical_contract_text(contract.get("expected_argv"), "expected_argv")
 
-    if requested_tool == "build":
+    if requested_tool == "build" or (
+        requested_tool == "bash" and effective_tool in {"maven", "gradle"}
+    ):
+        if requested_tool == "bash" and (
+            set(params) - {"command", "working_directory", "timeout", "environment"}
+            or not params.get("command")
+            or params.get("environment")
+        ):
+            raise ValueError(
+                "JVM shell contract must preserve a literal command with no discarded environment"
+            )
         action = _canonical_contract_text(
-            params.get("action"),
+            _public_build_action(params),
             "requested_call.params.action",
             lowercase=True,
         )
         if action not in PYTHON_PUBLIC_ACTION_TO_OPERATION and not (
-            action == "verify" and contract.get("effective_tool") == "maven"
+            (action == "verify" and contract.get("effective_tool") == "maven")
+            or (action == "run" and params.get("command"))
         ):
             raise ValueError("invocation contract public build action is not recognized")
+        if params.get("command"):
+            from sag.tools.build.backends import parse_runner_command
+
+            executor, _, argv = parse_runner_command(params["command"])
+            if executor != effective_tool:
+                raise ValueError("complete command executor differs from frozen contract")
+            if executor != "python" and shlex.split(contract.get("expected_argv") or "") != argv:
+                raise ValueError("complete command argv differs from frozen contract")
         public_cwd = params.get("working_directory")
         if public_cwd is not None:
             public_root = _canonical_contract_text(
@@ -1472,7 +1532,7 @@ def _validate_v2_contract_shape(
             _canonical_contract_text_list(contract.get(field), field)
 
     binding = _canonical_contract_text(contract.get("execution_binding"), "execution_binding")
-    derived_observations = _derived_contract_observations(requested, binding)
+    derived_observations = _derived_contract_observations(requested, binding, effective_tool)
     actual_observations = (
         _canonical_contract_text_list(
             contract.get("expected_observations"),
@@ -1484,7 +1544,7 @@ def _validate_v2_contract_shape(
     if actual_observations != derived_observations:
         raise ValueError("expected_observations differ from the shared action mapping")
 
-    derived_falsifiers = _derived_contract_falsifiers(requested, binding)
+    derived_falsifiers = _derived_contract_falsifiers(requested, binding, effective_tool)
     raw_falsifiers = contract.get("direct_falsifiers", [])
     if not isinstance(raw_falsifiers, list):
         raise ValueError("invocation contract direct_falsifiers must be a list")

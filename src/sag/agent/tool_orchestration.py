@@ -128,14 +128,24 @@ class ToolLifecycleEvent:
 def _format_maven_version_contract(result: ToolResult) -> str:
     metadata = result.metadata or {}
     requirement = metadata.get("maven_version_requirement")
-    if not requirement:
+    resolution_failure = result.error_code in {
+        "MAVEN_VERSION_NOT_RESOLVED",
+        "MAVEN_EXECUTABLE_NOT_RESOLVED",
+    }
+    if not requirement and not resolution_failure:
         return ""
 
-    lines = [
-        "",
-        "Maven version contract:",
-        f"Maven version requirement: {requirement.get('raw')} (source: {requirement.get('source', 'unknown')})",
-    ]
+    lines = ["", "Maven version contract:"]
+    if requirement:
+        lines.append(
+            f"Maven version requirement: {requirement.get('raw')} "
+            f"(source: {requirement.get('source', 'unknown')})"
+        )
+        if requirement.get("source") == "tool_parameter":
+            lines.append(
+                "This requirement came from this call's maven_version_requirement parameter; "
+                "the parameter itself does not establish a project requirement."
+            )
 
     runtime = metadata.get("maven_runtime") or {}
     if runtime.get("executable"):
@@ -143,8 +153,34 @@ def _format_maven_version_contract(result: ToolResult) -> str:
     if runtime.get("version"):
         lines.append(f"Current Maven version: {runtime['version']}")
 
-    if metadata.get("compatible_maven_candidate") is None:
+    registered = metadata.get("registered_maven") or {}
+    if registered:
+        lines.append(
+            f"Registered Maven without this call's requirement: "
+            f"{registered.get('version') or 'unknown version'} at "
+            f"{registered.get('executable') or 'unknown path'} "
+            f"(source: {registered.get('source', 'unknown')})"
+        )
+
+    if resolution_failure or (
+        "compatible_maven_candidate" in metadata and metadata["compatible_maven_candidate"] is None
+    ):
         lines.append("Compatible Maven candidate: none")
+
+    if resolution_failure:
+        # This is public tool syntax, not a selected version, command rewrite
+        # or ordered recovery recipe. Do not expose arbitrary suggestions.
+        lines.extend(
+            [
+                "Available Maven tool operations (arguments are chosen by the agent):",
+                "- project(action='provision', maven_version='<version floor>'): "
+                "install, activate and verify a supported Apache Maven distribution. "
+                "The installed version must still satisfy the required range.",
+                "- project(action='env', tool='maven', executable='<existing distribution>/bin/mvn', "
+                "requirement='<required range>', activate=True): verify and register an "
+                "existing distribution; this operation does not install missing files.",
+            ]
+        )
 
     return "\n".join(lines)
 
@@ -214,7 +250,12 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
             formatted += "\n" + "\n".join(evidence_lines)
 
         if result.output_ref:
-            formatted += f"\nFull output ref: {result.output_ref} (cite this ref as evidence)"
+            label = (
+                "Source output ref"
+                if result.metadata.get("source_ref") == result.output_ref
+                else "Full output ref"
+            )
+            formatted += f"\n{label}: {result.output_ref} (cite this ref as evidence)"
 
         # Add command information for bash tool
         if tool_name == "bash" and result.metadata and "command" in result.metadata:
@@ -263,11 +304,13 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         if visible_output and visible_output.strip():
             formatted += f"\n\n{visible_output}"
 
-        if tool_name in ("maven", "build"):
+        if tool_name in ("maven", "build") or (
+            tool_name == "bash" and result.metadata.get("system") == "maven"
+        ):
             formatted += _format_maven_version_contract(result)
 
         # A tool result is evidence, not a harness-authored repair plan.  The
-        # public schemas in the system prompt teach neutral syntax; after a
+        # public schemas and the Maven resolution projection teach neutral syntax; after a
         # rejected claim, RepairContext exposes facts, constraints, and action
         # kinds.  Result.suggestions remain in historical/UI records, but no
         # tool class may smuggle a selected next call into the model transcript.
@@ -289,6 +332,21 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         ):
             formatted += f"\n\nRaw output: {result.raw_output}"
 
+    path = result.metadata.get("output_path")
+    if path:
+        scope = result.metadata.get("output_path_scope", "container")
+        formatted += f"\nFull output file ({scope}): {path}"
+        formatted += f"\nStored output: {result.metadata.get('stored_chars')} chars"
+        if scope == "container":
+            formatted += "\nRead this file with file_io, or use bash with rg -n -C 3 or sed -n."
+        else:
+            formatted += "\nUse search with the output ref to read it; this is a host path."
+    elif result.metadata.get("output_file_unavailable"):
+        formatted += "\nPlain-text output file unavailable; use search with the output ref."
+    if result.metadata.get("log_path"):
+        formatted += f"\nJob log file (container): {result.metadata['log_path']}"
+        if result.invocation_status is InvocationStatus.PENDING:
+            formatted += "\nThis log is still growing; use file_io or bash to inspect it."
     return formatted
 
 

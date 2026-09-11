@@ -108,6 +108,26 @@ def test_a_later_build_result_cannot_finish_an_interrupted_summary():
     assert blocks[0].result is None
 
 
+def test_bundle_archive_messages_preserve_real_curator_reactor_scope():
+    from sag.metrics.ci_logs import modules_from_log
+    from sag.tools.internal.maven_tool import MavenTool, _reactor_receipt_fields
+
+    # Observed Curator 88dee99a log, 2026-09-10. The five Felix archive
+    # messages are not additional, unnumbered Maven project invocations.
+    text = (Path(__file__).parent / "fixtures/curator_bundle_reactor.txt").read_text()
+    fields = _reactor_receipt_fields(text)
+    assert "declared_omissions" not in fields
+    assert len(fields["module_outcomes"]) == 9
+    assert {row["status"] for row in fields["module_outcomes"]} == {"success"}
+    assert len(modules_from_log(text).modules) == 9
+    assert MavenTool(None)._analyze_maven_output(text, 0)["reactor_scope_issues"] == []
+
+    # A real extra project boundary must still invalidate the same scope.
+    text += "[INFO] Building Another Project 1.0\n"
+    assert _reactor_receipt_fields(text)["declared_omissions"]
+    assert modules_from_log(text).modules == ()
+
+
 @pytest.mark.parametrize("kind", ["prior_unfinished", "later_unfinished", "missing_row"])
 def test_ci_and_local_receipts_refuse_the_same_proven_boundary_gaps(kind):
     from sag.metrics.ci_logs import modules_from_log

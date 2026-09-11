@@ -45,6 +45,7 @@ from sag.agent.evidence_records import (
 )
 from sag.agent.receipt_structure import dispatch_terminated as _dispatch_terminated
 from sag.agent.receipt_structure import module_key as _receipt_module_key
+from sag.agent.receipt_test_rows import _SUREFIRE_RETRIES_SOURCE
 from sag.case_census import TestCensus, census_from_catalog_summary, produce_census
 from sag.config.settings import DEFAULT_BUILD_COVERAGE_THRESHOLD
 from sag.runtime.container_io import (
@@ -402,7 +403,7 @@ def name_and_param_id(value):
     return name, param_id
 
 
-def canonical_identity(classname, name, file_path=None):
+def canonical_identity(classname, name, file_path=None, module_coordinate=None):
     normalized_name, param_id = name_and_param_id(name)
     if not normalized_name:
         return None
@@ -417,6 +418,8 @@ def canonical_identity(classname, name, file_path=None):
     class_name = normalized_class.rsplit(".", 1)[-1] if normalized_class else ""
     if not class_name and normalized_file:
         class_name = normalized_file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if module_coordinate:
+        module_or_file = module_coordinate + "::" + module_or_file
     return (module_or_file, class_name, normalized_name, param_id)
 
 
@@ -448,6 +451,9 @@ def testcase_status(testcase):
     if "skipped" in child_names or testcase.get("status") == "skipped":
         return "skipped"
     return "passed"
+
+
+# SAG_SUREFIRE_RETRY_HELPER
 
 
 # Mirrors _collection_node_kind / _structured_error_line /
@@ -539,6 +545,7 @@ report_dirs = sorted({str(Path(path).parent) for path in scanned_files})
 # The partition runs over whatever the receipts claim, INCLUDING nothing at
 # all: an empty claim set makes every scanned report auxiliary.
 verified = set()
+verified_hashes = {}
 unverified = set()
 for claimed_path, claimed_hashes in receipt_claims.items():
     current = content_sha256(claimed_path)
@@ -547,10 +554,20 @@ for claimed_path, claimed_hashes in receipt_claims.items():
         continue
     if current in claimed_hashes:
         verified.add(claimed_path)
+        verified_hashes[claimed_path] = current
     else:
         unverified.add(claimed_path)
 unverified -= verified
 report_files = [path for path in scanned_files if path in verified]
+# Use one identity namespace for the whole primary report set. Partial row
+# metadata must not split two projections of the same case into qualified and
+# unqualified names. Without complete module evidence keep the legacy
+# diagnostic identity; the sealed row envelope owns any completeness claim.
+report_modules = globals().get("report_modules", {})
+module_identity_complete = bool(report_files) and all(
+    report_modules.get(path, {}).get(verified_hashes.get(path))
+    for path in report_files
+)
 auxiliary_files = [
     path for path in scanned_files if path not in verified and path not in unverified
 ]
@@ -617,6 +634,16 @@ def parse_report(report_file, errors=None):
     ]
     if testcases:
         cases = []
+        try:
+            retries = surefire_retries(xml_root)
+        except ValueError:
+            retries = {}
+            if str(report_file) in verified:
+                metrics_conflicts.add("surefire_retry_history_invalid")
+        module_coordinate = (
+            report_modules.get(str(report_file), {}).get(verified_hashes.get(str(report_file)))
+            if module_identity_complete else None
+        )
         collection_errors = 0
         collection_errors_skipped = 0
         collection_messages = {}
@@ -639,9 +666,23 @@ def parse_report(report_file, errors=None):
                 classname,
                 testcase.get("name"),
                 testcase.get("file"),
+                module_coordinate,
             )
             if identity:
-                cases.append((identity, testcase_status(testcase)))
+                status = testcase_status(testcase)
+                reruns = retries.get(id(testcase), 0)
+                # Retry tags describe earlier red executions, not extra
+                # logical cases. Keep their first/worst facts beside latest.
+                history_tags = [local_name(child) for child in testcase if local_name(child)
+                                in ("failure", "error", "flakyFailure", "flakyError",
+                                    "rerunFailure", "rerunError")]
+                first = status
+                worst = status
+                if reruns:
+                    first = "error" if history_tags[0] in ("error", "flakyError") else "failed"
+                    worst = "error" if any(tag in ("error", "flakyError", "rerunError")
+                                          for tag in history_tags) else "failed"
+                cases.append((identity, status, reruns, first, worst))
         return {
             "cases": cases,
             "suite_counts": None,
@@ -707,6 +748,7 @@ def add_suite_counts(counts, suite_counts):
 raw = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
 suite_only = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
 attempts = {}
+runner_histories = {}
 sources = {}
 collection_errors_total = 0
 collection_errors_skipped_total = 0
@@ -742,7 +784,7 @@ for report_file in report_files:
         if suite_counts["total"]:
             metrics_conflicts.add("test_identity_unavailable")
         continue
-    for identity, status in cases:
+    for identity, status, reruns, first, worst in cases:
         bump(raw, status)
         identity_attempts = attempts.setdefault(identity, {})
         identity_attempts[attempt_id] = (
@@ -751,6 +793,13 @@ for report_file in report_files:
             else status
         )
         sources.setdefault(identity, set()).add(report_file)
+        if reruns:
+            key = (identity, attempt_id)
+            previous = runner_histories.get(key)
+            runner_histories[key] = (
+                max(reruns, previous[0]), merge_status(first, previous[1]),
+                merge_status(worst, previous[2])
+            ) if previous else (reruns, first, worst)
 
 latest = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
 histories = []
@@ -761,12 +810,17 @@ for identity in sorted(attempts):
     identity_attempts = attempts[identity]
     attempt_ids = sorted(identity_attempts)
     statuses = [identity_attempts[attempt_id] for attempt_id in attempt_ids]
-    first = statuses[0]
+    first = runner_histories.get((identity, attempt_ids[0]), (0, statuses[0], statuses[0]))[1]
     current_latest = statuses[-1]
     worst = statuses[0]
     for status in statuses[1:]:
         worst = merge_status(worst, status)
     retries = max(len(attempt_ids) - 1, 0)
+    for attempt in attempt_ids:
+        native_history = runner_histories.get((identity, attempt))
+        if native_history:
+            retries += native_history[0]
+            worst = merge_status(worst, native_history[2])
     flaky = current_latest == "passed" and worst in ("failed", "error")
     bump(latest, current_latest)
     flaky_count += int(flaky)
@@ -812,7 +866,7 @@ def excluded_counts(files):
         if parsed["cases"] is None:
             add_suite_counts(counts, parsed["suite_counts"])
             continue
-        for identity, status in parsed["cases"]:
+        for identity, status, _reruns, _first, _worst in parsed["cases"]:
             bump(counts, status)
     counts["unparseable"] = len(unreadable)
     return counts
@@ -891,7 +945,7 @@ if unmeasured_files:
     result["unmeasured_test_reports"] = unmeasured_files[:200]
     result["unmeasured_test_stats"] = {"unparseable": len(unmeasured_files)}
 print(json.dumps(result, separators=(",", ":")))
-'''
+'''.replace("# SAG_SUREFIRE_RETRY_HELPER", _SUREFIRE_RETRIES_SOURCE)
 
 
 # --- pytest collection-node semantics (Plan 4 Task 2) -----------------------
@@ -2276,12 +2330,17 @@ class PhysicalValidator:
         partial module summary cannot satisfy it.
         """
 
-        from sag.agent.receipt_structure import maven_module_identity_ambiguous
+        from sag.agent.receipt_structure import (
+            maven_module_identity_ambiguous,
+            single_maven_module_proven,
+        )
 
         receipts = self._current_scoped_receipts(project_dir)
         if not receipts:
             return None
-        build_actions = {"compile", "package", "install"}
+        # Maven test/verify also compile. Completion still needs a current
+        # terminal receipt and actual output, not the lifecycle name alone.
+        build_actions = {"compile", "test", "package", "verify", "install"}
         candidates = [
             receipt
             for receipt in receipts
@@ -2296,6 +2355,29 @@ class PhysicalValidator:
             return None
         latest = max(candidates, key=self._receipt_sequence)
         outcomes = latest.get("module_outcomes")
+        if not outcomes:
+            from sag.agent.evidence_assessments import (
+                EXPECTATION_MET,
+                receipt_assessment_bundle_complete,
+            )
+
+            assessments = self._read_live_evidence_assessments()
+            if (
+                assessments is not None
+                and self._test_execution_contract(latest) is not None
+                and receipt_assessment_bundle_complete(latest, assessments)
+                and any(
+                    item.get("receipt_id") == latest.get("receipt_id")
+                    and item.get("typed_code") == EXPECTATION_MET
+                    for item in assessments
+                )
+                and not any(
+                    item.get("field") == "module_outcomes"
+                    for item in latest.get("evidence_omissions", ())
+                )
+                and single_maven_module_proven(self.docker_orchestrator, latest, project_dir)
+            ):
+                outcomes = [{"module": ".", "status": "success"}]
         if (
             latest.get("exit_code") != 0
             or str(latest.get("outcome") or "").strip().lower() != "completed"
@@ -2378,14 +2460,14 @@ class PhysicalValidator:
 
     def _test_execution_receipt_summary(self, project_dir: str) -> Dict[str, Any]:
         """Execution completion is independent of the outcome of project assertions."""
+        from sag.agent.evidence_assessments import receipt_assessment_bundle_complete
+
         from sag.agent.evidence_assessments import (
-            ASSESSMENT_BUNDLE_COMPLETE,
             BLOCKED_CLASS_CODES,
             DEVIATED_RECEIPT,
             EXECUTION_FAULT,
             EXPECTATION_MET,
             EXPECTATION_UNMET,
-            FINGERPRINT_KEYS,
             PREREQUISITE_EXECUTABLE_MISSING,
             PREREQUISITE_SERVICE_UNAVAILABLE,
             STALE_FINGERPRINT,
@@ -2405,10 +2487,10 @@ class PhysicalValidator:
                 continue
             receipt_id = str(receipt.get("receipt_id") or "")
             contract = self._test_execution_contract(receipt)
-            # The exact public call permits a repaired runtime/launcher while
-            # keeping cwd, args, profiles and selections fixed. A repair link
-            # alone cannot discharge a differently scoped task. Unbound records
-            # each remain visible and can never supersede a bound failure.
+            # A bound native argv fixes goals, profiles and test selections.
+            # The same task can move from Build to Test or between facades;
+            # phase labels and command spelling are not extra test scopes.
+            # Unbound records can never supersede a bound failure.
             key = ("unbound", receipt_id)
             if contract is not None:
                 key = (
@@ -2432,7 +2514,31 @@ class PhysicalValidator:
                     contract["expected_cwd"],
                 )
                 if contract.get("execution_binding") == "argv_v1":
-                    key += (self._test_argv_scope(receipt["tool"], receipt.get("argv", "")),)
+                    # Retain everything not represented by the bound argv/cwd:
+                    # in particular explicit environment and unknown options.
+                    native_params = {
+                        name: value
+                        for name, value in contract["requested_call"]["params"].items()
+                        if name
+                        not in {
+                            "action",
+                            "args",
+                            "command",
+                            "source_command",
+                            "system",
+                            "working_directory",
+                            "timeout",
+                        }
+                    }
+                    key = (
+                        contract["run_id"],
+                        contract.get("target_sha"),
+                        contract["effective_tool"],
+                        contract["effective_action"],
+                        contract["expected_cwd"],
+                        self._test_argv_scope(receipt["tool"], receipt.get("argv", "")),
+                        json.dumps(native_params, sort_keys=True, separators=(",", ":")),
+                    )
             latest[key] = (receipt, contract is not None)
         if not latest:
             return {"state": "unknown", "reason": "no current test receipt"}
@@ -2445,6 +2551,7 @@ class PhysicalValidator:
         unknown: List[str] = []
         completed: List[str] = []
         observed_rows = reported_executions = non_skipped = 0
+        counts_unavailable = False
         fault_codes = {
             *BLOCKED_CLASS_CODES,
             EXECUTION_FAULT,
@@ -2457,6 +2564,9 @@ class PhysicalValidator:
             observed_rows += sampled
             reported_executions += count
             non_skipped += attempted
+            rows_envelope = receipt.get("testcase_execution_rows") or {}
+            if not count and rows_envelope.get("status") != "complete":
+                counts_unavailable = True
             records = by_receipt.get(receipt_id, [])
             codes = {record.get("typed_code") for record in records}
             exit_code = receipt.get("exit_code")
@@ -2475,18 +2585,7 @@ class PhysicalValidator:
             if interrupted or codes.intersection(fault_codes) or prerequisite_failure:
                 failures.append(receipt_id)
                 continue
-            bundle_complete = any(
-                record.get("typed_code") == ASSESSMENT_BUNDLE_COMPLETE
-                and receipt.get("output_content_hash")
-                and record.get("scope") == receipt["output_content_hash"]
-                and record.get("fingerprints")
-                == {
-                    key: str(receipt[key]).strip()
-                    for key in FINGERPRINT_KEYS
-                    if receipt.get(key) is not None and str(receipt[key]).strip()
-                }
-                for record in records
-            )
+            bundle_complete = receipt_assessment_bundle_complete(receipt, records)
             if (
                 not bound
                 or assessments is None
@@ -2506,18 +2605,33 @@ class PhysicalValidator:
 
         result = {
             "receipt_ids": [str(receipt.get("receipt_id") or "") for receipt, _ in latest.values()],
+            # Dispatch and outcome completeness answer different questions.
+            # A bound terminal call already spent the attempt floor, even if
+            # mixed runner identities or missing diagnostics prevent grading.
+            "terminal_attempt_receipt_ids": [
+                str(receipt.get("receipt_id") or "")
+                for receipt, bound in latest.values()
+                if bound and _dispatch_terminated(receipt)
+            ],
             "interrupted_receipt_ids": failures,
             "unresolved_receipt_ids": unknown,
             "observed_rows": observed_rows,
-            "reported_executions": reported_executions,
+            "reported_executions": (
+                None if counts_unavailable and not reported_executions else reported_executions
+            ),
         }
         if failures:
+            count_detail = (
+                "receipt-bound testcase counts unavailable"
+                if counts_unavailable and not reported_executions
+                else f"{reported_executions:,} reported result(s) retained"
+            )
             return {
                 **result,
                 "state": "partial" if non_skipped else "failed",
                 "reason": (
                     "test execution did not complete: runner or prerequisite failure; "
-                    f"{reported_executions:,} reported result(s) retained"
+                    + count_detail
                 ),
             }
         if unknown:
@@ -2588,6 +2702,47 @@ class PhysicalValidator:
                         str(entry["sha256"]).strip().lower()
                     )
         return {path: sorted(digests) for path, digests in sorted(claims.items())}
+
+    @staticmethod
+    def _verified_report_modules(
+        receipt_records: List[Mapping[str, Any]],
+        primary_root: Optional[str],
+        *,
+        owner_receipt_ids: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Dict[str, str]]:
+        """Reuse sealed JVM module identity at the same report/hash boundary.
+
+        This carries one coordinate per report, never a second case list. A
+        The compact reader uses these coordinates only when every primary
+        report has one; absent or ambiguous metadata keeps the legacy
+        diagnostic identity instead of guessing a module from its path.
+        """
+        coordinates: Dict[tuple[str, str], set[str]] = {}
+        for receipt in receipt_records:
+            envelope = receipt.get("testcase_execution_rows") or {}
+            if (
+                receipt.get("tool") not in {"maven", "gradle"}
+                or envelope.get("status") != "complete"
+            ):
+                continue
+            claims = PhysicalValidator._verified_report_claims(
+                [receipt], primary_root, owner_receipt_ids=owner_receipt_ids
+            )
+            for row in envelope.get("rows") or ():
+                path, digest = row["report_path"], row["report_sha256"]
+                if digest not in claims.get(path, ()):
+                    continue
+                coordinate = json.dumps(
+                    [row["domain_id"], row["module_coordinate"]],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                coordinates.setdefault((path, digest), set()).add(coordinate)
+        result: Dict[str, Dict[str, str]] = {}
+        for (path, digest), values in coordinates.items():
+            if len(values) == 1:
+                result.setdefault(path, {})[digest] = next(iter(values))
+        return result
 
     def _attempted_module_evidence(
         self,
@@ -2931,6 +3086,9 @@ class PhysicalValidator:
                 "project_dir": project_dir,
                 "pytest_reports_dir": PYTEST_REPORT_DIR,
                 "receipt_claims": receipt_claims,
+                "report_modules": self._verified_report_modules(
+                    records, primary_root, owner_receipt_ids=owner_receipt_ids
+                ),
                 "primary_root": primary_root,
             },
             sort_keys=True,
@@ -2968,6 +3126,7 @@ class PhysicalValidator:
             "project_dir = parser_input['project_dir']\n"
             "pytest_reports_dir = parser_input['pytest_reports_dir']\n"
             "receipt_claims = parser_input['receipt_claims']\n"
+            "report_modules = parser_input['report_modules']\n"
             "primary_root = parser_input['primary_root']\n"
             f"{_COMPACT_REPORT_PARSER_BODY}\n"
             "PY"
@@ -4129,22 +4288,77 @@ class PhysicalValidator:
         logger.info(f"Build validation complete: {evidence_status.upper()} - {reason}")
         return result
 
+    def _java_requirements_for_invocation(self, manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Resolve explicit disabled profiles from a current, terminal receipt.
+
+        The static survey remains unchanged. Re-read only the pinned root POM
+        when it reproduces every surveyed Java fact; inherited or otherwise
+        unresolved inputs keep their original uncertainty.
+        """
+        requirements = manifest["java_requirements"]
+        if not isinstance(requirements, Mapping) or not requirements.get("unresolved"):
+            return requirements
+        survey = manifest.get("survey") or {}
+        root = survey.get("project_path")
+        fingerprint = survey.get("config_fingerprint")
+        if not root or not fingerprint or not survey.get("target_sha"):
+            return requirements
+        receipts = self._current_scoped_receipts(root)
+        candidates = [row for row in receipts or () if row.get("tool") == "maven"]
+        if not candidates:
+            return requirements
+        latest = max(candidates, key=self._receipt_sequence)
+        if (
+            not _dispatch_terminated(latest)
+            or latest.get("config_fingerprint") != fingerprint
+            or latest.get("target_sha") != survey["target_sha"]
+        ):
+            return requirements
+        selection = self._recorded_maven_profile_selection(
+            root,
+            receipt_records=[
+                {
+                    "tool": "maven",
+                    "command": latest.get("argv"),
+                    "working_dir": latest.get("actual_cwd") or latest.get("working_directory"),
+                }
+            ],
+        )
+        if not selection.disabled or selection.conflicts or selection.conservative:
+            return requirements
+        from sag.agent.physical_survey import config_fingerprint
+        from sag.runtime.container_io import read_container_text
+        from sag.tools.internal.java_versions import maven_java_requirements
+
+        if config_fingerprint(self.docker_orchestrator, root) != fingerprint:
+            return requirements
+        path = posixpath.join(root, "pom.xml")
+        content = read_container_text(self.docker_orchestrator, path, exact_bytes=True)
+        if content is None or len(content.encode("utf-8")) > 1024 * 1024:
+            return requirements
+        poms = [(content, path)]
+        if (
+            maven_java_requirements(poms) != requirements
+            or config_fingerprint(self.docker_orchestrator, root) != fingerprint
+        ):
+            return requirements
+        return maven_java_requirements(poms, disabled_profiles=selection.disabled)
+
     def _collect_env_conflicts(self) -> List[str]:
-        """jdk_mismatch / python_version_mismatch when the manifest's required
-        toolchain differs from the active one at validation time.
+        """Runtime conflicts use the same declared constraints as preflight.
 
         Report-only honesty signals (spec §4 + spec 2026-07-07 Component 4):
         provisioning failures degrade here instead of blocking the run. Empty
         when no requirement is known. python_version_mismatch is the exact
-        mirror of jdk_mismatch, with one PythonPreflight-aligned tolerance: an
-        active interpreter that satisfies the raw declared constraint is NOT a
-        mismatch even when it differs from the resolved-newest version.
+        A compiler release is not an exact JVM pin. A runtime satisfying the
+        declared Java/Python range is not a mismatch merely because it differs
+        from a resolved candidate or bytecode target.
         """
         conflicts: List[str] = []
         try:
             from sag.runtime.env_overlay import EnvOverlayStore
             from sag.tools.internal.build_preflight import (
-                active_java_major,
+                active_java_runtime,
                 read_live_build_requirements,
             )
             from sag.tools.internal.python_env import resolve_python_version
@@ -4159,9 +4373,35 @@ class PhysicalValidator:
             manifest = dict(manifest_read.payload)
 
             required_jdk = manifest.get("java_version")
-            if required_jdk:
-                active = active_java_major(self.docker_orchestrator)
-                if active and active != str(required_jdk):
+            requirements = manifest.get("java_requirements")
+            if isinstance(requirements, Mapping):
+                requirements = self._java_requirements_for_invocation(manifest)
+            if required_jdk or requirements is not None:
+                from sag.tools.internal.java_versions import (
+                    _java_version_tuple,
+                    java_constraint_matches,
+                    java_requirements_range,
+                )
+
+                runtime = active_java_runtime(self.docker_orchestrator)
+                source = str(manifest.get("java_version_source") or "")
+                if isinstance(requirements, Mapping):
+                    observed = (
+                        required_jdk if source.startswith(("runner", "persisted_dynamic")) else None
+                    )
+                    bound = java_requirements_range(dict(requirements), observed_major=observed)
+                    actual = _java_version_tuple(runtime.get("version"))
+                    if bound is None or actual is None or requirements.get("unresolved"):
+                        conflicts.append("build_requirements_unavailable")
+                    elif not bound.contains(actual):
+                        conflicts.append("jdk_mismatch")
+                elif source == "maven-enforcer":
+                    matches = java_constraint_matches(str(required_jdk), runtime.get("version"))
+                    if matches is None:
+                        conflicts.append("build_requirements_unavailable")
+                    elif not matches:
+                        conflicts.append("jdk_mismatch")
+                elif runtime.get("major") and runtime["major"] != str(required_jdk):
                     conflicts.append("jdk_mismatch")
 
             required_python = manifest.get("python_version")
@@ -5811,7 +6051,7 @@ class PhysicalValidator:
                 or "test execution was interrupted before producing results"
             )
 
-        if execution_summary.get("state") == "unknown" and status == "SUCCESS":
+        if execution_summary.get("state") == "unknown" and not collection_errors:
             status = "WARNING"
             evidence_status = "unknown"
             reason = str(execution_summary.get("reason") or "test execution completion is unknown")
@@ -7149,11 +7389,15 @@ class PhysicalValidator:
     def _recorded_maven_profile_selection(
         self,
         project_dir: str,
+        *,
+        receipt_records: Optional[List[Dict[str, Any]]] = None,
     ) -> _MavenProfileSelection:
         """Profiles from the newest build/test receipt bound to this reactor."""
         relevant: List[Tuple[Dict[str, any], List[str], str]] = []
         ambiguous_binding = False
-        for receipt in self._tracked_maven_receipts():
+        for receipt in (
+            self._tracked_maven_receipts() if receipt_records is None else receipt_records
+        ):
             binding, tokens, working_dir = self._maven_receipt_binding(
                 receipt,
                 project_dir,
@@ -7230,7 +7474,7 @@ class PhysicalValidator:
                 index += 2
                 continue
             if token.startswith("-P") and token != "-P":
-                values.append(token[2:])
+                values.append(token[2:].removeprefix("="))
             elif token.startswith("--activate-profiles="):
                 values.append(token.split("=", 1)[1])
             elif token.startswith("--activate-profiles"):
@@ -7793,6 +8037,12 @@ class PhysicalValidator:
             except Exception as e:
                 logger.debug(f"XML parsing fallback failed: {e}")
 
+        # Packaging selects a lifecycle/handler; it is not always the archive
+        # extension. Felix bundles and Maven's plugin/EJB handlers produce JARs.
+        # Keep the existing behavior for other packaging rather than assuming
+        # every extension is JAR. The resulting file must still exist.
+        extension = {"bundle": "jar", "maven-plugin": "jar", "ejb": "jar"}.get(packaging, packaging)
+
         # Strategy 3: Read version from pom.properties if still missing
         if artifact_id and not version:
             pom_props_cmd = f"cat {project_dir}/target/maven-archiver/pom.properties 2>/dev/null"
@@ -7812,7 +8062,7 @@ class PhysicalValidator:
         if artifact_id and not version and packaging != "pom":
             # Look for existing JAR that matches the pattern
             jar_search_cmd = (
-                f"ls {project_dir}/target/{artifact_id}-*.{packaging} 2>/dev/null | head -1"
+                f"ls {project_dir}/target/{artifact_id}-*.{extension} 2>/dev/null | head -1"
             )
             jar_result = self._execute_command_with_logging(
                 jar_search_cmd, f"searching for {artifact_id} JAR"
@@ -7823,8 +8073,8 @@ class PhysicalValidator:
                 import os
 
                 jar_name = os.path.basename(jar_result["output"].strip())
-                # Pattern: artifactId-version.packaging
-                version_pattern = f"{artifact_id}-(.+)\\.{packaging}"
+                # Pattern: artifactId-version.extension
+                version_pattern = f"{artifact_id}-(.+)\\.{extension}"
                 version_match = re.match(version_pattern, jar_name)
                 if version_match:
                     version = version_match.group(1)
@@ -7872,12 +8122,12 @@ class PhysicalValidator:
             and version
             and not _carries_unresolved_property(f"{artifact_id}{version}{packaging}")
         ):
-            expected_path = f"{project_dir}/target/{artifact_id}-{version}.{packaging}"
+            expected_path = f"{project_dir}/target/{artifact_id}-{version}.{extension}"
             expected.append(
                 {
                     "path": expected_path,
-                    "type": packaging,
-                    "artifact": f"{artifact_id}-{version}.{packaging}",
+                    "type": extension,
+                    "artifact": f"{artifact_id}-{version}.{extension}",
                 }
             )
 
