@@ -197,6 +197,9 @@ class _ScriptedClient:
     def capabilities_for(self, mode):
         return SimpleNamespace(supports_function_calling=True, model="scripted-model")
 
+    def build_tools_schema(self, mode):
+        return []
+
     def get_native_turn(self, messages, *, include_tools=True):
         self.requests.append(list(messages))
         if not self.turns:
@@ -204,7 +207,7 @@ class _ScriptedClient:
         return self.turns.pop(0)
 
     def get_advisor_response(self, messages, *, model, max_tokens):
-        self.advisor_calls.append({"model": model, "max_tokens": max_tokens})
+        self.advisor_calls.append({"model": model, "max_tokens": max_tokens, "messages": messages})
         return ADVICE
 
 
@@ -412,6 +415,10 @@ def test_consult_at_entry_and_direct_judge_claim_still_complete(tmp_path, pairin
     # Three consults: build-entry, the model's explicit consult, report-entry.
     assert [call["phase"] for call in telemetry["calls"]] == ["build", "build", "report"]
     assert [call["outcome"] for call in telemetry["calls"]] == ["advice", "advice", "advice"]
+    assert all(
+        "set up the project" in call["messages"][1]["content"]
+        for call in engine.llm_client.advisor_calls
+    )
     assert all(call["advice_chars"] == len(ADVICE) for call in telemetry["calls"])
     assert [call["max_tokens"] for call in engine.llm_client.advisor_calls] == [2048, 2048, 2048]
     # The entry consult is harness-authored: its id is minted by the harness,

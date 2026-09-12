@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -14,7 +15,13 @@ from sag.agent.loop_memory import COMPLETION_CLAIM_CAP
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolResult
-from .java_versions import java_major, java_major_from_path, names_bare_java_major
+from .java_versions import java_distribution as observed_java_distribution
+from .java_versions import (
+    java_major,
+    java_major_from_path,
+    names_bare_java_major,
+    parse_java_verification,
+)
 from .maven_versions import parse_maven_version
 from .toolchain_manager import (
     ToolchainManager,
@@ -168,9 +175,9 @@ class EnvTool(BaseTool):
             description=(
                 "Manage runtime env overlay entries for tool executable paths, PATH prefixes, "
                 "and environment variables. Use bash to download or install runtimes, then use "
-                "env register after installation; Maven registration probes the executable, and "
-                "any requirement in force is enforced against the registered version — which "
-                "must therefore be stated — before persistence. Use env activate before retrying a build. Use "
+                "env register after installation; Java and Maven registration measure the executable's "
+                "version and enforce requirements before persistence. Java activation also checks the "
+                "dispatch environment. Use env activate before retrying a build. Use "
                 "env block for exact executable/version negative evidence from build errors. Do "
                 "not use env to edit project build files, and do not use env to install or "
                 "download software."
@@ -196,6 +203,8 @@ class EnvTool(BaseTool):
         requirement: Optional[str] = None,
         working_directory: Optional[str] = None,
         reason: Optional[str] = None,
+        java_distribution: Optional[str] = None,
+        java_capabilities: Optional[list[str]] = None,
     ) -> ToolResult:
         """Execute an env overlay action."""
         params = self._normalize_request(
@@ -210,10 +219,23 @@ class EnvTool(BaseTool):
             requirement=requirement,
             working_directory=working_directory,
             reason=reason,
+            java_distribution=java_distribution,
+            java_capabilities=java_capabilities,
         )
 
+        java_observations = {}
         try:
             action_name = params["action"]
+            if (
+                params.get("java_distribution") is not None
+                or params.get("java_capabilities") is not None
+            ) and params.get("tool") != "java":
+                return ToolResult.completed_failure(
+                    output="",
+                    error="JVM selection parameters apply only to tool='java'",
+                    error_code="ENV_INVALID_PARAMETER",
+                    facts={"java_distribution_tool": "java", "java_capabilities_tool": "java"},
+                )
             if action_name == "inspect":
                 overlay = self.store.inspect()
                 return self._result("inspect", overlay)
@@ -230,10 +252,38 @@ class EnvTool(BaseTool):
                     if canonical_error:
                         return canonical_error
                     params["executable"] = canonical_executable
+                if params["tool"] == "java":
+                    canonical, error = self._canonicalize_java_executable(params["executable"])
+                    if error:
+                        return error
+                    params["executable"] = canonical
+                    params["env"] = {
+                        **(params.get("env") or {}),
+                        "JAVA_HOME": posixpath.dirname(posixpath.dirname(canonical)),
+                    }
                 validation_error = self._validate_executable(params["executable"], params.get("tool"))
                 if validation_error:
                     return validation_error
                 measured_version: Optional[str] = None
+                if params["tool"] == "java":
+                    measured, probe_error = self._probe_java_runtime(
+                        params["executable"],
+                        requirement=params.get("requirement"),
+                        distribution=params.get("java_distribution"),
+                    )
+                    if probe_error:
+                        return probe_error
+                    measured_version = measured["version"]
+                    params["version"] = measured_version
+                    params["java_distribution"] = measured.get("distribution", "unknown")
+                    params.setdefault("java_capabilities", [])
+                    capability_error = self._verify_java_capabilities(
+                        params["executable"],
+                        params.get("java_capabilities") or [],
+                        observations=java_observations,
+                    )
+                    if capability_error:
+                        return capability_error
                 if params["tool"] == "maven":
                     measured_version, probe_error = self._probe_maven_runtime(
                         params["executable"],
@@ -266,6 +316,8 @@ class EnvTool(BaseTool):
                     env=params.get("env"),
                     path_prepend=params.get("path_prepend"),
                     activate=activate_requested,
+                    distribution=params.get("java_distribution"),
+                    capabilities=params.get("java_capabilities"),
                 )
                 active_candidate = (
                     self.store.active_candidate(
@@ -302,6 +354,17 @@ class EnvTool(BaseTool):
                         executable=params["executable"],
                         tool=params["tool"],
                     )
+                if activate_requested and params["tool"] == "java":
+                    activation_error = self._verify_java_activation(
+                        active_candidate, observations=java_observations
+                    )
+                    if activation_error:
+                        activation_error.metadata["activation_persisted"] = True
+                        activation_error.raw_data = {
+                            **(activation_error.raw_data or {}),
+                            "runtime_observations": java_observations,
+                        }
+                        return activation_error
                 self._record_registered_runtime(
                     params["tool"],
                     params["executable"],
@@ -312,6 +375,7 @@ class EnvTool(BaseTool):
                     overlay,
                     active_candidate=active_candidate,
                     measured_version=measured_version,
+                    runtime_observations=java_observations,
                 )
 
             if action_name == "activate":
@@ -326,11 +390,74 @@ class EnvTool(BaseTool):
                     if canonical_error:
                         return canonical_error
                     params["executable"] = canonical_executable
+                if params["tool"] == "java":
+                    canonical, error = self._canonicalize_java_executable(params["executable"])
+                    if error:
+                        return error
+                    params["executable"] = canonical
                 validation_error = self._validate_executable(params["executable"], params.get("tool"))
                 if validation_error:
                     return validation_error
+                measured_version = None
+                if params["tool"] == "java":
+                    # Recheck on activation: an executable may have been replaced
+                    # since its registration. Preserve the candidate's environment.
+                    candidate = (
+                        self.store.inspect()
+                        .get("tools", {})
+                        .get("java", {})
+                        .get("candidates", {})
+                        .get(params["executable"])
+                    )
+                    if candidate is None:
+                        raise ValueError("Java executable is not registered")
+                    measured, probe_error = self._probe_java_runtime(
+                        params["executable"],
+                        requirement=params.get("requirement"),
+                        distribution=params.get("java_distribution")
+                        or (
+                            candidate.get("distribution")
+                            if candidate.get("distribution") != "unknown"
+                            else None
+                        ),
+                    )
+                    if probe_error:
+                        return probe_error
+                    measured_version = measured["version"]
+                    capabilities = params.get(
+                        "java_capabilities", candidate.get("capabilities", [])
+                    )
+                    capability_error = self._verify_java_capabilities(
+                        params["executable"], capabilities, observations=java_observations
+                    )
+                    if capability_error:
+                        return capability_error
+                    self.store.register(
+                        "java",
+                        params["executable"],
+                        version=measured_version,
+                        source=candidate.get("source", "agent_registered"),
+                        env={
+                            **(candidate.get("env") or {}),
+                            "JAVA_HOME": posixpath.dirname(posixpath.dirname(params["executable"])),
+                        },
+                        path_prepend=candidate.get("path_prepend"),
+                        distribution=measured.get("distribution", "unknown"),
+                        capabilities=capabilities,
+                    )
                 overlay = self.store.activate(params["tool"], params["executable"])
                 active_candidate = self.store.active_candidate(params["tool"])
+                if params["tool"] == "java":
+                    activation_error = self._verify_java_activation(
+                        active_candidate, observations=java_observations
+                    )
+                    if activation_error:
+                        activation_error.metadata["activation_persisted"] = True
+                        activation_error.raw_data = {
+                            **(activation_error.raw_data or {}),
+                            "runtime_observations": java_observations,
+                        }
+                        return activation_error
                 self._record_registered_runtime(
                     params["tool"],
                     params["executable"],
@@ -340,6 +467,8 @@ class EnvTool(BaseTool):
                     "activate",
                     overlay,
                     active_candidate=active_candidate,
+                    measured_version=measured_version,
+                    runtime_observations=java_observations,
                 )
 
             if action_name == "block":
@@ -1173,6 +1302,174 @@ class EnvTool(BaseTool):
             metadata={"action": "register"},
         )
 
+    def _canonicalize_java_executable(
+        self, executable: str
+    ) -> tuple[Optional[str], Optional[ToolResult]]:
+        if not posixpath.isabs(executable):
+            return None, ToolResult.completed_failure(
+                output="",
+                error="Java executable must be an absolute container path",
+                error_code="ENV_EXECUTABLE_PATH_NOT_ABSOLUTE",
+            )
+        if not hasattr(self.store.orchestrator, "execute_command"):
+            return None, ToolResult.completed_failure(
+                output="",
+                error="Java version probe executor is unavailable",
+                error_code="ENV_RUNTIME_PROBE_UNAVAILABLE",
+            )
+        missing = self._validate_executable(executable, "java")
+        if missing:
+            return None, missing
+        result = self.store.orchestrator.execute_command(
+            f"readlink -f -- {shlex.quote(executable)}", timeout=30
+        )
+        path = (result.get("output") or "").strip()
+        if (
+            result.get("exit_code") != 0
+            or result.get("success") is False
+            or not path.startswith("/")
+            or "\n" in path
+            or not path.endswith("/bin/java")
+        ):
+            return None, ToolResult.completed_failure(
+                output=result.get("output") or "",
+                error="Cannot resolve Java to a JDK bin/java executable",
+                error_code="ENV_RUNTIME_PROBE_FAILED",
+                facts={"executable": executable},
+            )
+        return path, None
+
+    def _probe_java_runtime(
+        self, executable: str, *, requirement: Optional[str], distribution: Optional[str] = None
+    ) -> tuple[Optional[dict[str, str]], Optional[ToolResult]]:
+        """Measure the executable itself; a caller's version is never evidence."""
+        orchestrator = getattr(self.store, "orchestrator", None)
+        if orchestrator is None or not hasattr(orchestrator, "execute_command"):
+            return None, ToolResult.completed_failure(
+                output="",
+                error="Java version probe executor is unavailable",
+                error_code="ENV_RUNTIME_PROBE_UNAVAILABLE",
+                facts={"tool": "java", "executable": executable},
+            )
+        probe = orchestrator.execute_command(f"{shlex.quote(executable)} -version", timeout=30)
+        output = probe.get("output") or ""
+        version = parse_java_verification(output).get("java_version")
+        if probe.get("exit_code") != 0 or probe.get("success") is False or not java_major(version):
+            return None, ToolResult.completed_failure(
+                output=output,
+                error=f"Java executable did not complete a readable version probe: {executable}",
+                error_code="ENV_RUNTIME_PROBE_FAILED",
+                facts={
+                    "tool": "java",
+                    "executable": executable,
+                    "probe_exit_code": probe.get("exit_code"),
+                },
+            )
+        failure = self._unproven_version_refusal("java", executable, version, requirement)
+        if failure:
+            return None, failure
+        observed_distribution = observed_java_distribution(output)
+        if distribution and distribution != observed_distribution:
+            return None, ToolResult.completed_failure(
+                output=output,
+                error="Java executable does not prove the selected distribution",
+                error_code="ENV_RUNTIME_DISTRIBUTION_MISMATCH",
+                facts={
+                    "requested_distribution": distribution,
+                    "observed_distribution": observed_distribution,
+                    "executable": executable,
+                },
+            )
+        return {
+            "version": version,
+            **({"distribution": observed_distribution} if observed_distribution else {}),
+        }, None
+
+    def _verify_java_capabilities(
+        self,
+        executable: str,
+        capabilities: list[str],
+        *,
+        dispatch: bool = False,
+        observations: Optional[dict] = None,
+    ) -> Optional[ToolResult]:
+        """Probe requested tools in this JVM installation, independent of vendor."""
+        flags = {"javac": "-version", "native-image": "--version"}
+        for capability in capabilities:
+            if capability not in flags:
+                return ToolResult.completed_failure(
+                    output="",
+                    error=f"Unsupported JVM capability probe: {capability}",
+                    error_code="ENV_CAPABILITY_UNSUPPORTED",
+                    facts={"supported_capabilities": sorted(flags)},
+                )
+            path = posixpath.join(posixpath.dirname(executable), capability)
+            command = f"{shlex.quote(path)} {flags[capability]} 2>&1"
+            if dispatch:
+                command = f"command -v {capability} && {capability} {flags[capability]} 2>&1"
+            result = self.store.orchestrator.execute_command(command, timeout=30)
+            output = result.get("output") or ""
+            if observations is not None:
+                observations[("dispatch:" if dispatch else "candidate:") + capability] = {
+                    "command": command,
+                    "exit_code": result.get("exit_code"),
+                    "output": output,
+                }
+            identity = re.search(
+                r"(?:^|\n)" + re.escape(capability) + r"\s+\d", output, re.IGNORECASE
+            )
+            if (
+                result.get("exit_code") != 0
+                or result.get("success") is False
+                or not identity
+                or (dispatch and path not in output.splitlines())
+            ):
+                return ToolResult.completed_failure(
+                    output=output,
+                    error=f"Selected JVM does not provide the requested {capability} capability in this environment",
+                    error_code="ENV_CAPABILITY_UNAVAILABLE",
+                    facts={
+                        "capability": capability,
+                        "executable": path,
+                        "dispatch_probe": dispatch,
+                    },
+                )
+        return None
+
+    def _verify_java_activation(
+        self, candidate: Optional[dict], *, observations: Optional[dict] = None
+    ) -> Optional[ToolResult]:
+        from .build_preflight import active_java_runtime, java_activation_conflict
+
+        actual = active_java_runtime(self.store.orchestrator)
+        if observations is not None:
+            observations["dispatch:java"] = actual
+        expected = {
+            "executable": (candidate or {}).get("executable"),
+            "major": java_major((candidate or {}).get("version")),
+            "version": (candidate or {}).get("version"),
+            "distribution": (
+                (candidate or {}).get("distribution")
+                if (candidate or {}).get("distribution") != "unknown"
+                else None
+            ),
+        }
+        conflict = java_activation_conflict(expected, actual)
+        if conflict or not actual.get("major") or not actual.get("executable"):
+            return ToolResult.completed_failure(
+                output="",
+                error=conflict or "Java activation has no complete dispatch observation",
+                error_code="ENV_ACTIVATION_NOT_CONFIRMED",
+                facts={"requested_runtime": expected, "dispatch_runtime": actual},
+                metadata={"activation_confirmed": False},
+            )
+        return self._verify_java_capabilities(
+            expected["executable"],
+            (candidate or {}).get("capabilities") or [],
+            dispatch=True,
+            observations=observations,
+        )
+
     def _probe_maven_runtime(
         self,
         executable: str,
@@ -1278,8 +1575,11 @@ class EnvTool(BaseTool):
         *,
         active_candidate: Optional[dict[str, Any]] = None,
         measured_version: Optional[str] = None,
+        runtime_observations: Optional[dict] = None,
     ) -> ToolResult:
         raw_data: dict[str, Any] = {"action": action, "overlay": overlay}
+        if runtime_observations:
+            raw_data["runtime_observations"] = runtime_observations
         if active_candidate is not None:
             raw_data["active_candidate"] = active_candidate
         if measured_version is not None:
@@ -1325,11 +1625,19 @@ class EnvTool(BaseTool):
                 "version": {
                     "type": "string",
                     "description": (
-                        "Observed executable version, as the executable itself reported it. "
-                        "Required whenever a version requirement is in force for the tool: an "
-                        "unstated version satisfies no requirement and the registration is "
-                        "refused."
+                        "Optional version claim for Java and Maven: the tool measures their "
+                        "executables and checks requirements itself. Other tools require a "
+                        "version when a version requirement is in force."
                     ),
+                },
+                "java_distribution": {
+                    "type": "string",
+                    "description": "Java: optional selected JVM family, checked against the executable's banner (e.g. openjdk, graalvm).",
+                },
+                "java_capabilities": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["javac", "native-image"]},
+                    "description": "Java: only the capabilities required by this selection are probed before and after activation; defaults to none.",
                 },
                 "source": {
                     "type": "string",

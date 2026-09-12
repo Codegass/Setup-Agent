@@ -84,7 +84,7 @@ class FakeContainer:
     def execute_command(self, command, workdir=None, timeout=None, truncate_output=None):
         self.commands.append(command)
 
-        if "java -version" in command:
+        if command.startswith("command -v java") or command == "java -version 2>&1":
             lines = []
             if self.java_executable:
                 lines.append(self.java_executable)
@@ -92,7 +92,7 @@ class FakeContainer:
                 lines.append(self.java_version_banner)
             return {"success": True, "output": "\n".join(lines), "exit_code": 0}
 
-        if command.startswith("realpath -e -- "):
+        if command.startswith(("realpath -e -- ", "readlink -f -- ")):
             path = shlex.split(command)[-1]
             if path in self.executables:
                 return {"success": True, "output": path, "exit_code": 0}
@@ -182,6 +182,8 @@ def _polaris_container():
 def test_env_registration_reaches_runtime_registry_and_resolution():
     """polaris regression: registration reaches both execution consumers."""
     container = _polaris_container()
+    container.java_executable = JAVA_21
+    container.java_version_banner = container.executables[JAVA_21]
 
     result = EnvTool(container).execute(
         action="register",
@@ -218,6 +220,8 @@ def test_identical_re_registration_leaves_the_registry_byte_stable():
     the runtime, not the number of times a model asked for it.
     """
     container = _polaris_container()
+    container.java_executable = JAVA_21
+    container.java_version_banner = container.executables[JAVA_21]
     tool = EnvTool(container)
     tool.execute(action="register", tool="java", executable=JAVA_21, activate=True)
     first = container.files[TOOLCHAIN_REGISTRY_PATH]

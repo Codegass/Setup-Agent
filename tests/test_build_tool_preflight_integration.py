@@ -331,7 +331,9 @@ def test_contract_records_probe_provenance_when_survey_states_no_jdk_requirement
     assert backend.contracts[0]["effective_jdk"] == {
         "major": "17",
         "runtime_authority": "dispatch_probe",
-        "provenance": {"source": "java_runtime_probe"},
+        "provenance": {
+            "dispatch_runtime": {"major": "17", "version": "17.0.1", "distribution": "openjdk"}
+        },
     }
 
 
@@ -471,7 +473,7 @@ def test_runner_observed_jdk_persists_and_next_invocation_outranks_static_survey
     )
 
 
-def test_same_scope_runtime_conflict_refuses_dispatch_without_latest_wins():
+def test_legacy_unscoped_errors_do_not_override_a_new_command():
     manifest = _domain_requirements(
         "/workspace/proj",
         "/workspace/proj/auxiliary",
@@ -504,10 +506,9 @@ def test_same_scope_runtime_conflict_refuses_dispatch_without_latest_wins():
         working_directory="/workspace/proj",
     )
 
-    assert result.succeeded is False
-    assert result.error_code == RUNTIME_REQUIREMENT_CONFLICT
-    assert result.metadata["runner_dispatched"] is False
-    assert backend.calls == []
+    assert result.succeeded is True
+    assert len(backend.calls) == 1
+    assert backend.contracts[0]["effective_jdk"]["requirement_authority"] == "static_survey"
 
 
 def test_sibling_domain_does_not_inherit_dynamic_jdk_requirement(monkeypatch):
@@ -1325,7 +1326,7 @@ def test_end_to_end_single_manifest_probe(monkeypatch):
     manifest_reads = [c for c in orch.commands if REQUIREMENTS_PATH in c]
     assert len(manifest_reads) == 1
     java_probes = [c for c in orch.commands if "java -version" in c]
-    assert len(java_probes) == 1  # facade pre-flight only
+    assert len(java_probes) == 2  # preflight check, then actual dispatch binding
     assert (result.output or "").count("[pre-flight]") == 0  # matched: silent
 
 

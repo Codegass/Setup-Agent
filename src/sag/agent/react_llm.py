@@ -66,6 +66,7 @@ class ReactLLMClient:
         self.logger = logger
         self.trace_context = trace_context
         self.repair_context_provider = repair_context_provider
+        self.last_advisor_receipt: dict[str, Any] = {}
         self._capability_cache: dict[ReactModelMode, ReactModelCapabilities] = {}
 
     def setup(self) -> None:
@@ -297,7 +298,7 @@ class ReactLLMClient:
     ) -> str:
         """One fresh-context advisor consult: plain completion text out.
 
-        No tools, no thinking config, a hard output cap — the advisor reviews
+        No tools, independent reasoning config, a hard output cap — the advisor reviews
         the transcript, it does not act. Provider errors propagate: the ONLY
         caller (`ReActEngine.consult_advisor`) turns them into a success-shaped
         "proceed with your best judgment" result, because a broken advisor must
@@ -307,15 +308,63 @@ class ReactLLMClient:
             "model": model,
             "messages": list(messages),
             "max_tokens": int(max_tokens),
-            # Providers that reject `max_tokens` (or any other field here) drop
-            # it instead of 400-ing the consult.
-            "drop_params": True,
+            # Input packing reserves this output budget. Silently dropping
+            # its cap would invalidate that budget; unsupported requests use
+            # the existing non-blocking advisor fallback instead.
+            "drop_params": False,
         }
+        effort = getattr(self.config, "advisor_reasoning_effort", None)
+        if effort is not None:
+            params["reasoning_effort"] = effort
+        self.last_advisor_receipt = {}
+        self._add_ollama_api_base(params, model)
+        try:
+            response = litellm.completion(**params)
+        except Exception as exc:
+            self.last_advisor_receipt = {"error_type": type(exc).__name__}
+            raise
+        self._track_advisor_usage(response, model)
+        choice = response.choices[0]
+        content = getattr(choice.message, "content", None) or ""
+        usage = getattr(response, "usage", None)
+        self.last_advisor_receipt = {
+            "model": getattr(response, "model", None),
+            "response_id": getattr(response, "id", None),
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "usage": usage.model_dump(mode="json") if hasattr(usage, "model_dump") else usage,
+            "content": content,
+        }
+        return content
+
+    def summarize_advisor_context(self, messages, *, max_tokens: int) -> dict:
+        """Use the executor model without tools; account separately from advice."""
+        model = self.config.get_litellm_model_name("action")
+        params = {
+            "model": model,
+            "messages": list(messages),
+            "max_tokens": max_tokens,
+            "drop_params": False,
+            "timeout": 90,
+            "num_retries": 0,
+        }
+        if self.config.is_gpt5_model("action"):
+            params["reasoning_effort"] = self.config.gpt5_reasoning_effort
         self._add_ollama_api_base(params, model)
         response = litellm.completion(**params)
-        self._track_advisor_usage(response, model)
-        message = response.choices[0].message
-        return getattr(message, "content", None) or ""
+        if self.token_tracker is not None:
+            try:
+                self.token_tracker.track_token_usage(response, model, "advisor_compression")
+            except Exception as exc:
+                self.logger.debug(f"Could not track compression token usage: {type(exc).__name__}")
+        choice = response.choices[0]
+        usage = getattr(response, "usage", None)
+        return {
+            "model": getattr(response, "model", None),
+            "response_id": getattr(response, "id", None),
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "usage": usage.model_dump(mode="json") if hasattr(usage, "model_dump") else usage,
+            "content": getattr(choice.message, "content", None) or "",
+        }
 
     def _track_advisor_usage(self, response: Any, model: str) -> None:
         if self.token_tracker is None:

@@ -2460,8 +2460,6 @@ class PhysicalValidator:
 
     def _test_execution_receipt_summary(self, project_dir: str) -> Dict[str, Any]:
         """Execution completion is independent of the outcome of project assertions."""
-        from sag.agent.evidence_assessments import receipt_assessment_bundle_complete
-
         from sag.agent.evidence_assessments import (
             BLOCKED_CLASS_CODES,
             DEVIATED_RECEIPT,
@@ -2471,6 +2469,7 @@ class PhysicalValidator:
             PREREQUISITE_EXECUTABLE_MISSING,
             PREREQUISITE_SERVICE_UNAVAILABLE,
             STALE_FINGERPRINT,
+            receipt_assessment_bundle_complete,
             test_outcome_diagnostics_complete,
         )
 
@@ -2949,14 +2948,28 @@ class PhysicalValidator:
         """
         if not expected_artifacts or not attempted:
             return _ExpectationScope(list(expected_artifacts), [], None, None)
-        attempted_keys = {self._module_key(name) for name in attempted} - {""}
+        gradle_coordinates = all(
+            item.get("build_system") == "gradle" and item.get("module")
+            for item in expected_artifacts
+        )
+
+        def key_for(value):
+            if gradle_coordinates:
+                return ":root" if value in (":", ":root", ".") else str(value).lstrip(":")
+            return self._module_key(value)
+
+        attempted_keys = {key_for(name) for name in attempted} - {""}
         if not attempted_keys:
             return _ExpectationScope(list(expected_artifacts), [], None, None)
         scoped: List[Dict[str, Any]] = []
         untried: List[str] = []
         matched_keys = set()
         for expectation in expected_artifacts:
-            key = self._module_key(str(expectation.get("path") or "").rsplit("/target", 1)[0])
+            key = key_for(
+                expectation["module"]
+                if gradle_coordinates
+                else str(expectation.get("path") or "").rsplit("/target", 1)[0]
+            )
             if key and key in attempted_keys:
                 matched_keys.add(key)
                 scoped.append(expectation)
@@ -6910,6 +6923,16 @@ class PhysicalValidator:
                 f"checking test sources {rel}",
             )
             has_test_sources = "EXISTS" in (tst.get("output") or "")
+            source_roots = (
+                self._gradle_source_dirs(module_dir, module_dirs)
+                if build_system == "gradle"
+                else []
+            )
+            if source_roots:
+                has_test_sources = has_test_sources or any(
+                    "test" in root.rsplit("/src/", 1)[-1].split("/", 1)[0].lower()
+                    for root in source_roots
+                )
 
             record = {
                 "path": rel,
@@ -6918,6 +6941,7 @@ class PhysicalValidator:
                 "jar_count": jar_count,
                 "report_dirs": report_dirs,
                 "has_test_sources": has_test_sources,
+                "source_roots": source_roots,
             }
             if declared_count:
                 # What the build DECLARED, carried beside what the scan found so
@@ -6948,8 +6972,9 @@ class PhysicalValidator:
             if (
                 rel == "."
                 and len(module_dirs) > 1
-                and (class_count or 0) == 0
-                and (jar_count or 0) == 0
+                and class_count == 0
+                and jar_count == 0
+                and not source_roots
                 and self._is_aggregator_shell_root(module_dir, build_system)
             ):
                 record["aggregator_shell"] = True
@@ -8160,100 +8185,95 @@ class PhysicalValidator:
         self._cache_result(cache_key, declared)
         return list(declared)
 
-    def _parse_gradle_expected_artifacts(self, project_dir: str) -> List[Dict[str, str]]:
-        """
-        Parse build.gradle to determine expected Gradle artifacts including .class files.
-        """
-        expected = []
+    def _gradle_source_dirs(self, module_dir: str, module_dirs: List[str]) -> List[str]:
+        """Find conventional source-set roots owned by this Gradle project.
 
-        # Check for build.gradle or build.gradle.kts
-        gradle_files = ["build.gradle", "build.gradle.kts"]
-        gradle_content = None
+        A project may own several source trees, such as core/src/test/java.
+        Child Gradle projects and generated build trees are separate owners.
+        This is a source census, not evaluation of arbitrary Gradle scripts.
+        """
+        children = [d for d in module_dirs if d.startswith(module_dir.rstrip("/") + "/")]
+        prune = " -o ".join(
+            ["-name .git", "-name build", *("-path " + shlex.quote(d) for d in children)]
+        )
+        cmd = (
+            f"find {shlex.quote(module_dir)} \\( {prune} \\) -prune -o -type d "
+            "\\( -path '*/src/*/java' -o -path '*/src/*/kotlin' -o -path '*/src/*/groovy' \\) -print"
+        )
+        result = self._execute_command_with_logging(cmd, "reading Gradle source-set directories")
+        if not result.get("success"):
+            return []
+        return sorted(
+            {
+                line.strip()
+                for line in (result.get("output") or "").splitlines()
+                if line.strip().startswith(module_dir.rstrip("/") + "/")
+            }
+        )
 
-        for gradle_file in gradle_files:
-            cmd = f"cat {project_dir}/{gradle_file} 2>/dev/null"
-            result = self._execute_command_with_logging(cmd, f"reading {gradle_file}")
-            if result["success"]:
-                gradle_content = result["output"]
+    def _parse_gradle_expected_artifacts(self, project_dir: str) -> List[Dict[str, Any]]:
+        """Keep project coordinates and all root/source-set owners in expectations."""
+        content = ""
+        for filename in ("build.gradle", "build.gradle.kts"):
+            read = self._execute_command_with_logging(
+                f"cat {project_dir}/{filename} 2>/dev/null", f"reading {filename}"
+            )
+            if read.get("success") and read.get("output"):
+                content = read["output"]
                 break
-
-        if not gradle_content:
-            return expected
-
-        # Check if it's a Java/Kotlin project
-        if "java" in gradle_content or "kotlin" in gradle_content:
-            # The declared subprojects, read through the ONE settings parse the
-            # module scan also uses (P3) — so a subproject can never be expected
-            # here and absent from the denominator there.
-            includes = self._declared_gradle_subprojects(project_dir)
-
-            if includes:
-                for subproject_path in includes:
-                    subproject_dir = f"{project_dir}/{subproject_path}"
-
-                    # Expected .class files for subproject
-                    src_check = f"test -d {subproject_dir}/src/main/java && echo EXISTS"
-                    src_result = self._execute_command_with_logging(
-                        src_check, f"checking {subproject_path} sources"
-                    )
-
-                    if src_result["success"] and "EXISTS" in src_result.get("output", ""):
-                        # Count Java sources
-                        count_cmd = f"find {subproject_dir}/src/main/java -name '*.java' -type f 2>/dev/null | wc -l"
-                        count_result = self._execute_command_with_logging(
-                            count_cmd, f"counting {subproject_path} sources"
-                        )
-
-                        if count_result["success"]:
-                            java_count = int(count_result["output"].strip() or 0)
-                            if java_count > 0:
-                                expected.append(
-                                    {
-                                        "path": f"{subproject_dir}/build/classes/java/main",
-                                        "type": "classes",
-                                        "artifact": f"{subproject_path} classes ({java_count} sources)",
-                                        "min_count": java_count,
-                                    }
-                                )
-
-                    # Expected JAR for subproject
-                    expected.append(
-                        {
-                            "path": f"{subproject_dir}/build/libs",
-                            "type": "jar",
-                            "artifact": f"{subproject_path} JAR",
-                        }
-                    )
-            else:
-                # Single project
-                # Check for Java sources
-                src_check = f"test -d {project_dir}/src/main/java && echo EXISTS"
-                src_result = self._execute_command_with_logging(src_check, "checking main sources")
-
-                if src_result["success"] and "EXISTS" in src_result.get("output", ""):
-                    # Count Java sources
-                    count_cmd = f"find {project_dir}/src/main/java -name '*.java' -type f 2>/dev/null | wc -l"
-                    count_result = self._execute_command_with_logging(
-                        count_cmd, "counting main sources"
-                    )
-
-                    if count_result["success"]:
-                        java_count = int(count_result["output"].strip() or 0)
-                        if java_count > 0:
-                            expected.append(
-                                {
-                                    "path": f"{project_dir}/build/classes/java/main",
-                                    "type": "classes",
-                                    "artifact": f"compiled classes ({java_count} sources)",
-                                    "min_count": java_count,
-                                }
-                            )
-
-                # Expected JAR
-                expected.append(
-                    {"path": f"{project_dir}/build/libs", "type": "jar", "artifact": "main JAR"}
+        if not content or not any(language in content for language in ("java", "kotlin", "groovy")):
+            return []
+        paths = ["", *self._declared_gradle_subprojects(project_dir)]
+        build_src = self._execute_command_with_logging(
+            f"test -f {shlex.quote(project_dir + '/buildSrc/build.gradle')} -o -f {shlex.quote(project_dir + '/buildSrc/build.gradle.kts')} && echo EXISTS",
+            "checking Gradle buildSrc",
+        )
+        if "EXISTS" in (build_src.get("output") or ""):
+            paths.append("buildSrc")
+        module_dirs = [project_dir + ("/" + path if path else "") for path in dict.fromkeys(paths)]
+        expected = []
+        for directory in module_dirs:
+            relative = directory[len(project_dir) :].strip("/")
+            coordinate = relative.replace("/", ":") or ":root"
+            roots = self._gradle_source_dirs(directory, module_dirs)
+            production = [
+                root
+                for root in roots
+                if "test" not in root.rsplit("/src/", 1)[-1].split("/", 1)[0].lower()
+            ]
+            # A root with subprojects is not necessarily an aggregator. Its own
+            # source-set roots establish the obligation before any build output.
+            # No recognized sources means its custom layout remains unverified.
+            if not relative and len(module_dirs) > 1 and not production:
+                continue
+            identity = {"module": coordinate, "build_system": "gradle"}
+            if production:
+                count = self._execute_command_with_logging(
+                    "find "
+                    + " ".join(shlex.quote(root) for root in production)
+                    + " -type f \\( -name '*.java' -o -name '*.kt' -o -name '*.groovy' \\) 2>/dev/null | wc -l",
+                    f"counting sources for {coordinate}",
                 )
-
+                source_count = (
+                    int((count.get("output") or "0").strip() or 0) if count.get("success") else 0
+                )
+                expected.append(
+                    {
+                        **identity,
+                        "path": directory + "/build/classes",
+                        "type": "classes",
+                        "artifact": f"{coordinate} compiled source sets",
+                        "min_count": source_count,
+                    }
+                )
+            expected.append(
+                {
+                    **identity,
+                    "path": directory + "/build/libs",
+                    "type": "jar",
+                    "artifact": f"{coordinate} JAR",
+                }
+            )
         return expected
 
     def _verify_expected_artifacts(

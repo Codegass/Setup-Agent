@@ -452,6 +452,8 @@ def coverage_conflicts(coverage: dict[str, Any] | None) -> tuple[str, ...]:
         conflicts.append("build_modules_incomplete")
     bearing = int(summary.get("modules_test_bearing") or 0)
     tested = summary.get("modules_tested")
+    if built > total or bearing > total or (tested is not None and int(tested) > bearing):
+        conflicts.append("module_coverage_count_conflict")
     if bearing and tested is not None and 0 < int(tested) < bearing:
         conflicts.append("reactor_scope_narrowed")
     return tuple(conflicts)

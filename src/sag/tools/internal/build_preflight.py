@@ -1194,19 +1194,6 @@ def read_live_build_requirements(orchestrator) -> PublishedJsonObjectRead:
 
 _JAVA_VERSION_RE = re.compile(r'version "(?:1\.)?(\d+)')
 
-# Adoptium/Temurin apt repo for JDKs missing from the base image's Debian
-# release (e.g. JDK 8 on bookworm). One-shot, idempotent.
-_TEMURIN_SETUP = (
-    "apt-get install -y wget apt-transport-https gnupg >/dev/null 2>&1; "
-    "wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public "
-    "| gpg --dearmor -o /usr/share/keyrings/adoptium.gpg 2>/dev/null; "
-    'echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] '
-    "https://packages.adoptium.net/artifactory/deb "
-    '$(. /etc/os-release && echo $VERSION_CODENAME) main" '
-    "> /etc/apt/sources.list.d/adoptium.list && apt-get update"
-)
-
-
 # One probe answers both questions the activation check asks: which `java` a
 # dispatch will actually run, and which major that is. Keeping them in one
 # command means the check costs no round trip a build did not already pay.
@@ -1223,6 +1210,8 @@ def active_java_runtime(orchestrator) -> Dict[str, str]:
     prints no version banner returns `{}` rather than a dict of Nones.
     """
     result = orchestrator.execute_command(_JAVA_RUNTIME_PROBE)
+    if result.get("exit_code") != 0 or result.get("success") is False:
+        return {}
     output = result.get("output") or ""
     runtime: Dict[str, str] = {}
     for line in output.splitlines():
@@ -1236,6 +1225,11 @@ def active_java_runtime(orchestrator) -> Dict[str, str]:
     version = parse_java_verification(output).get("java_version")
     if version:
         runtime["version"] = version
+    from .java_versions import java_distribution
+
+    distribution = java_distribution(output)
+    if distribution:
+        runtime["distribution"] = distribution
     return runtime
 
 
@@ -1244,7 +1238,7 @@ def active_java_major(orchestrator) -> Optional[str]:
     return active_java_runtime(orchestrator).get("major")
 
 
-def registered_java_runtime(orchestrator) -> Dict[str, str]:
+def registered_java_runtime(orchestrator) -> Dict[str, Any]:
     """The java runtime the env overlay states is active, or `{}`."""
     try:
         from sag.runtime.env_overlay import EnvOverlayStore
@@ -1260,6 +1254,10 @@ def registered_java_runtime(orchestrator) -> Dict[str, str]:
     major = java_major(candidate.get("version"))
     if major:
         runtime["major"] = major
+    if candidate.get("distribution"):
+        runtime["distribution"] = candidate["distribution"]
+    if candidate.get("capabilities"):
+        runtime["capabilities"] = candidate["capabilities"]
     return runtime
 
 
@@ -1276,6 +1274,10 @@ def java_activation_conflict(
     """
     if not registered or not active:
         return None
+    if registered.get("distribution") not in (None, "unknown") and registered[
+        "distribution"
+    ] != active.get("distribution"):
+        return f"[conflict] {JAVA_RUNTIME_CONFLICT}: selected JVM distribution {registered['distribution']}, dispatch distribution {active.get('distribution') or 'unverified'}"
     registered_executable = registered.get("executable")
     active_executable = active.get("executable")
     if registered_executable and active_executable:
@@ -1301,7 +1303,11 @@ def _register_overlay(orchestrator, java_home: str, version: str) -> bool:
         from sag.tools.internal.toolchain_manager import record_registered_runtime
 
         executable = f"{java_home}/bin/java"
-        EnvOverlayStore(orchestrator).register(
+        store = EnvOverlayStore(orchestrator)
+        candidate = store.active_candidate("java") or {}
+        if candidate.get("executable") == executable and candidate.get("version"):
+            version = candidate["version"]
+        store.register(
             "java",
             executable,
             version=version,
@@ -1350,8 +1356,19 @@ class JdkPreflight:
         source: str = "unknown",
         *,
         requirements: Optional[Dict[str, Any]] = None,
+        runtime_constraints: Optional[list[str]] = None,
     ) -> PreflightOutcome:
         try:
+            if runtime_constraints:
+                combined = dict(requirements or {})
+                combined["runtime"] = [
+                    *(combined.get("runtime") or []),
+                    *(
+                        {"constraint": constraint, "source": source}
+                        for constraint in runtime_constraints
+                    ),
+                ]
+                return self._run_constraints(combined, required_version, source, observed=False)
             if requirements is not None:
                 return self._run_constraints(requirements, required_version, source)
             if required_version and source == "maven-enforcer":
@@ -1385,10 +1402,17 @@ class JdkPreflight:
             )
 
     def _run_constraints(
-        self, requirements: Dict[str, Any], required: Optional[str], source: str
+        self,
+        requirements: Dict[str, Any],
+        required: Optional[str],
+        source: str,
+        *,
+        observed: bool = True,
     ) -> PreflightOutcome:
-        observed = required if source.startswith(("runner", "persisted_dynamic")) else None
-        bound = java_requirements_range(requirements, observed_major=observed)
+        observed_major = (
+            required if observed and source.startswith(("runner", "persisted_dynamic")) else None
+        )
+        bound = java_requirements_range(requirements, observed_major=observed_major)
         active_runtime = active_java_runtime(self.orchestrator)
         active = active_runtime.get("major")
         if bound is None or requirements.get("unresolved"):
@@ -1411,7 +1435,9 @@ class JdkPreflight:
                 "release have no common runtime; no automatic JDK change",
             )
         candidate = java_requirement_candidate(
-            requirements, active_version=active_runtime.get("version"), observed_major=observed
+            requirements,
+            active_version=active_runtime.get("version"),
+            observed_major=observed_major,
         )
         if candidate is None:
             outcome = PreflightOutcome(
@@ -1545,46 +1571,41 @@ class JdkPreflight:
             )
         return PreflightOutcome(
             matched=False,
-            active_version=active,
+            active_version=active_java_runtime(self.orchestrator).get("major"),
             required_version=required,
             provisioned=False,
             mismatch=True,
             narration=(
                 f"{header}\n→ could not provision JDK {required} "
-                f"(apt + Temurin exhausted); continuing on Java {active or 'unknown'} — "
-                "the verdict will record jdk_mismatch"
+                f"({getattr(self, '_provision_failure', 'runtime acquisition or activation unavailable')}); "
+                "the JVM requirement remains unmet"
             ),
         )
 
     def _provision(self, version: str) -> Optional[str]:
-        """apt -> Temurin ladder; returns JAVA_HOME on success, None on failure."""
-        apt = self.orchestrator.execute_command(
-            f"DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1; "
-            f"DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-{version}-jdk"
+        """The same JVM provisioning route used by the public project tool.
+
+        An automatic version repair preserves the selected distribution and
+        capabilities. Only an explicit new selection may replace that family.
+        """
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        from .system_tool import SystemTool
+
+        selected = registered_java_runtime(self.orchestrator) or active_java_runtime(
+            self.orchestrator
         )
-        if not apt.get("success"):
-            self.orchestrator.execute_command(_TEMURIN_SETUP)
-            temurin = self.orchestrator.execute_command(
-                f"DEBIAN_FRONTEND=noninteractive apt-get install -y temurin-{version}-jdk"
-            )
-            if not temurin.get("success"):
-                return None
-        home = self.orchestrator.execute_command(
-            f"ls -d /usr/lib/jvm/java-{version}-openjdk-* "
-            f"/usr/lib/jvm/temurin-{version}-jdk* 2>/dev/null | head -1"
+        result = SystemTool(self.orchestrator).execute(
+            action="install_java",
+            java_version=version,
+            java_distribution=selected.get("distribution") or "openjdk",
+            java_capabilities=selected.get("capabilities") or [],
         )
-        java_home = (home.get("output") or "").strip().splitlines()
-        java_home = java_home[0].strip() if java_home else ""
-        if not java_home:
+        if not result.succeeded:
+            self._provision_failure = f"{result.error_code}: {result.error or result.output}"[:2000]
             return None
-        self.orchestrator.execute_command(
-            f"update-alternatives --install /usr/bin/java java {java_home}/bin/java 100 "
-            f"&& update-alternatives --set java {java_home}/bin/java; "
-            f"test -x {java_home}/bin/javac && "
-            f"update-alternatives --install /usr/bin/javac javac {java_home}/bin/javac 100 "
-            f"&& update-alternatives --set javac {java_home}/bin/javac"
-        )
-        return java_home
+        candidate = EnvOverlayStore(self.orchestrator).active_candidate("java") or {}
+        return (candidate.get("env") or {}).get("JAVA_HOME")
 
 
 # Version-shaped build failures, in match priority. Each pattern captures the
@@ -1643,6 +1664,44 @@ def classify_version_error(output: str) -> Optional[str]:
     if _GROOVY_TRANSFORM_TYPERESOLVER.search(output):
         # Old-Groovy AST transform breaks on JDK >= 11: remediate to JDK 8.
         return "8"
+    return None
+
+
+def classify_java_constraint(output: str) -> Optional[Dict[str, str]]:
+    """A bounded runtime statement, suitable for one automatic retry.
+
+    Class-file compatibility and unsupported compiler releases impose floors,
+    not exact JDK selections. Ambiguous compatibility heuristics (notably old
+    Groovy) cannot authorize a runtime mutation.
+    """
+    range_match = re.search(
+        r"RequireJavaVersion[^\n]*?(?:\n[^\n]*){0,3}?allowed(?:\s+version)?\s+range\s*([\[(][^\n]+?[\])])",
+        output,
+        re.IGNORECASE,
+    )
+    if range_match:
+        if re.match(r"\s*,", output[range_match.end():]):
+            # A union must not be truncated into its first interval.
+            return None
+        raw = range_match.group(1)
+        candidate = java_requirement_candidate({"runtime": [{"constraint": raw}]})
+        return {"required_major": candidate, "constraint": raw} if candidate else None
+    exact = re.search(r"requires?\s+exactly\s+(?:Java|JDK)\s+(\d+)", output, re.IGNORECASE)
+    if exact:
+        major = exact.group(1)
+        return {"required_major": major, "constraint": f"[{major},{int(major) + 1})"}
+    for pattern in _VERSION_ERROR_PATTERNS:
+        # The range above must retain both ends, including unsupported unions.
+        if "allowed" in pattern.pattern:
+            continue
+        match = pattern.search(output)
+        if match:
+            major = match.group(1)
+            return {"required_major": major, "constraint": f"[{major},)"}
+    match = _CLASS_FILE_VERSION.search(output)
+    if match and int(match.group(1)) >= 45:
+        major = str(int(match.group(1)) - 44)
+        return {"required_major": major, "constraint": f"[{major},)"}
     return None
 
 

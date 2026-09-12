@@ -36,6 +36,7 @@ not answer for the claim.
 import json
 import posixpath
 import re
+import shlex
 
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON, EnvOverlayStore
 from sag.tools.internal.system_tool import PROVISION_ACTIVATION_STATE_MARKER, SystemTool
@@ -138,6 +139,12 @@ class FakeJdkContainer:
         if command == "dpkg --print-architecture":
             return {"success": True, "output": f"{ARCH}\n", "exit_code": 0}
 
+        if command.startswith("readlink -f"):
+            return {"success": True, "exit_code": 0, "output": shlex.split(command)[-1]}
+        if command.startswith("test -x"):
+            present = _major_of(shlex.split(command)[2]) in self.installed
+            return {"success": True, "exit_code": 0, "output": "EXISTS" if present else "MISSING"}
+
         if command.startswith("test -f "):
             paths = re.findall(r"test -f (\S+)", command)
             present = all(_major_of(path) in self.installed for path in paths)
@@ -192,8 +199,10 @@ class FakeJdkContainer:
             return {"success": False, "output": "java: command not found", "exit_code": 127}
         major = self.binary_answers.get(installed_major, installed_major)
         lines = []
-        if "command -v java" in command:
+        if "command -v java " in command:
             lines.append(f"{home}/bin/java")
+        if "command -v javac " in command:
+            lines.append(f"{home}/bin/javac")
         lines.append(_java_banner(major))
         if "javac -version" in command:
             lines.append("---")
@@ -252,7 +261,7 @@ def test_the_lucene_shape_is_unconstructible():
     result = _provision(container, "21")
 
     assert result.succeeded is False
-    assert result.error_code == "JAVA_VERSION_VERIFICATION_MISMATCH"
+    assert result.error_code == "ENV_ACTIVATION_NOT_CONFIRMED"
     assert result.metadata["claimed_java_version"] == "21"
     assert result.metadata["verified_java_version"] == FULL_VERSION["17"]
     assert result.metadata.get("java_version") != "21"

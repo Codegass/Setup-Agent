@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, cast
 
 from sag.agent.evidence_publications import (
-    EVIDENCE_PUBLICATION_GENESIS_SHA256,
     ENV_OVERLAY_LOGICAL_ARTIFACT_ID,
+    EVIDENCE_PUBLICATION_GENESIS_SHA256,
     MutablePublicationObservation,
     evidence_publication_authority_for,
     latest_publication_raw_sha256,
@@ -202,6 +202,8 @@ class EnvOverlayStore:
         env: Optional[dict[str, Any]] = None,
         path_prepend: Optional[list[str] | str] = None,
         activate: bool = False,
+        distribution: Optional[str] = None,
+        capabilities: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Register a candidate executable and optionally make it active."""
         overlay, _warnings = self._load_overlay()
@@ -223,6 +225,12 @@ class EnvOverlayStore:
             "env": normalized_env,
             "path_prepend": normalized_path,
         }
+        # Runtime identity belongs to the selected candidate, not to a project
+        # exception. Preserve it when a preflight refreshes this same path.
+        for key, value in (("distribution", distribution), ("capabilities", capabilities)):
+            selected = value if value is not None else existing.get(key)
+            if selected is not None:
+                candidates[executable_path][key] = deepcopy(selected)
 
         entry.setdefault("blocked", [])
         if activate:
@@ -377,6 +385,8 @@ class EnvOverlayStore:
         observed_sequence: Optional[int] = None,
         observed_at: Optional[str] = None,
         observed_runtime: Optional[Mapping[str, Any]] = None,
+        command_key: Optional[str] = None,
+        constraint: Optional[str] = None,
     ) -> dict[str, Any]:
         """Persist one runner-observed runtime requirement at an exact scope.
 
@@ -405,6 +415,12 @@ class EnvOverlayStore:
             "required_major": major,
             "source_ref": reference,
         }
+        if command_key is not None:
+            if not re.fullmatch(r"[0-9a-f]{64}", command_key) or not constraint:
+                raise ValueError(
+                    "scoped runtime observations require a command hash and constraint"
+                )
+            identity.update(command_key=command_key, constraint=str(constraint))
         for existing_record in records:
             if all(existing_record.get(key) == value for key, value in identity.items()):
                 # A receipt may be re-assessed after a process restart.  Its
@@ -520,6 +536,7 @@ class EnvOverlayStore:
         static_source: Optional[str],
         domain_id: Optional[str] = None,
         runner_observed: Optional[Mapping[str, Any]] = None,
+        command_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """Resolve runner > persisted dynamic > static survey authority.
 
@@ -533,6 +550,13 @@ class EnvOverlayStore:
             domain_id=domain_id,
             domain_root=domain_root,
         )
+        if command_key is not None:
+            # A runner error describes this command. A later CI step may use a
+            # different JVM or distribution. Old records without command/bound
+            # evidence remain readable, but cannot authorize an automatic switch.
+            records = [
+                r for r in records if r.get("command_key") == command_key and r.get("constraint")
+            ]
         current = dict(runner_observed or {})
         if current:
             scope = self._runtime_scope(
@@ -544,9 +568,23 @@ class EnvOverlayStore:
                 raise ValueError("runner_observed does not match the requested runtime scope")
             current_major = self._runtime_major(current.get("required_major"))
             current["required_major"] = current_major
+            if command_key is not None and current.get("command_key") != command_key:
+                raise ValueError("runner_observed does not match the command")
             records_for_conflict = records + [current]
         else:
             records_for_conflict = records
+        if command_key is not None and records_for_conflict:
+            # Preserve all bounded statements. JdkPreflight intersects them
+            # using the same range reader as declared JVM requirements.
+            newest = current or max(records, key=lambda item: int(item.get("observed_sequence", 0)))
+            return {
+                "required_major": newest["required_major"],
+                "authority": "runner_observed" if current else "persisted_dynamic",
+                "provenance": newest,
+                "runtime_constraints": list(
+                    dict.fromkeys(r["constraint"] for r in records_for_conflict)
+                ),
+            }
         majors = sorted(
             {
                 record.get("required_major")
@@ -822,7 +860,9 @@ class EnvOverlayStore:
                 raise ValueError("env overlay active executable is not a candidate")
             for executable, candidate in candidates.items():
                 self._require_strict_absolute_path(executable, "candidate executable")
-                if set(candidate) != {"version", "source", "env", "path_prepend"}:
+                required_fields = {"version", "source", "env", "path_prepend"}
+                optional_fields = {"distribution", "capabilities"}
+                if not required_fields <= set(candidate) <= required_fields | optional_fields:
                     raise ValueError("env overlay candidate schema is not closed")
                 if candidate["version"] is not None and not isinstance(candidate["version"], str):
                     raise ValueError("env overlay candidate version must be a string")
@@ -1050,6 +1090,28 @@ class EnvOverlayStore:
                                 executable,
                             ),
                         }
+                        if candidate.get("distribution") is not None:
+                            distribution = candidate["distribution"]
+                            if not isinstance(distribution, str) or not re.fullmatch(
+                                r"[a-z][a-z0-9._-]{0,63}", distribution
+                            ):
+                                raise ValueError("invalid runtime distribution")
+                            entry["candidates"][executable]["distribution"] = distribution
+                        if candidate.get("capabilities") is not None:
+                            capabilities = candidate["capabilities"]
+                            if (
+                                not isinstance(capabilities, list)
+                                or len(capabilities) > 32
+                                or any(
+                                    not isinstance(item, str)
+                                    or not re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", item)
+                                    for item in capabilities
+                                )
+                            ):
+                                raise ValueError("invalid runtime capabilities")
+                            entry["candidates"][executable]["capabilities"] = sorted(
+                                set(capabilities)
+                            )
                     except ValueError as exc:
                         if tolerant:
                             self._append_warning(
@@ -1148,6 +1210,17 @@ class EnvOverlayStore:
                         "observed_sequence": sequence,
                         "observed_at": observed_at,
                     }
+                    if raw_runtime.get("command_key") is not None:
+                        command_key = raw_runtime["command_key"]
+                        constraint = raw_runtime.get("constraint")
+                        if (
+                            not isinstance(command_key, str)
+                            or not re.fullmatch(r"[0-9a-f]{64}", command_key)
+                            or not isinstance(constraint, str)
+                            or not constraint
+                        ):
+                            raise ValueError("invalid command-scoped runtime constraint")
+                        record.update(command_key=command_key, constraint=constraint)
                     for key in ("observed_runtime", "active_runtime"):
                         snapshot = self._normalize_runtime_snapshot(raw_runtime.get(key))
                         if snapshot:
@@ -1298,6 +1371,11 @@ class EnvOverlayStore:
         executable = str(snapshot.get("executable") or "").strip()
         if executable:
             normalized["executable"] = executable
+        version = str(snapshot.get("version") or "").strip()
+        if version:
+            normalized["version"] = version
+        if snapshot.get("distribution"):
+            normalized["distribution"] = str(snapshot["distribution"])
         return normalized
 
     def _empty_overlay(self) -> dict[str, Any]:

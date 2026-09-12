@@ -50,7 +50,7 @@ from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
     JdkPreflight,
     active_java_major,
-    classify_version_error,
+    classify_java_constraint,
     read_live_build_requirements,
 )
 from .build_utils import (
@@ -1286,11 +1286,12 @@ class GradleTool(BaseTool):
                 and not result.get("dispatch_status")
                 and not result.get("termination_reason")
             ):
-                needed = classify_version_error(result.get("output") or "")
+                constraint = classify_java_constraint(result.get("output") or "")
+                needed = (constraint or {}).get("required_major")
                 active = outcome.active_version or active_java_major(self.orchestrator)
                 if needed and needed != active:
                     retry_outcome = JdkPreflight(self.orchestrator).run(
-                        needed, source="build-error"
+                        needed, source="build-error", runtime_constraints=[constraint["constraint"]]
                     )
                     if retry_outcome.provisioned:
                         preamble += (

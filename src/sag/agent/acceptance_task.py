@@ -310,7 +310,18 @@ def build_task_completion(
             (receipt.get("effective_jdk") or {}).get("major") != str(step.java_major)
             or (receipt.get("effective_jdk") or {}).get("runtime_authority") != "dispatch_probe"
         ):
-            status, reason = "unavailable", "Required launcher JVM was not observed at dispatch."
+            jdk = receipt.get("effective_jdk") or {}
+            status = "unavailable"
+            if jdk.get("runtime_authority") != "dispatch_probe":
+                reason = (
+                    f"Required launcher Java {step.java_major}; the receipt has no authorized "
+                    f"dispatch JVM probe (recorded major: {jdk.get('major') or 'unknown'})."
+                )
+            else:
+                reason = (
+                    f"Required launcher Java {step.java_major}; dispatch observed "
+                    f"Java {jdk.get('major') or 'unknown'}."
+                )
         elif tool == "bash" and not any(
             item.get("feature") == "native_executable_sha256"
             and item.get("probe_exit_code") == "0"

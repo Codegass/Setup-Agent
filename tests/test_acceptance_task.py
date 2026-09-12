@@ -281,7 +281,8 @@ def test_changed_task_input_cannot_redefine_obligations(tmp_path):
     assert closed.task_sha256 == run.task.sha256
 
 
-def test_unknown_or_wrong_runtime_does_not_complete_the_step(tmp_path):
+@pytest.mark.parametrize("measured", [None, "17"])
+def test_unknown_or_wrong_runtime_does_not_complete_the_step(tmp_path, monkeypatch, measured):
     run = task_run(tmp_path, "mvn test")
     run.task = AcceptanceTask.model_validate(
         {
@@ -290,8 +291,21 @@ def test_unknown_or_wrong_runtime_does_not_complete_the_step(tmp_path):
         }
     )
     pin_task(run)
+    if measured is not None:
+        monkeypatch.setattr(
+            "sag.tools.build.build_tool.active_java_runtime",
+            lambda _: {"major": measured, "version": measured + ".0.1"},
+        )
     retain(run, dispatch(run, "mvn test"))
-    assert completion(run).steps[0].status == "unavailable"
+    step = completion(run).steps[0]
+    assert step.status == "unavailable"
+    if measured:
+        assert step.reason == "Required launcher Java 21; dispatch observed Java 17."
+    else:
+        assert step.reason == (
+            "Required launcher Java 21; the receipt has no authorized "
+            "dispatch JVM probe (recorded major: unknown)."
+        )
 
 
 @pytest.mark.parametrize("value", [False, "broken", {"sha256": 3}, {"sha256": "bad"}])

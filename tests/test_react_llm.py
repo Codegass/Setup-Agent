@@ -74,6 +74,55 @@ def make_response(content="", tool_calls=None):
     )
 
 
+@pytest.mark.parametrize("effort", [None, "low"])
+def test_advisor_reasoning_is_independent_and_receipt_names_returned_model(monkeypatch, effort):
+    client = make_client(make_config(advisor_reasoning_effort=effort, gpt5_reasoning_effort="high"))
+    requests = []
+    response = make_response("Install GraalVM 21, then retry nativeCompile.")
+    response.model = "gpt-5.6-terra"
+    response.id = "response-1"
+    response.choices[0].finish_reason = "stop"
+    response.usage = {"prompt_tokens": 17, "completion_tokens": 11, "total_tokens": 28}
+    monkeypatch.setattr("litellm.completion", lambda **params: requests.append(params) or response)
+    messages = [{"role": "user", "content": "native-image is missing"}]
+
+    advice = client.get_advisor_response(messages, model="gpt-5.6-terra", max_tokens=2048)
+
+    assert requests[0]["messages"] == messages
+    assert requests[0]["max_tokens"] == 2048
+    assert "tools" not in requests[0]
+    if effort is None:
+        assert "reasoning_effort" not in requests[0]
+    else:
+        assert requests[0]["reasoning_effort"] == "low"
+    assert requests[0]["drop_params"] is False
+    assert client.config.gpt5_reasoning_effort == "high"
+    assert client.last_advisor_receipt == {
+        "model": "gpt-5.6-terra",
+        "response_id": "response-1",
+        "finish_reason": "stop",
+        "usage": response.usage,
+        "content": advice,
+    }
+    assert client.token_tracker.calls == [(response, "gpt-5.6-terra", "advisor")]
+
+
+def test_failed_advisor_request_cannot_reuse_previous_receipt(monkeypatch):
+    client = make_client(make_config(advisor_reasoning_effort="low"))
+    client.last_advisor_receipt = {"model": "old-model", "content": "old advice"}
+
+    def fail(**params):
+        assert params["reasoning_effort"] == "low"
+        assert params["drop_params"] is False
+        raise ValueError("unsupported reasoning effort")
+
+    monkeypatch.setattr("litellm.completion", fail)
+    with pytest.raises(ValueError, match="unsupported reasoning"):
+        client.get_advisor_response([], model="test-model", max_tokens=2048)
+    assert client.last_advisor_receipt == {"error_type": "ValueError"}
+    assert client.token_tracker.calls == []
+
+
 def test_capabilities_are_resolved_per_mode_with_gpt5_thinking_and_claude_action(
     monkeypatch,
 ):
@@ -241,4 +290,3 @@ def test_native_turn_logs_then_propagates_a_provider_failure(monkeypatch):
         client.get_native_turn([{"role": "user", "content": "go"}])
 
     assert any("llm_error" in message for message in captured_verbose_logger.error_messages)
-

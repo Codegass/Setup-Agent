@@ -115,3 +115,75 @@ def test_profile_property_uncertainty_reaches_the_physical_judge():
     assert env_conflicts(
         "<properties><maven.compiler.target>21</maven.compiler.target></properties>", "17"
     ) == ["build_requirements_unavailable"]
+
+
+# The pinned Gson POM replaces Error Prone arguments with this diagnostic flag
+# under a JDK-activated profile. Its profile name has no semantic significance.
+DIAGNOSTIC_PROFILE = "<activation><jdk>[,21)</jdk></activation>" + compiler(
+    '<configuration><compilerArgs combine.self="override">'
+    "<compilerArg>-Xlint:all,-options</compilerArg></compilerArgs>"
+    '<annotationProcessorPaths combine.self="override" /></configuration>'
+)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "<compilerArgs><arg>-Xlint:all,-options</arg></compilerArgs>",
+        "<compilerArgument>-Xlint:all -Werror</compilerArgument>",
+        "<compilerArguments><Xlint/><deprecation/></compilerArguments>",
+    ],
+)
+def test_profile_diagnostics_do_not_invent_java_version_uncertainty(arguments):
+    body = compiler("<configuration>" + arguments + "</configuration>")
+    assert maven_java_requirements([(pom(body), "pom.xml")])["unresolved"] == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "<compilerArgs><arg>-Xlint</arg><arg>--release</arg><arg>21</arg></compilerArgs>",
+        "<compilerArgument>--source=21 -Xlint</compilerArgument>",
+        "<compilerArguments><target>21</target></compilerArguments>",
+        "<compilerArgs><arg>${extra.compiler.args}</arg></compilerArgs>",
+        "<compilerArgs><arg>-Xlint:${diagnostic.args}</arg></compilerArgs>",
+        "<compilerArgs><arg>@compiler-options.txt</arg></compilerArgs>",
+        "<compilerArgs><arg>-Xplugin:Unknown</arg></compilerArgs>",
+        "<compilerArgs><arg>--enable-preview</arg></compilerArgs>",
+        '<compilerArgs combine.self="override"/>',
+        "<compilerArgs><arg><unknown/></arg></compilerArgs>",
+        "<compilerArgument>'unterminated</compilerArgument>",
+    ],
+)
+def test_diagnostic_precision_does_not_hide_conditional_compiler_requirements(arguments):
+    body = compiler("<configuration>" + arguments + "</configuration>")
+    assert maven_java_requirements([(pom(body), "pom.xml")])["unresolved"]
+
+
+@pytest.mark.parametrize("java, expected", [("17", []), ("7", ["jdk_mismatch"])])
+def test_diagnostic_only_jdk_profile_reaches_env_judge_without_false_unknown(java, expected):
+    assert env_conflicts(DIAGNOSTIC_PROFILE, java) == expected
+
+
+@pytest.mark.parametrize("java, expected", [("17", []), ("21", []), ("22", ["jdk_mismatch"])])
+def test_diagnostic_profile_preserves_the_declared_runtime_upper_bound(java, expected):
+    content = pom(DIAGNOSTIC_PROFILE).replace(
+        "<project>",
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        "<build><plugins><plugin><artifactId>maven-enforcer-plugin</artifactId>"
+        "<configuration><rules><requireJavaVersion><version>[17,22)</version>"
+        "</requireJavaVersion></rules></configuration></plugin></plugins></build>",
+    )
+    requirements = maven_java_requirements([(content, "pom.xml")])
+    assert requirements["unresolved"] == []
+    validator = PhysicalValidator.__new__(PhysicalValidator)
+    validator.docker_orchestrator = ConflictOrch(
+        java=java,
+        manifest=complete_build_requirements_v1(
+            java_version="8",
+            java_version_source="maven-compiler",
+            java_version_enforced=False,
+            java_requirements=requirements,
+        ),
+    )
+    assert validator._collect_env_conflicts() == expected

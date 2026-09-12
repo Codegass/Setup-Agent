@@ -16,6 +16,7 @@ import pytest
 pytestmark = pytest.mark.usefixtures("facade_contract_authority", "exact_internal_runner_authority")
 
 from build_requirements_fakes import complete_build_requirements_v1
+
 from sag.agent.control_events import canonical_json
 from sag.agent.evidence_publications import (
     BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID,
@@ -27,6 +28,7 @@ from sag.agent.output_storage import OutputStorageManager
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import bind_tool_result_output_storage
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.build_utils import (
     BuildAnalyzer,
     bounded_detached_log_excerpt,
@@ -35,7 +37,6 @@ from sag.tools.internal.build_utils import (
     detached_runner_from_command,
 )
 from sag.tools.internal.command_tracker import CommandTracker
-from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.search_tool import SearchTool
 
 CONTAINER_ID = "c" * 64
@@ -1706,7 +1707,7 @@ def test_maven_retry_dispatch_failure_preserves_first_real_dispatch(
             self.soft_timeout_calls.append(command)
             return self.results.pop(0)
 
-    def preflight(_self, required, source, *, requirements=None):
+    def preflight(_self, required, source, *, requirements=None, runtime_constraints=None):
         if source == "runner-observed:build-error":
             return SimpleNamespace(
                 provisioned=True,

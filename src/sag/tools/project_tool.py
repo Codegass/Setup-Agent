@@ -12,7 +12,11 @@ from .base import BaseTool, ToolResult
 # performs it — so a call that supplies two of them is answered with both of
 # the calls it should have been.
 PROVISION_ROUTES = {
-    "java_version": "project(action='provision', java_version=...) for the JDK",
+    "java_version": (
+        "project(action='provision', java_version=..., "
+        "java_distribution=..., java_capabilities=[...]) for the JDK; "
+        "distribution and capabilities are optional"
+    ),
     "maven_version": "project(action='provision', maven_version=...) for Apache Maven",
     "packages": "project(action='provision', packages=[...]) for apt packages",
 }
@@ -24,11 +28,14 @@ class ProjectTool(BaseTool):
             name="project",
             description=(
                 "Project lifecycle: action = clone (repo_url[, ref]) | "
-                "provision (install toolchain: java_version for a JDK, maven_version for an "
+                "provision (install toolchain: java_version for a JDK; java_distribution selects "
+                "openjdk or graalvm (omission keeps the selected family); java_capabilities declares required JVM tools; maven_version for an "
                 "Apache Maven distribution, packages for apt) | "
                 "analyze (survey the project; persist build facts) | "
                 "env (validate, register, and activate a runtime executable; "
-                "tool + executable [+ env])."
+                "tool + executable [+ env]). JDK and Maven provisioning registers and activates "
+                "the installation; installing another JDK changes the active JVM. Use env to "
+                "switch between installed runtimes as required by each task step."
             ),
         )
         self.setup_tool = setup_tool
@@ -92,6 +99,11 @@ class ProjectTool(BaseTool):
                     "unexpected": sorted(unexpected),
                     "accepted": sorted(accepted - {"self", "action"}),
                 },
+                facts={
+                    "action": verb,
+                    "unexpected_parameters": sorted(unexpected),
+                    "accepted_parameters": sorted(accepted - {"self", "action"}),
+                },
             )
         if verb == "clone":
             # ProjectSetupTool's real parameter is repository_url; accept the
@@ -120,6 +132,11 @@ class ProjectTool(BaseTool):
                         f"{', '.join(supplied)} were supplied together"
                     ),
                     error_code="PROJECT_PROVISION_AMBIGUOUS",
+                    facts={
+                        "supplied_routes": supplied,
+                        "routes_per_call": 1,
+                        "supported_routes": PROVISION_ROUTES,
+                    },
                     suggestions=[f"Call {PROVISION_ROUTES[name]}" for name in supplied],
                     raw_data={
                         "action": "provision",
@@ -128,6 +145,19 @@ class ProjectTool(BaseTool):
                     },
                 )
             # Exactly one route is reachable here, so each branch names its own.
+            if any(key in kwargs for key in ("java_distribution", "java_capabilities")) and (
+                "java_version" not in kwargs
+                or any(name in kwargs for name in ("maven_version", "packages"))
+            ):
+                return ToolResult.completed_failure(
+                    output="",
+                    error="JVM distribution/capabilities require the java_version route",
+                    error_code="PROJECT_PROVISION_AMBIGUOUS",
+                    facts={
+                        "java_distribution_applies_to": "java_version",
+                        "routes_per_call": 1,
+                    },
+                )
             if "maven_version" in kwargs:
                 kwargs.setdefault("action", "install_maven")
             elif "packages" in kwargs:
@@ -202,6 +232,20 @@ class ProjectTool(BaseTool):
                 "ref": {"type": "string", "description": "clone: git ref (optional)"},
                 "project_path": {"type": "string", "description": "analyze: project directory"},
                 "java_version": {"type": "string", "description": "provision: JDK version"},
+                "java_distribution": {
+                    "type": "string",
+                    "enum": ["openjdk", "graalvm"],
+                    "description": "provision/env: select a JVM distribution. Provision acquires OpenJDK via apt or Oracle GraalVM via verified archive. Omission keeps the selected family, or defaults to OpenJDK if none is registered. Both use the same JAVA_HOME/PATH activation.",
+                },
+                "java_capabilities": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["javac", "native-image"]},
+                    "description": "provision/env: required tools of the selected JVM. Provision always checks javac; request native-image only when the task needs it. Independent of distribution.",
+                },
+                "version": {
+                    "type": "string",
+                    "description": "env: optional version claim; Java and Maven are measured by the tool.",
+                },
                 "maven_version": {
                     "type": "string",
                     "description": (
@@ -210,10 +254,16 @@ class ProjectTool(BaseTool):
                         "it, and verifies mvn -version in the domain dispatches resolve."
                     ),
                 },
-                "packages": {"type": "array", "description": "provision: apt packages to install"},
+                "packages": {
+                    "type": "array",
+                    "description": "provision: apt packages to install",
+                },
                 "tool": {
                     "type": "string",
-                    "description": "env: tool name to register and activate (e.g. 'maven')",
+                    "description": (
+                        "env: runtime being registered; match the executable "
+                        "(e.g. 'java' for bin/java, 'maven' for bin/mvn)"
+                    ),
                 },
                 "executable": {
                     "type": "string",
@@ -235,7 +285,7 @@ class ProjectTool(BaseTool):
                     "type": "string",
                     "description": (
                         "env: version requirement the measured executable must satisfy "
-                        "(for example '[3.9,)' for Maven)"
+                        "(for example '[21,)' for Java or '[3.9,)' for Maven)"
                     ),
                 },
             },

@@ -317,6 +317,11 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
         if result.error_code:
             formatted += f"\nError code: {result.error_code}"
+        # Facts are current observations / facade contracts, not legacy repair
+        # suggestions. Project error projections retain their existing boundary.
+        if result.facts and not project_error_projection:
+            fact_text = ", ".join(f"{k}={v}" for k, v in list(result.facts.items())[:10])
+            formatted += f"\nFacts: {fact_text[:4000]}"
         if result.failure_signature:
             formatted += f"\nFailure signature: {result.failure_signature}"
         if result.error_tail_preview and not project_error_projection:

@@ -89,6 +89,21 @@ class FakeProvisionOrchestrator:
             return {"success": True, "output": f"{ARCH}\n", "exit_code": 0}
         if command.startswith("test -f ") and command.endswith("&& echo 'exists'"):
             return {"success": True, "output": "exists", "exit_code": 0}
+        if command.startswith("test -x"):
+            return {"success": True, "exit_code": 0, "output": "EXISTS"}
+        if command.startswith("readlink -f"):
+            return {"success": True, "exit_code": 0, "output": shlex.split(command)[-1]}
+        if "javac -version" in command and "java -version" not in command:
+            candidate = EnvOverlayStore(self).active_candidate("java") or {}
+            path = candidate.get("executable", JAVA_BIN).removesuffix("java") + "javac"
+            return {"success": True, "exit_code": 0, "output": path + "\n" + self.verification}
+        if command.startswith("command -v java"):
+            candidate = EnvOverlayStore(self).active_candidate("java") or {}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": candidate.get("executable", JAVA_BIN) + "\n" + self.verification,
+            }
         if "java -version" in command:
             return {"success": True, "output": self.verification, "exit_code": 0}
         return {"success": True, "output": "", "exit_code": 0}
@@ -163,7 +178,7 @@ def test_a_legacy_1_8_runtime_verifies_as_major_8():
 
 
 def test_a_legacy_1_8_provision_is_not_refused_by_its_own_evidence():
-    orchestrator = FakeProvisionOrchestrator('java version "1.8.0_361"\n---\njavac 1.8.0_361')
+    orchestrator = FakeProvisionOrchestrator('openjdk version "1.8.0_361"\n---\njavac 1.8.0_361')
     tool = SystemTool(orchestrator)
 
     result = tool._install_and_configure_java("8")
@@ -172,14 +187,35 @@ def test_a_legacy_1_8_provision_is_not_refused_by_its_own_evidence():
 
 
 class FakeJavaOverlayOrchestrator:
-    def __init__(self):
+
+    def __init__(self, version="17.0.1"):
         self.files = {}
         self.commands = []
+        self.version = version
+
+    def read_file(self, path):
+        return self.files.get(path)
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
-        if command.startswith("realpath -e -- "):
-            return {"success": True, "output": shlex.split(command)[-1], "exit_code": 0}
+        if command.startswith(("realpath -e -- ", "readlink -f -- ")):
+            path = shlex.split(command)[-1]
+            return {
+                "success": True,
+                "output": "/opt/jdk/bin/java" if path == "/usr/bin/java" else path,
+                "exit_code": 0,
+            }
+        if command.startswith("command -v java"):
+            path = (EnvOverlayStore(self).active_candidate("java") or {}).get(
+                "executable", "/opt/jdk/bin/java"
+            )
+            return {
+                "success": True,
+                "output": path + f'\nopenjdk version "{self.version}"',
+                "exit_code": 0,
+            }
+        if command.endswith(" -version"):
+            return {"success": True, "output": f'openjdk version "{self.version}"', "exit_code": 0}
         if command.startswith("test -x "):
             return {"success": True, "output": "EXISTS\n", "exit_code": 0}
         return {"success": True, "output": "", "exit_code": 0}
@@ -189,7 +225,7 @@ class FakeJavaOverlayOrchestrator:
         return {"success": True, "output": "", "exit_code": 0}
 
 
-def test_env_register_refuses_a_null_version_against_a_stated_requirement():
+def test_env_register_measures_the_executable_when_no_version_is_supplied():
     """lucene seq 86/88: `requirement="[21,24]"` and `"version": null` both sealed."""
     orchestrator = FakeJavaOverlayOrchestrator()
     tool = EnvTool(orchestrator)
@@ -203,13 +239,12 @@ def test_env_register_refuses_a_null_version_against_a_stated_requirement():
     )
 
     assert result.succeeded is False
-    assert result.error_code == "ENV_RUNTIME_VERSION_UNVERIFIED"
+    assert result.error_code == "ENV_RUNTIME_REQUIREMENT_MISMATCH"
     assert result.raw_data["requirement"] == "[21,24]"
-    assert result.raw_data["version"] is None
+    assert result.raw_data["version"] == "17.0.1"
     assert DEFAULT_OVERLAY_JSON not in orchestrator.files
     # A refusal that cannot be acted on is a wall: the moves are named.
     named = " ".join(result.suggestions)
-    assert "/usr/bin/java -version" in named
     assert "provision" in named
 
 
@@ -248,13 +283,13 @@ def test_env_register_refuses_against_a_requirement_the_harness_already_observed
     )
 
     assert result.succeeded is False
-    assert result.error_code == "ENV_RUNTIME_VERSION_UNVERIFIED"
+    assert result.error_code == "ENV_RUNTIME_REQUIREMENT_MISMATCH"
     assert result.raw_data["requirement_source"] == "registered_state"
     assert orchestrator.files[DEFAULT_OVERLAY_JSON] == sealed_before
 
 
 def test_env_register_seals_a_version_that_satisfies_the_requirement():
-    orchestrator = FakeJavaOverlayOrchestrator()
+    orchestrator = FakeJavaOverlayOrchestrator(version="21.0.4")
     tool = EnvTool(orchestrator)
 
     result = tool.execute(
@@ -274,7 +309,7 @@ def test_env_register_seals_a_version_that_satisfies_the_requirement():
 
 def test_the_same_jdk_spelled_at_two_precisions_satisfies_the_requirement():
     """`21` and `21.0.9` are one JDK: the honest observed version is not a mismatch."""
-    orchestrator = FakeJavaOverlayOrchestrator()
+    orchestrator = FakeJavaOverlayOrchestrator(version="21.0.9")
     tool = EnvTool(orchestrator)
 
     result = tool.execute(
@@ -297,7 +332,7 @@ def test_a_dotted_requirement_is_not_met_by_a_different_patch_runtime():
     of the constraint the caller stated, in the one code path whose whole job
     is to refuse a version its own requirement disproves.
     """
-    orchestrator = FakeJavaOverlayOrchestrator()
+    orchestrator = FakeJavaOverlayOrchestrator(version="21.0.9")
     tool = EnvTool(orchestrator)
 
     result = tool.execute(
@@ -316,7 +351,7 @@ def test_a_dotted_requirement_is_not_met_by_a_different_patch_runtime():
 
 
 def test_a_dotted_requirement_is_met_by_the_runtime_it_names():
-    orchestrator = FakeJavaOverlayOrchestrator()
+    orchestrator = FakeJavaOverlayOrchestrator(version="21.0.1")
     tool = EnvTool(orchestrator)
 
     result = tool.execute(
@@ -333,7 +368,7 @@ def test_a_dotted_requirement_is_met_by_the_runtime_it_names():
 
 def test_a_legacy_bare_major_requirement_keeps_its_major_match():
     """`1.8` names major 8 and nothing narrower: `1.8.0_361` satisfies it."""
-    orchestrator = FakeJavaOverlayOrchestrator()
+    orchestrator = FakeJavaOverlayOrchestrator(version="1.8.0_361")
     tool = EnvTool(orchestrator)
 
     result = tool.execute(
@@ -362,7 +397,8 @@ def test_env_register_without_any_requirement_is_unchanged():
 
     assert result.succeeded is True
     overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
-    assert overlay["tools"]["java"]["active"] == "/usr/bin/java"
+    assert overlay["tools"]["java"]["active"] == "/opt/jdk/bin/java"
+    assert overlay["tools"]["java"]["candidates"]["/opt/jdk/bin/java"]["version"] == "17.0.1"
 
 
 @pytest.mark.parametrize("requirement", ["~21", "preferred:21"])

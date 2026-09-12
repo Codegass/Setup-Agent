@@ -59,22 +59,33 @@ def test_an_unrelated_failure_names_no_version():
     assert classify_version_error("") is None
 
 
-def test_the_facade_classifies_the_complete_detached_log():
-    """A detached failure's version complaint sits outside the inline window.
+def test_the_facade_classifies_the_complete_detached_log(
+    monkeypatch,
+    facade_contract_authority,
+    exact_build_facade_authority,
+    exact_internal_runner_authority,
+):
+    """Only the full detached log carries the version failure, not its preview."""
+    from test_build_tool_preflight_integration import (
+        ScriptedBackendTool,
+        ScriptedOrch,
+        _patch_provision,
+        _tool,
+    )
 
-    The facade joins `output` and `raw_output` before classifying; for a
-    detached dispatch `output` is only the storage reference, so the complete
-    log on `raw_output` is what carries the sentence.
-    """
-    import inspect
+    from sag.tools.base import ToolResult
 
-    from sag.tools.build.build_tool import BuildTool
-
-    source = inspect.getsource(BuildTool._execute)
-    retry = source.split("Bounded retry (spec §1c)", 1)[1][:900]
-
-    assert "inner.raw_output" in retry
-    assert "classify_version_error(failure_text)" in retry
+    _patch_provision(monkeypatch)
+    backend = ScriptedBackendTool(
+        ToolResult.completed_failure(output="Stored detached log", raw_output=POLARIS_OUTPUT),
+        ToolResult.completed_success(output="BUILD SUCCESSFUL"),
+    )
+    result = _tool(ScriptedOrch(java="17", manifest={}), maven=backend).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    assert result.succeeded, (result.error_code, result.error)
+    assert len(backend.calls) == 2
+    assert result.metadata["jdk_retry"]["to"] == "21"
 
 
 def test_a_detached_failure_carries_its_complete_log():

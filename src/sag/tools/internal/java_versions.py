@@ -52,6 +52,18 @@ def java_major_from_path(path: Any) -> Optional[str]:
     return java_major(match.group(1)) if match else None
 
 
+def java_distribution(output: str) -> Optional[str]:
+    """Runtime family observed in Java's own banner; absent identity stays absent."""
+    output = "\n".join(line for line in output.splitlines() if not line.strip().startswith("/"))
+    if "graalvm" in output.lower():
+        return "graalvm"
+    if "openjdk" in output.lower():
+        return "openjdk"
+    if "Java(TM)" in output:
+        return "oracle"
+    return None
+
+
 def names_bare_java_major(version: Any) -> bool:
     """Whether a version string names a MAJOR and nothing narrower.
 
@@ -231,6 +243,40 @@ def java_requirement_candidate(
     return str(candidate)
 
 
+def _compiler_args_may_select_java(element: ET.Element) -> bool:
+    """Diagnostic switches alone do not declare a Java version or toolchain.
+
+    Keep unknown arguments, interpolation and empty overrides unresolved. This
+    does not judge whether a given javac supports a warning flag; the actual
+    runner reports compiler-option and plugin compatibility failures.
+    """
+    import shlex
+
+    name = element.tag.rsplit(".", 1)[-1]
+    if name == "compilerArgument":
+        values = [element.text or ""] if not list(element) else []
+    elif name == "compilerArgs":
+        values = [child.text or "" for child in element if not list(child)]
+        if len(values) != len(element) or (element.text or "").strip():
+            return True
+    else:  # Legacy compilerArguments map prepends '-' to each key.
+        values = [f"-{child.tag} {child.text or ''}" for child in element if not list(child)]
+        if len(values) != len(element) or (element.text or "").strip():
+            return True
+    try:
+        args = [arg for value in values for arg in shlex.split(value)]
+    except ValueError:
+        return True
+    return not args or any(
+        "${" in arg
+        or (
+            arg not in {"-Xlint", "-nowarn", "-deprecation", "-verbose", "-Werror"}
+            and not arg.startswith("-Xlint:")
+        )
+        for arg in args
+    )
+
+
 def _profile_declares_java_requirement(profile: ET.Element) -> bool:
     """Track conditional Java declarations, not merely a compiler plugin name.
 
@@ -251,11 +297,11 @@ def _profile_declares_java_requirement(profile: ET.Element) -> bool:
         "fork",
         "compilerId",
         "compilerVersion",
-        "compilerArgs",
-        "compilerArgument",
-        "compilerArguments",
     }
-    properties = {"java.version"} | {"maven.compiler." + key for key in compiler_options}
+    argument_options = {"compilerArgs", "compilerArgument", "compilerArguments"}
+    properties = {"java.version"} | {
+        "maven.compiler." + key for key in compiler_options | argument_options
+    }
     if any(element.tag in properties for element in profile.findall("./properties/*")):
         return True
     if any(True for _ in profile.iter("requireJavaVersion")):
@@ -264,7 +310,11 @@ def _profile_declares_java_requirement(profile: ET.Element) -> bool:
         plugin.findtext("artifactId") == "maven-toolchains-plugin"
         or (
             plugin.findtext("artifactId") == "maven-compiler-plugin"
-            and any(element.tag in compiler_options for element in plugin.iter())
+            and any(
+                element.tag in compiler_options
+                or (element.tag in argument_options and _compiler_args_may_select_java(element))
+                for element in plugin.iter()
+            )
         )
         for plugin in profile.iter("plugin")
     )

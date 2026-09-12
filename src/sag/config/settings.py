@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -104,8 +104,19 @@ class Config(BaseModel):
     # Plan-2 behavior. "same-model" consults the action model with a fresh
     # context; any other value is used verbatim as a litellm model name.
     advisor_mode: str = Field(default="same-model")
+    # None preserves the provider default used by existing advisor runs.
+    advisor_reasoning_effort: Optional[Literal["none", "low", "medium", "high", "xhigh", "max"]] = (
+        Field(default=None)
+    )
     # Hard output cap on one consult. Advice is strategy, not a transcript.
     advisor_max_tokens: int = Field(default=2048)
+    # Optional total window for an advisor deployment/alias. The local model
+    # catalog supplies a conservative input cap when no override is provided.
+    advisor_context_window: Optional[int] = Field(default=65536, ge=1024)
+    # Compare extractive and on-demand semantic compression without changing
+    # advisor model, triggers, task acceptance, or execution policy.
+    advisor_context_compression: Literal["extractive", "semantic"] = "extractive"
+    advisor_summary_context_window: Optional[int] = Field(default=None, ge=1024)
     # Consults allowed per phase; once exhausted the advisor answers "proceed
     # with your best judgment" and the guarantees go inert (never a dead-lock).
     advisor_phase_cap: int = Field(default=4)
@@ -170,7 +181,11 @@ class Config(BaseModel):
             ),
             dispatch_stall_seconds=int(os.getenv("SAG_DISPATCH_STALL_SECONDS", "600")),
             advisor_mode=os.getenv("SAG_ADVISOR_MODE", "same-model"),
+            advisor_reasoning_effort=os.getenv("SAG_ADVISOR_REASONING_EFFORT") or None,
             advisor_max_tokens=int(os.getenv("SAG_ADVISOR_MAX_TOKENS", "2048")),
+            advisor_context_window=os.getenv("SAG_ADVISOR_CONTEXT_WINDOW", "65536") or None,
+            advisor_context_compression=os.getenv("SAG_ADVISOR_CONTEXT_COMPRESSION", "extractive"),
+            advisor_summary_context_window=os.getenv("SAG_ADVISOR_SUMMARY_CONTEXT_WINDOW") or None,
             advisor_phase_cap=int(os.getenv("SAG_ADVISOR_PHASE_CAP", "4")),
             build_coverage_threshold=float(
                 os.getenv("SAG_BUILD_COVERAGE_THRESHOLD", str(DEFAULT_BUILD_COVERAGE_THRESHOLD))

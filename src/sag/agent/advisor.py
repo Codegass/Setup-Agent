@@ -1,10 +1,10 @@
 """The advisor tool: a no-parameter client surface over a harness-side consult.
 
-The model calls `advisor()`; the engine assembles the full phase transcript
-plus a deterministic evidence digest and consults a fresh-context reviewer
-(spec §3.2). Nothing about the consult is a model parameter — forwarding the
-transcript is the harness's job, so the model cannot narrow, bias, or forget
-what the reviewer sees.
+The model calls `advisor()`; the engine assembles the task, current facts and
+a view of recorded evidence within the advisor's context budget, then consults
+a fresh-context reviewer. Context selection is the harness's job: rank task
+requirements and current blockers first, then automatically compress lower
+priority material into labeled summaries or excerpts when space is tight.
 
 The tool itself is inert: it owns no provider call and no state. Everything
 that could fail lives behind `consult_fn`, which is
@@ -21,8 +21,8 @@ from ..tools.base import BaseTool, ToolResult
 
 ADVISOR_TOOL_DESCRIPTION = (
     "Consult a senior reviewer about strategy. Takes NO parameters: the harness "
-    "forwards your entire phase transcript and the run's evidence digest "
-    "automatically. Consult it before substantive work on a complex task, when "
+    "forwards the task, current facts and a model-budgeted evidence view "
+    "automatically, with omissions disclosed. Consult it before substantive work on a complex task, when "
     "you are stuck (a recurring error, an approach that is not converging), and "
     "before claiming a phase done or blocked after failures. The reviewer cannot "
     "call tools; it returns strategic guidance about what to do next and why."

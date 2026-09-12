@@ -82,6 +82,9 @@ class _ScriptedAdvisorClient:
     def capabilities_for(self, mode):
         return SimpleNamespace(model="scripted-action-model")
 
+    def build_tools_schema(self, mode):
+        return []
+
     def get_advisor_response(self, messages, *, model, max_tokens):
         self.calls.append({"messages": list(messages), "model": model, "max_tokens": max_tokens})
         if self.error is not None:
@@ -120,6 +123,9 @@ def _advisor_engine(
     engine.prompts = load_react_engine_prompts()
     engine.llm_client = client if client is not None else _ScriptedAdvisorClient()
     engine.steps = list(steps or [])
+    engine._executor_base_system_prompt = (
+        "Build and test the requested checkout. Preserve user requirements."
+    )
     engine.current_iteration = 7
     engine.phase_machine = SimpleNamespace(
         current_phase=phase,
@@ -289,6 +295,10 @@ def test_successful_consult_returns_the_advice_and_records_telemetry():
 
     telemetry = engine.advisor_telemetry
     assert telemetry["mode"] == "same-model"
+    context = telemetry["calls"][0].pop("context")
+    requests = telemetry["calls"][0].pop("provider_requests")
+    assert requests[0]["has_advice"]
+    assert context["estimated_input_tokens"] <= context["input_token_budget"]
     assert telemetry["calls"] == [
         {
             "iteration": 7,
@@ -330,9 +340,10 @@ def test_consult_messages_carry_the_flattened_transcript_and_the_digest():
     system_text = messages[0]["content"]
     assert "senior reviewer" in system_text
     assert "Never advise giving up while a mechanical repair is untried." in system_text
-    assert "SEALED PROJECT EXECUTION PLAN" in system_text
+    assert "SEALED PROJECT EXECUTION PLAN" not in system_text
 
     user_text = messages[1]["content"]
+    assert "SEALED PROJECT EXECUTION PLAN" in user_text
     # The whole phase transcript is forwarded, flattened role by role.
     assert "USER: === PHASE: BUILD ===" in user_text
     assert "ASSISTANT: Compiling now." in user_text
@@ -448,6 +459,11 @@ def test_the_run_pin_carries_advisor_telemetry(tmp_path):
     agent._write_run_pin(target_repo_sha="a" * 40)
 
     pin = RunPin.model_validate_json((tmp_path / "run-pin.json").read_text(encoding="utf-8"))
+    assert pin.advisor["calls"][0].pop("context") == engine.advisor_telemetry["calls"][0]["context"]
+    assert (
+        pin.advisor["calls"][0].pop("provider_requests")
+        == engine.advisor_telemetry["calls"][0]["provider_requests"]
+    )
     assert pin.advisor == {
         "mode": "same-model",
         "calls": [
@@ -499,3 +515,79 @@ def test_advisor_defaults_are_the_spec_values():
     assert config.advisor_mode == "same-model"
     assert config.advisor_max_tokens == 2048
     assert config.advisor_phase_cap == 4
+    assert config.advisor_reasoning_effort is None
+
+
+def test_advisor_reasoning_env_is_validated_without_changing_executor(monkeypatch, tmp_path):
+    from pydantic import ValidationError
+
+    from sag.config.settings import Config
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SAG_ADVISOR_REASONING_EFFORT", "low")
+    monkeypatch.setenv("SAG_GPT5_REASONING_EFFORT", "high")
+    config = Config.from_env()
+    assert config.advisor_reasoning_effort == "low"
+    assert config.gpt5_reasoning_effort == "high"
+    monkeypatch.setenv("SAG_ADVISOR_REASONING_EFFORT", "lwo")
+    with pytest.raises(ValidationError):
+        Config.from_env()
+
+
+def test_advisor_input_and_receipt_are_stored_without_changing_executor_observation(tmp_path):
+    import json
+
+    from sag.agent.react_engine import OBSERVABILITY_TASK_ID
+
+    client = _ScriptedAdvisorClient()
+    client.last_advisor_receipt = {"model": "returned-model", "content": client.advice}
+    engine = _advisor_engine(client=client)
+    engine.control_event_sink = SimpleNamespace(path=tmp_path / "control-events.jsonl")
+    engine.config.advisor_reasoning_effort = "low"
+
+    original = client.get_advisor_response
+
+    def consult(messages, **kwargs):
+        # Input bytes already exist when the provider is called.
+        entries = [
+            json.loads(line)
+            for line in (tmp_path / "contexts/full_outputs.jsonl").read_text().splitlines()
+        ]
+        assert len(entries) == 1
+        assert json.loads(entries[0]["output"])["messages"] == messages
+        return original(messages, **kwargs)
+
+    client.get_advisor_response = consult
+    result = engine.consult_advisor()
+
+    assert result.output == client.advice
+    assert set(result.metadata) == {"advisor", "advisor_call_index", "advisor_model"}
+    entries = [
+        json.loads(line)
+        for line in (tmp_path / "contexts/full_outputs.jsonl").read_text().splitlines()
+    ]
+    by_ref = {entry["ref_id"]: entry for entry in entries}
+    call = engine.advisor_telemetry["calls"][0]
+    request = json.loads(by_ref[call["request_ref"]]["output"])
+    receipt = json.loads(by_ref[call["receipt_ref"]]["output"])
+    assert request["messages"] == client.calls[0]["messages"]
+    assert request["reasoning_effort"] == "low"
+    assert receipt["request_ref"] == call["request_ref"]
+    assert receipt["model"] == "returned-model"
+    assert all(entry["task_id"] == OBSERVABILITY_TASK_ID for entry in entries)
+
+
+def test_advisor_input_failure_does_not_bind_a_previous_provider_receipt(tmp_path):
+    client = _ScriptedAdvisorClient()
+    client.last_advisor_receipt = {"model": "old-model", "content": "old advice"}
+    engine = _advisor_engine(client=client)
+    engine.control_event_sink = SimpleNamespace(path=tmp_path / "control_events.jsonl")
+
+    def fail():
+        raise ValueError("could not render input")
+
+    engine._advisor_messages = fail
+    result = engine.consult_advisor()
+    assert result.metadata["advisor"] == "error"
+    assert not client.calls
+    assert "receipt_ref" not in engine.advisor_telemetry["calls"][0]

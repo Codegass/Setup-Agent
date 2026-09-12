@@ -288,7 +288,9 @@ PHASE_OBJECTIVES = {
         "Test coordinates can live in a different module or build system from build "
         "coordinates. Persist executed, passed, failed, error, and skipped counts with their "
         "receipt references. Report what executed against what was discovered; red tests are "
-        "project facts to report, not a repair duty. Claim the outcome the receipts support; "
+        "project facts to report, not a repair duty. Missing runtime/build prerequisites "
+        "remain setup work: investigate and carry out feasible repairs before stopping. "
+        "Claim the outcome the receipts support; "
         "absence of a runner receipt cannot support test success."
     ),
     "report": (
@@ -316,8 +318,10 @@ PYTHON_PHASE_OBJECTIVES = {
         "executed, passed, failed, error, and skipped counts bound to receipt references. "
         "When native readiness is absent or unknown, the surveyed bounded-smoke constraint "
         "limits collection until capability evidence changes. Report what executed against "
-        "what was discovered; red tests are project facts to report, not a repair duty. Claim "
-        "the outcome the receipts support; no runner receipt cannot support success."
+        "what was discovered; red tests are project facts to report, not a repair duty. "
+        "Missing runtime/build prerequisites remain setup work: investigate and carry out "
+        "feasible repairs before stopping. Claim the outcome the receipts support; "
+        "no runner receipt cannot support success."
     ),
 }
 
@@ -3003,6 +3007,7 @@ class ReActEngine(UIEventEmitter):
             if inventory_guidance:
                 lines.extend(["", inventory_guidance])
         if phase in ("build", "test"):
+            lines.extend(self._required_task_progress_lines())
             if survey_state == "created":
                 lines.append(
                     "(framework survey ran — project facts were computed and "
@@ -3047,6 +3052,59 @@ class ReActEngine(UIEventEmitter):
             content=content,
             timestamp=self._get_timestamp(),
         )
+
+    def _required_task_progress_lines(self) -> List[str]:
+        """Rehydrate task progress from current receipts after a phase reset.
+
+        This is the same read-only assessment used at closure, not an execution
+        plan or a new gate. A missing assessment must never imply an empty task.
+        """
+        from .acceptance_task import (
+            AcceptanceTask,
+            build_task_completion,
+            render_task_completion_lines,
+        )
+        from .invocation_receipts import RECEIPT_DIR
+
+        orchestrator = getattr(self, "orchestrator", None) or getattr(
+            getattr(self, "context_manager", None), "orchestrator", None
+        )
+        task = getattr(orchestrator, "acceptance_task", None)
+        if not isinstance(task, AcceptanceTask):
+            return []
+        state = getattr(self, "run_evidence_state", None)
+        try:
+            snapshot = build_task_completion(
+                orchestrator,
+                state,
+                validator=getattr(self, "physical_validator", None),
+                project_root=getattr(orchestrator, "acceptance_task_root", None),
+                repository=getattr(orchestrator, "acceptance_task_repository", None),
+                task=task,
+                output_storage=getattr(self, "output_storage", None),
+            )
+            if snapshot is None:
+                raise ValueError("required task assessment missing")
+            lines = render_task_completion_lines(snapshot)
+            lines.extend(
+                f"Task {step.id} receipt file: {RECEIPT_DIR}/{step.receipt_id}.json; "
+                f"exit={step.exit_code}"
+                for step in snapshot.steps
+                if step.receipt_id
+            )
+            if any(step.receipt_id for step in snapshot.steps):
+                lines.append(
+                    "Receipt files are readable with file_io or search(target='file:<path>'). "
+                    "A receipt ID identifies a record, not a job: handle."
+                )
+            return ["", "Current task progress (observed receipts; not a revised plan):", *lines]
+        except Exception as exc:
+            logger.warning(f"Task progress projection unavailable: {exc}")
+            return [
+                "",
+                "Current task progress: unavailable; the pinned task remains required.",
+                "Inspect retained execution evidence; do not infer that any step completed.",
+            ]
 
     def _analyze_fact_sheet_guidance(self) -> str:
         """Project the small observed coordinate set useful for Analyze."""
@@ -4278,6 +4336,11 @@ class ReActEngine(UIEventEmitter):
             # a user turn made a run-task model read its own instructions twice
             # (Stage B carried the duplication deliberately; Task 8 removes it).
             base_system_prompt = base_system_prompt + "\n\n" + initial_prompt
+        # The advisor's phase window does not contain system messages. Keep
+        # the exact executor base for both model views, including the original
+        # user goal and pinned acceptance task. Reset on every run.
+        self._executor_base_system_prompt = base_system_prompt
+        self._executor_task_prompt = initial_prompt or ""
 
         run_started_at = time.time()
         wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
@@ -7692,14 +7755,74 @@ class ReActEngine(UIEventEmitter):
 
         phase = str(getattr(getattr(self, "phase_machine", None), "current_phase", "") or "")
         model = self._advisor_model()
+        request_ref = None
+        provider_records = []
+        self._last_advisor_context = {}
+        self._advisor_message_batches = []
+        unavailable_text = self._ADVISOR_UNAVAILABLE_TEXT
         try:
-            advice = self.llm_client.get_advisor_response(
-                self._advisor_messages(),
-                model=model,
-                max_tokens=int(getattr(self.config, "advisor_max_tokens", 2048)),
-            )
+            messages = self._advisor_messages()
+            max_tokens = int(getattr(self.config, "advisor_max_tokens", 2048))
+            batches = self._advisor_message_batches or [(messages, self._last_advisor_context)]
+            replies = []
+            for part, (messages, context) in enumerate(batches, 1):
+                request_ref = self._store_bytes_once(
+                    canonical_json(
+                        {
+                            "model": model,
+                            "messages": messages,
+                            "max_tokens": max_tokens,
+                            "reasoning_effort": getattr(
+                                self.config, "advisor_reasoning_effort", None
+                            ),
+                            "context": context,
+                        }
+                    ),
+                    label="advisor_request",
+                )
+                try:
+                    reply = self.llm_client.get_advisor_response(
+                        messages, model=model, max_tokens=max_tokens
+                    )
+                except Exception as exc:
+                    self.agent_logger.warning(f"Advisor part unavailable: {type(exc).__name__}")
+                    reply = ""
+                receipt = getattr(self.llm_client, "last_advisor_receipt", None)
+                receipt_ref = (
+                    self._store_bytes_once(
+                        canonical_json({"request_ref": request_ref, **receipt}),
+                        label="advisor_receipt",
+                    )
+                    if receipt
+                    else None
+                )
+                provider_records.append(
+                    {
+                        "part": part,
+                        "request_ref": request_ref,
+                        "receipt_ref": receipt_ref,
+                        "has_advice": bool(reply),
+                    }
+                )
+                if len(batches) == 1:
+                    replies.append(str(reply or ""))
+                else:
+                    replies.append(
+                        f"Partial review {part}/{len(batches)} (not a global completion judgment):\n"
+                        + (str(reply) if reply else "Unavailable; this part remains unreviewed.")
+                    )
+            advice = "\n\n".join(replies) if any(r["has_advice"] for r in provider_records) else ""
         except Exception as exc:
             self.agent_logger.warning(f"Advisor consult unavailable: {exc}")
+            from .advisor_context import AdvisorContextUnavailable
+
+            if isinstance(exc, AdvisorContextUnavailable):
+                self._last_advisor_context = exc.audit
+                unavailable_text = (
+                    f"Advisor could not review the required context ({exc}). "
+                    "No advice was produced. Continue with your best judgment; "
+                    "all original task requirements still apply."
+                )
             advice = ""
         advice_text = str(advice or "").strip()
         outcome = "advice" if advice_text else "error"
@@ -7708,8 +7831,19 @@ class ReActEngine(UIEventEmitter):
             advice_chars=len(advice_text),
             outcome=outcome,
         )
+        # Reuse the host observability store; these refs never enter the model's
+        # tool result or its searchable execution evidence.
+        call = self._advisor_calls[index - 1]
+        if self._last_advisor_context:
+            call["context"] = self._last_advisor_context
+        if request_ref:
+            call["request_ref"] = request_ref
+        if provider_records:
+            call["provider_requests"] = provider_records
+            if provider_records[-1]["receipt_ref"]:
+                call["receipt_ref"] = provider_records[-1]["receipt_ref"]
         return ToolResult.completed_success(
-            output=advice_text or self._ADVISOR_UNAVAILABLE_TEXT,
+            output=advice_text or unavailable_text,
             metadata={
                 "advisor": outcome,
                 "advisor_call_index": index,
@@ -7855,36 +7989,170 @@ class ReActEngine(UIEventEmitter):
         )
 
     def _advisor_messages(self) -> List[Dict[str, str]]:
-        """System reviewer brief + the whole phase transcript and evidence.
+        """Share executor instructions and facts, bounded by the advisor model."""
+        from dataclasses import asdict, replace
 
-        The model chooses WHEN to consult, never WHAT the reviewer sees."""
-        # Prompt key: advisor_system
-        system_brief = str(self.prompts.get("advisor_system") or "")
-        system_brief = self._system_prompt_for_current_phase(system_brief)
-        return [
-            {"role": "system", "content": system_brief},
-            {"role": "user", "content": self._advisor_user_message()},
+        from .advisor_context import (
+            AdvisorContextUnavailable,
+            AdvisorSection,
+            pack_advisor_contexts,
+        )
+
+        base = getattr(self, "_executor_base_system_prompt", "")
+        if not base:
+            raise AdvisorContextUnavailable("executor_instructions_unavailable", {})
+        digest = self._advisor_evidence_digest()
+        task_text = getattr(self, "_executor_task_prompt", "") or base
+        framework = base.removesuffix("\n\n" + task_text) if task_text != base else ""
+        plan = self._system_prompt_for_current_phase("").strip()
+        required = [
+            AdvisorSection("ORIGINAL TASK AND CONSTRAINTS", task_text, priority=5, policy="keep"),
+            AdvisorSection("CURRENT EVIDENCE DIGEST", digest, priority=10, policy="keep"),
         ]
+        # The existing typed acceptance task is a compact, authoritative task
+        # source. Preserve its literal commands ahead of explanatory prose.
+        from .acceptance_task import AcceptanceTask
 
-    def _advisor_user_message(self) -> str:
-        sections = [
-            f"{self._ADVISOR_TRANSCRIPT_HEADER}:",
-            self._advisor_transcript_text(),
-            self._advisor_evidence_digest(),
+        orchestrator = getattr(self, "orchestrator", None) or getattr(
+            getattr(self, "context_manager", None), "orchestrator", None
+        )
+        task = getattr(orchestrator, "acceptance_task", None)
+        root = getattr(orchestrator, "acceptance_task_root", None)
+        if isinstance(task, AcceptanceTask) and isinstance(root, str):
+            contract = task.prompt(root)
+            required[0] = replace(required[0], text=task_text.replace(contract, ""))
+            required.insert(
+                0, AdvisorSection("PINNED ACCEPTANCE TASK", contract, priority=0, policy="keep")
+            )
+        repair = getattr(self, "_pending_repair_context", None)
+        if repair is not None:
+            required.append(
+                AdvisorSection(
+                    "CURRENT JUDGE FACTS",
+                    self._repair_context_guidance(repair),
+                    priority=1,
+                    policy="keep",
+                )
+            )
+        history = self._advisor_history_sections()
+        if history and history[0].text.startswith("USER:"):
+            intro = history.pop(0)
+            before, separator, handoff = intro.text.partition("=== CUMULATIVE PHASE HANDOFF ===")
+            if separator and (separator + handoff).strip() in digest:
+                # Remove only an exact duplicate, never an older/different
+                # handoff that would conceal a change in evidence.
+                intro = replace(intro, text=before.rstrip())
+            required.append(replace(intro, priority=25))
+        latest = history.pop() if history else None
+        if latest:
+            # Keep requested arguments and observed envelope facts literally;
+            # the verbose transcript remains available as a separate source.
+            required.append(
+                replace(latest, text=latest.summary or latest.text, priority=15, policy="keep")
+            )
+        schemas = self.llm_client.build_tools_schema(ReactModelMode.ACTION)
+        required.append(
+            AdvisorSection(
+                "EXECUTOR TOOL NAMES (not callable by advisor)",
+                ", ".join((s.get("function") or s).get("name", "unknown") for s in schemas),
+                priority=30,
+            )
+        )
+        optional = [*reversed(history), *self._advisor_output_sections()]
+        if latest and latest.summary:
+            optional.insert(0, replace(latest, name=latest.name + " FULL", priority=15))
+        if plan:
+            optional.insert(0, AdvisorSection("CURRENT REVISABLE PLAN", plan, priority=20))
+        if framework:
+            optional.append(AdvisorSection("QUOTED EXECUTOR FRAMEWORK", framework, priority=90))
+        optional.extend(
+            AdvisorSection(
+                f"EXECUTOR TOOL SCHEMA {i}",
+                canonical_json(schema),
+                priority=95,
+                summary=canonical_json(
+                    {
+                        "name": (schema.get("function") or schema).get("name"),
+                        "description": (schema.get("function") or schema).get("description"),
+                        "parameter_names": list(
+                            (schema.get("function") or schema)
+                            .get("parameters", {})
+                            .get("properties", {})
+                        ),
+                    }
+                ),
+            )
+            for i, schema in enumerate(schemas)
+        )
+        compactor = None
+        if getattr(self.config, "advisor_context_compression", "extractive") == "semantic":
+            from .advisor_compaction import AdvisorCompactor
+
+            compactor = AdvisorCompactor(
+                model=self.config.get_litellm_model_name("action"),
+                complete=self.llm_client.summarize_advisor_context,
+                question=task_text + "\nCURRENT STATE:\n" + digest,
+                context_window=getattr(self.config, "advisor_summary_context_window", None),
+                persist=lambda value, label: self._store_bytes_once(
+                    canonical_json(value), label=label
+                ),
+            )
+        self._advisor_message_batches = pack_advisor_contexts(
+            model=self._advisor_model(),
+            # Prompt key: advisor_system
+            system=str(self.prompts.get("advisor_system") or ""),
+            required=required,
+            optional=optional,
+            max_output_tokens=int(getattr(self.config, "advisor_max_tokens", 2048)),
+            context_window=getattr(self.config, "advisor_context_window", None),
+            summarizer=compactor,
+        )
+        messages, audit = self._advisor_message_batches[0]
+        self._last_advisor_context = {
+            **audit,
+            "compression_mode": getattr(self.config, "advisor_context_compression", "extractive"),
+            "summary_calls": compactor.calls if compactor else [],
+            "review_parts": len(self._advisor_message_batches),
+        }
+        if self._last_advisor_context["compression_applied"]:
+            self._last_advisor_context["source_ref"] = self._store_bytes_once(
+                canonical_json({"sections": [asdict(s) for s in [*required, *optional]]}),
+                label="advisor_context_source",
+            )
+        self._advisor_message_batches[0] = (messages, self._last_advisor_context)
+        return messages
+
+    def _advisor_history_sections(self):
+        """Pair full exchanges and prepare source-bound attempt summaries."""
+        from .advisor_context import AdvisorSection
+        from .attempt_ledger import failure_preview
+
+        groups: list[list[str]] = []
+        summaries: list[list[str]] = []
+        steps = list(getattr(self, "steps", None) or [])
+        results = {
+            s.tool_call_id: s.tool_result
+            for s in steps
+            if s.tool_call_id and s.tool_result is not None
+        }
+        answered = {s.tool_call_id for s in steps if s.step_type == StepType.OBSERVATION}
+        steps = [
+            s
+            for s in steps
+            if not (
+                s.step_type == StepType.ACTION
+                and s.tool_name == "advisor"
+                and s.tool_call_id not in answered
+                and s.tool_result is None
+            )
         ]
-        return "\n".join(section for section in sections if section)
-
-    def _advisor_transcript_text(self) -> str:
-        """The rendered phase window flattened to `<ROLE>: <content>` lines.
-
-        Reusing `render_messages` is the point: the reviewer reads EXACTLY the
-        conversation the executor is working from (same pairing, same clamped
-        tool output), not a second, drifting projection of it."""
-        lines: List[str] = []
-        for message in render_messages("", getattr(self, "steps", None) or []):
+        for message in render_messages("", steps):
             role = str(message.get("role") or "")
             if role == "system":
                 continue
+            if role != "tool" or not groups:
+                groups.append([])
+                summaries.append([])
             content = str(message.get("content") or "")
             calls = message.get("tool_calls") or ()
             if calls:
@@ -7894,8 +8162,91 @@ class ReActEngine(UIEventEmitter):
                     for call in calls
                 )
                 content = f"{content} [tool calls: {rendered}]".strip()
-            lines.append(f"{role.upper()}: {content}")
-        return "\n".join(lines)
+            groups[-1].append(f"{role.upper()}: {content}")
+            if role == "tool":
+                result = results.get(message.get("tool_call_id"))
+                facts = {
+                    "tool_call_id": message.get("tool_call_id"),
+                    "invocation_status": getattr(
+                        getattr(result, "invocation_status", None), "value", "unknown"
+                    ),
+                    "operation_outcome": getattr(
+                        getattr(result, "operation_outcome", None), "value", "unknown"
+                    ),
+                    "error_code": getattr(result, "error_code", None),
+                    "output_ref": getattr(result, "output_ref", None),
+                    "poll_ref": getattr(result, "poll_ref", None),
+                }
+                if result is not None:
+                    facts["observed_metadata"] = {
+                        key: result.metadata[key]
+                        for key in (
+                            "command",
+                            "working_directory",
+                            "exit_code",
+                            "report_test_counts",
+                            "test_stats_basis",
+                            "job_id",
+                            "java_version",
+                            "java_home",
+                        )
+                        if key in result.metadata
+                    }
+                summaries[-1].append(
+                    f"TOOL OBSERVED: {canonical_json(facts)}\n"
+                    f"output excerpt: {failure_preview(content)}"
+                )
+            else:
+                summaries[-1].append(f"{role.upper()}: {content}")
+        return [
+            AdvisorSection(
+                f"PHASE TRANSCRIPT exchange {i} (chronological index)",
+                "\n".join(lines),
+                summary="\n".join(summaries[i]) if len(lines) > 1 else None,
+            )
+            for i, lines in enumerate(groups)
+        ]
+
+    def _advisor_output_sections(self):
+        """Expand already-observed bytes, including earlier phases; no new tool work."""
+        from sag.tools.base import canonical_full_output_source
+
+        from .advisor_context import AdvisorSection
+
+        sections = []
+        seen = set()
+        state = getattr(self, "run_evidence_state", None)
+        for observation in reversed(tuple(getattr(state, "tool_observations", ()) or ())):
+            result = observation.result
+            ref = getattr(result, "output_ref", None)
+            if observation.tool_name == "advisor" or not is_output_storage_ref(ref) or ref in seen:
+                continue
+            seen.add(ref)
+            output = canonical_full_output_source(
+                raw_output=result.raw_output, output=result.output, error=result.error
+            )
+            header = canonical_json(
+                {
+                    "tool": observation.tool_name,
+                    "params": observation.params,
+                    "phase": observation.source_phase,
+                    "output_ref": ref,
+                    "output_path": result.metadata.get("output_path"),
+                    "invocation_status": result.invocation_status.value,
+                    "operation_outcome": result.operation_outcome.value,
+                    "error_code": result.error_code,
+                }
+            )
+            sections.append(
+                AdvisorSection(
+                    f"RECORDED TOOL OUTPUT {ref}",
+                    header + "\n" + output,
+                    ref=ref,
+                    priority=30 if result.operation_outcome.value != "success" else 70,
+                    policy="excerpt",
+                )
+            )
+        return sections
 
     @staticmethod
     def _advisor_count(value: Any) -> str:

@@ -1,13 +1,46 @@
 """Web search tool for finding information online."""
 
-import json
+from html.parser import HTMLParser
 from typing import Any, Dict, List
-from urllib.parse import quote
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from loguru import logger
 
 from ..base import BaseTool, ToolResult
+
+
+class _PageText(HTMLParser):
+    """Readable page text with source links; never execute page content."""
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+        self.parts = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.hidden += 1
+        if not self.hidden:
+            if tag in ("p", "div", "li", "pre", "br", "h1", "h2", "h3", "tr"):
+                self.parts.append("\n")
+            if tag == "a":
+                href = dict(attrs).get("href")
+                if href:
+                    link = urljoin(self.url, href)
+                    if urlsplit(link).scheme in ("http", "https"):
+                        self.parts.append(f" [{link}] ")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self.hidden:
+            self.hidden -= 1
+        elif tag in ("p", "div", "li", "pre", "h1", "h2", "h3", "tr"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
 
 
 class WebSearchTool(BaseTool):
@@ -25,7 +58,7 @@ class WebSearchTool(BaseTool):
         # The base class now handles parameter validation automatically
 
         if not query.strip():
-            from .base import ToolError
+            from ..base import ToolError
 
             raise ToolError(
                 message="Empty search query provided",
@@ -42,9 +75,17 @@ class WebSearchTool(BaseTool):
             results = self._search_duckduckgo(query, max_results)
 
             if not results:
-                return ToolResult.completed_success(
-                    output="No search results found for the query.",
+                return ToolResult.completed(
+                    operation_outcome="unknown",
+                    evidence_status="unknown",
+                    output="DuckDuckGo Instant Answer returned no usable sources. This endpoint is not a full web index.",
+                    error="Search provider returned no usable source evidence",
+                    error_code="WEB_SEARCH_NO_EVIDENCE",
                     metadata={"query": query, "results_count": 0},
+                    facts={
+                        "provider": "duckduckgo_instant_answer",
+                        "page_reader": "search(target='url:<https URL>')",
+                    },
                 )
 
             # Format results
@@ -63,7 +104,14 @@ class WebSearchTool(BaseTool):
             error_msg = f"Web search failed: {str(e)}"
             logger.error(f"Web search error for query '{query}': {error_msg}")
             return ToolResult.completed_failure(
-                output="", error=error_msg, metadata={"query": query}
+                output="",
+                error=error_msg,
+                error_code="WEB_SEARCH_UNAVAILABLE",
+                metadata={"query": query},
+                facts={
+                    "provider": "duckduckgo_instant_answer",
+                    "page_reader": "search(target='url:<https URL>')",
+                },
             )
 
     def _search_duckduckgo(self, query: str, max_results: int) -> List[Dict[str, str]]:
@@ -101,32 +149,72 @@ class WebSearchTool(BaseTool):
                         }
                     )
 
-            # If no results from DuckDuckGo, try a simple search
-            if not results:
-                results = self._fallback_search(query, max_results)
-
             return results[:max_results]
 
         except Exception as e:
-            logger.warning(f"DuckDuckGo search failed: {e}, trying fallback")
-            return self._fallback_search(query, max_results)
+            logger.warning(f"DuckDuckGo search failed: {e}")
+            raise
 
-    def _fallback_search(self, query: str, max_results: int) -> List[Dict[str, str]]:
-        """Fallback search method."""
-        # For now, return a message indicating web search is limited
-        # In a production environment, you might integrate with other APIs
-        return [
-            {
-                "title": "Web Search Limited",
-                "url": f"https://www.google.com/search?q={quote(query)}",
-                "snippet": (
-                    f"Direct web search is limited in this environment. "
-                    f"You can manually search for '{query}' using the URL above. "
-                    f"Consider checking official documentation, GitHub issues, "
-                    f"or Stack Overflow for more information."
-                ),
-            }
-        ]
+    def read_url(self, url: str) -> ToolResult:
+        """Read a known documentation/release URL; large output uses normal storage."""
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return ToolResult.completed_failure(
+                output="",
+                error="Page reads require an HTTPS URL without credentials",
+                error_code="WEB_URL_INVALID",
+            )
+        try:
+            with requests.get(url, timeout=(10, 30), stream=True) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                if content_type not in (
+                    "text/html",
+                    "text/plain",
+                    "application/json",
+                    "application/xhtml+xml",
+                    "text/markdown",
+                ):
+                    return ToolResult.completed_failure(
+                        output="",
+                        error=f"Unsupported page content type: {content_type}",
+                        error_code="WEB_CONTENT_UNSUPPORTED",
+                        facts={"url": url, "content_type": content_type},
+                    )
+                data = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    data.extend(chunk)
+                    if len(data) > 4 * 1024 * 1024:
+                        return ToolResult.completed_failure(
+                            output="",
+                            error="Page exceeds the 4 MiB fetch limit; no complete page was read",
+                            error_code="WEB_PAGE_TOO_LARGE",
+                            facts={"url": url, "complete": False},
+                        )
+                body = bytes(data).decode(response.encoding or "utf-8", errors="replace")
+                if content_type in ("text/html", "application/xhtml+xml"):
+                    parser = _PageText(response.url)
+                    parser.feed(body)
+                    body = "\n".join(
+                        line.strip() for line in "".join(parser.parts).splitlines() if line.strip()
+                    )
+                return ToolResult.completed_success(
+                    output=f"Source: {response.url}\n\n{body}",
+                    facts={
+                        "requested_url": url,
+                        "source_url": response.url,
+                        "http_status": response.status_code,
+                        "bytes": len(data),
+                        "complete": True,
+                    },
+                )
+        except requests.RequestException as exc:
+            return ToolResult.completed_failure(
+                output="",
+                error=f"Page read failed: {exc}",
+                error_code="WEB_PAGE_UNAVAILABLE",
+                facts={"url": url, "complete": False},
+            )
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
         """Get the parameters schema for this tool."""

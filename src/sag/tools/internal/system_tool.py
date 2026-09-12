@@ -1,6 +1,7 @@
 """System management tool for package installation and system operations."""
 
 import re
+import shlex
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -18,6 +19,19 @@ from .maven_versions import (
     satisfies_maven_floor,
 )
 from .toolchain_manager import record_registered_runtime
+
+# Adoptium/Temurin apt repo for JDKs missing from the base image's Debian
+# release (e.g. JDK 8 on bookworm). One-shot, idempotent.
+_TEMURIN_SETUP = (
+    "apt-get install -y wget apt-transport-https gnupg >/dev/null 2>&1; "
+    "wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public "
+    "| gpg --dearmor -o /usr/share/keyrings/adoptium.gpg 2>/dev/null; "
+    'echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] '
+    "https://packages.adoptium.net/artifactory/deb "
+    '$(. /etc/os-release && echo $VERSION_CODENAME) main" '
+    "> /etc/apt/sources.list.d/adoptium.list && apt-get update"
+)
+
 
 # The verification a provision must pass is the one a dispatch would run: bare
 # `java` and `javac`, resolved through the same environment DockerOrchestrator
@@ -103,6 +117,8 @@ class SystemTool(BaseTool):
         packages: Optional[List[str]] = None,
         java_version: Optional[str] = None,
         maven_version: Optional[str] = None,
+        java_distribution: Optional[str] = None,
+        java_capabilities: Optional[List[str]] = None,
     ) -> ToolResult:
         """Execute system management operations."""
         # The base class now handles parameter validation automatically
@@ -180,7 +196,28 @@ class SystemTool(BaseTool):
                         ],
                         retryable=True,
                     )
-                return self._install_and_configure_java(java_version)
+                providers = {
+                    "openjdk": self._install_and_configure_java,
+                    "graalvm": self._install_graalvm,
+                }
+                # A version-only request keeps the explicit JVM selection.
+                # Replacing its distribution requires a new distribution value.
+                selected = EnvOverlayStore(self.docker_orchestrator).active_candidate("java") or {}
+                distribution = java_distribution or selected.get("distribution") or "openjdk"
+                capabilities = (
+                    java_capabilities
+                    if java_capabilities is not None
+                    else selected.get("capabilities", [])
+                )
+                provider = providers.get(distribution)
+                if provider is None:
+                    return ToolResult.completed_failure(
+                        output="",
+                        error=f"Unsupported Java distribution: {distribution}",
+                        error_code="JAVA_DISTRIBUTION_UNSUPPORTED",
+                        facts={"java_distributions": sorted(providers)},
+                    )
+                return provider(java_version, capabilities=capabilities)
 
             elif action == "install_maven":
                 if not maven_version:
@@ -463,8 +500,117 @@ class SystemTool(BaseTool):
 
         return result
 
-    def _install_and_configure_java(self, java_version: str) -> ToolResult:
+    def _install_graalvm(
+        self, java_version: str, *, capabilities: Optional[List[str]] = None
+    ) -> ToolResult:
+        """Acquire the selected JVM; capability and activation checks are shared.
+
+        Official script URLs: https://www.graalvm.org/downloads/ . This is an
+        explicit distribution route; ordinary OpenJDK of the same major cannot
+        satisfy a request for GraalVM.
+        """
+        if not re.fullmatch(r"\d{2}(?:\.\d+){0,3}", java_version):
+            return ToolResult.completed_failure(
+                output="",
+                error="GraalVM requires a numeric JDK major or release (for example 21 or 21.0.7)",
+                error_code="JAVA_VERSION_UNSUPPORTED",
+            )
+        platform_probe = self.docker_orchestrator.execute_command("uname -s; uname -m")
+        platform = (platform_probe.get("output") or "").split()
+        architecture = {"x86_64": "x64", "aarch64": "aarch64"}.get(platform[-1] if platform else "")
+        if platform_probe.get("exit_code") != 0 or platform[:1] != ["Linux"] or not architecture:
+            return ToolResult.completed_failure(
+                output=platform_probe.get("output") or "",
+                error="GraalVM archive provisioning supports Linux x86_64 and aarch64",
+                error_code="JAVA_PLATFORM_UNSUPPORTED",
+            )
+        major = java_major(java_version)
+        channel = "latest" if java_version == major else "archive"
+        url = f"https://download.oracle.com/graalvm/{major}/{channel}/graalvm-jdk-{java_version}_linux-{architecture}_bin.tar.gz"
+        # All paths are private staging paths. Never replace another installed
+        # JDK, and never activate an unchecked download.
+        script = f"""set -eu
+sag_graal_stage=$(mktemp -d /opt/.sag-graalvm.XXXXXX)
+trap 'rm -f "$sag_graal_stage/archive.tar.gz" "$sag_graal_stage/archive.sha256"' EXIT
+curl --fail --location --retry 2 --max-time 600 {shlex.quote(url)} -o "$sag_graal_stage/archive.tar.gz"
+curl --fail --location --retry 2 --max-time 60 {shlex.quote(url + '.sha256')} -o "$sag_graal_stage/archive.sha256"
+sag_graal_sha=$(awk '{{print $1}}' "$sag_graal_stage/archive.sha256")
+printf '%s' "$sag_graal_sha" | grep -Eq '^[0-9a-fA-F]{{64}}$'
+printf '%s  %s\\n' "$sag_graal_sha" "$sag_graal_stage/archive.tar.gz" | sha256sum -c -
+mkdir "$sag_graal_stage/jdk"
+tar -xzf "$sag_graal_stage/archive.tar.gz" -C "$sag_graal_stage/jdk" --strip-components=1
+"$sag_graal_stage/jdk/bin/java" -version 2>&1
+"$sag_graal_stage/jdk/bin/javac" -version 2>&1
+printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag_graal_sha"
+"""
+        downloaded = self.docker_orchestrator.execute_command(script, timeout=900)
+        output = downloaded.get("output") or ""
+        home = re.search(
+            r"^SAG_GRAAL_HOME=(/opt/\.sag-graalvm\.[A-Za-z0-9]+/jdk)$", output, re.MULTILINE
+        )
+        checksum = re.search(r"^SAG_GRAAL_SHA256=([0-9a-fA-F]{64})$", output, re.MULTILINE)
+        measured = parse_java_verification(output)
+        facts = {
+            "distribution": "graalvm",
+            "requested_version": java_version,
+            "platform": f"linux-{architecture}",
+            "source_url": url,
+            "checksum_url": url + ".sha256",
+        }
+        if (
+            downloaded.get("exit_code") != 0
+            or downloaded.get("success") is False
+            or not home
+            or not checksum
+            or java_major(measured["java_version"]) != major
+            or java_major(measured["javac_version"]) != major
+            or "GraalVM" not in output
+        ):
+            return ToolResult.completed_failure(
+                output=output,
+                error="GraalVM download, checksum or executable verification failed; archive not activated",
+                error_code="JAVA_DISTRIBUTION_VERIFICATION_FAILED",
+                facts=facts,
+            )
+        if java_version != major and measured["java_version"] != java_version:
+            return ToolResult.completed_failure(
+                output=output,
+                error="Downloaded GraalVM does not match the requested release",
+                error_code="JAVA_VERSION_MISMATCH",
+                facts=facts,
+            )
+        facts.update(
+            sha256=checksum.group(1).lower(),
+            java_home=home.group(1),
+            measured_version=measured["java_version"],
+        )
+        from .env_tool import EnvTool
+
+        result = EnvTool(self.docker_orchestrator).execute(
+            action="register",
+            tool="java",
+            executable=f"{home.group(1)}/bin/java",
+            requirement=java_version,
+            java_distribution="graalvm",
+            java_capabilities=list(dict.fromkeys(["javac", *(capabilities or [])])),
+            source="system_install",
+            activate=True,
+        )
+        result.facts.update(facts)
+        result.metadata.update(distribution="graalvm", activation_confirmed=result.succeeded)
+        return result
+
+    def _install_and_configure_java(
+        self, java_version: str, *, capabilities: Optional[List[str]] = None
+    ) -> ToolResult:
         """Install and configure a specific Java version."""
+        if not re.fullmatch(r"(?:1\.)?\d{1,2}", java_version):
+            return ToolResult.completed_failure(
+                output="",
+                error="OpenJDK apt provisioning requires a Java major",
+                error_code="JAVA_VERSION_UNSUPPORTED",
+            )
+        java_version = java_major(java_version)
         logger.info(f"Installing and configuring Java {java_version}")
 
         # Step 1: Check current Java version using the new verification method
@@ -473,11 +619,21 @@ class SystemTool(BaseTool):
 
         # If the correct version is already installed, just configure it
         if version_check["matches"]:
-            logger.info(f"Java {java_version} is already installed and active")
-            return ToolResult.completed_success(
-                output=f"Java {java_version} is already installed and configured\n\n{version_check['raw_output']}",
-                metadata=version_check,
-            )
+            from .build_preflight import active_java_runtime
+            from .env_tool import EnvTool
+
+            runtime = active_java_runtime(self.docker_orchestrator)
+            if runtime.get("distribution") == "openjdk" and runtime.get("executable"):
+                return EnvTool(self.docker_orchestrator).execute(
+                    action="register",
+                    tool="java",
+                    executable=runtime["executable"],
+                    requirement=java_version,
+                    java_distribution="openjdk",
+                    java_capabilities=list(dict.fromkeys(["javac", *(capabilities or [])])),
+                    source="system_install",
+                    activate=True,
+                )
 
         # Step 2: Update package lists
         update_result = self._update_packages()
@@ -509,15 +665,17 @@ class SystemTool(BaseTool):
                     java_package = alt_package
                     break
             else:
-                return ToolResult.completed_failure(
-                    output=install_result["output"],
-                    error=f"Failed to install Java {java_version}",
-                    error_code="JAVA_INSTALL_FAILED",
-                    suggestions=[
-                        f"Observed fact: packages for Java {java_version} were not installable",
-                        "Constraint: a compatible JDK package must exist in the configured repositories",
-                    ],
+                self.docker_orchestrator.execute_command(_TEMURIN_SETUP)
+                install_result = self.docker_orchestrator.execute_command(
+                    f"apt-get install -y temurin-{java_version}-jdk"
                 )
+                if install_result.get("exit_code") != 0:
+                    return ToolResult.completed_failure(
+                        output=install_result.get("output") or "",
+                        error=f"Failed to acquire OpenJDK {java_version} from system and Temurin repositories",
+                        error_code="JAVA_INSTALL_FAILED",
+                    )
+                java_package = f"temurin-{java_version}-jdk"
 
         # Step 4: Get architecture for Java home path - ENHANCED VERSION
         arch_result = self.docker_orchestrator.execute_command("dpkg --print-architecture")
@@ -548,8 +706,6 @@ class SystemTool(BaseTool):
                 if scan_result.get("output"):
                     installed_path = scan_result["output"].strip()
                     # Extract architecture from path
-                    import re
-
                     match = re.search(r"openjdk-([^/]+)$", installed_path)
                     if match:
                         arch = match.group(1)
@@ -571,6 +727,7 @@ class SystemTool(BaseTool):
 
             # Try to find the actual Java installation with more specific search
             find_cmds = [
+                f"ls -d /usr/lib/jvm/temurin-{java_version}-jdk* 2>/dev/null | head -1",
                 # First try: exact version match
                 f"find /usr/lib/jvm -name 'java-{java_version}-openjdk*' -type d | head -1",
                 # Second try: look for any java installation of this version
@@ -643,7 +800,9 @@ class SystemTool(BaseTool):
         # so it fronts both the verification shell and every later dispatch.
         self._persist_java_home_profile(java_home)
         alternatives = self._set_java_alternatives(java_bin, javac_bin)
-        activation_failure = self._activate_java_runtime(java_home, java_version, alternatives)
+        activation_failure = self._activate_java_runtime(
+            java_home, java_version, alternatives, capabilities=capabilities
+        )
         if activation_failure is not None:
             return activation_failure
 
@@ -1177,6 +1336,8 @@ class SystemTool(BaseTool):
         java_home: str,
         java_version: str,
         alternatives: Optional[Dict[str, bool]] = None,
+        *,
+        capabilities: Optional[List[str]] = None,
     ) -> Optional[ToolResult]:
         """Make the proven JDK the runtime this container resolves.
 
@@ -1206,15 +1367,34 @@ class SystemTool(BaseTool):
         landed_links = " and ".join(f"/usr/bin/{name}" for name in landed)
         landed_verb = "was" if len(landed) == 1 else "were"
         try:
-            EnvOverlayStore(self.docker_orchestrator).register(
-                "java",
-                java_bin,
-                version=java_version,
+            from .env_tool import EnvTool
+
+            activation = EnvTool(self.docker_orchestrator).execute(
+                action="register",
+                tool="java",
+                executable=java_bin,
+                requirement=java_version,
                 source="system_install",
-                env={"JAVA_HOME": java_home},
-                path_prepend=[f"{java_home}/bin"],
+                java_distribution="openjdk",
+                java_capabilities=list(dict.fromkeys(["javac", *(capabilities or [])])),
                 activate=True,
             )
+            if not activation.succeeded:
+                activation.metadata["activation_confirmed"] = False
+                if activation.metadata.get("activation_persisted"):
+                    actual = activation.facts.get("dispatch_runtime") or {}
+                    activation.metadata.update(
+                        claimed_java_version=java_version,
+                        verified_java_version=actual.get("version"),
+                        **activation_state_metadata(
+                            "java", java_bin, java_home, java_version, actual.get("version")
+                        ),
+                    )
+                    activation.error = (
+                        f"{activation.error}; activation persisted; verification refused the seal"
+                    )
+                    return activation
+                raise RuntimeError(f"{activation.error_code}: {activation.error}")
         except Exception as exc:
             logger.warning(f"Failed to register Java env overlay: {exc}")
             return ToolResult.completed_failure(
@@ -1231,6 +1411,11 @@ class SystemTool(BaseTool):
                 ),
                 error=f"Java {java_version} was installed but its activation did not persist",
                 error_code="JAVA_RUNTIME_ACTIVATION_FAILED",
+                facts={
+                    "java_home": java_home,
+                    "landed_alternatives": landed,
+                    "activation_error": str(exc),
+                },
                 suggestions=[
                     "Observed fact: the runtime overlay that resolves java did not accept "
                     f"{java_bin}",
@@ -1502,6 +1687,16 @@ class SystemTool(BaseTool):
                     "type": "string",
                     "description": "Java version to install or verify (for 'install_java' or 'verify_java' actions)",
                     "default": None,
+                },
+                "java_distribution": {
+                    "type": "string",
+                    "enum": ["openjdk", "graalvm"],
+                    "description": "install_java: select the JVM distribution to install and activate through the shared environment overlay. Omission keeps the selected family, or defaults to OpenJDK when none is registered.",
+                },
+                "java_capabilities": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["javac", "native-image"]},
+                    "description": "Additional capabilities required from the selected JVM. javac is always verified for a JDK installation; native-image is checked only when requested.",
                 },
                 "maven_version": {
                     "type": "string",

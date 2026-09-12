@@ -53,7 +53,7 @@ class SearchTool(BaseTool):
             description=(
                 "Search stored outputs, files, background-job logs, or the web. "
                 "target: ref id (e.g. 'output_5b9a') | 'file:<path>' | 'name:<dir>' "
-                "| 'job:<id>' | 'web:<query>'. "
+                "| 'job:<id>' | 'web:<query>' | 'url:<https URL>' (read a known documentation/release page). "
                 "'file:' greps file CONTENTS (a file, or a directory searched "
                 "recursively): it matches text INSIDE files, so it cannot report "
                 "whether a file exists. "
@@ -101,6 +101,14 @@ class SearchTool(BaseTool):
             return self._poll_job(target[4:])
         if target.startswith("web:"):
             return self._web(target[4:], max_results)
+        if target.startswith("url:"):
+            if self.web_search is None:
+                return ToolResult.completed_failure(
+                    output="",
+                    error="Web page reader unavailable",
+                    error_code="WEB_PAGE_UNAVAILABLE",
+                )
+            return self.web_search.read_url(target[4:])
         if target.startswith("output_") and self.output_search is not None:
             if not pattern:
                 # No pattern = read the stored output (auto-truncated by the
@@ -486,7 +494,7 @@ class SearchTool(BaseTool):
                         "recursively) and cannot report whether a file exists "
                         f"| name:<dir> matches file and directory NAMES under <dir> to "
                         f"depth {NAME_SEARCH_MAX_DEPTH}, reading no content "
-                        "| job:<id> | web:<query>"
+                        "| job:<id> | web:<query> | url:<https URL> reads a known documentation/release page"
                     ),
                 },
                 "pattern": {

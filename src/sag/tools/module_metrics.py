@@ -211,6 +211,10 @@ def assemble_module_metrics(
             "tests_skipped": _int_or_none(t.get("tests_skipped")),
             "test_source": "runner_xml" if has_tests else "none",
             "has_test_sources": bool(scan.get("has_test_sources")),
+            "test_bearing_evidence": [
+                *(["source_tree"] if scan.get("has_test_sources") else []),
+                *(["runner_xml"] if (t.get("tests_total") or 0) > 0 else []),
+            ],
             "failing_names": failing_names,
             "failing_count": failing_count,
             "evidence_refs": _str_list(t.get("evidence_refs") or scan.get("report_dirs"), 25),
@@ -272,11 +276,9 @@ def assemble_module_metrics(
         "modules_tested": tested,
         "modules_not_tested": total - tested,
         "modules_test_bearing": sum(
-            1 for m in counted if m.get("has_test_sources")
+            1 for m in counted if m.get("has_test_sources") or (m.get("tests_total") or 0) > 0
         ),
-        "modules_with_test_failures": sum(
-            1 for m in counted if (m["failing_count"] or 0) > 0
-        ),
+        "modules_with_test_failures": sum(1 for m in counted if (m["failing_count"] or 0) > 0),
         "build_systems": _str_list(build_systems, 5),
         "single_module": total <= 1,
     }

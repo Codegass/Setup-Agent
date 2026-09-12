@@ -122,6 +122,9 @@ class _ScriptedAdvisorClient:
     def capabilities_for(self, mode):
         return SimpleNamespace(model="scripted-action-model")
 
+    def build_tools_schema(self, mode):
+        return []
+
     def get_advisor_response(self, messages, *, model, max_tokens):
         self.calls.append(model)
         self.messages.append([dict(message) for message in messages])
@@ -131,6 +134,7 @@ class _ScriptedAdvisorClient:
 def _unit_engine(*, phase="build", advisor_mode="same-model", advisor_phase_cap=4):
     engine = ReActEngine.__new__(ReActEngine)
     engine.steps = []
+    engine._executor_base_system_prompt = "Build and test the requested project."
     engine.current_iteration = 4
     engine.config = SimpleNamespace(
         verbose=False,
@@ -216,7 +220,7 @@ def test_entering_the_build_phase_consults_the_advisor_once():
     # minted, the forced-attempt way.
     assert _observations(engine)[0].tool_call_id == "advisor-entry-1"
     assert ADVICE in _observations(engine)[0].content
-    assert "SEALED PROJECT EXECUTION PLAN" in engine.llm_client.messages[0][0]["content"]
+    assert "SEALED PROJECT EXECUTION PLAN" in engine.llm_client.messages[0][1]["content"]
     # It is a real consult: telemetry counts it and the phase cap sees it.
     assert [call["phase"] for call in engine.advisor_telemetry["calls"]] == ["build"]
     assert engine._advisor_calls_in_phase == 1
@@ -822,6 +826,9 @@ class _ScriptedClient:
 
     def capabilities_for(self, mode):
         return SimpleNamespace(supports_function_calling=True, model="scripted-model")
+
+    def build_tools_schema(self, mode):
+        return []
 
     def get_native_turn(self, messages, *, include_tools=True):
         self.requests.append(list(messages))

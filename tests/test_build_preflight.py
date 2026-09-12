@@ -345,11 +345,9 @@ def test_active_java_major_parses_legacy_and_modern():
 
 
 def test_mismatch_provisions_and_narrates(monkeypatch):
-    orch = ProvisionOrch('openjdk version "11.0.2"')
-    # Overlay registration talks to the container too; stub it out.
-    import sag.tools.internal.build_preflight as bp
+    from test_java_provision_activation_domain import FakeJdkContainer
 
-    monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: True)
+    orch = FakeJdkContainer(installed=("11",), linked_major="11")
     outcome = JdkPreflight(orch).run("17", source="maven-enforcer")
     assert outcome.provisioned is True
     assert outcome.mismatch is False
@@ -361,6 +359,7 @@ def test_jdk_install_without_durable_overlay_is_not_reported_as_provisioned(monk
     orch = ProvisionOrch('openjdk version "11.0.2"')
     import sag.tools.internal.build_preflight as bp
 
+    monkeypatch.setattr(JdkPreflight, "_provision", lambda *a: "/usr/lib/jvm/java-17-openjdk-arm64")
     monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: False)
 
     outcome = JdkPreflight(orch).run("17", source="maven-enforcer")
@@ -378,6 +377,7 @@ def test_jdk_install_without_same_dispatch_postcondition_is_not_provisioned(monk
     )
     import sag.tools.internal.build_preflight as bp
 
+    monkeypatch.setattr(JdkPreflight, "_provision", lambda *a: "/usr/lib/jvm/java-17-openjdk-arm64")
     monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: True)
 
     outcome = JdkPreflight(orch).run("17", source="runner-observed")

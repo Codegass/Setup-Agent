@@ -1,4 +1,5 @@
 import json
+import shlex
 
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
 from sag.tools.internal.system_tool import SystemTool
@@ -24,7 +25,7 @@ class FakeSystemOrchestrator:
         if command == "apt-get update":
             return {"success": True, "output": "", "exit_code": 0}
 
-        if command.startswith("apt-get install -y openjdk-17"):
+        if command.startswith(("apt-get install -y openjdk-17", "apt-get install -y temurin-17")):
             if self.install_success:
                 return {"success": True, "output": "installed", "exit_code": 0}
             return {"success": False, "output": "install failed", "exit_code": 100}
@@ -56,6 +57,13 @@ class FakeSystemOrchestrator:
         if command.startswith("update-alternatives"):
             return {"success": True, "output": "", "exit_code": 0}
 
+        if command.startswith("test -x"):
+            return {"success": True, "exit_code": 0, "output": "EXISTS"}
+        if command.startswith("readlink -f"):
+            return {"success": True, "exit_code": 0, "output": shlex.split(command)[-1]}
+        if "javac -version" in command and "java -version" not in command:
+            return {"success": True, "exit_code": 0, "output": JAVAC_BIN + "\njavac 17.0.10"}
+
         # Both verifications this provision runs — the exact binaries it is
         # about to activate, and the domain once the switch has landed — are
         # this container answering for the same JDK.
@@ -63,7 +71,7 @@ class FakeSystemOrchestrator:
             if self.verification_success:
                 return {
                     "success": True,
-                    "output": 'openjdk version "17.0.10"\n---\njavac 17.0.10',
+                    "output": JAVA_BIN + '\nopenjdk version "17.0.10"\n---\njavac 17.0.10',
                     "exit_code": 0,
                 }
             return {"success": False, "output": "verification failed", "exit_code": 1}
@@ -96,7 +104,7 @@ def test_install_java_registers_active_java_overlay_runtime():
     overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
     java_entry = overlay["tools"]["java"]
     assert java_entry["active"] == JAVA_BIN
-    assert java_entry["candidates"][JAVA_BIN]["version"] == "17"
+    assert java_entry["candidates"][JAVA_BIN]["version"] == "17.0.10"
     assert java_entry["candidates"][JAVA_BIN]["env"] == {"JAVA_HOME": JAVA_HOME}
     assert java_entry["candidates"][JAVA_BIN]["path_prepend"] == [f"{JAVA_HOME}/bin"]
 

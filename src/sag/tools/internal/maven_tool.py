@@ -30,7 +30,7 @@ from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
     JdkPreflight,
     active_java_major,
-    classify_version_error,
+    classify_java_constraint,
     read_live_build_requirements,
 )
 from .build_utils import (
@@ -44,7 +44,11 @@ from .build_utils import (
 )
 from .command_tracker import CommandTracker
 from .dispatch_argv import maven_action_tokens
-from .maven_versions import floor_from_requirement, nearest_installable_floor
+from .maven_versions import (
+    floor_from_requirement,
+    maven_distribution_for_floor,
+    nearest_installable_floor,
+)
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
 
@@ -676,12 +680,14 @@ class MavenTool(BaseTool):
                 and not result.get("dispatch_status")
                 and not result.get("termination_reason")
             ):
-                needed = classify_version_error(result.get("output") or "")
+                constraint = classify_java_constraint(result.get("output") or "")
+                needed = (constraint or {}).get("required_major")
                 active = outcome.active_version or active_java_major(self.orchestrator)
                 if needed and needed != active:
                     retry_outcome = JdkPreflight(self.orchestrator).run(
                         needed,
                         source="runner-observed:build-error",
+                        runtime_constraints=[constraint["constraint"]],
                         requirements=requirements.get("java_requirements"),
                     )
                     if retry_outcome.provisioned:
@@ -1958,6 +1964,32 @@ class MavenTool(BaseTool):
                 return tokens[1]
         return None
 
+    def _maven_runtime_repair_facts(
+        self, requirement: ToolVersionRequirement, runtime: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Current API affordance, verified against the entire version requirement.
+
+        This supplies context for a model-owned call; it neither schedules a
+        repair nor grants an execution envelope. Legacy suggestion strings do
+        not enter the observation formatter through this path.
+        """
+        facts: Dict[str, Any] = {
+            "maven_requirement": {"raw": requirement.raw, "source": requirement.source},
+            "observed_maven": runtime or {},
+        }
+        floor = nearest_installable_floor(floor_from_requirement(requirement.raw))
+        version = maven_distribution_for_floor(floor) if floor else None
+        if version and self._version_satisfies_requirement(
+            version, requirement.raw, requirement.kind
+        ):
+            facts["available_setup_call"] = {
+                "tool": "project",
+                "params": {"action": "provision", "maven_version": floor},
+                "installs_version": version,
+                "effect": "Install an Apache Maven distribution, activate it, and verify the active mvn. Then retry the required build/test command.",
+            }
+        return facts
+
     def _maven_version_not_resolved_result(
         self,
         required_version: ToolVersionRequirement,
@@ -2055,6 +2087,9 @@ class MavenTool(BaseTool):
             error_code="MAVEN_VERSION_NOT_RESOLVED",
             suggestions=suggestions,
             metadata=metadata,
+            facts=self._maven_runtime_repair_facts(
+                required_version, metadata.get("registered_maven")
+            ),
         )
 
     def _maven_executable_not_resolved_result(self, working_directory: str) -> ToolResult:
@@ -2900,14 +2935,14 @@ class MavenTool(BaseTool):
     ) -> ToolResult:
         """Return observed Maven failure facts and retry admissibility constraints.
 
-        The harness does not author the next tool call.  A later model turn owns
-        the ordinary ``ActionIntent`` after inspecting these facts, the stored
-        output, and applicable project documentation.
+        A later model turn owns the ordinary ``ActionIntent``. Facts may show
+        a current, verified tool affordance; they do not execute that call.
         """
 
         error_suggestions = []
         documentation_links = []
         error_code = "MAVEN_BUILD_ERROR"
+        error_facts: Dict[str, Any] = {}
 
         # Summarize observed error types.  These strings deliberately avoid
         # executable call syntax: they are evidence for the next model turn,
@@ -3078,6 +3113,13 @@ class MavenTool(BaseTool):
                 working_directory=working_directory,
             )
             error_code = "MAVEN_VERSION_ERROR"
+            error_facts.update(
+                self._maven_runtime_repair_facts(
+                    ToolVersionRequirement.from_raw(raw_requirement, source="build_error"),
+                    maven_runtime,
+                )
+            )
+            error_facts["runner_dispatched"] = runner_dispatched
             error_suggestions.extend(
                 [
                     (
@@ -3238,6 +3280,7 @@ class MavenTool(BaseTool):
             documentation_links=documentation_links,
             raw_output=output,
             metadata=metadata,
+            facts=error_facts,
             poll_ref=poll_ref,
             refs=[poll_ref] if poll_ref else [],
             **evidence_fields,

@@ -1,6 +1,8 @@
 """build(action: deps|compile|test|package|install|native) — one tool over all
 ecosystems."""
 
+import hashlib
+import json
 import posixpath
 import re
 import shlex
@@ -43,10 +45,11 @@ from sag.tools.internal.build_preflight import (
     JdkPreflight,
     active_java_major,
     active_java_runtime,
+    classify_java_constraint,
     classify_runner_java_requirement,
-    classify_version_error,
     read_live_build_requirements,
 )
+from sag.tools.internal.java_versions import java_constraint_matches
 
 from .backends import (
     BUILD_MARKERS,
@@ -58,8 +61,8 @@ from .backends import (
     PythonBackend,
     native_definition_feature,
     native_feature_definition,
-    source_command_tokens,
     parse_complete_command,
+    source_command_tokens,
 )
 
 _ACTIONS = ("deps", "compile", "test", "verify", "package", "install", "native")
@@ -174,10 +177,11 @@ def _runtime_domain_scope(
 def _effective_jdk_binding(
     resolution: Mapping[str, Any],
     outcome: Any,
+    dispatch_runtime: Optional[Mapping[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """The runtime a dispatch will see plus why its requirement won."""
     required = str(resolution.get("required_major") or "").strip()
-    active = str(getattr(outcome, "active_version", None) or "").strip()
+    active = str((dispatch_runtime or {}).get("major") or "").strip()
     authority = str(resolution.get("authority") or "").strip()
     if not any((required, active, authority)):
         return None
@@ -191,12 +195,11 @@ def _effective_jdk_binding(
     provenance = resolution.get("provenance")
     if isinstance(provenance, Mapping) and provenance:
         binding["provenance"] = dict(provenance)
-    elif active and not required:
-        # No requirement was asserted, but a registered runtime made the
-        # preflight probe the dispatch environment.  State that observation's
-        # source instead of emitting an unprovenanced effective major.
+    if active:
+        # Requirement provenance and actual JVM observation are independent.
+        # A successful retry must carry the probe just like the first dispatch.
         binding["runtime_authority"] = "dispatch_probe"
-        binding["provenance"] = {"source": "java_runtime_probe"}
+        binding.setdefault("provenance", {})["dispatch_runtime"] = dict(dispatch_runtime)
     return binding
 
 
@@ -685,6 +688,17 @@ class BuildTool(BaseTool):
                 f"at {island_context['island_root']}; executing install"
             )
         if effective_verb in _PREFLIGHT_VERBS and system != "python":
+            runtime_command_key = hashlib.sha256(
+                json.dumps(
+                    {
+                        "system": system,
+                        "action": effective_verb,
+                        "params": requested_call_params,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
             runtime_target_sha = probe_target_sha(
                 self.docker_orchestrator.execute_command,
                 working_directory,
@@ -709,6 +723,7 @@ class BuildTool(BaseTool):
                         domain_id=runtime_scope.get("domain_id"),
                         static_major=static_major,
                         static_source=static_source,
+                        command_key=runtime_command_key,
                     )
                 except Exception as exc:
                     # An unreadable dynamic store cannot honestly license a
@@ -767,6 +782,7 @@ class BuildTool(BaseTool):
             outcome = JdkPreflight(self.docker_orchestrator).run(
                 runtime_resolution.get("required_major"),
                 requirements=java_requirements,
+                runtime_constraints=runtime_resolution.get("runtime_constraints"),
                 source=(
                     str(runtime_resolution.get("authority") or "unknown")
                     + ":"
@@ -777,10 +793,8 @@ class BuildTool(BaseTool):
                     )
                 ),
             )
-            if not outcome.active_version:
-                dispatch_runtime = active_java_runtime(self.docker_orchestrator)
-                if dispatch_runtime.get("major"):
-                    outcome.active_version = dispatch_runtime["major"]
+            dispatch_runtime = active_java_runtime(self.docker_orchestrator)
+            outcome.active_version = dispatch_runtime.get("major")
             if (
                 outcome.provisioned
                 and jdk_store is not None
@@ -835,7 +849,7 @@ class BuildTool(BaseTool):
                             },
                             metadata={"runner_dispatched": False},
                         )
-            effective_jdk = _effective_jdk_binding(runtime_resolution, outcome)
+            effective_jdk = _effective_jdk_binding(runtime_resolution, outcome, dispatch_runtime)
             if "java_constraint_conflict" in outcome.conflicts:
                 return ToolResult.completed_failure(
                     output=outcome.narration,
@@ -1031,13 +1045,21 @@ class BuildTool(BaseTool):
         # the new runtime before a new contract can freeze.
         if outcome is not None and not inner.succeeded:
             failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
-            needed = classify_version_error(failure_text)
+            observed_constraint = classify_java_constraint(failure_text)
+            needed = (observed_constraint or {}).get("required_major")
             active = outcome.active_version or active_java_major(self.docker_orchestrator)
-            if needed and needed != active:
+            if (
+                needed
+                and java_constraint_matches(
+                    observed_constraint["constraint"], (dispatch_runtime or {}).get("version")
+                )
+                is not True
+            ):
                 retry_resolution: Dict[str, Any] = {
                     "required_major": needed,
                     "authority": "runner_observed",
                     "provenance": {},
+                    "runtime_constraints": [observed_constraint["constraint"]],
                 }
                 source_ref = str(
                     (inner.metadata or {}).get("receipt_id")
@@ -1064,6 +1086,8 @@ class BuildTool(BaseTool):
                                 required_major=needed,
                                 source_ref=source_ref,
                                 observed_runtime=observed_runtime,
+                                command_key=runtime_command_key,
+                                constraint=observed_constraint["constraint"],
                             )
                             observation = next(
                                 record
@@ -1088,6 +1112,7 @@ class BuildTool(BaseTool):
                                 ),
                                 static_source=requirements.get("java_version_source"),
                                 runner_observed=observation,
+                                command_key=runtime_command_key,
                             )
                         except Exception as exc:
                             logger.warning(f"runner-observed Java requirement not persisted: {exc}")
@@ -1126,6 +1151,7 @@ class BuildTool(BaseTool):
                         needed,
                         source=f"runner_observed:{source_ref or 'current-output'}",
                         requirements=requirements.get("java_requirements"),
+                        runtime_constraints=retry_resolution.get("runtime_constraints"),
                     )
                     if retry_outcome.provisioned:
                         post_runtime = active_java_runtime(self.docker_orchestrator)
@@ -1155,6 +1181,7 @@ class BuildTool(BaseTool):
                                     and record.get("required_major") == needed
                                 )
                                 retry_resolution = {
+                                    **retry_resolution,
                                     "required_major": needed,
                                     "authority": "runner_observed",
                                     "provenance": observation,
@@ -1170,6 +1197,7 @@ class BuildTool(BaseTool):
                             retry_effective_jdk = _effective_jdk_binding(
                                 retry_resolution,
                                 retry_outcome,
+                                post_runtime,
                             )
                             retry_contract = freeze_contract(
                                 self.docker_orchestrator.execute_command,
@@ -1935,6 +1963,7 @@ class BuildTool(BaseTool):
         contract: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         facts: Dict[str, Any] = {
+            **inner.facts,
             "system": system,
             "action": effective_verb,
             "requested_action": requested_verb,
