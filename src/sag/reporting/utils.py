@@ -29,7 +29,11 @@ def format_percentage(value: Optional[float], precision: int = 1) -> str:
     """Format a numeric ratio as a percentage string, handling None gracefully."""
     if value is None:
         return "N/A"
-    return f"{round(float(value), precision):.{precision}f}%"
+    numeric = float(value)
+    rounded = round(numeric, precision)
+    # A small nonzero failure count must never be displayed as all passed.
+    prefix = "<" if numeric < 100 and rounded == 100 else ""
+    return f"{prefix}{rounded:.{precision}f}%"
 
 
 def format_attention_items(

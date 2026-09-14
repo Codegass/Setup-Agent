@@ -259,8 +259,28 @@ class BashTool(BaseTool):
         Returns:
             (is_valid, error_message)
         """
-        # Split command chains (&&, ||, ;) and validate each part
-        command_parts = re.split(r"\s*(?:&&|\|\||;)\s*", command)
+        # Keep quoted/escaped separators inside awk, sed and other arguments.
+        # Validate command-list entries without rewriting what Bash will run.
+        command_parts = []
+        start, quote, escaped = 0, None, False
+        for index, char in enumerate(command):
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "'":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in {"'", '"'}:
+                quote = char
+            elif char in ";|\n" or (
+                char == "&"
+                and (index == 0 or command[index - 1] not in "<>")
+                and command[index + 1 : index + 2] != ">"
+            ):
+                command_parts.append(command[start:index])
+                start = index + 1
+        command_parts.append(command[start:])
 
         for part in command_parts:
             part = part.strip()
@@ -268,7 +288,13 @@ class BashTool(BaseTool):
                 continue
 
             # Extract the base command (first word)
-            base_cmd = shlex.split(part)[0] if part else ""
+            try:
+                tokens = shlex.split(part)
+            except ValueError as exc:
+                return False, f"Invalid shell quoting: {exc}"
+            if not tokens:
+                continue
+            base_cmd = tokens[0]
 
             # Check blocklist first (takes precedence)
             for blocked in self.config.blocked_commands:
@@ -993,6 +1019,8 @@ class BashTool(BaseTool):
             "head",
             "tail",
             "grep",
+            "rg",
+            "sed",
             "echo",
             "find",
             "stat",

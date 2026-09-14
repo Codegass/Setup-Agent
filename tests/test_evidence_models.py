@@ -31,7 +31,7 @@ def test_aggregate_evidence_status_uses_blocked_conflict_partial_precedence():
 def test_test_stats_preserve_counts_and_percentages():
     stats = TestStats(executed=214, passed=206, failed=3, skipped=5, discovered=460)
 
-    assert stats.pass_rate == 96.3
+    assert stats.pass_rate == 206 / 214 * 100
     assert stats.execution_rate == 46.5
     assert stats.as_summary() == "206 / 214 passed, 96.3% pass rate, 3 failed, 5 skipped"
 

@@ -348,6 +348,21 @@ def project_goal(project: dict) -> str:
     )
 
 
+def project_task(project: dict):
+    """Bind the measured CI tool version in new campaigns, beyond goal prose."""
+    from sag.agent.acceptance_task import AcceptanceTask
+
+    return AcceptanceTask.model_validate({
+        "repo": project["repo"], "sha": project["sha"],
+        "steps": [{
+            "id": "ci-build-test", "runner": "maven", "cwd": ".",
+            "argv": shlex.split(project["local_command"]),
+            "java_major": int(project["jdk_major"]),
+            "maven_version": project["maven_version"],
+        }],
+    })
+
+
 def checked_benchmark_projects(benchmark: Path, bench: dict) -> list[tuple[dict, TargetRecord]]:
     """Revalidate the portable evidence bundle, not the collector's local paths."""
     archive = benchmark / "official-ci-evidence.tar.gz"
@@ -425,8 +440,13 @@ def prepare(benchmark: Path, out: Path, source: Path, sha: str, image: str, only
     )
     out.mkdir(parents=True)
     (out / "targets").mkdir()
+    (out / "tasks").mkdir()
     for project in projects:
         shutil.copyfile(project["target_source"], project["target_file"])
+        task_path = out / "tasks" / f"{project['seat']}.json"
+        task_path.write_text(project_task(project).model_dump_json(indent=2) + "\n")
+        project["acceptance_task_file"] = str(task_path)
+        project["acceptance_task_sha256"] = runner.digest(task_path)
     runner.command(["git", "archive", "--format=tar.gz", f"--output={out / 'candidate-source.tar.gz'}", sha], cwd=source, timeout=120)
     runner.save(out / "manifest.json", manifest)
     (out / "manifest.sha256").write_text(runner.digest(out / "manifest.json") + "\n")

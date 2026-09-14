@@ -321,11 +321,15 @@ def _profile_declares_java_requirement(profile: ET.Element) -> bool:
 
 
 def maven_java_requirements(
-    poms: list[tuple[str, str]], *, disabled_profiles: frozenset[str] = frozenset()
+    poms: list[tuple[str, str]],
+    *,
+    disabled_profiles: frozenset[str] = frozenset(),
+    enabled_profiles: frozenset[str] = frozenset(),
+    runtime_version: str | None = None,
 ) -> Dict[str, Any]:
     """Preserve declared runtime bounds and compiler requirements with their source.
 
-    Only explicit profile deactivation supplied by the caller is resolved.
+    Explicit selections and simple JDK-only activation can be resolved.
     Other activation, remote parents, toolchain selection and arbitrary
     interpolation remain explicit unresolved facts.
     """
@@ -345,10 +349,32 @@ def maven_java_requirements(
         for element in root.iter():
             element.tag = element.tag.rsplit("}", 1)[-1]
         profiles = root.find("./profiles")
+        active_profiles = []
         if profiles is not None:
             for profile in list(profiles):
-                if (profile.findtext("id") or "").strip() in disabled_profiles:
+                name = (profile.findtext("id") or "").strip()
+                activation = profile.find("activation")
+                applies = None
+                if name in enabled_profiles:
+                    applies = True
+                elif (
+                    runtime_version
+                    and activation is not None
+                    and [e.tag for e in activation] == ["jdk"]
+                ):
+                    raw = (activation.findtext("jdk") or "").strip()
+                    # Maven's bare JDK activation is a prefix, unlike an
+                    # Enforcer lower bound. Qualified/compound values stay unknown.
+                    if raw.startswith(("[", "(")):
+                        applies = java_constraint_matches(raw, runtime_version)
+                    elif re.fullmatch(r"!?\d+(?:\.\d+)*", raw):
+                        applies = runtime_version.startswith(raw.lstrip("!"))
+                        if raw.startswith("!"):
+                            applies = not applies
+                if name in disabled_profiles or applies is False:
                     profiles.remove(profile)
+                elif applies is True:
+                    active_profiles.append(profile)
         # Resolve only one local, unconditional literal property. This covers
         # <release>${javaVersion}</release> without implementing Maven's model
         # interpolation or guessing which profile/parent supplies a value.
@@ -358,7 +384,12 @@ def maven_java_requirements(
             if element.tag in properties:
                 ambiguous.add(element.tag)
             properties[element.tag] = (element.text or "").strip()
-        ambiguous.update(element.tag for element in root.findall("./profiles/profile/properties/*"))
+        for profile in root.findall("./profiles/profile"):
+            for element in profile.findall("./properties/*"):
+                if profile in active_profiles:
+                    properties[element.tag] = (element.text or "").strip()
+                else:
+                    ambiguous.add(element.tag)
 
         def local_literal(value):
             match = re.fullmatch(r"\$\{([^{}]+)\}", value)
@@ -375,9 +406,19 @@ def maven_java_requirements(
                     {"constraint": local_literal(raw), "source": f"{location}:requireJavaVersion"}
                 )
         for profile in root.findall("./profiles/profile"):
-            if _profile_declares_java_requirement(profile):
+            if profile not in active_profiles and _profile_declares_java_requirement(profile):
                 result["unresolved"].append(
                     f"{location}:profile_activation:{profile.findtext('id') or 'unknown'}"
+                )
+            elif profile in active_profiles and any(
+                element.tag in {"compilerArgs", "compilerArgument", "compilerArguments"}
+                and _compiler_args_may_select_java(element)
+                for plugin in profile.iter("plugin")
+                if plugin.findtext("artifactId") == "maven-compiler-plugin"
+                for element in plugin.iter()
+            ):
+                result["unresolved"].append(
+                    f"{location}:profile_compiler_arguments:{profile.findtext('id') or 'unknown'}"
                 )
         compiler_plugins = [
             plugin
@@ -395,12 +436,22 @@ def maven_java_requirements(
                 "target",
                 "source",
             ):
-                elements = (
-                    root.findall(f"./properties/{tag}")
-                    if "." in tag
-                    else [element for plugin in compiler_plugins for element in plugin.iter(tag)]
-                )
-                values = [local_literal((element.text or "").strip()) for element in elements]
+                if "." in tag:
+                    values = [local_literal(properties[tag])] if tag in properties else []
+                else:
+                    active_elements = [
+                        element
+                        for profile in active_profiles
+                        for plugin in profile.iter("plugin")
+                        if plugin.findtext("artifactId") == "maven-compiler-plugin"
+                        for element in plugin.iter(tag)
+                    ]
+                    elements = active_elements or [
+                        element for plugin in compiler_plugins for element in plugin.iter(tag)
+                    ]
+                    values = [local_literal((element.text or "").strip()) for element in elements]
+                if len(set(values)) > 1:
+                    result["unresolved"].append(f"{location}:{tag}:multiple_values")
                 value = next((value for value in values if names_bare_java_major(value)), None)
                 if value:
                     result["compiler_release"] = java_major(value)
@@ -426,3 +477,47 @@ def maven_java_requirements(
         ):
             result["compiler_toolchain"] = True
     return result
+
+
+def resolve_maven_java_requirements(
+    orchestrator,
+    manifest,
+    *,
+    runtime_version=None,
+    disabled_profiles=frozenset(),
+    enabled_profiles=frozenset(),
+):
+    """Re-evaluate the pinned root POM only if it reproduces the entire survey.
+
+    Used by the invocation reader; a different POM or additional
+    inherited requirements cannot be erased by a convenient local parse.
+    """
+    import posixpath
+    from sag.agent.physical_survey import config_fingerprint
+    from sag.runtime.container_io import read_container_text
+
+    requirements = manifest.get("java_requirements")
+    if not isinstance(requirements, dict) or not requirements.get("unresolved"):
+        return requirements
+    survey = manifest.get("survey") or {}
+    root, fingerprint = survey.get("project_path"), survey.get("config_fingerprint")
+    if not root or not fingerprint or not survey.get("target_sha"):
+        return requirements
+    if config_fingerprint(orchestrator, root) != fingerprint:
+        return requirements
+    path = posixpath.join(root, "pom.xml")
+    content = read_container_text(orchestrator, path, exact_bytes=True)
+    if content is None or len(content.encode("utf-8")) > 1024 * 1024:
+        return requirements
+    poms = [(content, path)]
+    if (
+        maven_java_requirements(poms) != requirements
+        or config_fingerprint(orchestrator, root) != fingerprint
+    ):
+        return requirements
+    return maven_java_requirements(
+        poms,
+        runtime_version=runtime_version,
+        disabled_profiles=disabled_profiles,
+        enabled_profiles=enabled_profiles,
+    )

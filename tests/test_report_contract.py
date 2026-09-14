@@ -199,7 +199,7 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     assert result.succeeded is True
     assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert isinstance(result.test_stats, TestStats)
-    assert result.test_stats.pass_rate == 96.3
+    assert result.test_stats.pass_rate == 206 / 214 * 100
     assert result.test_stats.failed == 3
     assert result.conflicts == ["3 tests failed"]
     assert result.evidence_refs == ["/workspace/demo/target/surefire-reports/TEST-demo.xml"]
@@ -210,7 +210,7 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     assert result.metadata["status"] == "success"
     assert result.metadata["evidence_status"] == "partial"
     assert result.raw_data["evidence_status"] == "partial"
-    assert result.raw_data["test_stats"]["pass_rate"] == 96.3
+    assert result.raw_data["test_stats"]["pass_rate"] == 206 / 214 * 100
 
 
 def test_report_conflict_assessment_sets_canonical_conflict_status(monkeypatch):

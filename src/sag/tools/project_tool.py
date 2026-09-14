@@ -28,7 +28,9 @@ class ProjectTool(BaseTool):
             name="project",
             description=(
                 "Project lifecycle: action = clone (repo_url[, ref]) | "
-                "provision (install toolchain: java_version for a JDK; java_distribution selects "
+                "provision (one installation route per call: choose exactly one of java_version, "
+                "maven_version, packages; use separate calls for multiple installations. "
+                "java_version for a JDK; java_distribution selects "
                 "openjdk or graalvm (omission keeps the selected family); java_capabilities declares required JVM tools; maven_version for an "
                 "Apache Maven distribution, packages for apt) | "
                 "analyze (survey the project; persist build facts) | "
@@ -125,6 +127,20 @@ class ProjectTool(BaseTool):
             # over an uninstalled toolchain, one parameter over.
             supplied = [name for name in PROVISION_ROUTES if name in kwargs]
             if len(supplied) > 1:
+                calls = []
+                for name in supplied:
+                    arguments = {"action": "provision", name: kwargs[name]}
+                    if name == "java_version":
+                        arguments.update(
+                            {
+                                key: kwargs[key]
+                                for key in ("java_distribution", "java_capabilities")
+                                if key in kwargs
+                            }
+                        )
+                    if name == "maven_version" and "requirement" in kwargs:
+                        arguments["requirement"] = kwargs["requirement"]
+                    calls.append({"tool": "project", "arguments": arguments})
                 return ToolResult.completed_failure(
                     output="",
                     error=(
@@ -136,6 +152,7 @@ class ProjectTool(BaseTool):
                         "supplied_routes": supplied,
                         "routes_per_call": 1,
                         "supported_routes": PROVISION_ROUTES,
+                        "separate_calls_for_supplied_routes": calls,
                     },
                     suggestions=[f"Call {PROVISION_ROUTES[name]}" for name in supplied],
                     raw_data={
@@ -231,7 +248,10 @@ class ProjectTool(BaseTool):
                 "repo_url": {"type": "string", "description": "clone: repository URL"},
                 "ref": {"type": "string", "description": "clone: git ref (optional)"},
                 "project_path": {"type": "string", "description": "analyze: project directory"},
-                "java_version": {"type": "string", "description": "provision: JDK version"},
+                "java_version": {
+                    "type": "string",
+                    "description": "provision: JDK version. Use alone or with java_distribution/java_capabilities; do not combine with maven_version or packages.",
+                },
                 "java_distribution": {
                     "type": "string",
                     "enum": ["openjdk", "graalvm"],
@@ -250,13 +270,15 @@ class ProjectTool(BaseTool):
                     "type": "string",
                     "description": (
                         "provision: Apache Maven version floor, spelled major[.minor[.patch]] "
+                        "— do not combine with java_version or packages. "
                         "(for example '3.9'). Installs the distribution under /opt, activates "
                         "it, and verifies mvn -version in the domain dispatches resolve."
                     ),
                 },
                 "packages": {
                     "type": "array",
-                    "description": "provision: apt packages to install",
+                    "items": {"type": "string"},
+                    "description": "provision: apt packages to install. Use in a separate call from java_version or maven_version.",
                 },
                 "tool": {
                     "type": "string",
@@ -284,7 +306,7 @@ class ProjectTool(BaseTool):
                 "requirement": {
                     "type": "string",
                     "description": (
-                        "env: version requirement the measured executable must satisfy "
+                        "env, or provision with maven_version: version requirement the measured executable must satisfy "
                         "(for example '[21,)' for Java or '[3.9,)' for Maven)"
                     ),
                 },

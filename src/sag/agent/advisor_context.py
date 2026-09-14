@@ -460,6 +460,25 @@ def pack_advisor_contexts(**kwargs) -> list[tuple[list[dict], dict]]:
             if best is None:
                 raise AdvisorContextUnavailable("advisor_window_has_no_input_capacity", {})
             size, part, _ = best
+            # Keep structured failure rows and command lines together when
+            # one fits. Character slicing remains the fallback for a single
+            # line larger than the window, with exact offsets still audited.
+            if offset + size < len(section.text):
+                boundary = section.text.rfind("\n", offset, offset + size) + 1
+                if boundary > offset:
+                    candidate = replace(
+                        part,
+                        name=f"{section.name} [source {source_index + 1}/{len(protected)}; chars {offset}:{boundary}]",
+                        text=section.text[offset:boundary],
+                    )
+                    try:
+                        pack_advisor_context(
+                            **{**kwargs, "required": [candidate], "optional": [], "summarizer": None}
+                        )
+                    except AdvisorContextNeedsSplit:
+                        pass
+                    else:
+                        size, part = boundary - offset, candidate
             # Remaining evidence is optional in a slice; only this slice's
             # immutable text is guaranteed. All protected sources get a turn.
             messages, audit = pack_advisor_context(

@@ -1076,7 +1076,10 @@ def _synchronous_receipt(tmp_path):
 def test_the_settled_receipt_is_field_for_field_the_synchronous_one(tmp_path):
     """One schema, one writer. Only the id — which is a sequence, not a fact —
     is allowed to differ."""
-    orchestrator = _with_obligation(_orchestrator())
+    orchestrator = _with_obligation(
+        _orchestrator(),
+        toolchain_fingerprint={"executable": f"{ROOT}/gradlew", "version": "Gradle 8.7"},
+    )
 
     settle_open_obligations(orchestrator)
 

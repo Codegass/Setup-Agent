@@ -154,7 +154,8 @@ export function rollup(workspaces: WorkspaceSummary[]): Rollup {
 function pct(numerator: number, denominator: number): string | null {
   if (!Number.isFinite(numerator) || !Number.isFinite(denominator)) return null
   if (denominator <= 0 || numerator < 0 || numerator > denominator) return null
-  return `${((100 * numerator) / denominator).toFixed(1)}%`
+  const value = (100 * numerator) / denominator
+  return `${value < 100 && value.toFixed(1) === "100.0" ? "<" : ""}${value.toFixed(1)}%`
 }
 
 function buildDistribution(r: Rollup): string {

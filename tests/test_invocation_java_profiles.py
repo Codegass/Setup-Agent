@@ -154,3 +154,39 @@ def test_unconditional_java_mismatch_remains_after_disabled_profile(monkeypatch)
         lambda *a: {"major": "11", "version": "11.0.20"},
     )
     assert run.validator._collect_env_conflicts() == ["jdk_mismatch"]
+
+
+@pytest.mark.parametrize("probe", [True, False])
+def test_actual_receipt_provenance_resolves_jdk_profile_without_editing_survey(monkeypatch, probe):
+    import test_ci_comparison as fixture
+
+    content = """<project><profiles><profile><id>jdk-9-plus</id>
+    <activation><jdk>[1.9,)</jdk></activation>
+    <properties><maven.compiler.release>8</maven.compiler.release></properties>
+    </profile></profiles></project>"""
+    original = fixture.record_invocation
+
+    def observed(*args, **kwargs):
+        if probe:
+            from sag.tools.build.build_tool import _effective_jdk_binding
+
+            kwargs["effective_jdk"] = _effective_jdk_binding(
+                {},
+                None,
+                {
+                    "major": "17",
+                    "version": "17.0.20",
+                    "executable": "/opt/jdk/bin/java",
+                },
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fixture, "record_invocation", observed)
+    monkeypatch.setattr(__import__(__name__), "POM", content)
+    run, manifest = fixture_run(monkeypatch, args=None)
+    resolved = run.validator._java_requirements_for_invocation(manifest)
+    assert bool(resolved["unresolved"]) is not probe
+    assert manifest["java_requirements"]["unresolved"]
+    if probe:
+        assert resolved["compiler_release"] == "8"
+        assert run.validator._collect_env_conflicts() == []

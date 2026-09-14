@@ -133,6 +133,43 @@ def test_build_done_accepted_with_artifacts():
     assert result.to_metadata()["validated_facts"]["build.test_entry_ready"] is True
 
 
+@pytest.mark.parametrize(
+    "system, success, expected",
+    [
+        ("maven", True, ValidatorState.GREEN),
+        ("gradle", True, ValidatorState.GREEN),
+        ("python", True, ValidatorState.PARTIAL),
+        ("", True, ValidatorState.PARTIAL),
+        ("maven", False, ValidatorState.RED),
+    ],
+)
+def test_phase_and_finalizer_agree_on_execution_without_ci_scope(system, success, expected):
+    from sag.agent.phase_gates import _inspect_build
+    from sag.agent.verdict_finalizer import _physical_judgment
+
+    status = {
+        "success": success,
+        "build_complete": False,
+        "evidence_status": "partial" if success else "blocked",
+        "evidence": {"build_system": system},
+        "reason": "22/29 filesystem modules have output",
+    }
+    validator = SimpleNamespace(validate_build_status=lambda _: status)
+    observed = _inspect_build(validator, "cayenne")
+    assert observed.state == expected
+    assert (
+        _physical_judgment(status)
+        == {
+            ValidatorState.GREEN: "success",
+            ValidatorState.PARTIAL: "partial",
+            ValidatorState.RED: "failed",
+        }[expected]
+    )
+    if expected == ValidatorState.GREEN:
+        assert not observed.suggestions
+        assert "Official-CI" in observed.reason
+
+
 def test_container_authored_manifest_cannot_close_a_green_build_gate():
     # A schema-valid manifest the host never published: bytes alone are a
     # forensic mirror, so the live gate must refuse them on publication

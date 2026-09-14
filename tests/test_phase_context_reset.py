@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import pytest
 
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
@@ -10,7 +11,8 @@ from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.tools.base import ToolResult
 
 
-def test_phase_reset_injects_cumulative_typed_handoff(tmp_path):
+@pytest.mark.parametrize("jvm_counts", [False, True])
+def test_phase_reset_injects_cumulative_typed_handoff(tmp_path, jvm_counts):
     state = RunEvidenceState(run_id="context-reset")
     state.register_fact(
         scope="project_analysis",
@@ -38,6 +40,16 @@ def test_phase_reset_injects_cumulative_typed_handoff(tmp_path):
         evidence_ref="artifact://test-runtime",
     )
     handoff = PhaseHandoff(state, storage_path=tmp_path / "phase-handoff.json")
+    if jvm_counts:
+        from test_advisor_jvm_test_observations import CSV
+
+        state.ingest_tool_result(
+            "artifacts",
+            "build",
+            result=ToolResult.completed_success(output="runner result", metadata=CSV),
+            provenance="output_csv_build",
+            params={"command": CSV["command"]},
+        )
 
     machine = PhaseMachine(start_phase="build")
     claim = PhaseClaim(
@@ -88,3 +100,12 @@ def test_phase_reset_injects_cumulative_typed_handoff(tmp_path):
     assert "java.required_version" in engine.steps[0].content
     assert "CMake Error: target missing" in engine.steps[0].content
     assert "cmake:target-missing" in engine.steps[0].content
+    if jvm_counts:
+        visible = engine.steps[0].content
+        assert "reported=985, passed=974, failed=0, errors=0, skipped=11" in visible
+        assert (
+            "receipt_file=/workspace/.setup_agent/invocation_receipts/inv-maven-csv-1.json"
+            in visible
+        )
+        assert "raw execution records" in visible and "unique_counts=unknown" in visible
+        assert "not a completion verdict" in visible

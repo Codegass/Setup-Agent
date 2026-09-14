@@ -1667,7 +1667,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         outcomes_accounted = tests.passed + tests.failed + tests.errors + tests.skipped
         non_skipped = tests.passed + tests.failed + tests.errors
         non_skipped_pass_pct = (
-            round((tests.passed / non_skipped) * 100.0, 1) if non_skipped > 0 else None
+            (tests.passed / non_skipped) * 100.0 if non_skipped > 0 else None
         )
         expansion_factor = None
         if tests.executed > 0 and raw.executed > tests.executed:
@@ -2618,7 +2618,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             f"🔍 Status reconciliation - Claimed: '{claimed_status}', Evidence: '{evidence_status}'"
         )
         logger.info(
-            f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test pass rate: {test_pass_rate:.1f}%"
+            f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test pass rate: {format_percentage(test_pass_rate)}"
         )
 
         # Evidence-based status is authoritative
@@ -2637,7 +2637,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # partial result, never a success.
         logger.info(
             f"Reconciled without physical evidence: tests ran at "
-            f"{test_pass_rate:.1f}% pass rate, unverified — partial"
+            f"{format_percentage(test_pass_rate)} pass rate, unverified — partial"
         )
         return "partial"
 
@@ -2930,7 +2930,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # Log test status insights. Red tests are sealed facts, not a
                 # repair duty — the log states the rate without inventing a bar.
                 if test_status.get("has_test_reports") and test_status.get("pass_rate", 100) < 100:
-                    logger.info(f"Test pass rate is {test_status['pass_rate']:.1f}%")
+                    logger.info(f"Test pass rate is {format_percentage(test_status['pass_rate'])}")
                 if test_status.get("test_exclusions"):
                     logger.warning(
                         f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}"
@@ -3108,7 +3108,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 return "fail"
             else:
                 logger.info(
-                    f"📊 Test pass rate: {test_pass_rate:.1f}% ({test_data.get('passed_tests', 0)}/{test_data.get('total_tests', 0)})"
+                    f"📊 Test pass rate: {format_percentage(test_pass_rate)} ({test_data.get('passed_tests', 0)}/{test_data.get('total_tests', 0)})"
                 )
         elif test_success:
             # Assume high pass rate if tests succeeded without detailed data
@@ -3127,10 +3127,10 @@ class ReportTool(BaseTool, UIEventEmitter):
         if test_pass_rate < 50.0:
             logger.info(
                 f"PARTIAL: build passed and tests ran; most executed tests failed "
-                f"({test_pass_rate:.1f}% passed) — project-owned"
+                f"({format_percentage(test_pass_rate)} passed) — project-owned"
             )
             return "partial"
-        logger.info(f"SUCCESS: build passed and tests ran ({test_pass_rate:.1f}% passed)")
+        logger.info(f"SUCCESS: build passed and tests ran ({format_percentage(test_pass_rate)} passed)")
         return "success"
 
     def _generate_console_report(

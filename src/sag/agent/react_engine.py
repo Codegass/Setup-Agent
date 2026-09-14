@@ -3028,6 +3028,10 @@ class ReActEngine(UIEventEmitter):
             smoke = self._native_smoke_guidance(phase)
             if smoke:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, smoke)
+        if phase in ("build", "test", "report"):
+            last_test = self._last_test_attempt_line()
+            if last_test:
+                lines.extend(["", last_test])
         handoff = getattr(self, "phase_handoff", None)
         projection = None
         if handoff is not None:
@@ -5753,7 +5757,9 @@ class ReActEngine(UIEventEmitter):
             return None
         return (text, priority)
 
-    def _repair_tool_affordances(self) -> tuple[ToolSemanticAffordance, ...]:
+    def _repair_tool_affordances(
+        self, *, report_recovery: bool = False
+    ) -> tuple[ToolSemanticAffordance, ...]:
         """Project-action capabilities, without params, examples, or ordering."""
 
         excluded = {"advisor", "manage_context", "phase", "report"}
@@ -5761,6 +5767,11 @@ class ReActEngine(UIEventEmitter):
         for name, tool in sorted(getattr(self, "tools", {}).items()):
             normalized = str(name or "").strip().lower()
             if not normalized or normalized in excluded:
+                if not (normalized == "report" and report_recovery):
+                    continue
+            if self._evidence_execution_closed(ToolCall(name=normalized, raw_params={})):
+                continue
+            if normalized == "report" and not self._report_execution_allowed():
                 continue
             try:
                 schema = tool.get_parameter_schema()
@@ -5910,7 +5921,9 @@ class ReActEngine(UIEventEmitter):
                     constraints=(constraint,),
                     source_refs=(assessment.assessment_id,),
                 ),
-                allowed_tool_affordances=self._repair_tool_affordances(),
+                allowed_tool_affordances=self._repair_tool_affordances(
+                    report_recovery=claim.phase == "report" and gate.code == "report_missing"
+                ),
                 admissible_observation_types=(
                     "tool_result",
                     "receipt_assessment",
@@ -6938,6 +6951,17 @@ class ReActEngine(UIEventEmitter):
                     result = recorded
                     control_execution_id = actual.execution_id
             execution.actual_executions = recorded_executions
+            if control_execution_id is None:
+                # A facade may copy a leaf before ingestion adds its readable
+                # output path. Refresh that visible envelope too, without
+                # inventing another backend execution or evidence observation.
+                result = attach_durable_output_ref(
+                    result,
+                    self.output_storage,
+                    task_id=str(getattr(self.context_manager, "current_task_id", None) or "tool"),
+                    tool_name=call.name,
+                    action=self._tool_evidence_action(call.validated_params or call.raw_params),
+                )
             if result is not execution.result:
                 execution.result = result
                 execution.observation_text = format_tool_result(call.name, result)
@@ -8267,6 +8291,14 @@ class ReActEngine(UIEventEmitter):
             metadata = dict(getattr(result, "metadata", None) or {})
             if "collection_scope" in metadata:
                 break  # The newest relevant attempt is pytest; use its vocabulary below.
+            # Evidence ingestion records backend leaves, whereas ``system``
+            # is added by the outer build facade. Use the recorded executor
+            # and its exact params when the leaf lacks those display fields.
+            metadata.setdefault("system", getattr(observation, "tool_name", None))
+            metadata.setdefault(
+                "working_directory",
+                (getattr(observation, "params", None) or {}).get("working_directory"),
+            )
             if metadata.get("system") not in {"maven", "gradle"} or not (
                 metadata.get("receipt_id") or metadata.get("runner_dispatched")
             ):
@@ -8307,15 +8339,21 @@ class ReActEngine(UIEventEmitter):
                 for key in ("reported", "passed", "failed", "errors", "skipped")
             )
             outcome = getattr(result, "operation_outcome", "unknown")
+            receipt_id = str(metadata.get("receipt_id") or "unknown")[:160]
+            receipt_path = f"/workspace/.setup_agent/invocation_receipts/{receipt_id}.json"
             return (
                 f"Last JVM runner observation: {str(metadata.get('command') or 'unknown')[:2048]} — "
                 f"cwd={str(metadata.get('working_directory') or 'unknown')[:512]}, "
-                f"receipt={str(metadata.get('receipt_id') or 'unknown')[:160]}, "
+                f"receipt={receipt_id}, receipt_file={receipt_path}, "
                 f"output={str(metadata.get('output_ref_id') or 'unknown')[:160]}, "
                 f"tool_outcome={getattr(outcome, 'value', outcome)}, "
-                f"invocation XML counts: {values}. "
+                f"invocation XML counts: {values}; count_basis=raw execution records; "
+                "unique_counts=unknown (not inferred from raw totals). "
                 "These are tool observations, not a completion verdict. Inspect the linked "
                 "receipt and required scope before declaring tests missing or rerunning them."
+                + ("\n" + metadata["test_failure_summary"]
+                   if isinstance(metadata.get("test_failure_summary"), str)
+                   else "")
             )
         metadata = self._last_pytest_metadata()
         if not metadata:

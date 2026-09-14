@@ -14,6 +14,7 @@ from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.internal.build_preflight import read_live_build_requirements
 
 RequirementSource = Literal[
+    "acceptance_task",
     "tool_parameter",
     "project_metadata",
     "build_error",

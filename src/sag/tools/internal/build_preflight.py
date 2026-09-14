@@ -1422,7 +1422,8 @@ class JdkPreflight:
                 required,
                 unknown=True,
                 narration="[pre-flight] Java constraint resolution is unknown; preserving the active JVM "
-                "until Maven resolves the declared profiles/properties or version range",
+                "until Maven resolves the declared profiles/properties or version range. "
+                + "Unresolved declarations: " + "; ".join(requirements.get("unresolved") or ["version range"]),
             )
         if bound.empty:
             return PreflightOutcome(

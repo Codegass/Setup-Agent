@@ -34,6 +34,27 @@ BASIS_SCAN = "scan"
 BASIS_SURVEY = "survey"
 
 
+def physical_build_judgment(status: Mapping[str, Any]) -> str | None:
+    """Execution judgment shared by phase control and the finalizer.
+
+    Known JVM builds use the separate official-CI universe to grade scope.
+    Python and unknown backends retain their own completeness requirement.
+    """
+    if status.get("success") is True:
+        evidence = status.get("evidence")
+        system = (
+            str(evidence.get("build_system") or "").strip().lower()
+            if isinstance(evidence, Mapping)
+            else ""
+        )
+        if system in {"maven", "gradle"}:
+            return "success"
+        return "success" if status.get("build_complete", True) else "partial"
+    if status.get("success") is False:
+        return "failed"
+    return None
+
+
 @dataclass(frozen=True)
 class ModuleBasis:
     """Which computation set the coverage denominator, and what it stated.

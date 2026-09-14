@@ -2,6 +2,7 @@ import type { TestSummary } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { Tooltip } from "@/components/ui/tooltip"
+import { formatRate } from "@/evidencePresentation"
 
 // Method coverage = executed / declared methods. Only a valid coverage figure
 // when the static catalog is a complete denominator (rate in (0, 100]); a rate
@@ -17,7 +18,7 @@ function num(n?: number | null): string | null {
   return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : null
 }
 function pct(n?: number | null): string | null {
-  return typeof n === "number" && Number.isFinite(n) ? `${n.toFixed(1)}%` : null
+  return typeof n === "number" && Number.isFinite(n) ? formatRate(n) : null
 }
 
 export function TestCard({
@@ -29,12 +30,10 @@ export function TestCard({
 }) {
   const hasTests = test.total > 0
   const errors = test.errors ?? 0
-  // Errors are failures for display purposes: fold them into the red bar and the
-  // "failed" line so the card body never contradicts a non-success badge. The
-  // markdown read path already folds errors into fail; this keeps both paths in
-  // agreement. Errors are also surfaced explicitly below.
+  // The red bar includes both negative outcomes; labels keep their counts separate.
   const failed = test.fail + errors
-  const passRate = pct(test.passRate) ?? (hasTests ? `${((test.pass / test.total) * 100).toFixed(1)}%` : null)
+  const nonSkipped = test.pass + failed
+  const passRate = nonSkipped > 0 ? pct((test.pass / nonSkipped) * 100) : null
   // "Method coverage" is only a meaningful figure when the static catalog is a
   // complete denominator (rate <= 100). When more unique methods ran than were
   // statically declared (e.g. parameterized/inherited tests the catalog missed),
@@ -83,7 +82,7 @@ export function TestCard({
           {snapshotUniquePrimary ? "unique tests" : "runner executions"} passed
         </div>
         <div>
-          <span className={failed ? "text-status-failed" : ""}>{failed} failed</span>
+          <span className={test.fail ? "text-status-failed" : ""}>{test.fail} failed</span>
           {errors ? <span className="text-status-failed">{" · "}{errors} errors</span> : null}
           {" · "}{test.skip} skipped
           {test.reportFileCount != null ? <> · {test.reportFileCount.toLocaleString()} XML reports</> : null}

@@ -115,6 +115,18 @@ def test_current_red_xml_cannot_be_hidden_by_green_console_summaries(report_meta
 
 
 @pytest.mark.usefixtures('facade_contract_authority', 'exact_internal_runner_authority')
+@pytest.mark.parametrize('report_metadata', [1], indirect=True)
+def test_recorded_xml_failure_reaches_the_public_observation(report_metadata):
+    from sag.agent.tool_orchestration import format_tool_result
+
+    result = execute_with_metadata(report_metadata, exit_code=1)
+    summary = result.metadata['test_failure_summary']
+    assert 'a.T#case0' in summary and '"message": "red"' in summary
+    assert 'report_sha256' in summary and 'report_path' in summary
+    assert summary in format_tool_result('build', result)
+
+
+@pytest.mark.usefixtures('facade_contract_authority', 'exact_internal_runner_authority')
 def test_repeated_console_executions_do_not_double_the_final_report_pool(report_metadata):
     execution = '\n'.join([
         '[INFO] --- maven-surefire-plugin:3.5.6:test (default-test) @ root ---',

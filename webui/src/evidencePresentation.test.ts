@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import type { TestEvidenceLayers, TestSummary } from "@/api/types"
 
 import {
+  formatRate,
   moduleScanFromRates,
   completeEvidenceCounts,
   lowerBoundEvidenceCounts,
@@ -14,6 +15,12 @@ import {
   presentVerifiedIdentities,
   safeRate,
 } from "./evidencePresentation"
+
+it("does not round a nonzero test error into all passed", () => {
+  expect(formatRate(9999 / 10000 * 100)).toBe("<100%")
+  expect(formatRate(100)).toBe("100%")
+  expect(formatRate(0)).toBe("0%")
+})
 
 function unavailable(reason = "module-qualified subject/case identity was not sealed") {
   return {

@@ -1380,6 +1380,22 @@ class BaseTool(ABC):
             # Handle tool errors using to_result() method
             duration = time.time() - start_time
             result = e.to_result(duration=duration)
+            if e.category == "validation" and e.error_code in {
+                "MISSING_PARAMETERS",
+                "UNEXPECTED_PARAMETERS",
+            }:
+                result.facts.update(
+                    {
+                        "tool": self.name,
+                        "accepted_parameters": sorted(self._parameter_schema.get("properties", {})),
+                        "required_parameters": list(self._parameter_schema.get("required", [])),
+                        **{
+                            key: e.details[key]
+                            for key in ("missing_parameters", "unexpected_parameters")
+                            if key in e.details
+                        },
+                    }
+                )
 
             # Log to centralized error logger
             try:

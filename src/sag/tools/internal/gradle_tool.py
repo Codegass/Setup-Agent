@@ -36,7 +36,9 @@ from sag.agent.invocation_receipts import (
     record_invocation,
     report_delta,
     report_tag_command,
+    runner_executable,
     snapshot_reports,
+    toolchain_fingerprint,
 )
 from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
@@ -55,12 +57,12 @@ from .build_preflight import (
 )
 from .build_utils import (
     DETACHED_HANDOFF_STATUSES,
-    bounded_detached_log_excerpt,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
     dispatch_hold_policy,
     harvest_detached_evidence,
+    preserved_build_log,
 )
 from .dispatch_argv import gradle_task_tokens
 from .toolchain_manager import ToolchainManager, ToolchainSpec
@@ -1247,6 +1249,13 @@ class GradleTool(BaseTool):
                     before = snapshot_reports(
                         self.orchestrator.execute_command, [working_directory]
                     )
+                    toolchain = toolchain_fingerprint(
+                        self.orchestrator.execute_command,
+                        executable=runner_executable(gradle_cmd, "gradle"),
+                        version_flag="--version",
+                        working_directory=working_directory,
+                        tool="gradle",
+                    ) or {}
                     dispatched = _run_build()
                     self._record_invocation_receipt(
                         requested_action=tasks,
@@ -1254,6 +1263,7 @@ class GradleTool(BaseTool):
                         working_directory=working_directory,
                         attempt=attempt,
                         result=dispatched,
+                        toolchain_observation=toolchain,
                         before=before,
                         requirements=requirements,
                         # What Gradle itself ran, module by module — the
@@ -1346,7 +1356,7 @@ class GradleTool(BaseTool):
             # The durable detached job log remains complete; output storage
             # keeps a bounded searchable excerpt plus the full-log reference.
             ref_id = None
-            stored_output, log_storage_metadata = bounded_detached_log_excerpt(full_output, result)
+            stored_output, log_storage_metadata = preserved_build_log(full_output, result)
             self._pending_log_storage_metadata = log_storage_metadata
             if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
@@ -1543,6 +1553,7 @@ class GradleTool(BaseTool):
         result: Dict[str, Any],
         before: Dict[str, str],
         requirements: Optional[Dict[str, Any]] = None,
+        toolchain_observation: Optional[Mapping[str, str]] = None,
         module_outcomes: Optional[List[Dict[str, str]]] = None,
         cached_report_roots: Optional[List[str]] = None,
     ) -> None:
@@ -1567,6 +1578,7 @@ class GradleTool(BaseTool):
                 self.orchestrator.execute_command,
                 result=result,
                 tool="gradle",
+                toolchain_observation=toolchain_observation,
                 attempt=attempt,
                 requested_action=requested,
                 effective_action=requested or "build",
@@ -1595,6 +1607,7 @@ class GradleTool(BaseTool):
         self._pending_invocation_receipt = record_invocation(
             self.orchestrator.execute_command,
             tool="gradle",
+            toolchain_observation=toolchain_observation,
             attempt=attempt,
             requested_action=requested,
             effective_action=requested or "build",

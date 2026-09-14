@@ -257,11 +257,19 @@ class EnvTool(BaseTool):
                     if error:
                         return error
                     params["executable"] = canonical
+                    java_home = self._java_installation_home(canonical)
                     params["env"] = {
                         **(params.get("env") or {}),
-                        "JAVA_HOME": posixpath.dirname(posixpath.dirname(canonical)),
+                        "JAVA_HOME": java_home,
                     }
-                validation_error = self._validate_executable(params["executable"], params.get("tool"))
+                    prefixes = params.get("path_prepend") or []
+                    params["path_prepend"] = [
+                        posixpath.join(java_home, "bin"),
+                        *([prefixes] if isinstance(prefixes, str) else prefixes),
+                    ]
+                validation_error = self._validate_executable(
+                    params["executable"], params.get("tool")
+                )
                 if validation_error:
                     return validation_error
                 measured_version: Optional[str] = None
@@ -395,7 +403,9 @@ class EnvTool(BaseTool):
                     if error:
                         return error
                     params["executable"] = canonical
-                validation_error = self._validate_executable(params["executable"], params.get("tool"))
+                validation_error = self._validate_executable(
+                    params["executable"], params.get("tool")
+                )
                 if validation_error:
                     return validation_error
                 measured_version = None
@@ -432,6 +442,7 @@ class EnvTool(BaseTool):
                     )
                     if capability_error:
                         return capability_error
+                    java_home = self._java_installation_home(params["executable"])
                     self.store.register(
                         "java",
                         params["executable"],
@@ -439,9 +450,12 @@ class EnvTool(BaseTool):
                         source=candidate.get("source", "agent_registered"),
                         env={
                             **(candidate.get("env") or {}),
-                            "JAVA_HOME": posixpath.dirname(posixpath.dirname(params["executable"])),
+                            "JAVA_HOME": java_home,
                         },
-                        path_prepend=candidate.get("path_prepend"),
+                        path_prepend=[
+                            posixpath.join(java_home, "bin"),
+                            *(candidate.get("path_prepend") or []),
+                        ],
                         distribution=measured.get("distribution", "unknown"),
                         capabilities=capabilities,
                     )
@@ -1136,9 +1150,11 @@ class EnvTool(BaseTool):
             return ""
         if not isinstance(result, dict) or result.get("exit_code") not in (0, None):
             return ""
-        return str(result.get("output") or "").strip().splitlines()[0].strip() if result.get(
-            "output"
-        ) else ""
+        return (
+            str(result.get("output") or "").strip().splitlines()[0].strip()
+            if result.get("output")
+            else ""
+        )
 
     def _registered_candidates(self, tool: Optional[str]) -> list:
         """Executables the overlay already holds for this tool, blocked ones out.
@@ -1152,10 +1168,7 @@ class EnvTool(BaseTool):
             logger.debug(f"registered-candidate lookup skipped: {exc}")
             return []
         entry = ((overlay or {}).get("tools") or {}).get(str(tool or "").strip().lower()) or {}
-        blocked = {
-            str((item or {}).get("executable") or "")
-            for item in entry.get("blocked") or ()
-        }
+        blocked = {str((item or {}).get("executable") or "") for item in entry.get("blocked") or ()}
         return [
             path for path in sorted((entry.get("candidates") or {}).keys()) if path not in blocked
         ]
@@ -1385,6 +1398,28 @@ class EnvTool(BaseTool):
             **({"distribution": observed_distribution} if observed_distribution else {}),
         }, None
 
+    def _java_installation_home(self, executable: str) -> str:
+        """A JDK8 launcher may resolve into its embedded JRE.
+
+        Use the enclosing installation only when its bin/java resolves to this
+        exact launcher. A standalone JRE must not borrow an unrelated JDK.
+        Capability availability is still measured independently below.
+        """
+        home = posixpath.dirname(posixpath.dirname(executable))
+        if posixpath.basename(home) == "jre":
+            enclosing = posixpath.dirname(home)
+            launcher = shlex.quote(posixpath.join(enclosing, "bin/java"))
+            result = self.store.orchestrator.execute_command(
+                f"test -x {launcher} && readlink -f -- {launcher}", timeout=30
+            )
+            if (
+                result.get("exit_code") == 0
+                and result.get("success") is not False
+                and (result.get("output") or "").strip() == executable
+            ):
+                return enclosing
+        return home
+
     def _verify_java_capabilities(
         self,
         executable: str,
@@ -1403,7 +1438,7 @@ class EnvTool(BaseTool):
                     error_code="ENV_CAPABILITY_UNSUPPORTED",
                     facts={"supported_capabilities": sorted(flags)},
                 )
-            path = posixpath.join(posixpath.dirname(executable), capability)
+            path = posixpath.join(self._java_installation_home(executable), "bin", capability)
             command = f"{shlex.quote(path)} {flags[capability]} 2>&1"
             if dispatch:
                 command = f"command -v {capability} && {capability} {flags[capability]} 2>&1"

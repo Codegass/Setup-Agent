@@ -19,7 +19,7 @@ afterEach(() => cleanup())
 describe("TestCard", () => {
   it("headlines the runner pass rate and separates unique methods", () => {
     render(<TestCard test={test} />)
-    expect(screen.getByText("99.8% passed")).toBeInTheDocument()
+    expect(screen.getByText("<100% passed")).toBeInTheDocument()
     expect(screen.getByText(/18,805 \/ 18,839 runner executions/)).toBeInTheDocument()
     expect(screen.getByText(/9,497 unique methods/)).toBeInTheDocument()
     expect(screen.getByText(/46.3% method coverage/)).toBeInTheDocument()
@@ -56,14 +56,14 @@ describe("TestCard", () => {
     expect(screen.queryByText(/12[67]/)).not.toBeInTheDocument()
   })
 
-  it("counts errors as failures so the body agrees with a non-success badge", () => {
+  it("keeps errors separate while both negative outcomes remain red", () => {
     render(
       <TestCard
         test={{ state: "partial", pass: 97, fail: 0, skip: 0, total: 100, errors: 3 }}
       />,
     )
-    // failed line folds errors in (0 failures + 3 errors -> 3 failed)
-    expect(screen.getByText("3 failed")).toBeInTheDocument()
+    expect(screen.getByText("0 failed")).toBeInTheDocument()
+    expect(screen.getByText("97% passed")).toBeInTheDocument()
     // errors are surfaced explicitly, not hidden
     expect(screen.getByText(/3 errors/)).toBeInTheDocument()
     // the red bar must not be empty when only errors are present

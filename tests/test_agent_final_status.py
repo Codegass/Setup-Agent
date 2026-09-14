@@ -376,7 +376,7 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
     assert result["test_stats"]["passed"] == 420
     assert result["test_stats"]["failed"] > 0
     assert result["test_stats"]["skipped"] == 9
-    assert result["test_stats"]["pass_rate"] == 97.7
+    assert result["test_stats"]["pass_rate"] == 420 / 430 * 100
     assert result["conflicts"] == [
         "test_failures_detected",
         "test_errors_detected",

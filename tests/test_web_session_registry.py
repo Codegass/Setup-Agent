@@ -621,6 +621,23 @@ def test_container_session_registry_merges_web_sessions_with_setup_artifacts():
     assert [row.id for row in rows] == ["SETUP-commons-cli-20260606-213241", "UI-12345678"]
 
 
+def test_legacy_report_errors_remain_separate_and_do_not_round_to_all_passed():
+    from sag.web.session_registry import _test_payload_from_report
+
+    report = """| Total Available | Executed | Passed | Failed | Errors | Skipped |
+| --- | --- | --- | --- | --- | --- |
+| 10000 | 10000 | 9999 | 0 | 1 | 0 |
+"""
+    payload = _test_payload_from_report(report)
+    assert (payload["pass"], payload["fail"], payload["errors"], payload["total"]) == (
+        9999,
+        0,
+        1,
+        10000,
+    )
+    assert payload["state"] == "partial" and payload["pass_rate"] == 99.99
+
+
 def test_container_session_registry_parses_setup_report_breakdown_table():
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(

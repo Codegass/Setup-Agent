@@ -14,6 +14,8 @@ from sag.agent.acceptance_task import (
     build_task_completion,
     load_acceptance_task,
     render_task_completion_lines,
+    pinned_acceptance_task,
+    task_maven_requirement,
 )
 from sag.agent.action_intents import action_fingerprint
 from sag.agent.evidence_publications import RUN_PIN_LOGICAL_ARTIFACT_ID
@@ -107,6 +109,206 @@ def test_one_receipt_completes_task_without_an_accepted_model_plan(tmp_path):
     assert run.state.phase_records == ()
     assert not run.state.sealed
     assert "1/1 steps" in render_task_completion_lines(closed)[0]
+
+
+def with_maven_version(run, version="3.9.16"):
+    data = run.task.model_dump(mode="json")
+    for step in data["steps"]:
+        step["maven_version"] = version
+    run.task = AcceptanceTask.model_validate(data)
+    pin_task(run)
+    return run
+
+
+@pytest.mark.parametrize("version", ["3.9.16", "3.9.14", None])
+def test_fixed_maven_requires_actual_receipt_version(tmp_path, monkeypatch, version):
+    run = with_maven_version(task_run(tmp_path, "mvn test"))
+
+    def measured(*args, **kwargs):
+        return (
+            {"executable": "/opt/maven/bin/mvn", "version": f"Apache Maven {version}"}
+            if version
+            else None
+        )
+
+    monkeypatch.setattr("sag.agent.invocation_receipts.toolchain_fingerprint", measured)
+    retain(run, dispatch(run, "mvn test"))
+    snapshot = completion(run)
+    assert snapshot.status == ("complete" if version == "3.9.16" else "unavailable")
+    if version != "3.9.16":
+        assert "Required Apache Maven 3.9.16" in snapshot.steps[0].reason
+
+
+def test_unversioned_tasks_keep_their_original_hash(tmp_path):
+    from sag.agent.control_events import canonical_sha256
+
+    run = task_run(tmp_path, "mvn test")
+    data = run.task.model_dump(mode="json")
+    assert "maven_version" not in data["steps"][0]
+    assert run.task.sha256 == canonical_sha256(data)
+    versioned = with_maven_version(run)
+    assert versioned.task.sha256 != canonical_sha256(data)
+    assert "Maven exactly 3.9.16" in versioned.task.prompt(ROOT)
+
+
+def test_maven_requirement_reads_published_task_even_when_model_parameter_absent(tmp_path):
+    run = with_maven_version(task_run(tmp_path, "mvn test"))
+    contract = {"run_id": run.state.run_id, "expected_cwd": ROOT, "expected_argv": "test"}
+    # The in-memory task is intentionally still the old task from task_run.
+    required = task_maven_requirement(run.fs, contract)
+    assert required.raw == "3.9.16" and required.source == "acceptance_task"
+    assert (
+        task_maven_requirement(run.fs, {**contract, "expected_argv": "help:effective-pom"}) is None
+    )
+    with pytest.raises(ValueError, match="task_dispatch_contract_unavailable"):
+        task_maven_requirement(run.fs, None)
+    pin_task(run, {"sha256": "f" * 64, "definition": run.task.model_dump(mode="json")})
+    with pytest.raises(ValueError, match="missing_or_changed"):
+        task_maven_requirement(run.fs, contract)
+
+
+def task_ci(run):
+    from sag.agent.ci_comparison import build_ci_comparison
+
+    return build_ci_comparison(
+        run.fs,
+        run.state,
+        validator=run.validator,
+        project_root=ROOT,
+        repository=run.task.repo,
+        target=run.target,
+        task_completion=completion(run),
+    )
+
+
+def test_ci_bridge_consumes_fixed_task_without_old_command_or_plan(tmp_path):
+    run = task_run(tmp_path, "mvn test")
+    retain(run, dispatch(run, "mvn test"))
+    assert run.target.execution_command is None
+    assert run.state.phase_records == ()
+    result = task_ci(run)
+    assert result.status == "evaluated", result
+    assert result.certificate.test_counts.reported == 1
+    assert result.attainment.verdict == "met", result
+    assert len(result.receipt_ids) == 1
+
+
+@pytest.mark.parametrize("complete_second", [False, True])
+def test_ci_task_preserves_later_command_obligation(tmp_path, monkeypatch, complete_second):
+    import test_ci_comparison as runner_module
+
+    original = runner_module.record_invocation
+
+    def reports_only(*args, **kwargs):
+        # Real Maven report snapshots contain XML, not compiler class files.
+        kwargs["after"] = {p: h for p, h in kwargs["after"].items() if p.endswith(".xml")}
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "record_invocation", reports_only)
+    run = task_run(tmp_path, "mvn compile", "mvn test")
+    retain(run, dispatch(run, "mvn compile", suffix="1"))
+    if complete_second:
+        retain(run, dispatch(run, "mvn test", suffix="2"))
+    result = task_ci(run)
+    assert result.certificate is not None, result
+    assert result.certificate.flags.test_execution_closed is complete_second
+    if complete_second:
+        assert len(result.certificate.build_steps.satisfied_ids) == 2
+        assert result.certificate.test_counts.reported == 1
+    else:
+        assert result.attainment.verdict != "met"
+
+
+def test_task_command_alone_does_not_create_missing_ci_scope(tmp_path):
+    run = task_run(tmp_path, "mvn test")
+    retain(run, dispatch(run, "mvn test"))
+    data = run.target.model_dump(mode="json")
+    data["record"]["cells"][0]["modules"] = []
+    data["record"]["cells"][0]["modules_basis"] = None
+    data["record"]["cells"][0]["executed_ids"] = []
+    run.target = type(run.target).model_validate(data)
+    result = task_ci(run)
+    assert result.certificate.test_counts.reported == 1
+    assert result.attainment.verdict not in {"met", "exceeded"}
+    assert result.attainment.alpha is None
+
+
+def test_removing_only_maven_version_verification_exposes_false_task_completion(
+    tmp_path, monkeypatch
+):
+    """The same successful receipt must not satisfy a different pinned Maven."""
+    import sag.agent.acceptance_task as tasks
+
+    run = with_maven_version(task_run(tmp_path, "mvn test"))
+    monkeypatch.setattr(
+        "sag.agent.invocation_receipts.toolchain_fingerprint",
+        lambda *a, **k: {
+            "executable": "/opt/maven/bin/mvn",
+            "version": "Apache Maven 3.9.14",
+        },
+    )
+    result = retain(run, dispatch(run, "mvn test"))
+    after = completion(run)
+    with monkeypatch.context() as disabled:
+        disabled.setattr(tasks, "task_maven_version_problem", lambda *a: None)
+        before = completion(run)
+    assert before.status == "complete" and after.status == "unavailable"
+    assert before.steps[0].receipt_id == after.steps[0].receipt_id == result.metadata["receipt_id"]
+    _export_protocol_ablation(
+        "maven_version",
+        {
+            "before": before.status,
+            "after": after.status,
+            "actual": "3.9.14",
+            "required": "3.9.16",
+            "same_receipt": True,
+        },
+    )
+
+
+def test_fixed_task_ci_bridge_against_frozen_adapter(tmp_path, monkeypatch):
+    """Optional historical replay uses the same task, receipts and assessments."""
+    import os
+    import runpy
+    from pathlib import Path
+    import sag.agent.ci_comparison as ci
+
+    runner_path = Path("logs/twenty-project-repairs-20260914/ablation.py")
+    if not os.environ.get("SAG_REPAIR_ABLATION_OUTPUT"):
+        pytest.skip("Frozen-source replay is run explicitly with the ablation artifacts")
+    loader = runpy.run_path(str(runner_path))["old_function"]
+    old = loader(ci, "_certificate_input")
+    run = task_run(tmp_path, "mvn test")
+    retain(run, dispatch(run, "mvn test"))
+    with monkeypatch.context() as disabled:
+        disabled.setattr(ci, "_certificate_input", lambda *args: old(*args[:6]))
+        before = task_ci(run)
+    after = task_ci(run)
+    assert (
+        before.status == "unavailable" and "accepted_execution_plan_unavailable" in before.reasons
+    )
+    assert after.status == "evaluated" and after.attainment.verdict == "met"
+    _export_protocol_ablation(
+        "ci_task_bridge",
+        {
+            "before": before.status,
+            "before_reasons": before.reasons,
+            "after": after.status,
+            "test_count": after.certificate.test_counts.reported,
+            "task_steps": 1,
+            "same_task_receipts_and_assessments": True,
+            "scope": "production readers with in-memory published fixture; not a model run",
+        },
+    )
+
+
+def _export_protocol_ablation(name, data):
+    import os
+    from pathlib import Path
+
+    if directory := os.environ.get("SAG_REPAIR_ABLATION_OUTPUT"):
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        (Path(directory) / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
 
 
 @pytest.mark.parametrize("field", ["raw_output", "output"])

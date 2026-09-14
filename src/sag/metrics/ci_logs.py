@@ -59,9 +59,9 @@ def modules_from_log(text: str) -> LogModules:
         built: set[str] = set()
         failed: set[str] = set()
         skipped = 0
-        for match in gradle:
-            key = module_key(match.group("path") or ".")
-            suffix = match.group("suffix").split()
+        for task_match in gradle:
+            key = module_key(task_match.group("path") or ".")
+            suffix = task_match.group("suffix").split()
             if "FAILED" in suffix:
                 failed.add(key)
             elif "SKIPPED" in suffix:

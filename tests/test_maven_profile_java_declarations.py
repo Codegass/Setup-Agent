@@ -117,6 +117,58 @@ def test_profile_property_uncertainty_reaches_the_physical_judge():
     ) == ["build_requirements_unavailable"]
 
 
+@pytest.mark.parametrize("version, expected", [("17.0.20", "8"), ("1.8", "8"), (None, "8")])
+def test_curator_simple_jdk_profiles_use_the_observed_runtime(version, expected):
+    # Reduced from apache/curator@88dee99a85921bd0f20955e1d7efbaf896fc17f3.
+    content = (
+        """<project><properties><jdk-version>1.8</jdk-version>
+    <short-jdk-version>8</short-jdk-version></properties><profiles>
+    <profile><id>jdk-8-minus</id><activation><jdk>(,1.8]</jdk></activation>"""
+        + compiler(
+            "<configuration><source>${jdk-version}</source><target>${jdk-version}</target></configuration>"
+        )
+        + """</profile><profile><id>jdk-9-plus</id><activation><jdk>[1.9,)</jdk></activation>"""
+        + compiler("<configuration><release>${short-jdk-version}</release></configuration>")
+        + "</profile></profiles></project>"
+    )
+    result = maven_java_requirements([(content, "pom.xml")], runtime_version=version)
+    assert result["compiler_release"] == expected
+    assert bool(result["unresolved"]) is (version is None)
+
+
+@pytest.mark.parametrize(
+    "activation, version, unknown",
+    [
+        ("<jdk>17</jdk>", "21.0.1", False),
+        ("<jdk>17</jdk>", "17.0.20", False),
+        ("<jdk>[17,)</jdk><property><name>special</name></property>", "17.0.20", True),
+        ("<jdk>${range}</jdk>", "17.0.20", True),
+        ("<jdk>[17,)</jdk>", None, True),
+    ],
+)
+def test_profile_activation_does_not_guess_other_conditions(activation, version, unknown):
+    content = pom(
+        "<activation>"
+        + activation
+        + "</activation>"
+        + "<properties><maven.compiler.release>21</maven.compiler.release></properties>"
+    )
+    result = maven_java_requirements([(content, "pom.xml")], runtime_version=version)
+    assert bool(result["unresolved"]) is unknown
+    if activation == "<jdk>17</jdk>":
+        assert result["compiler_release"] == ("21" if version.startswith("17") else "8")
+
+
+def test_known_profile_activation_does_not_resolve_arbitrary_compiler_arguments():
+    content = pom(
+        "<activation><jdk>[17,)</jdk></activation>"
+        + compiler(
+            "<configuration><compilerArgs><arg>${flags}</arg></compilerArgs></configuration>"
+        )
+    )
+    assert maven_java_requirements([(content, "pom.xml")], runtime_version="17.0.20")["unresolved"]
+
+
 # The pinned Gson POM replaces Error Prone arguments with this diagnostic flag
 # under a JDK-activated profile. Its profile name has no semantic significance.
 DIAGNOSTIC_PROFILE = "<activation><jdk>[,21)</jdk></activation>" + compiler(

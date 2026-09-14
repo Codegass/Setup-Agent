@@ -60,7 +60,17 @@ import shlex
 import threading
 import uuid
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from loguru import logger
 
@@ -74,6 +84,7 @@ from sag.agent.receipt_test_rows import (
     diagnostic_testcase_outcomes,
     read_delta_testcase_rows,
     read_gradle_project_map,
+    receipt_failure_summary,
     rows_were_bounded,
     seal_testcase_execution_rows,
     validate_testcase_execution_row,
@@ -1459,8 +1470,8 @@ def toolchain_fingerprint(
     """Which runner binary this invocation actually launched, and its version.
 
     One round trip resolves the path and reads the runner's version output.
-    Gradle starts with blank/separator lines, so read up to 64 lines for its
-    explicit version banner. Other runners keep their first-line convention.
+    JVM launchers may print warnings before their version banner. Read a
+    bounded banner instead of treating the first warning as a version.
     The marker keeps an unresolved path out of the version slot; wrappers
     resolve from the invocation's own cwd.
     """
@@ -1468,27 +1479,35 @@ def toolchain_fingerprint(
     if not runner:
         return None
     directory = str(working_directory or "").strip()
-    prefix = f"cd {shlex.quote(directory)} 2>/dev/null; " if directory else ""
+    prefix = f"cd {shlex.quote(directory)} 2>/dev/null || exit; " if directory else ""
     command = (
-        f"{prefix}command -v {shlex.quote(runner)} 2>/dev/null; "
+        f"set -o pipefail; {prefix}command -v {shlex.quote(runner)} 2>/dev/null; "
         f"echo {shlex.quote(TOOLCHAIN_MARKER)}; "
-        f"{shlex.quote(runner)} {version_flag} 2>&1 | head -n {64 if tool == 'gradle' else 1}"
+        f"{shlex.quote(runner)} {version_flag} 2>&1 | head -n {64 if tool in {'maven', 'gradle'} else 1}"
     )
     try:
         result = execute(command) or {}
     except Exception as exc:
         logger.debug(f"toolchain fingerprint unavailable: {exc}")
         return None
-    resolved, _, version = str(result.get("output") or "").partition(TOOLCHAIN_MARKER)
+    resolved, marker, version = str(result.get("output") or "").partition(TOOLCHAIN_MARKER)
+    if not marker or result.get("success") is False or result.get("exit_code") not in (None, 0):
+        return None
     fingerprint: Dict[str, str] = {}
     path = _first_line(resolved)
     if path:
         fingerprint["executable"] = path
-    if tool == "gradle":
+    if tool in {"maven", "gradle"}:
+        version = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", version)
+        banner = (
+            r"Apache Maven [0-9][0-9A-Za-z.+-]*(?: \([^\r\n]*\))?"
+            if tool == "maven"
+            else r"Gradle [0-9][0-9A-Za-z.+-]*"
+        )
         versions = {
             line.strip()
             for line in version.splitlines()[:64]
-            if re.fullmatch(r"Gradle [0-9][0-9A-Za-z.+-]*", line.strip())
+            if re.fullmatch(banner, line.strip())
             and len(line.strip()) <= VERSION_LINE_MAX_CHARS
         }
         line = versions.pop() if len(versions) == 1 else ""
@@ -3657,6 +3676,7 @@ def record_invocation(
     cached_report_roots: Optional[Iterable[str]] = None,
     excluded_claimed_paths: Optional[int] = None,
     effective_jdk: Optional[Mapping[str, Any]] = None,
+    toolchain_observation: Optional[Mapping[str, str]] = None,
     producer_observations: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist the receipt for one runner call; return its ToolResult metadata.
@@ -3752,12 +3772,18 @@ def record_invocation(
         domain_id=resolved_domain_id,
         fact_epoch=resolved_fact_epoch,
         actual_cwd=working_directory,
-        toolchain_fingerprint=toolchain_fingerprint(
-            execute,
-            executable=runner_executable(argv, tool),
-            version_flag=VERSION_FLAGS.get(tool, "--version"),
-            working_directory=working_directory,
-            tool=tool,
+        # An empty dispatch observation means unavailable. In particular a
+        # detached settlement must never substitute its later control shell.
+        toolchain_fingerprint=(
+            dict(toolchain_observation)
+            if toolchain_observation is not None
+            else toolchain_fingerprint(
+                execute,
+                executable=runner_executable(argv, tool),
+                version_flag=VERSION_FLAGS.get(tool, "--version"),
+                working_directory=working_directory,
+                tool=tool,
+            )
         ),
         output_content_hash=output_content_hash(output),
         # Precedence, weakest transport last. A harvest that ran states BOTH
@@ -3819,6 +3845,11 @@ def record_invocation(
         promote_structure(execute, receipt)
         return {
             "receipt_id": receipt["receipt_id"],
+            **(
+                {"test_failure_summary": summary}
+                if (summary := receipt_failure_summary(receipt))
+                else {}
+            ),
             **(
                 {"report_test_counts": dict(parsed_rows["execution_totals"])}
                 if tool in {"maven", "gradle"}

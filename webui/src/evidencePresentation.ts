@@ -95,7 +95,9 @@ export function formatCount(value: number): string {
 }
 
 export function formatRate(value: number): string {
-  return `${value.toFixed(1).replace(/\.0$/, "")}%`
+  const rounded = value.toFixed(1)
+  const prefix = value < 100 && Number(rounded) === 100 ? "<" : ""
+  return `${prefix}${rounded.replace(/\.0$/, "")}%`
 }
 
 export function safeRate(numerator: number, denominator: number): number | null {

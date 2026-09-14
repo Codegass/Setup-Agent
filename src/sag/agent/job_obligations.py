@@ -75,6 +75,7 @@ from .invocation_receipts import (
     validate_receipt_v2,
 )
 from .project_execution_plan import sealed_test_disposition_status
+from .receipt_test_rows import receipt_failure_summary
 
 OBLIGATION_SCHEMA_VERSION = 3
 OBLIGATION_DIR = "/workspace/.setup_agent/job_obligations"
@@ -143,6 +144,7 @@ _OBLIGATION_OPTIONAL_FIELDS = frozenset(
         "domain_id",
         "dispatch_sequence",
         "effective_jdk",
+        "toolchain_fingerprint",
     }
 )
 _OBLIGATION_FIELDS = _OBLIGATION_REQUIRED_FIELDS | _OBLIGATION_OPTIONAL_FIELDS
@@ -249,6 +251,15 @@ def _validate_effective_jdk(value: Any) -> Dict[str, Any]:
     if normalized != dict(value):
         raise ValueError("job obligation effective_jdk is not canonical")
     return normalized
+
+
+def _validate_toolchain_fingerprint(value: Any) -> None:
+    # Empty records preserve an unavailable dispatch-time probe. They must
+    # not be replaced with a different environment's observation at settlement.
+    if not isinstance(value, Mapping) or set(value) - {"executable", "version"}:
+        raise ValueError("job obligation toolchain_fingerprint is invalid")
+    for key, item in value.items():
+        _obligation_text(item, f"toolchain_fingerprint.{key}", maximum_bytes=4096)
 
 
 def _validate_contract_tuple(payload: Mapping[str, Any]) -> None:
@@ -442,6 +453,8 @@ def validate_obligation_v3(
         raise ValueError("job obligation dispatch_sequence is invalid")
     if "effective_jdk" in body:
         _validate_effective_jdk(body.get("effective_jdk"))
+    if "toolchain_fingerprint" in body:
+        _validate_toolchain_fingerprint(body["toolchain_fingerprint"])
     _validate_lifecycle(body)
     canonical = json.dumps(
         body,
@@ -590,6 +603,7 @@ def build_obligation(
     domain_id: Optional[str] = None,
     dispatch_sequence: Optional[int] = None,
     effective_jdk: Optional[Mapping[str, Any]] = None,
+    toolchain_observation: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Assemble one obligation body. Absent facts serialize as absent keys.
 
@@ -649,6 +663,8 @@ def build_obligation(
         obligation["requirements_pins"] = pins
     if isinstance(effective_jdk, Mapping) and effective_jdk:
         obligation["effective_jdk"] = dict(effective_jdk)
+    if toolchain_observation is not None:
+        obligation["toolchain_fingerprint"] = dict(toolchain_observation)
     if isinstance(dispatch_sequence, int) and not isinstance(dispatch_sequence, bool):
         obligation["dispatch_sequence"] = dispatch_sequence
     # Startup identity is immutable dispatch evidence.  WS9 cleanup refuses
@@ -774,6 +790,7 @@ def record_dispatch_obligation_result(
     working_directory: str,
     before: Mapping[str, str],
     requirements: Optional[Mapping[str, Any]] = None,
+    toolchain_observation: Optional[Mapping[str, str]] = None,
 ) -> DispatchObligationResult:
     """Record a detached handle without losing it when ledger persistence fails.
 
@@ -857,6 +874,7 @@ def record_dispatch_obligation_result(
         process_identity_token=_text(handle.get("process_identity_token")),
         handoff_reason=_text(result.get("handoff_reason") or handle.get("handoff_reason")),
         requirements_pins=survey_pins(requirements),
+        toolchain_observation=toolchain_observation,
         domain_id=nearest_domain_root(requirements, working_directory),
         # Taken AFTER the handle check above: an ordinal spent on a dispatch
         # that never started would be a hole in receipt order for no fact.
@@ -1191,9 +1209,10 @@ class Settlement:
     excluded_claimed_paths: int = 0
     contract_id: str = ""
     evidence_omissions: Tuple[Tuple[str, str], ...] = ()
+    test_failure_summary: str = ""
 
     def notice(self) -> str:
-        """The ONE bounded line the next observation carries (spec §3.2.7).
+        """The bounded receipt notice and failure facts the next observation carries.
 
         A settled receipt must not surprise the model — "where did this come
         from?" — and must not be fabricated into a tool result either. One
@@ -1215,7 +1234,7 @@ class Settlement:
             # Silence here is what made a receipt with no module list read like
             # a build that named one module.
             line += f"; {field} was observed but not recorded on the receipt ({reason})"
-        return line
+        return line + ("\n" + self.test_failure_summary if self.test_failure_summary else "")
 
     def event_payload(self) -> Dict[str, Any]:
         return {
@@ -1406,6 +1425,7 @@ def settlement_from_ledger(
         excluded_claimed_paths=int(receipt.get("excluded_claimed_paths") or 0),
         contract_id=_text(obligation.get("contract_id")),
         evidence_omissions=_receipt_evidence_omissions(receipt),
+        test_failure_summary=receipt_failure_summary(receipt),
     )
 
 
@@ -1683,6 +1703,7 @@ def _settle_one(
         execution_binding=obligation.get("execution_binding"),
         compliance=obligation.get("compliance"),
         effective_jdk=obligation.get("effective_jdk"),
+        toolchain_observation=obligation.get("toolchain_fingerprint", {}),
         module_outcomes=module_outcomes,
         **harvested,
         cached_report_roots=cached_roots,
@@ -1763,6 +1784,7 @@ def _finalize_settlement(
             excluded_claimed_paths=int(receipt.get("excluded_claimed_paths") or 0),
             contract_id=_text(obligation.get("contract_id")),
             evidence_omissions=_receipt_evidence_omissions(receipt),
+            test_failure_summary=receipt_failure_summary(receipt),
         )
     )
 
@@ -1863,6 +1885,11 @@ def _receipt_matches_obligation(
             _text(receipt.get("argv")) == _text(obligation.get("argv")),
             _text(receipt.get("working_directory")) == _text(obligation.get("working_directory")),
             receipt.get("exit_code") == exit_code,
+            (
+                "toolchain_fingerprint" not in obligation
+                or receipt.get("toolchain_fingerprint")
+                == (obligation["toolchain_fingerprint"] or None)
+            ),
         )
     )
 

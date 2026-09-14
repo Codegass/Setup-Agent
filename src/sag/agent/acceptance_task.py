@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from sag.agent.control_events import canonical_sha256
 
@@ -28,9 +28,19 @@ class AcceptanceStep(BaseModel):
     cwd: str = "."
     # The launcher JVM only. This does not assert the compiler/toolchain vendor.
     java_major: int | None = Field(default=None, strict=True, ge=1, le=99)
+    maven_version: str | None = Field(default=None, pattern=r"^\d+\.\d+\.\d+$", max_length=32)
+
+    @model_serializer(mode="wrap")
+    def _preserve_unversioned_task_bytes(self, handler):
+        data = handler(self)
+        if self.maven_version is None:
+            data.pop("maven_version", None)
+        return data
 
     @model_validator(mode="after")
     def _bounded_literal_command(self):
+        if self.maven_version is not None and self.runner != "maven":
+            raise ValueError("only a Maven step can require a Maven version")
         if any("\x00" in part or "\n" in part or "\r" in part for part in self.argv):
             raise ValueError("task argv cannot contain NUL or line breaks")
         if not self.argv[0] or len(self.command.encode()) > 2048:
@@ -91,6 +101,8 @@ class AcceptanceTask(BaseModel):
         ]
         for step in self.steps:
             runtime = f"; launcher Java {step.java_major}" if step.java_major else ""
+            if step.maven_version:
+                runtime += f"; Apache Maven exactly {step.maven_version}"
             lines.append(
                 f"{step.id}: cwd={posixpath.join(project_root, step.cwd)}{runtime}\n"
                 f"  {step.command}"
@@ -120,6 +132,67 @@ def load_acceptance_task(path: str | Path) -> AcceptanceTask:
         return result
 
     return AcceptanceTask.model_validate(json.loads(raw, object_pairs_hook=unique))
+
+
+def pinned_acceptance_task(scope) -> AcceptanceTask | None:
+    """Read the task from the existing host-authorized run pin, not model text."""
+    if not scope.available:
+        raise ValueError("task_run_pin_unavailable")
+    if not scope.acceptance_task_declared:
+        return None
+    try:
+        task = AcceptanceTask.model_validate(scope.acceptance_task_definition)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task_definition_missing_or_changed") from exc
+    if task.sha256 != scope.acceptance_task_sha256 or task.sha != scope.target_sha:
+        raise ValueError("task_definition_missing_or_changed")
+    return task
+
+
+def task_maven_requirement(orchestrator, contract):
+    """Resolve a matching fixed step's version independently of agent parameters."""
+    from sag.agent.attempt_policy import resolve_current_build_receipt_scope
+    from sag.tools.internal.toolchain_manager import ToolVersionRequirement
+
+    root = getattr(orchestrator, "acceptance_task_root", None)
+    if not isinstance(root, str):
+        return None  # This runner was not configured with a host task.
+    if not contract or not contract.get("run_id"):
+        raise ValueError("task_dispatch_contract_unavailable")
+    scope = resolve_current_build_receipt_scope(
+        orchestrator, run_id=contract["run_id"], workspace_root="/workspace", project_root=root
+    )
+    task = pinned_acceptance_task(scope)
+    if task is None:
+        return None
+    argv = tuple(shlex.split(contract.get("expected_argv") or ""))
+    versions = {
+        step.maven_version
+        for step in task.steps
+        if step.runner == "maven"
+        and step.maven_version
+        and posixpath.normpath(posixpath.join(root, step.cwd)) == contract.get("expected_cwd")
+        and step.argv[1:] == argv
+    }
+    if len(versions) > 1:
+        raise ValueError("matching_task_steps_require_different_maven_versions")
+    return (
+        ToolVersionRequirement.from_raw(versions.pop(), source="acceptance_task")
+        if versions
+        else None
+    )
+
+
+def task_maven_version_problem(step, receipt) -> str | None:
+    from sag.tools.internal.maven_versions import parse_maven_version
+
+    if step.maven_version is None:
+        return None
+    fingerprint = receipt.get("toolchain_fingerprint") or {}
+    actual = parse_maven_version(fingerprint.get("version"))
+    if not fingerprint.get("executable") or actual != step.maven_version:
+        return f"Required Apache Maven {step.maven_version}; invocation observed {actual or 'unknown'}."
+    return None
 
 
 class TaskStepResult(BaseModel):
@@ -322,6 +395,8 @@ def build_task_completion(
                     f"Required launcher Java {step.java_major}; dispatch observed "
                     f"Java {jdk.get('major') or 'unknown'}."
                 )
+        elif version_problem := task_maven_version_problem(step, receipt):
+            status, reason = "unavailable", version_problem
         elif tool == "bash" and not any(
             item.get("feature") == "native_executable_sha256"
             and item.get("probe_exit_code") == "0"

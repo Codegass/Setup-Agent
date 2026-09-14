@@ -35,6 +35,16 @@ def pool():
     }
 
 
+def test_new_campaign_task_binds_measured_ci_maven_instead_of_only_prose():
+    entry = dict(repo="apache/demo", sha="a" * 40, jdk_major="17", maven_version="3.9.16",
+                 local_command="mvn -B clean install -Pci")
+    task = bench.project_task(entry)
+    assert task.steps[0].maven_version == "3.9.16"
+    assert task.steps[0].java_major == 17
+    assert task.steps[0].command == entry["local_command"]
+    assert "Apache Maven exactly 3.9.16" in task.prompt("/workspace/demo")
+
+
 def parse(report, **kwargs):
     return bench.flat_jenkins_cell(
         report, stage="Build", stage_log=STAGE_LOG, cell_id="linux17",

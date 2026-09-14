@@ -209,6 +209,9 @@ def _format_evidence_observation(result: ToolResult) -> list[str]:
 def format_tool_result(tool_name: str, result: ToolResult) -> str:
     """Format a tool result at the engine/model boundary."""
     evidence_lines = _format_evidence_observation(result)
+    failures = result.metadata.get("test_failure_summary")
+    if isinstance(failures, str) and failures and result.metadata.get("receipt_id"):
+        evidence_lines.append(failures)
     visible_output = result.output
     project_error_projection: dict[str, Any] = {}
     if (

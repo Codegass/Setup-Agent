@@ -18,7 +18,7 @@ from .maven_versions import (
     parse_maven_version,
     satisfies_maven_floor,
 )
-from .toolchain_manager import record_registered_runtime
+from .toolchain_manager import ToolchainManager, ToolVersionRequirement, record_registered_runtime
 
 # Adoptium/Temurin apt repo for JDKs missing from the base image's Debian
 # release (e.g. JDK 8 on bookworm). One-shot, idempotent.
@@ -119,8 +119,16 @@ class SystemTool(BaseTool):
         maven_version: Optional[str] = None,
         java_distribution: Optional[str] = None,
         java_capabilities: Optional[List[str]] = None,
+        requirement: Optional[str] = None,
     ) -> ToolResult:
         """Execute system management operations."""
+        if requirement is not None and action != "install_maven":
+            return ToolResult.completed_failure(
+                output="",
+                error="An installation requirement applies only to the Maven route.",
+                error_code="SYSTEM_PARAMETER_NOT_APPLICABLE",
+                facts={"requirement_applies_to": "project(action='provision', maven_version=...)"},
+            )
         # The base class now handles parameter validation automatically
 
         if action not in [
@@ -231,7 +239,7 @@ class SystemTool(BaseTool):
                         ],
                         retryable=True,
                     )
-                return self._install_and_configure_maven(maven_version)
+                return self._install_and_configure_maven(maven_version, requirement=requirement)
 
             elif action == "verify_java":
                 if not java_version:
@@ -844,7 +852,9 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
             },
         )
 
-    def _install_and_configure_maven(self, maven_version: str) -> ToolResult:
+    def _install_and_configure_maven(
+        self, maven_version: str, *, requirement: Optional[str] = None
+    ) -> ToolResult:
         """Install an Apache Maven distribution and make it the resolved runtime.
 
         The wall this answers, twice over in d2r4. camel
@@ -909,7 +919,15 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
         # downloading over it would swap a working runtime for no reason.
         current = self.docker_orchestrator.execute_command(MAVEN_DOMAIN_VERIFICATION)
         active_version = parse_maven_version(current.get("output"))
-        if active_version and satisfies_maven_floor(active_version, floor):
+        constraint = ToolVersionRequirement.from_raw(requirement)
+        matcher = ToolchainManager(None)
+        if (
+            current.get("exit_code") == 0
+            and current.get("success") is not False
+            and active_version
+            and satisfies_maven_floor(active_version, floor)
+            and matcher.matches_requirement(active_version, constraint)
+        ):
             return ToolResult.completed_success(
                 output=f"Maven {active_version} already satisfies {floor}\n\n"
                 f"Verification:\n{current.get('output', '')}",
@@ -924,6 +942,17 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
                 },
             )
 
+        if not matcher.matches_requirement(distribution, constraint):
+            return ToolResult.completed_failure(
+                output="",
+                error="The installable Maven distribution does not satisfy the requested requirement.",
+                error_code="MAVEN_DISTRIBUTION_REQUIREMENT_MISMATCH",
+                facts={
+                    "installable_version": distribution,
+                    "requirement": requirement,
+                    "observed_version": active_version,
+                },
+            )
         maven_home = f"{MAVEN_INSTALL_ROOT}/apache-maven-{distribution}"
         maven_bin = f"{maven_home}/bin/mvn"
         archive = f"/tmp/apache-maven-{distribution}-bin.tar.gz"
@@ -992,6 +1021,7 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
             floor,
             maven_home,
             probe_result.get("output", ""),
+            requirement=requirement,
         )
         if contradiction is not None:
             return contradiction
@@ -1013,6 +1043,7 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
             # As with the JDK: a bare `mvn` resolves through the persisted
             # overlay, so this question cannot be asked before the switch lands.
             activated_executable=maven_bin,
+            requirement=requirement,
         )
         if contradiction is not None:
             return contradiction
@@ -1043,6 +1074,7 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
         verification_output: str,
         *,
         activated_executable: Optional[str] = None,
+        requirement: Optional[str] = None,
     ) -> Optional[ToolResult]:
         """Refuse the seal when the verification block does not confirm the floor.
 
@@ -1083,11 +1115,13 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
                 ],
                 metadata=metadata,
             )
-        if satisfies_maven_floor(observed, floor):
+        if satisfies_maven_floor(observed, floor) and ToolchainManager(None).matches_requirement(
+            observed, ToolVersionRequirement.from_raw(requirement)
+        ):
             return None
         return ToolResult.completed_failure(
             output=stored_output,
-            error=f"Maven provisioning claimed {floor} but its verification reports {observed}",
+            error=f"Maven provisioning required {requirement or floor} but its verification reports {observed}",
             error_code="MAVEN_VERSION_VERIFICATION_MISMATCH",
             suggestions=[
                 f"Observed fact: verification under MAVEN_HOME={maven_home} reported "
@@ -1705,6 +1739,10 @@ printf 'SAG_GRAAL_HOME=%s\\nSAG_GRAAL_SHA256=%s\\n' "$sag_graal_stage/jdk" "$sag
                         "major[.minor[.patch]] (for the 'install_maven' action)"
                     ),
                     "default": None,
+                },
+                "requirement": {
+                    "type": "string",
+                    "description": "install_maven: optional exact version or range the active and downloaded Maven must satisfy; e.g. '3.9.16'.",
                 },
             },
             "required": ["action"],

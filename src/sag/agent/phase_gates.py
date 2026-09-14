@@ -2314,8 +2314,14 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     if validator is None:
         raise RuntimeError("no physical validator available")
     status = validator.validate_build_status(project_name)
+    from sag.agent.module_coverage import physical_build_judgment
+
+    evidence = status.get("evidence") or {}
+    jvm = isinstance(evidence, Mapping) and evidence.get("build_system") in {"maven", "gradle"}
     state = _state_from_evidence_status(status.get("evidence_status"))
-    if state is ValidatorState.UNAVAILABLE:
+    if jvm and (judgment := physical_build_judgment(status)) is not None:
+        state = {"success": ValidatorState.GREEN, "partial": ValidatorState.PARTIAL, "failed": ValidatorState.RED}[judgment]
+    elif state is ValidatorState.UNAVAILABLE:
         if status.get("success") and status.get("build_complete", True):
             state = ValidatorState.GREEN
         elif status.get("success"):
@@ -2323,6 +2329,8 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         elif status.get("success") is False:
             state = ValidatorState.RED
     reason = status.get("reason") or "build validator returned no conclusion"
+    if jvm and state is ValidatorState.GREEN:
+        reason = "JVM build execution validated. Official-CI evidence determines scope attainment separately."
     suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
@@ -2361,8 +2369,8 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
         shared_module_scan(validator, project_name), islands=islands
     )
     if checklist:
-        reason = f"{reason} · {checklist}"
-        if "no output yet" in checklist or "remaining:" in checklist:
+        reason = f"{reason} · {'Filesystem diagnostic: ' if jvm else ''}{checklist}"
+        if not jvm and ("no output yet" in checklist or "remaining:" in checklist):
             suggestions = (
                 *suggestions,
                 "Modules without build output remain (see the coverage line); they "

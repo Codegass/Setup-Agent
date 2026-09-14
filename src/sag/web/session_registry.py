@@ -1479,19 +1479,21 @@ def _test_payload_from_report(report_raw: str | None) -> dict[str, Any]:
     executed = _report_int(report_raw, "Tests Executed")
     passed = _report_int(report_raw, "Tests Passed")
     failed = _report_int(report_raw, "Failed") or _report_int(report_raw, "Failures")
+    errors = _report_int(report_raw, "Errors")
     skipped = _report_int(report_raw, "Skipped")
     total = executed or passed or 0
     pass_count = passed or 0
-    fail_count = failed or max(total - pass_count - skipped, 0)
-    state = "success" if total and fail_count == 0 else "partial" if total else "none"
+    fail_count = failed or max(total - pass_count - skipped - errors, 0)
+    state = "success" if total and fail_count + errors == 0 else "partial" if total else "none"
 
     return {
         "state": state,
         "pass": pass_count,
         "fail": fail_count,
+        "errors": errors,
         "skip": skipped,
         "total": total,
-        "pass_rate": _rate(pass_count, total),
+        "pass_rate": _rate(pass_count, pass_count + fail_count + errors),
         "execution_rate": None,
     }
 
@@ -1522,10 +1524,11 @@ def _test_breakdown_from_report(report_raw: str) -> dict[str, Any] | None:
             return {
                 "state": state,
                 "pass": passed,
-                "fail": fail_count,
+                "fail": failed,
+                "errors": errors,
                 "skip": skipped,
                 "total": executed,
-                "pass_rate": _rate(passed, executed),
+                "pass_rate": _rate(passed, passed + failed + errors),
                 "execution_rate": _rate(executed, total_available),
             }
 
@@ -1535,7 +1538,7 @@ def _test_breakdown_from_report(report_raw: str) -> dict[str, Any] | None:
 def _rate(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
-    return round((numerator / denominator) * 100, 1)
+    return (numerator / denominator) * 100
 
 
 def _report_int(report_raw: str, label: str) -> int:

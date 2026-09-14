@@ -501,6 +501,24 @@ def test_maven_version_alone_still_routes_to_the_maven_provision():
     assert facade.execute(action="provision", maven_version="3.9").succeeded is True
 
 
+def test_exact_requirement_installs_requested_patch_even_if_newer_maven_is_active():
+    container = FakeMavenContainer(system_version="3.9.17")
+    facade = ProjectTool(system_tool=SystemTool(container))
+    result = facade.safe_execute(action="provision", maven_version="3.9.16", requirement="3.9.16")
+    assert result.succeeded, result.error
+    assert container.resolved_version() == "3.9.16"
+    assert result.metadata["already_active"] is False
+
+
+def test_exact_requirement_cannot_seal_wrong_downloaded_version():
+    container = FakeMavenContainer(extracted_answers={"3.9.16": "3.9.17"})
+    result = ProjectTool(system_tool=SystemTool(container)).safe_execute(
+        action="provision", maven_version="3.9.16", requirement="3.9.16"
+    )
+    assert result.error_code == "MAVEN_VERSION_VERIFICATION_MISMATCH"
+    assert container.resolved_version() == APT_VERSION
+
+
 # ---------------------------------------------------------------------------
 # (b) the typed assessment for the failure that motivated the provision
 # ---------------------------------------------------------------------------

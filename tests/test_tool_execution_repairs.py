@@ -239,6 +239,72 @@ def test_distribution_is_measured_not_inferred_from_the_install_path():
     assert not host.files
 
 
+class EmbeddedJreHost(JavaHost):
+    """RocketMQ's measured layout; the launcher symlink and compiler are distinct."""
+
+    def __init__(self, *, compiler=True, enclosing_launcher=True):
+        super().__init__(version="1.8.0_502")
+        self.compiler = compiler
+        self.enclosing_launcher = enclosing_launcher
+
+    def execute_command(self, cmd, **kwargs):
+        self.commands.append(cmd)
+        if cmd.startswith("test -x /opt/jdk/bin/java && readlink"):
+            return {
+                "exit_code": 0 if self.enclosing_launcher else 1,
+                "output": "/opt/jdk/jre/bin/java" if self.enclosing_launcher else "",
+            }
+        if "jre/bin/javac" in cmd or ("javac" in cmd and not self.compiler):
+            return {"exit_code": 127, "success": False, "output": "javac: not found"}
+        if cmd.startswith("command -v javac"):
+            environment = EnvOverlayStore(self).authorized_environment({})
+            assert "/opt/jdk/bin" in environment["PATH"].split(":")
+        result = super().execute_command(cmd.replace("/jre/bin/java", "/bin/java"), **kwargs)
+        if cmd.startswith("readlink") or cmd.startswith("command -v java "):
+            result["output"] = result["output"].replace(
+                "/opt/jdk/bin/java", "/opt/jdk/jre/bin/java"
+            )
+        return result
+
+
+@pytest.mark.parametrize("compiler", [True, False])
+def test_embedded_jre_uses_jdk_home_and_still_requires_real_compiler(compiler):
+    host = EmbeddedJreHost(compiler=compiler)
+    tool = EnvTool(host)
+    result = tool.execute(
+        action="register",
+        tool="java",
+        executable="/usr/bin/java",
+        java_capabilities=["javac"],
+        requirement="8",
+        activate=True,
+    )
+    assert result.succeeded is compiler, result.error
+    if compiler:
+        environment = EnvOverlayStore(host).authorized_environment({})
+        assert environment["JAVA_HOME"] == "/opt/jdk"
+        assert "/opt/jdk/bin" in environment["PATH"].split(":")
+        again = tool.execute(action="activate", tool="java", executable="/opt/jdk/jre/bin/java")
+        assert again.succeeded, again.error
+    else:
+        assert result.error_code == "ENV_CAPABILITY_UNAVAILABLE"
+        assert not host.files
+    assert not any("jre/bin/javac" in c for c in host.commands)
+
+
+def test_standalone_jre_does_not_borrow_tools_from_unrelated_parent():
+    host = EmbeddedJreHost(enclosing_launcher=False)
+    result = EnvTool(host).execute(
+        action="register",
+        tool="java",
+        executable="/usr/bin/java",
+        java_capabilities=["javac"],
+        activate=True,
+    )
+    assert result.error_code == "ENV_CAPABILITY_UNAVAILABLE"
+    assert not host.files
+
+
 def test_new_unknown_banner_cannot_keep_a_previous_distribution_claim():
     host = JavaHost(distribution="graalvm")
     tool = EnvTool(host)
@@ -384,7 +450,8 @@ def test_maven_enforcer_failure_delivers_a_current_callable_provision_route(monk
     call = result.facts["available_setup_call"]
     observed = []
 
-    def install(self, floor):
+    def install(self, floor, *, requirement=None):
+        assert requirement is None
         observed.append(floor)
         return ToolResult.completed_success(output="installer delegated")
 

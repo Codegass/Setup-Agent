@@ -255,6 +255,65 @@ def test_the_checkout_wrapper_is_the_runner_when_it_exists_and_is_executable():
     assert manager.seen_specs[0].prefer_wrapper is True
     assert orchestrator.runners == [WRAPPER]
     assert result.metadata["maven_runner_choice"]["runner"] == "wrapper"
+
+
+@pytest.mark.parametrize("registered", ["3.9.16", None])
+def test_host_task_version_drives_resolver_without_model_parameter(monkeypatch, registered):
+    from sag.agent.acceptance_task import AcceptanceTask
+    from sag.agent.attempt_policy import CurrentBuildReceiptScope
+
+    task = AcceptanceTask.model_validate(
+        {
+            "repo": "apache/httpcomponents-client",
+            "sha": "a" * 40,
+            "steps": [
+                {
+                    "id": "verify",
+                    "runner": "maven",
+                    "argv": ["mvn", "test"],
+                    "maven_version": "3.9.16",
+                }
+            ],
+        }
+    )
+    scope = CurrentBuildReceiptScope(
+        status="available",
+        run_id="test",
+        project_root=WORKDIR,
+        target_sha=task.sha,
+        acceptance_task_declared=True,
+        acceptance_task_sha256=task.sha256,
+        acceptance_task_definition=task.model_dump(mode="json"),
+    )
+    monkeypatch.setattr(
+        "sag.agent.attempt_policy.resolve_current_build_receipt_scope", lambda *a, **kw: scope
+    )
+    orch = WrapperOrchestrator()
+    orch.acceptance_task_root = WORKDIR
+
+    class RequiredManager(WrapperAwareToolchainManager):
+        def resolve(self, spec, working_directory=WORKDIR):
+            self.seen_specs.append(spec)
+            if spec.version_requirement:
+                assert spec.version_requirement.raw == "3.9.16"
+                assert spec.version_requirement.source == "acceptance_task"
+                if registered is None:
+                    return None
+                return ResolvedToolExecutable(
+                    candidate=ToolExecutableCandidate(
+                        "maven", "mvn", REGISTERED, registered, "registered"
+                    ),
+                    reason="satisfies fixed task",
+                )
+            return super().resolve(spec, working_directory)
+
+    manager, result = _run(orch, manager=RequiredManager())
+    assert manager.seen_specs[0].version_requirement.source == "acceptance_task"
+    assert orch.runners == ([REGISTERED] if registered else [])
+    assert result.metadata["maven_version_requirement"]["source"] == "acceptance_task"
+    if registered is None:
+        assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
+        assert "available_setup_call" in result.facts
     assert result.metadata["maven_runner_choice"]["wrapper_path"] == WRAPPER
 
 

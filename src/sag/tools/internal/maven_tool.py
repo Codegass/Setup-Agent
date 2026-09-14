@@ -17,7 +17,12 @@ from sag.agent.invocation_contracts import (
     dispatch_contract,
     ensure_dispatch_contract,
 )
-from sag.agent.invocation_receipts import record_invocation, snapshot_reports
+from sag.agent.invocation_receipts import (
+    record_invocation,
+    runner_executable,
+    snapshot_reports,
+    toolchain_fingerprint,
+)
 from sag.agent.job_obligations import record_dispatch_obligation_result
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
@@ -35,12 +40,12 @@ from .build_preflight import (
 )
 from .build_utils import (
     DETACHED_HANDOFF_STATUSES,
-    bounded_detached_log_excerpt,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
     dispatch_hold_policy,
     harvest_detached_evidence,
+    preserved_build_log,
 )
 from .command_tracker import CommandTracker
 from .dispatch_argv import maven_action_tokens
@@ -290,6 +295,34 @@ class MavenTool(BaseTool):
         requested_version = ToolVersionRequirement.from_raw(
             maven_version_requirement, source="tool_parameter"
         )
+        from sag.agent.acceptance_task import task_maven_requirement
+
+        try:
+            task_version = task_maven_requirement(self.orchestrator, current_contract())
+        except ValueError as exc:
+            return ToolResult.completed_failure(
+                output="",
+                error=str(exc),
+                error_code="ACCEPTANCE_TASK_UNAVAILABLE",
+                metadata={"runner_dispatched": False},
+            )
+        if (
+            task_version
+            and requested_version
+            and not self._version_satisfies_requirement(
+                task_version.raw, requested_version.raw, requested_version.kind
+            )
+        ):
+            return ToolResult.completed_failure(
+                output="",
+                error="This call's Maven requirement conflicts with the fixed task.",
+                error_code="MAVEN_VERSION_REQUIREMENT_CONFLICT",
+                facts={
+                    "task_maven_version": task_version.raw,
+                    "call_requirement": requested_version.raw,
+                },
+                metadata={"runner_dispatched": False},
+            )
         observed_versions = []
         observed_requirements = getattr(self.toolchain_manager, "observed_requirements", None)
         if callable(observed_requirements):
@@ -303,10 +336,14 @@ class MavenTool(BaseTool):
                 inherited = observed_requirement("maven")
                 if inherited:
                     observed_versions = [inherited]
-        resolution_requirement = requested_version or (
-            observed_versions[0] if observed_versions else None
+        resolution_requirement = (
+            task_version
+            or requested_version
+            or (observed_versions[0] if observed_versions else None)
         )
-        contract_requirement = observed_versions[0] if observed_versions else requested_version
+        contract_requirement = task_version or (
+            observed_versions[0] if observed_versions else requested_version
+        )
         resolved_maven = self._resolve_maven_executable(
             working_directory=working_directory,
             version_requirement=resolution_requirement,
@@ -643,6 +680,13 @@ class MavenTool(BaseTool):
                     before = snapshot_reports(
                         self.orchestrator.execute_command, [working_directory]
                     )
+                    toolchain = toolchain_fingerprint(
+                        self.orchestrator.execute_command,
+                        executable=runner_executable(maven_cmd, "maven"),
+                        version_flag="--version",
+                        working_directory=working_directory,
+                        tool="maven",
+                    ) or {}
                     dispatched = _run_build()
                     self._record_invocation_receipt(
                         requested_action=requested_action,
@@ -651,6 +695,7 @@ class MavenTool(BaseTool):
                         working_directory=working_directory,
                         attempt=attempt,
                         result=dispatched,
+                        toolchain_observation=toolchain,
                         before=before,
                         requirements=requirements,
                     )
@@ -734,9 +779,8 @@ class MavenTool(BaseTool):
             # The complete log. For detached builds the orchestrator hands back
             # a complete `full_output` (untruncated) alongside the bounded
             # inline `output`; semantic parsing and receipt summaries read THIS
-            # text, never the model-facing window. OutputStorage may keep a
-            # bounded duplicate below because the durable job log retains the
-            # complete bytes (live commons-cli 2026-07-27: the aggregate
+            # text, never the model-facing window. OutputStorage also keeps
+            # the complete bytes (live commons-cli 2026-07-27: the aggregate
             # `Tests run:` line sat in the omitted middle, so counts the runner
             # had already computed were discarded and re-derived by hand).
             full_output = result.get("full_output") or result["output"]
@@ -755,7 +799,7 @@ class MavenTool(BaseTool):
             # bounded duplicate in output storage so persistence does not ship
             # multi-megabyte logs through encoded container-write commands.
             ref_id = None
-            stored_output, log_storage_metadata = bounded_detached_log_excerpt(full_output, result)
+            stored_output, log_storage_metadata = preserved_build_log(full_output, result)
             self._pending_log_storage_metadata = log_storage_metadata
             if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
@@ -1127,6 +1171,7 @@ class MavenTool(BaseTool):
         result: Dict[str, Any],
         before: Dict[str, str],
         requirements: Optional[Dict[str, Any]] = None,
+        toolchain_observation: Optional[Mapping[str, str]] = None,
     ) -> None:
         """Persist the P0-A invocation receipt for one physical dispatch.
 
@@ -1144,6 +1189,7 @@ class MavenTool(BaseTool):
                 self.orchestrator.execute_command,
                 result=result,
                 tool="maven",
+                toolchain_observation=toolchain_observation,
                 attempt=attempt,
                 requested_action=requested_action,
                 effective_action=effective_action,
@@ -1158,6 +1204,7 @@ class MavenTool(BaseTool):
         self._pending_invocation_receipt = record_invocation(
             self.orchestrator.execute_command,
             tool="maven",
+            toolchain_observation=toolchain_observation,
             attempt=attempt,
             requested_action=requested_action,
             effective_action=effective_action,
@@ -1984,7 +2031,15 @@ class MavenTool(BaseTool):
         ):
             facts["available_setup_call"] = {
                 "tool": "project",
-                "params": {"action": "provision", "maven_version": floor},
+                "params": {
+                    "action": "provision",
+                    "maven_version": floor,
+                    **(
+                        {"requirement": requirement.raw}
+                        if requirement.source == "acceptance_task"
+                        else {}
+                    ),
+                },
                 "installs_version": version,
                 "effect": "Install an Apache Maven distribution, activate it, and verify the active mvn. Then retry the required build/test command.",
             }
@@ -2888,13 +2943,15 @@ class MavenTool(BaseTool):
         if executed <= 0:
             return None
 
-        failed = int(tests.get("failures") or 0) + int(tests.get("errors") or 0)
+        failed = int(tests.get("failures") or 0)
+        errors = int(tests.get("errors") or 0)
         skipped = int(tests.get("skipped") or 0)
-        passed = max(executed - failed - skipped, 0)
+        passed = max(executed - failed - errors - skipped, 0)
         return TestStats(
             executed=executed,
             passed=passed,
             failed=failed,
+            errors=errors,
             skipped=skipped,
         )
 
@@ -2906,7 +2963,7 @@ class MavenTool(BaseTool):
         if test_stats:
             fields["test_stats"] = test_stats
 
-        has_test_failures = bool(test_stats and test_stats.failed > 0)
+        has_test_failures = bool(test_stats and test_stats.failed + test_stats.errors > 0)
         build_claimed_success = bool(
             analysis.get("has_build_success_marker") or analysis.get("exit_code") == 0
         )

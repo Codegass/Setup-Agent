@@ -20,21 +20,16 @@ from ..base import ToolResult, require_persisted_output_storage_ref
 DETACHED_HANDOFF_STATUSES = frozenset(
     {"running_detached", "liveness_unknown_detached", "dispatch_unknown"}
 )
-PERSISTED_DETACHED_LOG_MAX_BYTES = 128 * 1024
 
 
-def bounded_detached_log_excerpt(
+def preserved_build_log(
     output: Any,
     result: Dict[str, Any],
-    *,
-    max_bytes: int = PERSISTED_DETACHED_LOG_MAX_BYTES,
 ) -> tuple[str, Dict[str, Any]]:
-    """Bound output-store bytes when a durable detached job log already exists.
+    """Keep the primary output ref complete, with durable job provenance.
 
-    Parsing and receipt creation still consume the caller's full text. This
-    helper changes only the duplicate copy written to OutputStorageManager.
-    Attached commands, or detached results lacking a stable external log, keep
-    their full output so no evidence is discarded without another reference.
+    Only model-facing previews may be shortened. A job path is an additional
+    locator, not permission to replace the ref's bytes with an excerpt.
     """
 
     text = str(output or "")
@@ -47,29 +42,19 @@ def bounded_detached_log_excerpt(
             poll_ref = detached_poll_ref(result)
         except ValueError:
             poll_ref = ""
-    if len(encoded) <= max_bytes or not (poll_ref or log_path):
+    if not (poll_ref or log_path):
         return text, {}
 
-    marker = (
-        f"\n\n... {len(encoded) - max_bytes:,} or more bytes omitted from this "
-        "OutputStorage copy; read the durable detached job log for the full output ...\n\n"
-    ).encode("utf-8")
-    content_budget = max(max_bytes - len(marker), 0)
-    head_size = content_budget // 2
-    tail_size = content_budget - head_size
-    head = encoded[:head_size].decode("utf-8", "ignore")
-    tail = encoded[-tail_size:].decode("utf-8", "ignore") if tail_size else ""
-    excerpt = head + marker.decode("utf-8") + tail
     metadata: Dict[str, Any] = {
         "full_log_bytes": len(encoded),
         "full_log_sha256": hashlib.sha256(encoded).hexdigest(),
-        "output_storage_truncated": True,
+        "output_storage_truncated": False,
     }
     if poll_ref:
         metadata["full_log_ref"] = poll_ref
     if log_path:
         metadata["full_log_path"] = log_path
-    return excerpt, metadata
+    return text, metadata
 
 
 def detached_poll_ref(result: Dict[str, Any]) -> str:

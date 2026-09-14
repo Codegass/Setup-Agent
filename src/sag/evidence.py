@@ -73,7 +73,7 @@ class TestStats(BaseModel):
     def pass_rate(self) -> float:
         if self.executed <= 0:
             return 0.0
-        return round((self.passed / self.executed) * 100, 1)
+        return (self.passed / self.executed) * 100
 
     @property
     def execution_rate(self) -> float | None:
@@ -86,6 +86,8 @@ class TestStats(BaseModel):
         return min(round((self.executed / self.discovered) * 100, 1), 100.0)
 
     def as_summary(self) -> str:
+        from sag.reporting import format_percentage
+
         # Be explicit when nothing ran: "0 / 0 passed, 0.0% pass rate" reads like a
         # clean result and hides that a discovered suite was never executed. Report
         # the detected-but-not-executed case honestly so it cannot be mistaken for a
@@ -100,7 +102,7 @@ class TestStats(BaseModel):
         errors = f", {self.errors} errors" if self.errors else ""
         return (
             f"{self.passed} / {self.executed} passed{flaky}, "
-            f"{self.pass_rate:.1f}% pass rate, "
+            f"{format_percentage(self.pass_rate)} pass rate, "
             f"{self.failed} failed{errors}, {self.skipped} skipped"
         )
 

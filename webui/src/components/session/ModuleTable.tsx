@@ -2,6 +2,7 @@ import { ChevronDown } from "lucide-react"
 import { Fragment, useState } from "react"
 
 import type { ModuleSummary } from "@/api/types"
+import { formatRate } from "@/evidencePresentation"
 import { cn } from "@/lib/utils"
 
 function statusClass(s: string): string {
@@ -22,7 +23,7 @@ function passRate(p?: number | null, f?: number | null, e?: number | null): stri
   const pass = p as number
   const denominator = pass + (f as number) + (e as number)
   if (pass < 0 || denominator <= 0 || pass > denominator) return "—"
-  return `${((pass / denominator) * 100).toFixed(1).replace(/\.0$/, "")}%`
+  return formatRate((pass / denominator) * 100)
 }
 
 function covColor(rate: number): string {
@@ -59,7 +60,7 @@ function buildTextClass(s: string): string {
 }
 
 function pct1(n: number): string {
-  return `${n.toFixed(1).replace(/\.0$/, "")}%`
+  return formatRate(n)
 }
 
 function ProgressBar({ rate, color }: { rate: number; color: string }) {

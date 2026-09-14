@@ -187,7 +187,9 @@ def _current_test_counts(receipt, parsed, *, run_id, target_sha):
     )
 
 
-def _certificate_input(orchestrator, state, validator, project_root, repo, target=None):
+def _certificate_input(
+    orchestrator, state, validator, project_root, repo, target=None, task_completion=None
+):
     """Bind actual receipts to a fixed host task, or read the archived plan path.
 
     A fixed command supplies obligations, never observations or test counts.
@@ -212,8 +214,28 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
     execute = resolve_control_execute(orchestrator)
     if not callable(execute) or read_target_sha(execute, project_root) != scope_pin.target_sha:
         raise ValueError("current_checkout_differs_from_run_pin")
+    from sag.agent.acceptance_task import pinned_acceptance_task
+
+    task = pinned_acceptance_task(scope_pin)
     fixed_command = target.execution_command if target else None
-    if fixed_command:
+    task_results = {}
+    if task is not None:
+        if (
+            task.repo != repo
+            or task_completion is None
+            or (
+                task_completion.run_id != state.run_id
+                or task_completion.task_sha256 != task.sha256
+                or tuple((r.id, r.command) for r in task_completion.steps)
+                != tuple((s.id, s.command) for s in task.steps)
+            )
+        ):
+            raise ValueError("fixed_task_completion_unavailable")
+        task_results = {step.id: step for step in task_completion.steps}
+        plan_digest = basis_ref = task.sha256
+        groups = (("build", task.steps), ("test", task.steps))
+        fixed_key = None
+    elif fixed_command:
         from sag.agent.project_execution_plan import ExecutionStep
         from sag.tools.build.backends import parse_runner_command
 
@@ -255,7 +277,7 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
     receipts = [
         item
         for item in receipts
-        if item.get("tool") in {"maven", "gradle"}
+        if (task is not None or item.get("tool") in {"maven", "gradle"})
         and item.get("run_id") == state.run_id
         and item.get("target_sha") == scope_pin.target_sha
     ]
@@ -266,7 +288,7 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
         plan_sha256=plan_digest,
     )
     scope = ScopeClaim(
-        scope_id=("task:" if fixed_command else "plan:") + plan_digest[:32],
+        scope_id=("task:" if task is not None or fixed_command else "plan:") + plan_digest[:32],
         revision=1,
         evidence_epoch=state.run_id,
         subject=subject,
@@ -294,11 +316,18 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
     # Contracts are read through the same live binding predicate used by the
     # execution-completion validator. A later different/narrower call has a
     # different key and cannot discharge the original plan step.
-    planned_calls = Counter(
-        fixed_key or _call_key(step.tool, step.params) for _, steps in groups for step in steps
+    planned_calls = (
+        Counter()
+        if task is not None
+        else Counter(
+            fixed_key or _call_key(step.tool, step.params) for _, steps in groups for step in steps
+        )
     )
     matched = {}
+    receipts_by_id = {receipt["receipt_id"]: receipt for receipt in receipts}
     for receipt in sorted(receipts, key=validator._receipt_sequence):
+        if task is not None:
+            continue  # The completion reader already selected ordered, exact task receipts.
         contract = validator._test_execution_contract(receipt)
         if contract is None or not _assessed(receipt, assessments):
             continue
@@ -331,16 +360,54 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
             CertificateBlocker(code=code, affects=affects, owner="harness", reason=detail)
         )
 
+    if task is not None:
+        # Task execution obligations are fixed by the host. Test evidence is
+        # an additional whole-task obligation: compile/native steps need not
+        # fabricate JUnit reports. Every required command still has to finish.
+        test_required.append("test:task")
+        required_evidence.add("test:task")
+        if task_completion.status != "complete":
+            block(
+                "FIXED_TASK_INCOMPLETE",
+                ("build", "test_execution"),
+                "One or more fixed task steps lack ordered, successful execution evidence.",
+            )
+
     for lane, steps in groups:
         for index, step in enumerate(steps):
-            step_id = f"{lane}:{index + 1}"
-            required_evidence.add(step_id)
-            required = build_required if lane == "build" else test_required
-            required.append(step_id)
-            candidates = matched.get(fixed_key or _call_key(step.tool, step.params))
-            if not candidates:
-                continue
-            receipt = candidates[-1] if fixed_command else candidates.popleft()
+            step_id = "test:task" if task is not None and lane == "test" else f"{lane}:{index + 1}"
+            if not (task is not None and lane == "test"):
+                required_evidence.add(step_id)
+                required = build_required if lane == "build" else test_required
+                required.append(step_id)
+            if task is not None:
+                witness = task_results[step.id]
+                receipt = receipts_by_id.get(witness.receipt_id)
+                if receipt is None:
+                    continue
+                if receipt.get("tool") in {"maven", "gradle"} and (
+                    validator._test_execution_contract(receipt) is None
+                    or not _assessed(receipt, assessments)
+                ):
+                    block(
+                        "FIXED_TASK_ASSESSMENT_UNAVAILABLE",
+                        ("build", "test_execution"),
+                        "A fixed JVM task receipt has no complete current assessment.",
+                    )
+                    continue
+                if lane == "test" and (
+                    receipt.get("tool") not in {"maven", "gradle"}
+                    or not any(
+                        receipt.get("report_delta", {}).get(bucket)
+                        for bucket in ("new", "changed", "cached")
+                    )
+                ):
+                    continue
+            else:
+                candidates = matched.get(fixed_key or _call_key(step.tool, step.params))
+                if not candidates:
+                    continue
+                receipt = candidates[-1] if fixed_command else candidates.popleft()
             evidence.add(step_id)
             evidence.add(receipt["receipt_id"])
             required_evidence.add(receipt["receipt_id"])
@@ -354,7 +421,14 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
                 dispatch_terminated(receipt) and 0 <= int(receipt.get("exit_code", 255)) < 128
             )
             if lane == "build":
-                if terminal and receipt.get("exit_code") == 0 and "expectation_met" in codes:
+                if task is not None and witness.status == "complete":
+                    build_done.append(step_id)
+                elif (
+                    terminal
+                    and receipt.get("exit_code") == 0
+                    and "expectation_met" in codes
+                    and task is None
+                ):
                     build_done.append(step_id)
                 elif terminal and receipt.get("exit_code") != 0:
                     build_failed.append(step_id)
@@ -393,7 +467,9 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
                         and "test_failure_exit" in codes
                     )
                 ):
-                    (test_red if bound.counts.red else test_done).append(step_id)
+                    collection = test_red if bound.counts.red else test_done
+                    if step_id not in collection:
+                        collection.append(step_id)
             if maven_module_identity_ambiguous(receipt) or any(
                 item.get("field") == "module_outcomes"
                 for item in receipt.get("evidence_omissions", ())
@@ -427,7 +503,8 @@ def _certificate_input(orchestrator, state, validator, project_root, repo, targe
     bound_counts = None
     for counts in selected_counts.values():
         bound_counts = counts if bound_counts is None else bound_counts + counts
-    if len(selected_tests) != len(test_required):
+    test_done = [step for step in test_done if step not in test_red]
+    if not selected_tests if task is not None else len(selected_tests) != len(test_required):
         block(
             "PLAN_TEST_EVIDENCE_INCOMPLETE",
             ("test_execution",),
@@ -690,7 +767,9 @@ def _same_pool_identities(
     )
 
 
-def build_ci_comparison(orchestrator, state, *, validator, project_root, repository, target=None):
+def build_ci_comparison(
+    orchestrator, state, *, validator, project_root, repository, target=None, task_completion=None
+):
     repo = repository_identity(repository)
     base = {
         "run_id": state.run_id,
@@ -706,7 +785,7 @@ def build_ci_comparison(orchestrator, state, *, validator, project_root, reposit
         )
     try:
         payload, receipt_ids, commands, parsed_reads = _certificate_input(
-            orchestrator, state, validator, project_root, repo, target
+            orchestrator, state, validator, project_root, repo, target, task_completion
         )
         certificate = evaluate_java_success_certificate(payload)
     except Exception as exc:

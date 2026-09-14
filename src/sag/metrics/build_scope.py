@@ -92,7 +92,14 @@ def _invocation_start(tokens: list[str]) -> int | None:
     index = 1 if tokens and tokens[0] == "env" else 0
     while index < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]):
         index += 1
-    return index if index < len(tokens) and tokens[index] in _BUILD_TOOLS else None
+    return index if index < len(tokens) and _build_tool(tokens[index]) else None
+
+
+def _build_tool(executable: str) -> Literal["maven", "gradle"] | None:
+    # The dispatch can replace a PATH launcher with an observed absolute path.
+    # This identifies syntax only; it does not certify that executable or scope.
+    launcher = posixpath.basename(executable) if posixpath.isabs(executable) else executable
+    return _BUILD_TOOLS.get(launcher)
 
 
 def _split_csv(value: str) -> tuple[str, ...]:
@@ -118,7 +125,8 @@ def parse_ci_command(text: str) -> CiCommand:
     if not lines:
         return CiCommand(text=(text or "").strip()[:2_000])
     line, tokens, start = lines[0]
-    tool = _BUILD_TOOLS[tokens[start]]
+    tool = _build_tool(tokens[start])
+    assert tool is not None  # _invocation_start accepted this literal launcher.
     args = tokens[start + 1 :]
     reason = "multiple build invocations" if len(lines) > 1 else None
     if unparsed_lines:

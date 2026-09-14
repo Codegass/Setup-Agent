@@ -209,6 +209,7 @@ class CurrentBuildReceiptScope:
     project_root: str | None = None
     acceptance_task_declared: bool = False
     acceptance_task_sha256: str | None = None
+    acceptance_task_definition: Mapping[str, Any] | None = None
 
     @property
     def available(self) -> bool:
@@ -1498,6 +1499,7 @@ def resolve_current_build_receipt_scope(
         project_root=normalized_project,
         acceptance_task_declared=task_declared,
         acceptance_task_sha256=task_digest,
+        acceptance_task_definition=task_pin.get("definition") if isinstance(task_pin, Mapping) else None,
     )
 
 

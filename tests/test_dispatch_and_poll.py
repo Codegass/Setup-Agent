@@ -31,7 +31,7 @@ from sag.tools.base import bind_tool_result_output_storage
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.build_utils import (
     BuildAnalyzer,
-    bounded_detached_log_excerpt,
+    preserved_build_log,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_runner_from_command,
@@ -43,10 +43,10 @@ CONTAINER_ID = "c" * 64
 DOCKER_EXEC_ID = "d" * 64
 
 
-def test_detached_output_storage_copy_is_bounded_with_a_durable_log_reference():
+def test_detached_output_ref_keeps_full_bytes_even_with_a_durable_job_locator():
     full_output = "HEAD\n" + ("x" * 20_000) + "\nTAIL"
 
-    excerpt, metadata = bounded_detached_log_excerpt(
+    excerpt, metadata = preserved_build_log(
         full_output,
         {
             "dispatch": {
@@ -54,17 +54,16 @@ def test_detached_output_storage_copy_is_bounded_with_a_durable_log_reference():
                 "log_path": "/tmp/sag_jobs/ignite-test.log",
             }
         },
-        max_bytes=4096,
     )
 
-    assert len(excerpt.encode("utf-8")) <= 4096
+    assert excerpt == full_output
     assert excerpt.startswith("HEAD\n")
     assert excerpt.endswith("\nTAIL")
-    assert "omitted from this OutputStorage copy" in excerpt
+    assert "omitted from this OutputStorage copy" not in excerpt
     assert metadata == {
         "full_log_bytes": len(full_output.encode("utf-8")),
         "full_log_sha256": hashlib.sha256(full_output.encode("utf-8")).hexdigest(),
-        "output_storage_truncated": True,
+        "output_storage_truncated": False,
         "full_log_ref": "job:ignite-test",
         "full_log_path": "/tmp/sag_jobs/ignite-test.log",
     }
@@ -73,10 +72,9 @@ def test_detached_output_storage_copy_is_bounded_with_a_durable_log_reference():
 def test_output_storage_keeps_full_text_when_no_external_log_can_recover_it():
     full_output = "x" * 20_000
 
-    stored, metadata = bounded_detached_log_excerpt(
+    stored, metadata = preserved_build_log(
         full_output,
         {"exit_code": 0},
-        max_bytes=4096,
     )
 
     assert stored == full_output
@@ -1450,6 +1448,61 @@ class RoutingOrchestrator:
                 "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
             },
         }
+
+
+@pytest.mark.parametrize("runner", ["maven", "gradle"])
+def test_completed_build_primary_ref_reaches_unabridged_middle_via_search_and_shell(
+    tmp_path, runner
+):
+    from test_tool_output_access import ShellTransport
+    from sag.agent.output_storage import attach_durable_output_ref
+    from sag.agent.tool_orchestration import format_tool_result
+    from sag.tools.bash import BashTool, BashToolConfig
+    from sag.tools.internal.maven_tool import MavenTool
+    from sag.tools.internal.gradle_tool import GradleTool
+    from sag.tools.internal.output_search_tool import OutputSearchTool
+
+    full = "head\n" * 40000 + "ORIGINAL_MIDDLE_SENTINEL\n" + "tail\n" * 40000 + "BUILD SUCCESSFUL\n"
+
+    class CompletedBuild(RoutingOrchestrator):
+        def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+            result = super().execute_command_with_soft_timeout(command, workdir=workdir, **kwargs)
+            result.update(output=full, full_output=full, lifecycle_state="finished")
+            return result
+
+    storage = OutputStorageManager(tmp_path / "outputs")
+    tool = (
+        MavenTool(CompletedBuild(handoff=False))
+        if runner == "maven"
+        else GradleTool(CompletedBuild(handoff=False))
+    )
+    tool.output_storage = storage
+    result = tool.execute(
+        working_directory="/workspace/p",
+        **({"command": "test"} if runner == "maven" else {"tasks": "test"}),
+    )
+    result = attach_durable_output_ref(
+        result, storage, task_id="full-build-output", tool_name="build"
+    )
+    assert result.succeeded, result
+    assert storage.retrieve_output(result.output_ref) == full
+    path = result.metadata["output_path"]
+    visible = format_tool_result("build", result)
+    assert path in visible and result.output_ref in visible
+    reader = SearchTool(None, output_search=OutputSearchTool(contexts_dir=storage.storage_dir))
+    recovered = reader.safe_execute(
+        target=result.output_ref, pattern="ORIGINAL_MIDDLE_SENTINEL", context_lines=0
+    )
+    assert recovered.succeeded and "ORIGINAL_MIDDLE_SENTINEL" in recovered.output
+    shell = BashTool(ShellTransport(tmp_path), BashToolConfig(add_sag_cli_marker=False))
+    import shlex
+
+    for command in (
+        f"rg -n ORIGINAL_MIDDLE_SENTINEL {shlex.quote(path)}",
+        f"sed -n '40001p' {shlex.quote(path)}",
+    ):
+        fetched = shell.safe_execute(command=command, working_directory=str(tmp_path))
+        assert fetched.succeeded and "ORIGINAL_MIDDLE_SENTINEL" in fetched.output
 
 
 def test_gradle_tool_routes_build_through_dispatch_and_returns_handoff():

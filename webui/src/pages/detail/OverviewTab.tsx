@@ -2,6 +2,7 @@ import type { ExecutionSessionDetail } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
 import { NeedsAttention } from "@/components/session/NeedsAttention"
 import {
+  formatRate,
   presentBuild,
   presentDataNotes,
   presentDiagnostics,
@@ -11,7 +12,7 @@ import {
 import { cn } from "@/lib/utils"
 
 function pct1(n: number): string {
-  return `${n.toFixed(1).replace(/\.0$/, "")}%`
+  return formatRate(n)
 }
 
 function progressText(progress: Record<string, number> | undefined): string | null {

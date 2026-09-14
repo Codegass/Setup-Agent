@@ -19,6 +19,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.reporting import format_percentage
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
 from sag.verdict_rates import execution_sentence
 
@@ -1829,7 +1830,7 @@ START by working toward the current phase objective shown in my context.
             # Even if tests would pass, build failure means overall failure
             if test_status["has_test_reports"]:
                 logger.info(
-                    f"📊 Test status (informational): {test_status['passed_tests']}/{test_status['total_tests']} tests, {test_status['pass_rate']:.1f}% pass rate"
+                    f"📊 Test status (informational): {test_status['passed_tests']}/{test_status['total_tests']} tests, {format_percentage(test_status['pass_rate'])} pass rate"
                 )
 
             self.final_verdict = "failed"

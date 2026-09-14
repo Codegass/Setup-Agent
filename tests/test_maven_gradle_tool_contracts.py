@@ -301,7 +301,7 @@ def test_maven_success_marker_with_surefire_failures_returns_partial_evidence():
     assert result.test_stats.failed == 3
     assert result.test_stats.skipped == 5
     assert result.test_stats.passed == 206
-    assert result.test_stats.pass_rate == 96.3
+    assert result.test_stats.pass_rate == 206 / 214 * 100
     assert result.conflicts == ["maven_success_vs_test_failures"]
     assert result.evidence_refs == ["output_maven_success_with_failed_tests"]
     assert result.metadata["output_ref_id"] == "output_maven_success_with_failed_tests"
@@ -400,7 +400,7 @@ def test_gradle_success_marker_with_failed_tests_returns_partial_evidence():
     assert result.test_stats.failed == 3
     assert result.test_stats.skipped == 5
     assert result.test_stats.passed == 206
-    assert result.test_stats.pass_rate == 96.3
+    assert result.test_stats.pass_rate == 206 / 214 * 100
     assert result.conflicts == ["gradle_success_vs_test_failures"]
     assert result.evidence_refs == ["output_gradle_success_with_failed_tests"]
     assert result.metadata["output_ref_id"] == "output_gradle_success_with_failed_tests"

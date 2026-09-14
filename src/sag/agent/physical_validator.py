@@ -4302,7 +4302,7 @@ class PhysicalValidator:
         return result
 
     def _java_requirements_for_invocation(self, manifest: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Resolve explicit disabled profiles from a current, terminal receipt.
+        """Resolve simple profile conditions from a current, terminal receipt.
 
         The static survey remains unchanged. Re-read only the pinned root POM
         when it reproduces every surveyed Java fact; inherited or otherwise
@@ -4337,25 +4337,23 @@ class PhysicalValidator:
                 }
             ],
         )
-        if not selection.disabled or selection.conflicts or selection.conservative:
+        if selection.conflicts or selection.conservative:
             return requirements
-        from sag.agent.physical_survey import config_fingerprint
-        from sag.runtime.container_io import read_container_text
-        from sag.tools.internal.java_versions import maven_java_requirements
+        from sag.tools.internal.java_versions import resolve_maven_java_requirements
 
-        if config_fingerprint(self.docker_orchestrator, root) != fingerprint:
-            return requirements
-        path = posixpath.join(root, "pom.xml")
-        content = read_container_text(self.docker_orchestrator, path, exact_bytes=True)
-        if content is None or len(content.encode("utf-8")) > 1024 * 1024:
-            return requirements
-        poms = [(content, path)]
-        if (
-            maven_java_requirements(poms) != requirements
-            or config_fingerprint(self.docker_orchestrator, root) != fingerprint
-        ):
-            return requirements
-        return maven_java_requirements(poms, disabled_profiles=selection.disabled)
+        jdk = latest.get("effective_jdk") or {}
+        dispatch_runtime = (jdk.get("provenance") or {}).get("dispatch_runtime") or {}
+        return resolve_maven_java_requirements(
+            self.docker_orchestrator,
+            manifest,
+            runtime_version=(
+                dispatch_runtime.get("version")
+                if jdk.get("runtime_authority") == "dispatch_probe"
+                else None
+            ),
+            disabled_profiles=selection.disabled,
+            enabled_profiles=selection.enabled,
+        )
 
     def _collect_env_conflicts(self) -> List[str]:
         """Runtime conflicts use the same declared constraints as preflight.
@@ -6094,7 +6092,7 @@ class PhysicalValidator:
                 "failed": failed_count,
                 "skipped": test_metrics.get("skipped_tests", 0),
                 "flaky_count": test_metrics.get("flaky_count", 0),
-                "pass_rate": round(pass_rate, 1),
+                "pass_rate": pass_rate,
                 "collection_errors": collection_errors,
                 **(
                     {"driven_modules": list(test_metrics["driven_modules"])}

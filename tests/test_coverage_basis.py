@@ -841,9 +841,7 @@ def test_two_labels_for_one_module_are_counted_once():
 
 
 def test_the_polaris_sentence_is_unconstructible():
-    """The whole point of stage 4: a reason whose decision half says the
-    coverage passed while its commentary half says 1/26 cannot be built,
-    because both halves now read the same scan object."""
+    """Execution success never claims full CI coverage from a minority scan."""
     from sag.agent.phase_gates import ValidatorState, _inspect_build
 
     scan = _polaris_scan()
@@ -851,20 +849,16 @@ def test_the_polaris_sentence_is_unconstructible():
 
     observation = _inspect_build(validator, "polaris")
 
-    assert observation.state is not ValidatorState.GREEN
+    assert observation.state is ValidatorState.GREEN
+    assert "Official-CI evidence determines scope attainment separately" in observation.reason
+    assert "Filesystem diagnostic:" in observation.reason
     assert "Module coverage: 1/26 built" in observation.reason
     assert "100%" not in observation.reason
     assert "All expected build artifacts found" not in observation.reason
 
 
 def test_the_two_halves_of_the_sentence_always_state_the_same_ratio():
-    """The pin, as a property rather than one example: whatever the tree looks
-    like, the ratio the verdict stood on and the ratio the checklist printed
-    are read out of one object, so the sentence cannot say 100% and 1/26.
-
-    Both halves are parsed back out of the composed gate reason — the exact
-    string p7d's model was shown — and compared.
-    """
+    """Changing diagnostic scan coverage cannot change the execution verdict."""
     import re
 
     from sag.agent.phase_gates import ValidatorState, _inspect_build
@@ -874,13 +868,11 @@ def test_the_two_halves_of_the_sentence_always_state_the_same_ratio():
 
         observation = _inspect_build(_polaris_validator(scan=scan), "polaris")
 
-        decided = re.search(
-            r"denominator: the module scan on disk \((\d+)/(\d+)", observation.reason
-        )
         displayed = re.search(r"Module coverage: (\d+)/(\d+) built", observation.reason)
-        assert decided and displayed
-        assert decided.groups() == displayed.groups() == (str(len(built)), "26")
-        assert (observation.state is ValidatorState.GREEN) is False  # basis is still none
+        assert displayed and displayed.groups() == (str(len(built)), "26")
+        assert "Filesystem diagnostic:" in observation.reason
+        assert "module scan owns the denominator" not in observation.reason
+        assert observation.state is ValidatorState.GREEN
 
 
 def test_a_minority_scan_can_never_be_a_complete_build():
@@ -1008,14 +1000,7 @@ def test_a_receipt_that_did_not_set_the_denominator_leaves_the_scan_cap_live():
 
 
 def test_the_unnarrowed_state_cannot_pair_a_passing_verdict_with_a_minority_scan():
-    """Spec §6 acceptance 1, on the state that reached it in p7d.
-
-    The gate's composed sentence is the thing the model was shown, so the pin is
-    on that string. The verdict is no longer passing; and the clause that DECIDED
-    now leads it, with the artifact check's own finding kept but subordinated — a
-    met one-jar expectation is a true fact and stays in the sentence, it just may
-    not stand at the head of a sentence whose next clause says 1/26.
-    """
+    """No scan denominator or artifact claim is promoted to CI coverage."""
     from sag.agent.phase_gates import ValidatorState, _inspect_build
 
     observation = _inspect_build(
@@ -1023,11 +1008,9 @@ def test_the_unnarrowed_state_cannot_pair_a_passing_verdict_with_a_minority_scan
         "polaris",
     )
 
-    assert observation.state is not ValidatorState.GREEN
-    assert observation.reason.startswith(
-        "Not a complete build — the module scan owns the denominator and 1 of 26 modules"
-    )
-    assert "(artifact check: All expected build artifacts found: main JAR)" in observation.reason
+    assert observation.state is ValidatorState.GREEN
+    assert observation.reason.startswith("JVM build execution validated.")
+    assert "All expected build artifacts found" not in observation.reason
     assert "Module coverage: 1/26 built" in observation.reason
     assert "100%" not in observation.reason
 

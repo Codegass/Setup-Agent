@@ -28,7 +28,7 @@ def test_evidence_assessment_can_be_partial_when_operation_succeeds():
     assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.evidence_refs == ["output_abc"]
     assert result.conflicts == ["maven_success_vs_surefire_failures"]
-    assert result.test_stats.pass_rate == 96.3
+    assert result.test_stats.pass_rate == 206 / 214 * 100
 
 
 def test_tool_result_coerces_string_evidence_assessment_inputs():

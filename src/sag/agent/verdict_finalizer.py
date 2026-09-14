@@ -203,7 +203,7 @@ class SnapshotTestStats(BaseModel):
     def pass_rate(self) -> float:
         if self.executed <= 0:
             return 0.0
-        return round((self.passed / self.executed) * 100.0, 1)
+        return (self.passed / self.executed) * 100.0
 
     @property
     def execution_rate(self) -> float | None:
@@ -499,22 +499,9 @@ def _physical_build_status(validator, project_name) -> dict[str, Any] | None:
 
 
 def _physical_judgment(status: dict[str, Any]) -> str | None:
-    success = status.get("success")
-    if success is True:
-        evidence = status.get("evidence")
-        system = (
-            str(evidence.get("build_system") or "").strip().lower()
-            if isinstance(evidence, dict)
-            else ""
-        )
-        # Only known JVM builds use CI to grade scope. Python and unidentified
-        # builds keep their own completeness; missing identity cannot upgrade it.
-        if system in {"maven", "gradle"}:
-            return "success"
-        return "success" if status.get("build_complete", True) else "partial"
-    if success is False:
-        return "failed"
-    return None
+    from sag.agent.module_coverage import physical_build_judgment
+
+    return physical_build_judgment(status)
 
 
 def _build_execution_judgment(build: BuildEvidenceSnapshot) -> str:
@@ -1997,6 +1984,7 @@ class VerdictFinalizer:
                 project_root=(f"/workspace/{self.project_name}" if self.project_name else None),
                 repository=self.repository,
                 target=self.ci_target,
+                task_completion=completion,
             ),
         )
         self._expected_snapshots[cache_key] = snapshot

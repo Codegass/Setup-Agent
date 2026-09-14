@@ -6,6 +6,7 @@ WebSearchTool internals; file/job targets grep inside the container.
 """
 
 import shlex
+import posixpath
 from typing import Any, Dict, Mapping, Optional
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
@@ -456,6 +457,31 @@ class SearchTool(BaseTool):
 
         quoted = diagnostic[:_DIAGNOSTIC_QUOTE_LIMIT] or "no diagnostic was captured"
         reason = f"search failed in {path} (exit {exit_code}): {quoted}"
+        facts = {"target": path, "pattern": pattern, "matched": None}
+        if suggestions is None:
+            facts["file_target_contract"] = (
+                "literal file or directory; directories are searched recursively; paths do not expand globs"
+            )
+            facts["pattern_contract"] = (
+                "grep -E regular expression; use ignore_case=true instead of (?i)"
+            )
+            if any(char in path for char in "*?["):
+                # Preserve the submitted pattern; show how the current name
+                # operation addresses the literal ancestor, without claiming
+                # any files exist or that the glob has already been expanded.
+                parts = path.split("/")
+                first_glob = next(
+                    i for i, part in enumerate(parts) if any(c in part for c in "*?[")
+                )
+                directory = "/".join(parts[:first_glob]) or ("/" if path.startswith("/") else ".")
+                facts["name_lookup_call"] = {
+                    "tool": "search",
+                    "arguments": {
+                        "target": f"name:{directory}",
+                        "pattern": posixpath.basename(path),
+                    },
+                }
+                facts["name_lookup_max_depth"] = NAME_SEARCH_MAX_DEPTH
         return ToolResult.completed_failure(
             output=(
                 f"Search for {pattern!r} in {path} FAILED (exit {exit_code}). "
@@ -465,7 +491,7 @@ class SearchTool(BaseTool):
             error=reason,
             error_code=SEARCH_FAILED,
             # No `matched` verdict exists: the search never produced one.
-            facts={"target": path, "pattern": pattern, "matched": None},
+            facts=facts,
             suggestions=suggestions
             or [
                 f"Confirm the path exists (a directory target is searched recursively): {path}",

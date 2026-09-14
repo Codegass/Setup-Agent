@@ -995,6 +995,59 @@ def diagnostic_testcase_outcomes(
     return result
 
 
+def receipt_failure_summary(receipt: Mapping[str, Any]) -> str:
+    """Bounded diagnostic projection of an already recorded receipt.
+
+    The diagnostic sample retains assertions that the identity rows omit.
+    Join a report location only when that sample has one unambiguous source;
+    duplicate names across modules must not acquire a guessed provenance.
+    This projection changes neither receipt contents nor completion judgments.
+    """
+    diagnostics = receipt.get("testcase_outcomes") or {}
+    nodes = diagnostics.get("nodes", ()) if isinstance(diagnostics, Mapping) else ()
+    failures = [node for node in nodes if node.get("status") in {"failed", "error"}]
+    if not failures:
+        return ""
+    receipt_id = str(receipt.get("receipt_id") or "")
+    lines = [
+        "Observed test failures (bounded diagnostic sample, not a completion verdict):",
+        f"receipt_file=/workspace/.setup_agent/invocation_receipts/{receipt_id}.json",
+        f"exit_code={receipt.get('exit_code')}; command_excerpt={str(receipt.get('argv') or '')[:1024]}",
+    ]
+    rows = (receipt.get("testcase_execution_rows") or {}).get("rows", ())
+    shown = 0
+    for node in failures[:8]:
+        identity = str(node.get("node_id") or "")
+        sources = {
+            (row.get("module_coordinate"), row.get("report_path"), row.get("report_sha256"))
+            for row in rows
+            if " ".join(
+                (f"{row.get('owner')}#{row.get('test_name')}" if row.get("owner")
+                 else str(row.get("test_name") or "")).split()
+            ) == identity
+            and row.get("outcome") == node.get("status")
+        }
+        detail = {
+            "test": identity,
+            "status": node["status"],
+            "message": node.get("reason") or "unavailable",
+        }
+        if len(sources) == 1:
+            module, path, digest = next(iter(sources))
+            if path and digest:
+                detail.update(module=module, report_path=path, report_sha256=digest)
+        line = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        # Preserve complete diagnostic records; do not clip a hash or path
+        # into a different reference. Leave room for the omission disclosure.
+        if len(("\n".join([*lines, line])).encode("utf-8")) > 7600:
+            break
+        lines.append(line)
+        shown += 1
+    if shown < len(failures) or diagnostics.get("truncated"):
+        lines.append("Additional test details are omitted; inspect the linked receipt and reports.")
+    return "\n".join(lines)
+
+
 def _relative_root(root: str, parent: str) -> Optional[str]:
     normalized_root = posixpath.normpath(str(root or ""))
     normalized_parent = posixpath.normpath(str(parent or ""))
