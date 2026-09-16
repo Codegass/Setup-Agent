@@ -285,9 +285,23 @@ def _verdict_from_text(text):
     return match.group(1).lower()
 
 
-def _markdown_tests(text):
+def _markdown_verdict_from_text(text):
+    """The report states the run's verdict as the Result table's Setup row."""
+
     match = re.search(
-        r"Unattributed observations \(not verdict-bearing\): \d+/(\d+) passed",
+        r"^\| \*\*Setup\*\* \| (success|partial|failed|unknown) \|",
+        text,
+        re.MULTILINE,
+    )
+    assert match, text
+    return match.group(1)
+
+
+def _markdown_tests(text):
+    """The same layer the other surfaces read, under the report's own label."""
+
+    match = re.search(
+        r"Set aside: no module or test name recorded: \d+/(\d+) passed",
         text,
     )
     assert match, text
@@ -363,7 +377,7 @@ class SurfaceHarness:
 
         return RenderedSurfaces(
             markdown=RenderedSurface(
-                _verdict_from_text(markdown), _markdown_tests(markdown), markdown
+                _markdown_verdict_from_text(markdown), _markdown_tests(markdown), markdown
             ),
             condensed=RenderedSurface(
                 _verdict_from_text(condensed), _condensed_tests(condensed), condensed
@@ -554,12 +568,22 @@ def test_renderers_keep_observation_execution_grain_explicit(surface_harness, sn
         rendered.web,
     ):
         assert surface.primary_test_total != 328
-    for surface in (rendered.markdown, rendered.condensed):
-        primary_test_lines = [
-            line for line in surface.text.splitlines() if "Tests" in line or "observations" in line
-        ]
-        assert primary_test_lines
-        assert any("not verdict-bearing" in line and "987" in line for line in primary_test_lines)
+    # Both surfaces name the wider grain as a layer held apart from the
+    # verdict; only the words differ, the report saying it in the reader's.
+    markdown_lines = [
+        line
+        for line in rendered.markdown.text.splitlines()
+        if "Tests" in line or "Set aside" in line
+    ]
+    assert markdown_lines
+    assert any("Set aside" in line and "987" in line for line in markdown_lines)
+    condensed_lines = [
+        line
+        for line in rendered.condensed.text.splitlines()
+        if "Tests" in line or "observations" in line
+    ]
+    assert condensed_lines
+    assert any("not verdict-bearing" in line and "987" in line for line in condensed_lines)
     # The block keeps the grains apart by naming the larger one as raw, so 987
     # is never offered as the number of tests this run has.
     assert "328 executed" in rendered.cli.text
@@ -580,12 +604,15 @@ def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_fac
 
     rendered = surface_harness.render_all(snapshot)
 
-    assert "3 flaky" in rendered.markdown.text
     assert "3 flaky" in rendered.condensed.text
     assert "3 flaky" not in rendered.cli.text
     # The block does not drop the retry signal silently: it states the wider
     # execution grain instead of a flaky count it would have to name itself.
     assert "7 raw executions" in rendered.cli.text
+    # The report prints the same result card, so it keeps the retry signal the
+    # same way the block does rather than in a second, differently-worded line.
+    assert "3 flaky" not in rendered.markdown.text
+    assert "7 raw executions" in rendered.markdown.text
     assert "flaky_count=3" in rendered.web.text
 
 

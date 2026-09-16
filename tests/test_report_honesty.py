@@ -802,7 +802,35 @@ def test_run_without_collection_errors_renders_outcome_accounting():
 
 def test_no_tests_and_no_collection_facts_renders_no_test_section():
     """No observations still renders the explicit metrics-v2 availability layer."""
-    lines = _tool()._render_detailed_test_analysis(_sealed_snapshot(verdict="failed"))
-    assert lines[0] == "## 🧾 Metrics-v2 Evidence Layers"
-    assert any("Claimed latest subjects: unavailable" in line for line in lines)
-    assert "## 🧪 Snapshot Test Diagnostics" not in lines
+    snapshot = _sealed_snapshot(verdict="failed")
+    tool = _tool()
+    lines = tool._render_evidence_accounting(snapshot)
+    assert lines[0] == "## Evidence accounting"
+    assert any("Test classes identified by module and name: unavailable" in line for line in lines)
+    # The absence is stated in the reader's words, not the pipeline's.
+    assert not any("metrics-v2" in line.lower() for line in lines)
+    assert "## 🧪 Snapshot Test Diagnostics" not in tool._render_detailed_test_analysis(snapshot)
+
+
+def test_report_leads_with_the_result_table_not_bold_metric_lines():
+    """The report says what the CLI says, in the same words."""
+
+    from sag.result_card.build import build_result_card
+    from sag.result_card.markdown import render_result_card_markdown
+
+    from result_card_fakes import snapshot_dict
+
+    lines = render_result_card_markdown(build_result_card(snapshot_dict()))
+    assert lines[0] == "## Result"
+    assert not any(line.startswith("**Build:") for line in lines)
+    assert not any("Metrics-v2" in line for line in lines)
+
+
+def test_evidence_accounting_heading_replaces_the_metrics_v2_heading():
+    import inspect
+
+    from sag.tools import report_tool
+
+    source = inspect.getsource(report_tool)
+    assert "Metrics-v2 Evidence Layers" not in source
+    assert "## Evidence accounting" in source

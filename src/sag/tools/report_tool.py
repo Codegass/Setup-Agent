@@ -21,6 +21,7 @@ from sag.evidence import (
     coerce_evidence_status,
 )
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
+from sag.result_card.markdown import render_result_card_markdown
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.module_metrics import (
     MODULE_METRICS_PATH,
@@ -52,6 +53,38 @@ from sag.verdict_rates import (
 )
 
 from .base import BaseTool, ToolResult
+
+#: The evidence-accounting lines, said the way a reader would say them. The
+#: numbers are untouched — only the name in front of each one changes, from
+#: the pipeline's internal term for a layer to what that layer actually counts.
+_ACCOUNTING_LABELS: Dict[str, str] = {
+    "Receipt executions": "Results bound to this run's receipts",
+    "Claimed latest cases": "Tests identified by module and name",
+    "Claimed latest subjects": "Test classes identified by module and name",
+    "Quarantined observations (not verdict-bearing)": "Set aside: not from this run's receipts",
+    "Unattributed observations (not verdict-bearing)": (
+        "Set aside: no module or test name recorded"
+    ),
+    "Stale observations (not verdict-bearing)": "Set aside: from an earlier run",
+    "Evidence transport": "Evidence records",
+}
+
+#: The one reason string the layer formatter states in pipeline terms. The
+#: fact is the same either way: nothing was published for the report to read.
+_ACCOUNTING_VALUES: Dict[str, str] = {
+    "unavailable (metrics-v2 artifact unavailable)": (
+        "unavailable (no evidence record was published)"
+    ),
+}
+
+
+def _accounting_line(line: str) -> str:
+    """Relabel one evidence-accounting line, leaving its measurement alone."""
+
+    label, separator, value = line.partition(": ")
+    if not separator:
+        return line
+    return f"{_ACCOUNTING_LABELS.get(label, label)}: {_ACCOUNTING_VALUES.get(value, value)}"
 
 
 def rate_marker(rate: Optional[float]) -> str:
@@ -931,6 +964,55 @@ class ReportTool(BaseTool, UIEventEmitter):
         if failed or errors:
             lines[1] += f" — {failed} failed, {errors} errors (project-owned)"
         return lines
+
+    def _read_module_metrics_payload(self) -> Optional[Dict[str, Any]]:
+        """The per-module diagnostic file this tool writes, or nothing.
+
+        The card only reads it to name modules that were never built, so an
+        absent or unreadable file costs the card a detail, never a status.
+        """
+
+        if not self.docker_orchestrator:
+            return None
+        try:
+            from sag.runtime.container_io import read_container_text
+
+            text = read_container_text(self.docker_orchestrator, MODULE_METRICS_PATH)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"module metrics unavailable for the result card: {exc}")
+            return None
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _result_card(self, snapshot: Optional[Dict[str, Any]]):
+        """The shared result card, or None when this report has no verdict payload.
+
+        The report holds the run's verdict payload under ``canonical_snapshot``
+        (written by ``_build_report_snapshot``); a report built from anything
+        older carries no payload the card can read, and gets None.
+        """
+
+        from sag.result_card.build import build_result_card
+
+        payload = (snapshot or {}).get("canonical_snapshot")
+        if not isinstance(payload, dict):
+            return None
+        project = ((snapshot or {}).get("project_info") or {}).get("name")
+        try:
+            return build_result_card(
+                payload,
+                module_metrics=self._read_module_metrics_payload(),
+                report_metrics=(snapshot or {}).get("metrics_v2"),
+                project=project,
+                report_path=(snapshot or {}).get("report_path"),
+            )
+        except (TypeError, ValueError):
+            return None
 
     def _render_markdown_evidence_details(
         self, evidence: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None
@@ -3599,6 +3681,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         if next_steps_section:
             report_lines.extend(next_steps_section)
 
+        # Bookkeeping closes the report. It explains the counts the Result
+        # table opened with; a reader who only wants the result never has to
+        # scroll past it, and a reader auditing the counts knows where it is.
+        if report_snapshot:
+            report_lines.extend(self._render_evidence_accounting(report_snapshot))
+
         report_lines.extend(
             [
                 "---",
@@ -5017,6 +5105,18 @@ with open(lock_path,"a+b") as lock:
         lines.append(f"**Generated:** {timestamp}")
 
         evidence_result = (snapshot or {}).get("evidence_result") or {}
+        # One result card, three surfaces: the report opens with the same rows
+        # and the same words the terminal block prints, so a reader who saw the
+        # run finish does not have to re-learn the outcome in report dialect.
+        card = self._result_card(snapshot)
+        if card is not None:
+            lines.append("")
+            lines.extend(render_result_card_markdown(card))
+            refs = evidence_result.get("evidence_refs") or []
+            if refs:
+                lines.append(f"**Evidence refs:** {'; '.join(refs)}")
+                lines.append("")
+            return lines
         rate_lines = self._snapshot_rate_lines(snapshot)
         if rate_lines is not None:
             lines.extend(f"**{line}**" for line in rate_lines)
@@ -5080,15 +5180,10 @@ with open(lock_path,"a+b") as lock:
         evidence = snapshot.get("physical_evidence", {})
 
         if snapshot.get("mode") == "setup":
-            clone_status = "✅ SUCCESS" if phases.get("clone") else "❌ FAILED"
-            lines.extend(
-                [
-                    f"- Repository: {clone_status}",
-                    *[f"- {line}" for line in (self._snapshot_rate_lines(snapshot) or ())],
-                    "",
-                ]
-            )
-            return lines
+            # The Result table at the top of the report already states every
+            # measurement this dashboard used to repeat, in the same words the
+            # terminal used. A second telling only invites the two to disagree.
+            return []
 
         # Prepare values
         clone_status = "✅ Cloned successfully" if phases.get("clone") else "❌ Clone failed"
@@ -5179,22 +5274,33 @@ with open(lock_path,"a+b") as lock:
 
         return lines
 
-    def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
-        """Render detailed test analysis with all metrics clearly displayed."""
-        status = snapshot.get("status", {})
+    def _render_evidence_accounting(self, snapshot: Dict[str, Any]) -> List[str]:
+        """How every test observation was accounted for, said in plain English.
+
+        This is bookkeeping, not the result: it explains which observations the
+        run counted and which it set aside, and why. It closes the report for
+        the reader who wants to audit the counts the Result table states.
+        """
+
         from sag.tools.report_metrics import format_evidence_layer_lines
 
-        lines = [
-            "## 🧾 Metrics-v2 Evidence Layers",
+        return [
+            "## Evidence accounting",
             "",
             *[
-                f"- {line}"
+                f"- {_accounting_line(line)}"
                 for line in format_evidence_layer_lines(
                     snapshot.get("metrics_v2") or snapshot.get("evidence_layer_projection")
                 )
             ],
             "",
         ]
+
+    def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Render detailed test analysis with all metrics clearly displayed."""
+        status = snapshot.get("status", {})
+
+        lines: List[str] = []
 
         # A run whose pytest attempts produced only COLLECTION nodes executed
         # nothing, so the old gate ("skip unless tests_total") deleted the one
@@ -5212,8 +5318,9 @@ with open(lock_path,"a+b") as lock:
             [
                 "## 🧪 Snapshot Test Diagnostics",
                 "",
-                "> These aggregates are diagnostic. Metrics-v2 claimed subjects, cases, and "
-                "receipt executions are listed separately above.",
+                "> These aggregates are diagnostic. How every test observation was "
+                "accounted for is listed under Evidence accounting at the end of this "
+                "report.",
                 "",
             ]
         )

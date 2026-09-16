@@ -133,13 +133,14 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     assert snapshot.test_stats == base.test_stats and snapshot.rates == base.rates
     expected = render_task_completion_lines(completion)
     surfaces = SurfaceHarness().render_all(snapshot)
-    for surface in (surfaces.markdown, surfaces.condensed):
+    assert surfaces.condensed.verdict == snapshot.verdict
+    assert all(line in surfaces.condensed.text for line in expected)
+    # The report and the block print the same result card, so both say the same
+    # result in its words; the agreement is checked against the sealed task
+    # itself rather than against the condensed log's phrasing.
+    for surface in (surfaces.markdown, surfaces.cli):
         assert surface.verdict == snapshot.verdict
-        assert all(line in surface.text for line in expected)
-    # The block says the same result in its own words, so the agreement is
-    # checked against the sealed task itself rather than the report's phrasing.
-    assert surfaces.cli.verdict == snapshot.verdict
-    assert all(fragment in surfaces.cli.text for fragment in _block_task_fragments(completion))
+        assert all(fragment in surface.text for fragment in _block_task_fragments(completion))
     orch = SnapshotOrchestrator(
         {
             VERDICT_PATH: snapshot.model_dump_json(),

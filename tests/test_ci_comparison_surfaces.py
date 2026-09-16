@@ -92,16 +92,16 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     )
     surfaces = SurfaceHarness().render_all(snapshot)
     expected = render_ci_comparison_lines(comparison)
-    for surface in (surfaces.markdown, surfaces.condensed):
+    assert surfaces.condensed.verdict == "success"
+    for line in expected:
+        assert line in surfaces.condensed.text
+    # The report and the block print the same result card, so both say the same
+    # result in its words; the agreement is checked against the sealed
+    # comparison itself rather than against the condensed log's phrasing.
+    for surface in (surfaces.markdown, surfaces.cli):
         assert surface.verdict == "success"
-        for line in expected:
-            assert line in surface.text
-    # The block says the same result in its own words, so the agreement is
-    # checked against the sealed comparison itself rather than the report's
-    # phrasing.
-    assert surfaces.cli.verdict == "success"
-    for fragment in _block_ci_fragments(comparison):
-        assert fragment in surfaces.cli.text
+        for fragment in _block_ci_fragments(comparison):
+            assert fragment in surface.text
     files = {
         VERDICT_PATH: snapshot.model_dump_json(),
         "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
