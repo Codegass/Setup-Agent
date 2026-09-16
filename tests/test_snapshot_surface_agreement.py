@@ -6,6 +6,7 @@ from typing import get_args
 import pytest
 from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
 from result_card_fakes import (
+    RUN_ID,
     evaluated_ci_comparison,
     module_metrics,
     phase_record,
@@ -1100,6 +1101,35 @@ _FENCE_RECORDS: dict[str, tuple[dict, dict]] = {
             "report_path": "logs/session_z/setup-report.md",
         },
     ),
+    # A pipe is the one character that can split a Markdown column, so one
+    # record states a command containing one. The report escapes it in the cell
+    # and the block prints it as it is; both surfaces still have to state the
+    # same command, and the table still has to parse as a table.
+    "a run whose required task piped its output": (
+        snapshot_dict(
+            task_completion={
+                "run_id": RUN_ID,
+                "task_sha256": "b" * 64,
+                "status": "complete",
+                "steps": [
+                    {
+                        "id": "piped-verify",
+                        "command": "mvn test | tee out.log",
+                        "status": "complete",
+                        "receipt_id": "inv-maven-1-ee86ae186d94-0003",
+                        "exit_code": 0,
+                        "reason": None,
+                    }
+                ],
+                "reasons": [],
+            }
+        ),
+        {
+            "module_metrics": module_metrics(),
+            "termination": _DELIVERED,
+            "report_path": "logs/session_p/setup-report.md",
+        },
+    ),
     # Nothing beside the record: every row that needs a sibling artifact states
     # its absence instead, and the surfaces must agree about that too.
     "a record with nothing beside it": (snapshot_dict(), {}),
@@ -1246,10 +1276,10 @@ def _printed_items(items: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(shown)
 
 
-def _disagrees(surface: str, record: str, key: str, saw, want) -> str:
+def _disagrees(surface: str, record: str, key: str, saw, want, *, against: str = "the card") -> str:
     return (
         f"{surface} states {saw!r} for the {key} row of {record}; "
-        f"the card states {want!r}. One card, one wording: fix the renderer, not this test."
+        f"{against} states {want!r}. One card, one wording: fix the renderer, not this test."
     )
 
 
@@ -1276,7 +1306,9 @@ def test_every_surface_states_the_same_status_and_the_same_explanation(record):
             _TERMINAL, record, key, printed[key].status, row.status
         )
         assert status == row.status, _disagrees(_REPORT, record, key, status, row.status)
-        assert printed[key].said == said, _disagrees(_TERMINAL, record, key, printed[key].said, said)
+        assert printed[key].said == said, _disagrees(
+            _TERMINAL, record, key, printed[key].said, said
+        )
         assert detail == _report_detail(said), _disagrees(
             _REPORT, record, key, detail, _report_detail(said)
         )
@@ -1344,35 +1376,48 @@ def test_every_surface_lists_the_same_attention_and_the_same_notes(record):
 @pytest.mark.parametrize("record", list(_FENCE_RECORDS))
 def test_the_web_payload_carries_the_same_rows_as_the_terminal(record):
     card = _fence_card(record)
-    served = card.model_dump(mode="json")
+    printed = _printed_rows(card)
+    cells = _report_cells(card)
 
-    assert [row["key"] for row in served["rows"]] == list(ROW_ORDER), (
+    # The registry serialises the card and the read model validates it back
+    # (`_setup_artifact_item` and `_session_detail` above). Every row below is
+    # read off the far side of that hop and held against what the other two
+    # surfaces printed, so a field lost in transit and a renderer that drifted
+    # both fail here — and neither can pass by the payload agreeing with the
+    # object it was dumped from.
+    served = card.model_dump(mode="json")
+    delivered = RunResultCard.model_validate(served)
+
+    assert [row["key"] for row in served["rows"]] == list(printed), (
         f"{_WEB} serves rows {[row['key'] for row in served['rows']]} for {record}; "
-        f"a card states {list(ROW_ORDER)}"
+        f"{_TERMINAL} printed {list(printed)}"
     )
     for position, key in enumerate(ROW_ORDER):
-        row = card.row(key)
         payload = served["rows"][position]
-        for field in ("label", "status", "tone", "headline", "detail", "reason"):
+        for field in ("label", "status", "tone", "headline", "detail", "reason", "items"):
             assert field in payload, (
                 f"{_WEB} serves no {field!r} for the {key} row of {record}; the block and the "
-                "report both print it"
+                "report both state what it holds"
             )
-            assert payload[field] == getattr(row, field), _disagrees(
-                _WEB, record, key, payload[field], getattr(row, field)
-            )
-        assert tuple(payload["items"]) == row.items, _disagrees(
-            _WEB, record, key, tuple(payload["items"]), row.items
-        )
+        row = delivered.row(key)
+        said = _stated_parts(row)
+        status, detail = cells[ROW_LABELS[key]]
 
-    # The registry serialises the card and the session detail validates it back
-    # (`_setup_artifact_item` and `_session_detail` above). A field lost on that
-    # round trip is a row the Workbench would state differently from the block
-    # that was printed beside it.
-    assert RunResultCard.model_validate(served) == card, (
-        f"{_WEB} does not survive the registry's own serialise-and-validate round trip "
-        f"for {record}"
-    )
+        assert row.status == printed[key].status, _disagrees(
+            _WEB, record, key, row.status, printed[key].status, against=_TERMINAL
+        )
+        assert row.status == status, _disagrees(
+            _WEB, record, key, row.status, status, against=_REPORT
+        )
+        assert said == printed[key].said, _disagrees(
+            _WEB, record, key, said, printed[key].said, against=_TERMINAL
+        )
+        assert _report_detail(said) == detail, _disagrees(
+            _WEB, record, key, _report_detail(said), detail, against=_REPORT
+        )
+        assert _printed_items(row.items) == printed[key].items, _disagrees(
+            _WEB, record, key, _printed_items(row.items), printed[key].items, against=_TERMINAL
+        )
 
 
 @pytest.mark.parametrize("record", list(_FENCE_RECORDS))
@@ -1381,7 +1426,9 @@ def test_no_surface_invents_a_verdict_the_run_did_not_record(record):
     card = _fence_card(record)
     recorded = payload["verdict"]
 
-    assert card.verdict == recorded, _disagrees("the card", record, "verdict", card.verdict, recorded)
+    assert card.verdict == recorded, _disagrees(
+        "the card", record, "verdict", card.verdict, recorded
+    )
     assert card.row("setup").status == recorded, _disagrees(
         "the card", record, "setup", card.row("setup").status, recorded
     )
