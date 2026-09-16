@@ -40,6 +40,41 @@ from sag.agent.receipt_structure import single_maven_module_proven as _single_ma
 from sag.metrics.module_keys import module_key
 from sag.metrics.target_record import TargetRecord
 
+# The reason strings this module publishes, named so consumers can enumerate
+# them. Extracted verbatim from their raise/return sites; the strings are
+# unchanged and remain the wire values in CIComparisonSnapshot.reasons.
+CURRENT_RUN_CHECKOUT_UNAVAILABLE = "current_run_checkout_unavailable"
+CURRENT_CHECKOUT_DIFFERS_FROM_RUN_PIN = "current_checkout_differs_from_run_pin"
+FIXED_TASK_COMPLETION_UNAVAILABLE = "fixed_task_completion_unavailable"
+FIXED_TASK_REPOSITORY_OR_REVISION_MISMATCH = "fixed_task_repository_or_revision_mismatch"
+FIXED_TASK_CERTIFICATE_REQUIRES_JVM_RUNNER = "fixed_task_certificate_requires_jvm_runner"
+ACCEPTED_EXECUTION_PLAN_UNAVAILABLE = "accepted_execution_plan_unavailable"
+CURRENT_RECEIPT_OR_ASSESSMENT_PUBLICATION_UNAVAILABLE = (
+    "current_receipt_or_assessment_publication_unavailable"
+)
+CERTIFICATE_ADAPTER_UNAVAILABLE = "certificate_adapter_unavailable"
+OFFICIAL_CI_TARGET_NOT_SUPPLIED = "official_ci_target_not_supplied"
+OFFICIAL_CI_CELL_NOT_MATCHED = "official_ci_cell_not_matched"
+CI_TEST_IDENTITIES_NOT_COMPARABLE = "CI_TEST_IDENTITIES_NOT_COMPARABLE"
+CI_TEST_SCOPE_OVERLAP_UNRESOLVED = "CI_TEST_SCOPE_OVERLAP_UNRESOLVED"
+
+CI_REASON_CODES: frozenset[str] = frozenset(
+    {
+        CURRENT_RUN_CHECKOUT_UNAVAILABLE,
+        CURRENT_CHECKOUT_DIFFERS_FROM_RUN_PIN,
+        FIXED_TASK_COMPLETION_UNAVAILABLE,
+        FIXED_TASK_REPOSITORY_OR_REVISION_MISMATCH,
+        FIXED_TASK_CERTIFICATE_REQUIRES_JVM_RUNNER,
+        ACCEPTED_EXECUTION_PLAN_UNAVAILABLE,
+        CURRENT_RECEIPT_OR_ASSESSMENT_PUBLICATION_UNAVAILABLE,
+        CERTIFICATE_ADAPTER_UNAVAILABLE,
+        OFFICIAL_CI_TARGET_NOT_SUPPLIED,
+        OFFICIAL_CI_CELL_NOT_MATCHED,
+        CI_TEST_IDENTITIES_NOT_COMPARABLE,
+        CI_TEST_SCOPE_OVERLAP_UNRESOLVED,
+    }
+)
+
 
 def repository_identity(url: str | None) -> str | None:
     """Keep repository provenance independent of the comparison target."""
@@ -208,12 +243,12 @@ def _certificate_input(
         project_root=project_root,
     )
     if not scope_pin.available:
-        raise ValueError("current_run_checkout_unavailable")
+        raise ValueError(CURRENT_RUN_CHECKOUT_UNAVAILABLE)
     from sag.agent.invocation_receipts import target_sha as read_target_sha
 
     execute = resolve_control_execute(orchestrator)
     if not callable(execute) or read_target_sha(execute, project_root) != scope_pin.target_sha:
-        raise ValueError("current_checkout_differs_from_run_pin")
+        raise ValueError(CURRENT_CHECKOUT_DIFFERS_FROM_RUN_PIN)
     from sag.agent.acceptance_task import pinned_acceptance_task
 
     task = pinned_acceptance_task(scope_pin)
@@ -230,7 +265,7 @@ def _certificate_input(
                 != tuple((s.id, s.command) for s in task.steps)
             )
         ):
-            raise ValueError("fixed_task_completion_unavailable")
+            raise ValueError(FIXED_TASK_COMPLETION_UNAVAILABLE)
         task_results = {step.id: step for step in task_completion.steps}
         plan_digest = basis_ref = task.sha256
         groups = (("build", task.steps), ("test", task.steps))
@@ -240,10 +275,10 @@ def _certificate_input(
         from sag.tools.build.backends import parse_runner_command
 
         if target.record.repo != repo or target.record.sha != scope_pin.target_sha:
-            raise ValueError("fixed_task_repository_or_revision_mismatch")
+            raise ValueError(FIXED_TASK_REPOSITORY_OR_REVISION_MISMATCH)
         executor, _, argv = parse_runner_command(fixed_command)
         if executor not in {"maven", "gradle"}:
-            raise ValueError("fixed_task_certificate_requires_jvm_runner")
+            raise ValueError(FIXED_TASK_CERTIFICATE_REQUIRES_JVM_RUNNER)
         plan_digest = canonical_sha256(
             {
                 "target_sha256": target.raw_sha256,
@@ -265,7 +300,7 @@ def _certificate_input(
     else:
         artifact = _accepted_plan(orchestrator, state)
         if artifact is None:
-            raise ValueError("accepted_execution_plan_unavailable")
+            raise ValueError(ACCEPTED_EXECUTION_PLAN_UNAVAILABLE)
         plan_digest, basis_ref = artifact.authored_plan_sha256, artifact.artifact_sha256
         groups = (("build", artifact.plan.build_steps), ("test", artifact.plan.test_steps))
         fixed_key = None
@@ -273,7 +308,7 @@ def _certificate_input(
     receipts = validator._current_scoped_receipts(project_root)
     assessments = validator._read_live_evidence_assessments()
     if receipts is None or assessments is None:
-        raise ValueError("current_receipt_or_assessment_publication_unavailable")
+        raise ValueError(CURRENT_RECEIPT_OR_ASSESSMENT_PUBLICATION_UNAVAILABLE)
     receipts = [
         item
         for item in receipts
@@ -574,7 +609,7 @@ def _certificate_input(
         diagnostics=(
             (
                 {
-                    "code": "CI_TEST_SCOPE_OVERLAP_UNRESOLVED",
+                    "code": CI_TEST_SCOPE_OVERLAP_UNRESOLVED,
                     "observations": {"test_invocations": len(selected_tests)},
                     "note": "Counts sum receipt executions; overlap between multiple test invocation pools has not been proven.",
                 },
@@ -690,13 +725,13 @@ def _same_pool_identities(
         return (
             (),
             (),
-            "CI_TEST_IDENTITIES_NOT_COMPARABLE" if identity_needed_for_red else None,
+            CI_TEST_IDENTITIES_NOT_COMPARABLE if identity_needed_for_red else None,
             None,
         )
     if identity_needed_for_red and (
         len(cell.red_ids) != cell.red_count or len(cell.flaky_ids) != cell.flaky_count
     ):
-        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+        return (), (), CI_TEST_IDENTITIES_NOT_COMPARABLE, None
     # Jenkins Maven reports qualify raw JUnit IDs as group$artifact::class#name.
     # One independently proven module on BOTH sides makes that sole namespace
     # unambiguous. Never strip namespaces across multiple/unknown modules or
@@ -718,13 +753,13 @@ def _same_pool_identities(
             suffix: original for original, (_, _, suffix) in zip(cell.executed_ids, qualified)
         }
         if len(aliases) != len(cell.executed_ids):
-            return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+            return (), (), CI_TEST_IDENTITIES_NOT_COMPARABLE, None
         namespace = next(iter(namespaces))
     executed, red = [], []
     mapped = False
     for parsed in parsed_reads:
         if parsed.get("status") != "complete" or parsed.get("reasons") or rows_were_bounded(parsed):
-            return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+            return (), (), CI_TEST_IDENTITIES_NOT_COMPARABLE, None
         for row in parsed.get("rows", ()):
             classname, name = row.get("classname"), row.get("name")
             if (
@@ -733,7 +768,7 @@ def _same_pool_identities(
                 or not classname
                 or not name
             ):
-                return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+                return (), (), CI_TEST_IDENTITIES_NOT_COMPARABLE, None
             identity = classname + "#" + name
             if identity not in cell.executed_ids and identity in aliases:
                 identity = aliases[identity]
@@ -744,7 +779,7 @@ def _same_pool_identities(
                     identity = prefix + "::" + identity
                     mapped = True
             if identity not in cell.executed_ids or identity in executed:
-                return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+                return (), (), CI_TEST_IDENTITIES_NOT_COMPARABLE, None
             executed.append(identity)
             if row.get("outcome") in {"failed", "error"}:
                 red.append(identity)
@@ -754,7 +789,7 @@ def _same_pool_identities(
         or len(red) != counts.red
         or set(executed) != set(cell.executed_ids)
     ):
-        return (), (), "CI_TEST_IDENTITIES_NOT_COMPARABLE", None
+        return (), (), CI_TEST_IDENTITIES_NOT_COMPARABLE, None
     return (
         tuple(executed),
         tuple(red),
@@ -781,7 +816,7 @@ def build_ci_comparison(
         return CIComparisonSnapshot(
             **base,
             status="no_target" if target is None else "unavailable",
-            reasons=("certificate_adapter_unavailable",),
+            reasons=(CERTIFICATE_ADAPTER_UNAVAILABLE,),
         )
     try:
         payload, receipt_ids, commands, parsed_reads = _certificate_input(
@@ -803,11 +838,11 @@ def build_ci_comparison(
     )
     if target is None:
         return CIComparisonSnapshot(
-            **base, status="no_target", reasons=("official_ci_target_not_supplied",)
+            **base, status="no_target", reasons=(OFFICIAL_CI_TARGET_NOT_SUPPLIED,)
         )
     if target.record.matched_cell is None:
         return CIComparisonSnapshot(
-            **base, status="no_matched_cell", reasons=("official_ci_cell_not_matched",)
+            **base, status="no_matched_cell", reasons=(OFFICIAL_CI_CELL_NOT_MATCHED,)
         )
     cell = next(cell for cell in target.record.cells if cell.cell_id == target.record.matched_cell)
     single_module = certificate.build_units.required_ids == (".",)
@@ -835,7 +870,7 @@ def build_ci_comparison(
             and certificate.flags.test_execution_closed
             and certificate.build_units.status not in {"unavailable", "incomplete"}
             and not any(
-                item.code == "CI_TEST_SCOPE_OVERLAP_UNRESOLVED" for item in certificate.diagnostics
+                item.code == CI_TEST_SCOPE_OVERLAP_UNRESOLVED for item in certificate.diagnostics
             )
         ),
     )
@@ -856,7 +891,7 @@ def build_ci_comparison(
                     *(
                         item.code
                         for item in certificate.diagnostics
-                        if item.code == "CI_TEST_SCOPE_OVERLAP_UNRESOLVED"
+                        if item.code == CI_TEST_SCOPE_OVERLAP_UNRESOLVED
                     ),
                 )
             )

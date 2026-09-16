@@ -18,6 +18,27 @@ from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_valid
 
 from sag.agent.control_events import canonical_sha256
 
+# Snapshot-level reason strings, named for enumeration. Values are unchanged.
+TASK_EXECUTION_SCOPE_UNAVAILABLE = "task_execution_scope_unavailable"
+TASK_RUN_PIN_UNAVAILABLE = "task_run_pin_unavailable"
+TASK_DEFINITION_MISSING_OR_CHANGED = "task_definition_missing_or_changed"
+TASK_REPOSITORY_OR_REVISION_MISMATCH = "task_repository_or_revision_mismatch"
+TASK_CURRENT_CHECKOUT_MISMATCH = "task_current_checkout_mismatch"
+TASK_SOURCE_CHANGED_OR_UNVERIFIED = "task_source_changed_or_unverified"
+TASK_RECEIPT_PUBLICATION_UNAVAILABLE = "task_receipt_publication_unavailable"
+
+TASK_REASON_CODES: frozenset[str] = frozenset(
+    {
+        TASK_EXECUTION_SCOPE_UNAVAILABLE,
+        TASK_RUN_PIN_UNAVAILABLE,
+        TASK_DEFINITION_MISSING_OR_CHANGED,
+        TASK_REPOSITORY_OR_REVISION_MISMATCH,
+        TASK_CURRENT_CHECKOUT_MISMATCH,
+        TASK_SOURCE_CHANGED_OR_UNVERIFIED,
+        TASK_RECEIPT_PUBLICATION_UNAVAILABLE,
+    }
+)
+
 
 class AcceptanceStep(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
@@ -137,15 +158,15 @@ def load_acceptance_task(path: str | Path) -> AcceptanceTask:
 def pinned_acceptance_task(scope) -> AcceptanceTask | None:
     """Read the task from the existing host-authorized run pin, not model text."""
     if not scope.available:
-        raise ValueError("task_run_pin_unavailable")
+        raise ValueError(TASK_RUN_PIN_UNAVAILABLE)
     if not scope.acceptance_task_declared:
         return None
     try:
         task = AcceptanceTask.model_validate(scope.acceptance_task_definition)
     except (TypeError, ValueError) as exc:
-        raise ValueError("task_definition_missing_or_changed") from exc
+        raise ValueError(TASK_DEFINITION_MISSING_OR_CHANGED) from exc
     if task.sha256 != scope.acceptance_task_sha256 or task.sha != scope.target_sha:
-        raise ValueError("task_definition_missing_or_changed")
+        raise ValueError(TASK_DEFINITION_MISSING_OR_CHANGED)
     return task
 
 
@@ -265,7 +286,7 @@ def build_task_completion(
         or not project_root
         or not isinstance(getattr(validator, "project_path", None), str)
     ):
-        return unavailable("task_execution_scope_unavailable") if task else None
+        return unavailable(TASK_EXECUTION_SCOPE_UNAVAILABLE) if task else None
     scope = resolve_current_build_receipt_scope(
         orchestrator,
         run_id=state.run_id,
@@ -277,23 +298,23 @@ def build_task_completion(
     elif task is None:
         return None  # Historical runs did not declare this completion contract.
     if not scope.available:
-        return unavailable("task_run_pin_unavailable")
+        return unavailable(TASK_RUN_PIN_UNAVAILABLE)
     if task is None or expected != task.sha256 or not scope.acceptance_task_declared:
-        return unavailable("task_definition_missing_or_changed")
+        return unavailable(TASK_DEFINITION_MISSING_OR_CHANGED)
     if task.repo != repository_identity(repository) or task.sha != scope.target_sha:
-        return unavailable("task_repository_or_revision_mismatch")
+        return unavailable(TASK_REPOSITORY_OR_REVISION_MISMATCH)
     execute = resolve_control_execute(orchestrator)
     if not callable(execute) or target_sha(execute, project_root) != task.sha:
-        return unavailable("task_current_checkout_mismatch")
+        return unavailable(TASK_CURRENT_CHECKOUT_MISMATCH)
     try:
         unchanged = execute(f"git -C {shlex.quote(project_root)} diff --quiet HEAD --") or {}
     except Exception:
         unchanged = {}
     if type(unchanged.get("exit_code")) is not int or unchanged["exit_code"] != 0:
-        return unavailable("task_source_changed_or_unverified")
+        return unavailable(TASK_SOURCE_CHANGED_OR_UNVERIFIED)
     receipts = validator._current_scoped_receipts(project_root)
     if receipts is None:
-        return unavailable("task_receipt_publication_unavailable")
+        return unavailable(TASK_RECEIPT_PUBLICATION_UNAVAILABLE)
 
     results = []
     previous_sequence = -1
