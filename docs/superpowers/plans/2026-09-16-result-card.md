@@ -1522,6 +1522,9 @@ def _lower_bounded(report_metrics: Any) -> bool:
 
 
 def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
+    # pytest's default `python_functions = test*` collects this production
+    # function as a test case in every module that imports it. The marker is the
+    # standard remedy and has precedent in `sag/evidence.py`.
     """How many tests ran and how they came out, with skips out of the rate."""
 
     stats = snapshot.test_stats
@@ -1576,6 +1579,9 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
         headline=headline,
         detail=_join(rate_text, raw_text) or None,
     )
+
+
+tests_row.__test__ = False
 
 
 def coverage_row(snapshot: Any) -> ResultRow:
@@ -1640,10 +1646,27 @@ from result_card_fakes import attainment
 
 
 def _evaluated(**overrides) -> dict:
+    """An evaluated comparison, with the certificate the model insists on.
+
+    `CIComparisonSnapshot` refuses `status="evaluated"` unless a certificate is
+    bound and both digests are present ("evaluated CI comparison requires bound
+    certificate and target"), so this helper builds a real one. Follow the
+    existing fixture in `tests/test_ci_comparison_surfaces.py` for its shape;
+    a certificate that merely gets past validation is not good enough, because
+    `ci_row` reads the attainment beside it.
+    """
+
     comparison = dict(snapshot_dict()["ci_comparison"])
     comparison.update(
         {
             "status": "evaluated",
+            "certificate": _CI_CERTIFICATE,
+            "certificate_input_sha256": canonical_sha256(
+                _CI_CERTIFICATE_INPUT.model_dump(mode="json")
+            ),
+            "target_record_sha256": canonical_sha256(
+                {"repo": comparison["repo"], "sha": comparison["target_sha"]}
+            ),
             "attainment": attainment(**overrides),
             "acceptance_command": "mvn -B -f pom.xml -V clean test --batch-mode",
             "receipt_ids": ["inv-maven-1-17c8a2e62d8a-0001"],
@@ -1763,14 +1786,6 @@ _CI_TONE: dict[str, Tone] = {
 _MAX_RED_IDS = 10
 
 NOT_COMPARED = "not compared"
-
-_REPORT_TONE: dict[str, Tone] = {
-    "delivered": "neutral",
-    "skipped": "neutral",
-    "failed": "attention",
-    "unavailable": "attention",
-}
-
 
 def ci_row(snapshot: Any) -> ResultRow:
     """How this run measures against the project's own CI on the same commit."""
