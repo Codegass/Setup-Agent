@@ -1098,9 +1098,16 @@ def _setup_artifact_item(
             "session_dir": str(run_dir) if run_dir is not None else None,
             "report_path": _report_path_for_card(run_dir, report_path),
         }
+        # ValueError only. The guard exists for a record the card cannot read,
+        # and `RunVerdictSnapshot.model_validate` reports that as pydantic's
+        # ValidationError, which IS a ValueError — so bad data still degrades to
+        # no card instead of reaching the API as a 500. A TypeError here is a
+        # wrong keyword or a wrong shape, and this plan already came within one
+        # commit of shipping a card-less Workbench because such a mistake was
+        # caught and blanked. It raises now.
         try:
             result_card = build_result_card(snapshot, **card_inputs).model_dump(mode="json")
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             logger.warning("Result card unavailable for {}: {}", session_id, exc)
             result_card = None
 

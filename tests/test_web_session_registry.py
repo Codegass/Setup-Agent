@@ -1215,3 +1215,57 @@ def test_a_session_without_a_ledger_still_gets_a_card_that_says_so(tmp_path, sna
         "report",
     ]
     assert card.row("tests").headline.startswith("328 executed")
+
+
+def test_a_broken_card_call_raises_while_a_broken_record_only_costs_the_card(
+    tmp_path, snapshot_factory, monkeypatch
+):
+    """The guard around the card build tells bad data apart from a bad call.
+
+    A record the card cannot read is a fact about the run, and the detail loses
+    only its card. A TypeError in that position is a wrong keyword or a wrong
+    shape — the exact mistake that once served `resultCard: null` for every
+    session with the whole suite green — and it must surface instead.
+    """
+    import pytest
+
+    from test_snapshot_surface_agreement import (
+        VERDICT_PATH,
+        SnapshotOrchestrator,
+        _phase_trunk,
+    )
+
+    import sag.web.session_registry as registry
+
+    snapshot = snapshot_factory()
+    logs_root = _card_session_dir(tmp_path, snapshot.run_id, ledger=None)
+
+    def build(*args, **kwargs):
+        item = registry._setup_artifact_item(
+            SnapshotOrchestrator(
+                {
+                    VERDICT_PATH: snapshot.model_dump_json(),
+                    "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+                }
+            ),
+            "sag-tvm",
+            logs_root,
+        )
+        return item
+
+    def raise_type_error(*args, **kwargs):
+        raise TypeError("build_result_card() got an unexpected keyword argument 'goal'")
+
+    monkeypatch.setattr(registry, "build_result_card", raise_type_error)
+    with pytest.raises(TypeError):
+        build()
+
+    def raise_value_error(*args, **kwargs):
+        raise ValueError("this record states no verdict")
+
+    monkeypatch.setattr(registry, "build_result_card", raise_value_error)
+    item = build()
+    assert item is not None
+    assert item["result_card"] is None
+    # Everything the detail does not read from the card is unaffected.
+    assert item["canonical_verdict"] == snapshot.verdict
