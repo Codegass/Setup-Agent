@@ -1155,8 +1155,10 @@ def setup_row(snapshot: Any, *, stats: ResultStats, termination: Any | None) -> 
 
     verdict = str(snapshot.verdict)
     phases = None
-    if stats.phases_total:
-        phases = f"{stats.phases_completed or 0}/{stats.phases_total} phases"
+    # Both halves or neither: a fraction with an invented numerator reads as a
+    # measurement, and "0/5 phases" is a very different claim from "not counted".
+    if stats.phases_total is not None and stats.phases_completed is not None:
+        phases = f"{stats.phases_completed}/{stats.phases_total} phases"
     headline = _join(
         phases,
         f"{stats.turns:,} turns" if stats.turns is not None else None,
@@ -1475,8 +1477,11 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
     judgment = str(evidence.judgment)
     succeeded = evidence.reactor_modules_succeeded
     total = evidence.reactor_modules_total
-    if total:
-        headline = f"{succeeded or 0}/{total} modules built"
+    # `reactor_modules_succeeded` and `_total` are parsed independently, so one
+    # can be absent while the other is known. Printing "0/4 modules built" for
+    # that record would report a total build failure that never happened.
+    if succeeded is not None and total is not None:
+        headline = f"{succeeded}/{total} modules built"
     else:
         headline = judgment
 
@@ -1532,6 +1537,14 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
     raw = stats.raw
     judgment = str(stats.judgment)
     status = _TEST_JUDGMENT_WORD.get(judgment, "unavailable")
+    # `judgment` defaults to "unknown", so a record can carry real counts and no
+    # judgment about them. The counts stay in the headline — they are real — but
+    # the row must say why its status word is "unavailable".
+    unjudged_reason = (
+        "the run recorded test outcomes but no judgment about them"
+        if status == "unavailable"
+        else None
+    )
 
     if unique.executed <= 0:
         return ResultRow(
@@ -1578,6 +1591,7 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
         tone=tone,
         headline=headline,
         detail=_join(rate_text, raw_text) or None,
+        reason=unjudged_reason,
     )
 
 
