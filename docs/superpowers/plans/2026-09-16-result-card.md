@@ -687,6 +687,10 @@ from typing import Any
 
 from verdict_rate_fakes import complete_verdict_rates
 
+#: A snapshot cross-checks that its task completion and CI comparison belong to
+#: the same run, so every run_id in a fixture must be this one.
+RUN_ID = "20260914_210609_965730_e39856b237f2_9183-7-953da846d195"
+
 CLEAN_TEST_COUNTS = {
     "executed": 994,
     "passed": 933,
@@ -701,7 +705,7 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "schema_version": 5,
-        "run_id": "20260914_210609_965730_e39856b237f2_9183-7-953da846d195",
+        "run_id": RUN_ID,
         "finalized_at": "2026-09-14T21:14:51Z",
         "input_refs": [],
         "verdict": "success",
@@ -732,7 +736,7 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
         "conflicts": [],
         "phase_records": [],
         "task_completion": {
-            "run_id": "20260914_210609_965730_e39856b237f2_9183-7-953da846d195",
+            "run_id": RUN_ID,
             "task_sha256": "a" * 64,
             "status": "complete",
             "steps": [
@@ -750,7 +754,7 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
         "ci_comparison": {
             "schema_version": 1,
             "status": "no_matched_cell",
-            "run_id": "20260914_210609_965730_e39856b237f2_9183-7-953da846d195",
+            "run_id": RUN_ID,
             "repo": "apache/commons-cli",
             "target_sha": "e17111798da51037659b3594d9c0b3b525040081",
             "target_record_sha256": None,
@@ -875,6 +879,7 @@ def module_metrics(**overrides: Any) -> dict[str, Any]:
 
 __all__ = [
     "CLEAN_TEST_COUNTS",
+    "RUN_ID",
     "attainment",
     "module_metrics",
     "phase_record",
@@ -924,7 +929,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.models import ResultStats
 from sag.result_card.rows import setup_row, task_row
 
-from result_card_fakes import phase_record, snapshot_dict
+from result_card_fakes import RUN_ID, phase_record, snapshot_dict
 
 
 def _snapshot(**overrides) -> RunVerdictSnapshot:
@@ -1015,7 +1020,7 @@ def test_task_row_reports_a_failed_step_with_its_reason():
     snapshot = _snapshot(
         verdict="partial",
         task_completion={
-            "run_id": "r",
+            "run_id": RUN_ID,
             "task_sha256": "b" * 64,
             "status": "incomplete",
             "steps": [
@@ -1054,7 +1059,7 @@ def test_task_row_glosses_its_unavailable_reason():
     snapshot = _snapshot(
         verdict="partial",
         task_completion={
-            "run_id": "r",
+            "run_id": RUN_ID,
             "task_sha256": None,
             "status": "unavailable",
             "steps": [],
@@ -1919,7 +1924,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.build import build_result_card
 from sag.result_card.models import ROW_ORDER
 
-from result_card_fakes import module_metrics, phase_record, snapshot_dict
+from result_card_fakes import RUN_ID, module_metrics, phase_record, snapshot_dict
 
 
 def _termination(delivery=ReportDeliveryStatus.DELIVERED) -> RunTermination:
@@ -1993,7 +1998,7 @@ def test_attention_leads_with_incomplete_task_steps():
         snapshot_dict(
             verdict="partial",
             task_completion={
-                "run_id": "r",
+                "run_id": RUN_ID,
                 "task_sha256": "c" * 64,
                 "status": "incomplete",
                 "steps": [
@@ -2662,7 +2667,7 @@ import re
 from sag.result_card.build import build_result_card
 from sag.result_card.markdown import render_result_card_markdown
 
-from result_card_fakes import module_metrics, snapshot_dict
+from result_card_fakes import RUN_ID, module_metrics, snapshot_dict
 
 
 def _lines(**kwargs) -> list[str]:
@@ -2701,7 +2706,7 @@ def test_detail_and_reason_are_joined_in_the_third_column():
 def test_pipes_inside_a_command_do_not_break_the_table():
     snapshot = snapshot_dict(
         task_completion={
-            "run_id": "r",
+            "run_id": RUN_ID,
             "task_sha256": "d" * 64,
             "status": "complete",
             "steps": [
