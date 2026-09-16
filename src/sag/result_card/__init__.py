@@ -1,5 +1,6 @@
 """One presentation model of a finished run, rendered by three surfaces."""
 
+from sag.result_card.build import build_result_card
 from sag.result_card.glosses import REASON_GLOSS, gloss
 from sag.result_card.models import (
     ROW_LABELS,
@@ -22,5 +23,6 @@ __all__ = [
     "RowKey",
     "RunResultCard",
     "Tone",
+    "build_result_card",
     "gloss",
 ]
