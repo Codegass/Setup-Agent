@@ -9,7 +9,13 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.build import build_result_card
 from sag.result_card.models import ROW_ORDER
 
-from result_card_fakes import RUN_ID, module_metrics, phase_record, snapshot_dict
+from result_card_fakes import (
+    RUN_ID,
+    evaluated_ci_comparison,
+    module_metrics,
+    phase_record,
+    snapshot_dict,
+)
 
 
 def _termination(delivery=ReportDeliveryStatus.DELIVERED) -> RunTermination:
@@ -164,7 +170,33 @@ def test_notes_are_glossed_conflicts_in_order_without_repeats():
     )
 
 
-def test_an_unknown_verdict_source_is_stated_not_guessed():
+def test_a_ci_finding_that_names_work_needs_attention():
+    card = build_result_card(
+        snapshot_dict(
+            verdict="partial",
+            ci_comparison=evaluated_ci_comparison(
+                verdict="not_met",
+                clean=False,
+                red_observed=3,
+                unexpected_red_ids=["a.B#c", "a.B#d", "a.B#e"],
+                reason_codes=["NEW_RED_BEYOND_TARGET"],
+            ),
+        )
+    )
+    finding = next(item for item in card.attention if item.kind == "ci_finding")
+    assert finding.title == "NEW_RED_BEYOND_TARGET: tests failed here that pass in CI"
+
+
+def test_a_current_record_names_its_source():
     card = build_result_card(snapshot_dict(verdict="unknown", schema_version=5))
     assert card.verdict == "unknown"
     assert card.verdict_source == "snapshot"
+
+
+def test_an_older_record_is_read_as_the_version_it_carries():
+    # A v3 record is read additively and keeps the version it was written with,
+    # so the card says where its words came from rather than assuming.
+    payload = snapshot_dict(schema_version=3)
+    payload.pop("rates")
+    card = build_result_card(payload)
+    assert card.verdict_source == "legacy"

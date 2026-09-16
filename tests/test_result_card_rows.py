@@ -1,7 +1,5 @@
 """Each row states one measurement in the run's own words."""
 
-from sag.agent.control_events import canonical_sha256
-from sag.agent.java_success_certificates import evaluate_java_success_certificate
 from sag.agent.verdict_finalizer import (
     ReportDeliveryStatus,
     RunTermination,
@@ -22,12 +20,11 @@ from sag.result_card.rows import (
 from result_card_fakes import (
     CLEAN_TEST_COUNTS,
     RUN_ID,
-    attainment,
+    evaluated_ci_comparison,
     module_metrics,
     phase_record,
     snapshot_dict,
 )
-from test_java_success_certificates import _obligations, _payload, _scope
 
 
 def _snapshot(**overrides) -> RunVerdictSnapshot:
@@ -403,56 +400,8 @@ def test_coverage_row_names_why_nothing_was_collected():
     assert row.reason == "fixture coverage not collected"
 
 
-# A comparison only reaches "evaluated" while it still holds the certificate and
-# target digests that bound it, so the fixture carries a real certificate for
-# this run. No row reads it; it is what the snapshot requires to exist at all.
-_CI_TARGET_SHA = snapshot_dict()["ci_comparison"]["target_sha"]
-_CI_SCOPE = _scope(run_id=RUN_ID, target_sha=_CI_TARGET_SHA)
-
-
-def _bound_obligations(unit: str, ids: tuple[str, ...]):
-    """`_obligations` stamps its own epoch; this run's scope carries its own."""
-    return _obligations(unit, ids, ids, subject=_CI_SCOPE.subject).model_copy(
-        update={"evidence_epoch": _CI_SCOPE.evidence_epoch}
-    )
-
-
-_CI_CERTIFICATE_INPUT = _payload(
-    scope=_CI_SCOPE,
-    build_steps=_bound_obligations("build_plan_step", ("build-1",)),
-    build_units=_bound_obligations("single_maven_project", ("root",)),
-    test_steps=_bound_obligations("test_plan_step", ("test-1",)),
-    test_targets=_bound_obligations("single_test_project", ("root",)),
-    evidence_items=_bound_obligations(
-        "evidence_binding", ("plan", "build-receipt", "test-receipt")
-    ),
-)
-_CI_CERTIFICATE = evaluate_java_success_certificate(_CI_CERTIFICATE_INPUT)
-
-
-def _evaluated(**overrides) -> dict:
-    comparison = dict(snapshot_dict()["ci_comparison"])
-    comparison.update(
-        {
-            "status": "evaluated",
-            "certificate": _CI_CERTIFICATE,
-            "certificate_input_sha256": canonical_sha256(
-                _CI_CERTIFICATE_INPUT.model_dump(mode="json")
-            ),
-            "target_record_sha256": canonical_sha256(
-                {"repo": comparison["repo"], "sha": comparison["target_sha"]}
-            ),
-            "attainment": attainment(**overrides),
-            "acceptance_command": "mvn -B -f pom.xml -V clean test --batch-mode",
-            "receipt_ids": ["inv-maven-1-17c8a2e62d8a-0001"],
-            "reasons": [],
-        }
-    )
-    return comparison
-
-
 def test_ci_row_reports_a_met_comparison_with_its_denominator():
-    row = ci_row(_snapshot(ci_comparison=_evaluated()))
+    row = ci_row(_snapshot(ci_comparison=evaluated_ci_comparison()))
     assert row.status == "met"
     assert row.tone == "success"
     assert row.headline == "met 523/523"
@@ -462,7 +411,7 @@ def test_ci_row_reports_a_met_comparison_with_its_denominator():
 
 
 def test_ci_row_names_missing_lifecycle_phases():
-    comparison = _evaluated(
+    comparison = evaluated_ci_comparison(
         lifecycle_parity={
             "status": "not_equivalent",
             "form": "maven_phases",
@@ -481,7 +430,7 @@ def test_ci_row_names_missing_lifecycle_phases():
 def test_ci_row_without_a_scope_score_says_so():
     # A build stated as a conclusion echoes no module universe, so the whole
     # scope fraction goes with it.
-    comparison = _evaluated(
+    comparison = evaluated_ci_comparison(
         verdict="partial",
         alpha=None,
         alpha_build=None,
@@ -496,7 +445,7 @@ def test_ci_row_without_a_scope_score_says_so():
 
 
 def test_ci_row_lists_findings_with_their_glosses():
-    comparison = _evaluated(
+    comparison = evaluated_ci_comparison(
         verdict="not_met",
         clean=False,
         red_observed=3,

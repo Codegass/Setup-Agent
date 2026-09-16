@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from sag.agent.control_events import canonical_sha256
+from sag.agent.java_success_certificates import evaluate_java_success_certificate
+
+from test_java_success_certificates import _obligations, _payload, _scope
 from verdict_rate_fakes import complete_verdict_rates
 
 #: A snapshot cross-checks that its task completion and CI comparison belong to
@@ -209,10 +213,61 @@ def module_metrics(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+# A comparison only reaches "evaluated" while it still holds the certificate and
+# target digests that bound it, so the fixture carries a real certificate for
+# this run. No row reads it; it is what the snapshot requires to exist at all.
+_CI_TARGET_SHA = snapshot_dict()["ci_comparison"]["target_sha"]
+_CI_SCOPE = _scope(run_id=RUN_ID, target_sha=_CI_TARGET_SHA)
+
+
+def _bound_obligations(unit: str, ids: tuple[str, ...]):
+    """`_obligations` stamps its own epoch; this run's scope carries its own."""
+    return _obligations(unit, ids, ids, subject=_CI_SCOPE.subject).model_copy(
+        update={"evidence_epoch": _CI_SCOPE.evidence_epoch}
+    )
+
+
+_CI_CERTIFICATE_INPUT = _payload(
+    scope=_CI_SCOPE,
+    build_steps=_bound_obligations("build_plan_step", ("build-1",)),
+    build_units=_bound_obligations("single_maven_project", ("root",)),
+    test_steps=_bound_obligations("test_plan_step", ("test-1",)),
+    test_targets=_bound_obligations("single_test_project", ("root",)),
+    evidence_items=_bound_obligations(
+        "evidence_binding", ("plan", "build-receipt", "test-receipt")
+    ),
+)
+_CI_CERTIFICATE = evaluate_java_success_certificate(_CI_CERTIFICATE_INPUT)
+
+
+def evaluated_ci_comparison(**overrides: Any) -> dict[str, Any]:
+    """One comparison that reached a verdict, scoring ``attainment(**overrides)``."""
+
+    comparison = dict(snapshot_dict()["ci_comparison"])
+    comparison.update(
+        {
+            "status": "evaluated",
+            "certificate": _CI_CERTIFICATE,
+            "certificate_input_sha256": canonical_sha256(
+                _CI_CERTIFICATE_INPUT.model_dump(mode="json")
+            ),
+            "target_record_sha256": canonical_sha256(
+                {"repo": comparison["repo"], "sha": comparison["target_sha"]}
+            ),
+            "attainment": attainment(**overrides),
+            "acceptance_command": "mvn -B -f pom.xml -V clean test --batch-mode",
+            "receipt_ids": ["inv-maven-1-17c8a2e62d8a-0001"],
+            "reasons": [],
+        }
+    )
+    return comparison
+
+
 __all__ = [
     "CLEAN_TEST_COUNTS",
     "RUN_ID",
     "attainment",
+    "evaluated_ci_comparison",
     "module_metrics",
     "phase_record",
     "snapshot_dict",

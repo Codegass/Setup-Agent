@@ -158,13 +158,15 @@ def _attention(
         )
 
     # The same codes the CI row lists, read from the record rather than
-    # recovered from the row's rendered lines. A comparison carries a result
-    # only once it has been evaluated, so the result's presence is the gate.
+    # recovered from the row's rendered lines. `_consistent_subject` on
+    # CIComparisonSnapshot already refuses a result on anything but an evaluated
+    # comparison; the row states both halves of that gate, so this states both.
     comparison = getattr(snapshot, "ci_comparison", None)
     result = getattr(comparison, "attainment", None)
-    for code in getattr(result, "reason_codes", ()) or ():
-        if str(code) in _CI_FINDING_CODES:
-            items.append(AttentionItem(kind="ci_finding", title=f"{code}: {gloss(str(code))}"))
+    if str(getattr(comparison, "status", "")) == "evaluated" and result is not None:
+        for code in getattr(result, "reason_codes", ()) or ():
+            if str(code) in _CI_FINDING_CODES:
+                items.append(AttentionItem(kind="ci_finding", title=f"{code}: {gloss(str(code))}"))
 
     for module in _mapping(module_metrics).get("modules") or ():
         if not isinstance(module, Mapping):
