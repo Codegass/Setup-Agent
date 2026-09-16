@@ -33,6 +33,14 @@ def _card(**kwargs):
     return build_result_card(payload, **defaults)
 
 
+def _older_record() -> dict:
+    """A v3 payload, which the card reads as reconstructed rather than current."""
+
+    payload = snapshot_dict(schema_version=3)
+    payload.pop("rates")
+    return payload
+
+
 def test_block_opens_with_the_run_identity():
     text = _plain(_card())
     first = text.splitlines()[0]
@@ -62,19 +70,48 @@ def test_headline_and_detail_are_stacked_under_one_label():
 
 def test_a_reason_carries_its_code_in_parentheses():
     text = _plain(_card())
-    assert "no CI job on this commit matches the run's JDK and OS" in text
-    assert "(official_ci_cell_not_matched)" in text
+    assert (
+        " Official CI   not compared   no CI job on this commit matches the run's JDK\n"
+        "                              and OS (official_ci_cell_not_matched)\n"
+    ) in text
+
+
+def test_a_row_never_restates_its_status_as_its_headline():
+    text = _plain(_card())
+    assert " Coverage      not collected  not collected" not in text
+    assert " Official CI   not compared   not compared" not in text
+    # The third column carries the explanation instead, and carries it once.
+    assert " Coverage      not collected  fixture coverage not collected\n" in text
+    assert text.count("fixture coverage not collected") == 1
 
 
 def test_task_steps_are_listed_under_their_row():
     text = _plain(_card())
-    assert "   smoke-build-test: complete — mvn clean verify → exit 0" in text
+    assert (
+        "                              · smoke-build-test: complete — mvn clean verify\n"
+        "                              → exit 0\n"
+    ) in text
+
+
+def test_a_reconstructed_result_says_so_and_a_current_one_does_not():
+    assert " Record        reconstructed from an older run record\n" in _plain(
+        _card(snapshot=_older_record())
+    )
+    assert " Record " not in _plain(_card())
 
 
 def test_evidence_and_next_lines_close_the_block():
     text = _plain(_card())
-    assert " Evidence      logs/session_20260914_210609" in text
-    assert " Next          uv run sag ui" in text
+    assert " Evidence      logs/session_20260914_210609\n" in text
+    assert " Next          uv run sag ui · uv run sag result sag-commons-cli\n" in text
+
+
+def test_a_long_container_name_wraps_under_its_label():
+    text = _plain(_card(container="sag-advisor-high20-r2-terra-high-commons-cli-20260914"))
+    assert (
+        " Next          uv run sag ui · uv run sag result\n"
+        "               sag-advisor-high20-r2-terra-high-commons-cli-20260914\n"
+    ) in text
 
 
 def test_a_clean_run_says_nothing_after_the_block():

@@ -24,7 +24,9 @@ _TONE_STYLE: dict[Tone, str] = {
     "neutral": "dim",
 }
 
-_NEXT_STEPS = "uv run sag ui        uv run sag result {target}"
+_NEXT_STEPS = "uv run sag ui · uv run sag result {target}"
+_ITEM_BULLET = "· "
+_OLDER_RECORD = "reconstructed from an older run record"
 
 
 def _rule(width: int, title: str | None = None) -> str:
@@ -58,20 +60,32 @@ def _wrap(text: str, width: int, indent: str) -> list[str]:
     ) or [indent.rstrip()]
 
 
+def _labelled(label: str, value: str, width: int) -> list[str]:
+    """A label in its column and a value that wraps under itself, not off the edge.
+
+    Container names and session paths are as long as the run that made them, so
+    these lines are wrapped like every other line rather than trusted to fit.
+    """
+
+    indent = " " * (GUTTER + LABEL_WIDTH)
+    wrapped = _wrap(value, width - len(indent), indent)
+    head = f"{' ' * GUTTER}{label:<{LABEL_WIDTH}}"
+    return [head + wrapped[0][len(indent) :], *wrapped[1:]]
+
+
 def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
     """Render the card as the block a user reads when a run ends."""
 
     width = max(MIN_WIDTH, width)
     body_indent = " " * (GUTTER + LABEL_WIDTH + STATUS_WIDTH)
     body_width = width - len(body_indent)
-    # A row's prose — why it has nothing to measure, and the steps it lists —
-    # is sentences rather than column values, so it hangs under the status
-    # column, where a whole line of room is left for it. Keeping it clear of
-    # the label column also keeps the labels the only thing written there.
-    hang_indent = " " * (GUTTER + LABEL_WIDTH)
-    hang_width = width - len(hang_indent)
 
     lines: list[str] = [_rule(width, _identity(card))]
+
+    # A result rebuilt from an older run record is worth less than one read from
+    # the run that wrote it, and looks identical to one unless the block says so.
+    if card.verdict_source == "legacy":
+        lines.extend(_labelled("Record", _OLDER_RECORD, width))
 
     for row in card.rows:
         style = _TONE_STYLE[row.tone]
@@ -80,18 +94,27 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
             f"{' ' * GUTTER}{row.label:<{LABEL_WIDTH}}"
             f"[{style}]{status}[/{style}]{' ' * (STATUS_WIDTH - len(status))}"
         )
-        headline_lines = _wrap(row.headline, body_width, body_indent)
-        lines.append(head + headline_lines[0][len(body_indent) :])
-        lines.extend(headline_lines[1:])
-        if row.detail:
-            lines.extend(_wrap(row.detail, body_width, body_indent))
-        if row.reason:
-            lines.extend(_wrap(row.reason, hang_width, hang_indent))
-        shown = row.items[:_MAX_ITEMS]
-        for item in shown:
-            lines.extend(_wrap(item, hang_width, hang_indent))
+
+        # A headline that only repeats the status word says the same thing
+        # twice, so the body column leads with the explanation instead.
+        body = [
+            text
+            for text in (
+                None if row.headline == row.status else row.headline,
+                row.detail,
+                row.reason,
+            )
+            if text
+        ]
+        body.extend(f"{_ITEM_BULLET}{item}" for item in row.items[:_MAX_ITEMS])
         if len(row.items) > _MAX_ITEMS:
-            lines.append(f"{hang_indent}+{len(row.items) - _MAX_ITEMS} more")
+            body.append(f"{_ITEM_BULLET}+{len(row.items) - _MAX_ITEMS} more")
+
+        # One body column: everything the row says hangs under the same edge.
+        wrapped = [line for text in body for line in _wrap(text, body_width, body_indent)]
+        wrapped = wrapped or [body_indent]
+        lines.append(head + wrapped[0][len(body_indent) :])
+        lines.extend(wrapped[1:])
 
     lines.append(_rule(width))
 
@@ -102,13 +125,11 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
             lines.extend(_wrap(text, width - 3, "   "))
 
     if card.session_dir:
-        lines.append(f"{' ' * GUTTER}{'Evidence':<{LABEL_WIDTH}}{card.session_dir}")
+        lines.extend(_labelled("Evidence", card.session_dir, width))
 
     target = card.container or card.session_dir
     if target:
-        lines.append(
-            f"{' ' * GUTTER}{'Next':<{LABEL_WIDTH}}{_NEXT_STEPS.format(target=target)}"
-        )
+        lines.extend(_labelled("Next", _NEXT_STEPS.format(target=target), width))
 
     if card.notes:
         lines.append(f"{' ' * GUTTER}Notes")
