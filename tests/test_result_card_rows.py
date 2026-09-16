@@ -459,6 +459,23 @@ def test_ci_row_lists_findings_with_their_glosses():
     assert "a.B#c" in row.items[2]
 
 
+def test_ci_row_says_not_met_as_two_words():
+    # The record spells the verdict `not_met`; a reader does not. The word is
+    # spelled here so every surface says it the same way, and the tone still
+    # keys off the record's own word rather than the spelled one.
+    comparison = evaluated_ci_comparison(
+        verdict="not_met",
+        clean=False,
+        red_observed=3,
+        unexpected_red_ids=["a.B#c", "a.B#d", "a.B#e"],
+        reason_codes=["NEW_RED_BEYOND_TARGET"],
+    )
+    row = ci_row(_snapshot(ci_comparison=comparison))
+    assert row.status == "not met"
+    assert row.headline == "not met 523/523"
+    assert row.tone == "failed"
+
+
 def test_ci_row_not_compared_explains_itself():
     row = ci_row(_snapshot())
     assert row.status == "not compared"

@@ -313,6 +313,11 @@ _CI_TONE: dict[str, Tone] = {
     "invalid": "failed",
 }
 
+#: The record's word for a comparison, said the way a reader says it. The record
+#: is what tone keys off; this is only how the word is spelled on a surface, so
+#: all three spell it the same and none of them keeps its own copy.
+_CI_STATUS_WORD: dict[str, str] = {"not_met": "not met"}
+
 _MAX_RED_IDS = 10
 
 NOT_COMPARED = "not compared"
@@ -352,11 +357,12 @@ def ci_row(snapshot: Any) -> ResultRow:
         )
 
     verdict = str(result.verdict)
+    word = _CI_STATUS_WORD.get(verdict, verdict)
     alpha = getattr(result, "alpha", None)
     if alpha is not None:
-        headline = f"{verdict} {alpha.numerator:,}/{alpha.denominator:,}"
+        headline = f"{word} {alpha.numerator:,}/{alpha.denominator:,}"
     else:
-        headline = f"{verdict} · scope score unavailable"
+        headline = f"{word} · scope score unavailable"
 
     parity = getattr(result, "lifecycle_parity", None)
     detail_parts = []
@@ -382,7 +388,8 @@ def ci_row(snapshot: Any) -> ResultRow:
     return ResultRow(
         key="ci",
         label=ROW_LABELS["ci"],
-        status=verdict,
+        status=word,
+        # Tone keys off the record's own word, never off the spelled one.
         tone=_CI_TONE.get(verdict, "attention"),
         headline=headline,
         detail=_join(*detail_parts) or None,
