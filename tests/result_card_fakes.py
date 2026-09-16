@@ -93,6 +93,14 @@ def snapshot_dict(**overrides: Any) -> dict[str, Any]:
         },
     }
     payload.update(overrides)
+    # The snapshot cross-checks that its task completion and CI comparison belong
+    # to the same run, so a caller overriding `run_id` must not be left holding a
+    # payload that fails validation three layers away from the line they wrote.
+    # A caller who supplies its own nested dict has said what it wants; leave it.
+    run_id = payload["run_id"]
+    for key in ("task_completion", "ci_comparison"):
+        if key not in overrides and isinstance(payload.get(key), dict):
+            payload[key]["run_id"] = run_id
     return payload
 
 

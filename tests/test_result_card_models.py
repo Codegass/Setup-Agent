@@ -85,3 +85,29 @@ def test_attention_item_carries_its_refs():
     item = AttentionItem(kind="task_step", title="ci-step-1: failed", refs=("inv-maven-1-a-0001",))
     assert item.detail is None
     assert item.refs == ("inv-maven-1-a-0001",)
+
+
+def test_overriding_the_run_id_keeps_the_nested_records_with_it():
+    """A snapshot rejects a task completion belonging to another run."""
+
+    from sag.agent.verdict_finalizer import RunVerdictSnapshot
+
+    from result_card_fakes import snapshot_dict
+
+    payload = snapshot_dict(run_id="20260101_000000_000000_abcdef123456_1-2-deadbeef")
+    snapshot = RunVerdictSnapshot.model_validate(payload)
+    assert snapshot.task_completion.run_id == snapshot.run_id
+    assert snapshot.ci_comparison.run_id == snapshot.run_id
+
+
+def test_an_explicit_nested_override_still_wins():
+    """A caller who supplies its own task completion has said what it wants."""
+
+    from result_card_fakes import RUN_ID, snapshot_dict
+
+    payload = snapshot_dict(
+        run_id="20260101_000000_000000_abcdef123456_1-2-deadbeef",
+        task_completion={"run_id": RUN_ID, "task_sha256": None, "status": "unavailable",
+                         "steps": [], "reasons": ["task_run_pin_unavailable"]},
+    )
+    assert payload["task_completion"]["run_id"] == RUN_ID
