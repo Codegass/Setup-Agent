@@ -997,17 +997,31 @@ class ReportTool(BaseTool, UIEventEmitter):
         older carries no payload the card can read, and gets None.
         """
 
+        from sag.agent.verdict_finalizer import (
+            ReportDeliveryStatus,
+            RunTermination,
+            RunTerminationStatus,
+        )
         from sag.result_card.build import build_result_card
 
         payload = (snapshot or {}).get("canonical_snapshot")
         if not isinstance(payload, dict):
             return None
         project = ((snapshot or {}).get("project_info") or {}).get("name")
+        # Delivery is not asserted ahead of the fact here. `_generate_snapshot_report`
+        # raises OSError when `_save_markdown_report` fails, so this document only
+        # ever reaches a reader if the save succeeded: holding it is the proof. The
+        # Report row would otherwise tell that reader no report was written.
+        delivered = RunTermination(
+            termination=RunTerminationStatus.COMPLETED,
+            report_delivery_status=ReportDeliveryStatus.DELIVERED,
+        )
         try:
             return build_result_card(
                 payload,
                 module_metrics=self._read_module_metrics_payload(),
                 report_metrics=(snapshot or {}).get("metrics_v2"),
+                termination=delivered,
                 project=project,
                 report_path=(snapshot or {}).get("report_path"),
             )

@@ -85,7 +85,10 @@ def setup_row(snapshot: Any, *, stats: ResultStats, termination: Any | None) -> 
         label=ROW_LABELS["setup"],
         status=verdict,
         tone=_VERDICT_TONE.get(verdict, "attention"),
-        headline=headline or "no run counts were recorded",
+        # A surface that cannot reach the counts says so about itself. The run
+        # did record them — the ledger and the run pin hold them — so claiming
+        # they were never recorded would state a falsehood about the run.
+        headline=headline or "run counts unavailable",
         detail=detail,
     )
 

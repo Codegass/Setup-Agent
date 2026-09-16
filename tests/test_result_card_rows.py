@@ -63,8 +63,10 @@ def test_setup_row_will_not_invent_a_phase_numerator():
 
 
 def test_setup_row_says_so_when_it_counted_nothing():
+    """The absence is the surface's, not the run's: the counts do exist."""
+
     row = setup_row(_snapshot(), stats=ResultStats(), termination=_termination())
-    assert row.headline == "no run counts were recorded"
+    assert row.headline == "run counts unavailable"
 
 
 def test_setup_row_names_an_abnormal_ending():

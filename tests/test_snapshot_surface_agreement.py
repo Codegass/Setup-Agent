@@ -416,6 +416,24 @@ def surface_harness():
     return SurfaceHarness()
 
 
+def test_report_states_its_own_delivery_and_the_counts_it_cannot_reach(
+    tvm_snapshot, surface_harness
+):
+    """Neither row may say something untrue of the document holding it.
+
+    The writer raises when the save fails, so a reader of this document is the
+    proof it was delivered; and the run's counts do exist — this surface simply
+    cannot reach them from inside the container.
+    """
+
+    markdown = surface_harness.render_all(tvm_snapshot).markdown.text
+
+    assert "| **Report** | delivered | /workspace/setup-report-test.md |" in markdown
+    assert "no report was recorded" not in markdown
+    assert "| **Setup** | partial | run counts unavailable |" in markdown
+    assert "no run counts were recorded" not in markdown
+
+
 def test_all_surfaces_render_the_same_snapshot(tvm_snapshot, surface_harness):
     rendered = surface_harness.render_all(tvm_snapshot)
 
