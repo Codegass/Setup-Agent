@@ -58,6 +58,13 @@ def test_setup_row_drops_pieces_it_does_not_have():
     assert row.headline == "3 turns"
 
 
+def test_setup_row_will_not_invent_a_phase_numerator():
+    row = setup_row(
+        _snapshot(), stats=ResultStats(phases_total=5, turns=3), termination=_termination()
+    )
+    assert row.headline == "3 turns"
+
+
 def test_setup_row_says_so_when_it_counted_nothing():
     row = setup_row(_snapshot(), stats=ResultStats(), termination=_termination())
     assert row.headline == "no run counts were recorded"
@@ -213,6 +220,27 @@ def test_build_row_without_a_reactor_count_states_the_word():
     assert row.detail is None
 
 
+def test_build_row_will_not_invent_a_module_numerator():
+    snapshot = _snapshot(
+        build_evidence={
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "refs": [],
+            "compiled_classes": 119,
+            "reactor_modules_total": 4,
+        }
+    )
+    row = build_row(snapshot)
+    assert row.headline == "success"
+    assert row.detail == (
+        "module count not recorded · 119 class files · counts are diagnostic, CI defines scope"
+    )
+
+
 def test_build_row_unknown_judgment_states_a_reason():
     snapshot = _snapshot(
         verdict="unknown",
@@ -336,6 +364,26 @@ def test_interrupted_tests_keep_their_prefix_counts():
     assert row.status == "interrupted"
     assert row.tone == "attention"
     assert row.headline == "120 executed · 118 passed · 2 failed · 0 errors · 0 skipped"
+
+
+def test_tests_row_keeps_its_counts_and_says_the_judgment_is_missing():
+    snapshot = _snapshot(
+        verdict="partial",
+        test_stats={
+            "discovered": 472,
+            "denominator_basis": "complete",
+            "unique": dict(CLEAN_TEST_COUNTS),
+            "raw": dict(CLEAN_TEST_COUNTS),
+            "flaky_count": 0,
+            "judgment": "unknown",
+            "receipt_scoped": True,
+        },
+    )
+    row = tests_row(snapshot)
+    assert row.status == "unavailable"
+    assert row.tone == "attention"
+    assert row.headline == "994 executed · 933 passed · 0 failed · 0 errors · 61 skipped"
+    assert row.reason == "the run recorded test outcomes but no judgment about them"
 
 
 def test_coverage_row_reports_a_collected_rate():

@@ -58,8 +58,10 @@ def setup_row(snapshot: Any, *, stats: ResultStats, termination: Any | None) -> 
 
     verdict = str(snapshot.verdict)
     phases = None
-    if stats.phases_total:
-        phases = f"{stats.phases_completed or 0}/{stats.phases_total} phases"
+    # Both halves or no fraction. A missing numerator printed as 0 would read
+    # as "nothing finished" when the truth is "nobody counted".
+    if stats.phases_total and stats.phases_completed is not None:
+        phases = f"{stats.phases_completed}/{stats.phases_total} phases"
     headline = _join(
         phases,
         f"{stats.turns:,} turns" if stats.turns is not None else None,
@@ -157,8 +159,10 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
     judgment = str(evidence.judgment)
     succeeded = evidence.reactor_modules_succeeded
     total = evidence.reactor_modules_total
-    if total:
-        headline = f"{succeeded or 0}/{total} modules built"
+    # The two counts are parsed independently, so either can be absent. "0/4
+    # modules built" for an uncounted numerator reads as a total build failure.
+    if total and succeeded is not None:
+        headline = f"{succeeded}/{total} modules built"
     else:
         headline = judgment
 
@@ -178,6 +182,8 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
     detail = _join(*pieces)
     if detail:
         detail = f"{detail} · counts are diagnostic, CI defines scope"
+    if (succeeded is None) != (total is None):
+        detail = _join("module count not recorded", detail)
 
     reason = None
     if judgment == "unknown":
@@ -250,6 +256,12 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
     else:
         tone = "success"
 
+    # The counts are real and stay in the headline; what is missing is the
+    # run's word for them, and an unavailable row never leaves that unsaid.
+    reason = None
+    if status == "unavailable":
+        reason = "the run recorded test outcomes but no judgment about them"
+
     return ResultRow(
         key="tests",
         label=ROW_LABELS["tests"],
@@ -257,6 +269,7 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
         tone=tone,
         headline=headline,
         detail=_join(rate_text, raw_text) or None,
+        reason=reason,
     )
 
 
@@ -387,7 +400,7 @@ def report_row(termination: Any | None, *, report_path: str | None = None) -> Re
             key="report",
             label=ROW_LABELS["report"],
             status="unavailable",
-            tone="attention",
+            tone=_REPORT_TONE["unavailable"],
             headline="no report was recorded",
             reason="the run did not record whether a report was written",
         )
@@ -397,7 +410,7 @@ def report_row(termination: Any | None, *, report_path: str | None = None) -> Re
             key="report",
             label=ROW_LABELS["report"],
             status=status,
-            tone="neutral",
+            tone=_REPORT_TONE.get(status, "attention"),
             headline=headline,
             refs=(report_path,) if report_path else (),
         )
@@ -406,7 +419,7 @@ def report_row(termination: Any | None, *, report_path: str | None = None) -> Re
             key="report",
             label=ROW_LABELS["report"],
             status=status,
-            tone="attention",
+            tone=_REPORT_TONE.get(status, "attention"),
             headline="the setup report was not written",
             reason="the run result itself is unchanged",
         )
@@ -414,7 +427,7 @@ def report_row(termination: Any | None, *, report_path: str | None = None) -> Re
         key="report",
         label=ROW_LABELS["report"],
         status=status,
-        tone="neutral",
+        tone=_REPORT_TONE.get(status, "attention"),
         headline="no report was requested",
     )
 
