@@ -9,6 +9,7 @@ import shlex
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,9 +28,12 @@ from sag.agent.evidence_publications import (
 )
 from sag.agent.verdict_finalizer import (
     VERDICT_SNAPSHOT_PATH,
+    ReportDeliveryStatus,
     RunVerdictSnapshot,
     read_live_verdict_snapshot,
 )
+from sag.result_card.build import build_result_card
+from sag.result_card.models import RunResultCard
 from sag.runtime.container_io import resolve_control_execute
 from sag.trajectory.builder import CONTROL_EVENTS_NAME
 from sag.web.context_trace import ContextTraceBuilder
@@ -44,10 +48,8 @@ from sag.web.models import (
     ModuleSummary,
     ReportDocument,
     TestSummary,
-    VerdictSummary,
     WorkspaceSummary,
 )
-from sag.web.verdict import compose_verdict
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 #: The run-pin the agent publishes at startup, inside the container. It is the
@@ -585,20 +587,6 @@ def _session_detail(
     module_summary = _module_rollup(item.get("module_summary"))
     report_doc = _report_document(item)
 
-    verdict = compose_verdict(
-        build=build.model_dump(mode="json", by_alias=True),
-        test=summary.test.model_dump(mode="json", by_alias=True),
-        module_summary=(
-            module_summary.model_dump(mode="json", by_alias=True)
-            if module_summary is not None
-            else None
-        ),
-        outcome=outcome,
-        blocker=item.get("blocker"),
-        canonical_verdict=(summary.canonical_verdict if "canonical_verdict" in item else None),
-        verdict_source=_text(item.get("verdict_source"), default="derived"),
-    )
-
     return ExecutionSessionDetail(
         id=summary.id,
         workspace=summary.workspace,
@@ -618,20 +606,21 @@ def _session_detail(
         report_doc=report_doc,
         blocker=item.get("blocker"),
         evidence=_evidence(item, outcome),
-        files=None,
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
-        verdict=VerdictSummary.model_validate(verdict) if verdict else None,
+        result_card=(
+            RunResultCard.model_validate(item["result_card"])
+            if isinstance(item.get("result_card"), dict)
+            else None
+        ),
         model=_optional_text(item.get("model")),
         steps=_optional_int(item.get("steps")),
         step_budget=_optional_int(item.get("step_budget")),
         canonical_verdict=summary.canonical_verdict,
         rates=item.get("rates") if isinstance(item.get("rates"), dict) else None,
         ci_comparison=item.get("ci_comparison"),
-        ci_comparison_lines=item.get("ci_comparison_lines") or [],
         task_completion=item.get("task_completion"),
-        task_completion_lines=item.get("task_completion_lines") or [],
         snapshot_status=summary.snapshot_status,
         legacy=summary.legacy,
         report_delivery_status=summary.report_delivery_status,
@@ -890,6 +879,34 @@ def _snapshot_phase_reached(snapshot: RunVerdictSnapshot, phase: str) -> bool | 
     return any(record.phase == phase and record.termination != "skipped" for record in records)
 
 
+@dataclass(frozen=True)
+class _ReportDeliveryOnly:
+    """What this surface can state about how the run ended: the report, and no more.
+
+    The result card's Report row reads ``report_delivery_status`` and its Setup
+    row reads ``termination``. The Workbench reads a finished run's artifacts
+    from outside the run, so it can say whether the report document exists — it
+    is holding one — but nothing it reads says whether the run completed or was
+    cut short. Carrying no ``termination`` is how the Setup row is told that,
+    and it reads the same as the run ending normally.
+    """
+
+    report_delivery_status: ReportDeliveryStatus
+
+
+def _observed_report_delivery(
+    trunk_data: dict[str, Any], report_raw: str | None
+) -> _ReportDeliveryOnly | None:
+    """The run's own word on delivery, or the document this reader is holding."""
+
+    stated = _durable_report_delivery_status(trunk_data)
+    if stated is None and report_raw is not None:
+        stated = "delivered"
+    if stated is None:
+        return None
+    return _ReportDeliveryOnly(report_delivery_status=ReportDeliveryStatus(stated))
+
+
 def _durable_report_delivery_status(trunk_data: dict[str, Any]) -> str | None:
     termination = trunk_data.get("run_termination")
     if not isinstance(termination, dict):
@@ -973,11 +990,37 @@ def _setup_artifact_item(
         verdict_source = "snapshot"
         rates = None
 
-    from sag.agent.ci_comparison import render_ci_comparison_lines
-    from sag.agent.acceptance_task import render_task_completion_lines
-
     comparison = snapshot.ci_comparison if snapshot is not None else None
     task_completion = snapshot.task_completion if snapshot is not None else None
+    result_card = None
+    if snapshot is not None:
+        # Named by the run it belongs to, never by "the newest directory of
+        # this project": pointing a reader at another run's evidence is worse
+        # than not pointing at any.
+        run_dir = _pick_log_session_dir(
+            _log_session_dirs(logs_root or Path("logs"), project_name),
+            run_id=snapshot.run_id,
+        )
+        # Every argument is built out here on purpose. Inside the `try`, one
+        # mistake in building one of them is indistinguishable from a record the
+        # card cannot read, and the detail would serve no card at all while every
+        # test still passed.
+        card_inputs = {
+            "module_metrics": module_metrics,
+            "report_metrics": metrics if isinstance(metrics, dict) else None,
+            "termination": _observed_report_delivery(trunk_data, report_raw),
+            "project": project_name or None,
+            "goal": _text(trunk_data.get("goal"), default="") or None,
+            "container": workspace_id,
+            "session_dir": str(run_dir) if run_dir is not None else None,
+            "report_path": report_path or None,
+        }
+        try:
+            result_card = build_result_card(snapshot, **card_inputs).model_dump(mode="json")
+        except (TypeError, ValueError) as exc:
+            logger.warning("Result card unavailable for {}: {}", session_id, exc)
+            result_card = None
+
     return {
         "id": session_id,
         "workspace": workspace_id,
@@ -987,9 +1030,8 @@ def _setup_artifact_item(
         "canonical_verdict": canonical_verdict,
         "rates": rates,
         "ci_comparison": comparison.model_dump(mode="json") if comparison else None,
-        "ci_comparison_lines": render_ci_comparison_lines(comparison),
         "task_completion": task_completion.model_dump(mode="json") if task_completion else None,
-        "task_completion_lines": render_task_completion_lines(task_completion),
+        "result_card": result_card,
         "snapshot_status": snapshot_status,
         "legacy": legacy,
         "verdict_source": verdict_source,

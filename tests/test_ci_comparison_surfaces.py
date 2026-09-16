@@ -112,8 +112,21 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     second = _session_detail(item, "sag-tvm", None).model_dump(mode="json", by_alias=True)
     assert first == second
     assert first["ciComparison"] == comparison.model_dump(mode="json")
-    assert first["ciComparisonLines"] == expected
     assert first["canonicalVerdict"] == "success"
+    # The Workbench serves the card rather than rendering it, so the same
+    # fragments the block and the report print are read out of the CI row.
+    ci = next(row for row in first["resultCard"]["rows"] if row["key"] == "ci")
+    ci_text = " ".join(
+        [
+            ci["status"],
+            ci["headline"],
+            ci["detail"] or "",
+            ci["reason"] or "",
+            *ci["items"],
+        ]
+    )
+    for fragment in _block_ci_fragments(comparison):
+        assert fragment in ci_text
     if status == "met":
         assert comparison.attainment.verdict == "met"
         assert comparison.attainment.alpha is not None
@@ -132,7 +145,9 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     )
     withdrawn = _setup_artifact_item(orchestrator, "sag-tvm")
     assert withdrawn["ci_comparison"] is None
-    assert "unavailable" in withdrawn["ci_comparison_lines"][0]
+    # Nothing left to copy: the detail offers no card at all rather than one
+    # assembled from a record it can no longer stand behind.
+    assert withdrawn["result_card"] is None
 
 
 def test_cli_loads_explicit_target_bytes_before_starting_agent(monkeypatch, tmp_path):

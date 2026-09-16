@@ -685,12 +685,19 @@ def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
     assert detail.snapshot_status == "valid"
     assert detail.test.total == 328
     assert detail.test.raw_executions == 987
-    assert detail.verdict.verdict == tvm_snapshot.verdict
-    assert detail.verdict.source == "snapshot"
+    assert detail.result_card is not None
+    assert detail.result_card.verdict == tvm_snapshot.verdict
+    assert detail.result_card.row("tests").headline.startswith("328 executed")
     assert detail.report_delivery_status is None
 
 
-def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_factory):
+def test_web_card_keeps_the_mutable_module_rollup_out_of_the_build_word(snapshot_factory):
+    """The rollup is a report diagnostic and the record is the result.
+
+    Four failed modules beside a build the run recorded as successful must not
+    turn the Build row's own word around; the count is still worth showing, so
+    it is shown where a reader can see what it is."""
+
     snapshot = snapshot_factory(
         verdict="success",
         unique_passed=328,
@@ -702,11 +709,12 @@ def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_fact
         "/workspace/.setup_agent/module_metrics.json": json.dumps(
             {
                 "modules": [],
+                # The shape module_metrics.json is actually written in.
                 "module_summary": {
-                    "modulesTotal": 4,
-                    "modulesBuilt": 0,
-                    "modulesFailed": 4,
-                    "singleModule": False,
+                    "modules_total": 4,
+                    "modules_built": 0,
+                    "modules_failed": 4,
+                    "single_module": False,
                 },
             }
         ),
@@ -715,10 +723,18 @@ def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_fact
     item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm")
     detail = _session_detail(item, "sag-tvm", None)
 
-    assert detail.verdict is not None
-    assert detail.verdict.verdict == "success"
-    assert detail.verdict.tone == "success"
-    assert detail.verdict.headline == "Build passed. Test run passed with 328 sealed results"
+    card = detail.result_card
+    assert card is not None
+    assert card.verdict == "success"
+    build = card.row("build")
+    assert build.status == "success"
+    assert build.headline == "success"
+    assert build.detail == (
+        "4 modules failed · counts are diagnostic, CI defines scope"
+    )
+    assert card.row("tests").headline == (
+        "328 executed · 328 passed · 0 failed · 0 errors · 0 skipped"
+    )
 
 
 def test_web_terminal_snapshot_overrides_stale_trunk_and_marks_unreached_phases_not_run():
@@ -772,10 +788,12 @@ def test_web_terminal_snapshot_overrides_stale_trunk_and_marks_unreached_phases_
     assert detail.build.class_count is None
     assert detail.test.state == "not_attempted"
     assert detail.test.execution_rate is None
-    assert detail.verdict is not None
-    assert detail.verdict.headline == (
-        "Build was not run. Tests were not run. Review before promoting"
-    )
+    card = detail.result_card
+    assert card is not None
+    assert card.row("setup").headline == "0/1 phases"
+    assert card.row("setup").detail == "blocked at analyze: iteration budget exhausted"
+    assert card.row("tests").headline == "no test results were recorded"
+    assert card.row("tests").reason == "the run recorded no test outcomes"
 
 
 def test_web_treats_policy_skipped_build_and_test_as_not_run():
@@ -811,9 +829,14 @@ def test_web_treats_policy_skipped_build_and_test_as_not_run():
 
     assert detail.build.state == "not_attempted"
     assert detail.test.state == "not_attempted"
-    assert detail.verdict is not None
-    assert "Build was not run" in detail.verdict.headline
-    assert "Tests were not run" in detail.verdict.headline
+    card = detail.result_card
+    assert card is not None
+    assert card.row("build").reason == "no build result was recorded for this run"
+    assert card.row("tests").headline == "no test results were recorded"
+    assert [item.title for item in card.attention] == [
+        "The build phase did not finish",
+        "The test phase did not finish",
+    ]
 
 
 def test_web_exposes_report_delivery_only_from_durable_flow_data(tvm_snapshot):
@@ -923,8 +946,9 @@ def test_web_missing_legacy_snapshot_requires_labeled_legacy_fallback():
     assert detail.test.total == 987
     assert detail.evidence_status == "unknown"
     assert detail.legacy is True
-    assert detail.verdict.verdict == "unknown"
-    assert detail.verdict.source == "legacy"
+    # There is no record here to copy, so the detail offers no card rather
+    # than assembling one out of a report's prose.
+    assert detail.result_card is None
 
 
 def test_web_historical_shape_without_legacy_marker_stays_unknown():

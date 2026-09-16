@@ -787,11 +787,12 @@ def test_container_session_registry_returns_setup_artifact_detail():
     assert detail.context.phases[0].id == "phase_provision"
 
 
-def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
+def test_setup_artifact_detail_surfaces_runtime_metadata_without_a_card():
     """report_metrics.json carries model/iteration counts (the only writer of that
     file), and _setup_artifact_item -> _session_detail must surface them as
-    model/steps/stepBudget AND compose the verdict from the serialized model keys.
-    Locks the dead-wiring + serialization-alias contracts for real (non-demo) runs."""
+    model/steps/stepBudget. This run sealed no verdict record, so there is
+    nothing for the card to copy and the detail offers none — report metrics
+    are diagnostics and never stand in for the record."""
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260618_100000.json": json.dumps(
             {
@@ -854,12 +855,8 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
     assert detail.steps == 6
     assert detail.step_budget == 40
     # A new phase session without verdict.json keeps runtime metadata but does
-    # not reconstruct canonical test counts or verdict from report metrics.
-    assert detail.verdict is not None
-    assert detail.verdict.tone == "attention"
-    assert detail.verdict.headline == (
-        "Build result unavailable. Test result unavailable. Review before promoting"
-    )
+    # not reconstruct test counts or a result from report metrics.
+    assert detail.result_card is None
     assert detail.canonical_verdict == "unknown"
     assert detail.snapshot_status == "missing"
     assert detail.test.total == 0

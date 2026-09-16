@@ -8,6 +8,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from sag.agent.ci_comparison import CIComparisonSnapshot
 from sag.agent.acceptance_task import TaskCompletionSnapshot
+from sag.result_card.models import RunResultCard
 
 
 class WebModel(BaseModel):
@@ -782,14 +783,6 @@ class ModuleRollup(WebModel):
     )
 
 
-class VerdictSummary(WebModel):
-    tone: str  # "success" | "attention" | "failed"
-    headline: str
-    detail: str | None = None
-    verdict: str | None = None
-    source: str = "derived"
-
-
 class ExecutionSessionDetail(WebModel):
     id: str
     workspace: str
@@ -817,7 +810,6 @@ class ExecutionSessionDetail(WebModel):
     report_doc: ReportDocument | None = Field(default=None, serialization_alias="reportDoc")
     blocker: BlockerSummary | None = None
     evidence: list[EvidenceGroup] = Field(default_factory=list)
-    files: FileChangeDigest | None = None
     context: ContextTrace | None = None
     logs: list[str] = Field(default_factory=list)
     partial: bool = False
@@ -827,7 +819,10 @@ class ExecutionSessionDetail(WebModel):
     #: that directory (the timeline) are not offered at all. A real session
     #: never carries this, whatever state it is in.
     demo: bool = False
-    verdict: VerdictSummary | None = None
+    #: The one result card the CLI block and the report table also print,
+    #: copied rather than re-derived. None when the run sealed no record to
+    #: copy from.
+    result_card: RunResultCard | None = Field(default=None, alias="resultCard")
     model: str | None = None
     steps: int | None = None
     step_budget: int | None = Field(
@@ -840,14 +835,8 @@ class ExecutionSessionDetail(WebModel):
     ci_comparison: CIComparisonSnapshot | None = Field(
         default=None, serialization_alias="ciComparison"
     )
-    ci_comparison_lines: list[str] = Field(
-        default_factory=list, serialization_alias="ciComparisonLines"
-    )
     task_completion: TaskCompletionSnapshot | None = Field(
         default=None, serialization_alias="taskCompletion"
-    )
-    task_completion_lines: list[str] = Field(
-        default_factory=list, serialization_alias="taskCompletionLines"
     )
     snapshot_status: str = Field(default="unavailable", serialization_alias="snapshotStatus")
     legacy: bool = False

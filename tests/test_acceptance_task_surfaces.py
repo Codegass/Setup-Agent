@@ -150,7 +150,20 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     item = _setup_artifact_item(orch, "sag-tvm")
     detail = _session_detail(item, "sag-tvm", None).model_dump(mode="json", by_alias=True)
     assert detail["taskCompletion"] == completion.model_dump(mode="json")
-    assert detail["taskCompletionLines"] == expected
+    # The Workbench serves the card rather than rendering it, so the same
+    # fragments the block and the report print are read out of the task row.
+    task = next(row for row in detail["resultCard"]["rows"] if row["key"] == "task")
+    task_text = " ".join(
+        [
+            task["status"],
+            task["headline"],
+            task["detail"] or "",
+            task["reason"] or "",
+            *task["items"],
+        ]
+    )
+    for fragment in _block_task_fragments(completion):
+        assert fragment in task_text
     authority = evidence_publication_authority_for(orch)
     head = authority.latest_head(VERDICT_LOGICAL_ARTIFACT_ID)
     authority.revoke_latest(

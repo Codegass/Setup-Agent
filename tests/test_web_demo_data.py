@@ -15,7 +15,7 @@ def test_demo_dashboard_matches_local_ui_demo_shape():
     assert "1.6.0" in f"{workspace.release} {workspace.tag}"
 
 
-def test_demo_session_contains_evidence_context_files_and_report():
+def test_demo_session_contains_evidence_context_card_and_report():
     detail = get_demo_session("CC-3")
 
     assert detail.id == "CC-3"
@@ -24,7 +24,7 @@ def test_demo_session_contains_evidence_context_files_and_report():
     assert detail.test.pass_rate == 97.5
     assert detail.evidence[0].source == "Project analyzer"
     assert detail.context is not None
-    assert detail.files is not None
+    assert detail.result_card is not None
     assert detail.report_doc is not None
 
 
@@ -68,8 +68,19 @@ def test_demo_session_locks_local_ui_demo_facts():
             }
         }
     }
-    assert detail.verdict is not None
-    assert "Build passed on 3 of 3 modules" in detail.verdict.headline
+    # The demo card is derived by the same builder the CLI block and the
+    # report table use, so it states the demo's own numbers, not a sentence
+    # written beside them.
+    card = detail.result_card
+    assert card is not None
+    assert card.verdict == "partial"
+    assert card.row("build").headline == "3/3 modules built"
+    assert card.row("tests").headline.startswith(
+        "320 executed · 312 passed · 8 failed"
+    )
+    assert card.row("report").status == "delivered"
+    # One attention item, counting the same eight failures the Tests row does.
+    assert [item.title for item in card.attention] == ["commons-cli-core · 8 failing"]
 
 
 def test_demo_session_detail_has_modules():
@@ -82,7 +93,7 @@ def test_demo_session_detail_has_modules():
     by_path = {m.path: m for m in detail.modules}
     assert by_path["validator"].build_status == "success"
     assert by_path["validator"].build_error_samples == []
-    assert by_path["core"].failing_count == 2
+    assert by_path["core"].failing_count == 8
     assert detail.module_summary.modules_with_test_failures == 1
 
 
