@@ -1,5 +1,7 @@
 """Each row states one measurement in the run's own words."""
 
+from sag.agent.control_events import canonical_sha256
+from sag.agent.java_success_certificates import evaluate_java_success_certificate
 from sag.agent.verdict_finalizer import (
     ReportDeliveryStatus,
     RunTermination,
@@ -7,15 +9,25 @@ from sag.agent.verdict_finalizer import (
     RunVerdictSnapshot,
 )
 from sag.result_card.models import ResultStats
-from sag.result_card.rows import build_row, coverage_row, setup_row, task_row, tests_row
+from sag.result_card.rows import (
+    build_row,
+    ci_row,
+    coverage_row,
+    report_row,
+    setup_row,
+    task_row,
+    tests_row,
+)
 
 from result_card_fakes import (
     CLEAN_TEST_COUNTS,
     RUN_ID,
+    attainment,
     module_metrics,
     phase_record,
     snapshot_dict,
 )
+from test_java_success_certificates import _obligations, _payload, _scope
 
 
 def _snapshot(**overrides) -> RunVerdictSnapshot:
@@ -341,3 +353,150 @@ def test_coverage_row_names_why_nothing_was_collected():
     assert row.status == "not collected"
     assert row.headline == "not collected"
     assert row.reason == "fixture coverage not collected"
+
+
+# A comparison only reaches "evaluated" while it still holds the certificate and
+# target digests that bound it, so the fixture carries a real certificate for
+# this run. No row reads it; it is what the snapshot requires to exist at all.
+_CI_TARGET_SHA = snapshot_dict()["ci_comparison"]["target_sha"]
+_CI_SCOPE = _scope(run_id=RUN_ID, target_sha=_CI_TARGET_SHA)
+
+
+def _bound_obligations(unit: str, ids: tuple[str, ...]):
+    """`_obligations` stamps its own epoch; this run's scope carries its own."""
+    return _obligations(unit, ids, ids, subject=_CI_SCOPE.subject).model_copy(
+        update={"evidence_epoch": _CI_SCOPE.evidence_epoch}
+    )
+
+
+_CI_CERTIFICATE_INPUT = _payload(
+    scope=_CI_SCOPE,
+    build_steps=_bound_obligations("build_plan_step", ("build-1",)),
+    build_units=_bound_obligations("single_maven_project", ("root",)),
+    test_steps=_bound_obligations("test_plan_step", ("test-1",)),
+    test_targets=_bound_obligations("single_test_project", ("root",)),
+    evidence_items=_bound_obligations(
+        "evidence_binding", ("plan", "build-receipt", "test-receipt")
+    ),
+)
+_CI_CERTIFICATE = evaluate_java_success_certificate(_CI_CERTIFICATE_INPUT)
+
+
+def _evaluated(**overrides) -> dict:
+    comparison = dict(snapshot_dict()["ci_comparison"])
+    comparison.update(
+        {
+            "status": "evaluated",
+            "certificate": _CI_CERTIFICATE,
+            "certificate_input_sha256": canonical_sha256(
+                _CI_CERTIFICATE_INPUT.model_dump(mode="json")
+            ),
+            "target_record_sha256": canonical_sha256(
+                {"repo": comparison["repo"], "sha": comparison["target_sha"]}
+            ),
+            "attainment": attainment(**overrides),
+            "acceptance_command": "mvn -B -f pom.xml -V clean test --batch-mode",
+            "receipt_ids": ["inv-maven-1-17c8a2e62d8a-0001"],
+            "reasons": [],
+        }
+    )
+    return comparison
+
+
+def test_ci_row_reports_a_met_comparison_with_its_denominator():
+    row = ci_row(_snapshot(ci_comparison=_evaluated()))
+    assert row.status == "met"
+    assert row.tone == "success"
+    assert row.headline == "met 523/523"
+    assert row.detail == (
+        'cell "Apache Jenkins commons-dbutils Linux JDK 17 #455" · lifecycle equivalent'
+    )
+
+
+def test_ci_row_names_missing_lifecycle_phases():
+    comparison = _evaluated(
+        lifecycle_parity={
+            "status": "not_equivalent",
+            "form": "maven_phases",
+            "ci_command": "mvn -V verify",
+            "sag_commands": ["mvn test"],
+            "ci_reach": "verify",
+            "sag_reach": "test",
+            "missing": ["package", "verify"],
+            "extra": [],
+        }
+    )
+    row = ci_row(_snapshot(ci_comparison=comparison))
+    assert row.detail.endswith("lifecycle not_equivalent · missing package, verify")
+
+
+def test_ci_row_without_a_scope_score_says_so():
+    # A build stated as a conclusion echoes no module universe, so the whole
+    # scope fraction goes with it.
+    comparison = _evaluated(
+        verdict="partial",
+        alpha=None,
+        alpha_build=None,
+        build_form="conclusion",
+        modules_matched=0,
+        modules_target=0,
+        modules_basis=None,
+    )
+    row = ci_row(_snapshot(ci_comparison=comparison))
+    assert row.headline == "partial · scope score unavailable"
+    assert row.tone == "attention"
+
+
+def test_ci_row_lists_findings_with_their_glosses():
+    comparison = _evaluated(
+        verdict="not_met",
+        clean=False,
+        red_observed=3,
+        unexpected_red_ids=["a.B#c", "a.B#d", "a.B#e"],
+        reason_codes=["NEW_RED_BEYOND_TARGET"],
+    )
+    row = ci_row(_snapshot(ci_comparison=comparison))
+    assert row.tone == "failed"
+    assert row.items[0] == "NEW_RED_BEYOND_TARGET: tests failed here that pass in CI"
+    assert row.items[1] == "red beyond CI: 3 tests"
+    assert "a.B#c" in row.items[2]
+
+
+def test_ci_row_not_compared_explains_itself():
+    row = ci_row(_snapshot())
+    assert row.status == "not compared"
+    assert row.tone == "neutral"
+    assert row.headline == "not compared"
+    assert row.reason == (
+        "no CI job on this commit matches the run's JDK and OS (official_ci_cell_not_matched)"
+    )
+
+
+def test_ci_row_without_any_comparison_at_all():
+    payload = snapshot_dict()
+    payload.pop("ci_comparison")
+    row = ci_row(RunVerdictSnapshot.model_validate(payload))
+    assert row.status == "not compared"
+    assert row.reason == "no CI job was supplied to compare against"
+
+
+def test_report_row_points_at_the_delivered_file():
+    row = report_row(_termination(), report_path="logs/session_x/setup-report-1.md")
+    assert row.status == "delivered"
+    assert row.tone == "neutral"
+    assert row.headline == "logs/session_x/setup-report-1.md"
+    assert row.refs == ("logs/session_x/setup-report-1.md",)
+
+
+def test_report_row_flags_a_failed_delivery():
+    row = report_row(_termination(delivery=ReportDeliveryStatus.FAILED))
+    assert row.status == "failed"
+    assert row.tone == "attention"
+    assert row.headline == "the setup report was not written"
+    assert row.reason == "the run result itself is unchanged"
+
+
+def test_report_row_without_a_termination_is_unavailable():
+    row = report_row(None)
+    assert row.status == "unavailable"
+    assert row.reason == "the run did not record whether a report was written"

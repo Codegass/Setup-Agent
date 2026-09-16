@@ -292,4 +292,142 @@ def coverage_row(snapshot: Any) -> ResultRow:
 
 
 
-__all__ = ["NOT_SUPPLIED", "build_row", "coverage_row", "setup_row", "task_row", "tests_row"]
+_CI_TONE: dict[str, Tone] = {
+    "met": "success",
+    "exceeded": "success",
+    "partial": "attention",
+    "not_met": "failed",
+    "invalid": "failed",
+}
+
+_MAX_RED_IDS = 10
+
+NOT_COMPARED = "not compared"
+
+_REPORT_TONE: dict[str, Tone] = {
+    "delivered": "neutral",
+    "skipped": "neutral",
+    "failed": "attention",
+    "unavailable": "attention",
+}
+
+
+def ci_row(snapshot: Any) -> ResultRow:
+    """How this run measures against the project's own CI on the same commit."""
+
+    comparison = getattr(snapshot, "ci_comparison", None)
+    if comparison is None:
+        return ResultRow(
+            key="ci",
+            label=ROW_LABELS["ci"],
+            status=NOT_COMPARED,
+            tone="neutral",
+            headline=NOT_COMPARED,
+            reason=gloss("official_ci_target_not_supplied"),
+        )
+
+    result = getattr(comparison, "attainment", None)
+    if str(comparison.status) != "evaluated" or result is None:
+        return ResultRow(
+            key="ci",
+            label=ROW_LABELS["ci"],
+            status=NOT_COMPARED,
+            tone="neutral",
+            headline=NOT_COMPARED,
+            reason=_first_reason(getattr(comparison, "reasons", ()))
+            or "the comparison produced no result",
+        )
+
+    verdict = str(result.verdict)
+    alpha = getattr(result, "alpha", None)
+    if alpha is not None:
+        headline = f"{verdict} {alpha.numerator:,}/{alpha.denominator:,}"
+    else:
+        headline = f"{verdict} · scope score unavailable"
+
+    parity = getattr(result, "lifecycle_parity", None)
+    detail_parts = []
+    if result.cell_id:
+        detail_parts.append(f'cell "{result.cell_id}"')
+    if parity is not None:
+        parity_text = f"lifecycle {parity.status}"
+        if parity.missing:
+            parity_text = f"{parity_text} · missing {', '.join(parity.missing)}"
+        if parity.extra:
+            parity_text = f"{parity_text} · extra {', '.join(parity.extra)}"
+        detail_parts.append(parity_text)
+
+    items = [f"{code}: {gloss(code)}" for code in getattr(result, "reason_codes", ()) or ()]
+    red_ids = tuple(getattr(result, "unexpected_red_ids", ()) or ())
+    if red_ids:
+        items.append(f"red beyond CI: {len(red_ids):,} tests")
+        shown = ", ".join(red_ids[:_MAX_RED_IDS])
+        if len(red_ids) > _MAX_RED_IDS:
+            shown = f"{shown}, +{len(red_ids) - _MAX_RED_IDS} more"
+        items.append(shown)
+
+    return ResultRow(
+        key="ci",
+        label=ROW_LABELS["ci"],
+        status=verdict,
+        tone=_CI_TONE.get(verdict, "attention"),
+        headline=headline,
+        detail=_join(*detail_parts) or None,
+        items=tuple(items),
+        refs=tuple(getattr(comparison, "receipt_ids", ()) or ()),
+    )
+
+
+def report_row(termination: Any | None, *, report_path: str | None = None) -> ResultRow:
+    """Whether the written setup report exists, and where."""
+
+    status = getattr(getattr(termination, "report_delivery_status", None), "value", None)
+    if status is None:
+        return ResultRow(
+            key="report",
+            label=ROW_LABELS["report"],
+            status="unavailable",
+            tone="attention",
+            headline="no report was recorded",
+            reason="the run did not record whether a report was written",
+        )
+    if status == "delivered":
+        headline = report_path or "written inside the container"
+        return ResultRow(
+            key="report",
+            label=ROW_LABELS["report"],
+            status=status,
+            tone="neutral",
+            headline=headline,
+            refs=(report_path,) if report_path else (),
+        )
+    if status == "failed":
+        return ResultRow(
+            key="report",
+            label=ROW_LABELS["report"],
+            status=status,
+            tone="attention",
+            headline="the setup report was not written",
+            reason="the run result itself is unchanged",
+        )
+    return ResultRow(
+        key="report",
+        label=ROW_LABELS["report"],
+        status=status,
+        tone="neutral",
+        headline="no report was requested",
+    )
+
+
+
+__all__ = [
+    "NOT_COMPARED",
+    "NOT_SUPPLIED",
+    "build_row",
+    "ci_row",
+    "coverage_row",
+    "report_row",
+    "setup_row",
+    "task_row",
+    "tests_row",
+]
