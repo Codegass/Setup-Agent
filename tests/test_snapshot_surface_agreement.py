@@ -6,6 +6,7 @@ from typing import get_args
 import pytest
 from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
 from result_card_fakes import (
+    CLEAN_TEST_COUNTS,
     RUN_ID,
     evaluated_ci_comparison,
     module_metrics,
@@ -1023,6 +1024,11 @@ _REPORT_ITEM_HEADINGS = {"task": "Required task steps", "ci": "Official CI findi
 #: differs by design; the lines under it must not.
 _TRAILING_LISTS = {"Needs attention": "Needs attention", "Notes": "Data notes"}
 
+#: What both surfaces label the line that says where the result came from. Each
+#: renderer keeps its own copy of the sentence under it; the label is how this
+#: file finds that sentence on either surface.
+_PROVENANCE_LABEL = "Record"
+
 _DELIVERED = RunTermination(
     termination=RunTerminationStatus.COMPLETED,
     report_delivery_status=ReportDeliveryStatus.DELIVERED,
@@ -1133,6 +1139,43 @@ _FENCE_RECORDS: dict[str, tuple[dict, dict]] = {
     # Nothing beside the record: every row that needs a sibling artifact states
     # its absence instead, and the surfaces must agree about that too.
     "a record with nothing beside it": (snapshot_dict(), {}),
+    # A schema-v3 record: it predates the rates block, the CI comparison and
+    # the required task, so the card marks it `verdict_source == "legacy"`.
+    # That is the only shape in which either renderer prints its provenance
+    # line, and each renderer spells that line from its own copy of the
+    # sentence (`_OLDER_RECORD`, in sag/console/result_block.py and in
+    # sag/result_card/markdown.py). Without a record of this shape the two
+    # copies are never compared and can drift apart unseen.
+    "a result reconstructed from an older record": (
+        snapshot_dict(
+            schema_version=3,
+            verdict="partial",
+            rates={},
+            ci_comparison=None,
+            task_completion=None,
+            conflicts=["test_execution_interrupted"],
+            build_evidence={
+                "observed": True,
+                "green": True,
+                "judgment": "success",
+                "source": "observations",
+                "outcome": "success",
+                "evidence_status": "verified",
+                "refs": [],
+            },
+            test_stats={
+                "discovered": 472,
+                "denominator_basis": "complete",
+                "unique": dict(CLEAN_TEST_COUNTS),
+                "raw": dict(CLEAN_TEST_COUNTS),
+                "flaky_count": 0,
+                "judgment": "partial",
+                "collection_errors": 0,
+                "receipt_scoped": True,
+            },
+        ),
+        {"termination": _DELIVERED, "report_path": "logs/session_old/setup-report.md"},
+    ),
 }
 
 
@@ -1379,12 +1422,19 @@ def test_the_web_payload_carries_the_same_rows_as_the_terminal(record):
     printed = _printed_rows(card)
     cells = _report_cells(card)
 
-    # The registry serialises the card and the read model validates it back
-    # (`_setup_artifact_item` and `_session_detail` above). Every row below is
-    # read off the far side of that hop and held against what the other two
-    # surfaces printed, so a field lost in transit and a renderer that drifted
-    # both fail here — and neither can pass by the payload agreeing with the
-    # object it was dumped from.
+    # The hop this leg reaches is the card's own: `model_dump(mode="json")`
+    # out to the JSON shape the API serves, `model_validate` back in. It does
+    # NOT run the registry — `_setup_artifact_item` and `_session_detail` are
+    # imported above for the tests further up this file, not for this one, and
+    # that the registry performs this same dump and validate is pinned in
+    # tests/test_web_session_registry.py, not here.
+    #
+    # What that still buys is not circular: every row below is read off the far
+    # side of the hop and held against `printed`, parsed back out of rendered
+    # terminal text, and `cells`, parsed back out of rendered Markdown. A field
+    # the JSON shape drops and a renderer that drifted from the card both fail
+    # here, because neither of the two surfaces it is compared against went
+    # through this hop.
     served = card.model_dump(mode="json")
     delivered = RunResultCard.model_validate(served)
 
@@ -1418,6 +1468,54 @@ def test_the_web_payload_carries_the_same_rows_as_the_terminal(record):
         assert _printed_items(row.items) == printed[key].items, _disagrees(
             _WEB, record, key, _printed_items(row.items), printed[key].items, against=_TERMINAL
         )
+
+
+def _printed_provenance(card) -> str | None:
+    """The block's `Record` line, or nothing when it printed none."""
+
+    head = GUTTER + LABEL_WIDTH
+    for line in _fence_block(card).splitlines():
+        if line[:GUTTER].isspace() and line[GUTTER:head].strip() == _PROVENANCE_LABEL:
+            return line[head:].strip()
+    return None
+
+
+def _written_provenance(card) -> str | None:
+    """The report's `**Record**` line, or nothing when it wrote none."""
+
+    prefix = f"**{_PROVENANCE_LABEL}** — "
+    for line in render_result_card_markdown(card):
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return None
+
+
+@pytest.mark.parametrize("record", list(_FENCE_RECORDS))
+def test_every_surface_says_the_same_thing_about_where_the_result_came_from(record):
+    """A result rebuilt from an older record is worth less, and says so identically.
+
+    Each renderer keeps its own copy of that sentence, so nothing but a record
+    of this shape reaching both of them stops the copies drifting apart: one
+    surface would go on calling a reconstruction a reading, and only a reader
+    holding a terminal beside a report would ever notice.
+    """
+
+    card = _fence_card(record)
+    printed = _printed_provenance(card)
+    written = _written_provenance(card)
+    legacy = card.verdict_source == "legacy"
+
+    assert (printed is not None) is legacy, (
+        f"{_TERMINAL} {'omits' if printed is None else 'prints'} a Record line for {record}, "
+        f"whose card is {card.verdict_source!r}; it states one for a legacy record and no other"
+    )
+    assert (written is not None) is legacy, (
+        f"{_REPORT} {'omits' if written is None else 'writes'} a Record line for {record}, "
+        f"whose card is {card.verdict_source!r}; it states one for a legacy record and no other"
+    )
+    assert printed == written, _disagrees(
+        _TERMINAL, record, "record provenance", printed, written, against=_REPORT
+    )
 
 
 @pytest.mark.parametrize("record", list(_FENCE_RECORDS))
