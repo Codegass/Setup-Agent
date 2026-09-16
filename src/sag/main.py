@@ -61,6 +61,10 @@ def _render_setup_cli_result(
     module_metrics: Mapping[str, Any] | None = None,
     report_metrics: Mapping[str, Any] | None = None,
     run_pin: Mapping[str, Any] | None = None,
+    trajectory_session: Mapping[str, Any] | None = None,
+    turn_count: int | None = None,
+    tool_calls: int | None = None,
+    tool_failures: int | None = None,
     container: str | None = None,
     session_dir: str | None = None,
     report_path: str | None = None,
@@ -72,6 +76,10 @@ def _render_setup_cli_result(
         module_metrics=module_metrics,
         report_metrics=report_metrics,
         run_pin=run_pin,
+        trajectory_session=trajectory_session,
+        turn_count=turn_count,
+        tool_calls=tool_calls,
+        tool_failures=tool_failures,
         termination=termination,
         project=project_name,
         container=container,
@@ -97,6 +105,72 @@ def _read_module_metrics_for_cli(orchestrator: DockerOrchestrator) -> Mapping[st
     except ValueError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _report_name_for_block(report_path: str | None, session_dir: str | None) -> str | None:
+    """Name the report the way the block has room to print it.
+
+    The Evidence line directly above names the session directory, so a report
+    copied into it is named by its file rather than by a path several times
+    wider than the column, which would break the row it is printed in.
+    """
+
+    if not report_path or not session_dir:
+        return report_path
+    try:
+        return str(Path(report_path).relative_to(session_dir))
+    except ValueError:
+        return report_path
+
+
+def _read_run_pin_for_cli(session_logger: Any) -> Mapping[str, Any] | None:
+    """Read the host's run pin, or nothing when this run did not write one."""
+
+    if session_logger is None:
+        return None
+    try:
+        parsed = json.loads(Path(session_logger.run_pin_path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _read_run_counts_for_cli(session_dir: str | None) -> dict[str, Any]:
+    """Fold the session's own ledger into the counts the result block states.
+
+    Every count is absent unless the ledger supplied it: a run whose turns were
+    never recorded reports no turns, not zero turns, and a session directory
+    that cannot be read leaves the whole group absent rather than raising.
+    """
+
+    counts: dict[str, Any] = {
+        "trajectory_session": None,
+        "turn_count": None,
+        "tool_calls": None,
+        "tool_failures": None,
+    }
+    if not session_dir:
+        return counts
+    try:
+        document = build_trajectory(session_dir)
+    except Exception as exc:
+        logger.debug(f"run counts for the result block are unavailable: {exc}")
+        return counts
+
+    counts["trajectory_session"] = document.session.model_dump(mode="json")
+    # `list` is this module's `sag list` command, not the builtin.
+    turns = tuple(document.turns)
+    if not turns:
+        return counts
+    counts["turn_count"] = len(turns)
+    counts["tool_calls"] = sum(1 for turn in turns if turn.call is not None)
+    counts["tool_failures"] = sum(
+        1
+        for turn in turns
+        if turn.observation is not None
+        and (turn.observation.error_code or turn.observation.failure_signature)
+    )
+    return counts
 
 
 def _read_metrics_v2_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
@@ -227,18 +301,24 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
         return None
 
 
-def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:
+def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> str | None:
     """Copy setup artifacts from Docker container to local session logs.
+
+    Returns the host path of the setup report that was copied, so the result
+    block can name the file a reader can actually open. ``None`` whenever no
+    report reached the host, for any reason; copying is best-effort and never
+    fails the run.
 
     Args:
         orchestrator: Docker orchestrator for the project
         project_name: Name of the project
     """
+    copied_report: str | None = None
     try:
         session_logger = get_session_logger()
         if not session_logger:
             logger.warning("No session logger available, skipping artifact save")
-            return
+            return None
 
         # Get the session log directory
         session_dir = session_logger.session_log_dir
@@ -257,8 +337,10 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
             copy_cmd = (
                 f"docker cp {orchestrator.container_name}:/workspace/.setup_agent {session_dir}/"
             )
-            import subprocess
-
+            # `subprocess` is imported at module scope. A second import here
+            # made the name local to this whole function, so a container with
+            # no `.setup_agent` folder left the report copy below reading an
+            # unbound local and losing every report it was asked to save.
             result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
                 logger.info("✅ Copied .setup_agent folder from container")
@@ -285,6 +367,7 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
                     result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
                     if result.returncode == 0:
                         logger.info(f"✅ Copied {filename} from container")
+                        copied_report = str(session_dir / filename)
                     else:
                         logger.warning(f"Failed to copy {filename}: {result.stderr}")
         else:
@@ -296,6 +379,7 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
         logger.error(f"Failed to save artifacts: {e}")
         # Don't fail the main operation if artifact saving fails
         console.print(f"[yellow]⚠️ Could not save artifacts: {e}[/yellow]")
+    return copied_report
 
 
 def _detect_coverage_build_system(orchestrator, project_dir: str):
@@ -695,19 +779,27 @@ def project(
         snapshot = read_live_verdict_snapshot(orchestrator)
         session_logger = get_session_logger()
         session_dir = str(session_logger.session_log_dir) if session_logger else None
+
+        # The block names the report a reader can open, so the copy has to have
+        # happened before the block is built.
+        report_path = _save_setup_artifacts(orchestrator, project_name) if record else None
+
+        run_counts = _read_run_counts_for_cli(session_dir)
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
             project_name,
             module_metrics=_read_module_metrics_for_cli(orchestrator),
             report_metrics=_read_metrics_v2_for_cli(orchestrator),
+            run_pin=_read_run_pin_for_cli(session_logger),
+            trajectory_session=run_counts["trajectory_session"],
+            turn_count=run_counts["turn_count"],
+            tool_calls=run_counts["tool_calls"],
+            tool_failures=run_counts["tool_failures"],
             container=docker_name,
             session_dir=session_dir,
+            report_path=_report_name_for_block(report_path, session_dir),
         )
-
-        # Save artifacts if recording is enabled
-        if record:
-            _save_setup_artifacts(orchestrator, project_name)
 
         console.print(cli_result)
 

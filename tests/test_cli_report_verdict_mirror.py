@@ -64,6 +64,7 @@ def test_snapshot_success_cannot_be_demoted_by_report_delivery_failure():
         "demo",
     )
 
+    assert " Setup         [green]success[/green]" in output
     assert "Setup verdict" not in output
     assert "the setup report was not written" in output
     assert exit_code == 0

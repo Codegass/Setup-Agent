@@ -24,7 +24,11 @@ _TONE_STYLE: dict[Tone, str] = {
     "neutral": "dim",
 }
 
-_NEXT_STEPS = "uv run sag ui · uv run sag result {target}"
+#: `sag inspect` takes a container name and `sag trajectory` takes a session
+#: directory. One template for both would name a real command with the wrong
+#: kind of argument half the time, so each argument gets its own line.
+_NEXT_CONTAINER = "uv run sag ui · uv run sag inspect {container} --phase build"
+_NEXT_SESSION = "uv run sag ui · uv run sag trajectory {session_dir}"
 _ITEM_BULLET = "· "
 _OLDER_RECORD = "reconstructed from an older run record"
 _ELLIPSIS = "…"
@@ -137,17 +141,13 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
             )
             if text
         ]
-        body.extend(
-            (f"{_ITEM_BULLET}{item}", item_indent) for item in row.items[:_MAX_ITEMS]
-        )
+        body.extend((f"{_ITEM_BULLET}{item}", item_indent) for item in row.items[:_MAX_ITEMS])
         if len(row.items) > _MAX_ITEMS:
             body.append((f"{_ITEM_BULLET}+{len(row.items) - _MAX_ITEMS} more", item_indent))
 
         # One body column: everything the row says starts at the same edge.
         wrapped = [
-            line
-            for text, hanging in body
-            for line in _wrap(text, body_width, body_indent, hanging)
+            line for text, hanging in body for line in _wrap(text, body_width, body_indent, hanging)
         ]
         wrapped = wrapped or [body_indent]
         lines.append(head + wrapped[0][len(body_indent) :])
@@ -164,9 +164,12 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
     if card.session_dir:
         lines.extend(_labelled("Evidence", card.session_dir, width))
 
-    target = card.container or card.session_dir
-    if target:
-        lines.extend(_labelled("Next", _NEXT_STEPS.format(target=target), width))
+    # A run with neither gets no Next line: a command printed without its
+    # argument is not a command the reader can run.
+    if card.container:
+        lines.extend(_labelled("Next", _NEXT_CONTAINER.format(container=card.container), width))
+    elif card.session_dir:
+        lines.extend(_labelled("Next", _NEXT_SESSION.format(session_dir=card.session_dir), width))
 
     if card.notes:
         lines.append(f"{' ' * GUTTER}Notes")

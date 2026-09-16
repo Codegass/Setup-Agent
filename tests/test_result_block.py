@@ -114,14 +114,59 @@ def test_a_reconstructed_result_says_so_and_a_current_one_does_not():
 def test_evidence_and_next_lines_close_the_block():
     text = _plain(_card())
     assert " Evidence      logs/session_20260914_210609\n" in text
-    assert " Next          uv run sag ui · uv run sag result sag-commons-cli\n" in text
+    assert (
+        " Next          uv run sag ui · uv run sag inspect sag-commons-cli --phase\n"
+        "               build\n"
+    ) in text
+
+
+def _next_value(text: str) -> str | None:
+    """The Next line's value, rejoined across the wrap; ``None`` when absent."""
+
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line[1:15].strip() != "Next":
+            continue
+        parts = [line[15:].strip()]
+        for follow in lines[index + 1 :]:
+            if not follow.startswith(" " * 15):
+                break
+            parts.append(follow.strip())
+        return " ".join(parts)
+    return None
+
+
+def test_the_next_line_names_a_command_that_takes_the_argument_the_card_carries():
+    """`sag inspect` takes a container name; `sag trajectory` takes a session dir."""
+
+    from sag.main import cli
+
+    with_container = _plain(_card())
+    only_session = _plain(_card(container=None))
+    neither = _plain(_card(container=None, session_dir=None))
+
+    assert _next_value(with_container) == (
+        "uv run sag ui · uv run sag inspect sag-commons-cli --phase build"
+    )
+    assert _next_value(only_session) == (
+        "uv run sag ui · uv run sag trajectory logs/session_20260914_210609"
+    )
+    # Neither argument means no command to print, rather than one missing its
+    # argument.
+    assert _next_value(neither) is None
+
+    # Every command the block names is a command the CLI actually registers.
+    assert {"ui", "inspect", "trajectory"} <= set(cli.commands)
+    for text in (with_container, only_session, neither):
+        assert "sag result" not in text
 
 
 def test_a_long_container_name_wraps_under_its_label():
     text = _plain(_card(container="sag-advisor-high20-r2-terra-high-commons-cli-20260914"))
     assert (
-        " Next          uv run sag ui · uv run sag result\n"
-        "               sag-advisor-high20-r2-terra-high-commons-cli-20260914\n"
+        " Next          uv run sag ui · uv run sag inspect\n"
+        "               sag-advisor-high20-r2-terra-high-commons-cli-20260914 --phase\n"
+        "               build\n"
     ) in text
 
 
