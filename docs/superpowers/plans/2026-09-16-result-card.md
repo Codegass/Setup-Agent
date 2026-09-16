@@ -2657,6 +2657,8 @@ Create `tests/test_result_card_markdown.py`:
 ```python
 """The report's Result section is the same seven rows as the terminal block."""
 
+import re
+
 from sag.result_card.build import build_result_card
 from sag.result_card.markdown import render_result_card_markdown
 
@@ -2716,7 +2718,9 @@ def test_pipes_inside_a_command_do_not_break_the_table():
         }
     )
     row = next(line for line in _lines(snapshot=snapshot) if "**Required task**" in line)
-    assert row.count("|") == 4
+    # An escaped pipe is still a `|` character, so count the column separators:
+    # every pipe that is not preceded by a backslash.
+    assert len(re.findall(r"(?<!\\)\|", row)) == 4
     assert r"\|" in row
 
 
@@ -3139,7 +3143,12 @@ Apply it by splitting each line from `format_evidence_layer_lines` on its first 
 - [ ] **Step 5: Run the report tests**
 
 Run: `PYTHONPATH=.:tests uv run pytest tests/test_report_honesty.py tests/test_report_tool_metrics_artifact.py tests/test_snapshot_surface_agreement.py -v`
-Expected: PASS. `test_report_honesty.py`'s existing four-line block assertion (around line 221) must be rewritten to assert the new table's rows; keep it asserting the same facts, not the same formatting.
+Expected: PASS after two edits to `tests/test_report_honesty.py`:
+
+- the four-line block assertion around line 221 is rewritten to assert the new table's rows — keep it asserting the same facts, not the same formatting;
+- line 806's `assert lines[0] == "## 🧾 Metrics-v2 Evidence Layers"` becomes `assert lines[0] == "## Evidence accounting"`, and the `"Claimed latest subjects: unavailable"` assertion below it becomes the new label, `"Test classes identified by module and name"`.
+
+Both are the only places in the repo outside `report_tool.py` that pin those strings (`grep -rn "Metrics-v2 Evidence Layers" src tests`).
 
 - [ ] **Step 6: Commit**
 
