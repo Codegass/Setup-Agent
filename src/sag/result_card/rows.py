@@ -138,4 +138,158 @@ def task_row(snapshot: Any) -> ResultRow:
     )
 
 
-__all__ = ["NOT_SUPPLIED", "setup_row", "task_row"]
+_TEST_JUDGMENT_WORD = {
+    "success": "executed",
+    "partial": "interrupted",
+    "failed": "failed to run",
+    "unknown": "unavailable",
+}
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
+    """What compiled, with the module count marked as the diagnostic it is."""
+
+    evidence = snapshot.build_evidence
+    judgment = str(evidence.judgment)
+    succeeded = evidence.reactor_modules_succeeded
+    total = evidence.reactor_modules_total
+    if total:
+        headline = f"{succeeded or 0}/{total} modules built"
+    else:
+        headline = judgment
+
+    rollup = _mapping(_mapping(module_metrics).get("module_summary"))
+    jars = None
+    for module in _mapping(module_metrics).get("modules") or ():
+        count = module.get("jar_count") if isinstance(module, dict) else None
+        if isinstance(count, int):
+            jars = (jars or 0) + count
+    pieces = []
+    if evidence.compiled_classes is not None:
+        pieces.append(f"{evidence.compiled_classes:,} class files")
+    if jars is not None:
+        pieces.append(f"{jars:,} jars")
+    if rollup.get("modules_failed"):
+        pieces.append(f"{rollup['modules_failed']:,} modules failed")
+    detail = _join(*pieces)
+    if detail:
+        detail = f"{detail} · counts are diagnostic, CI defines scope"
+
+    reason = None
+    if judgment == "unknown":
+        reason = "no build result was recorded for this run"
+
+    return ResultRow(
+        key="build",
+        label=ROW_LABELS["build"],
+        status=judgment,
+        tone=_VERDICT_TONE.get(judgment, "attention"),
+        headline=headline,
+        detail=detail or None,
+        reason=reason,
+        refs=tuple(evidence.refs or ())[:12],
+    )
+
+
+def _lower_bounded(report_metrics: Any) -> bool:
+    """True when the run's own accounting says its execution total is a floor."""
+
+    layers = _mapping(_mapping(report_metrics).get("tests"))
+    executions = _mapping(_mapping(layers.get("claimed")).get("receipt_executions"))
+    return executions.get("availability") == "partial" and executions.get("bound") == "lower"
+
+
+def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
+    """How many tests ran and how they came out, with skips out of the rate."""
+
+    stats = snapshot.test_stats
+    unique = stats.unique
+    raw = stats.raw
+    judgment = str(stats.judgment)
+    status = _TEST_JUDGMENT_WORD.get(judgment, "unavailable")
+
+    if unique.executed <= 0:
+        return ResultRow(
+            key="tests",
+            label=ROW_LABELS["tests"],
+            status="unavailable",
+            tone="attention",
+            headline="no test results were recorded",
+            reason="the run recorded no test outcomes",
+        )
+
+    bound = "≥" if _lower_bounded(report_metrics) else ""
+    headline = (
+        f"{bound}{unique.executed:,} executed · {unique.passed:,} passed · "
+        f"{unique.failed:,} failed · {unique.errors:,} errors · {unique.skipped:,} skipped"
+    )
+
+    non_skipped = unique.passed + unique.failed + unique.errors
+    red = unique.failed + unique.errors
+    rate_text = None
+    if non_skipped > 0:
+        percent = unique.passed / non_skipped * 100.0
+        if red and percent >= 99.95:
+            rate_text = "<100% of non-skipped passed"
+        elif percent >= 99.95:
+            rate_text = "100% of non-skipped passed"
+        else:
+            rate_text = f"{percent:.1f}% of non-skipped passed"
+    raw_text = None
+    if raw.executed and raw.executed != unique.executed:
+        raw_text = f"{raw.executed:,} raw executions"
+
+    if status == "failed to run":
+        tone: Tone = "failed"
+    elif status == "interrupted" or red > 0 or status == "unavailable":
+        tone = "attention"
+    else:
+        tone = "success"
+
+    return ResultRow(
+        key="tests",
+        label=ROW_LABELS["tests"],
+        status=status,
+        tone=tone,
+        headline=headline,
+        detail=_join(rate_text, raw_text) or None,
+    )
+
+
+# pytest collects any imported module-level name matching `test*`, and every
+# test module that renders this row imports it by name (cf. TestStats in
+# sag/evidence.py).
+tests_row.__test__ = False
+
+
+def coverage_row(snapshot: Any) -> ResultRow:
+    """Line coverage when it was collected, and why not when it was not."""
+
+    coverage = _mapping(_mapping(snapshot.rates).get("coverage"))
+    if coverage.get("status") == "collected" and coverage.get("line_rate") is not None:
+        source = str(coverage.get("source") or "").strip()
+        return ResultRow(
+            key="coverage",
+            label=ROW_LABELS["coverage"],
+            status="collected",
+            tone="neutral",
+            headline=f"{float(coverage['line_rate']):g}% line coverage",
+            detail=f"source {source}" if source else None,
+        )
+    reason = str(coverage.get("reason") or "").strip() or "coverage was not collected"
+    return ResultRow(
+        key="coverage",
+        label=ROW_LABELS["coverage"],
+        status="not collected",
+        tone="neutral",
+        headline="not collected",
+        reason=reason,
+    )
+
+
+
+__all__ = ["NOT_SUPPLIED", "build_row", "coverage_row", "setup_row", "task_row", "tests_row"]
