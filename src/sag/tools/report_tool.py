@@ -974,11 +974,18 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         if not self.docker_orchestrator:
             return None
-        try:
-            from sag.runtime.container_io import read_container_text
+        from sag.runtime.container_io import ContainerFileReadError, read_container_text
 
+        try:
             text = read_container_text(self.docker_orchestrator, MODULE_METRICS_PATH)
-        except Exception as exc:  # pragma: no cover - defensive
+        except (OSError, ValueError, ContainerFileReadError) as exc:
+            # Exactly the three ways a FILE can be unreadable: the host refused
+            # the read, the bytes did not decode, or the container could not be
+            # asked. A broad `except` here also swallows a wrong-arity or
+            # wrong-keyword call to the reader, and the report then loses its
+            # jar count and every failing-test bullet with the whole suite
+            # green — the same silent kill this feature already survived once
+            # in the web registry. A TypeError is a bug, and it surfaces.
             logger.debug(f"module metrics unavailable for the result card: {exc}")
             return None
         if not text:
@@ -1016,10 +1023,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             termination=RunTerminationStatus.COMPLETED,
             report_delivery_status=ReportDeliveryStatus.DELIVERED,
         )
+        # Read outside the guard below: that guard is for a record the card
+        # cannot read, and it catches TypeError. Leaving the reader inside it
+        # would put the narrowing above straight back — a wrong-arity call
+        # would raise into this `except` and cost the report its whole Result
+        # section instead of raising.
+        module_metrics = self._read_module_metrics_payload()
         try:
             return build_result_card(
                 payload,
-                module_metrics=self._read_module_metrics_payload(),
+                module_metrics=module_metrics,
                 report_metrics=(snapshot or {}).get("metrics_v2"),
                 termination=delivered,
                 project=project,
