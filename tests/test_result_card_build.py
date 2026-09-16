@@ -150,6 +150,31 @@ def test_failing_names_are_capped_with_a_remainder():
     assert failing.detail.endswith("+3 more")
 
 
+def test_one_module_metrics_payload_reaches_every_reader_of_it():
+    """A read-only view of the file is the same file, to both readers of it.
+
+    `build_row` and `_attention` each narrow the payload themselves. While one
+    accepted any `Mapping` and the other only a `dict`, a caller handing over a
+    `MappingProxyType` got a card that raised the file's failing-test bullets
+    and dropped the file's jar count out of the build row in the same breath —
+    one artifact, two answers, and no failure anywhere to say so.
+    """
+
+    from types import MappingProxyType
+
+    metrics = module_metrics()
+    metrics["modules"][0].update(
+        {"tests_failed": 2, "failing_count": 2, "failing_names": ["a.BTest#one"]}
+    )
+    payload = snapshot_dict(verdict="partial")
+    plain = build_result_card(payload, module_metrics=metrics)
+    frozen = build_result_card(payload, module_metrics=MappingProxyType(metrics))
+
+    assert "4 jars" in plain.row("build").detail
+    assert frozen.row("build") == plain.row("build")
+    assert frozen.attention == plain.attention
+
+
 def test_a_failed_report_delivery_needs_attention():
     card = build_result_card(
         snapshot_dict(), termination=_termination(ReportDeliveryStatus.FAILED)

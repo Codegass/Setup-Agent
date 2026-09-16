@@ -6,7 +6,7 @@ a count always comes from the seal or a sealed sibling artifact.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from sag.result_card.glosses import gloss
 from sag.result_card.models import ROW_LABELS, ResultRow, ResultStats, Tone
@@ -152,7 +152,16 @@ _TEST_JUDGMENT_WORD = {
 
 
 def _mapping(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
+    """Any mapping read as a plain dict; anything else read as nothing.
+
+    ``Mapping``, not ``dict``: the sibling artifacts arrive from whichever
+    caller read them, and a read-only view of a payload is the same payload.
+    A narrower test here than the one `sag.result_card.build` applies would
+    drop a count out of a row while the same payload still raised an
+    attention item — the card saying two different things about one file.
+    """
+
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
@@ -172,7 +181,7 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
     rollup = _mapping(_mapping(module_metrics).get("module_summary"))
     jars = None
     for module in _mapping(module_metrics).get("modules") or ():
-        count = module.get("jar_count") if isinstance(module, dict) else None
+        count = module.get("jar_count") if isinstance(module, Mapping) else None
         if isinstance(count, int):
             jars = (jars or 0) + count
     pieces = []
@@ -191,6 +200,13 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
     reason = None
     if judgment == "unknown":
         reason = "no build result was recorded for this run"
+    elif headline == judgment and not detail:
+        # Nothing was counted anywhere: no reactor fraction, no class files,
+        # no jars. A non-reactor project and a build read back from
+        # observations both land here, and the row would otherwise be a
+        # status word beside an empty column — a blank a reader has to read
+        # as either zero or unknown. The row states which one it is.
+        reason = "the run recorded no module or class counts"
 
     return ResultRow(
         key="build",
@@ -202,6 +218,20 @@ def build_row(snapshot: Any, *, module_metrics: Any = None) -> ResultRow:
         reason=reason,
         refs=tuple(evidence.refs or ())[:12],
     )
+
+
+def _test_tone(status: str, *, red: int = 0) -> Tone:
+    """One rule for the tests row's colour, whether or not anything ran.
+
+    Kept in one place so a row with nothing to count cannot be coloured by a
+    different rule than the same judgment with counts behind it.
+    """
+
+    if status == "failed to run":
+        return "failed"
+    if status == "interrupted" or red > 0 or status == "unavailable":
+        return "attention"
+    return "success"
 
 
 def _lower_bounded(report_metrics: Any) -> bool:
@@ -222,13 +252,19 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
     status = _TEST_JUDGMENT_WORD.get(judgment, "unavailable")
 
     if unique.executed <= 0:
+        # Nothing to count is not the same as nothing decided. A record that
+        # sealed `failed` or `partial` here judged an execution that produced
+        # no rows; calling that `unavailable` would be the card re-judging the
+        # run, and it turns a red row yellow. The word comes from the seal;
+        # only a judgment the seal never made reads `unavailable`, and that
+        # row says why.
         return ResultRow(
             key="tests",
             label=ROW_LABELS["tests"],
-            status="unavailable",
-            tone="attention",
+            status=status,
+            tone=_test_tone(status),
             headline="no test results were recorded",
-            reason="the run recorded no test outcomes",
+            reason="the run recorded no test outcomes" if status == "unavailable" else None,
         )
 
     bound = "≥" if _lower_bounded(report_metrics) else ""
@@ -252,12 +288,7 @@ def tests_row(snapshot: Any, *, report_metrics: Any = None) -> ResultRow:
     if raw.executed and raw.executed != unique.executed:
         raw_text = f"{raw.executed:,} raw executions"
 
-    if status == "failed to run":
-        tone: Tone = "failed"
-    elif status == "interrupted" or red > 0 or status == "unavailable":
-        tone = "attention"
-    else:
-        tone = "success"
+    tone = _test_tone(status, red=red)
 
     # The counts are real and stay in the headline; what is missing is the
     # run's word for them, and an unavailable row never leaves that unsaid.

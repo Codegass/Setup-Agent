@@ -217,6 +217,7 @@ def test_build_row_without_a_reactor_count_states_the_word():
     assert row.tone == "failed"
     assert row.headline == "failed"
     assert row.detail is None
+    assert row.reason == "the run recorded no module or class counts"
 
 
 def test_build_row_will_not_invent_a_module_numerator():
@@ -256,6 +257,68 @@ def test_build_row_unknown_judgment_states_a_reason():
     row = build_row(snapshot)
     assert row.status == "unknown"
     assert row.reason == "no build result was recorded for this run"
+
+
+def test_build_row_with_nothing_counted_says_so_rather_than_printing_a_blank():
+    """A non-reactor project counts no modules; an observed build counts no classes.
+
+    Both land on a row whose headline is only its status word, so without this
+    the report prints `| **Build** | success | — |` and the block prints an
+    empty body column: a reader cannot tell a zero from an absence, which is
+    the one thing the card exists to keep apart.
+    """
+
+    snapshot = _snapshot(
+        build_evidence={
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "observations",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "refs": [],
+        }
+    )
+    row = build_row(snapshot)
+    assert row.status == "success"
+    assert row.headline == "success"
+    assert row.detail is None
+    assert row.reason == "the run recorded no module or class counts"
+
+
+def test_build_row_with_any_count_at_all_keeps_stating_the_count():
+    """The absence line is for a row with nothing; a counted row is untouched."""
+
+    snapshot = _snapshot(
+        build_evidence={
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "physical",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "refs": [],
+            "compiled_classes": 119,
+        }
+    )
+    row = build_row(snapshot)
+    assert row.detail == "119 class files · counts are diagnostic, CI defines scope"
+    assert row.reason is None
+    # And the same row when the only count comes from the sibling artifact.
+    bare = _snapshot(
+        build_evidence={
+            "observed": True,
+            "green": True,
+            "judgment": "success",
+            "source": "observations",
+            "outcome": "success",
+            "evidence_status": "verified",
+            "refs": [],
+        }
+    )
+    with_jars = build_row(bare, module_metrics=module_metrics())
+    assert with_jars.detail == "4 jars · counts are diagnostic, CI defines scope"
+    assert with_jars.reason is None
 
 
 def test_tests_row_reports_counts_and_the_non_skipped_rate():
@@ -343,6 +406,54 @@ def test_tests_row_says_when_no_tests_ran():
     assert row.tone == "attention"
     assert row.headline == "no test results were recorded"
     assert row.reason == "the run recorded no test outcomes"
+
+
+def test_a_sealed_failure_with_nothing_to_count_keeps_the_word_the_run_sealed():
+    """`verdict_finalizer` seals `failed` whenever the execution state failed.
+
+    It does that whether or not any report parsed, so this exact shape — a
+    sealed `failed` with five zero counts — is what a run that could not run
+    its tests writes. Reading the counts first and calling the row
+    `unavailable` is the card judging instead of copying, and it turns a red
+    row yellow on all three surfaces at once.
+    """
+
+    zero = {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+    snapshot = _snapshot(
+        verdict="failed",
+        test_stats={
+            "discovered": 0,
+            "denominator_basis": "complete",
+            "unique": zero,
+            "raw": zero,
+            "flaky_count": 0,
+            "judgment": "failed",
+            "receipt_scoped": True,
+        },
+    )
+    row = tests_row(snapshot)
+    assert row.status == "failed to run"
+    assert row.tone == "failed"
+    assert row.headline == "no test results were recorded"
+
+
+def test_a_sealed_interruption_with_nothing_to_count_keeps_its_own_word_too():
+    zero = {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+    snapshot = _snapshot(
+        verdict="partial",
+        test_stats={
+            "discovered": 472,
+            "denominator_basis": "partial",
+            "unique": zero,
+            "raw": zero,
+            "flaky_count": 0,
+            "judgment": "partial",
+            "receipt_scoped": True,
+        },
+    )
+    row = tests_row(snapshot)
+    assert row.status == "interrupted"
+    assert row.tone == "attention"
 
 
 def test_interrupted_tests_keep_their_prefix_counts():
