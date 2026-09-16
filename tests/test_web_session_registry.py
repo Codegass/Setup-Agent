@@ -11,6 +11,8 @@ from sag.agent.verdict_finalizer import (
     SnapshotTestCounts,
     SnapshotTestStats,
 )
+from test_snapshot_surface_agreement import snapshot_factory  # noqa: F401
+
 from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.web.models import DockerSummary, WorkspaceSummary
 from sag.web.session_registry import (
@@ -1106,3 +1108,110 @@ def test_resolve_logs_root_skips_empty_subdir_logs(tmp_path, monkeypatch):
     monkeypatch.delenv("SAG_LOG_DIR", raising=False)
     monkeypatch.chdir(tmp_path / "webui")
     assert _resolve_logs_root() == tmp_path / "logs"
+
+
+
+def _card_session_dir(tmp_path, run_id, *, ledger: str | None) -> Path:
+    """A host session directory for `run_id`, with or without its control ledger.
+
+    The ledger fixture names no run, so the directory is identified by the run
+    pin beside it — which is also what a run whose ledger never landed leaves
+    behind, and that is the case worth fencing.
+    """
+    from container_evidence_fakes import complete_run_pin
+
+    from sag.agent.control_events import canonical_json
+
+    logs_root = tmp_path / "logs"
+    session_dir = logs_root / "session_20260717_120000_000000_aaaaaaaaaaaa_1"
+    session_dir.mkdir(parents=True)
+    (session_dir / "command_project_tvm.log").write_text("tvm", encoding="utf-8")
+    (session_dir / "run-pin.json").write_text(
+        canonical_json(complete_run_pin(run_id, "a" * 40)), encoding="utf-8"
+    )
+    if ledger is not None:
+        (session_dir / "control_events.jsonl").write_text(ledger, encoding="utf-8")
+    return logs_root
+
+
+def _card_for_session(snapshot, logs_root):
+    """The card `_setup_artifact_item` builds for a run with a sealed record."""
+    from test_snapshot_surface_agreement import (
+        VERDICT_PATH,
+        SnapshotOrchestrator,
+        _phase_trunk,
+    )
+
+    from sag.result_card.models import RunResultCard
+    from sag.web.session_registry import _setup_artifact_item
+
+    item = _setup_artifact_item(
+        SnapshotOrchestrator(
+            {
+                VERDICT_PATH: snapshot.model_dump_json(),
+                "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+            }
+        ),
+        "sag-tvm",
+        logs_root,
+    )
+    assert item is not None and item["snapshot_status"] == "valid"
+    assert isinstance(item["result_card"], dict)
+    return RunResultCard.model_validate(item["result_card"])
+
+
+def test_card_states_the_run_counts_its_own_ledger_recorded(tmp_path, snapshot_factory):
+    """The Workbench reads the same ledger the result block does, and says so.
+
+    Two turns, both carrying a call, one of them answered by a failure: the same
+    three numbers the CLI block prints for the same directory, plus the wall
+    clock and the model the run pin beside it names.
+    """
+    from test_trajectory_reducer import REAL_FAILED_CALL_JSONL, REAL_TRIPLE_JSONL
+
+    ledger = REAL_TRIPLE_JSONL.strip() + "\n" + REAL_FAILED_CALL_JSONL.strip() + "\n"
+    snapshot = snapshot_factory()
+    card = _card_for_session(
+        snapshot, _card_session_dir(tmp_path, snapshot.run_id, ledger=ledger)
+    )
+
+    assert card.stats.turns == 2
+    assert card.stats.tool_calls == 2
+    assert card.stats.tool_failures == 1
+    assert card.stats.wall_clock_seconds == 27.690511
+    assert card.stats.model == "test-action-model"
+    assert card.session_dir is not None and card.session_dir.endswith(
+        "session_20260717_120000_000000_aaaaaaaaaaaa_1"
+    )
+    assert card.row("setup").headline == "2 turns · 2 tool calls · 27.7s"
+
+
+def test_a_session_without_a_ledger_still_gets_a_card_that_says_so(tmp_path, snapshot_factory):
+    """An absent count is stated as absent; it never blanks the card.
+
+    A directory holding no control ledger can answer nothing about turns, and
+    the Setup row says the counts are unavailable rather than printing zeros —
+    every other row still states what the run's own record holds.
+    """
+    snapshot = snapshot_factory()
+    card = _card_for_session(snapshot, _card_session_dir(tmp_path, snapshot.run_id, ledger=None))
+
+    assert card.stats.turns is None
+    assert card.stats.tool_calls is None
+    assert card.stats.tool_failures is None
+    assert card.stats.wall_clock_seconds is None
+    # The run pin sits beside the ledger, not inside it, so it still answers.
+    assert card.stats.model == "test-action-model"
+    assert card.row("setup").headline == "run counts unavailable"
+    # The rest of the card is untouched by the missing ledger.
+    assert card.verdict == snapshot.verdict
+    assert [row.key for row in card.rows] == [
+        "setup",
+        "task",
+        "build",
+        "tests",
+        "coverage",
+        "ci",
+        "report",
+    ]
+    assert card.row("tests").headline.startswith("328 executed")

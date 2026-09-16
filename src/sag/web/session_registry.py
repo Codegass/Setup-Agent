@@ -35,7 +35,7 @@ from sag.agent.verdict_finalizer import (
 from sag.result_card.build import build_result_card
 from sag.result_card.models import RunResultCard
 from sag.runtime.container_io import resolve_control_execute
-from sag.trajectory.builder import CONTROL_EVENTS_NAME
+from sag.trajectory.builder import CONTROL_EVENTS_NAME, build_trajectory
 from sag.web.context_trace import ContextTraceBuilder
 from sag.web.models import (
     BuildSummary,
@@ -879,6 +879,83 @@ def _snapshot_phase_reached(snapshot: RunVerdictSnapshot, phase: str) -> bool | 
     return any(record.phase == phase and record.termination != "skipped" for record in records)
 
 
+def _run_counts_from_ledger(session_dir: Path | None) -> dict[str, Any]:
+    """Fold the run's own ledger into the counts the card states.
+
+    Every count is absent unless the ledger supplied it: a run whose turns were
+    never recorded reports no turns, not zero turns, and a directory holding no
+    ledger leaves the whole group absent rather than raising. The four travel
+    together because they are four readings of one replay — asking the ledger
+    four times could answer four different things about the same run.
+
+    The failure signal is the one the result block already counts, so the two
+    surfaces state the same number for the same run.
+    """
+
+    counts: dict[str, Any] = {
+        "trajectory_session": None,
+        "turn_count": None,
+        "tool_calls": None,
+        "tool_failures": None,
+    }
+    if session_dir is None:
+        return counts
+    try:
+        document = build_trajectory(session_dir)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.debug("Run counts unavailable in {}: {}", session_dir, exc)
+        return counts
+
+    counts["trajectory_session"] = document.session.model_dump(mode="json")
+    turns = tuple(document.turns)
+    if not turns:
+        return counts
+    counts["turn_count"] = len(turns)
+    counts["tool_calls"] = sum(1 for turn in turns if turn.call is not None)
+    counts["tool_failures"] = sum(
+        1
+        for turn in turns
+        if turn.observation is not None
+        and (turn.observation.error_code or turn.observation.failure_signature)
+    )
+    return counts
+
+
+def _host_run_pin(session_dir: Path | None) -> dict[str, Any] | None:
+    """The run pin this session directory holds, or nothing when it holds none."""
+
+    if session_dir is None:
+        return None
+    try:
+        parsed = json.loads((session_dir / "run-pin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.debug("Run pin unavailable in {}: {}", session_dir, exc)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _report_path_for_card(session_dir: Path | None, container_path: str | None) -> str | None:
+    """Name the report where the reader of this page can reach it, if anywhere.
+
+    The registry resolves the report inside the container; a run that mirrored
+    its report out also left a copy beside its ledger, and that is the one a
+    Workbench reader can open. Neither path is constructed out of the knowledge
+    that a report exists — without a resolved path this names nothing, and the
+    row says the report was written without pointing anywhere.
+    """
+
+    if not container_path:
+        return None
+    if session_dir is not None:
+        mirrored = session_dir / Path(container_path).name
+        try:
+            if mirrored.is_file():
+                return str(mirrored)
+        except OSError:
+            pass
+    return container_path
+
+
 @dataclass(frozen=True)
 class _ReportDeliveryOnly:
     """What this surface can state about how the run ended: the report, and no more.
@@ -1005,15 +1082,21 @@ def _setup_artifact_item(
         # mistake in building one of them is indistinguishable from a record the
         # card cannot read, and the detail would serve no card at all while every
         # test still passed.
+        run_counts = _run_counts_from_ledger(run_dir)
         card_inputs = {
             "module_metrics": module_metrics,
             "report_metrics": metrics if isinstance(metrics, dict) else None,
+            "run_pin": _host_run_pin(run_dir),
+            "trajectory_session": run_counts["trajectory_session"],
+            "turn_count": run_counts["turn_count"],
+            "tool_calls": run_counts["tool_calls"],
+            "tool_failures": run_counts["tool_failures"],
             "termination": _observed_report_delivery(trunk_data, report_raw),
             "project": project_name or None,
             "goal": _text(trunk_data.get("goal"), default="") or None,
             "container": workspace_id,
             "session_dir": str(run_dir) if run_dir is not None else None,
-            "report_path": report_path or None,
+            "report_path": _report_path_for_card(run_dir, report_path),
         }
         try:
             result_card = build_result_card(snapshot, **card_inputs).model_dump(mode="json")
