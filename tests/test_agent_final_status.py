@@ -10,14 +10,10 @@ from sag.agent.agent import SetupAgent
 from sag.agent.evidence_publications import BUILD_REQUIREMENTS_LOGICAL_ARTIFACT_ID
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.verdict_finalizer import (
-    BuildEvidenceSnapshot,
     ReportDeliveryStatus,
     RunTermination,
     RunTerminationStatus,
-    RunVerdictSnapshot,
-    SnapshotTestStats,
 )
-from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.tools.report_tool import ReportTool
 
 
@@ -786,28 +782,6 @@ def test_partial_reason_for_missing_test_evidence():
 # --- sealed setup snapshot surface -------------------------------------------
 
 
-def _snapshot(verdict="partial"):
-    return RunVerdictSnapshot(
-        run_id="agent-status",
-        finalized_at="2026-07-17T12:00:00Z",
-        verdict=verdict,
-        build_evidence=BuildEvidenceSnapshot(
-            observed=True,
-            green=verdict == "success",
-            outcome=(
-                OperationOutcome.SUCCESS if verdict == "success" else OperationOutcome.PARTIAL
-            ),
-            evidence_status=EvidenceStatus.VERIFIED,
-        ),
-        test_stats=SnapshotTestStats(
-            discovered=10,
-            executed=10,
-            passed=10 if verdict == "success" else 8,
-            failed=0 if verdict == "success" else 2,
-        ),
-    )
-
-
 def _termination(delivery=ReportDeliveryStatus.DELIVERED):
     return RunTermination(
         termination=RunTerminationStatus.COMPLETED,
@@ -825,30 +799,6 @@ def _agent_for_unified_setup(termination):
     return agent, output
 
 
-def _agent_for_summary():
-    output = StringIO()
-    agent = object.__new__(SetupAgent)
-    agent.console = Console(file=output, force_terminal=False)
-    agent.react_engine = SimpleNamespace(
-        get_execution_summary=lambda: {
-            "total_steps": 3,
-            "iterations": 2,
-            "thoughts": 1,
-            "actions": 2,
-            "successful_actions": 1,
-            "failed_actions": 1,
-        }
-    )
-    agent.context_manager = SimpleNamespace(
-        get_current_context_info=lambda: {
-            "context_type": "branch",
-            "context_id": "phase_report",
-            "project_name": "demo",
-        }
-    )
-    return agent, output
-
-
 def test_unified_setup_returns_typed_termination_without_boolean_mirroring():
     termination = _termination()
     agent, _ = _agent_for_unified_setup(termination)
@@ -858,31 +808,12 @@ def test_unified_setup_returns_typed_termination_without_boolean_mirroring():
     assert result is termination
 
 
-def test_setup_summary_renders_literal_snapshot_verdict():
-    agent, output = _agent_for_summary()
+def test_the_agent_no_longer_prints_its_own_setup_summary():
+    """The CLI owns the end of a run; two panels said the same thing twice."""
 
-    agent._provide_setup_summary(_termination(), _snapshot("partial"))
+    from sag.agent.agent import SetupAgent
 
-    rendered = output.getvalue()
-    assert "PARTIAL" in rendered
-    assert "Claimed latest subjects: unavailable" in rendered
-    assert "Unattributed observations (not verdict-bearing): 8/10 passed" in rendered
-    assert "Report delivery: delivered" in rendered
-
-
-def test_setup_summary_warns_on_report_failure_without_mutating_verdict():
-    agent, output = _agent_for_summary()
-    snapshot = _snapshot("success")
-
-    agent._provide_setup_summary(
-        _termination(ReportDeliveryStatus.FAILED),
-        snapshot,
-    )
-
-    rendered = output.getvalue()
-    assert "SUCCESS" in rendered
-    assert "report delivery failed" in rendered.lower()
-    assert snapshot.verdict == "success"
+    assert not hasattr(SetupAgent, "_provide_setup_summary")
 
 
 def test_retired_setup_verdict_authorities_are_absent():

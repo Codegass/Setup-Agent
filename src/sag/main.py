@@ -22,7 +22,6 @@ from sag.agent.context_journal import JOURNAL_DIR
 from sag.agent.history_state import HistoryActionState, decode_history_action_state
 from sag.agent.phase_machine import PHASE_NAMES
 from sag.agent.verdict_finalizer import (
-    ReportDeliveryStatus,
     RunTermination,
     RunVerdictSnapshot,
     read_live_verdict_snapshot,
@@ -36,14 +35,15 @@ from sag.config import (
     set_config,
     suppress_console_logging,
 )
+from sag.console.result_block import render_result_block
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.result_card import build_result_card
 from sag.runtime.container_io import read_container_text
 from sag.tools.module_metrics import MODULE_METRICS_PATH
 from sag.trajectory.builder import build_trajectory, follow_trajectory
 from sag.trajectory.schema import DETAIL_TIERS
 from sag.utils.git_utils import extract_project_name_from_url
-from sag.verdict_rates import render_rate_lines, render_snapshot_metric_lines
 from sag.web.server import run_web_server
 
 console = Console()
@@ -58,37 +58,45 @@ def _render_setup_cli_result(
     termination: RunTermination,
     project_name: str,
     *,
-    metrics_v2: Mapping[str, Any] | None = None,
+    module_metrics: Mapping[str, Any] | None = None,
+    report_metrics: Mapping[str, Any] | None = None,
+    run_pin: Mapping[str, Any] | None = None,
+    container: str | None = None,
+    session_dir: str | None = None,
+    report_path: str | None = None,
 ) -> tuple[str, int]:
-    """Render the setup result and translate only the sealed verdict to an exit code."""
-    from sag.tools.report_metrics import (
-        build_evidence_layer_projection,
-        format_evidence_layer_lines,
+    """Render the run's result block and translate only its verdict to an exit code."""
+
+    card = build_result_card(
+        snapshot,
+        module_metrics=module_metrics,
+        report_metrics=report_metrics,
+        run_pin=run_pin,
+        termination=termination,
+        project=project_name,
+        container=container,
+        session_dir=session_dir,
+        report_path=report_path,
+    )
+    return render_result_block(card, width=console.width), (
+        0 if snapshot.verdict == "success" else 1
     )
 
-    if metrics_v2 is None:
-        metrics_v2 = build_evidence_layer_projection(
-            snapshot=snapshot.model_dump(mode="json"),
-            conflicts=[*snapshot.conflicts],
-        )
 
-    lines = render_snapshot_metric_lines(snapshot.model_dump(mode="json"))
-    from sag.agent.ci_comparison import render_ci_comparison_lines
-    from sag.agent.acceptance_task import render_task_completion_lines
+def _read_module_metrics_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
+    """Read the per-module diagnostic file, or nothing when it is absent."""
 
-    lines.extend(render_ci_comparison_lines(snapshot.ci_comparison))
-    lines.extend(render_task_completion_lines(snapshot.task_completion))
-    lines.extend(
-        [
-            f"Verdict (derived): {snapshot.verdict}",
-            f"Project: {project_name}",
-            *format_evidence_layer_lines(metrics_v2),
-        ]
-    )
-    lines.append(f"Report delivery: {termination.report_delivery_status.value}")
-    if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
-        lines.append("WARNING: setup report delivery failed; sealed verdict is unchanged")
-    return "\n".join(lines), 0 if snapshot.verdict == "success" else 1
+    try:
+        text = read_container_text(orchestrator, MODULE_METRICS_PATH)
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _read_metrics_v2_for_cli(orchestrator: DockerOrchestrator) -> Mapping[str, Any] | None:
@@ -685,32 +693,23 @@ def project(
             ),
         )
         snapshot = read_live_verdict_snapshot(orchestrator)
+        session_logger = get_session_logger()
+        session_dir = str(session_logger.session_log_dir) if session_logger else None
         cli_result, exit_code = _render_setup_cli_result(
             snapshot,
             termination,
             project_name,
-            metrics_v2=_read_metrics_v2_for_cli(orchestrator),
+            module_metrics=_read_module_metrics_for_cli(orchestrator),
+            report_metrics=_read_metrics_v2_for_cli(orchestrator),
+            container=docker_name,
+            session_dir=session_dir,
         )
 
         # Save artifacts if recording is enabled
         if record:
             _save_setup_artifacts(orchestrator, project_name)
 
-        # Only show completion messages in non-UI mode (UI manager handles this)
-        if not config.ui_mode:
-            console.print(cli_result)
-            if snapshot.verdict == "success":
-                console.print(
-                    f"[bold green]✅ Project '{project_name}' setup completed![/bold green]"
-                )
-                console.print(f"\n[dim]Next steps:[/dim]")
-                console.print(f'  uv run sag run {docker_name} --task "run the application"')
-                console.print(f'  uv run sag run {docker_name} --task "add tests"')
-                console.print(f"  uv run sag shell {docker_name}")
-            else:
-                console.print("[bold yellow]⚠️ Project setup needs attention.[/bold yellow]")
-                console.print(f"[dim]Check logs for details. You can retry with:[/dim]")
-                console.print(f'  sag run {docker_name} --task "continue setup"')
+        console.print(cli_result)
 
         if exit_code:
             sys.exit(exit_code)

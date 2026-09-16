@@ -303,13 +303,24 @@ def _condensed_tests(text):
     return int(match.group(1))
 
 
-def _cli_tests(text):
+def _cli_verdict_from_text(text):
+    """The block states the run's verdict as the Setup row's own status word."""
+
     match = re.search(
-        r"Unattributed observations \(not verdict-bearing\): \d+/(\d+) passed",
+        r"^ Setup\s+\[[a-z]+\](success|partial|failed|unknown)\[",
         text,
+        re.MULTILINE,
     )
     assert match, text
-    return int(match.group(1))
+    return match.group(1)
+
+
+def _cli_tests(text):
+    """The block names the raw execution grain; it prints it only when it differs."""
+
+    match = re.search(r"([\d,]+) raw executions", text) or re.search(r"([\d,]+) executed", text)
+    assert match, text
+    return int(match.group(1).replace(",", ""))
 
 
 class SurfaceHarness:
@@ -357,7 +368,7 @@ class SurfaceHarness:
             condensed=RenderedSurface(
                 _verdict_from_text(condensed), _condensed_tests(condensed), condensed
             ),
-            cli=RenderedSurface(_verdict_from_text(cli_text), _cli_tests(cli_text), cli_text),
+            cli=RenderedSurface(_cli_verdict_from_text(cli_text), _cli_tests(cli_text), cli_text),
             web=RenderedSurface(
                 detail.canonical_verdict,
                 detail.test.evidence_layers.tests.unattributed_observations.executed,
@@ -409,9 +420,13 @@ def test_all_surfaces_render_the_same_snapshot(tvm_snapshot, surface_harness):
 def test_all_surfaces_keep_failures_and_errors_distinct(tvm_snapshot, surface_harness):
     rendered = surface_harness.render_all(tvm_snapshot)
 
-    for surface in (rendered.markdown, rendered.condensed, rendered.cli):
+    for surface in (rendered.markdown, rendered.condensed):
         assert "0 failed" in surface.text
         assert "987 errors" in surface.text
+    # The block reports the run's own execution grain, and keeps the two counts
+    # side by side there rather than summing them into one red number.
+    assert "0 failed · 328 errors" in rendered.cli.text
+    assert "987 raw executions" in rendered.cli.text
     assert "fail_count=0" in rendered.web.text
     assert "errors=328" in rendered.web.text
 
@@ -539,12 +554,17 @@ def test_renderers_keep_observation_execution_grain_explicit(surface_harness, sn
         rendered.web,
     ):
         assert surface.primary_test_total != 328
-    for surface in (rendered.markdown, rendered.condensed, rendered.cli):
+    for surface in (rendered.markdown, rendered.condensed):
         primary_test_lines = [
             line for line in surface.text.splitlines() if "Tests" in line or "observations" in line
         ]
         assert primary_test_lines
         assert any("not verdict-bearing" in line and "987" in line for line in primary_test_lines)
+    # The block keeps the grains apart by naming the larger one as raw, so 987
+    # is never offered as the number of tests this run has.
+    assert "328 executed" in rendered.cli.text
+    assert "987 raw executions" in rendered.cli.text
+    assert "987 executed" not in rendered.cli.text
 
 
 def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_factory):
@@ -563,7 +583,9 @@ def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_fac
     assert "3 flaky" in rendered.markdown.text
     assert "3 flaky" in rendered.condensed.text
     assert "3 flaky" not in rendered.cli.text
-    assert "Claimed latest cases: unavailable" in rendered.cli.text
+    # The block does not drop the retry signal silently: it states the wider
+    # execution grain instead of a flaky count it would have to name itself.
+    assert "7 raw executions" in rendered.cli.text
     assert "flaky_count=3" in rendered.web.text
 
 
@@ -583,7 +605,7 @@ def test_cli_exit_code_comes_only_from_snapshot(verdict, expected_exit, snapshot
     assert exit_code == expected_exit
 
 
-def test_report_delivery_failure_warns_without_changing_success_exit(snapshot_factory):
+def test_report_delivery_failure_is_stated_without_changing_success_exit(snapshot_factory):
     snapshot = snapshot_factory(
         verdict="success",
         unique_passed=328,
@@ -597,9 +619,9 @@ def test_report_delivery_failure_warns_without_changing_success_exit(snapshot_fa
     text, exit_code = main_module._render_setup_cli_result(snapshot, termination, "tvm")
 
     assert exit_code == 0
-    assert "WARNING" in text
-    assert "report delivery failed" in text.lower()
-    assert "Verdict (derived): success" in text
+    assert "the setup report was not written" in text
+    assert "WARNING" not in text
+    assert _cli_verdict_from_text(text) == "success"
 
 
 def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):

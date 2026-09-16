@@ -26,6 +26,19 @@ from sag.agent.verdict_finalizer import RunVerdictSnapshot, validate_verdict_sna
 from sag.web.session_registry import _session_detail, _setup_artifact_item
 
 
+def _block_task_fragments(completion):
+    """What the result block must state about a sealed required task."""
+
+    steps = tuple(completion.steps or ())
+    if not steps:
+        return [str(completion.status), *completion.reasons]
+    complete = sum(1 for step in steps if step.status == "complete")
+    return [
+        f"{completion.status} {complete}/{len(steps)} steps",
+        *[f"{step.id}: {step.status} \u2014 {step.command}" for step in steps],
+    ]
+
+
 def input_task():
     return AcceptanceTask.model_validate(
         {
@@ -120,9 +133,13 @@ def test_required_task_result_is_identical_across_sealed_surfaces(snapshot_facto
     assert snapshot.test_stats == base.test_stats and snapshot.rates == base.rates
     expected = render_task_completion_lines(completion)
     surfaces = SurfaceHarness().render_all(snapshot)
-    for surface in (surfaces.cli, surfaces.markdown, surfaces.condensed):
+    for surface in (surfaces.markdown, surfaces.condensed):
         assert surface.verdict == snapshot.verdict
         assert all(line in surface.text for line in expected)
+    # The block says the same result in its own words, so the agreement is
+    # checked against the sealed task itself rather than the report's phrasing.
+    assert surfaces.cli.verdict == snapshot.verdict
+    assert all(fragment in surfaces.cli.text for fragment in _block_task_fragments(completion))
     orch = SnapshotOrchestrator(
         {
             VERDICT_PATH: snapshot.model_dump_json(),

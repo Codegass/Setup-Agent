@@ -63,6 +63,20 @@ def comparison_fixture(*, missing_scope=False):
     )
 
 
+def _block_ci_fragments(comparison):
+    """What the result block must state about a sealed comparison."""
+
+    result = comparison.attainment
+    if result is None:
+        return ["not compared", *comparison.reasons]
+    score = (
+        f"{result.alpha.numerator:,}/{result.alpha.denominator:,}"
+        if result.alpha is not None
+        else "scope score unavailable"
+    )
+    return [str(result.verdict).replace("_", " "), score, result.cell_id]
+
+
 @pytest.mark.parametrize("status", ["met", "missing_scope", "no_target", "unavailable"])
 def test_published_comparison_is_identical_across_every_surface(snapshot_factory, status):
     comparison = (
@@ -78,10 +92,16 @@ def test_published_comparison_is_identical_across_every_surface(snapshot_factory
     )
     surfaces = SurfaceHarness().render_all(snapshot)
     expected = render_ci_comparison_lines(comparison)
-    for surface in (surfaces.cli, surfaces.markdown, surfaces.condensed):
+    for surface in (surfaces.markdown, surfaces.condensed):
         assert surface.verdict == "success"
         for line in expected:
             assert line in surface.text
+    # The block says the same result in its own words, so the agreement is
+    # checked against the sealed comparison itself rather than the report's
+    # phrasing.
+    assert surfaces.cli.verdict == "success"
+    for fragment in _block_ci_fragments(comparison):
+        assert fragment in surfaces.cli.text
     files = {
         VERDICT_PATH: snapshot.model_dump_json(),
         "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
@@ -137,7 +157,8 @@ def test_cli_loads_explicit_target_bytes_before_starting_agent(monkeypatch, tmp_
     pinned = RecordingSetupAgent.calls[0]["ci_target"]
     assert pinned.record == target
     assert pinned.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert "Official CI: unavailable" in result.output
+    assert "Official CI" in result.output
+    assert "not compared" in result.output
     assert "[fully]" not in result.output
 
 

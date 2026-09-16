@@ -24,7 +24,7 @@ from sag.ui import EventType, PhaseType, UIEvent, UIManager
 from sag.verdict_rates import execution_sentence
 
 from .ci_comparison import PinnedCITarget
-from .acceptance_task import AcceptanceTask, render_task_completion_lines
+from .acceptance_task import AcceptanceTask
 from .context_manager import ContextManager
 from .control_events import (
     ControlEventSink,
@@ -51,7 +51,6 @@ from .verdict_finalizer import (
     ReportDeliveryStatus,
     RunTermination,
     RunTerminationStatus,
-    RunVerdictSnapshot,
     VerdictFinalizer,
     read_live_verdict_snapshot,
 )
@@ -1046,8 +1045,6 @@ class SetupAgent:
                         level="warning",
                     )
                 self.ui_manager.display_final_summary()
-            else:
-                self._provide_setup_summary(termination, snapshot)
 
             cmd_logger.info(
                 "Project setup completed: "
@@ -1887,85 +1884,6 @@ START by working toward the current phase objective shown in my context.
                 return project_name
 
         return None
-
-    def _provide_setup_summary(
-        self, termination: RunTermination, snapshot: RunVerdictSnapshot
-    ) -> None:
-        """Render setup completion from one sealed snapshot and flow termination."""
-        from sag.tools.report_metrics import (
-            build_evidence_layer_projection,
-            format_evidence_layer_lines,
-            read_live_report_metrics,
-        )
-
-        exec_summary = self.react_engine.get_execution_summary()
-        context_info = self.context_manager.get_current_context_info()
-        verdict_style = {
-            "success": ("bold green", "green"),
-            "partial": ("bold yellow", "yellow"),
-            "failed": ("bold red", "red"),
-            "unknown": ("bold yellow", "yellow"),
-        }
-        text_style, border_style = verdict_style[snapshot.verdict]
-        metrics_v2 = None
-        try:
-            read = read_live_report_metrics(self.orchestrator)
-            metrics_v2 = read.payload if read.complete and read.conflict is None else None
-        except (AttributeError, TypeError, ValueError):
-            pass
-        if metrics_v2 is None:
-            metrics_v2 = build_evidence_layer_projection(
-                snapshot=snapshot.model_dump(mode="json"),
-                conflicts=list(snapshot.conflicts),
-            )
-        summary_lines = [
-            f"[{text_style}]{snapshot.verdict.upper()}[/{text_style}]",
-            "",
-            "[bold]Canonical Result:[/bold]",
-            f"• Verdict: {snapshot.verdict}",
-            *[f"• {line}" for line in format_evidence_layer_lines(metrics_v2)],
-            *render_task_completion_lines(snapshot.task_completion),
-        ]
-        summary_lines.extend(
-            [
-                f"• Report delivery: {termination.report_delivery_status.value}",
-                "",
-                "[bold]Execution Statistics:[/bold]",
-                f"• Total Steps: {exec_summary['total_steps']}",
-                f"• Iterations: {exec_summary['iterations']}",
-                f"• Thoughts: {exec_summary['thoughts']}",
-                f"• Actions: {exec_summary['actions']}",
-                f"• Successful Actions: {exec_summary['successful_actions']}",
-                f"• Failed Actions: {exec_summary['failed_actions']}",
-                "",
-                "[bold]Final Context:[/bold]",
-                f"• Context Type: {context_info.get('context_type', 'Unknown')}",
-                f"• Context ID: {context_info.get('context_id', 'Unknown')}",
-            ]
-        )
-        self.console.print(
-            Panel(
-                "\n".join(summary_lines),
-                title="[bold]Setup Summary[/bold]",
-                border_style=border_style,
-            )
-        )
-
-        if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
-            self.console.print(
-                "[bold yellow]WARNING: setup report delivery failed; "
-                "the sealed setup verdict is unchanged.[/bold yellow]"
-            )
-
-        project_name = context_info.get("project_name", "project")
-        if snapshot.verdict == "success":
-            self.console.print("[bold green]Project setup completed successfully.[/bold green]")
-            self.console.print(f"[dim]Connect with:[/dim] setup-agent connect {project_name}")
-        else:
-            self.console.print(
-                f"[bold yellow]Project setup verdict: {snapshot.verdict.upper()}.[/bold yellow]"
-            )
-            self.console.print(f"[dim]Continue with:[/dim] setup-agent continue {project_name}")
 
     def _provide_legacy_setup_summary(self, success: bool):
         """Provide the pre-snapshot summary for non-setup compatibility paths."""

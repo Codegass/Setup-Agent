@@ -51,7 +51,7 @@ def test_snapshot_partial_is_rendered_literally_without_report_mirror():
 
     output, exit_code = _render_setup_cli_result(snapshot, _termination(), "cayenne")
 
-    assert "Verdict (derived): partial" in output
+    assert "Setup verdict: partial" in output
     assert exit_code == 1
 
 
@@ -64,8 +64,8 @@ def test_snapshot_success_cannot_be_demoted_by_report_delivery_failure():
         "demo",
     )
 
-    assert "Verdict (derived): success" in output
-    assert "report delivery failed" in output.lower()
+    assert "Setup verdict" not in output
+    assert "the setup report was not written" in output
     assert exit_code == 0
 
 
@@ -76,5 +76,5 @@ def test_snapshot_failed_cannot_be_promoted_by_completed_flow():
         "demo",
     )
 
-    assert "Verdict (derived): failed" in output
+    assert "Setup verdict: failed" in output
     assert exit_code == 1

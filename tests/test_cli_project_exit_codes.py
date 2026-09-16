@@ -1,3 +1,5 @@
+import json
+
 from click.testing import CliRunner
 from container_evidence_fakes import ContainerFS
 
@@ -20,6 +22,7 @@ from sag.agent.verdict_finalizer import (
     SnapshotTestCounts,
     SnapshotTestStats,
 )
+from sag.tools.module_metrics import MODULE_METRICS_PATH
 
 VERDICT_PATH = "/workspace/.setup_agent/verdict.json"
 
@@ -160,9 +163,10 @@ def test_project_command_returns_nonzero_for_partial_snapshot(monkeypatch, tmp_p
     result = invoke_project(monkeypatch, tmp_path, PartialSetupAgent)
 
     assert result.exit_code == 1
-    assert "Verdict (derived): partial" in result.output
-    assert "Claimed latest subjects: unavailable" in result.output
-    assert "Unattributed observations (not verdict-bearing): 8/10 passed" in result.output
+    assert "Setup verdict: partial" in result.output
+    assert "Claimed latest subjects" not in result.output
+    assert "8 passed" in result.output
+    assert "2 failed" in result.output
 
 
 def test_project_command_returns_nonzero_for_partial_snapshot_in_ui(monkeypatch, tmp_path):
@@ -175,16 +179,16 @@ def test_project_command_success_ignores_report_delivery_failure(monkeypatch, tm
     result = invoke_project(monkeypatch, tmp_path, ReportFailingSuccessfulAgent)
 
     assert result.exit_code == 0
-    assert "Verdict (derived): success" in result.output
-    assert "WARNING" in result.output
-    assert "report delivery failed" in result.output.lower()
+    assert "Setup verdict" not in result.output
+    assert "the setup report was not written" in result.output
+    assert "WARNING" not in result.output
 
 
 def test_project_command_never_promotes_unpublished_success_snapshot(monkeypatch, tmp_path):
     result = invoke_project(monkeypatch, tmp_path, UnpublishedSuccessfulAgent)
 
     assert result.exit_code == 1
-    assert "Verdict (derived): unknown" in result.output
+    assert "Setup verdict: unknown" in result.output
     assert "setup completed" not in result.output.lower()
 
 
@@ -234,3 +238,100 @@ def test_project_command_initializes_agent_session_logs(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert list((tmp_path / "logs").glob("session_*"))
+
+
+def test_block_states_the_verdict_once_and_exits_one(monkeypatch, tmp_path):
+    """A partial run says its verdict in the block's closing line, nowhere else."""
+
+    from result_card_fakes import snapshot_dict
+
+    from sag.agent.verdict_finalizer import (
+        ReportDeliveryStatus,
+        RunTermination,
+        RunTerminationStatus,
+        RunVerdictSnapshot,
+    )
+    from sag.main import _render_setup_cli_result
+
+    snapshot = RunVerdictSnapshot.model_validate(snapshot_dict(verdict="partial"))
+    termination = RunTermination(
+        termination=RunTerminationStatus.COMPLETED,
+        report_delivery_status=ReportDeliveryStatus.DELIVERED,
+    )
+    text, code = _render_setup_cli_result(snapshot, termination, "commons-cli")
+    assert code == 1
+    assert text.count("Setup verdict: partial") == 1
+    assert "Claimed latest subjects" not in text
+    assert "Verdict (derived)" not in text
+    assert "Required task" in text
+
+
+def test_success_exits_zero_and_adds_no_trailer():
+    from result_card_fakes import snapshot_dict
+
+    from sag.agent.verdict_finalizer import (
+        ReportDeliveryStatus,
+        RunTermination,
+        RunTerminationStatus,
+        RunVerdictSnapshot,
+    )
+    from sag.main import _render_setup_cli_result
+
+    snapshot = RunVerdictSnapshot.model_validate(snapshot_dict())
+    termination = RunTermination(
+        termination=RunTerminationStatus.COMPLETED,
+        report_delivery_status=ReportDeliveryStatus.DELIVERED,
+    )
+    text, code = _render_setup_cli_result(snapshot, termination, "commons-cli")
+    assert code == 0
+    assert "Setup verdict" not in text
+    assert "setup completed" not in text.lower()
+
+
+def test_failed_report_delivery_is_an_attention_line_not_a_warning_banner():
+    from result_card_fakes import snapshot_dict
+
+    from sag.agent.verdict_finalizer import (
+        ReportDeliveryStatus,
+        RunTermination,
+        RunTerminationStatus,
+        RunVerdictSnapshot,
+    )
+    from sag.main import _render_setup_cli_result
+
+    snapshot = RunVerdictSnapshot.model_validate(snapshot_dict())
+    termination = RunTermination(
+        termination=RunTerminationStatus.COMPLETED,
+        report_delivery_status=ReportDeliveryStatus.FAILED,
+    )
+    text, _ = _render_setup_cli_result(snapshot, termination, "commons-cli")
+    assert "the setup report was not written" in text
+    assert "WARNING" not in text
+
+
+class ModuleMetricsOrchestrator:
+    """Answers the one untruncated read the module-metrics reader performs."""
+
+    def __init__(self, body=None):
+        self.body = body
+
+    def execute_command(self, command, **kwargs):
+        del kwargs
+        if self.body is not None and command == f"cat -- {MODULE_METRICS_PATH}":
+            return {"exit_code": 0, "success": True, "output": self.body}
+        return {"exit_code": 1, "success": False, "output": ""}
+
+
+def test_module_metrics_are_read_when_present_and_absent_is_not_an_error():
+    """The per-module file is a diagnostic: missing or malformed, the block still renders."""
+
+    from result_card_fakes import module_metrics
+
+    from sag.main import _read_module_metrics_for_cli
+
+    payload = module_metrics()
+
+    assert _read_module_metrics_for_cli(ModuleMetricsOrchestrator()) is None
+    assert _read_module_metrics_for_cli(ModuleMetricsOrchestrator("{oops")) is None
+    assert _read_module_metrics_for_cli(ModuleMetricsOrchestrator("[]")) is None
+    assert _read_module_metrics_for_cli(ModuleMetricsOrchestrator(json.dumps(payload))) == payload

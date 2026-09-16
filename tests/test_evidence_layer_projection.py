@@ -18,6 +18,7 @@ from sag.tools.report_metrics import (
     MetricsContractError,
     assemble_report_metrics,
     build_evidence_layer_projection,
+    format_evidence_layer_lines,
     read_report_metrics,
 )
 from sag.web.models import TestSummary
@@ -452,14 +453,17 @@ def test_ignite_shape_keeps_auxiliary_failures_visible_and_non_verdict_bearing()
         _snapshot(verdict="success", auxiliary=auxiliary),
         termination,
         "ignite",
-        metrics_v2=metrics,
+        report_metrics=metrics,
     )
+    # The projection is what carries the partition; the CLI block no longer
+    # prints it, so the partition is read where it is produced.
+    layers = "\n".join(format_evidence_layer_lines(metrics))
 
     assert exit_code == 0
-    assert "Claimed latest subjects: unavailable" in text
-    assert "Receipt executions: 2/2 passed" in text
-    assert "Quarantined observations (not verdict-bearing): 267/2887 passed" in text
-    assert "28 failed, 2481 errors, 111 skipped" in text
+    assert "Claimed latest subjects: unavailable" in layers
+    assert "Receipt executions: 2/2 passed" in layers
+    assert "Quarantined observations (not verdict-bearing): 267/2887 passed" in layers
+    assert "28 failed, 2481 errors, 111 skipped" in layers
     assert "Tests: 2 unique" not in text
 
 
