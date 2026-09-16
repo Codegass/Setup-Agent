@@ -1,9 +1,16 @@
 import json
 import re
 from dataclasses import dataclass
+from typing import get_args
 
 import pytest
 from container_evidence_fakes import ContainerFS, canonical_json, complete_run_pin
+from result_card_fakes import (
+    evaluated_ci_comparison,
+    module_metrics,
+    phase_record,
+    snapshot_dict,
+)
 from rich.console import Console
 
 import sag.main as main_module
@@ -26,7 +33,19 @@ from sag.agent.verdict_finalizer import (
     SnapshotTestStats,
     read_verdict_snapshot,
 )
+from sag.console.result_block import (
+    _MAX_ITEMS,
+    GUTTER,
+    LABEL_WIDTH,
+    STATUS_WIDTH,
+    render_result_block,
+)
 from sag.evidence import EvidenceStatus, OperationOutcome
+from sag.metrics.attainment import AttainmentVerdict
+from sag.result_card.build import build_result_card
+from sag.result_card.markdown import render_result_card_markdown
+from sag.result_card.models import ROW_LABELS, ROW_ORDER, RunResultCard
+from sag.result_card.rows import _CI_STATUS_WORD, _CI_TONE
 from sag.tools.report_tool import ReportTool
 from sag.ui.ui_manager import UIManager
 from sag.web.session_registry import _session_detail, _setup_artifact_item
@@ -966,3 +985,437 @@ def test_web_historical_shape_without_legacy_marker_stays_unknown():
     assert detail.snapshot_status == "missing"
     assert detail.test.total == 0
     assert detail.legacy is False
+
+
+# ---------------------------------------------------------------------------
+# The fence: one record, every surface, one wording.
+#
+# Everything above holds a surface to the record. What follows holds the
+# surfaces to each other: one card, printed as the end-of-run block, written as
+# the report's `## Result` table and served as the web payload, must state the
+# same status, the same explanation and the same findings for every row. A
+# reader who watched the run end and a reader who opened the report a week
+# later are owed the same facts, so a failure here names the surface that
+# drifted, the row it drifted on and the record it drifted for.
+# ---------------------------------------------------------------------------
+
+_TERMINAL = "the terminal block"
+_REPORT = "the report table"
+_WEB = "the web payload"
+
+#: Wide enough that nothing these records say reaches the block's wrap column,
+#: so one thing the card states is one line of the block and the comparison
+#: below stays exact rather than approximate.
+_FENCE_WIDTH = 200
+
+#: The block bullets a row's findings; the report bullets them as Markdown
+#: under a heading. This prefix is the one piece of row text the two surfaces
+#: deliberately spell differently.
+_TERMINAL_BULLET = "· "
+
+#: What the report heads a row's findings with, restated here so a failure can
+#: name the row whose findings went missing rather than pointing at a heading
+#: (cf. `_ITEM_HEADINGS` in sag/result_card/markdown.py).
+_REPORT_ITEM_HEADINGS = {"task": "Required task steps", "ci": "Official CI findings"}
+
+#: The two trailing lists, under the name each surface gives them. The heading
+#: differs by design; the lines under it must not.
+_TRAILING_LISTS = {"Needs attention": "Needs attention", "Notes": "Data notes"}
+
+_DELIVERED = RunTermination(
+    termination=RunTerminationStatus.COMPLETED,
+    report_delivery_status=ReportDeliveryStatus.DELIVERED,
+)
+_REPORT_FAILED = RunTermination(
+    termination=RunTerminationStatus.COMPLETED,
+    report_delivery_status=ReportDeliveryStatus.FAILED,
+)
+
+#: Named records with the arguments each one's card is built from. Between them
+#: every row reaches both of its shapes: measured and absent, speaking for
+#: itself and collapsed onto its own status word, with findings and without.
+_FENCE_RECORDS: dict[str, tuple[dict, dict]] = {
+    "a clean run": (
+        snapshot_dict(),
+        {
+            "module_metrics": module_metrics(),
+            "termination": _DELIVERED,
+            "report_path": "logs/session_x/setup-report.md",
+            "project": "commons-cli",
+            "container": "sag-commons-cli",
+            "session_dir": "logs/session_x",
+            "turn_count": 42,
+            "tool_calls": 180,
+            "tool_failures": 3,
+        },
+    ),
+    "a partial run that was interrupted": (
+        snapshot_dict(
+            verdict="partial",
+            conflicts=["test_execution_interrupted"],
+            phase_records=[
+                phase_record(
+                    "build",
+                    termination="blocked",
+                    outcome="failure",
+                    reason="the maven wrapper was missing",
+                )
+            ],
+        ),
+        {
+            "module_metrics": module_metrics(),
+            "termination": _DELIVERED,
+            "report_path": "logs/session_y/setup-report.md",
+            "turn_count": 17,
+        },
+    ),
+    "a failed build whose report was never written": (
+        snapshot_dict(
+            verdict="failed",
+            build_evidence={
+                "observed": True,
+                "green": False,
+                "judgment": "failed",
+                "source": "physical",
+                "outcome": "failed",
+                "evidence_status": "verified",
+                "refs": [],
+            },
+        ),
+        {"termination": _REPORT_FAILED},
+    ),
+    "a run measured against official CI": (
+        snapshot_dict(
+            ci_comparison=evaluated_ci_comparison(
+                verdict="not_met",
+                clean=False,
+                red_observed=3,
+                unexpected_red_ids=["a.B#c", "a.B#d", "a.B#e"],
+                reason_codes=["NEW_RED_BEYOND_TARGET"],
+            )
+        ),
+        {
+            "module_metrics": module_metrics(),
+            "termination": _DELIVERED,
+            "report_path": "logs/session_z/setup-report.md",
+        },
+    ),
+    # Nothing beside the record: every row that needs a sibling artifact states
+    # its absence instead, and the surfaces must agree about that too.
+    "a record with nothing beside it": (snapshot_dict(), {}),
+}
+
+
+@dataclass(frozen=True)
+class _PrintedRow:
+    """One row of the block, split back into the things it states."""
+
+    status: str
+    said: tuple[str, ...]
+    items: tuple[str, ...]
+
+
+def _fence_card(record: str):
+    payload, arguments = _FENCE_RECORDS[record]
+    return build_result_card(payload, **arguments)
+
+
+def _fence_block(card) -> str:
+    console = Console(width=_FENCE_WIDTH, force_terminal=False, no_color=True, soft_wrap=False)
+    with console.capture() as capture:
+        console.print(render_result_block(card, width=_FENCE_WIDTH), markup=True, highlight=False)
+    return capture.get()
+
+
+def _printed_rows(card) -> dict[str, _PrintedRow]:
+    """Read the block back: every row it printed, in the order it printed them."""
+
+    by_label = {ROW_LABELS[key]: key for key in ROW_ORDER}
+    head = GUTTER + LABEL_WIDTH
+    body = head + STATUS_WIDTH
+    status: dict[str, str] = {}
+    said: dict[str, list[str]] = {}
+    items: dict[str, list[str]] = {}
+    key = None
+    for line in _fence_block(card).splitlines():
+        label = line[GUTTER:head].strip() if line[:GUTTER].isspace() else ""
+        if label in by_label:
+            key = by_label[label]
+            status[key] = line[head:body].strip()
+            said[key], items[key] = [], []
+            text = line[body:].strip()
+        elif key is not None and line.startswith(" " * body):
+            text = line.strip()
+        else:
+            key = None
+            continue
+        if not text:
+            continue
+        if text.startswith(_TERMINAL_BULLET):
+            items[key].append(text[len(_TERMINAL_BULLET) :])
+        else:
+            said[key].append(text)
+    return {key: _PrintedRow(status[key], tuple(said[key]), tuple(items[key])) for key in status}
+
+
+def _printed_lists(card) -> dict[str, tuple[str, ...]]:
+    """The block's trailing lists, keyed by the heading the block gives them."""
+
+    lists: dict[str, list[str]] = {}
+    heading = None
+    for line in _fence_block(card).splitlines():
+        text = line.strip()
+        if text in _TRAILING_LISTS and line == f"{' ' * GUTTER}{text}":
+            heading = text
+            lists.setdefault(heading, [])
+        elif heading is not None and line.startswith("   ") and text:
+            lists[heading].append(text)
+        elif text:
+            heading = None
+    return {heading: tuple(lines) for heading, lines in lists.items()}
+
+
+def _report_cells(card) -> dict[str, tuple[str, str]]:
+    """The table's body: label -> (status cell, detail cell), in printed order."""
+
+    cells: dict[str, tuple[str, str]] = {}
+    for line in render_result_card_markdown(card):
+        match = re.match(
+            r"^\| \*\*(?P<label>[^*]+)\*\* \| (?P<status>[^|]+) \| (?P<detail>.*) \|$", line
+        )
+        if match:
+            cells[match.group("label").strip()] = (
+                match.group("status").strip(),
+                match.group("detail").strip(),
+            )
+    return cells
+
+
+def _report_lists(card) -> dict[str, tuple[str, ...]]:
+    """Every `###` list the section writes, keyed by its heading."""
+
+    lists: dict[str, list[str]] = {}
+    heading = None
+    for line in render_result_card_markdown(card):
+        if line.startswith("### "):
+            heading = line[4:].strip()
+            lists.setdefault(heading, [])
+        elif heading is not None and line.startswith("- "):
+            lists[heading].append(line[2:].strip())
+    return {heading: tuple(lines) for heading, lines in lists.items()}
+
+
+def _stated_parts(row) -> tuple[str, ...]:
+    """What a row states beyond its status word, in the order every surface states it.
+
+    A headline that only repeats the status word says the same thing twice, so
+    both renderers drop it and lead with the explanation instead. The rule is
+    written out here as well as in each renderer on purpose: this is the
+    contract the surfaces are held to, and a renderer that quietly stops
+    following it fails here by name instead of shipping.
+    """
+
+    parts = (
+        None if row.headline == row.status else row.headline,
+        row.detail,
+        row.reason,
+    )
+    return tuple(part for part in parts if part)
+
+
+def _as_report_text(text: str) -> str:
+    """The report escapes a cell's pipes and flattens its newlines; nothing else."""
+
+    return text.replace("|", r"\|").replace("\n", " ")
+
+
+def _report_detail(parts: tuple[str, ...]) -> str:
+    return _as_report_text(" · ".join(parts)) if parts else "—"
+
+
+def _report_item_heading(row) -> str:
+    return _REPORT_ITEM_HEADINGS.get(row.key, f"{row.label} details")
+
+
+def _printed_items(items: tuple[str, ...]) -> tuple[str, ...]:
+    """The block prints a budget of a row's findings and counts the rest."""
+
+    shown = list(items[:_MAX_ITEMS])
+    if len(items) > _MAX_ITEMS:
+        shown.append(f"+{len(items) - _MAX_ITEMS} more")
+    return tuple(shown)
+
+
+def _disagrees(surface: str, record: str, key: str, saw, want) -> str:
+    return (
+        f"{surface} states {saw!r} for the {key} row of {record}; "
+        f"the card states {want!r}. One card, one wording: fix the renderer, not this test."
+    )
+
+
+@pytest.mark.parametrize("record", list(_FENCE_RECORDS))
+def test_every_surface_states_the_same_status_and_the_same_explanation(record):
+    card = _fence_card(record)
+    printed = _printed_rows(card)
+    cells = _report_cells(card)
+
+    assert list(printed) == list(ROW_ORDER), (
+        f"{_TERMINAL} prints rows {list(printed)} for {record}; a card states {list(ROW_ORDER)}"
+    )
+    assert list(cells) == [ROW_LABELS[key] for key in ROW_ORDER], (
+        f"{_REPORT} tabulates rows {list(cells)} for {record}; "
+        f"a card states {[ROW_LABELS[key] for key in ROW_ORDER]}"
+    )
+
+    for key in ROW_ORDER:
+        row = card.row(key)
+        status, detail = cells[ROW_LABELS[key]]
+        said = _stated_parts(row)
+
+        assert printed[key].status == row.status, _disagrees(
+            _TERMINAL, record, key, printed[key].status, row.status
+        )
+        assert status == row.status, _disagrees(_REPORT, record, key, status, row.status)
+        assert printed[key].said == said, _disagrees(_TERMINAL, record, key, printed[key].said, said)
+        assert detail == _report_detail(said), _disagrees(
+            _REPORT, record, key, detail, _report_detail(said)
+        )
+
+
+@pytest.mark.parametrize("record", list(_FENCE_RECORDS))
+def test_every_surface_files_a_rows_findings_under_that_row(record):
+    card = _fence_card(record)
+    printed = _printed_rows(card)
+    written = _report_lists(card)
+    expected_headings = set()
+
+    for key in ROW_ORDER:
+        row = card.row(key)
+        heading = _report_item_heading(row)
+        assert printed[key].items == _printed_items(row.items), _disagrees(
+            _TERMINAL, record, key, printed[key].items, _printed_items(row.items)
+        )
+        if not row.items:
+            assert heading not in written, (
+                f"{_REPORT} heads a list {heading!r} for {record}, but the {key} row of the "
+                "card has no findings to put under it"
+            )
+            continue
+        expected_headings.add(heading)
+        want = tuple(_as_report_text(item) for item in row.items)
+        assert written.get(heading) == want, _disagrees(
+            _REPORT, record, key, written.get(heading), want
+        )
+
+    # A finding under a heading no row accounts for is a bullet orphaned from
+    # its measurement: the table above is the only thing that could have said
+    # which row it belongs to.
+    filed = set(written) - set(_TRAILING_LISTS.values())
+    assert filed == expected_headings, (
+        f"{_REPORT} files findings under {sorted(filed)} for {record}; "
+        f"the card's rows account for {sorted(expected_headings)}"
+    )
+
+
+@pytest.mark.parametrize("record", list(_FENCE_RECORDS))
+def test_every_surface_lists_the_same_attention_and_the_same_notes(record):
+    card = _fence_card(record)
+    printed = _printed_lists(card)
+    written = _report_lists(card)
+    expected = {
+        "Needs attention": tuple(
+            item.title if not item.detail else f"{item.title} — {item.detail}"
+            for item in card.attention
+        ),
+        "Notes": tuple(card.notes),
+    }
+
+    for block_heading, report_heading in _TRAILING_LISTS.items():
+        want = expected[block_heading]
+        assert printed.get(block_heading, ()) == want, _disagrees(
+            _TERMINAL, record, block_heading, printed.get(block_heading, ()), want
+        )
+        escaped = tuple(_as_report_text(text) for text in want)
+        assert written.get(report_heading, ()) == escaped, _disagrees(
+            _REPORT, record, report_heading, written.get(report_heading, ()), escaped
+        )
+
+
+@pytest.mark.parametrize("record", list(_FENCE_RECORDS))
+def test_the_web_payload_carries_the_same_rows_as_the_terminal(record):
+    card = _fence_card(record)
+    served = card.model_dump(mode="json")
+
+    assert [row["key"] for row in served["rows"]] == list(ROW_ORDER), (
+        f"{_WEB} serves rows {[row['key'] for row in served['rows']]} for {record}; "
+        f"a card states {list(ROW_ORDER)}"
+    )
+    for position, key in enumerate(ROW_ORDER):
+        row = card.row(key)
+        payload = served["rows"][position]
+        for field in ("label", "status", "tone", "headline", "detail", "reason"):
+            assert field in payload, (
+                f"{_WEB} serves no {field!r} for the {key} row of {record}; the block and the "
+                "report both print it"
+            )
+            assert payload[field] == getattr(row, field), _disagrees(
+                _WEB, record, key, payload[field], getattr(row, field)
+            )
+        assert tuple(payload["items"]) == row.items, _disagrees(
+            _WEB, record, key, tuple(payload["items"]), row.items
+        )
+
+    # The registry serialises the card and the session detail validates it back
+    # (`_setup_artifact_item` and `_session_detail` above). A field lost on that
+    # round trip is a row the Workbench would state differently from the block
+    # that was printed beside it.
+    assert RunResultCard.model_validate(served) == card, (
+        f"{_WEB} does not survive the registry's own serialise-and-validate round trip "
+        f"for {record}"
+    )
+
+
+@pytest.mark.parametrize("record", list(_FENCE_RECORDS))
+def test_no_surface_invents_a_verdict_the_run_did_not_record(record):
+    payload, _ = _FENCE_RECORDS[record]
+    card = _fence_card(record)
+    recorded = payload["verdict"]
+
+    assert card.verdict == recorded, _disagrees("the card", record, "verdict", card.verdict, recorded)
+    assert card.row("setup").status == recorded, _disagrees(
+        "the card", record, "setup", card.row("setup").status, recorded
+    )
+    assert _printed_rows(card)["setup"].status == recorded, _disagrees(
+        _TERMINAL, record, "setup", _printed_rows(card)["setup"].status, recorded
+    )
+    served = _report_cells(card)[ROW_LABELS["setup"]][0]
+    assert served == recorded, _disagrees(_REPORT, record, "setup", served, recorded)
+
+
+def test_every_ci_verdict_the_record_can_hold_has_a_word_a_reader_can_read():
+    """No comparison verdict may reach a surface spelled the way the record spells it.
+
+    `ci_row` spells the record's word for a reader through `_CI_STATUS_WORD`
+    and falls back to the raw word for anything the map does not name. That
+    fallback is right for the words a reader already reads (`met`, `partial`)
+    and wrong for any word carrying an underscore, which would reach all three
+    surfaces as `not_met` did before it was given an entry. This fails at the
+    map, where the next verdict is added, rather than in a screenshot of the
+    report weeks later.
+    """
+
+    for verdict in get_args(AttainmentVerdict):
+        assert verdict in _CI_STATUS_WORD or "_" not in verdict, (
+            f"AttainmentVerdict {verdict!r} has no reader's spelling: give it one in "
+            "_CI_STATUS_WORD (sag/result_card/rows.py) or every surface prints the "
+            "record's own spelling"
+        )
+        assert verdict in _CI_TONE, (
+            f"AttainmentVerdict {verdict!r} has no tone: give it one in _CI_TONE "
+            "(sag/result_card/rows.py) or the block colours it as attention by default"
+        )
+
+    unknown = set(_CI_STATUS_WORD) - set(get_args(AttainmentVerdict))
+    assert not unknown, (
+        f"_CI_STATUS_WORD spells {sorted(unknown)}, which no AttainmentVerdict can hold"
+    )
