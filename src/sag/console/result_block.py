@@ -27,6 +27,12 @@ _TONE_STYLE: dict[Tone, str] = {
 _NEXT_STEPS = "uv run sag ui · uv run sag result {target}"
 _ITEM_BULLET = "· "
 _OLDER_RECORD = "reconstructed from an older run record"
+_ELLIPSIS = "…"
+
+#: What the opening rule spends on itself: ``"── "``, the space closing the
+#: title, and the one dash that keeps the rule a rule. The title gets the rest,
+#: so the first line is always exactly ``width`` and always one line.
+_RULE_CHROME = 5
 
 
 def _rule(width: int, title: str | None = None) -> str:
@@ -36,16 +42,38 @@ def _rule(width: int, title: str | None = None) -> str:
     return head + "─" * max(0, width - len(head))
 
 
-def _identity(card: RunResultCard) -> str:
-    parts = [
-        card.project,
-        card.commit[:_COMMIT_CHARS] if card.commit else None,
-        card.container,
-    ]
-    return " · ".join(part for part in parts if part) or card.run_id
+def _elide(text: str, room: int) -> str:
+    """Shorten to ``room``, marking the cut so a reader sees a name was shortened."""
+
+    if room <= 0:
+        return ""
+    if len(text) <= room:
+        return text
+    return text[: room - 1] + _ELLIPSIS if room > 1 else _ELLIPSIS
 
 
-def _wrap(text: str, width: int, indent: str) -> list[str]:
+def _identity(card: RunResultCard, room: int) -> str:
+    """The run's name, fitted to ``room``.
+
+    The project and the commit are what a reader recognises a run by, so the
+    container is the segment that gives way. Nothing is lost by shortening it
+    here: the Evidence and Next lines below print it in full.
+    """
+
+    named = " · ".join(
+        part
+        for part in (card.project, card.commit[:_COMMIT_CHARS] if card.commit else None)
+        if part
+    )
+    if card.container:
+        separator = " · " if named else ""
+        container = _elide(card.container, room - len(named) - len(separator))
+        if container:
+            named = f"{named}{separator}{container}"
+    return _elide(named or card.run_id, room)
+
+
+def _wrap(text: str, width: int, indent: str, hanging: str | None = None) -> list[str]:
     # ``width`` is the room left for the text itself; ``textwrap`` measures the
     # whole line, indent included, so the indent is added back before wrapping.
     if width <= 0:
@@ -54,7 +82,7 @@ def _wrap(text: str, width: int, indent: str) -> list[str]:
         text,
         width=width + len(indent),
         initial_indent=indent,
-        subsequent_indent=indent,
+        subsequent_indent=indent if hanging is None else hanging,
         break_long_words=False,
         break_on_hyphens=False,
     ) or [indent.rstrip()]
@@ -80,7 +108,7 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
     body_indent = " " * (GUTTER + LABEL_WIDTH + STATUS_WIDTH)
     body_width = width - len(body_indent)
 
-    lines: list[str] = [_rule(width, _identity(card))]
+    lines: list[str] = [_rule(width, _identity(card, width - _RULE_CHROME))]
 
     # A result rebuilt from an older run record is worth less than one read from
     # the run that wrote it, and looks identical to one unless the block says so.
@@ -97,8 +125,11 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
 
         # A headline that only repeats the status word says the same thing
         # twice, so the body column leads with the explanation instead.
-        body = [
-            text
+        # Each entry carries the indent its continuation lines take: a bulleted
+        # item hangs under its own text, so the bullet groups what follows it.
+        item_indent = body_indent + " " * len(_ITEM_BULLET)
+        body: list[tuple[str, str]] = [
+            (text, body_indent)
             for text in (
                 None if row.headline == row.status else row.headline,
                 row.detail,
@@ -106,12 +137,18 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
             )
             if text
         ]
-        body.extend(f"{_ITEM_BULLET}{item}" for item in row.items[:_MAX_ITEMS])
+        body.extend(
+            (f"{_ITEM_BULLET}{item}", item_indent) for item in row.items[:_MAX_ITEMS]
+        )
         if len(row.items) > _MAX_ITEMS:
-            body.append(f"{_ITEM_BULLET}+{len(row.items) - _MAX_ITEMS} more")
+            body.append((f"{_ITEM_BULLET}+{len(row.items) - _MAX_ITEMS} more", item_indent))
 
-        # One body column: everything the row says hangs under the same edge.
-        wrapped = [line for text in body for line in _wrap(text, body_width, body_indent)]
+        # One body column: everything the row says starts at the same edge.
+        wrapped = [
+            line
+            for text, hanging in body
+            for line in _wrap(text, body_width, body_indent, hanging)
+        ]
         wrapped = wrapped or [body_indent]
         lines.append(head + wrapped[0][len(body_indent) :])
         lines.extend(wrapped[1:])

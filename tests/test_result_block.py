@@ -89,8 +89,19 @@ def test_task_steps_are_listed_under_their_row():
     text = _plain(_card())
     assert (
         "                              · smoke-build-test: complete — mvn clean verify\n"
-        "                              → exit 0\n"
+        "                                → exit 0\n"
     ) in text
+
+
+def test_a_wrapped_item_hangs_under_its_own_text():
+    lines = _plain(_card()).splitlines()
+    bullet = next(i for i, line in enumerate(lines) if line.lstrip().startswith("· smoke-"))
+    continuation = lines[bullet + 1]
+    indent = len(lines[bullet]) - len(lines[bullet].lstrip())
+    # The bullet groups what follows it, rather than the continuation starting
+    # under the glyph as if it were a new item.
+    assert len(continuation) - len(continuation.lstrip()) == indent + 2
+    assert continuation.strip() == "→ exit 0"
 
 
 def test_a_reconstructed_result_says_so_and_a_current_one_does_not():
@@ -112,6 +123,19 @@ def test_a_long_container_name_wraps_under_its_label():
         " Next          uv run sag ui · uv run sag result\n"
         "               sag-advisor-high20-r2-terra-high-commons-cli-20260914\n"
     ) in text
+
+
+def test_a_long_container_name_leaves_the_rule_one_line_wide():
+    lines = _plain(
+        _card(container="sag-advisor-high20-r2-terra-high-commons-cli-20260914")
+    ).splitlines()
+    assert lines[0] == (
+        "── commons-cli · e171117 · sag-advisor-high20-r2-terra-high-commons-cli-202… ─"
+    )
+    assert len(lines[0]) == 78
+    # The rule is one line: the row block starts immediately after it, and the
+    # project and the commit survive intact because the container gave way.
+    assert lines[1].startswith(" Setup")
 
 
 def test_a_clean_run_says_nothing_after_the_block():
