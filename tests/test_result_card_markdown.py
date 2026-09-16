@@ -5,7 +5,7 @@ import re
 from sag.result_card.build import build_result_card
 from sag.result_card.markdown import render_result_card_markdown
 
-from result_card_fakes import RUN_ID, module_metrics, snapshot_dict
+from result_card_fakes import RUN_ID, evaluated_ci_comparison, module_metrics, snapshot_dict
 
 
 def _lines(**kwargs) -> list[str]:
@@ -35,10 +35,27 @@ def test_every_row_is_one_table_row_in_order():
 
 
 def test_detail_and_reason_are_joined_in_the_third_column():
+    # The reason joins like any other part. The row builder already names the
+    # code inside it, so a second pair of parentheses would only nest them.
     row = next(line for line in _lines() if "**Official CI**" in line)
-    assert "not compared" in row
-    assert "no CI job on this commit matches the run's JDK and OS" in row
-    assert "official_ci_cell_not_matched" in row
+    assert row == (
+        "| **Official CI** | not compared | no CI job on this commit matches "
+        "the run's JDK and OS (official_ci_cell_not_matched) |"
+    )
+
+
+def test_no_row_restates_its_status_word_in_its_detail_cell():
+    # What the status column says, the detail column does not say again.
+    assert next(line for line in _lines() if "**Coverage**" in line) == (
+        "| **Coverage** | not collected | fixture coverage not collected |"
+    )
+    # A headline saying more than the status word ("complete 1/1 steps") stays;
+    # what is barred is a first part that is the status word and nothing else.
+    for line in _lines():
+        if not line.startswith("| **"):
+            continue
+        _, _, status, detail, _ = line.split("|")
+        assert detail.strip().split(" · ")[0] != status.strip()
 
 
 def test_pipes_inside_a_command_do_not_break_the_table():
@@ -65,6 +82,8 @@ def test_pipes_inside_a_command_do_not_break_the_table():
     # every pipe that is not preceded by a backslash.
     assert len(re.findall(r"(?<!\\)\|", row)) == 4
     assert r"\|" in row
+    # The same command listed as an item is escaped the same way.
+    assert r"- s1: complete — mvn test \| tee out.log → exit 0" in _lines(snapshot=snapshot)
 
 
 def test_attention_is_listed_under_its_own_heading():
@@ -95,3 +114,33 @@ def test_a_reconstructed_result_says_so_and_a_current_one_does_not():
     payload.pop("rates")
     assert _lines(snapshot=payload)[2] == "**Record** — reconstructed from an older run record"
     assert not any(line.startswith("**Record**") for line in _lines())
+
+
+def test_a_rows_items_are_listed_under_a_heading_naming_that_row():
+    # Loose in one list, an item reads as a finding from nowhere; the table is
+    # the only thing that could have said which measurement it belongs to.
+    lines = _lines()
+    assert lines[lines.index("### Required task steps") + 2] == (
+        "- smoke-build-test: complete — mvn clean verify → exit 0"
+    )
+
+
+def test_the_comparisons_findings_are_listed_under_their_own_heading():
+    lines = _lines(
+        snapshot=snapshot_dict(
+            ci_comparison=evaluated_ci_comparison(
+                verdict="not_met",
+                clean=False,
+                red_observed=3,
+                unexpected_red_ids=["a.B#c"],
+                reason_codes=["NEW_RED_BEYOND_TARGET"],
+            )
+        )
+    )
+    assert lines[lines.index("### Official CI findings") + 2] == (
+        "- NEW_RED_BEYOND_TARGET: tests failed here that pass in CI"
+    )
+
+
+def test_a_row_with_no_items_gets_no_heading_of_its_own():
+    assert "### Coverage details" not in _lines()
