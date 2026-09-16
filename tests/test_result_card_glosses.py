@@ -2,7 +2,10 @@
 
 from sag.agent.acceptance_task import TASK_REASON_CODES
 from sag.agent.ci_comparison import CI_REASON_CODES
-from sag.agent.java_success_certificates import BLOCKED_AXIS_REASON_CODES
+from sag.agent.java_success_certificates import (
+    BLOCKED_AXIS_REASON_CODES,
+    TYPED_DEFEATER_CODES,
+)
 from sag.metrics import attainment
 from sag.result_card.glosses import KNOWN_REASON_CODES, REASON_GLOSS, gloss
 from sag.verdict import ADJUDICATED_CONFLICTS, BUILD_SCOPE_CONFLICTS
@@ -43,20 +46,7 @@ def _attainment_codes() -> set[str]:
 
 
 def _certificate_codes() -> set[str]:
-    return {
-        "AUTHORITATIVE_BUILD_FAILURE",
-        "TEST_EXECUTION_FAILURE",
-        "TEST_OUTCOME_RED",
-        "MISSING_REQUIRED_IDENTITY",
-        "EMPTY_VERDICT_BEARING_RESULT",
-        "IDENTITY_CONFLICT",
-        "DIAGNOSTIC_ONLY_OBSERVATION",
-        "TEST_RESULTS_UNAVAILABLE",
-        "LINEAGE_UNAVAILABLE",
-        "UNSEALED_DENOMINATOR",
-        "DOCUMENTED_NO_AUTOMATED_TESTS",
-        *BLOCKED_AXIS_REASON_CODES.values(),
-    }
+    return set(TYPED_DEFEATER_CODES) | set(BLOCKED_AXIS_REASON_CODES.values())
 
 
 def _conflict_codes() -> set[str]:
@@ -66,6 +56,11 @@ def _conflict_codes() -> set[str]:
         *UNCOUNTED_REPORT_CONFLICTS,
         HEAVY_RED_CONFLICT,
         UNBOUNDED_CONFLICT,
+        # Maintained by hand. These four are raised inline by the verdict
+        # kernel -- src/sag/agent/verdict_finalizer.py and
+        # src/sag/agent/phase_gates.py -- and are not exported as named
+        # constants, so this test cannot enumerate them. A conflict id added
+        # beside them there would ship unglossed and render as a bare code.
         "validated_test_stats_invalid",
         "test_execution_interrupted",
         "test_stats_basis_incomparable",
@@ -91,6 +86,7 @@ def test_every_inventoried_code_has_a_gloss():
 
 
 def test_glosses_are_plain_sentences():
+    assert len(REASON_GLOSS) > 50
     for code, text in REASON_GLOSS.items():
         assert text == text.strip(), code
         assert not text.endswith("."), f"{code}: glosses are clause-shaped, no trailing period"
