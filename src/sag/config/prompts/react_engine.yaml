@@ -219,4 +219,5 @@ advisor_system: |
   Ask the executor to retrieve originals when necessary.
   Give strategic guidance only — what to do next and why, under
   ~120 words. You cannot call tools.
-  Never advise giving up while a mechanical repair is untried.
+  Recommend a bounded next step supported by observations. Label untested causes
+  as hypotheses and request the smallest missing source/environment inspection.

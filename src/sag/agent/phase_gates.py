@@ -366,24 +366,53 @@ def gate_observation_text(
     text and the record cannot come from different objects.
     """
     outcome = PhaseOutcome(gate.validated_outcome).value
+    compilation = (
+        phase == "build"
+        and gate.validated_facts.get("build.validation_scope") == "compilation_evidence"
+    )
+    label = "compilation-evidence outcome" if compilation else "outcome"
     if origin == "terminal_claim":
-        return (
-            f"Phase '{phase}' terminal claim accepted with validated outcome "
+        text = (
+            f"Phase '{phase}' terminal claim accepted with validated {label} "
             f"'{outcome}'. Awaiting engine routing."
         )
-    if origin == "engine_close":
-        return (
-            f"PHASE_CLOSED: the harness closed phase '{phase}' with validated outcome "
+    elif origin == "engine_close":
+        text = (
+            f"PHASE_CLOSED: the harness closed phase '{phase}' with validated {label} "
             f"'{outcome}' ({gate.code or 'phase_closed'}): {gate.reason}"
         )
-    if superseded is None:
-        raise ValueError("an outcome revision must name the grading it supersedes")
-    prior = PhaseOutcome(superseded.validated_outcome).value
-    return (
-        f"GATE_OUTCOME_REVISED: phase '{phase}' was answered with validated outcome "
-        f"'{prior}', and the sealed outcome is '{outcome}' "
-        f"({gate.code or 'gate_outcome_revised'}): {gate.reason}"
-    )
+    else:
+        if superseded is None:
+            raise ValueError("an outcome revision must name the grading it supersedes")
+        prior = PhaseOutcome(superseded.validated_outcome).value
+        text = (
+            f"GATE_OUTCOME_REVISED: phase '{phase}' was answered with validated outcome "
+            f"'{prior}', and the sealed {label} is '{outcome}' "
+            f"({gate.code or 'gate_outcome_revised'}): {gate.reason}"
+        )
+    if compilation:
+        ready = gate.validated_facts.get("build.test_entry_ready")
+        coverage = gate.validated_facts.get("build.artifact_coverage_complete")
+        text += (
+            "\nScope: observed compilation evidence only; compiled output can cover "
+            "part of the project while the required command still fails. "
+            f"Test entry ready: {str(ready).lower() if isinstance(ready, bool) else 'unknown'}. "
+            "Filesystem artifact coverage diagnostic: "
+            f"{('complete' if coverage else 'incomplete') if isinstance(coverage, bool) else 'unknown'}. "
+            "This phase signal does not establish whole-task completion or CI attainment."
+        )
+        if origin == "terminal_claim":
+            text += f"\nEvidence: {gate.reason}"
+    completion = gate.validated_facts.get("task_completion")
+    if completion is not None:
+        from sag.agent.acceptance_task import render_task_completion_lines
+
+        text += "\n" + "\n".join(render_task_completion_lines(completion))
+    elif phase == "build":
+        text += (
+            "\nRequired task completion: unassessed here; inspect the required command receipts."
+        )
+    return text
 
 
 def _unclosed_domains(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
@@ -2320,7 +2349,11 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     jvm = isinstance(evidence, Mapping) and evidence.get("build_system") in {"maven", "gradle"}
     state = _state_from_evidence_status(status.get("evidence_status"))
     if jvm and (judgment := physical_build_judgment(status)) is not None:
-        state = {"success": ValidatorState.GREEN, "partial": ValidatorState.PARTIAL, "failed": ValidatorState.RED}[judgment]
+        state = {
+            "success": ValidatorState.GREEN,
+            "partial": ValidatorState.PARTIAL,
+            "failed": ValidatorState.RED,
+        }[judgment]
     elif state is ValidatorState.UNAVAILABLE:
         if status.get("success") and status.get("build_complete", True):
             state = ValidatorState.GREEN
@@ -2330,7 +2363,10 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
             state = ValidatorState.RED
     reason = status.get("reason") or "build validator returned no conclusion"
     if jvm and state is ValidatorState.GREEN:
-        reason = "JVM build execution validated. Official-CI evidence determines scope attainment separately."
+        reason = (
+            "JVM compilation evidence observed. Required command receipts determine task "
+            "completion. Official-CI evidence determines scope attainment separately."
+        )
     suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
@@ -2394,6 +2430,10 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     else:
         test_entry_ready = False
     validated_facts: dict[str, Any] = {"build.test_entry_ready": test_entry_ready}
+    if jvm:
+        validated_facts["build.validation_scope"] = "compilation_evidence"
+        if isinstance(status.get("build_complete"), bool):
+            validated_facts["build.artifact_coverage_complete"] = status["build_complete"]
     compiled_classes = _first_nonnegative_int(
         evidence.get("class_count") if isinstance(evidence, Mapping) else None,
         status.get("compiled_classes"),

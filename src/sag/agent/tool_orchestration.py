@@ -243,7 +243,11 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
                     "command still running"
                 )
         elif result.succeeded:
-            formatted = f"✅ {tool_name} executed successfully"
+            formatted = (
+                "Phase request processed (tool delivery status)."
+                if tool_name == "phase"
+                else f"✅ {tool_name} executed successfully"
+            )
         else:
             outcome = result.operation_outcome.value
             icon = {"partial": "⚠️", "unknown": "❔", "skipped": "⏭"}.get(outcome, "✅")

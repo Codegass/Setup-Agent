@@ -141,7 +141,7 @@ class PhaseTool(BaseTool):
         )
         gate = gate if gate.claim is not None else gate.with_claim(claim)
         if (
-            phase == "test"
+            phase in {"build", "test"}
             and not sealed
             and self.run_evidence_state is not None
             and gate.control_disposition is GateControlDisposition.TERMINAL_CLAIMABLE
@@ -158,7 +158,18 @@ class PhaseTool(BaseTool):
                 task=getattr(self.orchestrator, "acceptance_task", None),
                 output_storage=self._execution_plan_output_storage,
             )
-            if completion is not None and completion.status != "complete":
+            if completion is not None:
+                gate = replace(
+                    gate,
+                    validated_facts={
+                        **dict(gate.validated_facts),
+                        "task_completion": completion.model_dump(mode="json"),
+                    },
+                )
+            # Build may hand off with usable compilation evidence even when a
+            # required verify/package step failed or belongs to the next phase.
+            # Disclose that task status without turning it into a routing gate.
+            if phase == "test" and completion is not None and completion.status != "complete":
                 # This bounds the completion claim, not the next executable
                 # action. A truthful partial claim can still terminate.
                 remaining = ", ".join(

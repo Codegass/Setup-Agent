@@ -254,6 +254,16 @@ class _PreparedRejectedCompletion:
 # state and evidence required to close a phase; they never select a public tool
 # call or an order of project actions.  Neutral tool syntax is supplied once by
 # the generated schemas, while reactive corrective loops remain evidence-gated.
+FAILURE_DIAGNOSIS_GUIDANCE = (
+    "Before proposing a repair, state the condition in the failing source code and "
+    "which relevant environment value is measured versus unknown. If a relevant value "
+    "is unknown, propose one concrete read-only measurement and what results would "
+    "distinguish your hypotheses. Do not recommend changing project code or tests on "
+    "the basis of an unmeasured environment assumption. Keep diagnostic experiments "
+    "separate from completion of the required command. The latest terminal receipt "
+    "supersedes older pending output."
+)
+
 PHASE_OBJECTIVES = {
     "provision": (
         "Establish a checkout of the requested repository and ref plus a measured, "
@@ -287,8 +297,8 @@ PHASE_OBJECTIVES = {
         "runner evidence for the required surveyed test coordinates. "
         "Test coordinates can live in a different module or build system from build "
         "coordinates. Persist executed, passed, failed, error, and skipped counts with their "
-        "receipt references. Report what executed against what was discovered; red tests are "
-        "project facts to report, not a repair duty. Missing runtime/build prerequisites "
+        "receipt references. Report what executed against what was discovered; diagnose "
+        "red tests before choosing a repair or attributing their cause. Missing runtime/build prerequisites "
         "remain setup work: investigate and carry out feasible repairs before stopping. "
         "Claim the outcome the receipts support; "
         "absence of a runner receipt cannot support test success."
@@ -318,7 +328,7 @@ PYTHON_PHASE_OBJECTIVES = {
         "executed, passed, failed, error, and skipped counts bound to receipt references. "
         "When native readiness is absent or unknown, the surveyed bounded-smoke constraint "
         "limits collection until capability evidence changes. Report what executed against "
-        "what was discovered; red tests are project facts to report, not a repair duty. "
+        "what was discovered; diagnose red tests before choosing a repair or attributing their cause. "
         "Missing runtime/build prerequisites remain setup work: investigate and carry out "
         "feasible repairs before stopping. Claim the outcome the receipts support; "
         "no runner receipt cannot support success."
@@ -3032,6 +3042,8 @@ class ReActEngine(UIEventEmitter):
             last_test = self._last_test_attempt_line()
             if last_test:
                 lines.extend(["", last_test])
+        if phase in ("build", "test"):
+            lines.extend(["", FAILURE_DIAGNOSIS_GUIDANCE])
         handoff = getattr(self, "phase_handoff", None)
         projection = None
         if handoff is not None:
@@ -8033,6 +8045,18 @@ class ReActEngine(UIEventEmitter):
             AdvisorSection("ORIGINAL TASK AND CONSTRAINTS", task_text, priority=5, policy="keep"),
             AdvisorSection("CURRENT EVIDENCE DIGEST", digest, priority=10, policy="keep"),
         ]
+        if getattr(getattr(self, "phase_machine", None), "current_phase", None) in {
+            "build",
+            "test",
+        }:
+            required.append(
+                AdvisorSection(
+                    "FAILURE DIAGNOSIS GUIDANCE",
+                    FAILURE_DIAGNOSIS_GUIDANCE,
+                    priority=12,
+                    policy="keep",
+                )
+            )
         # The existing typed acceptance task is a compact, authoritative task
         # source. Preserve its literal commands ahead of explanatory prose.
         from .acceptance_task import AcceptanceTask
@@ -8347,13 +8371,16 @@ class ReActEngine(UIEventEmitter):
                 f"receipt={receipt_id}, receipt_file={receipt_path}, "
                 f"output={str(metadata.get('output_ref_id') or 'unknown')[:160]}, "
                 f"tool_outcome={getattr(outcome, 'value', outcome)}, "
+                f"exit_code={self._advisor_count(metadata.get('exit_code'))}, "
                 f"invocation XML counts: {values}; count_basis=raw execution records; "
                 "unique_counts=unknown (not inferred from raw totals). "
                 "These are tool observations, not a completion verdict. Inspect the linked "
                 "receipt and required scope before declaring tests missing or rerunning them."
-                + ("\n" + metadata["test_failure_summary"]
-                   if isinstance(metadata.get("test_failure_summary"), str)
-                   else "")
+                + (
+                    "\n" + metadata["test_failure_summary"]
+                    if isinstance(metadata.get("test_failure_summary"), str)
+                    else ""
+                )
             )
         metadata = self._last_pytest_metadata()
         if not metadata:
@@ -8543,6 +8570,7 @@ class ReActEngine(UIEventEmitter):
             last_test = ""
         if last_test:
             parts.append(last_test)
+        parts.extend(self._required_task_progress_lines())
         try:
             native_state = self._native_state_line()
         except Exception as exc:

@@ -575,6 +575,7 @@ def test_the_accepted_observation_is_rendered_from_the_gate_not_assembled():
     assert gate_observation_text(gate, phase="build", origin="terminal_claim") == (
         "Phase 'build' terminal claim accepted with validated outcome "
         "'partial'. Awaiting engine routing."
+        "\nRequired task completion: unassessed here; inspect the required command receipts."
     )
 
 

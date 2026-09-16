@@ -339,7 +339,8 @@ def test_consult_messages_carry_the_flattened_transcript_and_the_digest():
     assert [message["role"] for message in messages] == ["system", "user"]
     system_text = messages[0]["content"]
     assert "senior reviewer" in system_text
-    assert "Never advise giving up while a mechanical repair is untried." in system_text
+    assert "Recommend a bounded next step supported by observations." in system_text
+    assert "Label untested causes" in system_text
     assert "SEALED PROJECT EXECUTION PLAN" not in system_text
 
     user_text = messages[1]["content"]

@@ -452,6 +452,8 @@ def render_task_completion_lines(value) -> list[str]:
     lines.extend(
         f"Task {step.id}: {step.status} — {step.command}"
         + (f"; {step.reason}" if step.reason else "")
+        + (f"; exit_code={step.exit_code}" if step.exit_code is not None else "")
+        + (f"; receipt={step.receipt_id}" if step.receipt_id else "")
         for step in snapshot.steps
     )
     return lines
