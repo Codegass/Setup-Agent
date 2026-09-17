@@ -20,7 +20,9 @@
 - **Status earns color.** Hue belongs to state. No gradient accents, no hero-metric card grids, no colored side stripes (`docs/DESIGN.md`'s Hairline Rule).
 - **The frontend renders; it does not derive.** Every number and status comes from `resultCard`, `ciComparison`, `taskCompletion` or the trajectory document. No client-side recomputation of a rate that the card already states.
 - **Every fetch has a designed failure rendering and every list a designed empty rendering.**
-- **All frontend tests stay green** (`npm test --prefix webui`; the baseline is 352 tests in 46 files) and `npx tsc -b` is clean.
+- **All frontend tests stay green** (`npm test --prefix webui`; the baseline is 352 tests in 46 files) and `(cd webui && npx tsc -b)` is clean.
+  Type-check from inside `webui`: `npx --prefix webui tsc -b` resolves the binary there but reads `tsconfig.json` from the *current* directory, so from the repo root it exits 1 with `TS5083` whatever the code says, and bare `npx tsc -b` at the root downloads an unrelated registry package. `uv run python scripts/ship_gate.py` runs every leg and is the gate of record.
+- **The Python suite carries pre-existing failures that are nobody's in this plan.** They are listed in `scripts/ship_gate.py`'s `PRE_EXISTING_FAILURES`, verified at the pre-implementation commit `7e3b0ede`. Never chain the pytest leg with `&&`: it exits non-zero by design. What must hold is that the FAILED set equals that list and gains nothing. Do not "fix" them.
 - **Commit messages carry no `Co-Authored-By` trailer.**
 - **Test commands:** `npm test --prefix webui` and `PYTHONPATH=.:tests uv run pytest <path> -v`.
 
@@ -441,7 +443,7 @@ export interface TrajectoryPhase {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `npm test --prefix webui -- src/api/types.test.ts && npx --prefix webui tsc -b`
+Run: `npm test --prefix webui -- src/api/types.test.ts`, then separately `(cd webui && npx tsc -b)`
 Expected: the types test PASSES; `tsc` reports errors in every file that read a removed field. Those are Tasks 2-10's work; note the list and move on.
 
 - [ ] **Step 5: Commit**
@@ -2137,8 +2139,8 @@ In `docs/DESIGN.md`, correct the front-matter note that dark theme is dormant (t
 
 - [ ] **Step 5: Run everything**
 
-Run: `npm test --prefix webui && npx --prefix webui tsc -b && PYTHONPATH=.:tests uv run pytest -q --ignore=tests/test_packaging_smoke.py`
-Expected: PASS on all three. The frontend count will differ from the 352 baseline; what matters is zero failures.
+Run: `uv run python scripts/ship_gate.py`
+Expected: `SHIP GATE PASSED`. It runs all four legs — `npm test`, `(cd webui && npx tsc -b)`, `npm run build`, and pytest — without `&&`, so every leg runs whatever the one before it did and each prints its own verdict. The frontend count will differ from the 352 baseline; what matters is zero failures. The pytest leg passes when the FAILED set equals the documented pre-existing list and gains nothing.
 
 - [ ] **Step 6: Look at it**
 
