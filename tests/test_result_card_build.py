@@ -248,3 +248,94 @@ def test_every_schema_this_run_can_no_longer_re_read_is_a_reconstruction():
     assert build_result_card(
         snapshot_dict(schema_version=VERDICT_SCHEMA_VERSION)
     ).verdict_source == "snapshot"
+
+
+def _red_test_stats(*, failed: int, errors: int) -> dict:
+    """The record's own test counts, with some of them red."""
+
+    counts = {
+        "executed": 994,
+        "passed": 994 - failed - errors - 61,
+        "failed": failed,
+        "errors": errors,
+        "skipped": 61,
+    }
+    return {
+        "discovered": 472,
+        "denominator_basis": "complete",
+        "unique": dict(counts),
+        "raw": dict(counts),
+        "flaky_count": 0,
+        "judgment": "partial",
+        "collection_errors": 0,
+        "receipt_scoped": True,
+    }
+
+
+def test_a_run_whose_tests_went_red_is_named_under_attention():
+    """One notion of attention, derived once, so four surfaces cannot disagree.
+
+    The only `failing_tests` item the card could build came from
+    `module_metrics["modules"][*]["failing_count"]`, and `module_metrics.json`
+    occurs 0 times in 792 archived campaign directories — so that branch has
+    never fired on a real run. Meanwhile the dashboard rail flags a row from
+    `card.stats`' own failed + errors. The rail pointed at runs whose Overview
+    said nothing needed attention.
+    """
+
+    card = build_result_card(
+        snapshot_dict(verdict="partial", test_stats=_red_test_stats(failed=8, errors=3))
+    )
+
+    item = next(item for item in card.attention if item.kind == "failing_tests")
+    assert "8" in item.title and "3" in item.title
+    assert card.row("tests").headline.startswith("994 executed")
+
+
+def test_the_attention_item_counts_what_the_tests_row_counts():
+    """Both read `test_stats.unique`, so the two lines cannot state different numbers."""
+
+    for failed, errors in ((2, 0), (0, 5), (7, 1)):
+        card = build_result_card(
+            snapshot_dict(verdict="partial", test_stats=_red_test_stats(failed=failed, errors=errors))
+        )
+        titles = [item.title for item in card.attention if item.kind == "failing_tests"]
+        assert len(titles) == 1, f"{failed} failed / {errors} errors named {titles}"
+        if failed:
+            assert f"{failed:,} failed" in titles[0]
+        if errors:
+            assert f"{errors:,}" in titles[0]
+
+
+def _failing_items(card) -> list:
+    return [item for item in card.attention if item.kind == "failing_tests"]
+
+
+def test_a_run_with_no_red_tests_is_not_named():
+    # The red control is built by the same call, so an empty list here cannot
+    # pass merely because the derivation is missing.
+    assert _failing_items(
+        build_result_card(snapshot_dict(verdict="partial", test_stats=_red_test_stats(failed=1, errors=0)))
+    )
+    assert _failing_items(build_result_card(snapshot_dict())) == []
+
+
+def test_a_run_that_recorded_no_test_outcomes_is_not_named():
+    """Absence is not zero and it is not a failure: nothing to flag either way."""
+
+    assert _failing_items(
+        build_result_card(snapshot_dict(verdict="partial", test_stats=_red_test_stats(failed=1, errors=0)))
+    )
+    card = build_result_card(
+        snapshot_dict(
+            verdict="partial",
+            test_stats={
+                "discovered": 0,
+                "unique": {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0},
+                "raw": {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0},
+                "flaky_count": 0,
+                "judgment": "unknown",
+            },
+        )
+    )
+    assert _failing_items(card) == []

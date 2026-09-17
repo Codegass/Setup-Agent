@@ -151,6 +151,15 @@ def _attention(
             )
         )
 
+    # The run's own red count, from the numbers the Tests row prints. The
+    # module walk below names WHICH module, and is the better item when it can
+    # be built — but `module_metrics.json` occurs in none of the 792 archived
+    # campaign directories, so for every real run so far it built nothing, and
+    # a run with failing tests was never named here at all. The dashboard rail
+    # meanwhile flags exactly these runs off the same two numbers, so the two
+    # halves of one product disagreed about what needs attention. One
+    # derivation; both surfaces read it.
+    named_modules = False
     for module in _mapping(module_metrics).get("modules") or ():
         if not isinstance(module, Mapping):
             continue
@@ -159,6 +168,7 @@ def _attention(
         failing = module.get("failing_count")
         if not isinstance(failing, int) or failing <= 0:
             continue
+        named_modules = True
         names = [str(name) for name in module.get("failing_names") or ()]
         shown = ", ".join(names[:_MAX_FAILING_NAMES])
         if len(names) > _MAX_FAILING_NAMES:
@@ -171,6 +181,21 @@ def _attention(
                 refs=tuple(str(ref) for ref in module.get("evidence_refs") or ())[:5],
             )
         )
+
+    if not named_modules:
+        counts = getattr(getattr(snapshot, "test_stats", None), "unique", None)
+        failed = getattr(counts, "failed", 0) or 0
+        errors = getattr(counts, "errors", 0) or 0
+        if failed > 0 or errors > 0:
+            said = []
+            if failed:
+                said.append(f"{failed:,} failed")
+            if errors:
+                said.append(f"{errors:,} ended in an error" if errors == 1
+                            else f"{errors:,} ended in errors")
+            items.append(
+                AttentionItem(kind="failing_tests", title=f"Tests: {' · '.join(said)}")
+            )
 
     # The same codes the CI row lists, read from the record rather than
     # recovered from the row's rendered lines. `_consistent_subject` on
