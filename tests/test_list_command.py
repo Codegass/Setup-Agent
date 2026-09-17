@@ -7,7 +7,14 @@ so the terminal and the web page cannot disagree about a workspace.
 from click.testing import CliRunner
 
 from sag.main import cli
-from sag.web.models import DashboardResponse, DockerSummary, WorkspaceSummary
+from sag.web.models import (
+    DashboardResponse,
+    DockerSummary,
+    WorkspaceResult,
+    WorkspaceSummary,
+    WorkspaceTaskResult,
+    WorkspaceTestResult,
+)
 
 CONNECTED = DashboardResponse(docker=DockerSummary(status="connected"), workspaces=[])
 
@@ -20,6 +27,29 @@ ONE_WORKSPACE = DashboardResponse(
             container="sag-kafka",
             docker=DockerSummary(status="running"),
             updated="2026-09-16 10:00",
+        )
+    ],
+)
+
+#: The shape the read model actually serves for a finished run: the verdict,
+#: how far the required task got, and the test counts — read off the run's own
+#: card, which is where the Workbench rail reads the same four numbers.
+ONE_RESULT = DashboardResponse(
+    docker=DockerSummary(status="connected"),
+    workspaces=[
+        WorkspaceSummary(
+            id="sag-rocketmq",
+            project="rocketmq",
+            container="sag-rocketmq",
+            docker=DockerSummary(status="running"),
+            updated="2026-09-16 10:00",
+            result=WorkspaceResult(
+                verdict="partial",
+                task=WorkspaceTaskResult(status="complete", completed=3, required=4),
+                tests=WorkspaceTestResult(
+                    executed=1234, passed=1230, failed=3, errors=1, skipped=0
+                ),
+            ),
         )
     ],
 )
@@ -60,9 +90,42 @@ def test_columns_name_the_result_not_a_free_text_comment(monkeypatch):
 def test_a_workspace_with_no_recorded_result_says_nothing_is_known(monkeypatch):
     result = _invoke(monkeypatch, ONE_WORKSPACE)
 
-    # Setup, Required task and Tests have no source yet; they say so rather
-    # than borrowing a number from somewhere else.
+    # A workspace that has not run carries no result at all: Setup, Required
+    # task and Tests say so rather than borrowing a number from somewhere else.
     assert result.output.count("—") >= 3
+
+
+def test_the_result_columns_say_what_the_run_produced(monkeypatch):
+    """The three columns that used to be dashes now hold the run's own numbers.
+
+    `WorkspaceSummary.result` arrived with phase 3 and the rail already reads
+    it; the terminal kept printing a dash beside a comment saying the field did
+    not exist. One run, two surfaces, two different answers.
+    """
+
+    result = _invoke(monkeypatch, ONE_RESULT)
+
+    assert result.exit_code == 0
+    assert "partial" in result.output
+    assert "3/4" in result.output
+    # Thousands separators, the way the rail writes them.
+    assert "1,230/1,234" in result.output
+    # Failures and errors together, the red count the rail prints beside them.
+    assert "+4" in result.output
+
+
+def test_a_run_that_measured_nothing_still_says_so(monkeypatch):
+    """A cell the run declined to measure is a dash, not a zero."""
+
+    dashboard = ONE_RESULT.model_copy(deep=True)
+    dashboard.workspaces[0].result = WorkspaceResult(verdict="unknown")
+
+    result = _invoke(monkeypatch, dashboard)
+
+    assert result.exit_code == 0
+    assert "unknown" in result.output
+    assert "0/0" not in result.output
+    assert result.output.count("—") >= 2
 
 
 def test_an_empty_dashboard_teaches_the_first_command(monkeypatch):
@@ -89,13 +152,13 @@ def test_a_failed_read_is_not_reported_as_an_empty_dashboard(monkeypatch):
 
 
 def test_the_table_names_no_field_the_read_model_does_not_define():
-    """Three columns wait on a field `WorkspaceSummary` does not carry yet.
+    """Every field these columns read is one `WorkspaceSummary` defines.
 
-    `WebModel` ignores extras, so code reaching for one is unreachable for
-    every possible input while reading as though it were live — and the code
-    behind these columns also named `tests.passed`, `tests.executed` and
-    `tests.errors`, none of which `TestSummary` defines. A dash and a comment
-    naming the field are honest; unreachable code that looks live is not.
+    `WebModel` ignores extras, so code reaching for a field that does not exist
+    is unreachable for every possible input while reading as though it were
+    live — which is exactly what these three columns did for a while, naming
+    `tests.passed` and `tests.errors` on a `TestSummary` that defines neither.
+    They now read `workspace.result`, which the model does define.
     """
     import inspect
     import re

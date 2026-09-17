@@ -57,12 +57,14 @@ from sag.trajectory.builder import (
 )
 from sag.trajectory.schema import DETAIL_TIERS, TrajectoryDelta
 from sag.utils.git_utils import extract_project_name_from_url
+from sag.web.models import WorkspaceResult
 from sag.web.server import run_web_server
 
 console = Console()
 
-#: What a column says when the read model does not carry the answer yet.
-_NOT_YET_READ = "—"
+#: What a cell says when the run did not measure it. Absence is stated; it is
+#: never rendered as a zero a reader would take for a measurement.
+_NOT_MEASURED = "—"
 
 #: What tells a path from a container name. A container name never holds one.
 _SEPARATORS = frozenset({"/", os.sep})
@@ -588,6 +590,43 @@ def cli(ctx, log_level, log_file, verbose):
         )
 
 
+#: The colour a verdict wears in the terminal, matching `sag result`'s block.
+_VERDICT_STYLE = {"success": "green", "partial": "yellow", "failed": "red"}
+
+
+def _workspace_result_cells(result: WorkspaceResult | None) -> Tuple[Text, Text, Text]:
+    """The Setup, Required task and Tests cells for one row of `sag list`.
+
+    Copied off `WorkspaceSummary.result`, which the read model fills from the
+    run's own card — the same four numbers the Workbench rail shows, so the
+    terminal and the web page cannot disagree about a workspace. A cell the run
+    did not measure is a dash: absence is said, not guessed at.
+    """
+
+    if result is None:
+        dash = Text(_NOT_MEASURED, style="dim")
+        return dash, dash.copy(), dash.copy()
+
+    setup = Text(result.verdict, style=_VERDICT_STYLE.get(result.verdict, "dim"))
+
+    task = (
+        Text(f"{result.task.completed}/{result.task.required}")
+        if result.task is not None
+        else Text(_NOT_MEASURED, style="dim")
+    )
+
+    if result.tests is None:
+        tests = Text(_NOT_MEASURED, style="dim")
+    else:
+        tests = Text(f"{result.tests.passed:,}/{result.tests.executed:,}")
+        red = result.tests.failed + result.tests.errors
+        if red:
+            # The rail prints the same red `+N` beside the same two numbers.
+            tests.append(f" +{red:,}", style="red")
+
+    return setup, task, tests
+
+
 @cli.command()
 def list():
     """List SAG workspaces and what each run produced."""
@@ -624,19 +663,14 @@ def list():
 
     for workspace in dashboard.workspaces:
         status = workspace.docker.status or "—"
+        setup, task, tests = _workspace_result_cells(workspace.result)
         table.add_row(
             workspace.project or "—",
             workspace.container or workspace.id,
             Text(status, style="green" if status == "running" else "yellow"),
-            # The Setup, Required task and Tests columns wait on the result card
-            # that phase 3 adds to `WorkspaceSummary` (`src/sag/web/models.py`).
-            # `WorkspaceSummary` carries no such field today and `WebModel`
-            # ignores extras, so code that reached for one would be unreachable
-            # for every input while reading as though it were live. A dash is
-            # what this surface can honestly say until the field arrives.
-            _NOT_YET_READ,
-            _NOT_YET_READ,
-            _NOT_YET_READ,
+            setup,
+            task,
+            tests,
             workspace.updated or "—",
         )
 
