@@ -356,18 +356,26 @@ _CI_TONE: dict[str, Tone] = {
 
 _MAX_RED_IDS = 10
 
+#: No CI job was reached at all: none was supplied, or none on this commit
+#: matches the run's JDK and OS. Nothing was compared, and the row says so.
 NOT_COMPARED = "not compared"
+
+#: A CI job WAS reached and no score came out of the comparison.
+NOT_SCORED = "not scored"
 
 #: The record's word for a comparison, said the way a reader says it. The record
 #: is what tone keys off; this is only how the word is spelled on a surface, so
 #: all three spell it the same and none of them keeps its own copy.
 #:
-#: ``invalid`` is the record's word for a comparison it could not make — 135 of
-#: the 342 evaluated comparisons under ``logs/``. On a screen the bare word
-#: reads as a judgment on the project rather than on the comparison, so every
-#: surface says what actually happened: nothing was compared. The row's reason
-#: still names why.
-_CI_STATUS_WORD: dict[str, str] = {"not_met": "not met", "invalid": NOT_COMPARED}
+#: ``invalid`` is the record's word for a comparison that reached a CI job and
+#: could not put a number on it — 135 of the 342 evaluated comparisons under
+#: ``logs/``. The bare word reads on a screen as a judgment on the project
+#: rather than on the comparison. It was spelled ``not compared``, which is the
+#: phrase the no-CI-job cases already use: one phrase over two different facts,
+#: and wrong for this one — the row beneath it names the CI job, the commit and
+#: the command, under a heading that reads WHAT WAS COMPARED. The row's reason
+#: still names why no score came out.
+_CI_STATUS_WORD: dict[str, str] = {"not_met": "not met", "invalid": NOT_SCORED}
 
 _REPORT_TONE: dict[str, Tone] = {
     "delivered": "neutral",
@@ -408,14 +416,12 @@ def ci_row(snapshot: Any) -> ResultRow:
     alpha = getattr(result, "alpha", None)
     if alpha is not None:
         headline = f"{word} {alpha.numerator:,}/{alpha.denominator:,}"
-    elif word == NOT_COMPARED:
-        # A row that says nothing was compared does not then report a missing
-        # score: the score is missing because there was no comparison, and
-        # every `invalid` record under `logs/` carries no score at all. Saying
-        # it twice in one row reads as two separate facts. The findings below
-        # the row still say why, and this renders the way the unsupplied and
-        # unmatched cases already render.
-        headline = NOT_COMPARED
+    elif word == NOT_SCORED:
+        # A row whose word is already "not scored" does not then report a
+        # missing score: every `invalid` record under `logs/` carries none, and
+        # saying it twice in one row reads as two separate facts. The findings
+        # below the row still say why.
+        headline = NOT_SCORED
     else:
         headline = f"{word} · scope score unavailable"
 
@@ -497,6 +503,7 @@ def report_row(termination: Any | None, *, report_path: str | None = None) -> Re
 
 __all__ = [
     "NOT_COMPARED",
+    "NOT_SCORED",
     "NOT_SUPPLIED",
     "build_row",
     "ci_row",

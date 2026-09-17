@@ -10,13 +10,13 @@ function buildState(build: WorkspaceSummary["build"]): string {
 
 /** The Official CI words that are a finding about this run.
  *
- *  Only one. The card spells `not_met` as "not met" and spells BOTH `invalid`
- *  and "there was nothing to compare" as "not compared" — 269 of the 373
- *  archived runs under `logs/` land on that one word, and only 68 of them are
- *  the failed kind. The rail cell carries the spelled word and nothing else, so
- *  it cannot tell those apart; flagging it would flag most of the fleet. The
- *  result band's Official CI row can tell them apart — it carries the row's
- *  tone — and that is where a reader sees the difference today.
+ *  Only one. `invalid` — a comparison that reached a CI job and produced no
+ *  score — now spells itself "not scored" rather than sharing "not compared"
+ *  with the runs that had no CI job at all, so the rail cell CAN tell the two
+ *  apart. Whether "not scored" belongs in this set is a separate decision and
+ *  has not been made: 135 of the 342 evaluated comparisons under `logs/` are
+ *  invalid, so adding it would flag a third of the fleet, and the result
+ *  band's Official CI row already carries the row's own tone for it.
  *
  *  `partial` is deliberately absent: it is a weaker match, not a failure, and
  *  the row already prints the word "partial" where a reader can see it.

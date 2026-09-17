@@ -131,6 +131,21 @@ _TRANSITION_GLYPH = {
     "repair": "→",
 }
 
+#: What each kind of transition means to a reader. Spec §4.2 prescribes three
+#: forms — advanced, blocked, repair — and the band used to print the ledger's
+#: own `expected_kind` for the other three, so two of the five closes on every
+#: normal run read `evidence_close` and `flow_close`.
+_TRANSITION_WORD = {
+    "advance": "advanced",
+    "evidence_close": "finished",
+    "report": "reported",
+}
+
+#: The gate words a phase can be graded with (`success`, `partial`, `failed`,
+#: `unknown` — measured over 120 ledgers). Only one of them means the phase did
+#: not finish, and a band that closed with a tick over it said the opposite.
+_BLOCKED_GATE_WORD = "failed"
+
 #: What Rich reads as a style tag, and a bracket with whatever backslashes run
 #: up to it. `_escape` needs to tell the two apart because Rich's parser does.
 _TAG_SHAPED = re.compile(r"\[[a-z#/@][^\[]*?]")
@@ -290,6 +305,9 @@ class TurnStreamRenderer:
             max(_MIN_SUMMARY_WIDTH, self._width - _CHROME - _GUTTER - _OUTCOME_ROOM),
         )
         self._phase: str | None = None
+        #: The last word a gate delivered inside the open band, so the band's
+        #: close can say whether the phase finished.
+        self._phase_gate: str | None = None
         self._printed: set[int] = set()
         #: What each turn has already said, so a restatement that carries
         #: nothing new says nothing. The reducer restates a settled turn on
@@ -534,36 +552,71 @@ class TurnStreamRenderer:
         self._emit(_Line(marker).extend(self._settle(turn, len(marker)) or _Line()))
 
     def _band(self, turn: Turn) -> None:
-        """Open a phase band when the run enters one.
+        """Open a phase band when the run enters one, and remember its grading.
 
         A band is never opened for `unknown`: that is the reducer saying the
         ledger has not placed the run yet, not the name of a phase. A turn
         dispatched before any phase is stated is held (see `render_turn`) so
         that its band can be printed above it rather than under it.
+
+        The gate word is recorded after any band change, so a turn that both
+        enters a phase and carries its grading records the grading against the
+        phase it is in rather than the one it left.
         """
 
-        if not turn.phase or turn.phase == UNKNOWN_PHASE or turn.phase == self._phase:
-            return
-        self._phase = turn.phase
-        self._emit(_Line().add(f"▸ {turn.phase}", _BAND_STYLE))
+        if turn.phase and turn.phase != UNKNOWN_PHASE and turn.phase != self._phase:
+            self._phase = turn.phase
+            self._phase_gate = None
+            self._emit(_Line().add(f"▸ {turn.phase}", _BAND_STYLE))
+        if turn.gate is not None:
+            self._phase_gate = turn.gate.word
 
     # -- events --------------------------------------------------------
 
     def _note_transition(self, payload: dict) -> None:
+        """One line for a transition, in the three forms §4.2 prescribes.
+
+        The ledger's `expected_kind` and `expected_reason_code` are machine
+        vocabulary and stay out of the line. `advance` carries no reason by
+        spec; a phase whose gate said `failed` closes blocked rather than with
+        a tick over it, which is what a reader scanning the left edge reads.
+        """
+
         kind = str(payload.get("expected_kind") or "")
         target = payload.get("expected_target")
         reason = payload.get("expected_reason_code")
-        glyph = _TRANSITION_GLYPH.get(kind, "·")
         name = self._phase or target or "phase"
+
         if kind == "repair":
-            text = f"{glyph} {target or name} repair"
-        elif kind == "advance":
-            text = f"{glyph} {name} advanced"
+            text = f"{_TRANSITION_GLYPH['repair']} {target or name} repair"
+            if reason:
+                text = f"{text} · {reason}"
+            self._emit(_Line().add(text, _REPAIR_STYLE))
+            return
+
+        # `flow_close` ends the RUN. Naming it after whichever phase happened to
+        # be open attributed a run-level event to a phase that did not cause it.
+        if kind == "flow_close":
+            self._emit(_Line().add("✓ run ended", _CLOSE_STYLE))
+            return
+
+        blocked = kind != "advance" and self._phase_gate == _BLOCKED_GATE_WORD
+        if blocked:
+            # No reason here: the measured close codes (`test_terminal`,
+            # `build_evidence_closed`, …) say which close fired, not why the
+            # phase failed, and the turn line above already carries that.
+            text = f"✗ {name} blocked"
         else:
-            text = f"{glyph} {name} {kind}"
-        if reason:
-            text = f"{text} · {reason}"
-        self._emit(_Line().add(text, _REPAIR_STYLE if kind == "repair" else _CLOSE_STYLE))
+            word = _TRANSITION_WORD.get(kind)
+            if word is None:
+                # A kind this layer does not know yet is shown whole rather
+                # than guessed at, with a neutral glyph rather than a KeyError.
+                text = f"· {name} {kind}"
+                if reason:
+                    text = f"{text} · {reason}"
+            else:
+                text = f"{_TRANSITION_GLYPH.get(kind, '·')} {name} {word}"
+        self._emit(_Line().add(text, _CLOSE_STYLE))
 
     def _note_job(self, payload: dict) -> None:
         job = str(payload.get("job_id") or "")

@@ -137,6 +137,11 @@ def _attention(
             )
         )
 
+    # The Setup row already states the first blocked phase's reason, in full.
+    # Restating it here printed the same paragraph twice on one screen — 450
+    # characters of it on a real run — so the item names the phase and leaves
+    # the words to the row. A reason no row carries is still stated.
+    said_by_setup = rows["setup"].detail or ""
     for record in getattr(snapshot, "phase_records", ()) or ():
         termination = str(getattr(record, "termination", ""))
         if termination in {"completed", ""}:
@@ -146,7 +151,7 @@ def _attention(
             AttentionItem(
                 kind="blocked_phase",
                 title=f"The {record.phase} phase did not finish",
-                detail=reason or None,
+                detail=None if reason and reason in said_by_setup else (reason or None),
                 refs=tuple(getattr(record, "evidence_refs", ()) or ())[:5],
             )
         )

@@ -339,3 +339,53 @@ def test_a_run_that_recorded_no_test_outcomes_is_not_named():
         )
     )
     assert _failing_items(card) == []
+
+
+def test_a_blocked_phase_reason_is_printed_once_not_twice():
+    """One screen, one copy of a 450-character paragraph.
+
+    The Setup row's detail is `blocked at <phase>: <reason>` and the Needs
+    attention item restated the same reason in full, so every blocked run
+    printed its whole blocking paragraph twice — on the terminal, in the
+    report and on the page. The item still names the phase, which is what
+    sends a reader to it.
+    """
+
+    reason = (
+        "Test receipt parsing is unreadable in the judge container for the settled "
+        "Gradle test job, and the judge-supported ceiling for this blocker is failed."
+    )
+    card = build_result_card(
+        snapshot_dict(
+            verdict="partial",
+            phase_records=[
+                phase_record("test", termination="blocked", outcome="failure", reason=reason)
+            ],
+        )
+    )
+
+    item = next(item for item in card.attention if item.kind == "blocked_phase")
+    assert item.title == "The test phase did not finish"
+    assert reason in (card.row("setup").detail or ""), "the row still states it"
+    assert item.detail is None, "and the item does not state it a second time"
+
+
+def test_a_blocked_phase_reason_the_row_does_not_carry_is_still_stated():
+    """Only the duplicate goes. A reason no row shows must still reach a reader."""
+
+    card = build_result_card(
+        snapshot_dict(
+            verdict="partial",
+            phase_records=[
+                phase_record("build", termination="blocked", outcome="failure", reason="first"),
+                phase_record("test", termination="blocked", outcome="failure", reason="second"),
+            ],
+        )
+    )
+
+    details = {
+        item.title: item.detail for item in card.attention if item.kind == "blocked_phase"
+    }
+    # The Setup row states only the first blocked phase it finds.
+    assert details["The build phase did not finish"] is None
+    assert details["The test phase did not finish"] == "second"

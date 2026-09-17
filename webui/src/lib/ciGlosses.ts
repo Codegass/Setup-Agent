@@ -131,14 +131,16 @@ export function gloss(code: string): string {
  *
  * A copy of `_CI_STATUS_WORD` in `src/sag/result_card/rows.py`, kept in step by
  * the same parity test as the sentences above. `invalid` is the record's word
- * for a comparison it could not make — 135 of the 342 evaluated comparisons
- * under `logs/` — and on a screen the bare word reads as a judgment on the
- * project rather than on the comparison. The terminal, the report and this tab
- * all say what happened instead: nothing was compared.
+ * for a comparison that reached a CI job and produced no score — 135 of the 342
+ * evaluated comparisons under `logs/` — and on a screen the bare word reads as
+ * a judgment on the project rather than on the comparison. It is NOT the same
+ * fact as "there was no CI job to compare against", which the row spells
+ * "not compared"; one phrase over both read as wrong for this one, over a tab
+ * headed WHAT WAS COMPARED that names the job, the commit and the command.
  */
 export const CI_STATUS_WORD: Record<string, string> = {
   "not_met": "not met",
-  "invalid": "not compared",
+  "invalid": "not scored",
 }
 
 /** `verdict` as a reader reads it. Underscores become spaces for anything the

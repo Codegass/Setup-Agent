@@ -628,7 +628,7 @@ def test_a_blocked_phase_says_why():
 @pytest.mark.parametrize(
     "kind,target,reason,expected",
     [
-        ("advance", "analyze", "workspace_ready", "✓ build advanced · workspace_ready"),
+        ("advance", "analyze", "workspace_ready", "✓ build advanced"),
         # The target, not the band the run is in: a repair names the phase it is
         # sending the run back to, which is the one fact the line exists for.
         (
@@ -637,9 +637,10 @@ def test_a_blocked_phase_says_why():
             "maven_version_below_minimum",
             "→ analyze repair · maven_version_below_minimum",
         ),
-        ("report", "report", "report_ready", "✓ build report · report_ready"),
-        ("evidence_close", "test", "test_terminal", "✓ build evidence_close · test_terminal"),
-        ("flow_close", "report", "report_terminal", "✓ build flow_close · report_terminal"),
+        ("report", "report", "report_ready", "✓ build reported"),
+        ("evidence_close", "test", "test_terminal", "✓ build finished"),
+        # `flow_close` ends the run, so it names no phase.
+        ("flow_close", "report", "report_terminal", "✓ run ended"),
         ("something_new", "x", "y", "· build something_new · y"),
     ],
 )
@@ -670,6 +671,79 @@ def test_every_kind_of_transition_has_a_line(kind, target, reason, expected):
     )
     stream.close()
     assert expected in sink.lines
+
+
+def _transition(sequence: int, kind: str, target: str, reason: str) -> str:
+    return _event(
+        sequence,
+        "phase_transition",
+        {
+            "expected_kind": kind,
+            "expected_target": target,
+            "expected_reason_code": reason,
+        },
+    )
+
+
+def _run_to_close(kind: str, reason: str, *, gate: str | None = None) -> list[str]:
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "ls"}, "e1"))
+    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+    stream.feed(_decision(3, "bash", "test"))
+    if gate is not None:
+        stream.feed(_gate(4, gate, "test"))
+    stream.feed(_transition(5, kind, "test", reason))
+    stream.close()
+    return sink.lines
+
+
+def test_a_band_close_does_not_print_the_ledgers_own_event_kind():
+    """Spec 4.2 prescribes advanced / blocked / repair, and nothing else.
+
+    Every normal run closed two of its five bands with `evidence_close` and
+    `flow_close` — the ledger's `expected_kind` values — beside a raw
+    `expected_reason_code`. Measured over 120 ledgers: advance 338,
+    evidence_close 110, flow_close 109.
+    """
+
+    closes = [line for line in _run_to_close("evidence_close", "test_terminal") if line[0] in "✓✗→"]
+
+    assert closes, "the transition still prints a line"
+    for line in closes:
+        assert "evidence_close" not in line
+        assert "test_terminal" not in line
+
+
+def test_the_close_that_ends_the_run_is_not_attributed_to_a_phase():
+    """`flow_close` is the run ending, not the phase the run happened to be in."""
+
+    closes = [line for line in _run_to_close("flow_close", "report_terminal") if line[0] in "✓✗→"]
+
+    assert closes == ["✓ run ended"]
+
+
+def test_an_advance_states_the_phase_and_nothing_machine_made():
+    closes = [line for line in _run_to_close("advance", "workspace_ready") if line[0] in "✓✗→"]
+
+    assert closes == ["✓ test advanced"]
+
+
+def test_a_phase_its_gate_failed_does_not_close_with_a_tick():
+    """storm's test phase was graded `failed` and the band still closed green.
+
+    A reader scanning the left edge for the run's shape reads a column of
+    ticks and never learns that one of them sat over a phase that did not
+    finish.
+    """
+
+    failed = [line for line in _run_to_close("evidence_close", "test_terminal", gate="failed")
+              if line[0] in "✓✗→"]
+    passed = [line for line in _run_to_close("evidence_close", "test_terminal", gate="success")
+              if line[0] in "✓✗→"]
+
+    assert failed == ["✗ test blocked"]
+    assert passed == ["✓ test finished"]
 
 
 # --- jobs ------------------------------------------------------------------
@@ -1563,7 +1637,7 @@ def test_the_lines_a_watcher_is_scanning_for_carry_a_style():
 
     marked = _render("camel-quarkus-d2r3", tty=True).lines
     assert "[bold]▸ build[/bold]" in marked
-    assert "[green]✓ build advanced · test_entry_ready[/green]" in marked
+    assert "[green]✓ build advanced[/green]" in marked
     assert (
         "[yellow]  ! missing_envelope: turn 22 has a loop_decision "
         "but no action_envelope[/yellow]" in marked
@@ -1645,8 +1719,11 @@ VERBATIM = [
     ),
     ("kafka-d2r3", "      ↳ #7 gate: success"),
     ("kafka-d2r3", "▸ provision"),
-    ("kafka-d2r3", "✓ provision advanced · workspace_ready"),
-    ("kafka-d2r3", "✓ test evidence_close · test_terminal"),
+    ("kafka-d2r3", "✓ provision advanced"),
+    # This one used to read `✓ test evidence_close · test_terminal`: a green
+    # tick over a phase whose gate said failed, in the ledger's own words.
+    ("kafka-d2r3", "✗ test blocked"),
+    ("kafka-d2r3", "✓ run ended"),
     (
         "ignite-d2r3",
         "  #17  build     compile                     exit 0 · 5 artifacts                              2m27s",

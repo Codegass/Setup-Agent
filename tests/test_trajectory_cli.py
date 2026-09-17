@@ -457,7 +457,13 @@ def test_following_states_everything_a_replay_of_the_same_ledger_states(monkeypa
     followed = _table(str(KAFKA), "--follow")
 
     assert followed.exit_code == 0, followed.stderr
-    closes = [line for line in replay.stdout.splitlines() if line.startswith("✓ ")]
+    # Every band close, whichever glyph it carries: this run's test phase was
+    # graded failed, so one of the five closes is `✗ test blocked`.
+    closes = [
+        line
+        for line in replay.stdout.splitlines()
+        if line.startswith("✓ ") or line.startswith("✗ ")
+    ]
     assert len(closes) == 5
     missing = [line for line in closes if line not in followed.stdout]
     assert missing == []

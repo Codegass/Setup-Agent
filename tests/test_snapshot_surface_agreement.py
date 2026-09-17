@@ -48,7 +48,7 @@ from sag.result_card.build import build_result_card
 from sag.result_card.glosses import REASON_GLOSS
 from sag.result_card.markdown import render_result_card_markdown
 from sag.result_card.models import ROW_LABELS, ROW_ORDER, RunResultCard
-from sag.result_card.rows import _CI_STATUS_WORD, _CI_TONE, NOT_COMPARED
+from sag.result_card.rows import _CI_STATUS_WORD, _CI_TONE, NOT_COMPARED, NOT_SCORED
 from sag.tools.report_tool import ReportTool
 from sag.web.session_registry import _session_detail, _setup_artifact_item
 
@@ -1666,33 +1666,53 @@ def test_every_ci_verdict_the_record_can_hold_has_a_word_a_reader_can_read():
 
 
 def test_no_surface_spells_a_comparison_it_could_not_make_the_way_the_record_does():
-    """`invalid` is the record's word; `not compared` is what happened.
+    """`invalid` is the record's word; `not scored` is what happened.
 
     135 of the 342 evaluated comparisons under `logs/` are `invalid`, and on a
     screen the bare word reads as a judgment on the project — a reader sees a
     red row beside a green build and concludes the tests are broken. What the
-    record means is that it could not compare, which is what the run's own
-    unsupplied and unmatched cases already say. One spelling in
-    `_CI_STATUS_WORD` gives the terminal, the report and the web payload the
-    same word; this asserts all three read it, so none can keep its own copy.
+    record means is that it reached a named CI job and could not put a score on
+    it. One spelling in `_CI_STATUS_WORD` gives the terminal, the report and
+    the web payload the same word; this asserts all three read it, so none can
+    keep its own copy.
     """
 
     card = _fence_card("a comparison the run could not make")
 
-    assert card.row("ci").status == NOT_COMPARED
-    assert _printed_rows(card)["ci"].status == NOT_COMPARED
-    assert _report_cells(card)[ROW_LABELS["ci"]][0] == NOT_COMPARED
+    assert card.row("ci").status == NOT_SCORED
+    assert _printed_rows(card)["ci"].status == NOT_SCORED
+    assert _report_cells(card)[ROW_LABELS["ci"]][0] == NOT_SCORED
 
     # And it says it once. Every `invalid` record under `logs/` carries no
     # score, so a headline reporting the missing score beside the status word
     # states the same absence twice in one row.
-    assert card.row("ci").headline == NOT_COMPARED
+    assert card.row("ci").headline == NOT_SCORED
     assert _printed_rows(card)["ci"].said == ('cell "maven-compile (ubuntu-latest, JDK-8)"',)
 
     block = _fence_block(card).lower()
     written = "\n".join(render_result_card_markdown(card)).lower()
     assert "invalid" not in block, "the block prints the record's own word"
     assert "invalid" not in written, "the report prints the record's own word"
+
+
+def test_a_comparison_that_happened_does_not_read_as_one_that_did_not():
+    """Two different facts had one phrase, and the phrase was wrong for one.
+
+    `not compared` is true of a run with no CI job to compare against. It was
+    also printed over a comparison that named a repository, a commit, a CI job
+    and a command, and listed its findings under a heading reading WHAT WAS
+    COMPARED. The rail inherited the collision and had to stop flagging the
+    cell at all, because one word covered 269 of 373 archived rows.
+    """
+
+    made = _fence_card("a comparison the run could not make").row("ci")
+    unmatched = _fence_card("a clean run").row("ci")
+
+    assert made.status != unmatched.status
+    assert made.status == NOT_SCORED
+    assert unmatched.status == NOT_COMPARED
+    assert made.detail and "cell " in made.detail, "it names the CI job it reached"
+
 
 
 def test_a_reason_without_a_sentence_reaches_a_reader_once():

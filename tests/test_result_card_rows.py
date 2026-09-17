@@ -589,6 +589,44 @@ def test_ci_row_says_not_met_as_two_words():
     assert row.tone == "failed"
 
 
+def test_a_comparison_that_reached_a_ci_job_but_produced_no_score_says_so():
+    """The record's `invalid` means: a CI job was reached and no score came out.
+
+    It used to be spelled "not compared" — the same phrase a run with no CI job
+    at all gets — over a row that names the CI job it reached.
+    """
+
+    from result_card_fakes import evaluated_ci_comparison
+
+    row = ci_row(
+        _snapshot(
+            ci_comparison=evaluated_ci_comparison(
+                verdict="invalid",
+                valid=False,
+                built=False,
+                clean=False,
+                clean_form="counts",
+                alpha=None,
+                alpha_test=None,
+                alpha_build=None,
+                lifecycle_parity=None,
+                cell_id="Apache Jenkins httpcomponents-client Linux JDK 17 #225",
+                cell_grade="B",
+                executed_observed=1328,
+                executed_target=0,
+                red_observed=1,
+                modules_matched=2,
+                modules_target=4,
+                missing_module_ids=["httpclient5 5.3", "httpcore5 5.2"],
+                reason_codes=["CERTIFICATE_AUTHORITY_UNAVAILABLE"],
+            )
+        )
+    )
+    assert row.status == "not scored"
+    assert row.headline == "not scored"
+    assert row.detail and "Apache Jenkins" in row.detail
+
+
 def test_ci_row_not_compared_explains_itself():
     row = ci_row(_snapshot())
     assert row.status == "not compared"
