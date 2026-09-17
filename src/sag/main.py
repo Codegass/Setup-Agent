@@ -35,6 +35,7 @@ from sag.config import (
     set_config,
 )
 from sag.console.result_block import render_result_block
+from sag.console.turn_stream import TurnStreamRenderer
 from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.result_card import build_result_card
@@ -190,6 +191,33 @@ def _start_agent_session_logging(config: Config) -> None:
     if config.verbose and session_logger:
         logger.info(f"Session ID: {session_logger.session_id}")
         logger.info(f"Logs directory: {session_logger.session_log_dir}")
+
+
+def _attach_turn_stream() -> Optional[TurnStreamRenderer]:
+    """Show the run as turns. Returns the renderer so the caller can close it.
+
+    The renderer stands beside the session's control ledger and reads the same
+    lines the ledger keeps — never a log line. It writes through
+    `console.print`, not `console.file.write`: the latter is a raw stream write
+    that interprets no markup, so on a real terminal every styled token would
+    arrive as a literal `[red]failed[/red]`. All three keywords are load
+    bearing — `end=""` because the renderer owns its newlines and completes a
+    dispatch line in place, `soft_wrap=True` because Rich would otherwise
+    re-wrap a line the renderer has already fitted to the width, and
+    `highlight=False` because Rich's auto-highlighter would colour numbers
+    inside a summary the renderer is already styling.
+    """
+
+    session_logger = get_session_logger()
+    if session_logger is None:
+        return None
+    renderer = TurnStreamRenderer(
+        lambda text: console.print(text, end="", markup=True, highlight=False, soft_wrap=True),
+        width=console.width,
+        tty=console.is_terminal,
+    )
+    session_logger.get_control_event_sink().add_observer(renderer.feed)
+    return renderer
 
 
 def _execute_control(orchestrator, command: str, **kwargs):
@@ -709,35 +737,45 @@ def project(
             return
 
         _start_agent_session_logging(config)
+        turn_stream = _attach_turn_stream()
 
-        # Initialize agent
-        agent = SetupAgent(config=config, orchestrator=orchestrator)
+        # The close has to run from a `finally`: this command ends in a broad
+        # `except Exception`, which would otherwise take the crash before the
+        # stream flushed its last line and the warnings it is still holding —
+        # on exactly the runs a reader most needs to read.
+        try:
+            # Initialize agent
+            agent = SetupAgent(config=config, orchestrator=orchestrator)
 
-        # Run the setup - pass project_name (from URL) and docker_label for metadata
-        termination = agent.setup_project(
-            project_url=repo_url,
-            project_name=project_name,
-            goal=goal,
-            docker_label=docker_label,
-            project_ref=project_ref,
-            **({"ci_target": ci_target} if ci_target is not None else {}),
-            **({"acceptance_task": acceptance_task} if acceptance_task is not None else {}),
-            pre_finalize_evidence_callback=(
-                (
-                    lambda: _run_coverage_evidence_pass(
-                        orchestrator,
-                        project_name,
-                        validator=getattr(
-                            getattr(agent, "react_engine", None),
-                            "physical_validator",
-                            None,
-                        ),
+            # Run the setup - pass project_name (from URL) and docker_label for metadata
+            termination = agent.setup_project(
+                project_url=repo_url,
+                project_name=project_name,
+                goal=goal,
+                docker_label=docker_label,
+                project_ref=project_ref,
+                **({"ci_target": ci_target} if ci_target is not None else {}),
+                **({"acceptance_task": acceptance_task} if acceptance_task is not None else {}),
+                pre_finalize_evidence_callback=(
+                    (
+                        lambda: _run_coverage_evidence_pass(
+                            orchestrator,
+                            project_name,
+                            validator=getattr(
+                                getattr(agent, "react_engine", None),
+                                "physical_validator",
+                                None,
+                            ),
+                        )
                     )
-                )
-                if coverage
-                else None
-            ),
-        )
+                    if coverage
+                    else None
+                ),
+            )
+        finally:
+            if turn_stream is not None:
+                turn_stream.close()
+
         snapshot = read_live_verdict_snapshot(orchestrator)
         session_logger = get_session_logger()
         session_dir = str(session_logger.session_log_dir) if session_logger else None
@@ -836,17 +874,24 @@ def run(ctx, docker_name, task, max_iterations, record, coverage):
             console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         _start_agent_session_logging(config)
+        turn_stream = _attach_turn_stream()
 
-        # Initialize agent
-        final_max_iterations = (
-            max_iterations if max_iterations is not None else config.max_iterations
-        )
-        agent = SetupAgent(
-            config=config, orchestrator=orchestrator, max_iterations=final_max_iterations
-        )
+        # Same reason as `project`: the stream's last line and its held
+        # warnings belong to the reader even when the run dies.
+        try:
+            # Initialize agent
+            final_max_iterations = (
+                max_iterations if max_iterations is not None else config.max_iterations
+            )
+            agent = SetupAgent(
+                config=config, orchestrator=orchestrator, max_iterations=final_max_iterations
+            )
 
-        # Run the task with the actual project name
-        success = agent.run_task(project_name=actual_project_name, task_description=task)
+            # Run the task with the actual project name
+            success = agent.run_task(project_name=actual_project_name, task_description=task)
+        finally:
+            if turn_stream is not None:
+                turn_stream.close()
 
         # Save artifacts if recording is enabled
         if record:

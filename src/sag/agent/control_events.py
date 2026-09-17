@@ -1650,11 +1650,13 @@ class ControlEventSink:
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[int], str] | None = None,
         run_id: str | None = None,
+        observers: tuple[Callable[[str], None], ...] = (),
     ) -> None:
         self.path = Path(path)
         self.run_id = run_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._mirror = mirror
+        self._observers: list[Callable[[str], None]] = list(observers)
         self._clock = clock or (
             lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         )
@@ -1677,6 +1679,29 @@ class ControlEventSink:
     @property
     def sequence(self) -> int:
         return self._sequence
+
+    def add_observer(self, observer: Callable[[str], None]) -> None:
+        """Watch every line from here on. Observers never gate the append."""
+
+        with self._lock:
+            self._observers.append(observer)
+
+    def attach_mirror(self, mirror: Callable[[str], None]) -> bool:
+        """Fill in the container mirror on a sink that was built without one.
+
+        The CLI now asks the session for its sink before the agent exists, so
+        the agent's mirror arrives second and must still be installed — the
+        container copy is what `--record` archives, and its absence is silent.
+        Returns whether this call installed it: an existing mirror is never
+        displaced, because two writers appending to one container file would
+        interleave.
+        """
+
+        with self._lock:
+            if self._mirror is not None:
+                return False
+            self._mirror = mirror
+            return True
 
     def emit(
         self,
@@ -1717,6 +1742,13 @@ class ControlEventSink:
                 except Exception as exc:  # host truth remains append-only if mirroring is down
                     logging.getLogger(__name__).warning(
                         "control-event mirror failed at sequence %s: %s", sequence, exc
+                    )
+            for observer in tuple(self._observers):
+                try:
+                    observer(line)
+                except Exception as exc:  # a renderer may fail; the ledger may not
+                    logging.getLogger(__name__).warning(
+                        "control-event observer failed at sequence %s: %s", sequence, exc
                     )
             return event
 

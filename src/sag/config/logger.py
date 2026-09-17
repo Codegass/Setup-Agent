@@ -156,8 +156,22 @@ class SessionLogger:
         mirror: Optional[Callable[[str], None]] = None,
         clock: Optional[Callable[[], str]] = None,
         id_factory: Optional[Callable[[int], str]] = None,
+        observers: tuple[Callable[[str], None], ...] = (),
     ):
-        """Return the one append-only control stream owned by this session."""
+        """Return the one append-only control stream owned by this session.
+
+        The sink is built once and cached, so a later caller gets the stream
+        that is already writing rather than a second one. What a later caller
+        BRINGS still has to arrive: the CLI asks for this sink to hang a
+        renderer on it before the agent is constructed, and the agent's
+        container mirror therefore arrives on the second call. Dropping it
+        there left `/workspace/.setup_agent/control_events.jsonl` — the copy
+        `--record` archives — silently unwritten for the whole run.
+
+        `clock` and `id_factory` are construction-only: changing either
+        mid-stream would renumber or re-date a ledger that is already append-
+        only, so a later call's copies are ignored.
+        """
         from sag.agent.control_events import ControlEventSink
 
         if self._control_event_sink is None:
@@ -166,7 +180,14 @@ class SessionLogger:
                 mirror=mirror,
                 clock=clock,
                 id_factory=id_factory,
+                observers=observers,
             )
+            return self._control_event_sink
+
+        if mirror is not None:
+            self._control_event_sink.attach_mirror(mirror)
+        for observer in observers:
+            self._control_event_sink.add_observer(observer)
         return self._control_event_sink
 
     @property
