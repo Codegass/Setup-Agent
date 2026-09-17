@@ -283,7 +283,13 @@ export function TurnRow({
                 {turn.observation.outcome}
               </span>
             ) : null}
-            {turn.observation.summary ? (
+            {/* A failed call often summarises itself as its own error code,
+                which the badge beside it has already said. 13 of the 32 coded
+                observations across the committed fixtures read that way, so
+                the line is dropped rather than doubled — the same rule the
+                result band uses for a headline equal to its status chip. */}
+            {turn.observation.summary &&
+            turn.observation.summary !== turn.observation.error_code ? (
               <span className="min-w-0 truncate text-[12px] text-muted-foreground">
                 {turn.observation.summary}
               </span>

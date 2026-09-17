@@ -1,27 +1,14 @@
-import { Activity, Box, FileText, Sparkles, Terminal } from "lucide-react"
-import type { LucideIcon } from "lucide-react"
-
-import type { ExecutionSessionDetail, SubmitTaskResponse, Tone } from "@/api/types"
+import type { ExecutionSessionDetail, SubmitTaskResponse } from "@/api/types"
 import { isLiveSessionStatus } from "@/components/common/status"
 import { BuildFacet } from "@/components/session/BuildFacet"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
-import { FilesDigest } from "@/components/session/FilesDigest"
 import { LogsView } from "@/components/session/LogsView"
 import { ReportDoc } from "@/components/session/ReportDoc"
 import { TestFacet } from "@/components/session/TestFacet"
 
+import { OfficialCITab } from "./OfficialCITab"
 import { OverviewTab } from "./OverviewTab"
 import { TrajectoryTab } from "./TrajectoryTab"
-
-export type FacetId = "build" | "test" | "evidence" | "files" | "report" | "logs"
-
-export interface FacetMeta {
-  id: FacetId
-  label: string
-  icon: LucideIcon
-  count: number | null
-  countTone: Tone
-}
 
 function nonZero(n: number | null | undefined): number | null {
   return typeof n === "number" && n > 0 ? n : null
@@ -33,60 +20,15 @@ function testIssues(d: ExecutionSessionDetail): number | null {
   return nonZero(failed + errors)
 }
 
-/** Nav/section metadata for the detail pane (order matters; bodies render via <FacetBody>). */
-export function buildDetailFacets(d: ExecutionSessionDetail): FacetMeta[] {
-  return [
-    { id: "build", label: "Build", icon: Box, count: null, countTone: "neutral" },
-    { id: "test", label: "Test", icon: Activity, count: testIssues(d), countTone: "red" },
-    { id: "evidence", label: "Evidence", icon: Sparkles, count: nonZero(d.evidence.length), countTone: "neutral" },
-    { id: "files", label: "Files", icon: FileText, count: nonZero(d.files?.items.length), countTone: "neutral" },
-    { id: "report", label: "Report", icon: FileText, count: null, countTone: "neutral" },
-    { id: "logs", label: "Logs", icon: Terminal, count: null, countTone: "neutral" },
-  ]
-}
+// ── The pane's one nav model: a tab swaps the panel below it ──
 
-export function Empty({ label }: { label: string }) {
-  return (
-    <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
-      {label}
-    </div>
-  )
-}
-
-/** Renders a facet body by reusing the existing session renderers (no restyle — Phase 4/5). */
-export function FacetBody({ id, detail }: { id: FacetId; detail: ExecutionSessionDetail }) {
-  switch (id) {
-    case "build":
-      return <BuildFacet detail={detail} />
-    case "test":
-      return <TestFacet detail={detail} />
-    case "evidence":
-      return <EvidenceTimeline groups={detail.evidence} />
-    case "files":
-      return <FilesDigest digest={detail.files} />
-    case "report":
-      return <ReportDoc doc={detail.reportDoc} />
-    case "logs":
-      return <LogsView logs={detail.logs} />
-  }
-}
-
-// ── Tab model (replaces the facet/scroll-spy nav; wired in DetailPane in Task 12) ──
-
-// `trajectory` and `ci` are the two names the result band links to that this
-// builder does not yet emit; Task 6 adds them here and retires `timeline`,
-// `flow` and `files` along with their bodies. Until then a row pointed at one
-// of them renders as plain text rather than a button that goes nowhere.
 export type TabId =
   | "overview"
-  | "timeline"
   | "trajectory"
-  | "flow"
   | "tests"
   | "build"
-  | "files"
-  | "evidence"
   | "ci"
+  | "evidence"
   | "logs"
   | "report"
 
@@ -99,9 +41,9 @@ export interface TabMeta {
 }
 
 /**
- * Tab metadata for the redesigned detail pane. `overview` always leads; `tests`/`build`
- * are core and always present; `flow` and the supplementary panels appear only when their
- * data exists (mirroring `buildDetailFacets` gating). Order matches the design template.
+ * One reading order: what happened, how it happened, then each measurement's
+ * own evidence. `overview` always leads and `tests`/`build` are always present;
+ * the rest are offered only when the run produced something for them.
  */
 export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
   // Trajectory leads the panels because it is the run itself, turn by turn, and
@@ -124,13 +66,18 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
   })
   tabs.push({ id: "build", label: "Build" })
 
-  if (nonZero(d.files?.items.length)) {
-    tabs.push({ id: "files", label: "Files" })
+  // Presence, not status: a comparison the run served says inside the tab what
+  // it measured, or that it measured nothing. Only a run that served none at
+  // all has nothing to open — and the result band's CI row links here, so a
+  // status gate would strand that row on a tab this run does not have.
+  if (d.ciComparison) {
+    tabs.push({ id: "ci", label: "Official CI" })
   }
-  const evidenceCount = nonZero(d.evidence.length)
+
+  // Grouped evidence when the run built it, and otherwise the receipts it
+  // recorded. Neither is defaulted: a run with neither gets no tab.
+  const evidenceCount = nonZero(d.evidence.length) ?? nonZero(d.receipts?.length)
   if (evidenceCount) {
-    // Mirror the prior buildDetailFacets behavior + the spec's "Evidence 2"
-    // inline count (neutral toned, unlike the red Tests fail count).
     tabs.push({ id: "evidence", label: "Evidence", count: evidenceCount, tone: "neutral" })
   }
   if (nonZero(d.logs.length)) {
@@ -171,8 +118,8 @@ export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
       return <TestFacet detail={detail} />
     case "build":
       return <BuildFacet detail={detail} />
-    case "files":
-      return <FilesDigest digest={detail.files} />
+    case "ci":
+      return detail.ciComparison ? <OfficialCITab comparison={detail.ciComparison} /> : null
     case "evidence":
       return <EvidenceTimeline groups={detail.evidence} />
     case "logs":

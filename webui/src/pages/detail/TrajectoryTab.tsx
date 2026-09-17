@@ -218,7 +218,7 @@ export function TrajectoryTab({ sessionId, live }: { sessionId: string; live: bo
   if (loading && !doc) {
     return (
       <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
-        Reading the control ledger…
+        Reading the run's record…
       </div>
     )
   }
@@ -255,7 +255,7 @@ export function TrajectoryTab({ sessionId, live }: { sessionId: string; live: bo
         ) : null}
         {doc.warnings.length ? (
           <span className="rounded-full border border-status-attention-border bg-status-attention-soft px-2 py-0.5 text-[10.5px] text-status-attention">
-            {`${doc.warnings.length} hole${doc.warnings.length === 1 ? "" : "s"} stated`}
+            {`${doc.warnings.length} gap${doc.warnings.length === 1 ? "" : "s"} in the record`}
           </span>
         ) : null}
         {/* The pill is a claim about freshness. A green "following" over a poll

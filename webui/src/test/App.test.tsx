@@ -100,7 +100,6 @@ const sessionDetail: ExecutionSessionDetail = {
       records: [],
     },
   ],
-  files: null,
   context: null,
   logs: ["BUILD SUCCESS"],
 }

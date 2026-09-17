@@ -113,7 +113,11 @@ describe("TrajectoryTimeline", () => {
     // The build band must show how the visit its turns are in ended.
     render(<TrajectoryTimeline doc={reduced as unknown as TrajectoryDocument} />)
 
-    const bands = screen.getAllByRole("group")
+    // A band's own disclosure is a <details>, which also carries role="group";
+    // only the labelled ones are bands.
+    const bands = screen
+      .getAllByRole("group")
+      .filter((band) => band.getAttribute("aria-label")?.startsWith("Phase "))
     expect(bands.map((band) => band.getAttribute("aria-label"))).toEqual([
       "Phase provision",
       "Phase analyze",

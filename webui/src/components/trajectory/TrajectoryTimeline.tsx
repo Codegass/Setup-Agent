@@ -31,8 +31,7 @@ export function TrajectoryTimeline({
   if (!doc.turns.length) {
     return (
       <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
-        No turns on the record yet. A run that has just attached shows its first turn as soon
-        as the engine seals one.
+        No turns yet. The first turn appears here as soon as the run records one.
       </div>
     )
   }

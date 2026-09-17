@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
@@ -74,6 +74,20 @@ const detail: ExecutionSessionDetail = {
   logs: [],
 }
 
+/** Every run the API serves a comparison for; the tab is where it is read. */
+const withCI: ExecutionSessionDetail = {
+  ...detail,
+  ciComparison: {
+    schema_version: 1,
+    status: "no_matched_cell",
+    run_id: "CC-1",
+    attainment: null,
+    receipt_ids: [],
+    commands: [],
+    reasons: ["no cell in the workflow matched this run"],
+  },
+}
+
 const handlers = {
   sessionId: "CC-1",
   onSession: () => {},
@@ -84,6 +98,7 @@ const handlers = {
 describe("DetailPane", () => {
   afterEach(() => {
     cleanup()
+    vi.restoreAllMocks()
   })
 
   it("renders the header, the result band, and the tab bar (Overview active by default)", () => {
@@ -118,6 +133,46 @@ describe("DetailPane", () => {
     render(<DetailPane workspace={workspace} detail={detail} initialFacet="tests" {...handlers} />)
     expect(screen.getByRole("button", { name: /^Tests/ })).toHaveAttribute("aria-current", "true")
     expect(screen.getByRole("button", { name: /^Overview/ })).toHaveAttribute("aria-current", "false")
+  })
+
+  it("opens the trajectory from the result band's Setup row", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          schema_version: 1,
+          session: { run_id: "CC-1" },
+          phases: [],
+          turns: [],
+          annotations: [],
+          warnings: [],
+        }),
+        { headers: { "Content-Type": "application/json" }, status: 200 },
+      ),
+    )
+    render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Open the evidence behind Setup" }))
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^Trajectory/ })).toHaveAttribute(
+        "aria-current",
+        "true",
+      ),
+    )
+  })
+
+  it("offers official CI as its own tab, named apart from the row that links to it", () => {
+    render(<DetailPane workspace={workspace} detail={withCI} {...handlers} />)
+
+    // The tab and the band row do the same job and must not read the same to a
+    // screen reader: the tab is named for the subject, the row for the action.
+    const tab = screen.getByRole("button", { name: "Official CI" })
+    const row = screen.getByRole("button", { name: "Open the evidence behind Official CI" })
+    expect(tab).not.toBe(row)
+
+    fireEvent.click(row)
+    expect(tab).toHaveAttribute("aria-current", "true")
+    expect(screen.getByText("no cell in the workflow matched this run")).toBeInTheDocument()
   })
 
   it("opens the new-task modal from the header", () => {

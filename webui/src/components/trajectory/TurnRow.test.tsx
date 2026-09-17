@@ -89,6 +89,21 @@ describe("TurnRow", () => {
     expect(screen.getByText("project")).toBeInTheDocument()
   })
 
+  it("does not print the error code twice when the call summarised itself as one", () => {
+    render(
+      row({
+        turn_id: 14,
+        observation: {
+          outcome: "failed",
+          summary: "ENV_EXECUTABLE_NOT_FOUND",
+          error_code: "ENV_EXECUTABLE_NOT_FOUND",
+        },
+      }),
+    )
+
+    expect(screen.getByText("ENV_EXECUTABLE_NOT_FOUND")).toBeInTheDocument()
+  })
+
   it("expands into the model context, the call and the result", () => {
     render(row({ turn_id: 13 }))
 
