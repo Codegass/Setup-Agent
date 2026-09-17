@@ -46,7 +46,13 @@ from collections import Counter
 from typing import Callable, Iterable
 
 from sag.trajectory.reducer import UNKNOWN_PHASE, TrajectoryReducer, elapsed
-from sag.trajectory.schema import SUMMARY_MAX_CHARS, Turn, Warning, warning_order
+from sag.trajectory.schema import (
+    SUMMARY_MAX_CHARS,
+    TrajectoryDelta,
+    Turn,
+    Warning,
+    warning_order,
+)
 
 #: How much of the line the tool's name gets. Public because the turn stream and
 #: anything that lines up beneath it have to agree on one column.
@@ -89,8 +95,10 @@ _HOLE_HANG = "    "
 #: source now (`summaries._phase_observation`), so nothing here has to take a
 #: label off a neighbour's string.
 _GATE = "gate:"
-#: Where to read the counted notes in full.
-_TRAJECTORY_COMMAND = "uv run sag trajectory <session>"
+#: Where to read the counted notes in full. The format is named: the command's
+#: own default prints this very stream, so a bare `sag trajectory <session>`
+#: would answer the note by repeating it.
+_TRAJECTORY_COMMAND = "uv run sag trajectory <session> --format json"
 
 #: Codes that are true of most turns of most healthy sessions. They are the
 #: ledger's bookkeeping about itself, not something a reader can act on, and
@@ -675,6 +683,21 @@ class TurnStreamRenderer:
                 self._note_job(body)
             elif kind == "job_live_at_close":
                 self._note_live_job(body)
+        self.render_delta(delta)
+
+    def render_delta(self, delta: TrajectoryDelta) -> None:
+        """Write what one delta changed: its turns, then its statements.
+
+        A live run hands this renderer raw lines and it folds them itself. A
+        reader replaying or tailing a recorded session has already folded
+        them — `follow_trajectory` yields whole deltas, including the one only
+        the end of a follow can produce — so both arrive here and leave by the
+        same two steps. Turns first, because a statement about a turn is held
+        until that turn has settled; the statements after, so a hole a follow
+        reports is shown on exactly the terms a replay shows it.
+        """
+
+        self._refuse_when_closed()
         for turn in delta.turns:
             self.render_turn(turn)
         self._hold(delta.warnings, delta.retracted_warnings)

@@ -118,6 +118,18 @@ def build_trajectory(session_dir: Path | str, *, detail: str = "summary") -> Tra
     return sources.finish(reducer.snapshot(), extra=unread)
 
 
+def control_events_path(session_dir: Path | str) -> Path | None:
+    """Where this session keeps its control ledger, or nothing when it has none.
+
+    A session writes some artifacts at its root and some under `.setup_agent/`,
+    and a live run mirrors its events into the container's copy — so the one
+    place a reader must not look is a single fixed path. This answers with the
+    same search `build_trajectory` uses, so a renderer and the document it
+    prints a header from always read the same file.
+    """
+    return _SessionSources(session_dir, detail="summary").control_events()
+
+
 def read_call_envelope(session_dir: Path | str, envelope_id: str) -> dict[str, Any] | None:
     """Return one call envelope's exact parameters without changing trajectory-v1.
 
@@ -904,5 +916,6 @@ __all__ = [
     "DEFAULT_POLL_SECONDS",
     "TrajectoryFollow",
     "build_trajectory",
+    "control_events_path",
     "follow_trajectory",
 ]

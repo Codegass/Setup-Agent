@@ -149,7 +149,12 @@ uv run sag inspect sag-commons-cli --phase build --iter 23
 
 # Read a recorded session after the container is gone
 uv run sag inspect sag-commons-cli --session logs/session_X --phase build
-uv run sag trajectory logs/session_X --detail full
+uv run sag trajectory logs/session_X
+uv run sag result logs/session_X
+
+# Piping either one into a JSON reader needs the machine-readable form
+uv run sag trajectory logs/session_X --format json --detail full | jq .
+uv run sag result logs/session_X --json | jq .
 
 # Continue work, or remove the container and its filesystem
 uv run sag run sag-commons-cli --task "Investigate the failing tests"

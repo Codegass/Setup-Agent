@@ -448,6 +448,7 @@ def test_run_counts_state_absence_rather_than_zero_or_raising(tmp_path):
         "turn_count": None,
         "tool_calls": None,
         "tool_failures": None,
+        "token_usage": None,
     }
     assert _read_run_counts_for_cli(None) == absent
     assert _read_run_counts_for_cli(str(tmp_path / "never-written")) == absent

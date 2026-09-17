@@ -1731,7 +1731,7 @@ def test_the_counted_notes_say_where_to_read_them_in_full():
     assert (
         "11 more notes about the ledger itself: conservation_violation ×1, "
         "missing_loop_decision ×10 — read them in full with: "
-        "uv run sag trajectory <session>" in joined
+        "uv run sag trajectory <session> --format json" in joined
     )
 
 

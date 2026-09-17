@@ -105,8 +105,15 @@ def _labelled(label: str, value: str, width: int) -> list[str]:
     return [head + wrapped[0][len(indent) :], *wrapped[1:]]
 
 
-def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
-    """Render the card as the block a user reads when a run ends."""
+def render_result_block(card: RunResultCard, *, width: int = 78, exit_hint: bool = True) -> str:
+    """Render the card as the block a user reads when a run ends.
+
+    `exit_hint` is what the trailing verdict line is allowed to say. At the end
+    of a run the same call produces this block and the code the process exits
+    with, so naming the code there is a fact. A reader that prints a finished
+    run back produces no exit code of its own and passes False, because a block
+    that announces one would be stating something its command did not do.
+    """
 
     width = max(MIN_WIDTH, width)
     body_indent = " " * (GUTTER + LABEL_WIDTH + STATUS_WIDTH)
@@ -178,7 +185,8 @@ def render_result_block(card: RunResultCard, *, width: int = 78) -> str:
 
     if card.verdict != "success":
         style = _TONE_STYLE[card.tone]
-        lines.append(f"[{style}]Setup verdict: {card.verdict} · exit 1[/{style}]")
+        tail = " · exit 1" if exit_hint else ""
+        lines.append(f"[{style}]Setup verdict: {card.verdict}{tail}[/{style}]")
 
     return "\n".join(lines)
 
