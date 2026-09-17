@@ -268,7 +268,11 @@ def _build_observation(result: dict[str, Any], outcome: ObservationOutcome | Non
             terms.append(f"{skipped} S")
         counts = " · ".join(terms)
     artifacts = analysis.get("artifacts_created")
-    made = f"{len(artifacts)} artifacts" if isinstance(artifacts, list) and artifacts else None
+    made = (
+        f"{len(artifacts)} artifact{'s' if len(artifacts) > 1 else ''}"
+        if isinstance(artifacts, list) and artifacts
+        else None
+    )
     # A run that failed still ran what it ran: the reason is appended to the
     # counts, never substituted for them.
     reason = None

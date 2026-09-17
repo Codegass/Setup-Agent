@@ -601,9 +601,9 @@ LINES_AT_SEQUENCE = {
 }
 
 #: `session -> phase name -> (validator_state, the head of reason, len(key_results))`.
-#: The reading of the LAST gate on each band. `key_results` is 400 wherever the
-#: gate wrote more than the cap and the clip took it back to it; camel-quarkus'
-#: `test` band is the gate that wrote `""`, which this layer states as absence.
+#: The last reading each band was actually GIVEN, field by field. `key_results`
+#: is 400 wherever the gate that stated it wrote more than the cap and the clip
+#: took it back to it.
 PHASE_READINGS = {
     "kafka-d2r3": {
         "provision": ("green", "workspace /workspace/kafka exists", 400),
@@ -616,7 +616,10 @@ PHASE_READINGS = {
         "provision": ("green", "workspace /workspace/camel-quarkus exists", 400),
         "analyze": ("green", "project analysis validator returned no", 368),
         "build": ("partial", "Found 3386 compiled classes", 400),
-        "test": ("red", "no tests executed of 2,765 discovered", None),
+        # Ten gates grade this band. Seq 244 states 769 characters of results
+        # and seq 250, the last, states `""` — so the band keeps 244's reading,
+        # clipped to the cap. Pinning `None` here would pin the erasure.
+        "test": ("red", "no tests executed of 2,765 discovered", 400),
         "report": ("green", "report artifact exists", 400),
     },
     "ignite-d2r3": {
@@ -688,9 +691,18 @@ def test_the_archived_phases_carry_the_gates_reading(session):
     carry `validator_state`, `reason` and `key_results`, so all three populate
     here. Fifteen of them write more than `KEY_RESULTS_MAX_CHARS`, which is why
     so many bands read exactly 400 — the clip is exercised by real bytes, not
-    by a fixture built to exercise it. camel-quarkus' `test` band is the
-    opposite case: its last gate (seq 250) writes `key_results: ""`, and a
-    blank cell is stated as absence rather than shown as an empty paragraph.
+    by a fixture built to exercise it.
+
+    **camel-quarkus' `test` band is why the merge is per field and stated-only,
+    and this entry must not be "fixed" back.** Ten gates grade that band. Nine
+    state `key_results` — 571, 642, 754, 981, 746, 842, 818, 766 and, at seq
+    244, 769 characters — and the tenth, seq 250, states `""`. The engine
+    defaults the field to `""`, so seq 250 is not reporting that the phase
+    achieved nothing; it is simply not restating what seq 244 already said.
+    Taking the last WRITER rendered that band `key_results: null`, which
+    asserts an absence no gate ever declared. The band therefore keeps seq
+    244's reading, clipped to the cap — while `validator_state` and `reason`,
+    which seq 250 does state, come from seq 250.
     """
     snap = build_trajectory(SESSION_DIRS[session])
     readings = PHASE_READINGS[session]
