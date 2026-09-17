@@ -125,36 +125,17 @@ describe("OverviewTab", () => {
     expect(screen.getByText("Nothing needs attention.")).toBeInTheDocument()
   })
 
-  it("takes its build and test tiles from the card, word for word", () => {
+  it("does not restate the result band's Build and Tests rows", () => {
     const d = cleanDetail()
     render(<OverviewTab detail={d} />)
+    // The band renders these rows above the tab bar, on screen the whole time.
+    // Saying them again here printed the same sentence twice on one screen.
     const buildRow = d.resultCard!.rows.find((row) => row.key === "build")!
     const testsRow = d.resultCard!.rows.find((row) => row.key === "tests")!
-    expect(screen.getByText(buildRow.headline)).toBeInTheDocument()
-    expect(screen.getByText(buildRow.detail!)).toBeInTheDocument()
-    expect(screen.getByText(testsRow.headline)).toBeInTheDocument()
-    expect(screen.getByText(testsRow.detail!)).toBeInTheDocument()
-  })
-
-  it("states a row's own reason rather than leaving the tile blank", () => {
-    render(
-      <OverviewTab
-        detail={detail({
-          resultCard: card({
-            rows: rows({
-              tests: {
-                status: "unavailable",
-                tone: "attention",
-                headline: "unavailable",
-                detail: null,
-                reason: "the run recorded no test outcome totals",
-              },
-            }),
-          }),
-        })}
-      />,
-    )
-    expect(screen.getByText("the run recorded no test outcome totals")).toBeInTheDocument()
+    expect(screen.queryByText(buildRow.headline)).toBeNull()
+    expect(screen.queryByText(buildRow.detail!)).toBeNull()
+    expect(screen.queryByText(testsRow.headline)).toBeNull()
+    expect(screen.queryByText(testsRow.detail!)).toBeNull()
   })
 
   it("shows the run's notes in a disclosure", () => {

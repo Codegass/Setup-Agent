@@ -1,62 +1,6 @@
-import type {
-  AttentionItem,
-  CardTone,
-  ExecutionSessionDetail,
-  ResultCard,
-  ResultRow,
-  RowKey,
-} from "@/api/types"
+import type { AttentionItem, ExecutionSessionDetail } from "@/api/types"
 import { ModuleTable } from "@/components/session/ModuleTable"
 import { cn } from "@/lib/utils"
-
-const CHIP: Record<CardTone, string> = {
-  success: "bg-status-success-soft text-status-success",
-  attention: "bg-status-attention-soft text-status-attention",
-  failed: "bg-status-failed-soft text-status-failed",
-  neutral: "bg-accent text-muted-foreground",
-}
-
-function rowFor(card: ResultCard, key: RowKey): ResultRow | undefined {
-  return card.rows.find((row) => row.key === key)
-}
-
-/**
- * One measurement, restated exactly as the card wrote it.
- *
- * Nothing here is recomputed: the headline, the detail and the reason are the
- * run's own words, and a row the run did not measure carries its own reason
- * instead of a blank the reader has to interpret.
- */
-function Tile({ row }: { row: ResultRow | undefined }) {
-  if (!row) return null
-  return (
-    <div className="min-w-0 rounded-[10px] border border-border bg-card px-4 py-3.5">
-      <div className="flex items-center gap-2">
-        <span className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
-          {row.label}
-        </span>
-        <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-semibold", CHIP[row.tone])}>
-          {row.status}
-        </span>
-      </div>
-      {/* A headline that only repeats the chip beside it is dropped rather
-          than said twice — "success", "not collected" and the like. */}
-      {row.headline === row.status ? null : (
-        <div className="mt-1.5 text-[17px] font-semibold leading-snug tracking-[-0.01em] text-foreground">
-          {row.headline}
-        </div>
-      )}
-      {row.detail ? (
-        <div className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{row.detail}</div>
-      ) : null}
-      {row.reason ? (
-        <div className="mt-1 text-[12px] italic leading-relaxed text-muted-foreground">
-          {row.reason}
-        </div>
-      ) : null}
-    </div>
-  )
-}
 
 function AttentionRow({ item }: { item: AttentionItem }) {
   const refs = item.refs ?? []
@@ -83,8 +27,13 @@ function AttentionRow({ item }: { item: AttentionItem }) {
 }
 
 /**
- * The Overview: what needs a person first, then the two measurements they came
- * to read, then the modules behind them, then anything the run set aside.
+ * The Overview: what needs a person first, then what the run was asked to do,
+ * then the modules behind the numbers, then anything the run set aside.
+ *
+ * It does not restate the result band. The band sits above the tab bar and is
+ * on screen the whole time; an Overview that repeated its Build and Tests rows
+ * printed the same sentence twice on one screen. What this tab adds is what
+ * the band has no room for.
  *
  * Every word below the chrome is the result card's own. The tab does not
  * recompute a count, and it does not fill in a number the run declined to
@@ -104,38 +53,31 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
   return (
     <div>
       {card ? (
-        <>
-          <section
-            aria-labelledby="overview-attention"
-            className={cn(
-              "overflow-hidden rounded-xl border bg-card",
-              attention.length > 0 ? "border-status-attention-border" : "border-border",
-            )}
-          >
-            <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-              {attention.length > 0 ? (
-                <span className="h-[7px] w-[7px] rounded-full bg-status-failed" />
-              ) : null}
-              <h2 className="text-[14px] font-bold text-foreground" id="overview-attention">
-                Needs attention
-              </h2>
-            </div>
+        <section
+          aria-labelledby="overview-attention"
+          className={cn(
+            "overflow-hidden rounded-xl border bg-card",
+            attention.length > 0 ? "border-status-attention-border" : "border-border",
+          )}
+        >
+          <div className="flex items-center gap-2 border-b border-border px-4 py-3">
             {attention.length > 0 ? (
-              <ul>
-                {attention.map((item, index) => (
-                  <AttentionRow item={item} key={`${item.kind}-${index}-${item.title}`} />
-                ))}
-              </ul>
-            ) : (
-              <p className="px-4 py-3 text-[13px] text-muted-foreground">Nothing needs attention.</p>
-            )}
-          </section>
-
-          <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Tile row={rowFor(card, "build")} />
-            <Tile row={rowFor(card, "tests")} />
+              <span className="h-[7px] w-[7px] rounded-full bg-status-failed" />
+            ) : null}
+            <h2 className="text-[14px] font-bold text-foreground" id="overview-attention">
+              Needs attention
+            </h2>
           </div>
-        </>
+          {attention.length > 0 ? (
+            <ul>
+              {attention.map((item, index) => (
+                <AttentionRow item={item} key={`${item.kind}-${index}-${item.title}`} />
+              ))}
+            </ul>
+          ) : (
+            <p className="px-4 py-3 text-[13px] text-muted-foreground">Nothing needs attention.</p>
+          )}
+        </section>
       ) : (
         <div className="rounded-xl border border-border bg-card px-4 py-3">
           <p className="text-[13px] text-muted-foreground">
@@ -145,10 +87,10 @@ export function OverviewTab({ detail }: { detail: ExecutionSessionDetail }) {
       )}
 
       {goal ? (
-        // Below the two measurements, not above them: a real goal is a
-        // paragraph the operator wrote, and putting it first pushed what needs
-        // attention off the screen on every run checked against a live API.
-        // Stated in full — it is the instruction this run was given.
+        // Below what needs attention, not above it: a real goal is a paragraph
+        // the operator wrote, and putting it first pushed what needs attention
+        // off the screen on every run checked against a live API. Stated in
+        // full — it is the instruction this run was given.
         <section className="mt-3 rounded-[10px] border border-border bg-card px-4 py-3">
           <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
             Goal
