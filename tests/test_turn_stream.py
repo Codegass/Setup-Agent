@@ -8,10 +8,20 @@ pins what a reader actually sees — the band sequence, the turn count, the
 warning totals, and a verbatim line per tool copied from what the renderer
 produced. The second exists because the first is not enough: three times in this
 plan a clause was deleted and every invented-fixture test stayed green, and once
-a fence pinned a defect as correct. Every clause of `turn_stream.py` was deleted
-in turn and confirmed to take a test with it — 39 of 39 — and the four that only
-a constructed payload reaches, because no archived session holds the shape, are
-named in `test_what_the_corpus_replay_alone_cannot_reach`.
+a fence pinned a defect as correct.
+
+**On the mutation numbers in this file.** The first round of this task reported
+"40 of 40 caught" and a reviewer sampling 20 mutations found 6 survivors. The
+cause was not the tooling — `__pycache__` was cleared and bytecode disabled on
+every run, and the battery correctly reported SURVIVED the first time it saw
+one. The cause was that a survivor was treated as a prompt to write a STRONGER
+mutation rather than as a finding, and that a hand-picked list of 40 was then
+described as "every clause". The list is now enumerated from the source file
+clause by clause, a survivor is reported as a survivor, and the number here, in
+the report and in `progress.md` is one number. See
+`test_what_this_fence_does_not_catch` for what the three archived
+sessions cannot reach on their own. The number for this round is **93 of 100**,
+and the seven that survived are each named there.
 """
 
 import json
@@ -22,6 +32,7 @@ from rich.text import Text
 
 from sag.console.turn_stream import TOOL_WIDTH, TurnStreamRenderer, _Line
 from sag.trajectory.reducer import TrajectoryReducer
+from sag.trajectory.schema import SUMMARY_MAX_CHARS
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "trajectory"
 SESSIONS = ("camel-quarkus-d2r3", "ignite-d2r3", "kafka-d2r3")
@@ -115,6 +126,7 @@ def _turn_lines(sink: _Sink) -> list[str]:
 #: six-space `!` of a job still live at close is a note about a job, not a
 #: statement about the ledger, and is counted separately.
 _HOLE = "  ! "
+_HOLE_HANG = "    "
 
 
 def _warnings(sink: _Sink) -> list[str]:
@@ -130,7 +142,7 @@ def _hole_text(sink: _Sink) -> str:
             out.append(line.strip())
         elif (
             out
-            and line.startswith(" " * len(_HOLE))
+            and line.startswith(_HOLE_HANG)
             and not line.lstrip().startswith(("#", "↳", "…", "!"))
         ):
             out[-1] += " " + line.strip()
@@ -186,7 +198,7 @@ def test_the_outcome_gets_its_own_line_when_something_was_printed_between():
     stream.feed(_result(3, "build", "e1", _build_ok()))
     stream.close()
     assert "still running" in sink.text
-    assert "↳ exit 0" in sink.text
+    assert "↳ #1 exit 0" in sink.text
 
 
 def test_a_turn_still_in_flight_leaves_no_trailing_blanks_on_the_screen():
@@ -310,11 +322,12 @@ def test_a_turn_the_ledger_never_timed_says_nothing_about_timing():
         (
             "PHASE_ACTION_MISMATCH",
             "  #1   build     build"
-            "                                    refused · PHASE_ACTION_MISMATCH · 0.0s",
+            "                                        refused · PHASE_ACTION_MISMATCH · 0.0s",
         ),
         (
             "CALL_NOT_EXECUTED",
-            "  #1   build     build                                    cancelled · cancelled · 0.0s",
+            "  #1   build     build"
+            "                                        cancelled · cancelled · 0.0s",
         ),
     ],
 )
@@ -341,6 +354,23 @@ def test_a_refused_call_says_it_was_refused(code, expected):
         )
     )
     stream.close()
+    styled = _Sink()
+    marked = TurnStreamRenderer(styled, width=100, tty=True)
+    marked.feed(
+        _event(
+            1,
+            "refusal_record",
+            {
+                "tool": "build",
+                "tool_call_id": "call-1",
+                "refusal_code": code,
+                "exact_params_sha256": "b" * 64,
+            },
+        )
+    )
+    marked.close()
+    word = "cancelled" if code == "CALL_NOT_EXECUTED" else "refused"
+    assert f"[yellow]{word}[/yellow]" in styled.text
     # Pinned whole, not by substring: a refusal is the only real shape whose
     # turn is opened and answered by one event, so this line is the only fence
     # on the head being carried out to the column an outcome starts in. It is
@@ -348,6 +378,26 @@ def test_a_refused_call_says_it_was_refused(code, expected):
     # the derivation states a tool and no summary, and repeating the tool is
     # the most this layer can say without inventing a phrase.
     assert _turn_lines(sink) == [expected]
+
+
+def test_an_untimed_outcome_is_still_clipped_to_the_room_it_has():
+    """The branch that has no timing to reserve still has a width to obey."""
+
+    untimed = [
+        json.loads(_envelope(1, "bash", {"command": "ls"}, "e1")),
+        json.loads(
+            _result(2, "bash", "e1", {"operation_outcome": "failed", "error_code": "E" * 90})
+        ),
+    ]
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    for event in untimed:
+        event["timestamp"] = None
+        stream.feed(json.dumps(event))
+    stream.close()
+    for line in sink.lines:
+        assert len(line) <= 100, line
+    assert _turn_lines(sink)[0].endswith("…")
 
 
 def test_a_controller_turn_is_marked_as_the_engine():
@@ -406,18 +456,80 @@ def test_a_gate_that_arrives_after_the_result_gets_its_own_line_once():
     stream.feed(_gate(3, "partial", "build"))
     stream.feed(_decision(4, "phase", "build"))
     stream.close()
-    assert sink.text.count("graded partial") == 1
-    assert "↳ graded partial" in sink.text
+    assert sink.text.count("gate: partial") == 1
+    assert "↳ #1 gate: partial" in sink.text
+
+
+def test_a_gate_on_a_dispatched_turn_waits_for_the_answer_rather_than_taking_it():
+    """The gate lands while the turn's line is still open.
+
+    Only an answer finishes a turn's line. A gate completing it instead would
+    mark the turn as having spoken, and the result — landing after — would find
+    the turn already spoken for and never render its outcome at all.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "phase", "build"))
+    stream.feed(_envelope(2, "phase", {"action": "done", "outcome": "success"}, "e1"))
+    stream.feed(_gate(3, "partial", "build"))
+    stream.feed(_result(4, "phase", "e1", {"operation_outcome": "success"}))
+    stream.close()
+    line = [row for row in _turn_lines(sink) if row.lstrip().startswith("#2")][0]
+    assert "ok" in line
+    assert "gate: partial" in line
+    assert "↳" not in sink.text
+
+
+def test_an_escaped_bracket_does_not_move_the_outcome_column_of_an_open_line():
+    """The in-place completion of a line that was left open, with markup on.
+
+    `_open_cost` is how many columns the head took. Measured on the MARKUP it
+    counts the backslashes Rich adds and never shows, so the outcome of any turn
+    whose call held a bracket lands in a different column from every other turn.
+    """
+
+    plain, marked = _Sink(), _Sink()
+    for sink, tty in ((plain, False), (marked, True)):
+        stream = TurnStreamRenderer(sink, width=100, tty=tty)
+        stream.feed(_decision(1, "bash", "build"))
+        stream.feed(_envelope(2, "bash", {"command": "grep -n '[info] [warn] x'"}, "e1"))
+        stream.feed(_result(3, "bash", "e1", {"operation_outcome": "success"}))
+        stream.close()
+    assert [Text.from_markup(line).plain for line in marked.lines] == plain.lines
+    bracketed = [line for line in marked.lines if "info" in line][0]
+    rendered = Text.from_markup(bracketed).plain
+    assert "[info] [warn] x" in rendered
+    # The outcome lands in the column it would have landed in with no brackets
+    # in the call at all: markup the reader never sees does not move columns.
+    without = _Sink()
+    stream = TurnStreamRenderer(without, width=100, tty=True)
+    stream.feed(_decision(1, "bash", "build"))
+    stream.feed(_envelope(2, "bash", {"command": "grep -n  info   warn  x "}, "e1"))
+    stream.feed(_result(3, "bash", "e1", {"operation_outcome": "success"}))
+    stream.close()
+    other = Text.from_markup([line for line in without.lines if "warn" in line][0]).plain
+    assert rendered.index("ok") == other.index("ok")
 
 
 def test_a_gate_already_in_hand_stays_on_the_turns_own_line():
+    """And does not finish the line on its own, taking the outcome with it.
+
+    Only an answer finishes a turn. A gate arriving first used to complete the
+    line by itself, which marked the turn as having spoken; the result then
+    landed on a turn already spoken for and its outcome was never rendered at
+    all. Gates follow results in every archived session, so only this reaches it.
+    """
+
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
     stream.feed(_envelope(1, "phase", {"action": "done", "outcome": "success"}, "e1"))
     stream.feed(_gate(2, "success", "build"))
     stream.feed(_result(3, "phase", "e1", {"operation_outcome": "success"}))
     stream.close()
-    assert "graded success" in _turn_lines(sink)[0]
+    line = _turn_lines(sink)[0]
+    assert "gate: success" in line
+    assert "ok" in line
     assert "↳" not in sink.text
 
 
@@ -490,11 +602,13 @@ def test_a_blocked_phase_says_why():
     "kind,target,reason,expected",
     [
         ("advance", "analyze", "workspace_ready", "✓ build advanced · workspace_ready"),
+        # The target, not the band the run is in: a repair names the phase it is
+        # sending the run back to, which is the one fact the line exists for.
         (
             "repair",
-            "build",
+            "analyze",
             "maven_version_below_minimum",
-            "→ build repair · maven_version_below_minimum",
+            "→ analyze repair · maven_version_below_minimum",
         ),
         ("report", "report", "report_ready", "✓ build report · report_ready"),
         ("evidence_close", "test", "test_terminal", "✓ build evidence_close · test_terminal"),
@@ -637,12 +751,11 @@ def test_a_dangling_envelope_states_both_of_the_holes_it_leaves():
     stream = TurnStreamRenderer(sink, width=100)
     stream.feed(_envelope(1, "build", {"command": "mvn test"}, "e1"))
     stream.close()
-    warnings = _warnings(sink)
-    assert len(warnings) == 2
-    assert [warning.split(":")[0].lstrip("! ") for warning in warnings] == [
-        "missing_loop_decision",
-        "missing_tool_result",
-    ]
+    joined = _hole_text(sink)
+    assert "missing_tool_result: turn 1 has no tool_result and no typed refusal" in joined
+    # The second hole is real and is not dropped — it is one of the two codes
+    # that are counted rather than listed, so the count states it.
+    assert "more note" in joined and "missing_loop_decision ×1" in joined
 
 
 def test_a_turn_in_flight_is_not_yet_a_hole():
@@ -664,26 +777,53 @@ def test_a_turn_in_flight_is_not_yet_a_hole():
     assert "missing_tool_result: turn 1" not in sink.text
 
 
-def test_a_hole_is_stated_as_soon_as_the_run_has_moved_past_the_turn():
+def test_a_neighbour_opening_is_not_evidence_that_this_turn_settled():
+    """The counter-example the first round's release rule got wrong.
+
+    Two calls in flight at once: B opens and answers while A is still running.
+    Treating "a later turn exists" as "this turn settled" states a hole on A the
+    derivation withdraws two events later, which is exactly the firehose R33
+    exists to end — with the added insult that it cannot be un-printed. The
+    three archived sessions are strictly sequential, so only a constructed case
+    reaches it.
+    """
+
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
-    stream.feed(_envelope(1, "bash", {"command": "sleep 5"}, "e1"))
-    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
-    assert _warnings(sink) == []
-    stream.feed(_envelope(3, "bash", {"command": "ls"}, "e2"))
-    assert any("missing_loop_decision: turn 1" in line for line in _warnings(sink))
+    stream.feed(_envelope(1, "bash", {"command": "sleep 900"}, "e1"))
+    stream.feed(_envelope(2, "build", {"command": "mvn test"}, "e2"))
+    stream.feed(_result(3, "build", "e2", _build_ok()))
+    assert "turn 1" not in sink.text
+    stream.feed(_result(4, "bash", "e1", {"operation_outcome": "success"}))
+    stream.close()
+    assert "missing_tool_result" not in sink.text
+    assert "↳ #1 ok" in sink.text
+
+
+def test_a_hole_is_stated_as_soon_as_the_turn_it_names_has_settled():
+    """A turn with no call is settled the moment it appears.
+
+    An `action_envelope` always opens a NEW turn — `reducer._on_action_envelope`
+    says so and gives its reasons — so a turn that arrives with no call will
+    never be given one, and the hole in it can be stated where it happened
+    rather than saved up for the close.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "bash", "build"))
+    assert any("missing_envelope: turn 1" in line for line in _warnings(sink))
 
 
 def test_a_hole_is_stated_once_however_often_the_reducer_restates_it():
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
-    stream.feed(_envelope(1, "bash", {"command": "sleep 5"}, "e1"))
-    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+    stream.feed(_decision(1, "bash", "build"))
     for sequence, envelope in ((3, "e2"), (5, "e3"), (7, "e4")):
         stream.feed(_envelope(sequence, "bash", {"command": "ls"}, envelope))
         stream.feed(_result(sequence + 1, "bash", envelope, {"operation_outcome": "success"}))
     stream.close()
-    assert sink.text.count("missing_loop_decision: turn 1") == 1
+    assert sink.text.count("missing_envelope: turn 1") == 1
 
 
 def test_a_holes_explanation_wraps_rather_than_losing_its_second_half():
@@ -692,12 +832,25 @@ def test_a_holes_explanation_wraps_rather_than_losing_its_second_half():
     stream.feed(_envelope(1, "build", {"command": "mvn test"}, "e1"))
     stream.close()
     joined = _hole_text(sink)
-    assert "turn 1 called 'build' and emitted no loop_decision" in joined
+    assert "turn 1 has no tool_result and no typed refusal" in joined
     for line in sink.lines:
         assert len(line) <= 60, line
 
 
 # --- the ledger is the only input -----------------------------------------
+
+
+def test_a_wrapped_hole_hangs_four_columns_in_and_not_under_its_own_code():
+    """A 28-column hanging indent eats a third of an 80-column line."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=60)
+    stream.feed(_envelope(1, "build", {"command": "mvn test"}, "e1"))
+    stream.close()
+    wrapped = [line for line in sink.lines if line.startswith(_HOLE_HANG) and _HOLE not in line]
+    assert wrapped
+    for line in wrapped:
+        assert len(line) - len(line.lstrip()) == len(_HOLE_HANG), line
 
 
 def test_the_stream_never_reads_a_log_line():
@@ -706,6 +859,136 @@ def test_the_stream_never_reads_a_log_line():
     stream.feed("2026-09-14 21:06:09 | INFO | Executing command in container: ls")
     stream.close()
     assert sink.lines == []
+
+
+def test_a_torn_event_line_is_stated_and_a_log_line_is_not():
+    """A log line and a half-written event line are not the same thing.
+
+    A process killed mid-write leaves a truncated last line, which is exactly
+    what a live reader needs told. The old rule dropped both in silence, which
+    made `malformed_event_line` unreachable from this renderer entirely.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed("2026-09-14 21:06:09 | INFO | Executing command in container: ls")
+    stream.feed('{"sequence": 2, "kind": "tool_result", "payload": {"envelope')
+    assert "malformed_event_line" in _hole_text(sink), "stated where it happened"
+    stream.close()
+    joined = _hole_text(sink)
+    assert "malformed_event_line" in joined
+    assert "Executing command" not in sink.text
+    assert len(_inline_holes(sink)) == 1
+
+
+def test_an_event_whose_payload_is_not_a_mapping_does_not_crash_the_run():
+    """The note handlers read keys off the payload; `None.get` is a crash."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_event(1, "job_live_at_close", {}).replace('"payload": {}', '"payload": 5'))
+    stream.feed(_event(2, "job_barrier_wait", {}).replace('"payload": {}', '"payload": null'))
+    stream.feed(_event(3, "phase_transition", {}).replace('"payload": {}', '"payload": []'))
+    stream.close()
+    assert "still live at close" in sink.text
+
+
+def test_a_line_that_names_no_kind_is_a_torn_event_and_says_so():
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed('{"sequence": 2, "payload": {}}')
+    stream.close()
+    assert "malformed_event_line" in _hole_text(sink)
+
+
+def test_a_job_with_no_name_is_not_given_the_name_none():
+    """`None` on a user's terminal is a value nobody stated."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_event(1, "job_live_at_close", {}))
+    stream.close()
+    assert "      ! a job still live at close" in sink.lines
+    assert "job None" not in "".join(line for line in sink.lines if line.startswith("    "))
+
+
+def test_close_is_terminal_and_a_second_session_cannot_continue_the_first():
+    """One renderer renders one session.
+
+    Feeding a closed renderer used to be accepted and silently continue: the
+    already-shown holes stayed suppressed, the old band carried over so a new
+    run's first band was dropped, and turn ids ran on from the finished run.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "ls"}, "e1"))
+    stream.close()
+    with pytest.raises(RuntimeError):
+        stream.feed(_envelope(3, "bash", {"command": "pwd"}, "e2"))
+
+
+def test_the_two_accounting_codes_are_counted_and_everything_else_is_stated():
+    """R34's split, on constructed events rather than only on the corpus."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_decision(1, "bash", "build"))
+    stream.feed(_envelope(2, "bash", {"command": "ls"}, "e1"))
+    stream.close()
+    inline = _inline_holes(sink)
+    assert [hole.split(":")[0].strip("! ") for hole in inline] == [
+        "missing_envelope",
+        "missing_tool_result",
+        "missing_tool_result",
+    ]
+    assert "missing_loop_decision" not in " ".join(inline)
+    assert (
+        "2 more notes about the ledger itself: conservation_violation ×1, "
+        "missing_loop_decision ×1" in _hole_text(sink)
+    )
+
+
+def test_a_session_with_nothing_to_count_says_nothing_about_counting():
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "ls"}, "e1"))
+    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+    stream.feed(_decision(3, "bash", "build"))
+    stream.close()
+    assert "more note" not in sink.text
+    assert _inline_holes(sink) == []
+
+
+def test_the_call_column_grows_with_the_terminal_and_stops_where_the_derivation_does():
+    """Upward as well as downward, and no further than the longest line it gets.
+
+    `CallInfo.summary` is capped at `SUMMARY_MAX_CHARS`, so past that the room
+    belongs to what came back rather than to blank columns after a call.
+    """
+
+    command = "x" * 300
+    widths = {}
+    for width in (80, 100, 120, 200, 400):
+        sink = _Sink()
+        stream = TurnStreamRenderer(sink, width=width)
+        stream.feed(_envelope(1, "bash", {"command": command}, "e1"))
+        stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+        stream.close()
+        widths[width] = len(_call_of(_turn_lines(sink)[0]))
+    assert widths[80] < widths[100] < widths[120] < widths[200]
+    assert widths[200] == widths[400] == SUMMARY_MAX_CHARS
+
+
+def test_the_call_and_what_came_back_are_two_columns_not_one_string():
+    """A call clipped to its full column keeps two blank columns after it."""
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "y" * 300}, "e1"))
+    stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+    stream.close()
+    assert "…  ok" in _turn_lines(sink)[0]
 
 
 def test_nothing_is_buffered_across_a_close():
@@ -781,12 +1064,34 @@ def test_a_narrow_terminal_takes_the_room_from_the_call_not_the_answer():
 def test_the_tool_column_is_the_width_this_module_publishes():
     sink = _Sink()
     stream = TurnStreamRenderer(sink, width=100)
-    stream.feed(_envelope(1, "bash", {"command": "ls"}, "e1"))
-    stream.feed(_envelope(3, "project", {"action": "analyze"}, "e2"))
+    for sequence, tool, params, envelope in (
+        (1, "bash", {"command": "ls"}, "e1"),
+        (3, "project", {"action": "analyze"}, "e2"),
+    ):
+        stream.feed(_envelope(sequence, tool, params, envelope))
+        stream.feed(_result(sequence + 1, tool, envelope, {"operation_outcome": "success"}))
+        stream.feed(_decision(sequence + 1, tool, "build"))
     stream.close()
     first, second = (line.index(name) for line, name in zip(_turn_lines(sink), ("bash", "project")))
     assert first == second
     assert TOOL_WIDTH == 9
+
+
+def test_a_held_first_line_is_placed_before_the_next_turn_takes_the_terminal():
+    """Two turns dispatched before the ledger states a phase, not one lost.
+
+    The first line is held for its band; a second turn arriving is the signal
+    that it has waited long enough. Overwriting the held turn instead would
+    print the second and lose the first entirely.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "bash", {"command": "first"}, "e1"))
+    stream.feed(_envelope(2, "bash", {"command": "second"}, "e2"))
+    stream.close()
+    assert [line.split()[0] for line in _turn_lines(sink)] == ["#1", "#2"]
+    assert "first" in _turn_lines(sink)[0]
 
 
 # --- styling ---------------------------------------------------------------
@@ -847,17 +1152,57 @@ def test_a_styled_line_is_clipped_by_its_characters_and_not_by_its_tags():
     # to the end of the clipped line would paint the whole row red and no
     # plain-text assertion would ever see it.
     assert line.render(100, tty=True).startswith("[red]failed[/red] · EEE")
-    for width in (10, 40, 100):
+    for width in (4, 10, 40, 100):
         rendered = line.render(width, tty=True)
         plain = Text.from_markup(rendered).plain
-        assert len(plain) == width, (width, plain)
+        assert 0 < len(plain) <= width, (width, plain)
         assert plain.endswith("…")
         assert rendered.count("[red]") == rendered.count("[/red]") == 1
     # A clip landing INSIDE the styled word keeps the word's tag closed around
     # only what survived, rather than reaching past the end of the line.
-    tight = line.render(4, tty=True)
-    assert Text.from_markup(tight).plain == "fai…"
-    assert tight == "[red]fai…[/red]"
+    assert line.render(4, tty=True) == "[red]fai…[/red]"
+    # And a clip landing on the separator drops the separator with it, rather
+    # than leaving `failed ·…` — a join with nothing on the far side of it.
+    assert line.render(10, tty=True) == "[red]failed[/red]…"
+    assert line.render(12, tty=True) == "[red]failed[/red] · EE…"
+
+
+def test_a_truncated_span_does_not_paint_what_is_appended_after_it():
+    """`_settle` truncates the outcome and then appends the turn's timing.
+
+    A span that kept the end it had before the cut would reach past the text it
+    was clipped to, and the appended timing would land inside it.
+    """
+
+    grown = _Line().add("cancelled", "yellow").truncated(4).add(" · 1.0s")
+    assert grown.render(100, tty=True) == "[yellow]can…[/yellow] · 1.0s"
+
+
+def test_a_style_over_no_text_records_nothing():
+    """`[red][/red]` around nothing is markup a terminal parses for no reason."""
+
+    assert _Line().add("", "red").add("x").render(10, tty=True) == "x"
+
+
+def test_a_span_dropped_by_a_truncation_cannot_come_back_when_text_is_appended():
+    """`truncated()` then `add()` is what `_settle` does to every outcome.
+
+    A span kept past the cut would be dormant until the append made the text
+    long enough to reach it again, and would then paint characters it was never
+    given.
+    """
+
+    grown = _Line().add("ab").add("cd", "red").truncated(2).add("xyz")
+    assert grown.render(100, tty=True) == "a…xyz"
+
+
+def test_a_style_wholly_past_the_cut_is_dropped_rather_than_emitted_empty():
+    line = _Line().add("ab").add("cd", "red")
+    # Clipped to two columns the styled half is gone entirely; emitting an empty
+    # `[red][/red]` around nothing is markup a reader's terminal parses for no
+    # reason, and a pair of them is how a stray tag gets noticed.
+    assert line.render(2, tty=True) == "a…"
+    assert line.render(4, tty=True) == "ab[red]cd[/red]"
 
 
 def test_a_bracket_a_reader_typed_is_not_read_as_a_style_tag():
@@ -867,6 +1212,23 @@ def test_a_bracket_a_reader_typed_is_not_read_as_a_style_tag():
     stream.close()
     rendered = Text.from_markup(sink.lines[0]).plain
     assert "[info] [/red] x" in rendered
+
+
+def test_an_escaped_bracket_does_not_move_the_outcome_column():
+    """The escape Rich needs adds characters a reader never sees.
+
+    An outcome column placed by the length of the MARKUP lands in a different
+    place on every line whose call happened to contain a bracket — and real
+    calls contain brackets.
+    """
+
+    plain, marked = _Sink(), _Sink()
+    for sink, tty in ((plain, False), (marked, True)):
+        stream = TurnStreamRenderer(sink, width=100, tty=tty)
+        stream.feed(_envelope(1, "bash", {"command": "grep -n '[info] x'"}, "e1"))
+        stream.feed(_result(2, "bash", "e1", {"operation_outcome": "success"}))
+        stream.close()
+    assert [Text.from_markup(line).plain for line in marked.lines] == plain.lines
 
 
 def test_the_plain_path_carries_no_markup_at_all():
@@ -893,31 +1255,59 @@ def _render(session: str, width: int = 100, tty: bool = False) -> _Sink:
 
 #: What each archived session renders as. Every number was read off the output
 #: of the shipped renderer and checked against the ledger it came from.
-#: `warnings` is the count of statements that were still TRUE at the end — the
+#:
+#: `standing` is the count of statements that were still TRUE at the end — the
 #: brief would have printed 65, 171 and 97 of them, 86% of camel-quarkus' false.
+#: `inline` is how many of those a reader is shown where they happen; the rest
+#: are the two accounting codes, which are counted and stated once at the close.
+#: inline + counted == standing, and the fence asserts that rather than trusting
+#: the three numbers to have been written down consistently.
 CORPUS = {
     "kafka-d2r3": {
         "turns": 24,
         "bands": ["provision", "analyze", "build", "test", "report"],
-        "warnings": 11,
+        "standing": 11,
+        "inline": 0,
+        "counted": {"conservation_violation": 1, "missing_loop_decision": 10},
         "missing_tool_result": 0,
-        "lines": 53,
+        "lines": 43,
     },
     "camel-quarkus-d2r3": {
         "turns": 58,
         "bands": ["provision", "analyze", "build", "test", "report"],
-        "warnings": 24,
+        "standing": 24,
+        "inline": 6,
+        "counted": {"conservation_violation": 1, "missing_loop_decision": 17},
         "missing_tool_result": 3,
-        "lines": 107,
+        "lines": 90,
     },
     "ignite-d2r3": {
         "turns": 35,
         "bands": ["provision", "analyze", "build", "test"],
-        "warnings": 9,
+        "standing": 9,
+        "inline": 0,
+        "counted": {"conservation_violation": 1, "missing_loop_decision": 8},
         "missing_tool_result": 0,
-        "lines": 58,
+        "lines": 50,
     },
 }
+
+
+def _call_of(line: str) -> str:
+    """The call column of a turn line, whatever width it was rendered at.
+
+    The renderer keeps two blank columns between the call and what came back, so
+    the boundary is findable without the test having to know the layout.
+    """
+
+    fields = [field for field in line.split("  ") if field]
+    return fields[2] if len(fields) > 2 else ""
+
+
+def _inline_holes(sink: _Sink) -> list[str]:
+    """The holes stated where they happened, without the closing tally."""
+
+    return [line for line in _warnings(sink) if "more note" not in line]
 
 
 @pytest.mark.parametrize("session", SESSIONS)
@@ -931,26 +1321,93 @@ def test_every_turn_of_a_real_session_gets_exactly_one_dispatch_line(session):
 @pytest.mark.parametrize("session", SESSIONS)
 def test_a_real_session_renders_the_bands_it_actually_walked(session):
     sink = _render(session)
-    bands = [line[2:] for line in sink.lines if line.startswith("▸ ")]
-    assert bands == CORPUS[session]["bands"]
+    assert [line[2:] for line in sink.lines if line.startswith("▸ ")] == CORPUS[session]["bands"]
 
 
 @pytest.mark.parametrize("session", SESSIONS)
-def test_only_the_holes_that_still_stand_are_printed(session):
-    """R33's numbers, as literals.
+def test_a_real_session_opens_with_its_band_and_not_with_a_turn(session):
+    """The run's first line is the phase it is in, not the call it made there.
+
+    Nothing states a phase until the first turn's result, so the first line is
+    held for its band rather than printed above it.
+    """
+
+    assert _render(session).lines[0].startswith("▸ ")
+
+
+def test_a_held_line_is_placed_as_soon_as_a_phase_is_stated_not_when_it_answers():
+    """A long first call should not leave the terminal empty until it returns.
+
+    The line is held for its BAND, so anything that states the phase places it —
+    here a `loop_decision`, before the call has come back at all.
+    """
+
+    sink = _Sink()
+    stream = TurnStreamRenderer(sink, width=100)
+    stream.feed(_envelope(1, "build", {"command": "mvn verify"}, "e1"))
+    assert sink.lines == []
+    stream.feed(_decision(2, "build", "build"))
+    assert sink.lines[0] == "▸ build"
+    assert sink.lines[1].lstrip().startswith("#1")
+    assert "verify mvn verify" in sink.lines[1]
+
+
+def test_a_hole_about_a_call_less_turn_is_stated_where_that_turn_is(session=None):
+    """Right under it, not saved up for the close.
+
+    A call-less turn is settled the moment it appears, so the two holes in it
+    are stated there — which is where a reader is looking when they see a turn
+    with no call in it.
+    """
+
+    lines = _render("camel-quarkus-d2r3").lines
+    index = lines.index("  #22  —         no call")
+    assert lines[index + 1] == (
+        "  ! missing_envelope: turn 22 has a loop_decision but no action_envelope"
+    )
+    assert lines[index + 2] == (
+        "  ! missing_tool_result: turn 22 has no tool_result and no typed refusal"
+    )
+
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_every_band_opens_above_the_first_turn_it_holds(session):
+    """A band under its own first turn reads as though the turn preceded it.
+
+    It happens because the ledger does not state a phase until the turn's result
+    lands — twice per session, at the run's first turn and again after an
+    evidence close. The first line is held for its band rather than printed
+    above it.
+    """
+
+    lines = _render(session).lines
+    for index, line in enumerate(lines):
+        if line.startswith("▸ "):
+            assert lines[index + 1].lstrip().startswith("#"), line
+
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_only_the_holes_that_still_stand_are_stated_and_the_rest_are_counted(session):
+    """R33's numbers, as literals, and R34's split of them.
 
     Printing each warning as the reducer emits it would print 65 / 171 / 97 —
     one under every dispatch — and retract none of them. These are the counts
-    that were still true when the ledger ended.
+    that were still true when the ledger ended, and how they are divided between
+    what a reader is shown and what is counted for them.
     """
 
-    sink = _render(session)
-    warnings = _warnings(sink)
-    assert len(warnings) == CORPUS[session]["warnings"]
-    assert (
-        sum("missing_tool_result" in warning for warning in warnings)
-        == CORPUS[session]["missing_tool_result"]
-    )
+    expected = CORPUS[session]
+    sink = _render(session, width=200)
+    inline = _inline_holes(sink)
+    assert len(inline) == expected["inline"]
+    assert sum("missing_tool_result" in hole for hole in inline) == expected["missing_tool_result"]
+    counted = expected["counted"]
+    total = sum(counted.values())
+    named = ", ".join(f"{code} ×{n}" for code, n in sorted(counted.items()))
+    assert f"{total} more notes about the ledger itself: {named}" in _hole_text(sink)
+    assert len(inline) + total == expected["standing"]
+    for code in counted:
+        assert not [hole for hole in inline if hole.startswith(f"{_HOLE}{code}:")]
 
 
 @pytest.mark.parametrize("session", SESSIONS)
@@ -961,40 +1418,28 @@ def test_the_stream_states_exactly_the_holes_the_derivation_holds(session):
     own accumulation rule; this is the check that following it line by line
     lands on the same statements a snapshot of the whole ledger makes, so the
     stream and the timeline cannot describe the same run's holes differently.
-    `build_trajectory` additionally reads `token_usage.csv`, which this renderer
-    is not given, so the comparison is against the reducer it actually owns.
+    The two accounting codes are checked by their counts rather than their text,
+    because the stream states those as a number.
     """
 
     reducer = TrajectoryReducer()
     for line in (FIXTURE_DIR / session / "control_events.jsonl").read_text().splitlines():
         reducer.feed(line)
+    held = reducer.snapshot().warnings
+    counted = CORPUS[session]["counted"]
     expected = sorted(
-        f"{warning.code}: {warning.detail}" for warning in reducer.snapshot().warnings
+        f"{warning.code}: {warning.detail}" for warning in held if warning.code not in counted
     )
-    printed = sorted(
-        part.strip() for part in _hole_text(_render(session, width=200)).split("! ") if part.strip()
-    )
+    sink = _render(session, width=200)
+    printed = sorted(hole.strip()[len("! ") :] for hole in _inline_holes(sink))
     assert printed == expected
-
-
-def test_two_holes_released_together_are_stated_in_the_order_warnings_have():
-    """`warning_order` is the one order a set of statements renders in.
-
-    The live stream releases a set it accumulated; the batch view sorts a list
-    it built in one pass. They can only be compared if both use the same total
-    order, so the release path sorts rather than taking insertion order.
-    """
-
-    lines = _render("camel-quarkus-d2r3").lines
-    first = lines.index("  ! missing_envelope: turn 22 has a loop_decision but no action_envelope")
-    assert lines[first + 1] == (
-        "  ! missing_tool_result: turn 22 has no tool_result and no typed refusal"
-    )
+    for code, count in counted.items():
+        assert sum(warning.code == code for warning in held) == count
 
 
 @pytest.mark.parametrize("session", SESSIONS)
 def test_a_real_session_fits_the_terminal_it_was_given(session):
-    for width in (60, 80, 100, 120):
+    for width in (60, 80, 100, 120, 200):
         sink = _render(session, width=width)
         assert sink.lines
         for line in sink.lines:
@@ -1017,9 +1462,51 @@ def test_the_styled_and_plain_renderings_of_a_real_session_agree(session):
 def test_a_real_line_paints_the_outcome_word_and_nothing_else():
     marked = _render("kafka-d2r3", tty=True).lines
     assert (
-        "  #3   project   env gradle                               "
-        "[red]failed[/red] · ENV_EXECUTABLE_NOT_FOUND · 0.8s" in marked
+        "  #3   project   env gradle                                   "
+        "[red]failed[/red] · ENV_EXECUTABLE_NOT_FO… · 0.8s" in marked
     )
+
+
+def test_the_lines_a_watcher_is_scanning_for_carry_a_style():
+    """Bands, closes and holes, not only the outcome word.
+
+    On a real terminal the lines a watcher most needs to catch were the ones
+    with no colour on them.
+    """
+
+    marked = _render("camel-quarkus-d2r3", tty=True).lines
+    assert "[bold]▸ build[/bold]" in marked
+    assert "[green]✓ build advanced · test_entry_ready[/green]" in marked
+    assert (
+        "[yellow]  ! missing_envelope: turn 22 has a loop_decision "
+        "but no action_envelope[/yellow]" in marked
+    )
+
+
+def test_a_five_way_collision_is_five_different_lines_when_the_terminal_has_the_room():
+    """The one place the reviewer could not follow the run.
+
+    camel-quarkus calls `bash` five times with commands that share their first
+    46 characters and differ by the 57th. A call column that stops at 40 renders
+    all five as the same string on a terminal that had the room to tell them
+    apart.
+    """
+
+    collisions = [
+        line
+        for line in _turn_lines(_render("camel-quarkus-d2r3", width=120))
+        if "JAVA_HOME=" in line
+    ]
+    assert len(collisions) == 5
+    assert len({_call_of(line) for line in collisions}) == 5
+    # And at 80 columns there is genuinely no room, which the fence states
+    # rather than pretending otherwise.
+    narrow = [
+        line
+        for line in _turn_lines(_render("camel-quarkus-d2r3", width=80))
+        if "JAVA_HOME=" in line
+    ]
+    assert len({_call_of(line) for line in narrow}) == 1
 
 
 #: One verbatim line per tool, copied from what the renderer printed on the
@@ -1028,37 +1515,41 @@ def test_a_real_line_paints_the_outcome_word_and_nothing_else():
 VERBATIM = [
     (
         "kafka-d2r3",
-        "  #1   project   clone apache/kafka@4.3.1                 26b251a → /workspace/kafka · 12.6s",
+        "  #1   project   clone apache/kafka@4.3.1                     26b251a → /workspace/kafka · 12.6s",
     ),
-    ("kafka-d2r3", "  #15  build     compile --no-daemon                      exit 0 · 1m23s"),
+    ("kafka-d2r3", "  #15  build     compile --no-daemon                          exit 0 · 1m23s"),
     (
         "kafka-d2r3",
-        "  #19  build     test --no-daemon :clients:test           failed · exit 1 · DETACHED_OPERAT… · 7m26s",
+        "  #19  build     test --no-daemon :clients:test               failed · exit 1 · DETACHED_OP… · 7m26s",
     ),
-    ("kafka-d2r3", "  #20  search    output_3ea47959569d /(?i)(BUILD SUCCESS… 80 matches · 1.9s"),
-    ("kafka-d2r3", "  #5   bash      which gradle || true; ls -l /usr/bin/gr… ok · 2.8s"),
     (
         "kafka-d2r3",
-        "  #14  advisor   consult                                  advice delivered · 0.0s",
+        "  #20  search    output_3ea47959569d /(?i)(BUILD SUCCESSFUL…  80 matches · 1.9s",
     ),
-    ("kafka-d2r3", "  #23  report    generate                                 ok · 0.9s"),
+    ("kafka-d2r3", "  #5   bash      which gradle || true; ls -l /usr/bin/gradl…  ok · 2.8s"),
     (
         "kafka-d2r3",
-        "  #7   phase     done success                             gate workspace_present · workspace… · 0.2s",
+        "  #14  advisor   consult                                      advice delivered · 0.0s",
     ),
-    ("kafka-d2r3", "      ↳ graded success"),
+    ("kafka-d2r3", "  #23  report    generate                                     ok · 0.9s"),
+    (
+        "kafka-d2r3",
+        "  #7   phase     done success                                 workspace_present · workspace… · 0.2s",
+    ),
+    ("kafka-d2r3", "      ↳ #7 gate: success"),
+    ("kafka-d2r3", "▸ provision"),
     ("kafka-d2r3", "✓ provision advanced · workspace_ready"),
     ("kafka-d2r3", "✓ test evidence_close · test_terminal"),
-    ("kafka-d2r3", "  ! missing_loop_decision: turn 7 called 'phase' and emitted no loop_decision"),
     (
         "ignite-d2r3",
-        "  #17  build     compile                                  exit 0 · 5 artifacts · 2m27s",
+        "  #17  build     compile                                      exit 0 · 5 artifacts · 2m27s",
     ),
     (
         "ignite-d2r3",
-        "  #35  ⚙ engine  test                                     pending · running · job 2c4d56b2… · 15m06s",
+        "  #35  ⚙ engine  test                                         pending · running · job 2c4d… · 15m06s",
     ),
     ("ignite-d2r3", "      ! job 2c4d56b2fdca still live at close"),
+    ("ignite-d2r3", "      ↳ #34 gate: unknown"),
     ("camel-quarkus-d2r3", "  #22  —         no call"),
     (
         "camel-quarkus-d2r3",
@@ -1070,7 +1561,7 @@ VERBATIM = [
     ),
     (
         "camel-quarkus-d2r3",
-        "  #14  build     test -DskipITs -DskipIntegrationTests -… failed · exit 1 · JAVA_VERSION_ER… · 6m23s",
+        "  #14  build     test -DskipITs -DskipIntegrationTests -Dsk…  failed · exit 1 · JAVA_VERSIO… · 6m23s",
     ),
 ]
 
@@ -1080,39 +1571,104 @@ def test_a_real_line_reads_exactly_this(session, line):
     assert line in _render(session).lines
 
 
-def test_the_conservation_statement_survives_the_width_it_is_printed_at():
-    """The one statement long enough to be cut in half by an 80-column terminal."""
+def test_a_real_gate_that_said_unknown_says_so():
+    """`gate_decision.expected_outcome` is literally `unknown` once in ignite.
 
+    The gate DID state something, so the stream states it. This is the one token
+    that means absence elsewhere in the schema — `operation_outcome: unknown` is
+    `None`, and an `unknown` phase opens no band — and the difference is that a
+    gate saying `unknown` is a gate that answered.
+    """
+
+    assert "      ↳ #34 gate: unknown" in _render("ignite-d2r3").lines
+
+
+def test_a_phase_reason_code_is_rendered_bare_like_every_other_reason_code():
+    """The derivation labels it `gate <code>`; this layer already says `gate:`.
+
+    Two different facts under one word on adjacent lines is what made both
+    unreadable. `summaries._phase_observation` is out of this task's scope, so
+    the label is removed here at the presentation layer.
+    """
+
+    lines = _render("kafka-d2r3").lines
+    turn = [line for line in lines if line.lstrip().startswith("#7 ")][0]
+    assert "workspace_present · workspace" in turn
+    assert "gate workspace_present" not in turn
+    assert "      ↳ #7 gate: success" in lines
+
+
+def test_the_counted_notes_say_where_to_read_them_in_full():
     joined = _hole_text(_render("kafka-d2r3", width=80))
     assert (
-        "the ledger accounts for 23 closed call(s) on its fullest side, and is "
-        "short: decided (loop_decision + cancelled) by 9" in joined
+        "11 more notes about the ledger itself: conservation_violation ×1, "
+        "missing_loop_decision ×10 — read them in full with: "
+        "uv run sag trajectory <session>" in joined
     )
 
 
-def test_what_the_corpus_replay_alone_cannot_reach():
-    """Named gaps, rather than a silent one (R16/R27).
+def test_a_clip_at_eighty_columns_never_ends_on_a_dangling_separator():
+    for session in SESSIONS:
+        for line in _render(session, width=80).lines:
+            assert not line.endswith("·…"), line
+            assert " ·…" not in line, line
 
-    Every clause in `turn_stream.py` was deleted in turn and a test failed —
-    33 of 33 on the battery run for this task. But four of those clauses are
-    caught only by a constructed payload, because the three archived sessions do
-    not contain the shape at all, and a fence that says "three real sessions
-    pass" while those clauses go dead is the failure this note exists to stop:
 
-    - `_TRANSITION_GLYPH`'s `repair` and `report` rows. The 550-ledger corpus
-      holds `advance` (1532), `evidence_close` (526) and `flow_close` (526) and
-      nothing else; both other kinds are real —
-      `PhaseTransitionPayload.expected_kind` admits them — and only
-      `test_every_kind_of_transition_has_a_line` reaches them.
-    - `_OUTCOME_STYLE`'s `refused` and `cancelled` rows, and with them the whole
-      refusal path. 298 refusal records exist across the corpus and none is in
-      these three sessions; only `test_a_refused_call_says_it_was_refused`
-      reaches them.
+def test_what_this_fence_does_not_catch():
+    """The named gaps, rather than a silent one (R16/R27).
 
-    One clause could not be shown to bite at all and is not defended here: the
-    `_JOB_NOTE_INTERVAL_SECONDS` value itself. Any interval between one second
-    and a session's length passes every test in this file — the throttle's
-    existence is fenced, its calibration is a judgment.
+    100 mutations were enumerated by walking `turn_stream.py` clause by clause,
+    all 100 applied, **93 caught**. This is the list of the 7 that did not fail a
+    test, written down here so the next reader knows which parts of the module
+    are held up by reading rather than by this file. Two of them are guards I
+    would keep even knowing they cannot bite; four are equivalent mutants; one
+    is a real gap.
+
+    **A real gap.**
+
+    - `_release`'s `sorted(..., key=warning_order)`. Replacing it with insertion
+      order passes everything. On every reachable release that carries more than
+      one statement — a call-less turn's `missing_envelope` and
+      `missing_tool_result` — the reducer emits them in the order
+      `warning_order` puts them in, so the two orders agree and nothing can tell
+      them apart. The sort stays because `warning_order` is the schema's stated
+      total order and the live stream and the batch view are only comparable if
+      both use it, not because a test proves it.
+
+    **Guards over invariants held elsewhere (the R32 class).**
+
+    - `_outcome_line`'s `turn.call.tool == "phase"` on the `gate ` label strip.
+      Only `summaries._phase_observation` writes that label, so widening the
+      strip to every tool changes nothing the derivation can produce today. The
+      guard says which fact is being translated, and stops a future summariser
+      that puts `gate ` in a bash line from having it quietly removed.
+    - `render_turn`'s `self._answered(turn)` half of the settle predicate.
+      Removing it — settling only call-less turns — changes no output, because
+      the only turn-scoped statement that can stand on a turn WITH a call is
+      `missing_tool_result`, and that is retracted by the very event that
+      answers it. So there is no reachable statement to release early. The half
+      stays because it is what "settled" means; the code would be right by
+      accident without it.
+
+    **Equivalent mutants — the mutation is a different spelling of the same
+    behaviour on every input the derivation can produce.**
+
+    - Holding a turn that arrives already answered. Such a turn's phase can
+      never resolve later, so it is placed by the next `_emit` or by `close()`
+      either way, and `_flush` runs ahead of every emission.
+    - `close()`'s explicit `_flush()`. Every close that has a held turn also has
+      a statement to state about it, and stating one flushes.
+    - `_event`'s `isinstance(kind, str)` guard. A non-string kind matches none
+      of the `elif` arms, so returning it changes nothing.
+    - Opening a band before a restated turn writes a late outcome rather than
+      after it. Reachable only if a turn moves from one KNOWN phase to another,
+      which no archived session does — measured across all three: the only
+      phase moves are `unknown` → a real phase, at the run's first turn and
+      after an evidence close.
+
+    **And one value, not a clause.** `_JOB_NOTE_INTERVAL_SECONDS` itself: any
+    interval between one second and a session's length passes every test here.
+    The throttle's existence is fenced; its calibration is a judgment.
     """
 
     assert True
