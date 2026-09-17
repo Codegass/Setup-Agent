@@ -106,6 +106,7 @@ REAL_OBSERVATION_LINES = {
         12,
     ): "gate workspace_present · workspace /workspace/camel-quarkus exists",
     ("camel-quarkus-d2r3", 62): "advice delivered",
+    ("camel-quarkus-d2r3", 108): "COMMAND_FAILED",
     ("camel-quarkus-d2r3", 70): "exit 1 · JAVA_VERSION_ERROR",
     ("camel-quarkus-d2r3", 99): "ENV_MAVEN_EXECUTABLE_NAME_MISMATCH",
     ("camel-quarkus-d2r3", 54): "matched",
@@ -114,13 +115,95 @@ REAL_OBSERVATION_LINES = {
     # The two results in these sessions that counted their matches.
     ("ignite-d2r3", 177): "80 matches",
     ("ignite-d2r3", 157): "note",
-    ("ignite-d2r3", 174): "exit 0 · 5 jars",
+    ("ignite-d2r3", 174): "exit 0 · 5 artifacts",
     # The one dispatched job in the three sessions: pending, not failed.
     ("ignite-d2r3", 238): "running · job 2c4d56b2fdca",
     ("kafka-d2r3", 4): "26b251a → /workspace/kafka",
     ("kafka-d2r3", 124): "exit 0",
     ("kafka-d2r3", 146): "80 matches",
     ("kafka-d2r3", 143): "exit 1 · DETACHED_OPERATION_FAILED",
+}
+
+
+#: One real build result, verbatim: the `tool_result` at sequence 116 of
+#: `logs/advisor-high20-mini-high-httpcomponents-client-20260914/runs/
+#: httpcomponents-client/logs/session_20260914_044129_085078_dbb0f0d5b4b9_60849/
+#: control_events.jsonl`. Copied out of that ledger by machine, not composed
+#: here; the only edit is that the bulky text fields — `output`, `warnings`,
+#: `reactor_summary`, `failed_tests` — are left out. Every key the summarisers
+#: read is as the run wrote it.
+#:
+#: It is embedded because **no build result in any of the three archived
+#: sessions carries `facts["executed"]`**, so the counts clause — the one clause
+#: that produced the original `0 E` defect — had no real payload behind it at
+#: all, and deleting it outright left this fence green.
+REAL_FAILED_BUILD_RESULT = {
+    "error_code": "TEST_FAILURE",
+    "facts": {
+        "action": "install",
+        "effective_action": "install",
+        "executed": 2692,
+        "failed": 1,
+        "pass_rate": 99.21991084695394,
+        "passed": 2671,
+        "requested_action": "install",
+        "skipped": 13,
+        "system": "maven",
+    },
+    "failure_signature": "TEST_FAILURE:c12b9a9cdb4a175c",
+    "invocation_status": "completed",
+    "metadata": {
+        "analysis": {
+            "artifacts_created": [
+                "/workspace/httpcomponents-client/httpclient5/target/httpclient5-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5/target/httpclient5-5.7-alpha2-SNAPSHOT-tests.jar",
+                "/workspace/httpcomponents-client/httpclient5/target/httpclient5-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5/target/httpclient5-5.7-alpha2-SNAPSHOT-tests.jar",
+                "/workspace/httpcomponents-client/httpclient5-sse/target/httpclient5-sse-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-sse/target/httpclient5-sse-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-cache/target/httpclient5-cache-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-cache/target/httpclient5-cache-5.7-alpha2-SNAPSHOT-tests.jar",
+                "/workspace/httpcomponents-client/httpclient5-cache/target/httpclient5-cache-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-cache/target/httpclient5-cache-5.7-alpha2-SNAPSHOT-tests.jar",
+                "/workspace/httpcomponents-client/httpclient5-observation/target/httpclient5-observation-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-observation/target/httpclient5-observation-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-fluent/target/httpclient5-fluent-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-fluent/target/httpclient5-fluent-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-websocket/target/httpclient5-websocket-5.7-alpha2-SNAPSHOT.jar",
+                "/workspace/httpcomponents-client/httpclient5-websocket/target/httpclient5-websocket-5.7-alpha2-SNAPSHOT.jar",
+            ],
+            "build_success": False,
+            "error_type": "MODULE_FAILURE",
+            "exit_code": 1,
+            "test_error_count": 7,
+            "test_failure_count": 1,
+            "tests_run": {"errors": 7, "failures": 1, "skipped": 13, "total": 2692},
+        },
+        "command": "/opt/apache-maven-3.9.16/bin/mvn -B -f pom.xml clean verify "
+        "install -P-use-toolchains,nodoclint",
+        "error_type": "TEST_FAILURE",
+        "exit_code": 1,
+        "system": "maven",
+        "working_directory": "/workspace/httpcomponents-client",
+    },
+    "operation_outcome": "failed",
+}
+
+
+#: Results that honestly state nothing. A bash that exited 0 and a report that
+#: was written carry no line of their own, and silence is the answer there —
+#: pinned by sequence so the generic tail cannot go back to inventing `failed`.
+REAL_SILENT_OBSERVATIONS = {
+    ("camel-quarkus-d2r3", 87),
+    ("camel-quarkus-d2r3", 102),
+    ("camel-quarkus-d2r3", 158),
+    ("camel-quarkus-d2r3", 256),
+    ("ignite-d2r3", 21),
+    ("ignite-d2r3", 24),
+    ("ignite-d2r3", 188),
+    ("kafka-d2r3", 18),
+    ("kafka-d2r3", 22),
+    ("kafka-d2r3", 165),
 }
 
 
@@ -163,11 +246,14 @@ def test_every_real_call_is_named(session):
     for sequence, tool, params in _calls(session):
         total[tool] = total.get(tool, 0) + 1
         summary = call_summary(tool, params)
-        assert summary is not None, f"{session} seq {sequence}: {tool} call has no summary"
+        if summary is None:
+            continue
         assert _is_a_line(summary), f"{session} seq {sequence}: {summary!r} is not one line"
         named[tool] = named.get(tool, 0) + 1
 
     assert total == ENVELOPES_PER_TOOL[session]
+    # Held apart from the total above, so a tool that stops summarising fails
+    # here rather than passing on a count it no longer earns.
     assert named == ENVELOPES_PER_TOOL[session]
 
 
@@ -246,6 +332,51 @@ def test_every_tool_these_sessions_exercise_has_an_exact_line():
         exercised |= set(ENVELOPES_PER_TOOL[session])
     assert covered == exercised
     assert exercised == {"advisor", "bash", "build", "phase", "project", "report", "search"}
+
+
+def test_every_tool_that_says_something_has_an_exact_observation_line():
+    """The counterpart of the call coverage test, for what came back.
+
+    Without it the exact-value table can hold nothing for a whole tool while its
+    coverage count still passes — which is how the generic tail could go back to
+    inventing a word with this fence still green.
+    """
+    covered = set()
+    said_something = set()
+    for session in SESSIONS:
+        by_sequence = {sequence: tool for sequence, tool, _ in _results(session)}
+        for key in REAL_OBSERVATION_LINES:
+            if key[0] == session:
+                covered.add(by_sequence[key[1]])
+        said_something |= set(OBSERVATIONS_NAMED_PER_TOOL[session])
+
+    assert covered == said_something
+    assert said_something == {"advisor", "bash", "build", "phase", "project", "search"}
+
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_the_results_that_honestly_state_nothing(session):
+    """Silence is an answer, and it is pinned like any other."""
+
+    silent = {
+        (session, sequence)
+        for sequence, tool, result in _results(session)
+        if observation_summary(tool, result) is None
+    }
+    assert silent == {key for key in REAL_SILENT_OBSERVATIONS if key[0] == session}
+
+
+def test_a_real_build_that_ran_tests_and_failed_is_counted_and_then_says_why():
+    """The clause the original defect lived in, held to a record a run wrote.
+
+    2,692 tests ran, 1 failed, 7 errored, 13 were skipped, 16 artifacts landed,
+    and the build failed. Every one of those numbers is in the record; none of
+    them was defaulted, and the reason is appended rather than swallowing them.
+    """
+    assert observation_outcome(REAL_FAILED_BUILD_RESULT) == "failed"
+    line = observation_summary("build", REAL_FAILED_BUILD_RESULT)
+    assert line == "exit 1 · 2,692 tests · 1 F · 7 E · 13 S · 16 artifacts · TEST_FAILURE"
+    assert _is_a_line(line)
 
 
 def test_what_these_sessions_do_not_exercise():

@@ -125,34 +125,17 @@ def _command_action(command: str | None) -> str | None:
     return named[-1] if named else None
 
 
-def _arguments(value: Any) -> str | None:
-    """The runner options a verb was given, as one line of text.
-
-    Every real envelope states `args` as a string, which is what the build
-    tool's own parameter schema declares. A sequence is joined rather than
-    printed, so a container can never reach the line as `['-B', 'clean']`;
-    anything else is left out and the verb stands alone.
-    """
-
-    if isinstance(value, (list, tuple)):
-        scalars = [str(item) for item in value if isinstance(item, (str, int, float, bool))]
-        return _first_line(" ".join(scalars))
-    return _first_line(value)
-
-
 def _build_call(params: dict[str, Any]) -> str | None:
     command = _first_line(params.get("command")) or _first_line(params.get("source_command"))
-    action = (
-        _first_line(params.get("action"))
-        or _first_line(params.get("effective_action"))
-        or _command_action(command)
-    )
+    action = _first_line(params.get("action")) or _command_action(command)
     if command:
         # A command spells out its own options; the args are not appended twice.
         return f"{action} {command}" if action else command
     if not action:
         return None
-    args = _arguments(params.get("args"))
+    # Only text is rendered, so a container never reaches the line raw; the
+    # build tool declares `args` a string and every real envelope states one.
+    args = _first_line(params.get("args"))
     return f"{action} {args}" if args else action
 
 
@@ -266,31 +249,37 @@ def _build_observation(result: dict[str, Any], outcome: ObservationOutcome | Non
     if exit_code is None:
         exit_code = _count(analysis.get("exit_code"))
     exit_text = f"exit {exit_code}" if exit_code is not None else None
-    if outcome != "ok":
-        reason = _first_line(result.get("error_code")) or _first_line(analysis.get("error_type"))
-        return _join(exit_text, reason)
     counts = None
     executed = _count(facts.get("executed"))
     if executed is not None:
-        # Each term is stated only when its own number was taken. There is no
-        # error term: no build result carries an error count, and `0 E` would be
-        # a measurement nobody made.
+        # Each term is stated only when its own number was taken. The error
+        # count is a measurement of its own — a test that could not run at all,
+        # counted apart from one that ran and failed — and it is kept in the log
+        # analysis rather than in `facts`.
         terms = [f"{executed:,} tests"]
         failed = _count(facts.get("failed"))
         if failed is not None:
             terms.append(f"{failed} F")
+        errors = _count(analysis.get("test_error_count"))
+        if errors is not None:
+            terms.append(f"{errors} E")
         skipped = _count(facts.get("skipped"))
         if skipped is not None:
             terms.append(f"{skipped} S")
         counts = " · ".join(terms)
     artifacts = analysis.get("artifacts_created")
-    jars = f"{len(artifacts)} jars" if isinstance(artifacts, list) and artifacts else None
-    return _join(exit_text, counts, jars)
+    made = f"{len(artifacts)} artifacts" if isinstance(artifacts, list) and artifacts else None
+    # A run that failed still ran what it ran: the reason is appended to the
+    # counts, never substituted for them.
+    reason = None
+    if outcome != "ok":
+        reason = _first_line(result.get("error_code")) or _first_line(analysis.get("error_type"))
+    return _join(exit_text, counts, made, reason)
 
 
 def _project_observation(result: dict[str, Any]) -> str | None:
     metadata = _mapping(result.get("metadata"))
-    commit = _short_sha(metadata.get("resolved_commit")) or _ref_label(metadata.get("ref"))
+    commit = _short_sha(metadata.get("resolved_commit"))
     path = _first_line(metadata.get("clone_path"))
     if commit and path:
         return f"{commit} → {path}"

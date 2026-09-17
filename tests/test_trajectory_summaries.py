@@ -89,17 +89,17 @@ def test_a_build_call_carries_the_args_the_verb_was_given():
 
 
 def test_build_args_that_are_not_one_line_of_text_are_left_out():
-    """A container never reaches the line as `['-B', 'clean']`.
+    """Only text is rendered, so a container never reaches the line raw.
 
     Every real envelope states `args` as a string, and the build tool's own
     parameter schema declares it one (`build_tool.py`, `"args": {"type":
-    "string"}`). A sequence is joined rather than printed, defensively; anything
-    else is dropped, and the verb stands alone.
+    "string"}`). Anything else is dropped and the verb stands alone — which is
+    the same protection a join would give, without a branch nothing reaches.
     """
     assert call_summary("build", {"action": "test", "args": None}) == "test"
     assert call_summary("build", {"action": "test", "args": "   "}) == "test"
     assert call_summary("build", {"action": "test", "args": {"skip": True}}) == "test"
-    assert call_summary("build", {"action": "test", "args": ["-B", "clean"]}) == "test -B clean"
+    assert call_summary("build", {"action": "test", "args": ["-B", "clean"]}) == "test"
 
 
 def test_the_mirrored_build_verbs_are_the_build_tool_s_own():
@@ -161,6 +161,32 @@ def test_a_clone_ref_that_is_a_tag_is_carried_whole():
             },
         )
         == "clone apache/lucene@releases/lucene/10.4.0"
+    )
+
+
+def test_only_a_full_length_sha_is_shortened():
+    """A tag can be hex too, and `20250101` shortened to `2025010` names nothing.
+
+    Forty characters exactly, hex only. Anything shorter or longer is a ref and
+    is carried whole.
+    """
+    forty = "e17111798da51037659b3594d9c0b3b525040081"
+    hexish_tag = "20250101"
+    assert (
+        call_summary(
+            "project", {"action": "clone", "repo_url": "https://x/a/b.git", "ref": hexish_tag}
+        )
+        == "clone a/b@20250101"
+    )
+    assert (
+        call_summary(
+            "project", {"action": "clone", "repo_url": "https://x/a/b.git", "ref": forty[:39]}
+        )
+        == f"clone a/b@{forty[:39]}"
+    )
+    assert (
+        call_summary("project", {"action": "clone", "repo_url": "https://x/a/b.git", "ref": forty})
+        == "clone a/b@e171117"
     )
 
 
@@ -351,7 +377,39 @@ def test_build_result_summarises_exit_tests_and_artifacts():
             "analysis": {"exit_code": 0, "artifacts_created": ["a.jar", "b.jar"]},
         },
     }
-    assert observation_summary("build", result) == "exit 0 · 994 tests · 0 F · 61 S · 2 jars"
+    assert observation_summary("build", result) == "exit 0 · 994 tests · 0 F · 61 S · 2 artifacts"
+
+
+def test_the_error_count_comes_from_the_log_analysis():
+    """`metadata.analysis.test_error_count` is the only error count a build takes.
+
+    An error is not a failure: a test that could not run at all is counted
+    apart from one that ran and failed, and a reader chasing 7 E is chasing
+    something different from 1 F.
+    """
+    result = {
+        "operation_outcome": "success",
+        "facts": {"executed": 100, "failed": 2, "skipped": 3},
+        "metadata": {"exit_code": 0, "analysis": {"test_error_count": 4}},
+    }
+    assert observation_summary("build", result) == "exit 0 · 100 tests · 2 F · 4 E · 3 S"
+
+
+def test_the_exit_code_the_runner_reported_wins_over_the_log_reading():
+    """Both keys are real and they agree in every record, so the rule needs saying.
+
+    `metadata.exit_code` is what the dispatcher saw the process return;
+    `metadata.analysis.exit_code` is what reading the log concluded. Only a
+    constructed disagreement can state which one this line follows.
+    """
+    both = {
+        "operation_outcome": "success",
+        "metadata": {"exit_code": 0, "analysis": {"exit_code": 9}},
+    }
+    assert observation_summary("build", both) == "exit 0"
+
+    log_only = {"operation_outcome": "success", "metadata": {"analysis": {"exit_code": 9}}}
+    assert observation_summary("build", log_only) == "exit 9"
 
 
 def test_a_five_figure_test_count_is_grouped_for_reading():
@@ -364,12 +422,13 @@ def test_a_five_figure_test_count_is_grouped_for_reading():
 
 
 def test_a_count_the_payload_never_took_is_not_printed_as_zero():
-    """No `E` term at all: no real build result carries an error count.
+    """Every term is stated only when its own number was taken.
 
-    `facts["errors"]` does not exist, and `metadata.analysis.log_tests_run`
-    occurs in no build result, so every `0 E` this line used to print was a
-    count nobody took. `failed` and `skipped` are stated only when they are
-    stated — a `None` must never render as `0 F`, and never as `None F`.
+    `facts["errors"]` does not exist — the error count lives in
+    `metadata.analysis.test_error_count` — so the `0 E` this line used to print
+    came from a `.get(..., 0)` over a key that was never there. `failed` and
+    `skipped` are the same: a `None` must never render as `0 F`, and never as
+    `None F`.
     """
     counted = {
         "operation_outcome": "success",
@@ -385,7 +444,7 @@ def test_a_count_the_payload_never_took_is_not_printed_as_zero():
     flagged = {
         "operation_outcome": "success",
         "facts": {"executed": 5, "failed": True, "skipped": False},
-        "metadata": {"exit_code": 0},
+        "metadata": {"exit_code": 0, "analysis": {"test_error_count": True}},
     }
     assert observation_summary("build", flagged) == "exit 0 · 5 tests"
 
@@ -412,6 +471,24 @@ def test_a_failed_build_that_states_only_a_log_diagnosis_names_that():
         "metadata": {"exit_code": 1, "analysis": {"exit_code": 1, "error_type": "MODULE_BANNED"}},
     }
     assert observation_summary("build", result) == "exit 1 · MODULE_BANNED"
+
+
+def test_a_failed_test_run_is_counted_first_and_then_says_why():
+    """A build that ran 2,692 tests and failed still ran 2,692 tests.
+
+    The reason is appended, not substituted: the counts are the most
+    informative thing in the record, and a failing run is exactly when a reader
+    needs them.
+    """
+    result = {
+        "operation_outcome": "failed",
+        "error_code": "TEST_FAILURE",
+        "facts": {"executed": 2692, "failed": 1, "skipped": 13},
+        "metadata": {"exit_code": 1, "analysis": {"test_error_count": 7}},
+    }
+    assert observation_summary("build", result) == (
+        "exit 1 · 2,692 tests · 1 F · 7 E · 13 S · TEST_FAILURE"
+    )
 
 
 def test_provision_result_names_the_version_it_verified():
@@ -546,26 +623,41 @@ def test_a_result_that_states_no_error_states_nothing():
     assert observation_summary("bash", {"operation_outcome": "success"}) is None
 
 
-def test_a_refusal_states_its_code():
-    outcome, summary = refusal_summary(
-        {"refusal_code": "CALL_NOT_EXECUTED", "reason": "phase transition applied"}
+def test_a_refusal_reads_as_the_code_the_record_carries():
+    """A refusal record holds a code and nothing else to say.
+
+    `RefusalRecordPayload` is strict and its fields are `tool`, `tool_call_id`,
+    `refusal_code`, `exact_params_sha256` and `repair_intent` — there is no
+    `reason`, so no ledger written today can produce one. These three are the
+    whole of what a reader can be shown.
+    """
+    assert refusal_summary({"refusal_code": "CALL_NOT_EXECUTED"}) == ("cancelled", "cancelled")
+    assert refusal_summary({"refusal_code": "PHASE_ACTION_MISMATCH"}) == (
+        "refused",
+        "PHASE_ACTION_MISMATCH",
     )
-    assert outcome == "cancelled"
-    assert summary == "cancelled: phase transition applied"
+    # Real codes are not all SHOUTED.
+    assert refusal_summary({"refusal_code": "execution_refused:evidence_closed"}) == (
+        "refused",
+        "execution_refused:evidence_closed",
+    )
 
 
-def test_a_non_cancellation_refusal_is_a_refusal():
-    outcome, summary = refusal_summary({"refusal_code": "TOOL_PARAMETERS_INVALID"})
-    assert outcome == "refused"
-    assert summary == "TOOL_PARAMETERS_INVALID"
+def test_a_refusal_reason_is_carried_if_a_later_record_ever_states_one():
+    """Nothing emits this today; the branch is kept for a ledger that might.
 
-
-def test_a_lowercase_refusal_code_is_still_shown_whole():
-    """Real refusal codes are not all SHOUTED: `execution_refused:evidence_closed`."""
-
-    outcome, summary = refusal_summary({"refusal_code": "execution_refused:evidence_closed"})
-    assert outcome == "refused"
-    assert summary == "execution_refused:evidence_closed"
+    Stated here rather than left looking like live behaviour — no
+    `refusal_record` in any archive carries a `reason` field, and the payload
+    model forbids one.
+    """
+    assert refusal_summary({"refusal_code": "CALL_NOT_EXECUTED", "reason": "phase closed"}) == (
+        "cancelled",
+        "cancelled: phase closed",
+    )
+    assert refusal_summary({"refusal_code": "REPAIR_INTENT_REQUIRED", "reason": "no intent"}) == (
+        "refused",
+        "REPAIR_INTENT_REQUIRED · no intent",
+    )
     assert refusal_summary({"refusal_code": "skipped"}) == ("refused", "skipped")
 
 
