@@ -23,6 +23,12 @@ REASON_GLOSS: dict[str, str] = {
     "MODULES_BELOW_TARGET": "fewer modules were built than CI built",
     "BUILD_AXIS_NOT_SUCCESSFUL": "the build did not succeed, so CI attainment cannot be met",
     "EXECUTION_BELOW_TARGET": "fewer tests ran than CI ran",
+    # Official-CI comparison: blockers raised while the comparison is assembled
+    "TEST_EXECUTION_NOT_COMPLETE": "the test commands did not run to completion, so there is nothing to compare",
+    "BUILD_MODULE_SCOPE_UNAVAILABLE": "the run did not record which modules it built, so modules cannot be compared",
+    "PLAN_TEST_EVIDENCE_INCOMPLETE": "at least one test step finished without a readable test report",
+    "FIXED_TASK_INCOMPLETE": "one or more required task steps did not run successfully",
+    "CURRENT_TEST_REPORTS_UNAVAILABLE": "this run's test reports could not be read back, so its counts cannot be checked",
     # Official-CI comparison: availability
     "official_ci_target_not_supplied": "no CI job was supplied to compare against",
     "official_ci_cell_not_matched": "no CI job on this commit matches the run's JDK and OS",
@@ -89,4 +95,27 @@ def gloss(code: str) -> str:
     return REASON_GLOSS.get(code) or code
 
 
-__all__ = ["REASON_GLOSS", "KNOWN_REASON_CODES", "gloss"]
+def explain(code: str) -> str:
+    """``sentence (CODE)``, or the bare code when there is no sentence.
+
+    The code stays beside its sentence because it is the handle a reader
+    quotes in a bug report. Without a sentence there is only the code, and
+    printing it twice — ``CODE (CODE)`` — reads as two different facts.
+    """
+
+    sentence = REASON_GLOSS.get(code)
+    return f"{sentence} ({code})" if sentence else code
+
+
+def cited(code: str) -> str:
+    """``CODE: sentence``, or the bare code when there is no sentence.
+
+    The same rule as :func:`explain` with the code leading, for lists whose
+    reader scans codes down the left edge.
+    """
+
+    sentence = REASON_GLOSS.get(code)
+    return f"{code}: {sentence}" if sentence else code
+
+
+__all__ = ["REASON_GLOSS", "KNOWN_REASON_CODES", "cited", "explain", "gloss"]

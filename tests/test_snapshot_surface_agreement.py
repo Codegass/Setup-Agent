@@ -45,9 +45,10 @@ from sag.console.result_block import (
 from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.metrics.attainment import AttainmentVerdict
 from sag.result_card.build import build_result_card
+from sag.result_card.glosses import REASON_GLOSS
 from sag.result_card.markdown import render_result_card_markdown
 from sag.result_card.models import ROW_LABELS, ROW_ORDER, RunResultCard
-from sag.result_card.rows import _CI_STATUS_WORD, _CI_TONE
+from sag.result_card.rows import _CI_STATUS_WORD, _CI_TONE, NOT_COMPARED
 from sag.tools.report_tool import ReportTool
 from sag.web.session_registry import _session_detail, _setup_artifact_item
 
@@ -1074,6 +1075,46 @@ _FENCE_RECORDS: dict[str, tuple[dict, dict]] = {
             "report_path": "logs/session_z/setup-report.md",
         },
     ),
+    # The record's word for a comparison it could not make. 135 of the 342
+    # evaluated comparisons under `logs/` hold it, every one of them with no
+    # score and with blocker codes on the comparison beside the attainment's
+    # own. No surface may spell it `invalid`, and no surface may invent a
+    # score the record declined to give.
+    "a comparison the run could not make": (
+        snapshot_dict(
+            ci_comparison=dict(
+                evaluated_ci_comparison(
+                    verdict="invalid",
+                    valid=False,
+                    built=False,
+                    clean=False,
+                    clean_form="counts",
+                    alpha=None,
+                    alpha_test=None,
+                    alpha_build=None,
+                    lifecycle_parity=None,
+                    cell_id="maven-compile (ubuntu-latest, JDK-8)",
+                    cell_grade="B",
+                    executed_observed=1328,
+                    executed_target=0,
+                    red_observed=1,
+                    modules_matched=2,
+                    modules_target=4,
+                    missing_module_ids=["rocketmq-broker 5.5.1", "rocketmq-store 5.5.1"],
+                    reason_codes=[
+                        "CERTIFICATE_AUTHORITY_UNAVAILABLE",
+                        "TARGET_TEST_UNIVERSE_EMPTY",
+                    ],
+                ),
+                reasons=["TEST_EXECUTION_NOT_COMPLETE", "BUILD_MODULE_SCOPE_UNAVAILABLE"],
+            )
+        ),
+        {
+            "module_metrics": module_metrics(),
+            "termination": _DELIVERED,
+            "report_path": "logs/session_i/setup-report.md",
+        },
+    ),
     # A pipe is the one character that can split a Markdown column, so one
     # record states a command containing one. The report escapes it in the cell
     # and the block prints it as it is; both surfaces still have to state the
@@ -1541,6 +1582,76 @@ def test_every_ci_verdict_the_record_can_hold_has_a_word_a_reader_can_read():
 
 
 # -- one reader, four surfaces ---------------------------------------------
+
+
+def test_no_surface_spells_a_comparison_it_could_not_make_the_way_the_record_does():
+    """`invalid` is the record's word; `not compared` is what happened.
+
+    135 of the 342 evaluated comparisons under `logs/` are `invalid`, and on a
+    screen the bare word reads as a judgment on the project — a reader sees a
+    red row beside a green build and concludes the tests are broken. What the
+    record means is that it could not compare, which is what the run's own
+    unsupplied and unmatched cases already say. One spelling in
+    `_CI_STATUS_WORD` gives the terminal, the report and the web payload the
+    same word; this asserts all three read it, so none can keep its own copy.
+    """
+
+    card = _fence_card("a comparison the run could not make")
+
+    assert card.row("ci").status == NOT_COMPARED
+    assert _printed_rows(card)["ci"].status == NOT_COMPARED
+    assert _report_cells(card)[ROW_LABELS["ci"]][0] == NOT_COMPARED
+
+    # And it says it once. Every `invalid` record under `logs/` carries no
+    # score, so a headline reporting the missing score beside the status word
+    # states the same absence twice in one row.
+    assert card.row("ci").headline == NOT_COMPARED
+    assert _printed_rows(card)["ci"].said == ('cell "maven-compile (ubuntu-latest, JDK-8)"',)
+
+    block = _fence_block(card).lower()
+    written = "\n".join(render_result_card_markdown(card)).lower()
+    assert "invalid" not in block, "the block prints the record's own word"
+    assert "invalid" not in written, "the report prints the record's own word"
+
+
+def test_a_reason_without_a_sentence_reaches_a_reader_once():
+    """An unglossed code is one fact, printed once, on every surface.
+
+    `_first_reason` used to render `f"{gloss(text)} ({text})"`, and `gloss`
+    falls back to the code, so a code with no sentence arrived as
+    `TEST_EXECUTION_NOT_COMPLETE (TEST_EXECUTION_NOT_COMPLETE)` — the same word
+    twice, which reads as two different facts. A glossed code still carries its
+    code, because the code is the handle a reader quotes.
+    """
+
+    unglossed = "A_CODE_THAT_SHIPPED_BEFORE_ITS_SENTENCE"
+    assert unglossed not in REASON_GLOSS
+
+    card = build_result_card(
+        snapshot_dict(
+            ci_comparison=dict(
+                snapshot_dict()["ci_comparison"], status="unavailable", reasons=[unglossed]
+            )
+        ),
+        termination=_DELIVERED,
+    )
+    assert card.row("ci").reason == unglossed
+    assert _printed_rows(card)["ci"].said == (unglossed,)
+    assert _report_cells(card)[ROW_LABELS["ci"]][1] == unglossed
+
+    glossed = build_result_card(
+        snapshot_dict(
+            ci_comparison=dict(
+                snapshot_dict()["ci_comparison"],
+                status="unavailable",
+                reasons=["official_ci_cell_not_matched"],
+            )
+        ),
+        termination=_DELIVERED,
+    )
+    assert glossed.row("ci").reason == (
+        "no CI job on this commit matches the run's JDK and OS (official_ci_cell_not_matched)"
+    )
 
 
 def test_the_run_counts_a_card_states_come_from_one_reader():

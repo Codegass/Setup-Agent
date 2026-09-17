@@ -1,5 +1,5 @@
 import type { Attainment, CIComparison, LifecycleParity, Pair } from "@/api/types"
-import { gloss } from "@/lib/ciGlosses"
+import { gloss, statusWord } from "@/lib/ciGlosses"
 import { cn } from "@/lib/utils"
 
 /** How many failing test names to print before summarising the rest. */
@@ -145,7 +145,7 @@ function Measurement({ result }: { result: Attainment }) {
             VERDICT_CHIP[result.verdict] ?? "bg-accent text-muted-foreground",
           )}
         >
-          {result.verdict.replace(/_/g, " ")}
+          {statusWord(result.verdict)}
         </span>
       </p>
       <Fraction

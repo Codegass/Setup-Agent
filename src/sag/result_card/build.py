@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
-from sag.result_card.glosses import gloss
+from sag.result_card.glosses import cited, gloss
 from sag.result_card.models import (
     ROW_ORDER,
     AttentionItem,
@@ -166,7 +166,7 @@ def _attention(
     if str(getattr(comparison, "status", "")) == "evaluated" and result is not None:
         for code in getattr(result, "reason_codes", ()) or ():
             if str(code) in _CI_FINDING_CODES:
-                items.append(AttentionItem(kind="ci_finding", title=f"{code}: {gloss(str(code))}"))
+                items.append(AttentionItem(kind="ci_finding", title=cited(str(code))))
 
     for module in _mapping(module_metrics).get("modules") or ():
         if not isinstance(module, Mapping):

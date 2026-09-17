@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from sag.result_card.glosses import gloss
+from sag.result_card.glosses import cited, explain, gloss
 from sag.result_card.models import ROW_LABELS, ResultRow, ResultStats, Tone
 
 _VERDICT_TONE: dict[str, Tone] = {
@@ -46,10 +46,17 @@ def _duration_text(seconds: float | None) -> str | None:
 
 
 def _first_reason(reasons: Any) -> str | None:
+    """The first reason a row cites, said once.
+
+    ``explain`` keeps the code beside its sentence — the code is the handle a
+    reader quotes — and drops the parenthesis when there is no sentence, so an
+    unglossed code reads as one code rather than as the same word twice.
+    """
+
     for reason in reasons or ():
         text = str(reason).strip()
         if text:
-            return f"{gloss(text)} ({text})"
+            return explain(text)
     return None
 
 
@@ -347,14 +354,20 @@ _CI_TONE: dict[str, Tone] = {
     "invalid": "failed",
 }
 
-#: The record's word for a comparison, said the way a reader says it. The record
-#: is what tone keys off; this is only how the word is spelled on a surface, so
-#: all three spell it the same and none of them keeps its own copy.
-_CI_STATUS_WORD: dict[str, str] = {"not_met": "not met"}
-
 _MAX_RED_IDS = 10
 
 NOT_COMPARED = "not compared"
+
+#: The record's word for a comparison, said the way a reader says it. The record
+#: is what tone keys off; this is only how the word is spelled on a surface, so
+#: all three spell it the same and none of them keeps its own copy.
+#:
+#: ``invalid`` is the record's word for a comparison it could not make — 135 of
+#: the 342 evaluated comparisons under ``logs/``. On a screen the bare word
+#: reads as a judgment on the project rather than on the comparison, so every
+#: surface says what actually happened: nothing was compared. The row's reason
+#: still names why.
+_CI_STATUS_WORD: dict[str, str] = {"not_met": "not met", "invalid": NOT_COMPARED}
 
 _REPORT_TONE: dict[str, Tone] = {
     "delivered": "neutral",
@@ -395,6 +408,14 @@ def ci_row(snapshot: Any) -> ResultRow:
     alpha = getattr(result, "alpha", None)
     if alpha is not None:
         headline = f"{word} {alpha.numerator:,}/{alpha.denominator:,}"
+    elif word == NOT_COMPARED:
+        # A row that says nothing was compared does not then report a missing
+        # score: the score is missing because there was no comparison, and
+        # every `invalid` record under `logs/` carries no score at all. Saying
+        # it twice in one row reads as two separate facts. The findings below
+        # the row still say why, and this renders the way the unsupplied and
+        # unmatched cases already render.
+        headline = NOT_COMPARED
     else:
         headline = f"{word} · scope score unavailable"
 
@@ -410,7 +431,7 @@ def ci_row(snapshot: Any) -> ResultRow:
             parity_text = f"{parity_text} · extra {', '.join(parity.extra)}"
         detail_parts.append(parity_text)
 
-    items = [f"{code}: {gloss(code)}" for code in getattr(result, "reason_codes", ()) or ()]
+    items = [cited(str(code)) for code in getattr(result, "reason_codes", ()) or ()]
     red_ids = tuple(getattr(result, "unexpected_red_ids", ()) or ())
     if red_ids:
         items.append(f"red beyond CI: {len(red_ids):,} tests")

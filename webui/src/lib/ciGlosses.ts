@@ -25,6 +25,12 @@ export const REASON_GLOSS: Record<string, string> = {
   "MODULES_BELOW_TARGET": "fewer modules were built than CI built",
   "BUILD_AXIS_NOT_SUCCESSFUL": "the build did not succeed, so CI attainment cannot be met",
   "EXECUTION_BELOW_TARGET": "fewer tests ran than CI ran",
+  // Official-CI comparison: blockers raised while the comparison is assembled
+  "TEST_EXECUTION_NOT_COMPLETE": "the test commands did not run to completion, so there is nothing to compare",
+  "BUILD_MODULE_SCOPE_UNAVAILABLE": "the run did not record which modules it built, so modules cannot be compared",
+  "PLAN_TEST_EVIDENCE_INCOMPLETE": "at least one test step finished without a readable test report",
+  "FIXED_TASK_INCOMPLETE": "one or more required task steps did not run successfully",
+  "CURRENT_TEST_REPORTS_UNAVAILABLE": "this run's test reports could not be read back, so its counts cannot be checked",
   // Official-CI comparison: availability
   "official_ci_target_not_supplied": "no CI job was supplied to compare against",
   "official_ci_cell_not_matched": "no CI job on this commit matches the run's JDK and OS",
@@ -85,4 +91,25 @@ export const REASON_GLOSS: Record<string, string> = {
 /** The sentence for `code`, or the code itself when it has none. */
 export function gloss(code: string): string {
   return REASON_GLOSS[code] ?? code
+}
+
+/**
+ * The record's word for a comparison verdict, said the way a reader says it.
+ *
+ * A copy of `_CI_STATUS_WORD` in `src/sag/result_card/rows.py`, kept in step by
+ * the same parity test as the sentences above. `invalid` is the record's word
+ * for a comparison it could not make — 135 of the 342 evaluated comparisons
+ * under `logs/` — and on a screen the bare word reads as a judgment on the
+ * project rather than on the comparison. The terminal, the report and this tab
+ * all say what happened instead: nothing was compared.
+ */
+export const CI_STATUS_WORD: Record<string, string> = {
+  "not_met": "not met",
+  "invalid": "not compared",
+}
+
+/** `verdict` as a reader reads it. Underscores become spaces for anything the
+ *  map does not name, so a new verdict is legible before it is spelled. */
+export function statusWord(verdict: string): string {
+  return CI_STATUS_WORD[verdict] ?? verdict.replace(/_/g, " ")
 }
