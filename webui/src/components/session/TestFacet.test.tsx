@@ -92,51 +92,88 @@ describe("TestFacet", () => {
     expect(screen.getByText("streams")).toBeInTheDocument()
   })
 
-  it("separates a sealed run from verified identities and diagnostic observations", () => {
+  it("files what the run counted under one Evidence accounting block", () => {
     render(<TestFacet detail={igniteShape} />)
 
     expect(screen.getByText("Test execution")).toBeInTheDocument()
-    expect(screen.getByText("Executed")).toHaveClass("text-status-success")
-    expect(screen.getByText(/test results: 2 passed · 0 failed · 0 errors/i)).toBeInTheDocument()
-    expect(screen.getByText(/100% of non-skipped results passed/i)).toBeInTheDocument()
     expect(screen.getByRole("img", { name: /2 passed, 0 failed, 2 total/i })).toBeInTheDocument()
 
-    expect(screen.getByText("Verified per-test results")).toBeInTheDocument()
-    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0)
-    expect(screen.getByText(/module and test names were not sealed/i)).toBeInTheDocument()
+    // One block, opened on demand, in place of the three that said the same
+    // things in three vocabularies.
+    expect(screen.getByText("Evidence accounting")).toBeInTheDocument()
+    expect(screen.queryByText("Evidence details")).not.toBeInTheDocument()
+    expect(screen.queryByText("Verified per-test results")).not.toBeInTheDocument()
+    expect(screen.queryByText("Diagnostic observations")).not.toBeInTheDocument()
 
-    expect(screen.getByText("Evidence details")).toBeInTheDocument()
-    expect(screen.getByText("Recorded test executions")).toBeInTheDocument()
-    expect(screen.getByText("2 / 2 passed")).toBeInTheDocument()
-    expect(screen.getByText("Excluded observations")).toBeInTheDocument()
-    expect(screen.getByText("267 / 2,887 passed")).toBeInTheDocument()
-    expect(screen.getByText("Diagnostic observations")).toBeInTheDocument()
-    expect(screen.getByText("2,887")).toBeInTheDocument()
-    expect(screen.getByText("Evidence records")).toBeInTheDocument()
-    expect(screen.getByText("Complete")).toBeInTheDocument()
+    fireEvent.click(screen.getByText("Evidence accounting"))
+    expect(screen.getByText("Results bound to this run's receipts")).toBeVisible()
+    expect(
+      screen.getByText("2 executed · 2 passed · 0 failed · 0 errors · 0 skipped"),
+    ).toBeVisible()
+    expect(
+      screen.getByText("2,887 executed · 267 passed · 28 failed · 2,481 errors · 111 skipped"),
+    ).toBeVisible()
   })
 
-  it("shows incomplete suite totals as a named lower bound, not an exact tool-run rate", () => {
-    const incompleteTotals = JSON.parse(JSON.stringify(igniteShape))
-    incompleteTotals.test.evidenceLayers.tests.claimed.receiptExecutions = {
-      executed: 2048,
-      passed: 2040,
-      failed: 8,
-      errors: 0,
-      skipped: 0,
-      availability: "partial",
-      bound: "lower",
-      basis: "gradle suite totals over the claimed reports the read reached",
-      reason: "gradle suite totals were incomplete (disclosed bounds: unsummarized_files)",
-    }
+  it("never puts the payload's own reason wording on the screen", () => {
+    // `igniteShape`'s reason is the one 434 of the 674 archived runs state, and
+    // it contains two words this UI may not print. The old panel printed it
+    // twice: once as an identities summary, once as a "Source note".
+    const { container } = render(<TestFacet detail={igniteShape} />)
+    fireEvent.click(screen.getByText("Evidence accounting"))
+    const text = (container.textContent ?? "").toLowerCase()
+    expect(text).not.toContain("sealed")
+    expect(text).not.toContain("subject")
+    expect(text).not.toContain("source note")
+    expect(screen.getAllByText(/the run did not record module and test names/)[0]).toBeVisible()
+  })
 
-    render(<TestFacet detail={incompleteTotals} />)
+  it("states the headline the result card states, rather than working it out again", () => {
+    const carded = {
+      ...igniteShape,
+      resultCard: {
+        schemaVersion: 1,
+        runId: "r",
+        verdict: "partial",
+        verdictSource: "snapshot",
+        rows: [
+          {
+            key: "tests",
+            label: "Tests",
+            status: "unavailable",
+            tone: "attention",
+            headline: "≥2,688 executed · 2,662 passed · 2 failed · 11 errors · 13 skipped",
+            detail: "99.5% of non-skipped passed · 2,692 raw executions",
+            reason: "the run recorded test outcomes but no judgment about them",
+          },
+        ],
+        stats: {},
+        attention: [],
+        notes: [],
+      },
+    } as any
 
-    expect(screen.getByText("Recorded test executions")).toBeInTheDocument()
-    expect(screen.getByText("≥2,048 retained")).toHaveClass("text-status-attention")
-    expect(screen.getByText(/lower bound; complete total unavailable/i)).toBeInTheDocument()
-    expect(screen.getByText(/disclosed bounds: unsummarized_files/i)).toBeInTheDocument()
-    expect(screen.queryByText("2,040 / 2,048 passed")).not.toBeInTheDocument()
+    render(<TestFacet detail={carded} />)
+    expect(
+      screen.getByText("≥2,688 executed · 2,662 passed · 2 failed · 11 errors · 13 skipped"),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText("99.5% of non-skipped passed · 2,692 raw executions"),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText("the run recorded test outcomes but no judgment about them"),
+    ).toBeInTheDocument()
+    // The card said `unavailable`; the tab may not say `Executed` beside it.
+    expect(screen.queryByText("Executed")).not.toBeInTheDocument()
+  })
+
+  it("shows the failing names whether or not the run recorded evidence layers", () => {
+    const failing = {
+      ...igniteShape,
+      test: { ...igniteShape.test, failingNames: ["BugCLI162Test.testInfiniteLoop"] },
+    } as any
+    render(<TestFacet detail={failing} />)
+    expect(screen.getByText("BugCLI162Test.testInfiniteLoop")).toBeInTheDocument()
   })
 
   it("counts errors as negative non-skipped results", () => {
