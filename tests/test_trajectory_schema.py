@@ -124,3 +124,75 @@ def test_a_document_without_the_new_fields_still_validates():
     )
     assert document.turns[0].call.summary is None
     assert document.turns[0].observation.outcome is None
+
+
+def test_an_empty_string_is_never_a_summary():
+    """Absence is stated with `None`; `""` is the forbidden value, not a synonym.
+
+    `ValidatorObservationPayload.reason` defaults to `""`, so a one-line wiring
+    of the reducer would write the forbidden value straight in unless the
+    boundary rejects it here.
+    """
+    import pytest
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import CallInfo, ObservationInfo, PhaseInfo
+
+    with pytest.raises(ValidationError):
+        CallInfo(tool="build", summary="")
+    with pytest.raises(ValidationError):
+        ObservationInfo(summary="")
+    with pytest.raises(ValidationError):
+        PhaseInfo(name="build", reason="")
+    with pytest.raises(ValidationError):
+        PhaseInfo(name="build", key_results="")
+
+
+def test_an_observation_summary_is_capped_like_a_call_summary():
+    import pytest
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import SUMMARY_MAX_CHARS, ObservationInfo
+
+    assert len(ObservationInfo(summary="x" * SUMMARY_MAX_CHARS).summary) == SUMMARY_MAX_CHARS
+    with pytest.raises(ValidationError):
+        ObservationInfo(summary="x" * (SUMMARY_MAX_CHARS + 1))
+
+
+def test_key_results_are_capped_at_a_paragraph():
+    import pytest
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import KEY_RESULTS_MAX_CHARS, PhaseInfo
+
+    assert KEY_RESULTS_MAX_CHARS == 400
+    assert len(PhaseInfo(name="b", key_results="x" * KEY_RESULTS_MAX_CHARS).key_results) == 400
+    with pytest.raises(ValidationError):
+        PhaseInfo(name="b", key_results="x" * (KEY_RESULTS_MAX_CHARS + 1))
+
+
+def test_validator_state_is_a_closed_vocabulary():
+    import pytest
+    from pydantic import ValidationError
+
+    from sag.trajectory.schema import PhaseInfo
+
+    assert PhaseInfo(name="b", validator_state="unavailable").validator_state == "unavailable"
+    with pytest.raises(ValidationError):
+        PhaseInfo(name="b", validator_state="mostly green")
+
+
+def test_the_validator_state_words_are_the_engine_s_own():
+    """This schema mirrors a vocabulary it must not import; pin the two together.
+
+    `sag.trajectory` is a read-only derivation and does not import the agent
+    package, so `ValidatorState` is a copy. A copy that drifts is a word the
+    reader sees that the engine never wrote.
+    """
+    from typing import get_args
+
+    from sag.agent.control_events import ValidatorObservationPayload
+    from sag.trajectory.schema import ValidatorState
+
+    engine = ValidatorObservationPayload.model_fields["validator_state"].annotation
+    assert set(get_args(ValidatorState)) == set(get_args(engine))

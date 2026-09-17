@@ -35,6 +35,11 @@ SUMMARY_MAX_CHARS = 80
 #: A phase's key results are a paragraph the gate wrote, not a line.
 KEY_RESULTS_MAX_CHARS = 400
 
+# Every free-text field below carries `min_length=1`. A derived line is
+# either a sentence or `None`; "" is a blank cell that reads as though a
+# summary had been taken and come back empty, which is the one thing this
+# layer must never say.
+
 ObservationOutcome = Literal["ok", "failed", "refused", "pending", "cancelled"]
 ValidatorState = Literal["green", "partial", "red", "unavailable"]
 
@@ -73,7 +78,7 @@ class CallInfo(_TrajectoryModel):
     #: What this call asked for, in one line. Derived from the envelope's exact
     #: params; `None` when the tool's shape is unknown to the summariser, never
     #: an empty string, so "no summary" and "an empty summary" stay distinct.
-    summary: str | None = Field(default=None, max_length=SUMMARY_MAX_CHARS)
+    summary: str | None = Field(default=None, min_length=1, max_length=SUMMARY_MAX_CHARS)
 
 
 class ObservationInfo(_TrajectoryModel):
@@ -96,7 +101,7 @@ class ObservationInfo(_TrajectoryModel):
     #: stopped before it dispatched anything.
     outcome: ObservationOutcome | None = None
     #: What came back, in one line.
-    summary: str | None = Field(default=None, max_length=SUMMARY_MAX_CHARS)
+    summary: str | None = Field(default=None, min_length=1, max_length=SUMMARY_MAX_CHARS)
 
 
 class GateInfo(_TrajectoryModel):
@@ -157,9 +162,9 @@ class PhaseInfo(_TrajectoryModel):
     #: What the validator observed when the phase closed.
     validator_state: ValidatorState | None = None
     #: Why the gate decided what it decided.
-    reason: str | None = None
+    reason: str | None = Field(default=None, min_length=1)
     #: What the phase reported it achieved, as the gate recorded it.
-    key_results: str | None = Field(default=None, max_length=KEY_RESULTS_MAX_CHARS)
+    key_results: str | None = Field(default=None, min_length=1, max_length=KEY_RESULTS_MAX_CHARS)
 
 
 class Annotation(_TrajectoryModel):
